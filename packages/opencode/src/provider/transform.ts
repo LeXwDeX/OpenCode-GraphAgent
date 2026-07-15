@@ -1129,6 +1129,12 @@ export function options(input: {
     result["promptCacheKey"] = input.sessionID
   }
 
+  if (input.model.providerID === "meta" && input.model.api.npm === "@ai-sdk/openai") {
+    result["reasoningEffort"] = "xhigh"
+    result["reasoningSummary"] = "auto"
+    result["include"] = INCLUDE_ENCRYPTED_REASONING
+  }
+
   if (input.model.api.npm === "@ai-sdk/google" || input.model.api.npm === "@ai-sdk/google-vertex") {
     if (input.model.capabilities.reasoning) {
       result["thinkingConfig"] = {
