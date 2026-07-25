@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test"
-import { Deferred, Effect, Layer, Option, Queue } from "effect"
+import { Deferred, Effect, Fiber, Layer, Option, Queue } from "effect"
 import type { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Database } from "@opencode-ai/core/database/database"
 import { TerminalViolationError } from "@opencode-ai/core/dag/core/types"
@@ -797,6 +797,108 @@ describe("DagLoop atomic wake integration", () => {
           expect(promptText(parent.input)).toContain('Node "busy-node" completed: held result')
           yield* Deferred.succeed(parent.release, "success")
         }),
+      ),
+    )
+  })
+
+  it("recovers after a false conditional branch and eventually wakes the parent", async () => {
+    await Effect.runPromise(
+      runWakeTest(
+        ({ store, childPrompts, parentPrompts }) =>
+          Effect.gen(function* () {
+            const responder = yield* Effect.forever(
+              Queue.take(childPrompts).pipe(
+                Effect.flatMap((prompt) => Deferred.succeed(prompt.release, "done")),
+              ),
+            ).pipe(Effect.forkChild)
+
+            const parent = yield* takeWithin(
+              parentPrompts,
+              "parent agent did not receive the durable DAG status after recovery",
+            )
+            expect(
+              (yield* store.getNode("dag_recovered_conditional", "conditional"))?.status,
+            ).toBe("skipped")
+            expect(
+              (yield* store.getNode("dag_recovered_conditional", "after-conditional"))?.status,
+            ).toBe("completed")
+            expect(promptText(parent.input)).toContain(
+              'Node "quality-gate" completed: REJECT',
+            )
+            expect(promptText(parent.input)).toContain(
+              'Workflow "Recovered conditional workflow" has reached terminal status',
+            )
+            yield* Deferred.succeed(parent.release, "success")
+            yield* Fiber.interrupt(responder)
+          }),
+        ({ database }) =>
+          database.db.transaction((tx) =>
+            Effect.gen(function* () {
+              yield* tx.insert(WorkflowTable).values({
+                id: "dag_recovered_conditional",
+                project_id: "project-1" as never,
+                session_id: "ses_parent" as never,
+                title: "Recovered conditional workflow",
+                status: "running",
+                config: JSON.stringify({
+                  name: "dag_recovered_conditional",
+                  nodes: [
+                    node("quality-gate"),
+                    {
+                      ...node("conditional", ["quality-gate"]),
+                      report_to_parent: false,
+                      condition: 'quality-gate.output.verdict == "ACCEPT"',
+                    },
+                    {
+                      ...node("after-conditional", ["conditional"]),
+                      report_to_parent: false,
+                    },
+                  ],
+                }),
+                seq: 6,
+                wake_reported: false,
+              }).run()
+              yield* tx.insert(WorkflowNodeTable).values([
+                {
+                  id: "quality-gate",
+                  workflow_id: "dag_recovered_conditional",
+                  name: "quality-gate",
+                  worker_type: "build",
+                  status: "completed",
+                  required: true,
+                  depends_on: [],
+                  output: "REJECT",
+                  wake_eligible: true,
+                  wake_reported: false,
+                  seq: 4,
+                },
+                {
+                  id: "conditional",
+                  workflow_id: "dag_recovered_conditional",
+                  name: "conditional",
+                  worker_type: "build",
+                  status: "pending",
+                  required: true,
+                  depends_on: ["quality-gate"],
+                  wake_eligible: false,
+                  wake_reported: false,
+                  seq: 2,
+                },
+                {
+                  id: "after-conditional",
+                  workflow_id: "dag_recovered_conditional",
+                  name: "after-conditional",
+                  worker_type: "build",
+                  status: "pending",
+                  required: true,
+                  depends_on: ["conditional"],
+                  wake_eligible: false,
+                  wake_reported: false,
+                  seq: 1,
+                },
+              ]).run()
+            }),
+          ).pipe(Effect.orDie),
       ),
     )
   })
