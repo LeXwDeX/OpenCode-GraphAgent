@@ -95,11 +95,9 @@ export const layer = Layer.effect(
               const condResult = evaluateCondition(nodeConfig.condition, outputs)
               if (!condResult.ok) {
                 yield* dag.nodeFailed(dagID, nodeID, condResult.error, "exec_failed").pipe(Effect.ignore)
-                entry.runtime.markUnsatisfied(nodeID)
                 continue
               }
               if (!condResult.value) {
-                entry.runtime.markSatisfied(nodeID)
                 yield* dag.nodeSkipped(dagID, nodeID, "condition_false").pipe(Effect.ignore)
                 continue
               }
@@ -140,7 +138,6 @@ export const layer = Layer.effect(
                   `Review input contract failed: ${reviewInput.errors.join("; ")}`,
                   "verdict_fail",
                 ).pipe(Effect.ignore)
-                entry.runtime.markUnsatisfied(nodeID)
                 continue
               }
             }
@@ -165,10 +162,7 @@ export const layer = Layer.effect(
                   text: node.name,
                   unresolvedPlaceholders: [],
                 }))
-            if (!resolved.ok) {
-              entry.runtime.markUnsatisfied(nodeID)
-              continue
-            }
+            if (!resolved.ok) continue
 
             if (resolved.unresolvedPlaceholders.length > 0) {
               yield* dag.nodeFailed(
@@ -177,7 +171,6 @@ export const layer = Layer.effect(
                 `Unresolved template placeholders: ${resolved.unresolvedPlaceholders.join(", ")}`,
                 "verdict_fail",
               ).pipe(Effect.ignore)
-              entry.runtime.markUnsatisfied(nodeID)
               continue
             }
 
@@ -406,6 +399,7 @@ export const layer = Layer.effect(
                       yield* abortChild(nid, node?.childSessionId ?? null).pipe(Effect.ignore)
                       if (fiber) yield* Fiber.interrupt(fiber).pipe(Effect.ignore)
                       entry.runtime.markUnsatisfied(nid)
+                      if (!entry.runtime.isStepMode()) yield* spawnReady(dagID)
                     }
                     // In stepMode, checkCompletion (which can trigger autonomous
                     // fail/complete) still runs, but spawnReady is skipped —
