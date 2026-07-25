@@ -8,8 +8,9 @@ import { ProjectTable } from "@opencode-ai/core/project/sql"
 import { SessionTable } from "@opencode-ai/core/session/sql"
 import { DagEvent } from "@opencode-ai/schema/dag-event"
 import { Agent } from "@/agent/agent"
-import { Dag, type NodeConfig } from "@/dag/dag"
+import { Dag, type NodeConfig, type WorkflowConfig } from "@/dag/dag"
 import { DagLoop } from "@/dag/runtime/loop"
+import { fingerprintBrief } from "@/dag/admission"
 import { InstanceRef } from "@/effect/instance-ref"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { SessionPrompt } from "@/session/prompt"
@@ -124,6 +125,7 @@ function createRunningNode(
   config: NodeConfig[],
   deadlineMs?: number,
   wakeEligible?: boolean,
+  configOverrides: Partial<WorkflowConfig> = {},
 ) {
   return Effect.gen(function* () {
     yield* database.db.insert(ProjectTable).values({
@@ -143,7 +145,7 @@ function createRunningNode(
       projectID: "project-1",
       sessionID: "ses_parent1",
       title: "Recovery",
-      config: { name: "recovery", nodes: config },
+      config: { name: "recovery", nodes: config, ...configOverrides },
     })
     yield* dag.nodeStarted(dagID, "n1", "ses_child1", deadlineMs, wakeEligible)
     return dagID
@@ -151,6 +153,64 @@ function createRunningNode(
 }
 
 describe("DagLoop crash recovery integration", () => {
+  it("retains consumed deep admission across recovery without replaying QA", async () => {
+    const brief = {
+      goal: "Recover a qualified deep workflow",
+      scope: { in: ["DAG recovery"], out: ["admission UI"] },
+      constraints: ["keep the original brief"],
+      assumptions: ["the durable config is available"],
+      acceptance_criteria: ["recovery retains the consumed admission"],
+      evidence_required: ["integration test"],
+      risks: ["production rollout is unspecified"],
+      review_plan: ["verify the recovered config"],
+      open_questions: [],
+      blocking_questions: ["Confirm production rollout"],
+    }
+    await Effect.runPromise(
+      runRecovery("active", ({ dag, database, loop, store, created }) =>
+        Effect.gen(function* () {
+          const dagID = yield* createRunningNode(
+            dag,
+            database,
+            [node()],
+            undefined,
+            undefined,
+            {
+              mode: "deep",
+              admission: {
+                protocol_version: 1,
+                brief_revision: 2,
+                qa_mode: "GRILL",
+                verdict: "WAIVED",
+                state: "WAIVED",
+                fingerprint: fingerprintBrief(brief),
+                brief,
+                waiver_reason: "Preview recovery coverage only",
+                acknowledged_risks: ["Production rollout is unspecified"],
+              },
+            },
+          )
+
+          yield* loop.init()
+
+          const workflow = yield* store.getWorkflow(dagID)
+          expect(Dag.parseWorkflowConfig(workflow?.config ?? "")).toEqual(expect.objectContaining({
+            mode: "deep",
+            admission: expect.objectContaining({
+              state: "CONSUMED",
+              verdict: "WAIVED",
+              brief_revision: 2,
+              brief,
+              waiver_reason: "Preview recovery coverage only",
+              acknowledged_risks: ["Production rollout is unspecified"],
+            }),
+          }))
+          expect(created).toEqual([])
+        }),
+      ),
+    )
+  })
+
   it("cancels active children with future or absent deadlines without spawning replacements", async () => {
     for (const deadline of [Date.now() + 60_000, undefined]) {
       await Effect.runPromise(

@@ -16,6 +16,81 @@ Explicit user constraints override profile defaults:
 - "Do not modify files" does not disable a useful brainstorm or review DAG; it makes every node read-only.
 - Preserve named roles, exact model assignments, scope limits, and prohibited actions in every node prompt.
 
+## Deep Admission QA
+
+`standard` remains the compatibility default and may start without admission.
+Simple or already-bounded work stays `standard` and MUST NOT be forced through
+deep admission QA. Recommend `deep` only when the request has at least two deep-complexity signals: independent workstreams, cross-domain uncertainty,
+high blast radius, conflicting constraints, evidence gathering, or multiple
+verification perspectives. Explicit `deep` intent still requires admission; it
+selects the mode, not a bypass.
+
+Run admission before constructing or starting the graph. Questions belong to
+the existing parent-session question interaction because the answers define the
+graph. You MUST NOT create an admission child node, QA workflow, separate
+persona, or privileged command. `GRILL-ME` selects `GRILL`; equivalent explicit
+requests for adversarial qualification do the same.
+
+Cover these six dimensions, asking only material unresolved questions:
+
+1. goal;
+2. scope;
+3. constraints and assumptions;
+4. acceptance criteria;
+5. evidence and review;
+6. risks and failure modes.
+
+Use one adaptive policy with bounded modes:
+
+- `LIGHT`: at most 1 question round for a nearly complete brief.
+- `STANDARD`: at most 3 question rounds and the default for deep admission.
+- `GRILL`: at most 5 question rounds, probing contradictions, hidden
+  assumptions, evidence quality, failure modes, and falsifiers.
+
+Stop early as soon as the brief is ready. Exhausting a budget with unresolved
+blockers yields `NOT_READY`; it never silently yields `READY`.
+
+Maintain a versioned Requirement Brief with this structure:
+
+```json
+{
+  "goal": "string",
+  "scope": {
+    "in": [],
+    "out": []
+  },
+  "constraints": [],
+  "assumptions": [],
+  "acceptance_criteria": [],
+  "evidence_required": [],
+  "risks": [],
+  "review_plan": [],
+  "open_questions": [],
+  "blocking_questions": []
+}
+```
+
+Before start, show a concise brief summary and verdict:
+`READY | NOT_READY | WAIVED`, plus QA mode, brief revision, fingerprint, and
+remaining blockers. `READY` requires a non-empty goal, scope boundaries,
+acceptance criteria, evidence obligations, review plan, and no blocking
+questions. For `NOT_READY`, remain in the parent conversation and offer:
+continue QA, reduce scope, use `standard`, or explicitly waive. A `WAIVED`
+start is informed only when both `waiver_reason` and `acknowledged_risks` are
+non-empty; preserve them for audit.
+
+Compute `fingerprint` exactly as the workflow boundary does: trim `goal`; for
+every array in the Brief, trim strings, remove blanks, and sort them; preserve
+the documented key order; then SHA-256 hash the compact JSON object and encode
+it as lowercase hexadecimal. Use normal local calculation tools rather than
+inventing a digest.
+
+Material changes to goal, scope, constraints, assumptions, or acceptance
+criteria create a new brief revision, invalidate the prior fingerprint, and
+return admission to questioning. Only a successful deep workflow start consumes
+a `READY` or `WAIVED` record. Do not replay QA from a consumed record after
+recovery.
+
 ## Role Resolution
 
 Profiles declare capability slots, not fixed agent names. Resolve each slot in this order:
@@ -59,6 +134,31 @@ Choose only the phases the task still needs:
 8. verification, CI when available, final audit, and report.
 
 Omit phases whose evidence is already satisfied. Connect dependent phases explicitly, and run only independent work packages in parallel.
+
+## Review Lifecycle
+
+Name what a review can actually prove. A pre-implementation review is a
+`design` review of requirements, architecture, threat model, plan, or test
+strategy. It may appear in the flow `design review → implementation`, but it
+MUST NOT claim implementation-diff assurance, code-correctness verification, or
+executed-test evidence.
+
+A production implementation review uses:
+`implementation → verification(PASS) → diff review → final gate/audit`.
+The implementation supplies an actual diff or changed-file artifact and an
+implementation fingerprint. Verification consumes that implementation and must
+return `PASS` before the diff review can run. The diff review returns
+`ACCEPT | REJECT` and echoes the reviewed fingerprint.
+
+Route rejection through a finite correction wave:
+`REJECT → corrected implementation → verification(PASS) → new diff review`.
+If implementation changes, the old review fingerprint is stale and cannot
+satisfy a final gate.
+
+Synthetic stress-test graphs may intentionally place reviews early to exercise
+fan-out and fan-in. Label those nodes `design` reviews and state the limitation;
+they MUST NOT claim implementation-diff assurance merely because their worker
+type says review.
 
 ## Gates and Business Verdicts
 

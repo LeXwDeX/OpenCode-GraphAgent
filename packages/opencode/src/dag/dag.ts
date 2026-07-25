@@ -22,6 +22,13 @@ import {
   WorkflowStatus,
   NodeStatus,
 } from "@opencode-ai/core/dag/core/types"
+import {
+  AdmissionRecord,
+  ExecutionMode,
+  transitionAdmission,
+  validateAdmission,
+} from "./admission"
+import { validateReviewLifecycle } from "./review-lifecycle"
 
 // Re-export domain types
 export const ID = DagEvent.DagID
@@ -54,6 +61,11 @@ export interface NodeConfig {
   restart?: boolean
   cancel?: boolean
   output_schema?: Record<string, unknown>
+  review?: {
+    phase: "design" | "diff"
+    implementation_node_id?: string
+    verification_node_id?: string
+  }
 }
 
 export interface NodeDefaults {
@@ -65,6 +77,8 @@ export interface NodeDefaults {
 
 export interface WorkflowConfig {
   name: string
+  mode?: ExecutionMode
+  admission?: AdmissionRecord
   max_concurrency?: number
   max_node_replan_attempts?: number
   max_total_nodes?: number
@@ -114,6 +128,7 @@ function normalizeWorkflowConfig(config: WorkflowConfig): WorkflowConfig {
   const defaults = normalizeNodeDefaults(config.node_defaults)
   return {
     ...config,
+    mode: config.mode ?? "standard",
     max_concurrency: config.max_concurrency ?? DEFAULT_WORKFLOW_CONFIG.maxConcurrency,
     max_node_replan_attempts: config.max_node_replan_attempts ?? DEFAULT_WORKFLOW_CONFIG.maxNodeReplanAttempts,
     max_total_nodes: config.max_total_nodes ?? DEFAULT_WORKFLOW_CONFIG.maxTotalNodes,
@@ -239,8 +254,47 @@ export const layer = Layer.effect(
       config: WorkflowConfig
     }) {
       const config = normalizeWorkflowConfig(input.config)
+      if (config.mode === "deep") {
+        if (!config.admission) {
+          return yield* Effect.fail(new Error(
+            "Deep workflow admission blocked: admission is required; complete parent-session QA or provide an informed waiver",
+          ))
+        }
+        const admission = validateAdmission(config.admission)
+        const stateAccepted = config.admission.state === "READY" || config.admission.state === "WAIVED"
+        if (!admission.valid || !stateAccepted) {
+          const errors = [
+            ...(!stateAccepted
+              ? [`state ${config.admission.state} cannot start a deep workflow; expected READY or WAIVED`]
+              : []),
+            ...(!admission.valid ? admission.errors : []),
+            ...config.admission.brief.blocking_questions,
+          ]
+          return yield* Effect.fail(new Error(
+            `Deep workflow admission blocked: ${errors.join("; ")}. Answer blockers, reduce scope, use standard mode, or provide an informed waiver`,
+          ))
+        }
+      }
+      const durableConfig = config.mode === "deep" && config.admission
+        ? {
+            ...config,
+            admission: {
+              ...config.admission,
+              state: transitionAdmission(config.admission.state, "CONSUMED"),
+            },
+          }
+        : config
+      const reviewLifecycle = validateReviewLifecycle(durableConfig)
+      if (!reviewLifecycle.valid) {
+        return yield* Effect.fail(new Error(
+          `Invalid review lifecycle: ${reviewLifecycle.errors.join("; ")}`,
+        ))
+      }
+      for (const warning of reviewLifecycle.warnings) {
+        yield* Effect.logWarning("DAG review lifecycle diagnostic", { warning })
+      }
       const validation = validateRequiredNodes({
-        nodes: config.nodes.map((n) => ({ id: n.id, depends_on: n.depends_on, required: n.required })),
+        nodes: durableConfig.nodes.map((n) => ({ id: n.id, depends_on: n.depends_on, required: n.required })),
       })
       if (!validation.valid) return yield* Effect.fail(new Error(`Invalid workflow config: ${validation.errors.join("; ")}`))
 
@@ -250,7 +304,7 @@ export const layer = Layer.effect(
       const cyclePath: string[] | null = yield* Effect.sync(() => {
         try {
           const graph = buildGraph(
-            config.nodes.map((n) => ({ id: n.id, dependsOn: n.depends_on, status: "pending" as const, required: n.required })),
+            durableConfig.nodes.map((n) => ({ id: n.id, dependsOn: n.depends_on, status: "pending" as const, required: n.required })),
           )
           return graph.hasCycle() ? (graph.findCycles()[0] ?? null) : null
         } catch (e) {
@@ -269,11 +323,11 @@ export const layer = Layer.effect(
         projectID: input.projectID as never,
         sessionID: input.sessionID as never,
         title: input.title,
-        config: JSON.stringify(config),
+        config: JSON.stringify(durableConfig),
         status: "pending",
         timestamp: ts,
       })
-      for (const node of config.nodes) {
+      for (const node of durableConfig.nodes) {
         yield* events.publish(DagEvent.NodeRegistered, {
           dagID,
           nodeID: node.id as never,
@@ -407,6 +461,20 @@ export const layer = Layer.effect(
       // (cumulative lifetime) — terminal nodes still count toward the cap.
       if (nodes.length + plan.add.length > maxTotalNodes) {
         return yield* Effect.fail(new Error(`Total node ceiling exceeded: ${nodes.length} existing + ${plan.add.length} new > ${maxTotalNodes} max`))
+      }
+
+      if (wfConfig) {
+        const reviewLifecycle = validateReviewLifecycle(
+          computeMergedConfig(wfConfig, normalizedFragment, plan),
+        )
+        if (!reviewLifecycle.valid) {
+          return yield* Effect.fail(new Error(
+            `Invalid review lifecycle: ${reviewLifecycle.errors.join("; ")}`,
+          ))
+        }
+        for (const warning of reviewLifecycle.warnings) {
+          yield* Effect.logWarning("DAG review lifecycle diagnostic", { warning })
+        }
       }
 
       const nodeById = new Map(nodes.map((n) => [n.id, n]))

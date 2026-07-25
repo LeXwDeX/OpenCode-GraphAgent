@@ -88,22 +88,31 @@ function makePromptLayerWithCapture(result: SessionV1.WithParts, payloads: unkno
   })
 }
 
-function makeSpawnInput(outputSchema?: Record<string, unknown>): NodeSpawnInput {
+function makeSpawnInput(
+  outputSchema?: Record<string, unknown>,
+  overrides: Partial<NodeSpawnInput> = {},
+): NodeSpawnInput {
   return {
     dagID: "wf-1", nodeID: "node-1", node: makeNodeRow(),
     parentSessionID: "ses_parent",
     promptParts: [{ type: "text", text: "do the thing" }],
     outputSchema,
+    ...overrides,
   }
 }
 
-async function runSpawn(dagLayer: Layer.Layer<never>, promptLayer: Layer.Layer<never>, outputSchema?: Record<string, unknown>) {
+async function runSpawn(
+  dagLayer: Layer.Layer<never>,
+  promptLayer: Layer.Layer<never>,
+  outputSchema?: Record<string, unknown>,
+  overrides: Partial<NodeSpawnInput> = {},
+) {
   const semaphore = Semaphore.makeUnsafe(1)
   const fullLayer = Layer.mergeAll(dagLayer, agentLayer, sessionLayer, promptLayer)
   await Effect.runPromise(
     Effect.scoped(
       Effect.gen(function* () {
-        const result = yield* spawnNode(semaphore, makeSpawnInput(outputSchema))
+        const result = yield* spawnNode(semaphore, makeSpawnInput(outputSchema, overrides))
         yield* Fiber.await(result.fiber)
       }),
     ).pipe(Effect.provide(fullLayer)) as Effect.Effect<never>,
@@ -257,5 +266,34 @@ describe("spawnNode submit_result capture", () => {
     const completed = events.find((e) => e.type === "nodeCompleted")
     expect(completed).toBeDefined()
     expect(completed!.output).toBe("Task completed")
+  })
+
+  it("fails a diff review whose result targets a stale implementation fingerprint", async () => {
+    const { events, dagLayer } = makeEventTracker()
+    const schema = {
+      type: "object",
+      properties: {
+        verdict: { enum: ["ACCEPT", "REJECT"] },
+        implementation_fingerprint: { type: "string" },
+      },
+      required: ["verdict", "implementation_fingerprint"],
+    }
+    await runSpawn(
+      dagLayer,
+      makePromptLayerWithCapture(reply("ignored text"), [{
+        verdict: "ACCEPT",
+        implementation_fingerprint: "sha256:revision-1",
+      }], schema),
+      schema,
+      { reviewImplementationFingerprint: "sha256:revision-2" },
+    )
+
+    expect(events.find((event) => event.type === "nodeCompleted")).toBeUndefined()
+    expect(events.find((event) => event.type === "nodeFailed")).toEqual({
+      type: "nodeFailed",
+      nodeID: "node-1",
+      reason: "Review result contract failed: review result fingerprint sha256:revision-1 does not match current implementation sha256:revision-2",
+      trigger: "verdict_fail",
+    })
   })
 })

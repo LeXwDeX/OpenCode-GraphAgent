@@ -5,6 +5,7 @@ import { Dag } from "@/dag/dag"
 import { Session } from "@/session/session"
 import { SessionID } from "@/session/schema"
 import type { NodeConfig, WorkflowConfig } from "@/dag/dag"
+import { AdmissionRecord, ExecutionMode } from "@/dag/admission"
 
 const id = "workflow"
 
@@ -45,6 +46,13 @@ const NodeSchema = Schema.Struct({
   restart: Schema.optional(Schema.Boolean).annotate({ description: "(replan only) Re-spawn this running node with new prompt" }),
   cancel: Schema.optional(Schema.Boolean).annotate({ description: "(replan only) Cancel this node" }),
   output_schema: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)).annotate({ description: "JSON Schema; child agent must call submit_result to submit structured output" }),
+  review: Schema.optional(
+    Schema.Struct({
+      phase: Schema.Literals(["design", "diff"]),
+      implementation_node_id: Schema.optional(Schema.String),
+      verification_node_id: Schema.optional(Schema.String),
+    }),
+  ).annotate({ description: '(deep review workers) design reviews pre-implementation artifacts; diff reviews require implementation_node_id and verification_node_id' }),
 })
 
 const WorkflowGraphSchema = Schema.Struct({
@@ -77,6 +85,8 @@ const WorkflowGraphSchema = Schema.Struct({
 export const Parameters = Schema.Struct({
   action: Schema.Literals(["start", "extend", "control", "status"]).annotate({ description: "start: create workflow; extend: add nodes; control: pause/resume/cancel/replan/step/complete; status: inspect durable workflow and node state" }),
   config: Schema.optional(WorkflowGraphSchema).annotate({ description: "(start) Workflow graph definition" }),
+  mode: Schema.optional(ExecutionMode).annotate({ description: "(start) standard by default; deep requires completed parent-session admission QA" }),
+  admission: Schema.optional(AdmissionRecord).annotate({ description: "(start deep) Structured Requirement Brief and READY/WAIVED verdict" }),
   session_id: Schema.optional(Schema.String).annotate({ description: "(start) Parent session ID" }),
   project_id: Schema.optional(Schema.String).annotate({ description: "(start) Optional Project ID; must match the parent session project" }),
   title: Schema.optional(Schema.String).annotate({ description: "(start) Workflow title" }),
@@ -109,6 +119,7 @@ export const WorkflowTool = Tool.define<typeof Parameters, Metadata, Dag.Service
               const workflow = yield* dag.store.getWorkflow(params.workflow_id).pipe(Effect.orDie)
               if (!workflow) return yield* Effect.die(new Error(`Workflow not found: ${params.workflow_id}`))
               const nodes = yield* dag.store.getNodes(params.workflow_id).pipe(Effect.orDie)
+              const config = Dag.parseWorkflowConfig(workflow.config)
               return {
                 title: `Workflow status: ${workflow.title}`,
                 output: JSON.stringify(
@@ -117,6 +128,24 @@ export const WorkflowTool = Tool.define<typeof Parameters, Metadata, Dag.Service
                     title: workflow.title,
                     status: workflow.status,
                     session_id: workflow.sessionId,
+                    mode: config?.mode ?? "standard",
+                    ...(config?.admission
+                      ? {
+                          admission: {
+                            verdict: config.admission.verdict,
+                            state: config.admission.state,
+                            qa_mode: config.admission.qa_mode,
+                            brief_revision: config.admission.brief_revision,
+                            fingerprint: config.admission.fingerprint,
+                            ...(config.admission.waiver_reason
+                              ? { waiver_reason: config.admission.waiver_reason }
+                              : {}),
+                            ...(config.admission.acknowledged_risks
+                              ? { acknowledged_risks: config.admission.acknowledged_risks }
+                              : {}),
+                          },
+                        }
+                      : {}),
                     nodes: nodes.map((node) => ({
                       id: node.id,
                       name: node.name,
@@ -144,11 +173,16 @@ export const WorkflowTool = Tool.define<typeof Parameters, Metadata, Dag.Service
                 projectID: session.projectID,
                 sessionID,
                 title: params.title ?? params.config.name,
-                config: params.config as WorkflowConfig,
+                config: {
+                  ...params.config,
+                  mode: params.mode ?? "standard",
+                  ...(params.admission ? { admission: params.admission } : {}),
+                } as WorkflowConfig,
               }).pipe(Effect.orDie)
+              const mode = params.mode ?? "standard"
               return {
                 title: `Workflow started: ${params.config.name}`,
-                output: `<workflow id="${dagID}" state="running">\n${params.config.nodes.length} nodes registered.\nDo not poll this workflow. It runs asynchronously and will wake the parent session when attention is required.\n</workflow>`,
+                output: `<workflow id="${dagID}" state="running" mode="${mode}">\n${params.config.nodes.length} nodes registered.\nDo not poll this workflow. It runs asynchronously and will wake the parent session when attention is required.\n</workflow>`,
                 metadata: { workflowId: dagID } as Metadata,
               }
             }

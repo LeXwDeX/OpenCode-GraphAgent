@@ -10,6 +10,7 @@ import { EventV2 } from "@opencode-ai/core/event"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
 import { SessionTable } from "@opencode-ai/core/session/sql"
 import { Agent } from "@/agent/agent"
+import { fingerprintBrief } from "@/dag/admission"
 import { Dag, type NodeConfig } from "@/dag/dag"
 import { DagLoop } from "@/dag/runtime/loop"
 import { InstanceRef } from "@/effect/instance-ref"
@@ -214,6 +215,65 @@ function runWakeTest<A>(
 }
 
 describe("DagLoop atomic wake integration", () => {
+  it("injects a bounded Requirement Brief without raw QA questions", async () => {
+    await Effect.runPromise(
+      runWakeTest(({ dag, store, childPrompts }) =>
+        Effect.gen(function* () {
+          const brief = {
+            goal: "Implement and verify durable deep admission",
+            scope: {
+              in: ["workflow start", "recovery"],
+              out: ["new user interface"],
+            },
+            constraints: ["standard mode remains compatible"],
+            assumptions: ["parent-session questions are available"],
+            acceptance_criteria: ["deep work starts only when admitted"],
+            evidence_required: ["typecheck", "unit tests"],
+            risks: ["stale admission"],
+            review_plan: ["verify the implementation diff"],
+            open_questions: ["raw QA transcript must not reach child prompts"],
+            blocking_questions: [],
+          }
+          const dagID = yield* dag.create({
+            projectID: "project-1",
+            sessionID: "ses_parent",
+            title: "Deep prompt context",
+            config: {
+              name: "deep-prompt-context",
+              mode: "deep",
+              admission: {
+                protocol_version: 1,
+                brief_revision: 1,
+                qa_mode: "STANDARD",
+                verdict: "READY",
+                state: "READY",
+                fingerprint: fingerprintBrief(brief),
+                brief,
+              },
+              nodes: [node("implement")],
+            },
+          })
+
+          const implement = yield* takeWithin(childPrompts, "implement did not start")
+          const prompt = promptText(implement.input)
+          expect(prompt).toContain("Requirement Brief")
+          expect(prompt).toContain("Implement and verify durable deep admission")
+          expect(prompt).toContain("standard mode remains compatible")
+          expect(prompt).not.toContain("open_questions")
+          expect(prompt).not.toContain("raw QA transcript must not reach child prompts")
+          yield* Deferred.succeed(implement.release, "Implemented")
+
+          yield* pollWithTimeout(
+            store.getWorkflow(dagID).pipe(
+              Effect.map((workflow) => workflow?.status === "completed" ? workflow : undefined),
+            ),
+            "deep prompt workflow did not complete",
+          )
+        }),
+      ),
+    )
+  })
+
   it("preserves documented template variables inside static template input", async () => {
     await Effect.runPromise(
       runWakeTest(({ dag, childPrompts }) =>
