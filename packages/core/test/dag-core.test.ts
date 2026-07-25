@@ -162,6 +162,40 @@ describe("iron laws (transition tables)", () => {
     )
   })
 
+  it("covers the complete node transition matrix", () => {
+    const transitions = [
+      [NodeStatus.PENDING, [NodeStatus.QUEUED, NodeStatus.RUNNING, NodeStatus.SKIPPED, NodeStatus.FAILED]],
+      [NodeStatus.QUEUED, [NodeStatus.RUNNING, NodeStatus.SKIPPED]],
+      [NodeStatus.RUNNING, [NodeStatus.COMPLETED, NodeStatus.FAILED, NodeStatus.PAUSED, NodeStatus.PENDING, NodeStatus.SKIPPED]],
+      [NodeStatus.PAUSED, [NodeStatus.RUNNING]],
+      [NodeStatus.COMPLETED, []],
+      [NodeStatus.FAILED, []],
+      [NodeStatus.ABORTED, []],
+      [NodeStatus.SKIPPED, []],
+    ] as const
+
+    for (const [status, expected] of transitions) {
+      expect(getValidNextNodeStatuses(status)).toEqual([...expected])
+    }
+  })
+
+  it("covers the complete workflow transition matrix", () => {
+    const transitions = [
+      [WorkflowStatus.PENDING, [WorkflowStatus.RUNNING]],
+      [WorkflowStatus.RUNNING, [WorkflowStatus.PAUSED, WorkflowStatus.STEPPING, WorkflowStatus.COMPLETED, WorkflowStatus.FAILED, WorkflowStatus.CANCELLED]],
+      [WorkflowStatus.STEPPING, [WorkflowStatus.RUNNING, WorkflowStatus.PAUSED, WorkflowStatus.COMPLETED, WorkflowStatus.FAILED, WorkflowStatus.CANCELLED]],
+      [WorkflowStatus.PAUSED, [WorkflowStatus.RUNNING, WorkflowStatus.CANCELLED]],
+      [WorkflowStatus.COMPLETED, [WorkflowStatus.ARCHIVED]],
+      [WorkflowStatus.FAILED, [WorkflowStatus.ARCHIVED]],
+      [WorkflowStatus.CANCELLED, [WorkflowStatus.ARCHIVED]],
+      [WorkflowStatus.ARCHIVED, []],
+    ] as const
+
+    for (const [status, expected] of transitions) {
+      expect(getValidNextWorkflowStatuses(status)).toEqual([...expected])
+    }
+  })
+
   it("assertValidNodeTransition throws TerminalViolationError from terminal", () => {
     expect(() => assertValidNodeTransition("n1", NodeStatus.COMPLETED, NodeStatus.RUNNING)).toThrow(
       TerminalViolationError,
@@ -176,6 +210,42 @@ describe("iron laws (transition tables)", () => {
 
   it("assertValidWorkflowTransition allows PAUSED → RUNNING (resume)", () => {
     expect(() => assertValidWorkflowTransition("w1", WorkflowStatus.PAUSED, WorkflowStatus.RUNNING)).not.toThrow()
+  })
+
+  it("assertValidWorkflowTransition accepts every declared workflow transition", () => {
+    for (const from of Object.values(WorkflowStatus)) {
+      for (const to of getValidNextWorkflowStatuses(from)) {
+        expect(() => assertValidWorkflowTransition("w1", from, to)).not.toThrow()
+      }
+    }
+  })
+
+  it("assertValidNodeTransition accepts every declared node transition", () => {
+    for (const from of Object.values(NodeStatus)) {
+      for (const to of getValidNextNodeStatuses(from)) {
+        expect(() => assertValidNodeTransition("n1", from, to)).not.toThrow()
+      }
+    }
+  })
+
+  it("rejects every undeclared workflow transition", () => {
+    for (const from of Object.values(WorkflowStatus)) {
+      for (const to of Object.values(WorkflowStatus)) {
+        if (getValidNextWorkflowStatuses(from).includes(to)) continue
+        const error = isWorkflowTerminalStatus(from) ? TerminalViolationError : InvalidTransitionError
+        expect(() => assertValidWorkflowTransition("w1", from, to)).toThrow(error)
+      }
+    }
+  })
+
+  it("rejects every undeclared node transition", () => {
+    for (const from of Object.values(NodeStatus)) {
+      for (const to of Object.values(NodeStatus)) {
+        if (getValidNextNodeStatuses(from).includes(to)) continue
+        const error = isNodeTerminalStatus(from) ? TerminalViolationError : InvalidTransitionError
+        expect(() => assertValidNodeTransition("n1", from, to)).toThrow(error)
+      }
+    }
   })
 })
 
@@ -202,6 +272,40 @@ describe("transitions (event mappings + aggregation)", () => {
 
   it("transitionToWorkflowEvent: PENDING → RUNNING emits workflow.started", () => {
     expect(transitionToWorkflowEvent(WorkflowStatus.PENDING, WorkflowStatus.RUNNING)).toBe("workflow.started")
+  })
+
+  it("maps every node target state to its durable event", () => {
+    const events = [
+      [NodeStatus.PENDING, null],
+      [NodeStatus.QUEUED, null],
+      [NodeStatus.RUNNING, "node.started"],
+      [NodeStatus.PAUSED, "node.paused"],
+      [NodeStatus.COMPLETED, "node.completed"],
+      [NodeStatus.FAILED, "node.failed"],
+      [NodeStatus.ABORTED, "node.aborted"],
+      [NodeStatus.SKIPPED, "node.skipped"],
+    ] as const
+
+    for (const [status, event] of events) {
+      expect(transitionToNodeEvent(NodeStatus.PENDING, status)).toBe(event)
+    }
+  })
+
+  it("maps every workflow target state to its durable event", () => {
+    const events = [
+      [WorkflowStatus.PENDING, "workflow.created"],
+      [WorkflowStatus.RUNNING, "workflow.started"],
+      [WorkflowStatus.PAUSED, "workflow.paused"],
+      [WorkflowStatus.STEPPING, "workflow.stepped"],
+      [WorkflowStatus.COMPLETED, "workflow.completed"],
+      [WorkflowStatus.FAILED, "workflow.failed"],
+      [WorkflowStatus.CANCELLED, "workflow.cancelled"],
+      [WorkflowStatus.ARCHIVED, "workflow.archived"],
+    ] as const
+
+    for (const [status, event] of events) {
+      expect(transitionToWorkflowEvent(WorkflowStatus.PENDING, status)).toBe(event)
+    }
   })
 
   it("aggregateBranchStatus: any FAILED → FAILED", () => {
@@ -432,11 +536,21 @@ describe("WorkflowRuntime", () => {
     expect(rt.getReadyNodes()).toEqual(["c"])
   })
 
-  it("markUnsatisfied blocks dependents", () => {
-    const rt = new WorkflowRuntime(linearNodes(), 4)
+  it("required markUnsatisfied blocks dependents", () => {
+    const rt = new WorkflowRuntime(
+      linearNodes().map((node) => node.id === "a" ? { ...node, required: true } : node),
+      4,
+    )
     expect(rt.getReadyNodes()).toEqual(["a"])
     rt.markUnsatisfied("a")
     expect(rt.getReadyNodes()).toEqual([])
+  })
+
+  it("optional markUnsatisfied unblocks dependents", () => {
+    const rt = new WorkflowRuntime(linearNodes(), 4)
+    rt.markUnsatisfied("a")
+    expect(rt.getReadyNodes()).toEqual(["b"])
+    expect(rt.hasRequiredFailure()).toBe(false)
   })
 
   it("markRunning excludes a node from getReadyNodes", () => {
@@ -469,8 +583,11 @@ describe("WorkflowRuntime", () => {
     const rt = new WorkflowRuntime(linearNodes(), 4)
     rt.markSatisfied("a")
     rt.markUnsatisfied("b")
-    expect(rt.isComplete()).toBe(true)
+    expect(rt.getReadyNodes()).toEqual(["c"])
+    expect(rt.isComplete()).toBe(false)
     expect(rt.hasRequiredFailure()).toBe(false)
+    rt.markSatisfied("c")
+    expect(rt.isComplete()).toBe(true)
   })
 
   it("hasRequiredFailure detects required node failure", () => {
@@ -533,8 +650,8 @@ describe("WorkflowRuntime", () => {
 
   it("constructor seeds from unsatisfied node statuses", () => {
     const rt = new WorkflowRuntime(linearNodes({ a: "unsatisfied" }), 4)
-    expect(rt.getReadyNodes()).toEqual([])
-    expect(rt.isComplete()).toBe(true)
+    expect(rt.getReadyNodes()).toEqual(["b"])
+    expect(rt.isComplete()).toBe(false)
     expect(rt.hasRequiredFailure()).toBe(false)
   })
 
@@ -556,7 +673,10 @@ describe("WorkflowRuntime", () => {
   })
 
   it("markUnsatisfied cascades to transitive dependents", () => {
-    const rt = new WorkflowRuntime(linearNodes(), 4)
+    const rt = new WorkflowRuntime(
+      linearNodes().map((node) => node.id === "a" ? { ...node, required: true } : node),
+      4,
+    )
     rt.markUnsatisfied("a")
     expect(rt.isComplete()).toBe(true)
     expect(rt.getReadyNodes()).toEqual([])
@@ -564,7 +684,7 @@ describe("WorkflowRuntime", () => {
 
   it("markUnsatisfied cascade respects already-satisfied nodes", () => {
     const nodes: SchedulingNode[] = [
-      { id: "a", dependsOn: [], status: "pending", required: false },
+      { id: "a", dependsOn: [], status: "pending", required: true },
       { id: "b", dependsOn: ["a"], status: "pending", required: false },
       { id: "c", dependsOn: [], status: "pending", required: false },
     ]

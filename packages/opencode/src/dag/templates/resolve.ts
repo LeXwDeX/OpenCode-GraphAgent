@@ -25,7 +25,7 @@ export interface TemplateRef {
   input?: Record<string, unknown>
 }
 
-const INTERPOLATION_RE = /\{\{(\w+)\}\}/g
+const INTERPOLATION_RE = /{{\s*([^{}]+?)\s*}}/g
 
 /** A template id must be a single path segment (no separators, no parent refs)
  * so it cannot escape the dag-prompts directory via path traversal. */
@@ -40,8 +40,16 @@ function isSafeTemplateId(id: string): boolean {
  * @param projectDir  The project root (for `.opencode/dag-prompts/` lookup)
  */
 export function resolveTemplate(ref: TemplateRef, projectDir: string): Effect.Effect<string, Error> {
+  return renderTemplate(ref, projectDir).pipe(Effect.map((result) => result.text))
+}
+
+export function renderTemplate(
+  ref: TemplateRef,
+  projectDir: string,
+  dynamicInput: Record<string, unknown> = {},
+) {
   return Effect.gen(function* () {
-    const input = sanitizeInput(ref.input ?? {})
+    const input = sanitizeInput({ ...dynamicInput, ...(ref.input ?? {}) })
     const raw = yield* readTemplateSource(ref, projectDir)
     return interpolate(raw, input)
   })
@@ -100,9 +108,13 @@ function readById(id: string, projectDir: string): Effect.Effect<string, Error> 
   })
 }
 
-function interpolate(template: string, input: Record<string, unknown>): string {
-  return template.replace(INTERPOLATION_RE, (match, key: string) => {
+function interpolate(template: string, input: Record<string, unknown>) {
+  const unresolvedPlaceholders: string[] = []
+  const text = template.replace(INTERPOLATION_RE, (match, key: string) => {
     const value = input[key]
-    return value !== undefined ? String(value) : match
+    if (value !== null && value !== undefined) return String(value)
+    unresolvedPlaceholders.push(key)
+    return match
   })
+  return { text, unresolvedPlaceholders }
 }

@@ -214,6 +214,140 @@ function runWakeTest<A>(
 }
 
 describe("DagLoop atomic wake integration", () => {
+  it("preserves documented template variables inside static template input", async () => {
+    await Effect.runPromise(
+      runWakeTest(({ dag, childPrompts }) =>
+        Effect.gen(function* () {
+          yield* dag.create({
+            projectID: "project-1",
+            sessionID: "ses_parent",
+            title: "Static template documentation",
+            config: {
+              name: "static-template-documentation",
+              nodes: [
+                {
+                  ...node("review-guidance"),
+                  prompt_template: {
+                    inline: "Review this guidance:\n{{guidance}}",
+                    input: {
+                      guidance: "Workflow examples use {{node-id}} as a documented template variable.",
+                    },
+                  },
+                },
+              ],
+            },
+          })
+
+          const review = yield* takeWithin(childPrompts, "review-guidance did not start")
+          expect(promptText(review.input)).toContain(
+            "Workflow examples use {{node-id}} as a documented template variable.",
+          )
+          yield* Deferred.succeed(review.release, "The guidance is clear.")
+        }),
+      ),
+    )
+  })
+
+  it("preserves documented template variables inside dependency output", async () => {
+    await Effect.runPromise(
+      runWakeTest(({ dag, store, childPrompts }) =>
+        Effect.gen(function* () {
+          const dagID = yield* dag.create({
+            projectID: "project-1",
+            sessionID: "ses_parent",
+            title: "Documented template variable",
+            config: {
+              name: "documented-template-variable",
+              nodes: [
+                node("analyze-security"),
+                {
+                  ...node("review-security", ["analyze-security"]),
+                  prompt_template: { inline: "Review this analysis:\n{{analyze-security}}" },
+                },
+              ],
+            },
+          })
+
+          const analyze = yield* takeWithin(childPrompts, "analyze-security did not start")
+          yield* Deferred.succeed(
+            analyze.release,
+            "Workflow examples use {{node-id}} as a documented template variable.",
+          )
+
+          const review = yield* takeWithin(childPrompts, "review-security did not start")
+          expect(review.title).toBe("review-security")
+          expect(promptText(review.input)).toContain(
+            "Workflow examples use {{node-id}} as a documented template variable.",
+          )
+          yield* Deferred.succeed(review.release, "No security issues found.")
+
+          yield* pollWithTimeout(
+            store.getWorkflow(dagID).pipe(
+              Effect.map((workflow) => workflow?.status === "completed" ? workflow : undefined),
+            ),
+            "workflow did not complete",
+          )
+        }),
+      ),
+    )
+  })
+
+  it("runs a required fan-in after an optional dependency fails", async () => {
+    await Effect.runPromise(
+      runWakeTest(({ dag, store, childPrompts }) =>
+        Effect.gen(function* () {
+          const dagID = yield* dag.create({
+            projectID: "project-1",
+            sessionID: "ses_parent",
+            title: "Optional review failure",
+            config: {
+              name: "optional-review-failure",
+              nodes: [
+                node("analysis"),
+                {
+                  ...node("review-quality", ["analysis"]),
+                  required: false,
+                },
+                {
+                  ...node("review-security", ["analysis"]),
+                  required: false,
+                  condition: "analysis.output.verdict ==",
+                },
+                {
+                  ...node("arbitrate", ["review-quality", "review-security"]),
+                  prompt_template: {
+                    inline: "Quality review: {{review-quality}}\nSecurity review: {{review-security}}",
+                  },
+                },
+              ],
+            },
+          })
+
+          const analysis = yield* takeWithin(childPrompts, "analysis did not start")
+          yield* Deferred.succeed(analysis.release, "The implementation follows the approved design.")
+
+          const quality = yield* takeWithin(childPrompts, "review-quality did not start")
+          expect(quality.title).toBe("review-quality")
+          yield* Deferred.succeed(quality.release, "No quality issues found.")
+
+          const arbitrate = yield* takeWithin(childPrompts, "arbitrate did not start")
+          const text = promptText(arbitrate.input)
+          expect(text).toContain("No quality issues found.")
+          expect(text).toContain('Dependency "review-security" failed:')
+          yield* Deferred.succeed(arbitrate.release, "Proceed with one review unavailable.")
+
+          yield* pollWithTimeout(
+            store.getWorkflow(dagID).pipe(
+              Effect.map((workflow) => workflow?.status === "completed" ? workflow : undefined),
+            ),
+            "workflow did not complete",
+          )
+          expect((yield* store.getNode(dagID, "review-security"))?.status).toBe("failed")
+        }),
+      ),
+    )
+  })
+
   it("injects direct dependency outputs into an aggregate node by default", async () => {
     await Effect.runPromise(
       runWakeTest(({ dag, childPrompts }) =>

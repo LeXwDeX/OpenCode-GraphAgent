@@ -213,10 +213,9 @@ export function assertValidNodeTransition(nodeId: string, from: NodeStatus, to: 
 }
 
 export function assertValidWorkflowTransition(workflowId: string, from: WorkflowStatus, to: WorkflowStatus): void {
+  if (getValidNextWorkflowStatuses(from).includes(to)) return
   if (isWorkflowTerminalStatus(from)) {
     throw new TerminalViolationError(workflowId, from, to)
   }
-  if (!getValidNextWorkflowStatuses(from).includes(to)) {
-    throw new InvalidTransitionError(workflowId, from, to)
-  }
+  throw new InvalidTransitionError(workflowId, from, to)
 }

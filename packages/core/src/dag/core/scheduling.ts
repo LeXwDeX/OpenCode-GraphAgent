@@ -44,7 +44,7 @@ export class WorkflowRuntime {
       else if (node.status === "unsatisfied") this.unsatisfied.add(node.id)
       else if (node.status === "running") this.running.add(node.id)
     })
-    unsatisfiedIDs.forEach((id) => this.cascadeUnsatisfied(id))
+    unsatisfiedIDs.filter((id) => this.required.has(id)).forEach((id) => this.cascadeUnsatisfied(id))
   }
 
   markSatisfied(nodeID: string): void {
@@ -57,7 +57,7 @@ export class WorkflowRuntime {
     this.unsatisfied.add(nodeID)
     this.running.delete(nodeID)
     this.satisfied.delete(nodeID)
-    this.cascadeUnsatisfied(nodeID)
+    if (this.required.has(nodeID)) this.cascadeUnsatisfied(nodeID)
   }
 
   private cascadeUnsatisfied(nodeID: string): void {
@@ -99,7 +99,10 @@ export class WorkflowRuntime {
   getReadyNodes(): string[] {
     if (this.paused) return []
     const ready = this.graph
-      .getExecutableNodes(this.satisfied)
+      .getExecutableNodes(new Set([
+        ...this.satisfied,
+        ...[...this.unsatisfied].filter((id) => !this.required.has(id)),
+      ]))
       .filter((id) => !this.satisfied.has(id) && !this.unsatisfied.has(id) && !this.running.has(id))
     if (this.stepMode && ready.length > 0) return [ready.slice().sort()[0]]
     return ready

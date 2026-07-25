@@ -15,7 +15,7 @@ import { Session } from "@/session/session"
 import { SessionPrompt } from "@/session/prompt"
 import { SessionID } from "@/session/schema"
 import { SessionStatus } from "@/session/status"
-import { resolveTemplate } from "../templates/resolve"
+import { renderTemplate } from "../templates/resolve"
 import { sanitizeInput } from "../templates/sanitize"
 import { spawnNode } from "./spawn"
 import { evaluateCondition, resolveInputMapping } from "./eval"
@@ -107,7 +107,17 @@ export const layer = Layer.effect(
               const allNodes = yield* store.getNodes(dagID)
               resolvedMapping = resolveInputMapping(inputMapping, (depId) => {
                 const depNode = allNodes.find((n) => n.id === depId)
-                return depNode?.output ?? null
+                if (!depNode) return null
+                if (depNode.output !== null) return depNode.output
+                if (depNode.status === "failed") {
+                  return `Dependency "${depId}" failed: ${depNode.errorReason ?? "unknown error"}`
+                }
+                if (depNode.status === "skipped") {
+                  return `Dependency "${depId}" skipped: ${depNode.errorReason ?? "no output"}`
+                }
+                if (depNode.status === "aborted") return `Dependency "${depId}" aborted`
+                if (depNode.status === "completed") return `Dependency "${depId}" completed without output`
+                return null
               })
             }
 
@@ -115,51 +125,43 @@ export const layer = Layer.effect(
             // outputs) before interpolation and Context serialization.
             resolvedMapping = sanitizeInput(resolvedMapping)
 
-            let promptText: string
-            if (nodeConfig?.prompt_template) {
-              const resolved = yield* resolveTemplate(nodeConfig.prompt_template, ctx.directory).pipe(
-                Effect.tap((text) =>
-                  text.trim() === ""
-                    ? Effect.logWarning("DAG node resolved template is empty", { dagID, nodeID })
-                    : Effect.void,
-                ),
-                Effect.map((text) => ({ ok: true as const, text })),
-                Effect.catch((err: unknown) =>
-                  Effect.gen(function* () {
-                    yield* dag.nodeFailed(dagID, nodeID, `Template resolution failed: ${String(err)}`, "exec_failed").pipe(Effect.ignore)
-                    return { ok: false as const, text: "" }
-                  }),
-                ),
-              )
-              if (!resolved.ok) {
-                entry.runtime.markUnsatisfied(nodeID)
-                continue
-              }
-              promptText = resolved.text
-            } else {
-              promptText = node.name
+            const resolved = yield* (nodeConfig?.prompt_template
+              ? renderTemplate(nodeConfig.prompt_template, ctx.directory, resolvedMapping).pipe(
+                  Effect.tap((result) =>
+                    result.text.trim() === ""
+                      ? Effect.logWarning("DAG node resolved template is empty", { dagID, nodeID })
+                      : Effect.void,
+                  ),
+                  Effect.map((result) => ({ ok: true as const, ...result })),
+                  Effect.catch((err: unknown) =>
+                    Effect.gen(function* () {
+                      yield* dag.nodeFailed(dagID, nodeID, `Template resolution failed: ${String(err)}`, "exec_failed").pipe(Effect.ignore)
+                      return { ok: false as const, text: "", unresolvedPlaceholders: [] }
+                    }),
+                  ),
+                )
+              : Effect.succeed({
+                  ok: true as const,
+                  text: node.name,
+                  unresolvedPlaceholders: [],
+                }))
+            if (!resolved.ok) {
+              entry.runtime.markUnsatisfied(nodeID)
+              continue
             }
 
-            for (const [key, value] of Object.entries(resolvedMapping)) {
-              if (value !== null && value !== undefined) {
-                promptText = promptText.replaceAll(`{{${key}}}`, String(value))
-              }
-            }
-
-            const unresolvedPlaceholders = [...promptText.matchAll(/{{\s*([^{}]+?)\s*}}/g)]
-              .map((match) => match[1])
-            if (unresolvedPlaceholders.length > 0) {
+            if (resolved.unresolvedPlaceholders.length > 0) {
               yield* dag.nodeFailed(
                 dagID,
                 nodeID,
-                `Unresolved template placeholders: ${unresolvedPlaceholders.join(", ")}`,
+                `Unresolved template placeholders: ${resolved.unresolvedPlaceholders.join(", ")}`,
                 "verdict_fail",
               ).pipe(Effect.ignore)
               entry.runtime.markUnsatisfied(nodeID)
               continue
             }
 
-            promptParts.push({ type: "text", text: promptText })
+            promptParts.push({ type: "text", text: resolved.text })
 
             if (Object.keys(resolvedMapping).length > 0) {
               promptParts.push({ type: "text", text: `\n\nContext:\n${JSON.stringify(resolvedMapping, null, 2)}` })

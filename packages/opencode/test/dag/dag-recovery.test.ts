@@ -276,6 +276,30 @@ describe("reconcileWorkflow", () => {
 })
 
 describe("rehydration via toSchedulingNodes", () => {
+  it("maps every durable node status into the scheduling state machine", () => {
+    const nodes = [
+      makeNodeRow({ id: "pending", status: "pending" }),
+      makeNodeRow({ id: "queued", status: "queued" }),
+      makeNodeRow({ id: "running", status: "running" }),
+      makeNodeRow({ id: "paused", status: "paused" }),
+      makeNodeRow({ id: "completed", status: "completed" }),
+      makeNodeRow({ id: "failed", status: "failed" }),
+      makeNodeRow({ id: "aborted", status: "aborted" }),
+      makeNodeRow({ id: "skipped", status: "skipped" }),
+    ]
+
+    expect(toSchedulingNodes(nodes).map((node) => [node.id, node.status])).toEqual([
+      ["pending", "pending"],
+      ["queued", "pending"],
+      ["running", "running"],
+      ["paused", "pending"],
+      ["completed", "satisfied"],
+      ["failed", "unsatisfied"],
+      ["aborted", "satisfied"],
+      ["skipped", "satisfied"],
+    ])
+  })
+
   it("running nodes are seeded as running in WorkflowRuntime", () => {
     const nodes = [makeNodeRow({ id: "n1", status: "running", childSessionId: "ses_1" })]
     const rt = new WorkflowRuntime(toSchedulingNodes(nodes), 4)
@@ -301,6 +325,16 @@ describe("rehydration via toSchedulingNodes", () => {
     expect(rt.getReadyNodes()).toEqual([])
     expect(rt.isComplete()).toBe(true)
     expect(rt.hasRequiredFailure()).toBe(true)
+  })
+
+  it("failed optional nodes after reconciliation unblock dependents", () => {
+    const nodes = [
+      makeNodeRow({ id: "n1", status: "failed", required: false }),
+      makeNodeRow({ id: "n2", status: "pending", dependsOn: ["n1"], required: true }),
+    ]
+    const rt = new WorkflowRuntime(toSchedulingNodes(nodes), 4)
+    expect(rt.getReadyNodes()).toEqual(["n2"])
+    expect(rt.hasRequiredFailure()).toBe(false)
   })
 
   it("paused workflow rehydrates with setPaused(true)", () => {
