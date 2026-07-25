@@ -290,6 +290,8 @@ function DagInspector(props: { api: TuiPluginApi }) {
   const closeShortcut = useCommandShortcut("dag.close")
   const enterShortcut = useCommandShortcut("dag.enter")
 
+  const selectedWorkflowSummary = createMemo(() => workflows().find((workflow) => workflow.id === selectedWorkflow()))
+
   const statusColor = (status: string) => {
     if (status === "completed") return theme().success
     if (status === "failed") return theme().error
@@ -301,35 +303,72 @@ function DagInspector(props: { api: TuiPluginApi }) {
 
   return (
     <box flexDirection="column" width="100%" height="100%" padding={1} gap={1}>
+      <box
+        flexDirection="row"
+        width="100%"
+        flexShrink={0}
+        justifyContent="space-between"
+        border={["bottom"]}
+        borderColor={theme().borderSubtle}
+      >
+        <box flexDirection="column" paddingBottom={1}>
+          <text fg={theme().text} attributes={TextAttributes.BOLD}>
+            DAG Inspector
+          </text>
+          <text fg={theme().textMuted}>Workflow execution overview</text>
+        </box>
+        <text fg={theme().textMuted}>
+          {workflows().length} {workflows().length === 1 ? "workflow" : "workflows"}
+        </text>
+      </box>
+
       <box flexDirection="row" width="100%" flexGrow={1} minHeight={0} gap={1}>
         {/* Left column: workflow list */}
-        <box width="30%" minWidth={24} border={["right"]} borderColor={theme().borderSubtle}>
-          <box flexDirection="column" paddingRight={1}>
-            <text fg={theme().text} attributes={TextAttributes.BOLD}>
-              Workflows
-            </text>
+        <box width="25.5%" minWidth={20} border={["right"]} borderColor={theme().borderSubtle}>
+          <box flexDirection="column" width="100%" paddingRight={1} gap={1}>
+            <box flexDirection="row" width="100%" justifyContent="space-between">
+              <text fg={theme().text} attributes={TextAttributes.BOLD}>
+                Workflows
+              </text>
+              <text fg={theme().textMuted}>{workflows().length}</text>
+            </box>
+            <Show when={workflowLoad() === "loading"}>
+              <text fg={theme().textMuted}>Loading...</text>
+            </Show>
             <Show when={workflowLoad() !== "loading" && workflows().length === 0}>
               <text fg={theme().textMuted}>No workflows</text>
             </Show>
             <For each={workflows().slice(0, 10)}>
               {(wf) => (
                 <box
-                  flexDirection="row"
-                  gap={1}
+                  flexDirection="column"
+                  width="100%"
+                  paddingLeft={1}
+                  paddingRight={1}
                   onMouseUp={() => setSelectedWorkflow(wf.id)}
                   style={{ backgroundColor: selectedWorkflow() === wf.id ? theme().backgroundMenu : undefined }}
                 >
-                  <text
-                    flexShrink={0}
-                    style={{
-                      fg: statusColor(wf.status),
-                    }}
-                  >
-                    •
-                  </text>
-                  <text fg={theme().text} wrapMode="word">
-                    {wf.title} ({Number(wf.completedNodes)}/{Number(wf.nodeCount)})
-                  </text>
+                  <box flexDirection="row" width="100%" gap={1}>
+                    <text fg={selectedWorkflow() === wf.id ? theme().accent : theme().textMuted} flexShrink={0}>
+                      {selectedWorkflow() === wf.id ? "›" : " "}
+                    </text>
+                    <text
+                      flexShrink={0}
+                      style={{
+                        fg: statusColor(wf.status),
+                      }}
+                    >
+                      •
+                    </text>
+                    <text fg={theme().text} wrapMode="word">
+                      {wf.title}
+                    </text>
+                  </box>
+                  <box paddingLeft={4}>
+                    <text fg={theme().textMuted}>
+                      {Number(wf.completedNodes)}/{Number(wf.nodeCount)} nodes · {wf.status}
+                    </text>
+                  </box>
                 </box>
               )}
             </For>
@@ -350,24 +389,66 @@ function DagInspector(props: { api: TuiPluginApi }) {
               </text>
             }
           >
-            <box flexDirection="column" gap={1}>
-              <text fg={theme().text} attributes={TextAttributes.BOLD}>
-                {workflows().find((w) => w.id === selectedWorkflow())?.title ?? "Unknown"}
-              </text>
-              <text fg={theme().textMuted}>ID: {selectedWorkflow()}</text>
+            <box flexDirection="column" width="100%" gap={1}>
+              <box
+                flexDirection="column"
+                width="100%"
+                flexShrink={0}
+                paddingBottom={1}
+                border={["bottom"]}
+                borderColor={theme().borderSubtle}
+              >
+                <box flexDirection="row" width="100%" justifyContent="space-between">
+                  <box flexDirection="column">
+                    <text fg={theme().textMuted}>Selected workflow</text>
+                    <text fg={theme().text} attributes={TextAttributes.BOLD}>
+                      {selectedWorkflowSummary()?.title ?? "Unknown"}
+                    </text>
+                  </box>
+                  <box flexDirection="row" gap={1}>
+                    <text fg={statusColor(selectedWorkflowSummary()?.status ?? "")}>•</text>
+                    <text fg={statusColor(selectedWorkflowSummary()?.status ?? "")}>
+                      {selectedWorkflowSummary()?.status ?? "unknown"}
+                    </text>
+                  </box>
+                </box>
+                <text fg={theme().textMuted}>ID: {selectedWorkflow()}</text>
+              </box>
+
               <Show when={actionMessage()}>
                 <text fg={theme().warning} wrapMode="word">
                   {actionMessage()}
                 </text>
               </Show>
 
+              <box flexDirection="row" width="100%" justifyContent="space-between">
+                <text fg={theme().text} attributes={TextAttributes.BOLD}>
+                  Execution
+                </text>
+                <text fg={theme().textMuted}>
+                  {nodes().length} {nodes().length === 1 ? "node" : "nodes"} · {layers().length}{" "}
+                  {layers().length === 1 ? "wave" : "waves"}
+                </text>
+              </box>
+
               {/* Wave header: nodes at the same topological depth, NOT a barrier */}
               <For each={layers()}>
                 {(layer, layerIdx) => (
-                  <box flexDirection="column">
-                    <text fg={theme().textMuted}>
-                      ═══ wave {layerIdx()} ({layer.length} {layer.length === 1 ? "node" : "nodes"})
-                    </text>
+                  <box
+                    flexDirection="column"
+                    width="100%"
+                    paddingLeft={1}
+                    border={["left"]}
+                    borderColor={theme().borderSubtle}
+                  >
+                    <box flexDirection="row" width="100%" justifyContent="space-between">
+                      <text fg={theme().accent} attributes={TextAttributes.BOLD}>
+                        Wave {layerIdx() + 1}
+                      </text>
+                      <text fg={theme().textMuted}>
+                        {layer.length} {layer.length === 1 ? "node" : "nodes"}
+                      </text>
+                    </box>
                     <For each={layer}>
                       {(node) => (
                         <box
@@ -377,10 +458,10 @@ function DagInspector(props: { api: TuiPluginApi }) {
                           style={{ backgroundColor: selectedNode() === node.id ? theme().backgroundMenu : undefined }}
                         >
                           <box flexDirection="row" gap={1} width="100%">
-                            <Show
-                              when={node.status !== "running"}
-                              fallback={<Spinner color={theme().textMuted} />}
-                            >
+                            <text fg={selectedNode() === node.id ? theme().accent : theme().textMuted} flexShrink={0}>
+                              {selectedNode() === node.id ? "›" : " "}
+                            </text>
+                            <Show when={node.status !== "running"} fallback={<Spinner color={theme().textMuted} />}>
                               <text
                                 flexShrink={0}
                                 style={{
@@ -394,14 +475,16 @@ function DagInspector(props: { api: TuiPluginApi }) {
                               {node.name}
                             </text>
                             <text fg={theme().textMuted}>[{node.worker_type}]</text>
-                            <Show when={node.depends_on.length > 0}>
-                              <text fg={theme().textMuted} wrapMode="word">
-                                [deps: {node.depends_on.join(", ")}]
-                              </text>
-                            </Show>
                           </box>
+                          <Show when={node.depends_on.length > 0}>
+                            <box paddingLeft={4} paddingRight={1}>
+                              <text fg={theme().textMuted} wrapMode="word">
+                                depends on {node.depends_on.join(", ")}
+                              </text>
+                            </box>
+                          </Show>
                           <Show when={node.status === "failed" && node.error_reason}>
-                            <box paddingLeft={2} paddingRight={1}>
+                            <box paddingLeft={4} paddingRight={1}>
                               <text fg={theme().error} wrapMode="word">
                                 ⚠ {formatDagError(node.error_reason!)}
                               </text>
@@ -419,7 +502,7 @@ function DagInspector(props: { api: TuiPluginApi }) {
       </box>
 
       {/* Footer: shortcut hints */}
-      <box flexDirection="row" gap={2} flexShrink={0}>
+      <box flexDirection="row" gap={2} flexShrink={0} border={["top"]} borderColor={theme().borderSubtle}>
         <text fg={theme().textMuted}>↑/↓ node</text>
         <text fg={theme().textMuted}>←/→ workflow</text>
         <Show when={enterShortcut()}>
