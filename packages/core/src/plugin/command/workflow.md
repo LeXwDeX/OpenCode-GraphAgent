@@ -24,6 +24,21 @@ does not require this implicit-trigger test. If a task fits in one context
 window and has no inter-step dependencies, use the `task` tool instead. For
 trivial work, use direct tools.
 
+## Standard and deep workflow entry
+
+Omitting the top-level start parameter `mode` preserves `standard` behavior. Use `deep` for explicit
+deep intent or requests with at least two substantial complexity signals, such
+as independent workstreams, cross-domain uncertainty, high blast radius,
+conflicting constraints, evidence gathering, or multiple verification
+perspectives.
+
+Before a deep start, qualify the request interactively in the parent session
+and pass `mode: deep` plus a versioned `READY` or informed `WAIVED` admission
+record beside `config` in the `action: start` tool call. Do not put admission
+QA inside the graph: its answers define the graph. Use the orchestration policy
+below for QA modes, round budgets, verdict recovery, revision invalidation, and
+waiver audit fields.
+
 ## Orchestration Lifecycle
 
 Heavy tasks follow a meta-workflow: multiple workflows chained together, each producing a decision that shapes the next. The lifecycle is not a rigid template — assess the task and enter at the phase that matches its current state.
@@ -160,11 +175,18 @@ config:
       prompt_template: { id: patcher-assemble }
 ```
 
-### Phase 4 — Audit + Merge
+### Phase 4 — Verify + Diff Review + Audit
 
-Goal: verify integration, merge results, update progress tracking.
+Goal: verify integration, review the actual implementation, merge results, and
+update progress tracking.
 
-A workflow runs review nodes (adversarial review pattern) on the assembled output, then a final auditor confirms completeness. Progress tracking (todowrite, OpenSpec tasks, or project board) is updated to reflect what shipped.
+Production assurance follows `implementation → verification(PASS) → diff
+review → final gate/audit`. A diff review maps the implementation's actual diff
+and fingerprint plus the verification output. If it returns `REJECT`, route the
+findings through corrected implementation and verification before a new diff
+review. A final auditor then confirms completeness. Progress tracking
+(todowrite, OpenSpec tasks, or project board) is updated to reflect what
+shipped.
 
 ### Phase 5 — Expansion Decision
 

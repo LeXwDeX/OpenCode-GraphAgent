@@ -1,0 +1,239 @@
+export * as DagReviewLifecycle from "./review-lifecycle"
+
+import type { NodeConfig, WorkflowConfig } from "./dag"
+
+export function validateReviewLifecycle(config: WorkflowConfig) {
+  const issues = config.nodes.flatMap((node) => {
+    if (!isReviewWorker(node.worker_type)) return []
+    if (!node.review) {
+      if ((config.mode ?? "standard") === "standard") return []
+      return [`${node.id}: deep review worker must declare review.phase as "design" or "diff"`]
+    }
+    if (node.review.phase === "design") return []
+    return validateDiffReview(config, node.id)
+  })
+
+  if ((config.mode ?? "standard") === "standard") {
+    return { valid: true, errors: [], warnings: issues }
+  }
+  return { valid: issues.length === 0, errors: issues, warnings: [] }
+}
+
+export function validateReviewExecutionInput(
+  node: NodeConfig,
+  resolvedMapping: Record<string, unknown>,
+) {
+  if (!node.review || node.review.phase === "design") {
+    return {
+      valid: true,
+      phase: node.review?.phase,
+      satisfies_diff_gate: false,
+      errors: [],
+    }
+  }
+
+  const implementationID = node.review.implementation_node_id
+  const verificationID = node.review.verification_node_id
+  const entries = Object.entries(node.input_mapping ?? {})
+  const implementationKey = entries.find(([, source]) => {
+    const [sourceID, output, field] = source.split(".")
+    return sourceID === implementationID
+      && output === "output"
+      && field !== undefined
+      && ["diff", "patch", "changed_files"].includes(field)
+  })?.[0]
+  const fingerprintKey = entries.find(([, source]) => {
+    const [sourceID, output, field] = source.split(".")
+    return sourceID === implementationID && output === "output" && field === "fingerprint"
+  })?.[0]
+  const verificationKey = entries.find(([, source]) => source.split(".")[0] === verificationID)?.[0]
+  const errors = [
+    ...(hasEvidence(implementationKey ? resolvedMapping[implementationKey] : undefined)
+      ? []
+      : [`${node.id}: implementation evidence is empty or unresolved`]),
+    ...(hasEvidence(fingerprintKey ? resolvedMapping[fingerprintKey] : undefined)
+      ? []
+      : [`${node.id}: implementation fingerprint is empty or unresolved`]),
+    ...(hasPassVerdict(verificationKey ? resolvedMapping[verificationKey] : undefined)
+      ? []
+      : [`${node.id}: verification evidence must contain verdict PASS`]),
+  ]
+  return {
+    valid: errors.length === 0,
+    phase: "diff" as const,
+    satisfies_diff_gate: errors.length === 0,
+    errors,
+  }
+}
+
+export function reviewImplementationFingerprint(
+  node: NodeConfig,
+  resolvedMapping: Record<string, unknown>,
+) {
+  if (node.review?.phase !== "diff") return undefined
+  const implementationID = node.review.implementation_node_id
+  const fingerprintKey = Object.entries(node.input_mapping ?? {}).find(([, source]) => {
+    const [sourceID, output, field] = source.split(".")
+    return sourceID === implementationID && output === "output" && field === "fingerprint"
+  })?.[0]
+  const fingerprint = fingerprintKey ? resolvedMapping[fingerprintKey] : undefined
+  return typeof fingerprint === "string" && fingerprint.trim() !== ""
+    ? fingerprint
+    : undefined
+}
+
+export function validateReviewResult(output: unknown, currentFingerprint: string) {
+  if (typeof output !== "object" || output === null || Array.isArray(output)) {
+    return {
+      valid: false,
+      action: "invalidate" as const,
+      reviewed_fingerprint: "",
+      errors: ["review result must be a structured object"],
+    }
+  }
+
+  const verdict = "verdict" in output ? output.verdict : undefined
+  const fingerprint = "implementation_fingerprint" in output
+    ? output.implementation_fingerprint
+    : undefined
+  const reviewedFingerprint = typeof fingerprint === "string" ? fingerprint : ""
+  const errors = [
+    ...(["ACCEPT", "REJECT"].includes(typeof verdict === "string" ? verdict : "")
+      ? []
+      : ["review result verdict must be ACCEPT or REJECT"]),
+    ...(reviewedFingerprint.trim() === ""
+      ? ["review result must include implementation_fingerprint"]
+      : reviewedFingerprint === currentFingerprint
+        ? []
+        : [`review result fingerprint ${reviewedFingerprint} does not match current implementation ${currentFingerprint}`]),
+  ]
+  return {
+    valid: errors.length === 0,
+    action: errors.length > 0
+      ? "invalidate" as const
+      : verdict === "ACCEPT"
+        ? "proceed" as const
+        : "correct" as const,
+    reviewed_fingerprint: reviewedFingerprint,
+    errors,
+  }
+}
+
+export function reviewContractForNode(node: NodeConfig) {
+  if (!node.review) return undefined
+  if (node.review.phase === "design") {
+    return [
+      "Review contract: this is a design/specification review.",
+      "Evaluate only the pre-implementation artifacts supplied by dependencies.",
+      "You MUST NOT claim to have inspected an implementation diff or executed implementation tests.",
+    ].join(" ")
+  }
+  return [
+    "Review contract: this is an implementation diff review.",
+    "Base the verdict on the supplied actual diff, implementation fingerprint, and verification PASS evidence.",
+    "The structured result must report ACCEPT or REJECT and echo the reviewed implementation fingerprint.",
+  ].join(" ")
+}
+
+function validateDiffReview(config: WorkflowConfig, reviewID: string) {
+  const review = config.nodes.find((node) => node.id === reviewID)
+  if (!review?.review || review.review.phase !== "diff") return []
+
+  const implementationID = review.review.implementation_node_id
+  const verificationID = review.review.verification_node_id
+  const missing = [
+    ...(!implementationID
+      ? [`${reviewID}: diff review must declare implementation_node_id`]
+      : config.nodes.some((node) => node.id === implementationID)
+        ? []
+        : [`${reviewID}: implementation node ${implementationID} does not exist`]),
+    ...(!verificationID
+      ? [`${reviewID}: diff review must declare verification_node_id`]
+      : config.nodes.some((node) => node.id === verificationID)
+        ? []
+        : [`${reviewID}: verification node ${verificationID} does not exist`]),
+  ]
+  if (missing.length > 0 || !implementationID || !verificationID) return missing
+
+  const sources = Object.values(review.input_mapping ?? {})
+  const implementationArtifact = sources.some((source) => {
+    const [nodeID, output, field] = source.split(".")
+    return nodeID === implementationID
+      && output === "output"
+      && field !== undefined
+      && ["diff", "patch", "changed_files"].includes(field)
+  })
+  const verificationOutput = sources.some((source) => source.split(".")[0] === verificationID)
+  const implementationFingerprint = sources.some((source) => {
+    const [nodeID, output, field] = source.split(".")
+    return nodeID === implementationID && output === "output" && field === "fingerprint"
+  })
+
+  return [
+    ...(dependsTransitively(config, reviewID, verificationID)
+      ? []
+      : [`${reviewID}: diff review must depend transitively on verification node ${verificationID}`]),
+    ...(dependsTransitively(config, verificationID, implementationID)
+      ? []
+      : [`${reviewID}: verification node ${verificationID} must depend transitively on implementation node ${implementationID}`]),
+    ...(implementationArtifact
+      ? []
+      : [`${reviewID}: input_mapping must map an actual diff or changed-file artifact from ${implementationID}`]),
+    ...(implementationFingerprint
+      ? []
+      : [`${reviewID}: input_mapping must map implementation fingerprint from ${implementationID}`]),
+    ...(verificationOutput
+      ? []
+      : [`${reviewID}: input_mapping must map verification output from ${verificationID}`]),
+    ...(review.condition?.includes(verificationID) && review.condition.includes("PASS")
+      ? []
+      : [`${reviewID}: condition must require PASS from verification node ${verificationID}`]),
+    ...(hasReviewResultSchema(review.output_schema)
+      ? []
+      : [`${reviewID}: output_schema must require verdict and implementation_fingerprint`]),
+  ]
+}
+
+function hasReviewResultSchema(schema: Record<string, unknown> | undefined) {
+  if (!schema || schema.type !== "object") return false
+  const required = schema.required
+  if (!Array.isArray(required)) return false
+  return ["verdict", "implementation_fingerprint"].every((field) =>
+    required.includes(field),
+  )
+}
+
+function hasEvidence(value: unknown): boolean {
+  if (typeof value === "string") {
+    const text = value.trim()
+    return text.length > 0
+      && !text.includes("{{")
+      && !text.startsWith("Dependency ")
+  }
+  if (Array.isArray(value)) return value.some(hasEvidence)
+  if (typeof value !== "object" || value === null) return false
+  return Object.values(value).some(hasEvidence)
+}
+
+function hasPassVerdict(value: unknown): boolean {
+  if (value === "PASS") return true
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false
+  return "verdict" in value && value.verdict === "PASS"
+}
+
+function dependsTransitively(config: WorkflowConfig, startID: string, targetID: string) {
+  const visited = new Set<string>()
+  const visit = (nodeID: string): boolean => {
+    if (visited.has(nodeID)) return false
+    visited.add(nodeID)
+    const node = config.nodes.find((candidate) => candidate.id === nodeID)
+    if (!node) return false
+    if (node.depends_on.includes(targetID)) return true
+    return node.depends_on.some(visit)
+  }
+  return visit(startID)
+}
+
+function isReviewWorker(workerType: string) {
+  return workerType === "review" || workerType.startsWith("review-")
+}

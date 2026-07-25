@@ -132,6 +132,105 @@ describe("CommandPlugin.Plugin", () => {
     }),
   )
 
+  it.effect("defines parent-session admission fixtures for standard deep and GRILL requests", () =>
+    Effect.sync(() => {
+      const fixtures = [
+        {
+          name: "simple request remains standard",
+          expected: "Simple or already-bounded work stays `standard`",
+        },
+        {
+          name: "qualified complex request recommends deep",
+          expected: "at least two deep-complexity signals",
+        },
+        {
+          name: "explicit deep enters admission",
+          expected: "Explicit `deep` intent still requires admission",
+        },
+        {
+          name: "questions stay in the parent session",
+          expected: "MUST NOT create an admission child node",
+        },
+        {
+          name: "explicit GRILL-ME selects adversarial QA",
+          expected: "`GRILL-ME` selects `GRILL`",
+        },
+      ]
+
+      for (const fixture of fixtures) {
+        expect(
+          CommandPlugin.OrchestrationPolicyContent,
+          fixture.name,
+        ).toContain(fixture.expected)
+      }
+    }),
+  )
+
+  it.effect("defines bounded Requirement Brief verdict and recovery contracts", () =>
+    Effect.sync(() => {
+      expect(CommandPlugin.OrchestrationPolicyContent).toContain("## Deep Admission QA")
+      for (const dimension of [
+        "goal",
+        "scope",
+        "constraints and assumptions",
+        "acceptance criteria",
+        "evidence and review",
+        "risks and failure modes",
+      ]) {
+        expect(CommandPlugin.OrchestrationPolicyContent).toContain(dimension)
+      }
+      for (const field of [
+        "acceptance_criteria",
+        "evidence_required",
+        "review_plan",
+        "open_questions",
+        "blocking_questions",
+      ]) {
+        expect(CommandPlugin.OrchestrationPolicyContent).toContain(field)
+      }
+      expect(CommandPlugin.OrchestrationPolicyContent).toContain('"in": []')
+      expect(CommandPlugin.OrchestrationPolicyContent).toContain('"out": []')
+      expect(CommandPlugin.OrchestrationPolicyContent).not.toContain("in_scope")
+      expect(CommandPlugin.OrchestrationPolicyContent).not.toContain("out_of_scope")
+      expect(CommandPlugin.OrchestrationPolicyContent).toContain("`LIGHT`: at most 1 question round")
+      expect(CommandPlugin.OrchestrationPolicyContent).toContain("`STANDARD`: at most 3 question rounds")
+      expect(CommandPlugin.OrchestrationPolicyContent).toContain("`GRILL`: at most 5 question rounds")
+      expect(CommandPlugin.OrchestrationPolicyContent).toContain("Stop early as soon as the brief is ready")
+      expect(CommandPlugin.OrchestrationPolicyContent).toContain("READY | NOT_READY | WAIVED")
+      expect(CommandPlugin.OrchestrationPolicyContent).toContain("continue QA, reduce scope, use `standard`, or explicitly waive")
+      expect(CommandPlugin.OrchestrationPolicyContent).toContain("waiver_reason")
+      expect(CommandPlugin.OrchestrationPolicyContent).toContain("acknowledged_risks")
+      expect(CommandPlugin.OrchestrationPolicyContent).toContain("Material changes")
+      expect(CommandPlugin.OrchestrationPolicyContent).toContain("invalidate the prior fingerprint")
+      expect(CommandPlugin.OrchestrationPolicyContent).toContain("SHA-256 hash")
+      expect(CommandPlugin.WorkflowFactsContent).toContain(
+        "pass `mode: deep` plus a versioned `READY` or informed `WAIVED` admission",
+      )
+      expect(CommandPlugin.WorkflowFactsContent).toContain(
+        "beside `config` in the `action: start` tool call",
+      )
+      expect(CommandPlugin.WorkflowFactsContent).not.toContain("`config.mode`")
+    }),
+  )
+
+  it.effect("documents truthful design and diff review production topologies", () =>
+    Effect.sync(() => {
+      expect(CommandPlugin.OrchestrationPolicyContent).toContain("design review → implementation")
+      expect(CommandPlugin.OrchestrationPolicyContent).toContain(
+        "implementation → verification(PASS) → diff review → final gate/audit",
+      )
+      expect(CommandPlugin.OrchestrationPolicyContent).toContain(
+        "REJECT → corrected implementation → verification(PASS) → new diff review",
+      )
+      expect(CommandPlugin.OrchestrationPolicyContent).toContain(
+        "Synthetic stress-test graphs",
+      )
+      expect(CommandPlugin.OrchestrationPolicyContent).toContain(
+        "MUST NOT claim implementation-diff assurance",
+      )
+    }),
+  )
+
   it.effect("keeps workflow examples aligned with runtime data flow and safety", () =>
     Effect.sync(() => {
       const graphExamples = [...CommandPlugin.WorkflowFactsContent.matchAll(/```yaml\n([\s\S]*?)```/g)]

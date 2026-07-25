@@ -21,6 +21,7 @@ import { SessionID, MessageID } from "@/session/schema"
 import { deriveSubagentSessionPermission } from "@/agent/subagent-permissions"
 import { SessionPrompt } from "@/session/prompt"
 import { Dag } from "../dag"
+import { validateReviewResult } from "../review-lifecycle"
 import { InvalidTransitionError, TerminalViolationError } from "@opencode-ai/core/dag/core/types"
 import type { DagStore } from "@opencode-ai/core/dag/store"
 import { registerCaptureSlot, clearCaptureSlot } from "./capture"
@@ -39,6 +40,7 @@ export interface NodeSpawnInput {
   outputSchema?: Record<string, unknown>
   timeoutMs?: number
   reportToParent?: boolean
+  reviewImplementationFingerprint?: string
 }
 
 export interface NodeSpawnResult {
@@ -189,6 +191,26 @@ export function spawnNode(
             const updatedNode = yield* dag.store.getNode(input.dagID, input.nodeID).pipe(Effect.orDie)
             const captured = updatedNode?.capturedOutput
             if (captured !== undefined && captured !== null) {
+              if (input.reviewImplementationFingerprint) {
+                const reviewResult = validateReviewResult(
+                  captured,
+                  input.reviewImplementationFingerprint,
+                )
+                if (!reviewResult.valid) {
+                  yield* dag.nodeFailed(
+                    input.dagID,
+                    input.nodeID,
+                    `Review result contract failed: ${reviewResult.errors.join("; ")}`,
+                    "verdict_fail",
+                  ).pipe(
+                    Effect.catchIf(
+                      isTransitionRejection,
+                      () => Effect.logWarning("nodeFailed (review result contract) guard rejected — node already terminal"),
+                    ),
+                  )
+                  return
+                }
+              }
               yield* dag.nodeCompleted(input.dagID, input.nodeID, captured).pipe(
                 Effect.catchIf(
                   isTransitionRejection,

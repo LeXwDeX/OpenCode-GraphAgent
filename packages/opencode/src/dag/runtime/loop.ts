@@ -10,6 +10,12 @@ import { DagStore } from "@opencode-ai/core/dag/store"
 import { WorkflowRuntime, type SchedulingNode } from "@opencode-ai/core/dag/core/scheduling"
 import { isWorkflowTerminalStatus } from "@opencode-ai/core/dag/core/types"
 import { Dag, type WorkflowConfig, parseWorkflowConfig } from "../dag"
+import { projectBriefForNode } from "../admission"
+import {
+  reviewImplementationFingerprint,
+  reviewContractForNode,
+  validateReviewExecutionInput,
+} from "../review-lifecycle"
 import { Agent } from "@/agent/agent"
 import { Session } from "@/session/session"
 import { SessionPrompt } from "@/session/prompt"
@@ -125,6 +131,20 @@ export const layer = Layer.effect(
             // outputs) before interpolation and Context serialization.
             resolvedMapping = sanitizeInput(resolvedMapping)
 
+            if (nodeConfig) {
+              const reviewInput = validateReviewExecutionInput(nodeConfig, resolvedMapping)
+              if (!reviewInput.valid) {
+                yield* dag.nodeFailed(
+                  dagID,
+                  nodeID,
+                  `Review input contract failed: ${reviewInput.errors.join("; ")}`,
+                  "verdict_fail",
+                ).pipe(Effect.ignore)
+                entry.runtime.markUnsatisfied(nodeID)
+                continue
+              }
+            }
+
             const resolved = yield* (nodeConfig?.prompt_template
               ? renderTemplate(nodeConfig.prompt_template, ctx.directory, resolvedMapping).pipe(
                   Effect.tap((result) =>
@@ -163,6 +183,18 @@ export const layer = Layer.effect(
 
             promptParts.push({ type: "text", text: resolved.text })
 
+            const reviewContract = nodeConfig ? reviewContractForNode(nodeConfig) : undefined
+            if (reviewContract) {
+              promptParts.push({ type: "text", text: `\n\n${reviewContract}` })
+            }
+
+            if (entry.config?.mode === "deep" && entry.config.admission) {
+              promptParts.push({
+                type: "text",
+                text: `\n\nRequirement Brief:\n${JSON.stringify(projectBriefForNode(entry.config.admission.brief), null, 2)}`,
+              })
+            }
+
             if (Object.keys(resolvedMapping).length > 0) {
               promptParts.push({ type: "text", text: `\n\nContext:\n${JSON.stringify(resolvedMapping, null, 2)}` })
             }
@@ -187,6 +219,9 @@ export const layer = Layer.effect(
               outputSchema: nodeConfig?.output_schema as Record<string, unknown> | undefined,
               timeoutMs: nodeConfig?.worker_config?.timeout_ms,
               reportToParent: nodeConfig?.report_to_parent,
+              reviewImplementationFingerprint: nodeConfig
+                ? reviewImplementationFingerprint(nodeConfig, resolvedMapping)
+                : undefined,
             }).pipe(
               Effect.tap((result) => Effect.sync(() => entry.fibers.set(nodeID, result.fiber))),
               Effect.provideService(Dag.Service, dag),

@@ -11,8 +11,52 @@ import type { Tool } from "@/tool/tool"
 import { Truncate } from "@/tool/truncate"
 import { Parameters, WorkflowTool } from "@/tool/workflow"
 import { testEffect } from "../lib/effect"
+import { fingerprintBrief, type State } from "@/dag/admission"
 
 const projectID = "project_test"
+const admissionBrief = {
+  goal: "Qualify and execute a deep workflow",
+  scope: {
+    in: ["workflow start", "review lifecycle"],
+    out: ["new admission UI"],
+  },
+  constraints: ["standard workflows stay compatible"],
+  assumptions: ["the parent session can ask questions"],
+  acceptance_criteria: ["deep start requires READY or WAIVED"],
+  evidence_required: ["unit tests", "integration tests"],
+  risks: ["waiver misuse"],
+  review_plan: ["verify", "review the implementation diff"],
+  open_questions: [],
+  blocking_questions: [],
+}
+
+function admissionFor(
+  verdict: "READY" | "NOT_READY" | "WAIVED",
+  state: State = verdict,
+) {
+  const brief = verdict === "READY"
+    ? admissionBrief
+    : {
+        ...admissionBrief,
+        blocking_questions: ["Confirm the production rollout target"],
+      }
+  return {
+    protocol_version: 1,
+    brief_revision: 1,
+    qa_mode: "STANDARD" as const,
+    verdict,
+    state,
+    fingerprint: fingerprintBrief(brief),
+    brief,
+    ...(verdict === "WAIVED"
+      ? {
+          waiver_reason: "Preview release only",
+          acknowledged_risks: ["Production rollout is unresolved"],
+        }
+      : {}),
+  }
+}
+
 const published: Array<{ type: string; data: unknown }> = []
 const store = Layer.mock(DagStore.Service, {
   getWorkflow: (id: string) =>
@@ -32,6 +76,29 @@ const store = Layer.mock(DagStore.Service, {
             timeCreated: 1,
             timeUpdated: 2,
           }
+        : id === "dag_deep_status"
+          ? {
+              id,
+              projectId: projectID,
+              sessionId: "ses_workflow_parent",
+              title: "Deep status workflow",
+              status: "running",
+              config: JSON.stringify({
+                name: "deep-status",
+                mode: "deep",
+                admission: {
+                  ...admissionFor("WAIVED"),
+                  state: "CONSUMED",
+                },
+                nodes: [],
+              }),
+              seq: 1,
+              wakeReported: false,
+              startedAt: 1,
+              completedAt: null,
+              timeCreated: 1,
+              timeUpdated: 2,
+            }
         : id === "dag_defaults"
           ? {
               id,
@@ -201,6 +268,22 @@ describe("workflow tool schema (negative tests)", () => {
       model: { providerID: "configured", modelID: "configured/model" },
     })
   })
+
+  it("decodes deep mode and structured admission", () => {
+    const decode = Schema.decodeUnknownSync(Parameters)
+    expect(decode({
+      action: "start",
+      mode: "deep",
+      admission: admissionFor("READY"),
+      config: {
+        name: "deep-schema",
+        nodes: [],
+      },
+    })).toEqual(expect.objectContaining({
+      mode: "deep",
+      admission: expect.objectContaining({ verdict: "READY" }),
+    }))
+  })
 })
 
 describe("workflow tool execution", () => {
@@ -240,6 +323,44 @@ describe("workflow tool execution", () => {
       expect(result.output).toContain('"status": "running"')
       expect(result.output).toContain('"id": "node_running"')
       expect(result.output).toContain('"child_session_id": "ses_child"')
+      expect(result.output).toContain('"mode": "standard"')
+    }),
+  )
+
+  runtime.effect("status and recovery reads retain consumed deep admission audit fields", () =>
+    Effect.gen(function* () {
+      const info = yield* WorkflowTool
+      const workflow = yield* info.init()
+      const result = yield* workflow.execute(
+        {
+          action: "status",
+          workflow_id: "dag_deep_status",
+        },
+        {
+          sessionID: SessionID.make("ses_workflow_parent"),
+          messageID: MessageID.ascending(),
+          agent: "build",
+          abort: new AbortController().signal,
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        } satisfies Tool.Context,
+      )
+
+      const output = JSON.parse(result.output)
+      expect(output).toEqual(expect.objectContaining({
+        mode: "deep",
+        admission: {
+          verdict: "WAIVED",
+          state: "CONSUMED",
+          qa_mode: "STANDARD",
+          brief_revision: 1,
+          fingerprint: admissionFor("WAIVED").fingerprint,
+          waiver_reason: "Preview release only",
+          acknowledged_risks: ["Production rollout is unresolved"],
+        },
+      }))
+      expect(output.admission).not.toHaveProperty("qa_transcript")
     }),
   )
 
@@ -275,6 +396,135 @@ describe("workflow tool execution", () => {
       expect(published.find((event) => event.type === DagEvent.WorkflowCreated.type)?.data).toEqual(
         expect.objectContaining({ projectID, sessionID: parentID }),
       )
+      const created = published.find((event) => event.type === DagEvent.WorkflowCreated.type)?.data as {
+        config?: string
+      }
+      expect(JSON.parse(created.config ?? "{}").mode).toBe("standard")
+    }),
+  )
+
+  runtime.effect("deep start consumes and persists a READY admission", () =>
+    Effect.gen(function* () {
+      published.length = 0
+      const info = yield* WorkflowTool
+      const workflow = yield* info.init()
+      const result = yield* workflow.execute(
+        {
+          action: "start",
+          mode: "deep",
+          admission: admissionFor("READY"),
+          config: {
+            name: "deep-ready",
+            nodes: [],
+          },
+        },
+        {
+          sessionID: SessionID.make("ses_workflow_parent"),
+          messageID: MessageID.ascending(),
+          agent: "build",
+          abort: new AbortController().signal,
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        } satisfies Tool.Context,
+      )
+
+      expect(result.output).toContain('mode="deep"')
+      const created = published.find((event) => event.type === DagEvent.WorkflowCreated.type)?.data as {
+        config?: string
+      }
+      expect(JSON.parse(created.config ?? "{}")).toEqual(expect.objectContaining({
+        mode: "deep",
+        admission: expect.objectContaining({
+          verdict: "READY",
+          state: "CONSUMED",
+          fingerprint: admissionFor("READY").fingerprint,
+        }),
+      }))
+    }),
+  )
+
+  runtime.effect("deep start consumes and retains an informed WAIVED admission", () =>
+    Effect.gen(function* () {
+      published.length = 0
+      const info = yield* WorkflowTool
+      const workflow = yield* info.init()
+      yield* workflow.execute(
+        {
+          action: "start",
+          mode: "deep",
+          admission: admissionFor("WAIVED"),
+          config: {
+            name: "deep-waived",
+            nodes: [],
+          },
+        },
+        {
+          sessionID: SessionID.make("ses_workflow_parent"),
+          messageID: MessageID.ascending(),
+          agent: "build",
+          abort: new AbortController().signal,
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        } satisfies Tool.Context,
+      )
+
+      const created = published.find((event) => event.type === DagEvent.WorkflowCreated.type)?.data as {
+        config?: string
+      }
+      expect(JSON.parse(created.config ?? "{}").admission).toEqual(expect.objectContaining({
+        verdict: "WAIVED",
+        state: "CONSUMED",
+        waiver_reason: "Preview release only",
+        acknowledged_risks: ["Production rollout is unresolved"],
+      }))
+    }),
+  )
+
+  runtime.effect("deep start blocks every non-admitted state without side effects", () =>
+    Effect.gen(function* () {
+      const info = yield* WorkflowTool
+      const workflow = yield* info.init()
+      const cases = [
+        { name: "missing", admission: undefined },
+        { name: "not-ready", admission: admissionFor("NOT_READY") },
+        { name: "invalidated", admission: admissionFor("NOT_READY", "INVALIDATED") },
+        {
+          name: "bad-fingerprint",
+          admission: {
+            ...admissionFor("READY"),
+            fingerprint: "0".repeat(64),
+          },
+        },
+      ]
+
+      for (const item of cases) {
+        published.length = 0
+        const exit = yield* workflow.execute(
+          {
+            action: "start",
+            mode: "deep",
+            admission: item.admission,
+            config: {
+              name: `deep-${item.name}`,
+              nodes: [],
+            },
+          },
+          {
+            sessionID: SessionID.make("ses_workflow_parent"),
+            messageID: MessageID.ascending(),
+            agent: "build",
+            abort: new AbortController().signal,
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          } satisfies Tool.Context,
+        ).pipe(Effect.exit)
+
+        expect(Exit.isFailure(exit)).toBe(true)
+        expect(published).toHaveLength(0)
+      }
     }),
   )
 
