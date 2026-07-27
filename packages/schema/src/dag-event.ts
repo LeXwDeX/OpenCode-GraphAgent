@@ -204,6 +204,20 @@ export const NodeRegistered = Event.define({
 })
 export type NodeRegistered = typeof NodeRegistered.Type
 
+// Admission: the scheduler accepted the node into an execution attempt but it
+// has not acquired an execution permit yet — no child session exists. The
+// deadline starts here so queue wait counts toward the node's budget (P0-2).
+export const NodeQueued = Event.define({
+  type: "dag.node.queued",
+  ...options,
+  schema: {
+    ...Base,
+    nodeID: NodeID,
+    deadlineMs: Schema.optional(Schema.Number),
+  },
+})
+export type NodeQueued = typeof NodeQueued.Type
+
 export const NodeStarted = Event.define({
   type: "dag.node.started",
   ...options,
@@ -289,6 +303,7 @@ export const DurableDefinitions = Event.inventory(
   WorkflowReplanned,
   WorkflowConfigUpdated,
   NodeRegistered,
+  NodeQueued,
   NodeStarted,
   NodeCompleted,
   NodeFailed,

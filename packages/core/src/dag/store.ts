@@ -67,6 +67,8 @@ export interface WorkflowSummary {
   completedNodes: number
   runningNodes: number
   failedNodes: number
+  skippedNodes: number
+  queuedNodes: number
 }
 
 const mapWorkflow = (r: typeof WorkflowTable.$inferSelect): WorkflowRow => ({
@@ -209,19 +211,21 @@ export const layer = Layer.effect(
           .all()
           .pipe(Effect.orDie)
         const counts = countRows.reduce((all, row) => {
-          const current = all.get(row.workflowId) ?? { nodeCount: 0, completedNodes: 0, runningNodes: 0, failedNodes: 0 }
+          const current = all.get(row.workflowId) ?? { nodeCount: 0, completedNodes: 0, runningNodes: 0, failedNodes: 0, skippedNodes: 0, queuedNodes: 0 }
           current.nodeCount += row.total
           if (row.status === "completed") current.completedNodes += row.total
           if (row.status === "running") current.runningNodes += row.total
           if (row.status === "failed") current.failedNodes += row.total
+          if (row.status === "skipped") current.skippedNodes += row.total
+          if (row.status === "queued") current.queuedNodes += row.total
           all.set(row.workflowId, current)
           return all
-        }, new Map<string, { nodeCount: number; completedNodes: number; runningNodes: number; failedNodes: number }>())
+        }, new Map<string, { nodeCount: number; completedNodes: number; runningNodes: number; failedNodes: number; skippedNodes: number; queuedNodes: number }>())
         return wfRows.map((wf) => ({
           id: wf.id,
           title: wf.title,
           status: wf.status,
-          ...(counts.get(wf.id) ?? { nodeCount: 0, completedNodes: 0, runningNodes: 0, failedNodes: 0 }),
+          ...(counts.get(wf.id) ?? { nodeCount: 0, completedNodes: 0, runningNodes: 0, failedNodes: 0, skippedNodes: 0, queuedNodes: 0 }),
         }))
       }),
 

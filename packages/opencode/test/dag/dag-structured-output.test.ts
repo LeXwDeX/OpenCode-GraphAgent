@@ -27,6 +27,7 @@ function makeEventTracker() {
   }
   const dagLayer = Layer.mock(Dag.Service, {
     store: storeStub as DagStore.Interface,
+    nodeQueued: Effect.fn("s")((_dagID: string, _nodeID: string) => Effect.void),
     nodeStarted: Effect.fn("s")((_dagID: string, _nodeID: string) => Effect.void),
     nodeCompleted: Effect.fn("s")((_dagID: string, nodeID: string, output: unknown) =>
       Effect.sync(() => events.push({ type: "nodeCompleted", nodeID, output }))),

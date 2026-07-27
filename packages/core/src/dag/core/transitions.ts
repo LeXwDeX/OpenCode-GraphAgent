@@ -41,12 +41,13 @@ export function aggregateBranchStatus(statuses: NodeStatus[]): NodeStatus {
 
 /**
  * Map a node transition to its event type string, or null if the transition
- * produces no event (e.g. entering QUEUED).
+ * produces no event.
  *
  * The from-status disambiguates semantically-identical transitions:
  * - PENDING|QUEUED → RUNNING emits "node.started"
  * - PAUSED → RUNNING emits "node.resumed"
  * - FAILED → RUNNING emits "node.restarted" (the replan restart path, D11)
+ * - entering QUEUED emits "node.queued" (admission before permit, P0-2)
  */
 export function transitionToNodeEvent(from: NodeStatus, to: NodeStatus): string | null {
   switch (to) {
@@ -66,7 +67,7 @@ export function transitionToNodeEvent(from: NodeStatus, to: NodeStatus): string 
     case NodeStatus.SKIPPED:
       return "node.skipped"
     case NodeStatus.QUEUED:
-      return null
+      return "node.queued"
     default:
       return null
   }

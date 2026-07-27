@@ -111,6 +111,8 @@ describe("DagProjector: NodeStarted status guard", () => {
             completedNodes: 0,
             runningNodes: 1,
             failedNodes: 0,
+            skippedNodes: 0,
+            queuedNodes: 0,
           },
           {
             id: otherDagID,
@@ -120,6 +122,8 @@ describe("DagProjector: NodeStarted status guard", () => {
             completedNodes: 0,
             runningNodes: 0,
             failedNodes: 0,
+            skippedNodes: 0,
+            queuedNodes: 0,
           },
         ])
       }).pipe(Effect.provide(projectorLayer)) as Effect.Effect<never>,

@@ -17,6 +17,9 @@ function makeEventTracker() {
   const events: TrackedEvent[] = []
   const dagLayer = Layer.mock(Dag.Service, {
     store: {} as DagStore.Interface,
+    nodeQueued: Effect.fn("stub.nodeQueued")((dagID: string, nodeID: string) =>
+      Effect.sync(() => events.push({ type: "nodeQueued", dagID, nodeID })),
+    ),
     nodeStarted: Effect.fn("stub.nodeStarted")((dagID: string, nodeID: string) =>
       Effect.sync(() => events.push({ type: "nodeStarted", dagID, nodeID })),
     ),
@@ -249,6 +252,7 @@ describe("spawnNode terminalization during spawn window", () => {
     let cancelCalled = false
     const dagLayer = Layer.mock(Dag.Service, {
       store: {} as DagStore.Interface,
+      nodeQueued: () => Effect.void,
       nodeStarted: () => Effect.fail(new TerminalViolationError("node-1", "failed", "running")),
       nodeCompleted: Effect.fn("stub.nodeCompleted")((dagID: string, nodeID: string) =>
         Effect.sync(() => events.push({ type: "nodeCompleted", dagID, nodeID })),

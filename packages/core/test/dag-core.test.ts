@@ -166,7 +166,9 @@ describe("iron laws (transition tables)", () => {
   it("covers the complete node transition matrix", () => {
     const transitions = [
       [NodeStatus.PENDING, [NodeStatus.QUEUED, NodeStatus.RUNNING, NodeStatus.SKIPPED, NodeStatus.FAILED]],
-      [NodeStatus.QUEUED, [NodeStatus.RUNNING, NodeStatus.SKIPPED]],
+      // P0-2: QUEUED→QUEUED idempotent re-admission, →PENDING replan reset,
+      // →FAILED queue-wait timeout.
+      [NodeStatus.QUEUED, [NodeStatus.QUEUED, NodeStatus.RUNNING, NodeStatus.PENDING, NodeStatus.SKIPPED, NodeStatus.FAILED]],
       [NodeStatus.RUNNING, [NodeStatus.COMPLETED, NodeStatus.FAILED, NodeStatus.PAUSED, NodeStatus.PENDING, NodeStatus.SKIPPED]],
       [NodeStatus.PAUSED, [NodeStatus.RUNNING]],
       [NodeStatus.COMPLETED, []],
@@ -263,8 +265,8 @@ describe("transitions (event mappings + aggregation)", () => {
     expect(transitionToNodeEvent(NodeStatus.FAILED, NodeStatus.RUNNING)).toBe("node.restarted")
   })
 
-  it("transitionToNodeEvent: → QUEUED emits nothing", () => {
-    expect(transitionToNodeEvent(NodeStatus.PENDING, NodeStatus.QUEUED)).toBeNull()
+  it("transitionToNodeEvent: → QUEUED emits node.queued (P0-2 admission)", () => {
+    expect(transitionToNodeEvent(NodeStatus.PENDING, NodeStatus.QUEUED)).toBe("node.queued")
   })
 
   it("transitionToWorkflowEvent: PAUSED → RUNNING emits workflow.resumed", () => {
@@ -278,7 +280,7 @@ describe("transitions (event mappings + aggregation)", () => {
   it("maps every node target state to its durable event", () => {
     const events = [
       [NodeStatus.PENDING, null],
-      [NodeStatus.QUEUED, null],
+      [NodeStatus.QUEUED, "node.queued"],
       [NodeStatus.RUNNING, "node.started"],
       [NodeStatus.PAUSED, "node.paused"],
       [NodeStatus.COMPLETED, "node.completed"],

@@ -74,6 +74,7 @@ function seed() {
       node("wf-mixed", "f1", "failed", 4),
       node("wf-mixed", "p1", "pending", 5),
       node("wf-mixed", "s1", "skipped", 6),
+      node("wf-mixed", "q1", "queued", 7),
     ]).run().pipe(Effect.orDie)
   })
 }
@@ -93,10 +94,12 @@ describe("DagStore.getWorkflowSummaries (SQL aggregation)", () => {
           id: "wf-mixed",
           title: "Mixed",
           status: "running",
-          nodeCount: 6,
+          nodeCount: 7,
           completedNodes: 2,
           runningNodes: 1,
           failedNodes: 1,
+          skippedNodes: 1,
+          queuedNodes: 1,
         })
         expect(summaries[1]).toEqual({
           id: "wf-empty",
@@ -106,6 +109,8 @@ describe("DagStore.getWorkflowSummaries (SQL aggregation)", () => {
           completedNodes: 0,
           runningNodes: 0,
           failedNodes: 0,
+          skippedNodes: 0,
+          queuedNodes: 0,
         })
       }).pipe(Effect.provide(storeLayer()), Effect.scoped),
     )

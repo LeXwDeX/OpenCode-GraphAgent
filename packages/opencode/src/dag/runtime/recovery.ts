@@ -36,13 +36,15 @@ export function reconcileWorkflow(
     let ownershipLost = 0
 
     for (const node of nodes) {
-      // Pending nodes have not been admitted to an execution attempt yet. This
-      // includes ordinary dependency-blocked work and restart-orphans; both are
-      // left for spawnReady to schedule after runtime reconstruction.
-      // A restart-orphan (pending + stale childSessionId) must have its old
-      // child session cancelled here, since spawnReady may never revisit it if
-      // the workflow is about to become terminal.
-      if (node.status === "pending") {
+      // Pending/queued nodes have no live execution attempt — a queued node
+      // never created its child session (P0-2: sessions materialize inside
+      // the permit), so both re-enter scheduling after runtime reconstruction
+      // without any ownership judgement. This includes ordinary
+      // dependency-blocked work and restart-orphans; a restart-orphan
+      // (pending/queued + stale childSessionId from the attempt it replaced)
+      // must have its old child session cancelled here, since spawnReady may
+      // never revisit it if the workflow is about to become terminal.
+      if (node.status === "pending" || node.status === "queued") {
         if (node.childSessionId && cancelSession) {
           yield* cancelSession(node.childSessionId).pipe(Effect.catch(() => Effect.void))
         }

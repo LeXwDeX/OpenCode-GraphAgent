@@ -13,6 +13,11 @@ export const WorkflowSummary = Schema.Struct({
   completedNodes: Schema.Number,
   runningNodes: Schema.Number,
   failedNodes: Schema.Number,
+  // P2-9: skipped is a legitimate terminal state (condition gates) — progress
+  // displays count completed+skipped as settled so a gated workflow doesn't
+  // finish with a "3/9" denominator lie. queued surfaces true concurrency.
+  skippedNodes: Schema.Number,
+  queuedNodes: Schema.Number,
 }).annotate({ identifier: "DagWorkflowSummary" })
 export type WorkflowSummary = typeof WorkflowSummary.Type
 
