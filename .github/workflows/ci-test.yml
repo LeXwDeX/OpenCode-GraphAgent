@@ -114,6 +114,11 @@ jobs:
         working-directory: packages/client
         run: bun run check:generated
 
+      - name: Check generated SDK
+        if: runner.os == 'Linux'
+        working-directory: packages/sdk/js
+        run: bun run check:generated
+
       - name: Run HttpAPI Exerciser Gates
         if: runner.os == 'Linux'
         working-directory: packages/opencode
