@@ -3910,6 +3910,15 @@ export type DagNode = {
   completed_at?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
 }
 
+export type DagControlResult = {
+  status: string
+  cancel?: Array<string>
+  restart?: Array<string>
+  replace?: Array<string>
+  add?: Array<string>
+  ignore?: Array<string>
+}
+
 export type LocationInfo = {
   directory: string
   workspaceID?: string
@@ -11527,6 +11536,46 @@ export type DagListResponses = {
 
 export type DagListResponse = DagListResponses[keyof DagListResponses]
 
+export type DagStartData = {
+  body?: {
+    session_id: string
+    title?: string
+    config: unknown
+  }
+  path?: never
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/dag"
+}
+
+export type DagStartErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type DagStartError = DagStartErrors[keyof DagStartErrors]
+
+export type DagStartResponses = {
+  /**
+   * Created workflow
+   */
+  200: DagWorkflow
+}
+
+export type DagStartResponse = DagStartResponses[keyof DagStartResponses]
+
 export type DagBySessionData = {
   body?: never
   path: {
@@ -11700,7 +11749,7 @@ export type DagNodeDetailResponse = DagNodeDetailResponses[keyof DagNodeDetailRe
 
 export type DagControlData = {
   body?: {
-    operation: "pause" | "resume" | "cancel" | "replan" | "step" | "complete"
+    operation: "pause" | "resume" | "cancel" | "replan" | "extend" | "step" | "complete"
     fragment?: unknown
   }
   path: {
@@ -11732,11 +11781,9 @@ export type DagControlError = DagControlErrors[keyof DagControlErrors]
 
 export type DagControlResponses = {
   /**
-   * Control result
+   * Control result (replan/extend include the plan disposition)
    */
-  200: {
-    status: string
-  }
+  200: DagControlResult
 }
 
 export type DagControlResponse = DagControlResponses[keyof DagControlResponses]
