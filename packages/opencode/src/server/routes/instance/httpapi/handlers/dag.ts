@@ -3,6 +3,8 @@ import { HttpApiBuilder } from "effect/unstable/httpapi"
 import { InstanceHttpApi } from "../api"
 import { InvalidRequestError, ConflictError, notFound } from "../errors"
 import { Dag } from "@/dag/dag"
+import { Session } from "@/session/session"
+import { SessionID } from "@/session/schema"
 import { InvalidTransitionError, TerminalViolationError } from "@opencode-ai/core/dag/core/types"
 import type { DagStore } from "@opencode-ai/core/dag/store"
 
@@ -26,6 +28,7 @@ function mapTransitionConflict<Success>(effect: Effect.Effect<Success, Error>) {
 export const dagHandlers = HttpApiBuilder.group(InstanceHttpApi, "dag", (handlers) =>
   Effect.gen(function* () {
     const dag = yield* Dag.Service
+    const sessions = yield* Session.Service
 
     const wf = (r: DagStore.WorkflowRow) => ({
       id: r.id,
@@ -100,6 +103,31 @@ export const dagHandlers = HttpApiBuilder.group(InstanceHttpApi, "dag", (handler
       return node(row)
     })
 
+    const start = Effect.fn("DagHttpApi.start")(function* (ctx: { payload: { session_id: string; title?: string; config: unknown } }) {
+      const config = ctx.payload.config
+      if (!config || typeof config !== "object" || !Array.isArray((config as Record<string, unknown>).nodes)) {
+        return yield* Effect.fail(new InvalidRequestError({ message: "start requires 'config' with a 'nodes' array" }))
+      }
+      const session = yield* sessions.get(SessionID.make(ctx.payload.session_id)).pipe(
+        Effect.catch(() => Effect.fail(notFound(`Session not found: ${ctx.payload.session_id}`))),
+      )
+      const cfg = config as Dag.WorkflowConfig
+      // Same code path as the workflow tool's start action — create validates
+      // the config (duplicate ids / dangling deps / condition refs / ceiling)
+      // and fail-fast errors surface as 400, not 500 defects.
+      const dagID = yield* dag.create({
+        projectID: session.projectID,
+        sessionID: session.id,
+        title: ctx.payload.title ?? cfg.name,
+        config: cfg,
+      }).pipe(
+        Effect.catch((error) => Effect.fail(new InvalidRequestError({ message: error.message }))),
+      )
+      const row = yield* dag.store.getWorkflow(dagID).pipe(Effect.orDie)
+      if (!row) return yield* Effect.die(new Error(`created workflow missing from store: ${dagID}`))
+      return wf(row)
+    })
+
     const control = Effect.fn("DagHttpApi.control")(function* (ctx: { params: { dagID: string }; payload: { operation: string; fragment?: unknown } }) {
       const { dagID } = ctx.params
       const op = ctx.payload.operation
@@ -137,13 +165,22 @@ export const dagHandlers = HttpApiBuilder.group(InstanceHttpApi, "dag", (handler
           return yield* Effect.fail(new InvalidRequestError({ message: "replan requires 'fragment' with a 'nodes' array" }))
         }
         const result = yield* mapTransitionConflict(dag.replan(dagID, fragment as { nodes: Dag.NodeConfig[] }))
-        return { status: "ok", ...result } as never
+        return { status: "ok", ...result }
+      }
+      if (op === "extend") {
+        const fragment = ctx.payload.fragment
+        if (!fragment || typeof fragment !== "object" || !Array.isArray((fragment as Record<string, unknown>).nodes)) {
+          return yield* Effect.fail(new InvalidRequestError({ message: "extend requires 'fragment' with a 'nodes' array" }))
+        }
+        const result = yield* mapTransitionConflict(dag.extend(dagID, (fragment as { nodes: Dag.NodeConfig[] }).nodes))
+        return { status: "ok", ...result }
       }
       return yield* Effect.fail(new InvalidRequestError({ message: `Unknown operation: ${op}` }))
     })
 
     return handlers
       .handle("list", list)
+      .handle("start", start)
       .handle("bySession", bySession)
       .handle("summary", summary)
       .handle("detail", detail)

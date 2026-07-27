@@ -1849,6 +1849,31 @@ const scenarios: Scenario[] = [
     ),
 
   http.protected
+    .post("/dag", "dag.start")
+    .mutating()
+    .seeded((ctx) => ctx.session({ title: "DAG start owner" }))
+    .at((ctx) => ({
+      path: "/dag",
+      headers: ctx.headers(),
+      body: {
+        session_id: ctx.state.id,
+        title: "HTTP started workflow",
+        config: {
+          name: "http-start",
+          nodes: [{ id: "n1", name: "N1", worker_type: "general", depends_on: [], required: true, prompt_template: { inline: "noop" } }],
+        },
+      },
+    }))
+    .jsonEffect(200, (body) =>
+      Effect.sync(() => {
+        object(body)
+        check(typeof body.id === "string", "start should return the created workflow id")
+        check(body.title === "HTTP started workflow", "start should honor the provided title")
+        check(typeof body.status === "string", "start should return the workflow status")
+      }),
+    ),
+
+  http.protected
     .post("/dag/{dagID}/control", "dag.control")
     .mutating()
     .seeded((ctx) =>
@@ -1863,6 +1888,34 @@ const scenarios: Scenario[] = [
       Effect.sync(() => {
         object(body)
         check(body.status === "ok", "control pause should return ok")
+      }),
+    ),
+
+  http.protected
+    .post("/dag/{dagID}/control", "dag.control")
+    .mutating()
+    .seeded((ctx) =>
+      ctx.session({ title: "DAG extend owner" }).pipe(
+        Effect.flatMap((s) =>
+          ctx.dag({ sessionID: s.id, nodes: [{ id: "n1", name: "N1", worker_type: "general", depends_on: [], required: true }] }),
+        ),
+      ),
+    )
+    .at((ctx) => ({
+      path: route("/dag/{dagID}/control", { dagID: ctx.state.dagID }),
+      headers: ctx.headers(),
+      body: {
+        operation: "extend",
+        fragment: {
+          nodes: [{ id: "n2", name: "N2", worker_type: "general", depends_on: ["n1"], required: false, prompt_template: { inline: "noop" } }],
+        },
+      },
+    }))
+    .jsonEffect(200, (body) =>
+      Effect.sync(() => {
+        object(body)
+        check(body.status === "ok", "control extend should return ok")
+        check(Array.isArray(body.add) && body.add.includes("n2"), "extend should report the added node")
       }),
     ),
 

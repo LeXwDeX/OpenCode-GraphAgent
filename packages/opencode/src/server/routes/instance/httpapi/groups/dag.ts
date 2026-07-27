@@ -61,12 +61,33 @@ export const WorkflowSummaryResponse = Schema.Struct({
 export const DagSummaryListResponse = Schema.Array(WorkflowSummaryResponse)
 
 export const DagControlPayload = Schema.Struct({
-  operation: Schema.Literals(["pause", "resume", "cancel", "replan", "step", "complete"]),
+  operation: Schema.Literals(["pause", "resume", "cancel", "replan", "extend", "step", "complete"]),
   fragment: Schema.optional(Schema.Unknown),
+})
+
+// replan/extend return the plan disposition; other ops return status only.
+// The optional arrays must be declared here or the response encoder strips them.
+export const DagControlResponse = Schema.Struct({
+  status: Schema.String,
+  cancel: Schema.optional(Schema.Array(Schema.String)),
+  restart: Schema.optional(Schema.Array(Schema.String)),
+  replace: Schema.optional(Schema.Array(Schema.String)),
+  add: Schema.optional(Schema.Array(Schema.String)),
+  ignore: Schema.optional(Schema.Array(Schema.String)),
+}).annotate({ identifier: "Dag.ControlResult" })
+
+// Config is validated by Dag.create at runtime (duplicate ids, dangling deps,
+// condition references, node ceiling) — same fail-fast path as the tool
+// surface; a schema-level WorkflowConfig would duplicate that contract.
+export const DagStartPayload = Schema.Struct({
+  session_id: Schema.String,
+  title: Schema.optional(Schema.String),
+  config: Schema.Unknown,
 })
 
 export const DagPaths = {
   list: `${root}`,
+  start: `${root}`,
   bySession: `${root}/session/:sessionID`,
   summary: `${root}/session/:sessionID/summary`,
   detail: `${root}/:dagID`,
@@ -141,14 +162,24 @@ export const DagApi = HttpApi.make("dag").add(
       ),
     )
     .add(
+      HttpApiEndpoint.post("start", DagPaths.start, {
+        query: WorkspaceRoutingQuery,
+        payload: DagStartPayload,
+        success: described(WorkflowResponse, "Created workflow"),
+        error: [ApiNotFoundError, ConflictError],
+      }).annotateMerge(
+        OpenApi.annotations({ identifier: "dag.start", summary: "Create and start a DAG workflow" }),
+      ),
+    )
+    .add(
       HttpApiEndpoint.post("control", DagPaths.control, {
         params: { dagID: Schema.String },
         query: WorkspaceRoutingQuery,
         payload: DagControlPayload,
-        success: described(Schema.Struct({ status: Schema.String }), "Control result"),
+        success: described(DagControlResponse, "Control result (replan/extend include the plan disposition)"),
         error: [ApiNotFoundError, ConflictError],
       }).annotateMerge(
-        OpenApi.annotations({ identifier: "dag.control", summary: "Control a workflow (pause/resume/cancel/replan/step/complete)" }),
+        OpenApi.annotations({ identifier: "dag.control", summary: "Control a workflow (pause/resume/cancel/replan/extend/step/complete)" }),
       ),
     )
     .annotateMerge(OpenApi.annotations({ title: "dag", description: "DAG workflow inspector + control routes" }))
