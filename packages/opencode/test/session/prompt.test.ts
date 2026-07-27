@@ -1791,6 +1791,46 @@ it.instance("interrupting idle-only admission releases the reserved runner", () 
   }),
 )
 
+it.instance("idle-only prompt resolves only after the full provider turn completes", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+    let releaseTurn: (value: unknown) => void = () => {}
+    yield* llm.hold("wake handled", new Promise((resolve) => {
+      releaseTurn = resolve
+    }))
+
+    const wake = yield* prompt
+      .promptIfIdle({
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        parts: [{ type: "text", text: "synthetic DAG wake", synthetic: true }],
+      })
+      .pipe(Effect.forkChild({ startImmediately: true }))
+    yield* awaitWithTimeout(llm.wait(1), "idle-only prompt did not reach the provider")
+
+    // The DAG orchestrator-unresponsive net (DagLoop.tryDeliverWake) re-reads
+    // the wake batch as soon as promptIfIdle resolves and fails the workflow
+    // if it still looks stalled. That judgement is only sound while
+    // promptIfIdle waits for the FULL provider turn (runLoop) — resolving
+    // after admission alone would create a mis-kill window. Pin the contract.
+    const early = yield* Fiber.join(wake).pipe(
+      Effect.timeoutOrElse({ duration: "250 millis", orElse: () => Effect.succeed("still-running" as const) }),
+    )
+    expect(early).toBe("still-running")
+
+    releaseTurn(undefined)
+    const result = yield* awaitWithTimeout(
+      Fiber.join(wake),
+      "idle-only prompt did not resolve after turn completion",
+    )
+    expect(result._tag).toBe("Some")
+  }),
+)
+
 it.instance("prompt submitted during an active run is included in the next LLM input", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig(providerCfg)

@@ -3,8 +3,7 @@ import { Effect, Layer } from "effect"
 import { reconcileWorkflow } from "@/dag/runtime/recovery"
 import { Dag } from "@/dag/dag"
 import type { DagStore } from "@opencode-ai/core/dag/store"
-import { WorkflowRuntime } from "@opencode-ai/core/dag/core/scheduling"
-import { SUCCESS_TERMINAL, toSchedulingNodes } from "@/dag/runtime/loop"
+import { WorkflowRuntime, toSchedulingNodes } from "@opencode-ai/core/dag/core/scheduling"
 import { makeNodeRow } from "./fixtures"
 
 type TrackedEvent = {
@@ -296,7 +295,9 @@ describe("rehydration via toSchedulingNodes", () => {
       ["completed", "satisfied"],
       ["failed", "unsatisfied"],
       ["aborted", "satisfied"],
-      ["skipped", "satisfied"],
+      // D13: skipped stays distinguishable from satisfied so pure-skip
+      // descendants cascade-skip after rehydration instead of running.
+      ["skipped", "skipped"],
     ])
   })
 

@@ -80,6 +80,13 @@ export const WorkflowNodeTable = sqliteTable(
   ],
 )
 
+/**
+ * Reserved audit table. The physical table exists via the 20260702 migration
+ * but NOTHING writes or reads it yet — the read surface was removed from
+ * DagStore as dead code. Keep the definition so the drizzle schema matches
+ * the database; wire producers (sanitizer hits, ceiling rejections,
+ * orchestrator_unresponsive verdicts) before adding any query surface back.
+ */
 export const WorkflowViolationTable = sqliteTable(
   "workflow_violation",
   {

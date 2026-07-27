@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test"
-import { DateTime, Effect, Layer } from "effect"
+import { DateTime, Effect, Layer, Option } from "effect"
 import { Database } from "@opencode-ai/core/database/database"
 import { DagProjector } from "@opencode-ai/core/dag/projector"
 import { DagStore } from "@opencode-ai/core/dag/store"
@@ -16,6 +16,7 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 import { SessionPrompt } from "@/session/prompt"
 import { Session } from "@/session/session"
 import { SessionStatus } from "@/session/status"
+import { pollWithTimeout } from "../lib/effect"
 
 type ChildStatus = "active" | "completed" | "failed" | "unknown"
 
@@ -76,6 +77,7 @@ function recoveryLayer(input: {
     ),
     // Keep wake delivery pending so tests can inspect durable unreported rows.
     prompt: () => Effect.never,
+    promptIfIdle: () => Effect.succeed(Option.none()),
   })
   const loop = DagLoop.layer.pipe(
     Layer.provide(base),
@@ -274,7 +276,7 @@ describe("DagLoop crash recovery integration", () => {
     )
   })
 
-  it("cascades a required recovery failure through the standard workflow terminal path", async () => {
+  it("pauses on invented recovery failures and terminalizes only after explicit resume", async () => {
     await Effect.runPromise(
       runRecovery("active", ({ dag, database, loop, store }) =>
         Effect.gen(function* () {
@@ -285,9 +287,80 @@ describe("DagLoop crash recovery integration", () => {
 
           yield* loop.init()
 
+          // P2-2 recovery-pause: the ownership-lost failure is invented, so the
+          // workflow pauses instead of cascading skips — downstream stays
+          // pending (replannable), disposition belongs to the parent.
           expect((yield* store.getNode(dagID, "n1"))?.status).toBe("failed")
+          expect((yield* store.getNode(dagID, "n2"))?.status).toBe("pending")
+          expect((yield* store.getWorkflow(dagID))?.status).toBe("paused")
+
+          // Explicit resume accepts the failure semantics: the required-node
+          // failure terminalizes the workflow as FAILED (P2-1 attribution).
+          yield* dag.resume(dagID)
+          yield* pollWithTimeout(
+            Effect.gen(function* () {
+              const wf = yield* store.getWorkflow(dagID)
+              return wf?.status === "failed" ? wf : undefined
+            }),
+            "resumed workflow did not terminalize",
+          )
           expect((yield* store.getNode(dagID, "n2"))?.status).toBe("skipped")
-          expect((yield* store.getWorkflow(dagID))?.status).toBe("cancelled")
+        }),
+      ),
+    )
+  })
+
+  it("keeps downstream replannable after recovery-pause", async () => {
+    await Effect.runPromise(
+      runRecovery("active", ({ dag, database, loop, store }) =>
+        Effect.gen(function* () {
+          const dagID = yield* createRunningNode(dag, database, [
+            node(),
+            node({ id: "n2", name: "Node 2", depends_on: ["n1"] }),
+          ])
+
+          yield* loop.init()
+          expect((yield* store.getWorkflow(dagID))?.status).toBe("paused")
+
+          // The failed node is terminal-immutable, but its pending dependents
+          // are not — replan can rewire them onto a replacement node. Under the
+          // pre-P2-2 behavior n2 was already skipped (terminal) and the
+          // workflow already failed, so this exact replan was impossible.
+          yield* dag.replan(dagID, {
+            nodes: [
+              node({ id: "n1b", name: "Node 1 retry" }),
+              node({ id: "n2", name: "Node 2", depends_on: ["n1b"] }),
+            ],
+          })
+
+          expect((yield* store.getNode(dagID, "n1b"))?.status).toBe("pending")
+          expect((yield* store.getNode(dagID, "n2"))?.dependsOn).toEqual(["n1b"])
+          expect((yield* store.getWorkflow(dagID))?.status).toBe("paused")
+        }),
+      ),
+    )
+  })
+
+  it("terminalizes a fully-settled workflow on resume after recovery-pause", async () => {
+    await Effect.runPromise(
+      runRecovery("active", ({ dag, database, loop, store }) =>
+        Effect.gen(function* () {
+          const dagID = yield* createRunningNode(dag, database, [node()])
+
+          yield* loop.init()
+          expect((yield* store.getWorkflow(dagID))?.status).toBe("paused")
+
+          // Every node is already settled at resume time — the WorkflowResumed
+          // handler itself must re-run completion or the workflow would hang
+          // in running forever.
+          yield* dag.resume(dagID)
+          yield* pollWithTimeout(
+            Effect.gen(function* () {
+              const wf = yield* store.getWorkflow(dagID)
+              return wf?.status === "failed" ? wf : undefined
+            }),
+            "resumed settled workflow did not terminalize",
+          )
         }),
       ),
     )

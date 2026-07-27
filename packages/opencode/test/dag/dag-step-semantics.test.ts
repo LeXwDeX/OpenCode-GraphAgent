@@ -62,10 +62,12 @@ describe("state machine: stepping status", () => {
     expect(getValidNextWorkflowStatuses(WorkflowStatus.RUNNING)).toContain(WorkflowStatus.STEPPING)
   })
 
-  it("stepping → running/paused/cancelled/failed/completed are valid", () => {
+  it("stepping → running/paused/stepping/cancelled/failed/completed are valid", () => {
     const valid = getValidNextWorkflowStatuses(WorkflowStatus.STEPPING)
     expect(valid).toContain(WorkflowStatus.RUNNING)
     expect(valid).toContain(WorkflowStatus.PAUSED)
+    // Consecutive single-step: each step command re-enters stepping.
+    expect(valid).toContain(WorkflowStatus.STEPPING)
     expect(valid).toContain(WorkflowStatus.CANCELLED)
     expect(valid).toContain(WorkflowStatus.FAILED)
     expect(valid).toContain(WorkflowStatus.COMPLETED)
@@ -175,6 +177,33 @@ describe("Dag.Service.step", () => {
         )
         expect(error).toBeInstanceOf(Error)
         expect((error as Error).message).toContain("in-flight")
+      }).pipe(Effect.scoped, Effect.provide(dagLayer)) as Effect.Effect<never>,
+    )
+  })
+
+  it("consecutive steps advance one node at a time (stepping → stepping)", async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        yield* setupFKs()
+        yield* createRunningWorkflow(["b", "a"])
+        const dag = yield* Dag.Service
+        const events = yield* EventV2.Service
+
+        const first = yield* dag.step(dagID).pipe(Effect.orDie)
+        expect(first).toEqual({ status: "stepping", nodeID: "a" })
+
+        // Settle the stepped node so no node is in-flight for the next step.
+        yield* events.publish(DagEvent.NodeStarted, { dagID, nodeID: "a" as never, childSessionID: "ses_child_a" as never, timestamp: ts(3) })
+        yield* events.publish(DagEvent.NodeCompleted, { dagID, nodeID: "a" as never, output: "done", durationMs: 0 as never, timestamp: ts(4) })
+
+        // The workflow is still "stepping" — a second step must re-enter
+        // stepping and select the next node instead of dying on an
+        // InvalidTransitionError(stepping → stepping).
+        const second = yield* dag.step(dagID).pipe(Effect.orDie)
+        expect(second).toEqual({ status: "stepping", nodeID: "b" })
+
+        const store = yield* DagStore.Service
+        expect((yield* store.getWorkflow(dagID))?.status).toBe("stepping")
       }).pipe(Effect.scoped, Effect.provide(dagLayer)) as Effect.Effect<never>,
     )
   })

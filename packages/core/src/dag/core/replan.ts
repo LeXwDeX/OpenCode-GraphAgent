@@ -91,9 +91,17 @@ export function planReplan(
   const fragmentNodeById = new Map(fragment.nodes.map((n) => [n.id, n]))
   const fragmentIds = new Set(fragment.nodes.map((n) => n.id))
 
-  // 1. Validate fragment-internal consistency: restart/cancel mutual exclusion,
-  //    and restart/cancel on ids that don't exist in the current graph (those
-  //    are nonsensical — a new id can't be restarted/cancelled, only added).
+  // 1. Validate fragment-internal consistency: duplicate ids, restart/cancel
+  //    mutual exclusion, and restart/cancel on ids that don't exist in the
+  //    current graph (those are nonsensical — a new id can't be restarted or
+  //    cancelled, only added).
+  const fragmentSeen = new Set<string>()
+  for (const fragNode of fragment.nodes) {
+    if (fragmentSeen.has(fragNode.id)) {
+      errors.push(`Fragment contains duplicate node id "${fragNode.id}"`)
+    }
+    fragmentSeen.add(fragNode.id)
+  }
   for (const fragNode of fragment.nodes) {
     if (fragNode.restart && fragNode.cancel) {
       errors.push(`Node "${fragNode.id}" declares both restart and cancel — pick one`)
@@ -106,7 +114,11 @@ export function planReplan(
       errors.push(`Node "${fragNode.id}" declares cancel but is not in the current graph (new nodes are added, not cancelled)`)
     }
     if (existing && fragNode.restart && existing.status !== NodeStatus.RUNNING) {
-      errors.push(`Node "${fragNode.id}" declares restart but is ${existing.status} (restart is only valid on running nodes)`)
+      errors.push(
+        isNodeTerminalStatus(existing.status)
+          ? `Node "${fragNode.id}" declares restart but is terminal (${existing.status}) — terminal nodes are immutable; add a replacement node under a new id instead`
+          : `Node "${fragNode.id}" declares restart but is ${existing.status} (restart is only valid on running nodes; include a ${existing.status} node without restart to replace its definition)`,
+      )
     }
     if (existing && fragNode.cancel && isNodeTerminalStatus(existing.status)) {
       errors.push(`Node "${fragNode.id}" declares cancel but is already terminal (${existing.status})`)

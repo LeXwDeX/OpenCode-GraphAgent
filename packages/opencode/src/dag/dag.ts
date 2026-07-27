@@ -9,7 +9,7 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 import { Database } from "@opencode-ai/core/database/database"
 import { KeyedMutex } from "@opencode-ai/core/effect/keyed-mutex"
 import { validateRequiredNodes } from "@opencode-ai/core/dag/core/required-validator"
-import { buildGraph, WorkflowRuntime } from "@opencode-ai/core/dag/core/scheduling"
+import { buildGraph, WorkflowRuntime, toSchedulingNodes } from "@opencode-ai/core/dag/core/scheduling"
 import { CycleError } from "@opencode-ai/core/dag/core/graph"
 import { planReplan } from "@opencode-ai/core/dag/core/replan"
 import {
@@ -29,6 +29,7 @@ import {
   validateAdmission,
 } from "./admission"
 import { validateReviewLifecycle } from "./review-lifecycle"
+import { conditionReference } from "./runtime/eval"
 
 // Re-export domain types
 export const ID = DagEvent.DagID
@@ -176,6 +177,21 @@ export function parseWorkflowConfig(raw: string): WorkflowConfig | undefined {
   return parsed.value as WorkflowConfig
 }
 
+/**
+ * A parseable condition may only reference the node's direct dependencies —
+ * anything else silently resolves to undefined and evaluates false at spawn
+ * time. Shared by create (all nodes) and replan (fragment nodes).
+ */
+function conditionReferenceErrors(nodes: readonly NodeConfig[]): string[] {
+  return nodes.flatMap((node) => {
+    const ref = conditionReference(node.condition)
+    if (!ref || node.depends_on.includes(ref)) return []
+    return [
+      `node "${node.id}" condition references "${ref}" which is not in its depends_on (condition inputs come from direct dependencies only; this would silently evaluate false)`,
+    ]
+  })
+}
+
 export interface Interface {
   readonly create: (input: {
     projectID: string
@@ -254,6 +270,33 @@ export const layer = Layer.effect(
       config: WorkflowConfig
     }) {
       const config = normalizeWorkflowConfig(input.config)
+      // Structural validation first (mirrors planReplan's fragment checks so
+      // create and replan reject the same malformed shapes): duplicate ids
+      // would silently merge via the projector's upsert, and a dangling
+      // depends_on reference would silently drop the edge in buildGraph —
+      // turning a typo'd dependency into an immediately-runnable root node.
+      const ids = config.nodes.map((n) => n.id)
+      const idSet = new Set(ids)
+      if (idSet.size !== ids.length) {
+        const duplicates = [...new Set(ids.filter((id, index) => ids.indexOf(id) !== index))]
+        return yield* Effect.fail(new Error(`Invalid workflow config: duplicate node ids: ${duplicates.join(", ")}`))
+      }
+      const danglingDeps = config.nodes.flatMap((n) =>
+        n.depends_on.filter((dep) => !idSet.has(dep)).map((dep) => `node "${n.id}" depends on unknown node "${dep}"`),
+      )
+      if (danglingDeps.length > 0) {
+        return yield* Effect.fail(new Error(`Invalid workflow config: ${danglingDeps.join("; ")}`))
+      }
+      const conditionErrors = conditionReferenceErrors(config.nodes)
+      if (conditionErrors.length > 0) {
+        return yield* Effect.fail(new Error(`Invalid workflow config: ${conditionErrors.join("; ")}`))
+      }
+      // Enforce the total node ceiling at creation, not only on replan — the
+      // ceiling is a lifetime cap and the initial graph counts toward it.
+      const maxTotalNodes = config.max_total_nodes ?? DEFAULT_WORKFLOW_CONFIG.maxTotalNodes
+      if (config.nodes.length > maxTotalNodes) {
+        return yield* Effect.fail(new Error(`Total node ceiling exceeded: ${config.nodes.length} nodes > ${maxTotalNodes} max`))
+      }
       if (config.mode === "deep") {
         if (!config.admission) {
           return yield* Effect.fail(new Error(
@@ -361,19 +404,7 @@ export const layer = Layer.effect(
       const hasInFlight = nodes.some((n) => n.status === "running")
       if (hasInFlight) return yield* Effect.fail(new Error(`Node still in-flight: cannot step ${dagID}`))
       // Compute ready nodes using a transient WorkflowRuntime.
-      const SUCCESS_TERMINAL = new Set(["completed", "skipped", "aborted"])
-      const schedulingNodes = nodes.map((n) => ({
-        id: n.id,
-        dependsOn: n.dependsOn,
-        required: n.required,
-        status: SUCCESS_TERMINAL.has(n.status)
-          ? ("satisfied" as const)
-          : n.status === "failed"
-            ? ("unsatisfied" as const)
-            : n.status === "running"
-              ? ("running" as const)
-              : ("pending" as const),
-      }))
+      const schedulingNodes = toSchedulingNodes(nodes)
       const config = parseWorkflowConfig((yield* store.getWorkflow(dagID))?.config ?? "")
       const maxConcurrency = Math.max(1, config?.max_concurrency ?? DEFAULT_WORKFLOW_CONFIG.maxConcurrency)
       const runtime = new WorkflowRuntime(schedulingNodes, maxConcurrency)
@@ -452,6 +483,22 @@ export const layer = Layer.effect(
         { nodes: normalizedFragment.nodes.map((n) => ({ id: n.id, depends_on: n.depends_on, restart: n.restart, cancel: n.cancel })) },
       )
       if (plan.errors.length > 0) return yield* Effect.fail(new Error(`Replan rejected: ${plan.errors.join("; ")}`))
+
+      // Fragment nodes that will actually (re)run must satisfy the same
+      // condition-reference rule as create. Terminal nodes in the fragment are
+      // ignored by the plan and keep their immutable definitions; cancelled
+      // nodes never evaluate a condition again.
+      const nodeStatusById = new Map(nodes.map((n) => [n.id, n.status]))
+      const conditionErrors = conditionReferenceErrors(
+        normalizedFragment.nodes.filter((n) => {
+          if (n.cancel) return false
+          const status = nodeStatusById.get(n.id)
+          return status === undefined || !isNodeTerminalStatus(status as NodeStatus)
+        }),
+      )
+      if (conditionErrors.length > 0) {
+        return yield* Effect.fail(new Error(`Replan rejected: ${conditionErrors.join("; ")}`))
+      }
 
       const maxReplanAttempts = wfConfig?.max_node_replan_attempts ?? DEFAULT_WORKFLOW_CONFIG.maxNodeReplanAttempts
       const maxTotalNodes = wfConfig?.max_total_nodes ?? DEFAULT_WORKFLOW_CONFIG.maxTotalNodes

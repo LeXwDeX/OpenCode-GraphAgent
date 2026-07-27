@@ -9,6 +9,12 @@
  * This is NOT a startup-blocking scan (unlike the old recoverOrphanedWorkflows).
  * It runs lazily when a workflow is first accessed, and only touches workflows
  * that have running nodes.
+ *
+ * `ownershipLost` counts nodes whose failure was INVENTED by reconciliation
+ * (no durable proof of the child's outcome: session missing, still active, or
+ * unknown), as opposed to failures read from durable child state. The caller
+ * uses it to pause the workflow instead of letting the scheduler cascade skips
+ * and terminalize on fabricated evidence (P2-2 recovery-pause).
  */
 
 import { Effect, Clock } from "effect"
@@ -44,6 +50,9 @@ export function reconcileWorkflow(
       }
       if (node.status !== "running") continue
       if (!node.childSessionId) {
+        // Crash landed between admission and session creation — no durable
+        // outcome exists, so this is an invented failure like ownership loss.
+        ownershipLost++
         yield* dag.nodeFailed(dagID, node.id, "node was running but had no child session on recovery", "exec_failed")
         reconciled++
         continue

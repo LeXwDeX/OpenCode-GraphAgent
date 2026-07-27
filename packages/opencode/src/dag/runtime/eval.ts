@@ -11,6 +11,8 @@
 
 import type { DagStore } from "@opencode-ai/core/dag/store"
 
+const CONDITION_RE = /^(.+?)\s*(==|!=|>=|<=|>|<)\s*(.+)$/
+
 /**
  * Evaluate a node's `condition` expression.
  *
@@ -35,7 +37,7 @@ export function evaluateCondition(
 ): { ok: true; value: boolean } | { ok: false; error: string } {
   if (!condition || condition.trim() === "") return { ok: true, value: true }
 
-  const match = condition.match(/^(.+?)\s*(==|!=|>=|<=|>|<)\s*(.+)$/)
+  const match = condition.match(CONDITION_RE)
   if (!match) return { ok: false, error: `condition unparseable: ${condition}` }
 
   const [, lhsRaw, op, rhsRaw] = match
@@ -51,6 +53,21 @@ export function evaluateCondition(
     case "<=": return { ok: true, value: (lhs as number) <= (rhs as number) }
     default: return { ok: true, value: true }
   }
+}
+
+/**
+ * NodeID referenced by a parseable condition's left-hand side, or null when
+ * the condition is empty or unparseable. Used at create/replan time to reject
+ * conditions referencing nodes outside `depends_on` — those would silently
+ * resolve to undefined and evaluate false at spawn time (the worst failure
+ * mode). Unparseable conditions are left to the runtime, which fails the node
+ * loudly instead.
+ */
+export function conditionReference(condition: string | undefined): string | null {
+  if (!condition || condition.trim() === "") return null
+  const match = condition.match(CONDITION_RE)
+  if (!match) return null
+  return match[1]!.trim().split(".")[0] || null
 }
 
 /**

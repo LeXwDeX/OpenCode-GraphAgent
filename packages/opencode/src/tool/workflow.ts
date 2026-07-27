@@ -19,7 +19,7 @@ const NodeSchema = Schema.Struct({
   worker_type: Schema.String.annotate({ description: "Agent type (explore, build, general, plan, or custom)" }),
   depends_on: Schema.Array(Schema.String).annotate({ description: "Node IDs this node waits for ([] for root)" }),
   required: Schema.optional(Schema.Boolean).annotate({
-    description: "If true and this node fails, the workflow is cancelled. Inherits config.node_defaults.required",
+    description: "If true and this node fails, the workflow terminalizes as failed. Inherits config.node_defaults.required",
   }),
   prompt_template: Schema.Struct({
     id: Schema.optional(Schema.String),
@@ -43,7 +43,7 @@ const NodeSchema = Schema.Struct({
   model: Schema.optional(Schema.Struct({ modelID: Schema.String, providerID: Schema.String })).annotate({
     description: 'Optional node override. modelID is provider-local, e.g. { providerID: "local-proxy-compatible", modelID: "glm-5.2" }, never repeat providerID inside modelID. Omit to inherit config.node_defaults.model, then the agent or parent-session model',
   }),
-  restart: Schema.optional(Schema.Boolean).annotate({ description: "(replan only) Re-spawn this running node with new prompt" }),
+  restart: Schema.optional(Schema.Boolean).annotate({ description: "(replan only) Re-spawn this running node with new prompt. Running nodes only — terminal (completed/failed/skipped) nodes are immutable; to retry a failed node, add a replacement node under a new id" }),
   cancel: Schema.optional(Schema.Boolean).annotate({ description: "(replan only) Cancel this node" }),
   output_schema: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)).annotate({ description: "JSON Schema; child agent must call submit_result to submit structured output" }),
   review: Schema.optional(
@@ -201,7 +201,7 @@ export const WorkflowTool = Tool.define<typeof Parameters, Metadata, Dag.Service
               switch (params.operation) {
                 case "pause":
                   yield* dag.pause(wfId).pipe(Effect.orDie)
-                  return { title: "Workflow paused", output: `<workflow id="${wfId}" state="paused"/>`, metadata: { workflowId: wfId } as Metadata }
+                  return { title: "Workflow paused", output: `<workflow id="${wfId}" state="paused"/>\nNote: pause stops new node spawns only — nodes already running continue to completion.`, metadata: { workflowId: wfId } as Metadata }
                 case "resume":
                   yield* dag.resume(wfId).pipe(Effect.orDie)
                   return { title: "Workflow resumed", output: `<workflow id="${wfId}" state="running"/>`, metadata: { workflowId: wfId } as Metadata }
@@ -214,9 +214,10 @@ export const WorkflowTool = Tool.define<typeof Parameters, Metadata, Dag.Service
                 case "replan": {
                   if (!params.fragment) return yield* Effect.die(new Error("replan operation requires 'fragment'"))
                   const r = yield* dag.replan(wfId, { nodes: params.fragment.nodes as NodeConfig[] }).pipe(Effect.orDie)
+                  const ignored = r.ignore.length > 0 ? `\nIgnored (terminal, immutable — add replacements under new ids to retry): ${r.ignore.join(", ")}` : ""
                   return {
                     title: `Workflow replanned: +${r.add.length} -${r.cancel.length} ↻${r.restart.length}`,
-                    output: `<workflow id="${wfId}" action="replan">\nAdded: ${r.add.join(", ")}\nCancelled: ${r.cancel.join(", ")}\nRestarted: ${r.restart.join(", ")}\nReplaced: ${r.replace.join(", ")}\n</workflow>`,
+                    output: `<workflow id="${wfId}" action="replan">\nAdded: ${r.add.join(", ")}\nCancelled: ${r.cancel.join(", ")}\nRestarted: ${r.restart.join(", ")}\nReplaced: ${r.replace.join(", ")}${ignored}\n</workflow>`,
                     metadata: { workflowId: wfId, ...r } as Metadata,
                   }
                 }
