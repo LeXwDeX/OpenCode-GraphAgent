@@ -54,6 +54,8 @@ export const WorkflowSummaryResponse = Schema.Struct({
   completedNodes: Schema.Number,
   runningNodes: Schema.Number,
   failedNodes: Schema.Number,
+  skippedNodes: Schema.Number,
+  queuedNodes: Schema.Number,
 }).annotate({ identifier: "Dag.WorkflowSummary" })
 
 export const DagSummaryListResponse = Schema.Array(WorkflowSummaryResponse)

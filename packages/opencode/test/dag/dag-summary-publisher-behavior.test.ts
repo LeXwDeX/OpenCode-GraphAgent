@@ -62,6 +62,8 @@ function summary(id: string, completedNodes: number): WorkflowSummary {
     completedNodes,
     runningNodes: 0,
     failedNodes: 0,
+    skippedNodes: 0,
+    queuedNodes: 0,
   }
 }
 
