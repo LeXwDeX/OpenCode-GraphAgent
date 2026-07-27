@@ -4,7 +4,7 @@ import type { DagNode, DagWorkflowSummary } from "@opencode-ai/sdk/v2"
 import type { BuiltinTuiPlugin } from "../builtins"
 import { createEffect, createMemo, createSignal, For, Show } from "solid-js"
 import { Spinner } from "../../component/spinner"
-import { dagNodeGlyph, dagStatusColor } from "../system/dag-inspector-utils"
+import { dagNodeGlyph, dagStatusColor, formatDagProgress } from "../system/dag-inspector-utils"
 
 const id = "internal:sidebar-dag-panel"
 
@@ -24,8 +24,9 @@ function WorkflowRow(props: {
   const completed = () => Number(props.summary.completedNodes)
   const running = () => Number(props.summary.runningNodes)
   const failed = () => Number(props.summary.failedNodes)
+  const queued = () => Number(props.summary.queuedNodes)
 
-  const signature = () => `${total()}:${completed()}:${running()}:${failed()}`
+  const signature = () => `${total()}:${completed()}:${running()}:${failed()}:${queued()}`
 
   const fetchNodes = async (dagID: string, sig: string) => {
     try {
@@ -61,8 +62,9 @@ function WorkflowRow(props: {
         <text fg={theme().text} wrapMode="word">
           {props.summary.title}{" "}
           <span style={{ fg: theme().textMuted }}>
-            ({completed()}/{total()}
+            ({formatDagProgress(props.summary)}
             {running() > 0 ? `, ${running()} running` : ""}
+            {queued() > 0 ? `, ${queued()} queued` : ""}
             {failed() > 0 ? `, ${failed()} failed` : ""})
           </span>
         </text>

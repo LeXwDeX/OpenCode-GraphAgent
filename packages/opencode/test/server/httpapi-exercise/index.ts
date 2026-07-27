@@ -1828,6 +1828,7 @@ const scenarios: Scenario[] = [
         check(typeof n.id === "string", "node should have id")
         check(typeof n.status === "string", "node should have status")
         check(Array.isArray(n.depends_on), "node should have depends_on")
+        check(typeof n.replan_attempts === "number", "node should have replan_attempts")
       }),
     ),
 

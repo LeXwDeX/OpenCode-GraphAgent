@@ -12,10 +12,13 @@ import {
   dagControlProgressMessage,
   dagControlUnavailableMessage,
   dagNodeGlyph,
+  dagNodeHistoryLabel,
   dagStatusColor,
+  formatDagDeadline,
   formatDagDuration,
   formatDagError,
   formatDagOutputPreview,
+  formatDagProgress,
   type DagControlOperation,
   type DagNode,
 } from "./dag-inspector-utils"
@@ -347,6 +350,16 @@ function DagInspector(props: { api: TuiPluginApi }) {
   const selectedWorkflowSummary = createMemo(() => workflows().find((workflow) => workflow.id === selectedWorkflow()))
   const selectedNodeDetail = createMemo(() => orderedNodes().find((node) => node.id === selectedNode()))
 
+  // 1s tick driving the running-node deadline countdown. Only active while the
+  // selected node is actually counting down — idle inspectors don't re-render.
+  const [now, setNow] = createSignal(Date.now())
+  createEffect(() => {
+    const detail = selectedNodeDetail()
+    if (!detail || (detail.status !== "running" && detail.status !== "queued")) return
+    const timer = setInterval(() => setNow(Date.now()), 1000)
+    onCleanup(() => clearInterval(timer))
+  })
+
   const statusColor = (status: string) => dagStatusColor(theme(), status)
 
   return (
@@ -409,7 +422,7 @@ function DagInspector(props: { api: TuiPluginApi }) {
                               </text>
                             </box>
                             <text fg={selected() ? theme().background : theme().textMuted} flexShrink={0}>
-                              {Number(wf.completedNodes)}/{Number(wf.nodeCount)}
+                              {formatDagProgress(wf)}
                             </text>
                           </box>
                         )
@@ -512,7 +525,15 @@ function DagInspector(props: { api: TuiPluginApi }) {
                             {formatDagDuration(node().started_at, node().completed_at)
                               ? ` · ${formatDagDuration(node().started_at, node().completed_at)}`
                               : ""}
+                            {dagNodeHistoryLabel(node()) ? ` · ${dagNodeHistoryLabel(node())}` : ""}
                           </text>
+                          <Show when={formatDagDeadline(node().status, node().deadline_ms, now())}>
+                            {(deadline) => (
+                              <text fg={deadline() === "overdue" ? theme().error : theme().warning} wrapMode="none">
+                                {deadline()}
+                              </text>
+                            )}
+                          </Show>
                         </box>
                         <Show when={node().depends_on.length > 0}>
                           <text fg={theme().textMuted} wrapMode="none">
