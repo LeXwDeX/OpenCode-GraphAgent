@@ -18,7 +18,9 @@ const SATISFIED_TERMINAL = new Set(["completed", "aborted"])
  * same mapping. `skipped` is deliberately NOT folded into `satisfied`: a
  * skipped dependency still unlocks mixed fan-ins, but descendants that depend
  * on skipped nodes only must cascade-skip instead of running on placeholder
- * inputs (D13 — condition gates).
+ * inputs (D13 — condition gates). `queued` maps to `pending`: a queued node
+ * never reached the provider (no child session before the permit, P0-2), so
+ * rebuilding after a crash simply re-admits it — no ownership is lost.
  */
 export function toSchedulingNodes(
   nodes: readonly { id: string; status: string; dependsOn: readonly string[]; required: boolean }[],

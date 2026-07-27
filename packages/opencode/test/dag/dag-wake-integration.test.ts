@@ -274,6 +274,48 @@ describe("DagLoop atomic wake integration", () => {
     )
   })
 
+  it("holds queued admissions durably until a permit frees (P0-2)", async () => {
+    await Effect.runPromise(
+      runWakeTest(({ dag, store, childPrompts }) =>
+        Effect.gen(function* () {
+          const dagID = yield* dag.create({
+            projectID: "project-1",
+            sessionID: "ses_parent",
+            title: "Queued admission",
+            config: { name: "queued-admission", max_concurrency: 1, nodes: [node("a"), node("b")] },
+          })
+
+          const first = yield* takeWithin(childPrompts, "no node acquired the permit")
+          // While the permit is held, the other admission stays durably queued
+          // with NO child session — the fan-out no longer eagerly creates one
+          // session per ready node (P0-2).
+          const queued = yield* pollWithTimeout(
+            Effect.gen(function* () {
+              const nodes = yield* store.getNodes(dagID)
+              return nodes.find((n) => n.status === "queued")
+            }),
+            "second admission did not surface as durably queued",
+          )
+          expect(queued.childSessionId).toBeNull()
+          expect(queued.deadlineMs).not.toBeNull()
+          expect((yield* store.getNodes(dagID)).filter((n) => n.status === "running")).toHaveLength(1)
+
+          yield* Deferred.succeed(first.release, "done")
+          const second = yield* takeWithin(childPrompts, "queued node did not start after permit release")
+          expect(second.title).toBe(queued.id)
+          yield* Deferred.succeed(second.release, "done")
+
+          yield* pollWithTimeout(
+            store.getWorkflow(dagID).pipe(
+              Effect.map((workflow) => workflow?.status === "completed" ? workflow : undefined),
+            ),
+            "queued-admission workflow did not complete",
+          )
+        }),
+      ),
+    )
+  })
+
   it("preserves documented template variables inside static template input", async () => {
     await Effect.runPromise(
       runWakeTest(({ dag, childPrompts }) =>

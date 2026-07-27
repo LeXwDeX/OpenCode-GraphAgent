@@ -214,6 +214,7 @@ export interface Interface {
     { cancel: string[]; restart: string[]; replace: string[]; add: string[]; ignore: string[] },
     Error
   >
+  readonly nodeQueued: (dagID: string, nodeID: string, deadlineMs?: number) => Effect.Effect<void, Error>
   readonly nodeStarted: (dagID: string, nodeID: string, childSessionID: string, deadlineMs?: number, wakeEligible?: boolean) => Effect.Effect<void, Error>
   readonly nodeCompleted: (dagID: string, nodeID: string, output: unknown) => Effect.Effect<void, Error>
   readonly nodeFailed: (dagID: string, nodeID: string, reason: string, trigger: string) => Effect.Effect<void, Error>
@@ -654,6 +655,10 @@ export const layer = Layer.effect(
       return yield* _replan(dagID, { nodes: [...preserved, ...newNodes] }, reopenCompleted)
     })
 
+    const nodeQueued = Effect.fn("Dag.nodeQueued")(function* (dagID: string, nodeID: string, deadlineMs?: number) {
+      yield* guardNode(dagID, nodeID, NodeStatus.QUEUED)
+      yield* events.publish(DagEvent.NodeQueued, { dagID: dagID as ID, nodeID: nodeID as never, deadlineMs, timestamp: yield* DateTime.now })
+    })
     const nodeStarted = Effect.fn("Dag.nodeStarted")(function* (dagID: string, nodeID: string, childSessionID: string, deadlineMs?: number, wakeEligible?: boolean) {
       yield* guardNode(dagID, nodeID, NodeStatus.RUNNING)
       yield* events.publish(DagEvent.NodeStarted, { dagID: dagID as ID, nodeID: nodeID as never, childSessionID: childSessionID as never, deadlineMs, wakeEligible, timestamp: yield* DateTime.now })
@@ -702,6 +707,7 @@ export const layer = Layer.effect(
       fail: (dagID, reason) => withWorkflowLock(dagID)(fail(dagID, reason)),
       replan: (dagID, fragment) => withWorkflowLock(dagID)(_replan(dagID, fragment)),
       extend: (dagID, nodes) => withWorkflowLock(dagID)(_extend(dagID, nodes)),
+      nodeQueued: (dagID, nodeID, deadlineMs) => withWorkflowLock(dagID)(nodeQueued(dagID, nodeID, deadlineMs)),
       nodeStarted: (dagID, nodeID, childSessionID, deadlineMs, wakeEligible) =>
         withWorkflowLock(dagID)(nodeStarted(dagID, nodeID, childSessionID, deadlineMs, wakeEligible)),
       nodeCompleted: (dagID, nodeID, output) => withWorkflowLock(dagID)(nodeCompleted(dagID, nodeID, output)),

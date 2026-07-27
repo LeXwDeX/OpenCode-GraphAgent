@@ -165,6 +165,27 @@ export const layer = Layer.effectDiscard(
         .pipe(Effect.orDie),
     )
 
+    yield* events.project(DagEvent.NodeQueued, (event) =>
+      db
+        .update(WorkflowNodeTable)
+        .set({
+          status: "queued",
+          deadline_ms: event.data.deadlineMs ?? null,
+          seq: event.durable!.seq,
+          time_updated: toMillis(event.data.timestamp),
+        })
+        // Admission is only valid from pending (fresh dispatch) or queued
+        // (idempotent re-admission after crash recovery, P0-2). A concurrent
+        // replan(cancel) terminalizing the node makes this a 0-row update.
+        .where(and(
+          eq(WorkflowNodeTable.workflow_id, event.data.dagID),
+          eq(WorkflowNodeTable.id, event.data.nodeID),
+          inArray(WorkflowNodeTable.status, ["pending", "queued"]),
+        ))
+        .run()
+        .pipe(Effect.orDie),
+    )
+
     yield* events.project(DagEvent.NodeStarted, (event) =>
       db
         .update(WorkflowNodeTable)
@@ -228,10 +249,11 @@ export const layer = Layer.effectDiscard(
         })
         // P1-7: only fail nodes in non-terminal status. Prevents stale
         // replan-ceiling events from overwriting completed/skipped nodes.
+        // "queued" is included for the queue-wait timeout path (P0-2).
         .where(and(
           eq(WorkflowNodeTable.workflow_id, event.data.dagID),
           eq(WorkflowNodeTable.id, event.data.nodeID),
-          inArray(WorkflowNodeTable.status, ["running", "pending"]),
+          inArray(WorkflowNodeTable.status, ["running", "pending", "queued"]),
         ))
         .run()
         .pipe(Effect.orDie),

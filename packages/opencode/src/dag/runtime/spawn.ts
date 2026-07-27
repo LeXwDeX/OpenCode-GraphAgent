@@ -4,6 +4,12 @@
  * A ready node spawns a real child Session through the same contract as task.ts:
  * Agent.Service.get → Session.Service.create(parentID) → deriveSubagentSessionPermission → promptOps.prompt.
  *
+ * Admission model (P0-2): the node is durably QUEUED at dispatch — the child
+ * session and NodeStarted only materialize INSIDE the concurrency permit, so a
+ * 100-node fan-out no longer creates 100 sessions and shows 100 "running"
+ * rows while true concurrency is 5. The deadline is fixed at admission time:
+ * queue wait counts toward the node's budget.
+ *
  * Completion model (mirrors task.ts:210-221): a node completes when its child
  * session's prompt() resolves; it fails when prompt() fails. The completion
  * signal (NodeCompleted / NodeFailed) is published from inside the forked
@@ -44,7 +50,6 @@ export interface NodeSpawnInput {
 }
 
 export interface NodeSpawnResult {
-  childSessionID: string
   fiber: Fiber.Fiber<unknown, unknown>
 }
 
@@ -94,47 +99,35 @@ export function spawnNode(
       subagent: agent,
     })
 
-    const childSession = yield* sessions.create({
-      parentID: SessionID.make(input.parentSessionID),
-      title: `${input.node.name} (DAG node)`,
-      agent: agent.name,
-      model: { id: model.modelID, providerID: model.providerID },
-      permission: childPermission,
-    })
-
-    // Resolve timeout and compute absolute deadline (D0 path 1).
-    // The deadline is computed at spawn time and persisted so crash-recovery
-    // can inherit it. The actual timeout race uses the REMAINING time from
-    // when the semaphore permit is acquired — queue wait counts toward the
-    // deadline, preventing a node that queued past its deadline from running.
+    // Resolve timeout and compute the absolute deadline at ADMISSION time
+    // (P0-2). The deadline is persisted on the durable queued row so
+    // crash-recovery can inherit it; queue wait counts toward the budget.
     const timeoutMs = input.timeoutMs ?? Dag.DEFAULT_WORKFLOW_CONFIG.nodeTimeoutMs
     const spawnTime = yield* Clock.currentTimeMillis
     const deadlineMs = spawnTime + timeoutMs
 
     // If a concurrent replan(cancel/restart) terminalized the node during the
-    // async window (agent resolution / session creation above), nodeStarted's
-    // guard rejects with TerminalViolationError. Cancel the orphaned child
-    // session and return a no-op fiber — the winning cancel/restart is the
-    // sole terminalization, no spurious NodeFailed should be published.
-    const terminalized = yield* dag.nodeStarted(input.dagID, input.nodeID, childSession.id, deadlineMs, input.reportToParent).pipe(
-      Effect.map(() => false),
+    // async window above (agent/model resolution), the queued guard rejects.
+    // The winning control op is the sole terminalization — no spurious
+    // NodeFailed, no execution fiber.
+    const admitted = yield* dag.nodeQueued(input.dagID, input.nodeID, deadlineMs).pipe(
+      Effect.as(true),
       Effect.catchIf(
         isTransitionRejection,
         () =>
-          Effect.gen(function* () {
-            yield* promptSvc.cancel(childSession.id).pipe(Effect.catch(() => Effect.void))
-            yield* Effect.logWarning(`Node ${input.nodeID} was terminalized during spawn — child session cancelled, no spurious failure published`)
-            return true
-          }),
+          Effect.logWarning(`Node ${input.nodeID} was terminalized before queueing — no execution attempt started`).pipe(
+            Effect.as(false),
+          ),
       ),
     )
-
-    if (terminalized) {
+    if (!admitted) {
       const fiber = yield* Effect.forkIn(scope)(Effect.void)
-      return { childSessionID: childSession.id as string, fiber }
+      return { fiber }
     }
 
-    if (input.outputSchema) registerCaptureSlot(childSession.id, input.outputSchema)
+    // Assigned inside the fiber once the child session materializes; read by
+    // the ensuring/onInterrupt cleanups below.
+    let childSessionID: string | undefined
 
     const fiber = yield* Effect.forkIn(scope)(
       Effect.gen(function* () {
@@ -165,10 +158,43 @@ export function spawnNode(
           )
           return
         }
-        // Permit acquired — run the actual prompt with remaining time budget
-        const permitTime = yield* Clock.currentTimeMillis
-        const remainingMs = Math.max(0, deadlineMs - permitTime)
         try {
+          // Permit acquired — only NOW materialize the child session and mark
+          // the node running (P0-2). Before this point the node is durably
+          // "queued" with no session: a 100-node fan-out holds at most
+          // max_concurrency live sessions.
+          const childSession = yield* sessions.create({
+            parentID: SessionID.make(input.parentSessionID),
+            title: `${input.node.name} (DAG node)`,
+            agent: agent.name,
+            model: { id: model.modelID, providerID: model.providerID },
+            permission: childPermission,
+          })
+          childSessionID = childSession.id as string
+
+          // A concurrent replan(cancel/restart) may have terminalized the node
+          // while it waited for the permit. nodeStarted's guard rejects; cancel
+          // the just-created child session and stop — the winning control op is
+          // the sole terminalization, no spurious NodeFailed.
+          const terminalized = yield* dag.nodeStarted(input.dagID, input.nodeID, childSession.id, deadlineMs, input.reportToParent).pipe(
+            Effect.map(() => false),
+            Effect.catchIf(
+              isTransitionRejection,
+              () =>
+                Effect.gen(function* () {
+                  yield* promptSvc.cancel(childSession.id).pipe(Effect.catch(() => Effect.void))
+                  yield* Effect.logWarning(`Node ${input.nodeID} was terminalized during queue wait — child session cancelled, no spurious failure published`)
+                  return true
+                }),
+            ),
+          )
+          if (terminalized) return
+
+          if (input.outputSchema) registerCaptureSlot(childSession.id, input.outputSchema)
+
+          // Run the actual prompt with the remaining time budget.
+          const permitTime = yield* Clock.currentTimeMillis
+          const remainingMs = Math.max(0, deadlineMs - permitTime)
           const resultOpt = yield* promptSvc.prompt({
             messageID: MessageID.ascending(),
             sessionID: childSession.id,
@@ -258,8 +284,18 @@ export function spawnNode(
       }).pipe(
         Effect.ensuring(
           Effect.sync(() => {
-            if (input.outputSchema) clearCaptureSlot(childSession.id)
+            if (input.outputSchema && childSessionID) clearCaptureSlot(childSessionID)
           }),
+        ),
+        // The fiber can be interrupted between session creation and node
+        // settlement (replan cancel/restart, workflow-terminal cleanup). In
+        // the pre-NodeStarted window the durable row does not reference the
+        // session yet, so the caller's abortChild cannot reach it — cancel
+        // the child here.
+        Effect.onInterrupt(() =>
+          childSessionID
+            ? promptSvc.cancel(childSessionID as never).pipe(Effect.ignore)
+            : Effect.void,
         ),
         Effect.catchCause((cause) =>
           Effect.gen(function* () {
@@ -275,6 +311,6 @@ export function spawnNode(
       ),
     )
 
-    return { childSessionID: childSession.id as string, fiber }
+    return { fiber }
   })
 }

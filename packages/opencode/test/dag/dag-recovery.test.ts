@@ -139,6 +139,37 @@ describe("reconcileWorkflow", () => {
     expect(result.reconciled).toBe(0)
   })
 
+  it("re-admits a queued node without any ownership judgement (P0-2)", async () => {
+    const events: { type: string; nodeID: string }[] = []
+    const nodes = [makeNodeRow({ id: "n1", status: "queued", childSessionId: null })]
+    const dagLayer = makeDagLayer(nodes, events)
+    const checkStatus = () => Effect.succeed("active" as const)
+
+    const result = await Effect.runPromise(reconcileWorkflow("wf-1", checkStatus).pipe(Effect.provide(dagLayer)))
+
+    // A queued node never created its child session — no invented failure,
+    // no recovery-pause trigger; it simply re-enters scheduling.
+    expect(events).toEqual([])
+    expect(result).toEqual({ reconciled: 0, ownershipLost: 0 })
+  })
+
+  it("cancels the stale session of a queued restart-orphan without judging it", async () => {
+    const events: { type: string; nodeID: string }[] = []
+    const cancelled: string[] = []
+    const nodes = [makeNodeRow({ id: "n1", status: "queued", childSessionId: "ses_stale" })]
+    const dagLayer = makeDagLayer(nodes, events)
+    const checkStatus = () => Effect.succeed("active" as const)
+    const cancelSession = (sessionID: string) => Effect.sync(() => cancelled.push(sessionID))
+
+    const result = await Effect.runPromise(
+      reconcileWorkflow("wf-1", checkStatus, cancelSession).pipe(Effect.provide(dagLayer)),
+    )
+
+    expect(cancelled).toEqual(["ses_stale"])
+    expect(events).toEqual([])
+    expect(result).toEqual({ reconciled: 0, ownershipLost: 0 })
+  })
+
   it("cancels and fails a zero-message child classified as unknown exactly once", async () => {
     const events: TrackedEvent[] = []
     const cancelled: string[] = []

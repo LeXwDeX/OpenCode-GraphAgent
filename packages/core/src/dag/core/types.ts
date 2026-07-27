@@ -158,7 +158,10 @@ export function getValidNextNodeStatuses(currentStatus: NodeStatus): NodeStatus[
     case NodeStatus.PENDING:
       return [NodeStatus.QUEUED, NodeStatus.RUNNING, NodeStatus.SKIPPED, NodeStatus.FAILED]
     case NodeStatus.QUEUED:
-      return [NodeStatus.RUNNING, NodeStatus.SKIPPED]
+      // QUEUED→QUEUED is idempotent re-admission after crash recovery;
+      // QUEUED→PENDING is the replan-replacement reset; QUEUED→FAILED covers
+      // queue-wait timeout (the deadline keeps running while queued, P0-2).
+      return [NodeStatus.QUEUED, NodeStatus.RUNNING, NodeStatus.PENDING, NodeStatus.SKIPPED, NodeStatus.FAILED]
     case NodeStatus.RUNNING:
       return [NodeStatus.COMPLETED, NodeStatus.FAILED, NodeStatus.PAUSED, NodeStatus.PENDING, NodeStatus.SKIPPED]
     case NodeStatus.PAUSED:
