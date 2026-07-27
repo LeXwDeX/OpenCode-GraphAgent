@@ -1,15 +1,21 @@
 /** @jsxImportSource @opentui/solid */
 import type { TuiPlugin, TuiPluginApi } from "@opencode-ai/plugin/tui"
 import type { BuiltinTuiPlugin } from "../builtins"
-import { createMemo, For, Show, createSignal, createEffect, onCleanup } from "solid-js"
+import type { ScrollBoxRenderable } from "@opentui/core"
+import { createMemo, For, Show, Switch, Match, createSignal, createEffect, onCleanup } from "solid-js"
 import { Spinner } from "../../component/spinner"
-import { TextAttributes } from "@opentui/core"
 import { useBindings, useCommandShortcut } from "../../keymap"
+import { Panel, PanelGroup, Separator } from "./diff-viewer-ui"
 import {
+  computeNodeRowIndex,
   computeWaves,
   dagControlProgressMessage,
   dagControlUnavailableMessage,
+  dagNodeGlyph,
+  dagStatusColor,
+  formatDagDuration,
   formatDagError,
+  formatDagOutputPreview,
   type DagControlOperation,
   type DagNode,
 } from "./dag-inspector-utils"
@@ -17,6 +23,18 @@ import type { DagWorkflowSummary } from "@opencode-ai/sdk/v2"
 
 const id = "internal:system-dag-inspector"
 const ROUTE = "dag"
+const WORKFLOW_LIST_WIDTH = 32
+
+function scrollRowIntoView(scroll: ScrollBoxRenderable | undefined, index: number) {
+  if (!scroll) return
+  if (index < scroll.scrollTop) {
+    scroll.scrollTo(index)
+    return
+  }
+  if (index >= scroll.scrollTop + scroll.viewport.height) {
+    scroll.scrollTo(index - scroll.viewport.height + 1)
+  }
+}
 
 function DagInspector(props: { api: TuiPluginApi }) {
   const theme = () => props.api.theme.current
@@ -31,6 +49,8 @@ function DagInspector(props: { api: TuiPluginApi }) {
   const [fetchedWorkflows, setFetchedWorkflows] = createSignal<ReadonlyArray<DagWorkflowSummary> | undefined>()
   const [workflowLoad, setWorkflowLoad] = createSignal<"loading" | "loaded" | "error">("loading")
   const [actionMessage, setActionMessage] = createSignal<string | undefined>()
+  let workflowScroll: ScrollBoxRenderable | undefined
+  let nodeScroll: ScrollBoxRenderable | undefined
 
   const workflows = createMemo(() => {
     const sid = params()?.sessionID
@@ -140,6 +160,28 @@ function DagInspector(props: { api: TuiPluginApi }) {
     const sel = selectedNode()
     if (sel && ns.some((n) => n.id === sel)) return
     setSelectedNode(ns[0]?.id)
+  })
+
+  // Keep the selected workflow visible in the (unsliced) scrollable list.
+  createEffect(() => {
+    const sel = selectedWorkflow()
+    if (!sel) return
+    const index = workflows().findIndex((w) => w.id === sel)
+    if (index === -1) return
+    const scrollSelected = () => scrollRowIntoView(workflowScroll, index)
+    scrollSelected()
+    requestAnimationFrame(scrollSelected)
+  })
+
+  // Keep the selected node visible inside the wave list.
+  createEffect(() => {
+    const sel = selectedNode()
+    if (!sel) return
+    const row = computeNodeRowIndex(layers(), sel)
+    if (row === undefined) return
+    const scrollSelected = () => scrollRowIntoView(nodeScroll, row)
+    scrollSelected()
+    requestAnimationFrame(scrollSelected)
   })
 
   const moveNode = (delta: number) => {
@@ -270,6 +312,14 @@ function DagInspector(props: { api: TuiPluginApi }) {
       },
     },
     {
+      name: "dag.step",
+      title: "Step selected workflow (run one node)",
+      category: "Workflow",
+      run() {
+        control("step")
+      },
+    },
+    {
       name: "dag.cancel",
       title: "Cancel selected workflow",
       category: "Workflow",
@@ -289,232 +339,252 @@ function DagInspector(props: { api: TuiPluginApi }) {
 
   const closeShortcut = useCommandShortcut("dag.close")
   const enterShortcut = useCommandShortcut("dag.enter")
+  const pauseShortcut = useCommandShortcut("dag.pause")
+  const resumeShortcut = useCommandShortcut("dag.resume")
+  const stepShortcut = useCommandShortcut("dag.step")
+  const cancelShortcut = useCommandShortcut("dag.cancel")
 
   const selectedWorkflowSummary = createMemo(() => workflows().find((workflow) => workflow.id === selectedWorkflow()))
+  const selectedNodeDetail = createMemo(() => orderedNodes().find((node) => node.id === selectedNode()))
 
-  const statusColor = (status: string) => {
-    if (status === "completed") return theme().success
-    if (status === "failed") return theme().error
-    if (status === "running") return theme().textMuted
-    if (status === "pending" || status === "queued") return theme().textMuted
-    if (status === "skipped" || status === "cancelled") return theme().textMuted
-    return theme().text
-  }
+  const statusColor = (status: string) => dagStatusColor(theme(), status)
 
   return (
-    <box flexDirection="column" width="100%" height="100%" padding={1} gap={1}>
-      <box
-        flexDirection="row"
-        width="100%"
-        flexShrink={0}
-        justifyContent="space-between"
-        border={["bottom"]}
-        borderColor={theme().borderSubtle}
-      >
-        <box flexDirection="column" paddingBottom={1}>
-          <text fg={theme().text} attributes={TextAttributes.BOLD}>
-            DAG Inspector
+    <box width="100%" height="100%">
+      <PanelGroup axis="y" width="100%" height="100%">
+        <Panel border="none" flexShrink={0} padding={0} paddingLeft={1}>
+          <text fg={theme().text}>DAG </text>
+          <text fg={theme().textMuted}>{selectedWorkflowSummary()?.title ?? "workflow inspector"}</text>
+          <box flexGrow={1} />
+          <text fg={theme().textMuted}>
+            {workflows().length} {workflows().length === 1 ? "workflow" : "workflows"}
           </text>
-          <text fg={theme().textMuted}>Workflow execution overview</text>
-        </box>
-        <text fg={theme().textMuted}>
-          {workflows().length} {workflows().length === 1 ? "workflow" : "workflows"}
-        </text>
-      </box>
+        </Panel>
 
-      <box flexDirection="row" width="100%" flexGrow={1} minHeight={0} gap={1}>
-        {/* Left column: workflow list */}
-        <box width="25.5%" minWidth={20} border={["right"]} borderColor={theme().borderSubtle}>
-          <box flexDirection="column" width="100%" paddingRight={1} gap={1}>
-            <box flexDirection="row" width="100%" justifyContent="space-between">
-              <text fg={theme().text} attributes={TextAttributes.BOLD}>
-                Workflows
-              </text>
-              <text fg={theme().textMuted}>{workflows().length}</text>
-            </box>
-            <Show when={workflowLoad() === "loading"}>
-              <text fg={theme().textMuted}>Loading...</text>
-            </Show>
-            <Show when={workflowLoad() !== "loading" && workflows().length === 0}>
-              <text fg={theme().textMuted}>No workflows</text>
-            </Show>
-            <For each={workflows().slice(0, 10)}>
-              {(wf) => (
-                <box
-                  flexDirection="column"
-                  width="100%"
-                  paddingLeft={1}
-                  paddingRight={1}
-                  onMouseUp={() => setSelectedWorkflow(wf.id)}
-                  style={{ backgroundColor: selectedWorkflow() === wf.id ? theme().backgroundMenu : undefined }}
-                >
-                  <box flexDirection="row" width="100%" gap={1}>
-                    <text fg={selectedWorkflow() === wf.id ? theme().accent : theme().textMuted} flexShrink={0}>
-                      {selectedWorkflow() === wf.id ? "›" : " "}
-                    </text>
-                    <text
-                      flexShrink={0}
-                      style={{
-                        fg: statusColor(wf.status),
+        <box flexGrow={1} minHeight={0}>
+          <Switch>
+            <Match when={workflowLoad() === "loading" && workflows().length === 0}>
+              <Separator axis="x" />
+              <box flexGrow={1} paddingLeft={1}>
+                <text fg={theme().textMuted}>Loading workflows...</text>
+              </box>
+            </Match>
+            <Match when={workflowLoad() === "error" && workflows().length === 0}>
+              <Separator axis="x" />
+              <box flexGrow={1} paddingLeft={1}>
+                <text fg={theme().error}>Unable to load workflows</text>
+              </box>
+            </Match>
+            <Match when={workflows().length === 0}>
+              <Separator axis="x" />
+              <box flexGrow={1} paddingLeft={1}>
+                <text fg={theme().textMuted}>No workflows for this session</text>
+              </box>
+            </Match>
+            <Match when={workflows().length > 0}>
+              <PanelGroup axis="x">
+                <Panel border="both" width={WORKFLOW_LIST_WIDTH}>
+                  <scrollbox
+                    ref={(element: ScrollBoxRenderable) => (workflowScroll = element)}
+                    verticalScrollbarOptions={{ visible: false }}
+                    horizontalScrollbarOptions={{ visible: false }}
+                  >
+                    <For each={workflows()}>
+                      {(wf) => {
+                        const selected = () => selectedWorkflow() === wf.id
+                        return (
+                          <box
+                            flexDirection="row"
+                            gap={1}
+                            width="100%"
+                            backgroundColor={selected() ? theme().primary : undefined}
+                            onMouseUp={() => setSelectedWorkflow(wf.id)}
+                          >
+                            <text fg={selected() ? theme().background : statusColor(wf.status)} flexShrink={0}>
+                              •
+                            </text>
+                            <box flexGrow={1} minWidth={0}>
+                              <text fg={selected() ? theme().background : theme().text} wrapMode="none">
+                                {wf.title}
+                              </text>
+                            </box>
+                            <text fg={selected() ? theme().background : theme().textMuted} flexShrink={0}>
+                              {Number(wf.completedNodes)}/{Number(wf.nodeCount)}
+                            </text>
+                          </box>
+                        )
                       }}
-                    >
+                    </For>
+                  </scrollbox>
+                </Panel>
+
+                <Panel flexGrow={1} minHeight={0} border="none">
+                  <Separator axis="x" start="edge-out" />
+                  <box flexDirection="row" gap={1} paddingLeft={1} flexShrink={0}>
+                    <text fg={statusColor(selectedWorkflowSummary()?.status ?? "")} flexShrink={0}>
                       •
                     </text>
-                    <text fg={theme().text} wrapMode="word">
-                      {wf.title}
+                    <text fg={theme().text}>{selectedWorkflowSummary()?.status ?? "unknown"}</text>
+                    <Show when={actionMessage()}>
+                      <text fg={theme().warning} wrapMode="none">
+                        {actionMessage()}
+                      </text>
+                    </Show>
+                    <box flexGrow={1} />
+                    <text fg={theme().textMuted} flexShrink={0}>
+                      {nodes().length} {nodes().length === 1 ? "node" : "nodes"} · {layers().length}{" "}
+                      {layers().length === 1 ? "wave" : "waves"}
                     </text>
                   </box>
-                  <box paddingLeft={4}>
-                    <text fg={theme().textMuted}>
-                      {Number(wf.completedNodes)}/{Number(wf.nodeCount)} nodes · {wf.status}
-                    </text>
-                  </box>
-                </box>
-              )}
-            </For>
-          </box>
-        </box>
-
-        {/* Right column: node tree in topological waves */}
-        <box flexGrow={1} minWidth={0} paddingLeft={1}>
-          <Show
-            when={selectedWorkflow()}
-            fallback={
-              <text fg={theme().textMuted}>
-                {workflowLoad() === "loading"
-                  ? "Loading workflows..."
-                  : workflowLoad() === "error"
-                    ? "Unable to load workflows"
-                    : "No workflows for this session"}
-              </text>
-            }
-          >
-            <box flexDirection="column" width="100%" gap={1}>
-              <box
-                flexDirection="column"
-                width="100%"
-                flexShrink={0}
-                paddingBottom={1}
-                border={["bottom"]}
-                borderColor={theme().borderSubtle}
-              >
-                <box flexDirection="row" width="100%" justifyContent="space-between">
-                  <box flexDirection="column">
-                    <text fg={theme().textMuted}>Selected workflow</text>
-                    <text fg={theme().text} attributes={TextAttributes.BOLD}>
-                      {selectedWorkflowSummary()?.title ?? "Unknown"}
-                    </text>
-                  </box>
-                  <box flexDirection="row" gap={1}>
-                    <text fg={statusColor(selectedWorkflowSummary()?.status ?? "")}>•</text>
-                    <text fg={statusColor(selectedWorkflowSummary()?.status ?? "")}>
-                      {selectedWorkflowSummary()?.status ?? "unknown"}
-                    </text>
-                  </box>
-                </box>
-                <text fg={theme().textMuted}>ID: {selectedWorkflow()}</text>
-              </box>
-
-              <Show when={actionMessage()}>
-                <text fg={theme().warning} wrapMode="word">
-                  {actionMessage()}
-                </text>
-              </Show>
-
-              <box flexDirection="row" width="100%" justifyContent="space-between">
-                <text fg={theme().text} attributes={TextAttributes.BOLD}>
-                  Execution
-                </text>
-                <text fg={theme().textMuted}>
-                  {nodes().length} {nodes().length === 1 ? "node" : "nodes"} · {layers().length}{" "}
-                  {layers().length === 1 ? "wave" : "waves"}
-                </text>
-              </box>
-
-              {/* Wave header: nodes at the same topological depth, NOT a barrier */}
-              <For each={layers()}>
-                {(layer, layerIdx) => (
-                  <box
-                    flexDirection="column"
-                    width="100%"
-                    paddingLeft={1}
-                    border={["left"]}
-                    borderColor={theme().borderSubtle}
+                  <Separator axis="x" start="edge" />
+                  <scrollbox
+                    ref={(element: ScrollBoxRenderable) => (nodeScroll = element)}
+                    flexGrow={1}
+                    minHeight={0}
+                    verticalScrollbarOptions={{ visible: false }}
+                    horizontalScrollbarOptions={{ visible: false }}
                   >
-                    <box flexDirection="row" width="100%" justifyContent="space-between">
-                      <text fg={theme().accent} attributes={TextAttributes.BOLD}>
-                        Wave {layerIdx() + 1}
-                      </text>
-                      <text fg={theme().textMuted}>
-                        {layer.length} {layer.length === 1 ? "node" : "nodes"}
-                      </text>
-                    </box>
-                    <For each={layer}>
-                      {(node) => (
-                        <box
-                          flexDirection="column"
-                          width="100%"
-                          onMouseUp={() => setSelectedNode(node.id)}
-                          style={{ backgroundColor: selectedNode() === node.id ? theme().backgroundMenu : undefined }}
-                        >
-                          <box flexDirection="row" gap={1} width="100%">
-                            <text fg={selectedNode() === node.id ? theme().accent : theme().textMuted} flexShrink={0}>
-                              {selectedNode() === node.id ? "›" : " "}
+                    <For each={layers()}>
+                      {(layer, layerIdx) => (
+                        <>
+                          {/* Wave header: nodes at the same topological depth, NOT a barrier */}
+                          <box flexDirection="row" gap={1} width="100%" paddingLeft={1}>
+                            <text fg={theme().textMuted} wrapMode="none">
+                              wave {layerIdx() + 1} · {layer.length} {layer.length === 1 ? "node" : "nodes"}
                             </text>
-                            <Show when={node.status !== "running"} fallback={<Spinner color={theme().textMuted} />}>
-                              <text
-                                flexShrink={0}
-                                style={{
-                                  fg: statusColor(node.status),
-                                }}
-                              >
-                                •
-                              </text>
-                            </Show>
-                            <text fg={theme().text} wrapMode="word">
-                              {node.name}
-                            </text>
-                            <text fg={theme().textMuted}>[{node.worker_type}]</text>
                           </box>
-                          <Show when={node.depends_on.length > 0}>
-                            <box paddingLeft={4} paddingRight={1}>
-                              <text fg={theme().textMuted} wrapMode="word">
-                                depends on {node.depends_on.join(", ")}
-                              </text>
-                            </box>
-                          </Show>
-                          <Show when={node.status === "failed" && node.error_reason}>
-                            <box paddingLeft={4} paddingRight={1}>
-                              <text fg={theme().error} wrapMode="word">
-                                ⚠ {formatDagError(node.error_reason!)}
-                              </text>
-                            </box>
-                          </Show>
-                        </box>
+                          <For each={layer}>
+                            {(node) => {
+                              const selected = () => selectedNode() === node.id
+                              return (
+                                <box
+                                  flexDirection="row"
+                                  gap={1}
+                                  width="100%"
+                                  paddingLeft={2}
+                                  backgroundColor={selected() ? theme().primary : undefined}
+                                  onMouseUp={() => setSelectedNode(node.id)}
+                                >
+                                  <Show
+                                    when={node.status !== "running"}
+                                    fallback={<Spinner color={selected() ? theme().background : theme().textMuted} />}
+                                  >
+                                    <text fg={selected() ? theme().background : statusColor(node.status)} flexShrink={0}>
+                                      {dagNodeGlyph(node.status)}
+                                    </text>
+                                  </Show>
+                                  <box flexGrow={1} minWidth={0}>
+                                    <text
+                                      fg={
+                                        selected()
+                                          ? theme().background
+                                          : node.status === "running"
+                                            ? theme().text
+                                            : theme().textMuted
+                                      }
+                                      wrapMode="none"
+                                    >
+                                      {node.name}
+                                    </text>
+                                  </box>
+                                  <text fg={selected() ? theme().background : theme().textMuted} flexShrink={0}>
+                                    {node.worker_type}
+                                  </text>
+                                </box>
+                              )
+                            }}
+                          </For>
+                        </>
                       )}
                     </For>
-                  </box>
-                )}
-              </For>
-            </box>
-          </Show>
+                  </scrollbox>
+                  <Separator axis="x" start="edge-in" />
+                  <Show when={selectedNodeDetail()}>
+                    {(node) => (
+                      <box flexDirection="column" paddingLeft={1} flexShrink={0}>
+                        <box flexDirection="row" gap={1}>
+                          <text fg={theme().text} wrapMode="none">
+                            {node().name}
+                          </text>
+                          <text fg={theme().textMuted} wrapMode="none">
+                            {node().worker_type}
+                            {node().model_id ? ` · ${node().model_id}` : ""}
+                            {formatDagDuration(node().started_at, node().completed_at)
+                              ? ` · ${formatDagDuration(node().started_at, node().completed_at)}`
+                              : ""}
+                          </text>
+                        </box>
+                        <Show when={node().depends_on.length > 0}>
+                          <text fg={theme().textMuted} wrapMode="none">
+                            depends on {node().depends_on.join(", ")}
+                          </text>
+                        </Show>
+                        <Switch>
+                          <Match when={node().error_reason}>
+                            <text fg={theme().error} wrapMode="word">
+                              {formatDagError(node().error_reason!)}
+                            </text>
+                          </Match>
+                          <Match when={formatDagOutputPreview(node().output)}>
+                            <text fg={theme().textMuted} wrapMode="word">
+                              {formatDagOutputPreview(node().output)}
+                            </text>
+                          </Match>
+                        </Switch>
+                      </box>
+                    )}
+                  </Show>
+                </Panel>
+              </PanelGroup>
+            </Match>
+          </Switch>
         </box>
-      </box>
 
-      {/* Footer: shortcut hints */}
-      <box flexDirection="row" gap={2} flexShrink={0} border={["top"]} borderColor={theme().borderSubtle}>
-        <text fg={theme().textMuted}>↑/↓ node</text>
-        <text fg={theme().textMuted}>←/→ workflow</text>
-        <Show when={enterShortcut()}>
-          <text fg={theme().textMuted}>{enterShortcut()} open session</text>
-        </Show>
-        <text fg={theme().textMuted}>p pause</text>
-        <text fg={theme().textMuted}>r resume</text>
-        <text fg={theme().textMuted}>x cancel</text>
-        <Show when={closeShortcut()}>
-          <text fg={theme().textMuted}>{closeShortcut()} close</text>
-        </Show>
-      </box>
+        <Panel flexShrink={0} gap={2} paddingLeft={1} border="none">
+          <Show when={enterShortcut()}>
+            {(shortcut) => (
+              <text fg={theme().text}>
+                {shortcut()} <span style={{ fg: theme().textMuted }}>open session</span>
+              </text>
+            )}
+          </Show>
+          <Show when={pauseShortcut()}>
+            {(shortcut) => (
+              <text fg={theme().text}>
+                {shortcut()} <span style={{ fg: theme().textMuted }}>pause</span>
+              </text>
+            )}
+          </Show>
+          <Show when={resumeShortcut()}>
+            {(shortcut) => (
+              <text fg={theme().text}>
+                {shortcut()} <span style={{ fg: theme().textMuted }}>resume</span>
+              </text>
+            )}
+          </Show>
+          <Show when={stepShortcut()}>
+            {(shortcut) => (
+              <text fg={theme().text}>
+                {shortcut()} <span style={{ fg: theme().textMuted }}>step</span>
+              </text>
+            )}
+          </Show>
+          <Show when={cancelShortcut()}>
+            {(shortcut) => (
+              <text fg={theme().text}>
+                {shortcut()} <span style={{ fg: theme().textMuted }}>cancel</span>
+              </text>
+            )}
+          </Show>
+          <Show when={closeShortcut()}>
+            {(shortcut) => (
+              <text fg={theme().text}>
+                {shortcut()} <span style={{ fg: theme().textMuted }}>close</span>
+              </text>
+            )}
+          </Show>
+        </Panel>
+      </PanelGroup>
     </box>
   )
 }

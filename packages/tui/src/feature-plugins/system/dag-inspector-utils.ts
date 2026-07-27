@@ -42,13 +42,79 @@ export function computeWaves(nodes: readonly DagNode[]): DagNode[][] {
   return result
 }
 
+/**
+ * Visual row index of a node inside the rendered wave list, counting one row
+ * per wave header and one row per node. Used to scroll the selected node into
+ * view — valid only while every node renders as a single row.
+ */
+export function computeNodeRowIndex(layers: readonly (readonly DagNode[])[], nodeID: string): number | undefined {
+  let row = 0
+  for (const layer of layers) {
+    row++ // wave header
+    for (const node of layer) {
+      if (node.id === nodeID) return row
+      row++
+    }
+  }
+  return undefined
+}
+
 export function formatDagError(error: string) {
   return error
     .replace(/^Cause\(\[Die\((.*)\)\]\)$/, "$1")
     .replace(/^ProviderModelNotFoundError:\s*/, "")
 }
 
-export type DagControlOperation = "pause" | "resume" | "cancel"
+/** Compact "3m 12s" duration between two epoch-millis timestamps. The SDK
+ * serializes numbers with Infinity/NaN sentinels — non-finite inputs yield
+ * no duration. */
+export function formatDagDuration(startedAt: number | string | undefined, completedAt: number | string | undefined): string | undefined {
+  if (typeof startedAt !== "number" || !Number.isFinite(startedAt)) return undefined
+  const end = typeof completedAt === "number" && Number.isFinite(completedAt) ? completedAt : Date.now()
+  const totalSeconds = Math.max(0, Math.round((end - startedAt) / 1000))
+  const minutes = Math.floor(totalSeconds / 60)
+  const seconds = totalSeconds % 60
+  if (minutes === 0) return `${seconds}s`
+  return `${minutes}m ${seconds}s`
+}
+
+/** Single-line preview of a node's output for the detail pane. */
+export function formatDagOutputPreview(output: unknown, maxLength = 200): string | undefined {
+  if (output === undefined || output === null) return undefined
+  const text = typeof output === "string" ? output : JSON.stringify(output)
+  const flat = text.replace(/\s+/g, " ").trim()
+  if (flat === "") return undefined
+  return flat.length > maxLength ? `${flat.slice(0, maxLength)}…` : flat
+}
+
+/**
+ * Shared status→color mapping for every DAG surface (sidebar indicator,
+ * sidebar panel, inspector) so one status never renders in different colors
+ * across views. Accepts both workflow and node statuses. Generic over the
+ * theme's color type (RGBA at runtime).
+ */
+export function dagStatusColor<Color>(
+  theme: { success: Color; error: Color; warning: Color; text: Color; textMuted: Color },
+  status: string,
+): Color {
+  if (status === "completed") return theme.success
+  if (status === "failed") return theme.error
+  if (status === "paused" || status === "stepping") return theme.warning
+  if (status === "running") return theme.textMuted
+  if (status === "pending" || status === "queued") return theme.textMuted
+  if (status === "skipped" || status === "cancelled" || status === "aborted") return theme.textMuted
+  return theme.text
+}
+
+/** Status glyph for node rows — mirrors the todo-item ✓ vocabulary. */
+export function dagNodeGlyph(status: string): string {
+  if (status === "completed") return "✓"
+  if (status === "failed") return "✗"
+  if (status === "skipped" || status === "cancelled" || status === "aborted") return "⊘"
+  return "○"
+}
+
+export type DagControlOperation = "pause" | "resume" | "cancel" | "step"
 
 export function dagControlUnavailableMessage(status: string | undefined, operation: DagControlOperation) {
   const allowed =
@@ -56,14 +122,18 @@ export function dagControlUnavailableMessage(status: string | undefined, operati
       ? status === "running" || status === "stepping"
       : operation === "resume"
         ? status === "paused" || status === "stepping"
-        : status === "running" || status === "stepping" || status === "paused"
+        : operation === "step"
+          ? status === "running" || status === "stepping"
+          : status === "running" || status === "stepping" || status === "paused"
   if (allowed) return undefined
-  const action = operation === "pause" ? "paused" : operation === "resume" ? "resumed" : "cancelled"
+  const action =
+    operation === "pause" ? "paused" : operation === "resume" ? "resumed" : operation === "step" ? "stepped" : "cancelled"
   return `Workflow is ${status ?? "unavailable"} and cannot be ${action}`
 }
 
 export function dagControlProgressMessage(operation: DagControlOperation) {
   if (operation === "pause") return "Pausing workflow..."
   if (operation === "resume") return "Resuming workflow..."
+  if (operation === "step") return "Stepping workflow..."
   return "Cancelling workflow..."
 }

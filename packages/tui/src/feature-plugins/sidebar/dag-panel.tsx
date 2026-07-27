@@ -4,21 +4,12 @@ import type { DagNode, DagWorkflowSummary } from "@opencode-ai/sdk/v2"
 import type { BuiltinTuiPlugin } from "../builtins"
 import { createEffect, createMemo, createSignal, For, Show } from "solid-js"
 import { Spinner } from "../../component/spinner"
+import { dagNodeGlyph, dagStatusColor } from "../system/dag-inspector-utils"
 
 const id = "internal:sidebar-dag-panel"
 
 const ACTIVE_STATUSES = new Set(["running", "paused", "stepping"])
 const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled"])
-
-function statusColor(theme: TuiPluginApi["theme"]["current"], status: string) {
-  if (status === "completed") return theme.success
-  if (status === "failed") return theme.error
-  if (status === "cancelled") return theme.textMuted
-  if (status === "running") return theme.textMuted
-  if (status === "paused") return theme.warning
-  if (status === "stepping") return theme.warning
-  return theme.textMuted
-}
 
 function WorkflowRow(props: {
   api: TuiPluginApi
@@ -61,27 +52,19 @@ function WorkflowRow(props: {
     void fetchNodes(props.summary.id, sig)
   })
 
-  const bar = () => {
-    const width = 6
-    const t = total()
-    if (t <= 0) return ""
-    const filled = Math.round((completed() / t) * width)
-    return "▓".repeat(filled) + "░".repeat(width - filled)
-  }
-
   return (
     <box flexDirection="column">
       <box flexDirection="row" gap={1} onMouseDown={props.onToggle}>
-        <text flexShrink={0} style={{ fg: statusColor(theme(), props.summary.status) }}>
-          {props.expanded ? "▼" : "▶"}
+        <text flexShrink={0} style={{ fg: dagStatusColor(theme(), props.summary.status) }}>
+          •
         </text>
-        <text fg={theme().text} wrapMode="char">
-          {props.summary.title}
-        </text>
-        <text flexShrink={0} fg={theme().textMuted}>
-          {bar()} {completed()}/{total()}
-          {running() > 0 ? ` ▶${running()}` : ""}
-          {failed() > 0 ? ` ✗${failed()}` : ""}
+        <text fg={theme().text} wrapMode="word">
+          {props.summary.title}{" "}
+          <span style={{ fg: theme().textMuted }}>
+            ({completed()}/{total()}
+            {running() > 0 ? `, ${running()} running` : ""}
+            {failed() > 0 ? `, ${failed()} failed` : ""})
+          </span>
         </text>
       </box>
       <Show when={props.expanded}>
@@ -89,21 +72,12 @@ function WorkflowRow(props: {
           <For each={nodes()}>
             {(node) => (
               <box flexDirection="row" gap={1}>
-                <Show
-                  when={node.status !== "running"}
-                  fallback={<Spinner color={theme().textMuted} />}
-                >
-                  <text flexShrink={0} style={{ fg: statusColor(theme(), node.status) }}>
-                    {node.status === "completed"
-                      ? "✓"
-                      : node.status === "failed"
-                        ? "✗"
-                        : node.status === "skipped" || node.status === "cancelled"
-                          ? "⊘"
-                          : "○"}
+                <Show when={node.status !== "running"} fallback={<Spinner color={theme().textMuted} />}>
+                  <text flexShrink={0} style={{ fg: dagStatusColor(theme(), node.status) }}>
+                    {dagNodeGlyph(node.status)}
                   </text>
                 </Show>
-                <text fg={theme().text} wrapMode="char">
+                <text fg={theme().textMuted} wrapMode="word">
                   {node.name}
                 </text>
               </box>
@@ -116,6 +90,7 @@ function WorkflowRow(props: {
 }
 
 function DagPanel(props: { api: TuiPluginApi; session_id: string }) {
+  const [open, setOpen] = createSignal(true)
   const theme = () => props.api.theme.current
   const dags = createMemo(() => props.api.state.session.dag(props.session_id))
   const active = createMemo(() => dags().filter((d) => ACTIVE_STATUSES.has(d.status)))
@@ -146,29 +121,40 @@ function DagPanel(props: { api: TuiPluginApi; session_id: string }) {
 
   return (
     <Show when={dags().length > 0}>
-      <box flexDirection="column" gap={1}>
-        <text fg={theme().text}>
-          <b>DAG</b>
-        </text>
-        <For each={active()}>
-          {(summary) => (
-            <WorkflowRow
-              api={props.api}
-              summary={summary}
-              expanded={isExpanded(summary.id)}
-              onToggle={() => toggle(summary.id)}
-            />
-          )}
-        </For>
-        <Show when={terminal().length > 0}>
-          <box flexDirection="column">
-            <box flexDirection="row" gap={1} onMouseDown={() => setShowTerminal((x) => !x)}>
-              <text fg={theme().textMuted}>
-                {showTerminal() ? "▼" : "▶"} done ({terminal().length})
-              </text>
-            </box>
-            <Show when={showTerminal()}>
-              <box flexDirection="column" paddingLeft={1}>
+      <box>
+        <box flexDirection="row" gap={1} onMouseDown={() => dags().length > 2 && setOpen((x) => !x)}>
+          <Show when={dags().length > 2}>
+            <text fg={theme().text}>{open() ? "▼" : "▶"}</text>
+          </Show>
+          <text fg={theme().text}>
+            <b>DAG</b>
+            <Show when={!open() && dags().length > 2}>
+              <span style={{ fg: theme().textMuted }}>
+                {" "}
+                ({active().length} active{terminal().length > 0 ? `, ${terminal().length} done` : ""})
+              </span>
+            </Show>
+          </text>
+        </box>
+        <Show when={dags().length <= 2 || open()}>
+          <For each={active()}>
+            {(summary) => (
+              <WorkflowRow
+                api={props.api}
+                summary={summary}
+                expanded={isExpanded(summary.id)}
+                onToggle={() => toggle(summary.id)}
+              />
+            )}
+          </For>
+          <Show when={terminal().length > 0}>
+            <box flexDirection="column">
+              <box flexDirection="row" gap={1} onMouseDown={() => setShowTerminal((x) => !x)}>
+                <text fg={theme().textMuted}>
+                  {showTerminal() ? "▼" : "▶"} done ({terminal().length})
+                </text>
+              </box>
+              <Show when={showTerminal()}>
                 <For each={terminal()}>
                   {(summary) => (
                     <WorkflowRow
@@ -179,9 +165,9 @@ function DagPanel(props: { api: TuiPluginApi; session_id: string }) {
                     />
                   )}
                 </For>
-              </box>
-            </Show>
-          </box>
+              </Show>
+            </box>
+          </Show>
         </Show>
       </box>
     </Show>
