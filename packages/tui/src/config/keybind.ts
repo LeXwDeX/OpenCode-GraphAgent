@@ -83,6 +83,7 @@ export const Definitions = {
   dag_previous_workflow: keybind("h,left", "Select previous DAG workflow"),
   dag_pause: keybind("p", "Pause selected DAG workflow"),
   dag_resume: keybind("r", "Resume selected DAG workflow"),
+  dag_step: keybind("s", "Step selected DAG workflow (run one node)"),
   dag_cancel: keybind("x", "Cancel selected DAG workflow"),
 
   editor_open: keybind("<leader>e", "Open external editor"),
@@ -301,6 +302,7 @@ export const CommandMap = {
   dag_previous_workflow: "dag.previous_workflow",
   dag_pause: "dag.pause",
   dag_resume: "dag.resume",
+  dag_step: "dag.step",
   dag_cancel: "dag.cancel",
   editor_open: "prompt.editor",
   theme_list: "theme.switch",

@@ -1,9 +1,14 @@
 import { describe, expect, test } from "bun:test"
 import {
+  computeNodeRowIndex,
   computeWaves,
   dagControlProgressMessage,
   dagControlUnavailableMessage,
+  dagNodeGlyph,
+  dagStatusColor,
+  formatDagDuration,
   formatDagError,
+  formatDagOutputPreview,
   type DagNode,
 } from "../../src/feature-plugins/system/dag-inspector-utils"
 
@@ -87,5 +92,62 @@ describe("DAG control state", () => {
     expect(dagControlProgressMessage("pause")).toBe("Pausing workflow...")
     expect(dagControlProgressMessage("resume")).toBe("Resuming workflow...")
     expect(dagControlProgressMessage("cancel")).toBe("Cancelling workflow...")
+  })
+
+  test("step is available while running or stepping only", () => {
+    expect(dagControlUnavailableMessage("running", "step")).toBeUndefined()
+    expect(dagControlUnavailableMessage("stepping", "step")).toBeUndefined()
+    expect(dagControlUnavailableMessage("paused", "step")).toBe("Workflow is paused and cannot be stepped")
+    expect(dagControlProgressMessage("step")).toBe("Stepping workflow...")
+  })
+})
+
+describe("computeNodeRowIndex", () => {
+  test("counts one row per wave header plus one row per node", () => {
+    const layers = computeWaves([node("a"), node("b", ["a"]), node("c", ["a"]), node("d", ["b", "c"])])
+    // rows: 0 wave1 header, 1 a, 2 wave2 header, 3 b, 4 c, 5 wave3 header, 6 d
+    expect(computeNodeRowIndex(layers, "a")).toBe(1)
+    expect(computeNodeRowIndex(layers, "b")).toBe(3)
+    expect(computeNodeRowIndex(layers, "c")).toBe(4)
+    expect(computeNodeRowIndex(layers, "d")).toBe(6)
+    expect(computeNodeRowIndex(layers, "missing")).toBeUndefined()
+  })
+})
+
+describe("shared status presentation", () => {
+  const theme = { success: "S", error: "E", warning: "W", text: "T", textMuted: "M" }
+
+  test("one status maps to one color across every DAG surface", () => {
+    expect(dagStatusColor(theme, "completed")).toBe("S")
+    expect(dagStatusColor(theme, "failed")).toBe("E")
+    expect(dagStatusColor(theme, "paused")).toBe("W")
+    expect(dagStatusColor(theme, "stepping")).toBe("W")
+    expect(dagStatusColor(theme, "running")).toBe("M")
+    expect(dagStatusColor(theme, "skipped")).toBe("M")
+    expect(dagStatusColor(theme, "cancelled")).toBe("M")
+  })
+
+  test("node glyphs mirror the todo-item vocabulary", () => {
+    expect(dagNodeGlyph("completed")).toBe("✓")
+    expect(dagNodeGlyph("failed")).toBe("✗")
+    expect(dagNodeGlyph("skipped")).toBe("⊘")
+    expect(dagNodeGlyph("pending")).toBe("○")
+  })
+})
+
+describe("node detail formatting", () => {
+  test("formats durations and tolerates SDK non-finite sentinels", () => {
+    expect(formatDagDuration(1_000, 63_000)).toBe("1m 2s")
+    expect(formatDagDuration(1_000, 5_000)).toBe("4s")
+    expect(formatDagDuration(undefined, 5_000)).toBeUndefined()
+    expect(formatDagDuration("NaN", 5_000)).toBeUndefined()
+  })
+
+  test("flattens output previews to one bounded line", () => {
+    expect(formatDagOutputPreview("line one\n  line two")).toBe("line one line two")
+    expect(formatDagOutputPreview({ verdict: "ACCEPT" })).toBe('{"verdict":"ACCEPT"}')
+    expect(formatDagOutputPreview(null)).toBeUndefined()
+    expect(formatDagOutputPreview("   ")).toBeUndefined()
+    expect(formatDagOutputPreview("x".repeat(300))?.length).toBe(201)
   })
 })
