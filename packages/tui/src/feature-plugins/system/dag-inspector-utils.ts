@@ -158,16 +158,17 @@ export function dagNodeGlyph(status: string): string {
 
 export type DagControlOperation = "pause" | "resume" | "cancel" | "step"
 
+/** Whether a control operation applies to the workflow's current status.
+ * Shared by keybinding feedback and the footer's contextual hints so the
+ * hint bar never advertises an operation that would only produce a toast. */
+export function dagControlAllowed(status: string | undefined, operation: DagControlOperation): boolean {
+  if (operation === "pause" || operation === "step") return status === "running" || status === "stepping"
+  if (operation === "resume") return status === "paused" || status === "stepping"
+  return status === "running" || status === "stepping" || status === "paused"
+}
+
 export function dagControlUnavailableMessage(status: string | undefined, operation: DagControlOperation) {
-  const allowed =
-    operation === "pause"
-      ? status === "running" || status === "stepping"
-      : operation === "resume"
-        ? status === "paused" || status === "stepping"
-        : operation === "step"
-          ? status === "running" || status === "stepping"
-          : status === "running" || status === "stepping" || status === "paused"
-  if (allowed) return undefined
+  if (dagControlAllowed(status, operation)) return undefined
   const action =
     operation === "pause" ? "paused" : operation === "resume" ? "resumed" : operation === "step" ? "stepped" : "cancelled"
   return `Workflow is ${status ?? "unavailable"} and cannot be ${action}`

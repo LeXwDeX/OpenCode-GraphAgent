@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test"
 import {
   computeNodeRowIndex,
   computeWaves,
+  dagControlAllowed,
   dagControlProgressMessage,
   dagControlUnavailableMessage,
   dagNodeGlyph,
@@ -103,6 +104,16 @@ describe("DAG control state", () => {
     expect(dagControlUnavailableMessage("stepping", "step")).toBeUndefined()
     expect(dagControlUnavailableMessage("paused", "step")).toBe("Workflow is paused and cannot be stepped")
     expect(dagControlProgressMessage("step")).toBe("Stepping workflow...")
+  })
+
+  test("dagControlAllowed mirrors the unavailable-message predicate", () => {
+    expect(dagControlAllowed("running", "pause")).toBe(true)
+    expect(dagControlAllowed("paused", "pause")).toBe(false)
+    expect(dagControlAllowed("paused", "resume")).toBe(true)
+    expect(dagControlAllowed("running", "resume")).toBe(false)
+    expect(dagControlAllowed("paused", "cancel")).toBe(true)
+    expect(dagControlAllowed("completed", "cancel")).toBe(false)
+    expect(dagControlAllowed(undefined, "pause")).toBe(false)
   })
 })
 

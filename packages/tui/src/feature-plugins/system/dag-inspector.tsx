@@ -9,6 +9,7 @@ import { Panel, PanelGroup, Separator } from "./diff-viewer-ui"
 import {
   computeNodeRowIndex,
   computeWaves,
+  dagControlAllowed,
   dagControlProgressMessage,
   dagControlUnavailableMessage,
   dagNodeGlyph,
@@ -27,6 +28,9 @@ import type { DagWorkflowSummary } from "@opencode-ai/sdk/v2"
 const id = "internal:system-dag-inspector"
 const ROUTE = "dag"
 const WORKFLOW_LIST_WIDTH = 32
+// Node detail rows below the wave list: header, dependencies, error/output
+// preview. Fixed so changing the selection never moves the footer.
+const NODE_DETAIL_HEIGHT = 3
 
 function scrollRowIntoView(scroll: ScrollBoxRenderable | undefined, index: number) {
   if (!scroll) return
@@ -350,6 +354,21 @@ function DagInspector(props: { api: TuiPluginApi }) {
   const selectedWorkflowSummary = createMemo(() => workflows().find((workflow) => workflow.id === selectedWorkflow()))
   const selectedNodeDetail = createMemo(() => orderedNodes().find((node) => node.id === selectedNode()))
 
+  // Footer hints mirror the diff-viewer's `key label` vocabulary. Control
+  // hints are contextual: only operations valid for the selected workflow's
+  // status appear, so pause/resume never advertise a guaranteed no-op.
+  const footerHints = createMemo(() => {
+    const status = selectedWorkflowSummary()?.status
+    return [
+      { key: enterShortcut(), label: "open session", show: true },
+      { key: pauseShortcut(), label: "pause", show: dagControlAllowed(status, "pause") },
+      { key: resumeShortcut(), label: "resume", show: dagControlAllowed(status, "resume") },
+      { key: stepShortcut(), label: "step", show: dagControlAllowed(status, "step") },
+      { key: cancelShortcut(), label: "cancel", show: dagControlAllowed(status, "cancel") },
+      { key: closeShortcut(), label: "close", show: true },
+    ].filter((hint) => hint.show && hint.key !== "")
+  })
+
   // 1s tick driving the running-node deadline countdown. Only active while the
   // selected node is actually counting down — idle inspectors don't re-render.
   const [now, setNow] = createSignal(Date.now())
@@ -486,7 +505,7 @@ function DagInspector(props: { api: TuiPluginApi }) {
                                       {dagNodeGlyph(node.status)}
                                     </text>
                                   </Show>
-                                  <box flexGrow={1} minWidth={0}>
+                                  <box flexShrink={1} minWidth={0}>
                                     <text
                                       fg={
                                         selected()
@@ -500,7 +519,11 @@ function DagInspector(props: { api: TuiPluginApi }) {
                                       {node.name}
                                     </text>
                                   </box>
-                                  <text fg={selected() ? theme().background : theme().textMuted} flexShrink={0}>
+                                  <text
+                                    fg={selected() ? theme().background : theme().textMuted}
+                                    wrapMode="none"
+                                    flexShrink={0}
+                                  >
                                     {node.worker_type}
                                   </text>
                                 </box>
@@ -512,49 +535,54 @@ function DagInspector(props: { api: TuiPluginApi }) {
                     </For>
                   </scrollbox>
                   <Separator axis="x" start="edge-in" />
-                  <Show when={selectedNodeDetail()}>
-                    {(node) => (
-                      <box flexDirection="column" paddingLeft={1} flexShrink={0}>
-                        <box flexDirection="row" gap={1}>
-                          <text fg={theme().text} wrapMode="none">
-                            {node().name}
-                          </text>
-                          <text fg={theme().textMuted} wrapMode="none">
-                            {node().worker_type}
-                            {node().model_id ? ` · ${node().model_id}` : ""}
-                            {formatDagDuration(node().started_at, node().completed_at)
-                              ? ` · ${formatDagDuration(node().started_at, node().completed_at)}`
-                              : ""}
-                            {dagNodeHistoryLabel(node()) ? ` · ${dagNodeHistoryLabel(node())}` : ""}
-                          </text>
-                          <Show when={formatDagDeadline(node().status, node().deadline_ms, now())}>
-                            {(deadline) => (
-                              <text fg={deadline() === "overdue" ? theme().error : theme().warning} wrapMode="none">
-                                {deadline()}
-                              </text>
-                            )}
+                  <box flexDirection="column" paddingLeft={1} flexShrink={0} height={NODE_DETAIL_HEIGHT}>
+                    <Show when={selectedNodeDetail()}>
+                      {(node) => (
+                        <>
+                          <box flexDirection="row" gap={1}>
+                            <text fg={theme().text} wrapMode="none" flexShrink={0}>
+                              {node().name}
+                            </text>
+                            <text fg={theme().textMuted} wrapMode="none">
+                              {node().worker_type}
+                              {node().model_id ? ` · ${node().model_id}` : ""}
+                              {formatDagDuration(node().started_at, node().completed_at)
+                                ? ` · ${formatDagDuration(node().started_at, node().completed_at)}`
+                                : ""}
+                              {dagNodeHistoryLabel(node()) ? ` · ${dagNodeHistoryLabel(node())}` : ""}
+                            </text>
+                            <Show when={formatDagDeadline(node().status, node().deadline_ms, now())}>
+                              {(deadline) => (
+                                <text wrapMode="none" flexShrink={0}>
+                                  <span style={{ fg: theme().textMuted }}>·</span>{" "}
+                                  <span style={{ fg: deadline() === "overdue" ? theme().error : theme().warning }}>
+                                    {deadline()}
+                                  </span>
+                                </text>
+                              )}
+                            </Show>
+                          </box>
+                          <Show when={node().depends_on.length > 0}>
+                            <text fg={theme().textMuted} wrapMode="none">
+                              depends on {node().depends_on.join(", ")}
+                            </text>
                           </Show>
-                        </box>
-                        <Show when={node().depends_on.length > 0}>
-                          <text fg={theme().textMuted} wrapMode="none">
-                            depends on {node().depends_on.join(", ")}
-                          </text>
-                        </Show>
-                        <Switch>
-                          <Match when={node().error_reason}>
-                            <text fg={theme().error} wrapMode="word">
-                              {formatDagError(node().error_reason!)}
-                            </text>
-                          </Match>
-                          <Match when={formatDagOutputPreview(node().output)}>
-                            <text fg={theme().textMuted} wrapMode="word">
-                              {formatDagOutputPreview(node().output)}
-                            </text>
-                          </Match>
-                        </Switch>
-                      </box>
-                    )}
-                  </Show>
+                          <Switch>
+                            <Match when={node().error_reason}>
+                              <text fg={theme().error} wrapMode="none">
+                                {formatDagError(node().error_reason!)}
+                              </text>
+                            </Match>
+                            <Match when={formatDagOutputPreview(node().output)}>
+                              <text fg={theme().textMuted} wrapMode="none">
+                                {formatDagOutputPreview(node().output)}
+                              </text>
+                            </Match>
+                          </Switch>
+                        </>
+                      )}
+                    </Show>
+                  </box>
                 </Panel>
               </PanelGroup>
             </Match>
@@ -562,48 +590,13 @@ function DagInspector(props: { api: TuiPluginApi }) {
         </box>
 
         <Panel flexShrink={0} gap={2} paddingLeft={1} border="none">
-          <Show when={enterShortcut()}>
-            {(shortcut) => (
+          <For each={footerHints()}>
+            {(hint) => (
               <text fg={theme().text}>
-                {shortcut()} <span style={{ fg: theme().textMuted }}>open session</span>
+                {hint.key} <span style={{ fg: theme().textMuted }}>{hint.label}</span>
               </text>
             )}
-          </Show>
-          <Show when={pauseShortcut()}>
-            {(shortcut) => (
-              <text fg={theme().text}>
-                {shortcut()} <span style={{ fg: theme().textMuted }}>pause</span>
-              </text>
-            )}
-          </Show>
-          <Show when={resumeShortcut()}>
-            {(shortcut) => (
-              <text fg={theme().text}>
-                {shortcut()} <span style={{ fg: theme().textMuted }}>resume</span>
-              </text>
-            )}
-          </Show>
-          <Show when={stepShortcut()}>
-            {(shortcut) => (
-              <text fg={theme().text}>
-                {shortcut()} <span style={{ fg: theme().textMuted }}>step</span>
-              </text>
-            )}
-          </Show>
-          <Show when={cancelShortcut()}>
-            {(shortcut) => (
-              <text fg={theme().text}>
-                {shortcut()} <span style={{ fg: theme().textMuted }}>cancel</span>
-              </text>
-            )}
-          </Show>
-          <Show when={closeShortcut()}>
-            {(shortcut) => (
-              <text fg={theme().text}>
-                {shortcut()} <span style={{ fg: theme().textMuted }}>close</span>
-              </text>
-            )}
-          </Show>
+          </For>
         </Panel>
       </PanelGroup>
     </box>
