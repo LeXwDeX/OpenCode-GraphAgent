@@ -7,7 +7,7 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 import { DagEvent } from "@opencode-ai/schema/dag-event"
 import { SessionStatusEvent } from "@opencode-ai/schema/session-status-event"
 import { DagStore } from "@opencode-ai/core/dag/store"
-import { WorkflowRuntime, type SchedulingNode } from "@opencode-ai/core/dag/core/scheduling"
+import { WorkflowRuntime, toSchedulingNodes } from "@opencode-ai/core/dag/core/scheduling"
 import { isWorkflowTerminalStatus } from "@opencode-ai/core/dag/core/types"
 import { Dag, type WorkflowConfig, parseWorkflowConfig } from "../dag"
 import { projectBriefForNode } from "../admission"
@@ -32,23 +32,6 @@ export interface Interface {
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/DagLoop") {}
-
-export const SUCCESS_TERMINAL = new Set(["completed", "skipped", "aborted"])
-
-export function toSchedulingNodes(nodes: readonly DagStore.NodeRow[]): SchedulingNode[] {
-  return nodes.map((n) => ({
-    id: n.id,
-    dependsOn: n.dependsOn,
-    required: n.required,
-    status: SUCCESS_TERMINAL.has(n.status)
-      ? ("satisfied" as const)
-      : n.status === "failed"
-        ? ("unsatisfied" as const)
-        : n.status === "running"
-          ? ("running" as const)
-          : ("pending" as const),
-  }))
-}
 
 interface WorkflowEntry {
   runtime: WorkflowRuntime
@@ -79,6 +62,20 @@ export const layer = Layer.effect(
         const spawnReady = Effect.fn("DagLoop.spawnReady")(function* (dagID: string) {
           const entry = runtimes.get(dagID)
           if (!entry) return
+          // D13: settle cascade-skips before spawning. A node whose dependencies
+          // are all skipped can never receive a real input; publish a durable
+          // NodeSkipped(orphan_cascade) wave by wave until a fixpoint so gated
+          // subtrees terminalize instead of running on placeholder inputs.
+          // Eagerly markSkipped so the fixpoint advances synchronously; the
+          // NodeSkipped handler's isActive guard then no-ops on these events.
+          for (;;) {
+            const cascade = entry.runtime.getCascadeSkipNodes()
+            if (cascade.length === 0) break
+            for (const nodeID of cascade) {
+              entry.runtime.markSkipped(nodeID)
+              yield* dag.nodeSkipped(dagID, nodeID, "orphan_cascade").pipe(Effect.ignore)
+            }
+          }
           const ready = entry.runtime.getReadyNodes()
           for (const nodeID of ready) {
             const node = yield* store.getNode(dagID, nodeID)
@@ -235,8 +232,14 @@ export const layer = Layer.effect(
           if (!entry.runtime.isComplete()) return
           const wf = yield* store.getWorkflow(dagID).pipe(Effect.orDie)
           if (wf && isWorkflowTerminalStatus(wf.status as never)) return
-          if (entry.runtime.hasRequiredFailure()) yield* dag.cancel(dagID)
-          else yield* dag.complete(dagID)
+          // A required-node failure is a workflow FAILURE, not a cancellation —
+          // "cancelled" is reserved for explicit user/agent cancels so the
+          // terminal status attributes the outcome correctly (P2-1).
+          if (entry.runtime.hasRequiredFailure()) {
+            yield* dag.fail(dagID, `required node(s) failed: ${entry.runtime.getRequiredFailures().join(", ")}`)
+            return
+          }
+          yield* dag.complete(dagID)
         })
 
         const checkSessionStatus = makeSessionStatusChecker(sessionSvc)
@@ -260,7 +263,26 @@ export const layer = Layer.effect(
           ).pipe(
             Effect.provideService(Dag.Service, dag),
           )
-          if (recovery.ownershipLost > 0) {
+          // P2-2 recovery-pause: reconciliation invented failures (ownership
+          // lost / no child session / deadline enforced offline) without any
+          // durable proof of the child's outcome. Letting spawnReady cascade
+          // skips and checkCompletion terminalize now would weld the workflow
+          // into a terminal status the parent never sanctioned — and terminal
+          // nodes are immutable, so replan could no longer rewire downstream.
+          // Pause instead: pending nodes stay replannable, the durable
+          // NodeFailed wake rows reach the parent at the paused delivery
+          // boundary, and disposition (replan / resume / cancel) stays under
+          // explicit workflow control.
+          const pausedForRecovery = recovery.ownershipLost > 0 && wf.status === "running"
+          if (pausedForRecovery) {
+            yield* dag.pause(dagID)
+            yield* Effect.logWarning("DagLoop paused workflow after recovery invented node failures", {
+              dagID,
+              reconciled: recovery.reconciled,
+              ownershipLost: recovery.ownershipLost,
+            })
+          }
+          if (recovery.ownershipLost > 0 && !pausedForRecovery) {
             yield* Effect.logWarning("DagLoop terminalized recovered nodes after execution ownership loss", {
               dagID,
               reconciled: recovery.reconciled,
@@ -271,7 +293,7 @@ export const layer = Layer.effect(
           const maxConcurrency = Math.max(1, config?.max_concurrency ?? Dag.DEFAULT_WORKFLOW_CONFIG.maxConcurrency)
           const runtime = new WorkflowRuntime(toSchedulingNodes(nodes), maxConcurrency)
           const semaphore = Semaphore.makeUnsafe(maxConcurrency)
-          const isPaused = wf.status === "paused"
+          const isPaused = wf.status === "paused" || pausedForRecovery
           const isStepping = wf.status === "stepping"
           if (isPaused) runtime.setPaused(true)
           if (isStepping) runtime.setStepMode(true)
@@ -287,6 +309,12 @@ export const layer = Layer.effect(
                 yield* checkCompletion(dagID)
               }),
             )
+          }
+          // Deliver the invented-failure wake rows now instead of waiting for
+          // the next idle event — the workflow just paused itself and the
+          // parent is the only actor that can dispose of it.
+          if (pausedForRecovery) {
+            yield* tryDeliverWake(wf.sessionId).pipe(Effect.ignore, Effect.forkScoped)
           }
         })
 
@@ -316,6 +344,12 @@ export const layer = Layer.effect(
         )
 
         for (const def of [DagEvent.NodeCompleted, DagEvent.NodeSkipped]) {
+          // A completed node is an output-producing success; a skipped node is a
+          // terminal no-output state that must stay distinguishable so pure-skip
+          // descendants cascade instead of running (D13).
+          const settle = def === DagEvent.NodeSkipped
+            ? (entry: WorkflowEntry, nodeID: string) => entry.runtime.markSkipped(nodeID)
+            : (entry: WorkflowEntry, nodeID: string) => entry.runtime.markSatisfied(nodeID)
           yield* events.subscribe(def).pipe(
             Stream.filter((e) => runtimes.has(e.data.dagID as string)),
             Stream.runForEach((evt) =>
@@ -333,7 +367,7 @@ export const layer = Layer.effect(
                     // (markUnsatisfied) or already satisfied must not be flipped
                     // back. Mirrors the NodeFailed handler's isActive guard.
                     if (entry.runtime.isActive(evt.data.nodeID as string)) {
-                      entry.runtime.markSatisfied(evt.data.nodeID as string)
+                      settle(entry, evt.data.nodeID as string)
                       // In stepMode, do NOT auto-advance — wait for the next
                       // explicit step command. checkCompletion still runs so
                       // required-node failure / early completion is detected.
@@ -455,6 +489,11 @@ export const layer = Layer.effect(
                   entry.runtime.setPaused(false)
                   entry.runtime.setStepMode(false)
                   yield* spawnReady(dagID)
+                  // A workflow can be resumed with every node already settled
+                  // (e.g. recovery-pause on a single lost node). Without this,
+                  // nothing else re-runs completion and the workflow hangs in
+                  // running forever.
+                  yield* checkCompletion(dagID)
                 }),
               )
             }).pipe(Effect.ignore),
@@ -546,7 +585,13 @@ export const layer = Layer.effect(
             if (workflow.status === "paused" || workflow.status === "stepping") return true
             if (entry?.runtime.isPaused() || entry?.runtime.isStepMode()) return true
             if (workflow.status !== "running" || !entry) return false
-            if (entry.runtime.hasRunningMatching((id) => entry.fibers.has(id))) return false
+            // Delivery boundary uses the runtime's own running set, NOT fiber
+            // ownership: between markRunning and fibers.set the spawn path has
+            // async yield points, and a wake reading that window would misjudge
+            // "running, no fiber, nothing ready" as a stalled boundary and
+            // deliver a mid-flight batch. The orchestrator-unresponsive net
+            // below keeps the stricter fiber-ownership check.
+            if (entry.runtime.hasRunning()) return false
             return entry.runtime.getReadyNodes().length === 0
           })
           const atBoundary = new Set(boundaryWorkflows.map((workflow) => workflow.id))

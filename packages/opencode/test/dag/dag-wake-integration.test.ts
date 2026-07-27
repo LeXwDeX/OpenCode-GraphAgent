@@ -819,9 +819,12 @@ describe("DagLoop atomic wake integration", () => {
             expect(
               (yield* store.getNode("dag_recovered_conditional", "conditional"))?.status,
             ).toBe("skipped")
-            expect(
-              (yield* store.getNode("dag_recovered_conditional", "after-conditional"))?.status,
-            ).toBe("completed")
+            // D13: after-conditional depends only on the skipped conditional
+            // node, so it cascade-skips instead of running on a placeholder
+            // input — the gate rejection blocks the whole downstream subtree.
+            const afterConditional = yield* store.getNode("dag_recovered_conditional", "after-conditional")
+            expect(afterConditional?.status).toBe("skipped")
+            expect(afterConditional?.errorReason).toBe("orphan_cascade")
             expect(promptText(parent.input)).toContain(
               'Node "quality-gate" completed: REJECT',
             )
@@ -936,6 +939,63 @@ describe("DagLoop atomic wake integration", () => {
 
           expect((yield* store.getWorkflow(dagID))?.status).toBe("stepping")
           expect((yield* store.getNode(dagID, "after"))?.status).toBe("pending")
+        }),
+      ),
+    )
+  })
+
+  it("cascade-skips the whole downstream subtree when a condition gate rejects", async () => {
+    await Effect.runPromise(
+      runWakeTest(({ dag, store, childPrompts, parentPrompts }) =>
+        Effect.gen(function* () {
+          const dagID = yield* dag.create({
+            projectID: "project-1",
+            sessionID: "ses_parent",
+            title: "Gated pipeline",
+            config: {
+              name: "gated-pipeline",
+              nodes: [
+                node("quality-gate"),
+                {
+                  ...node("implement", ["quality-gate"]),
+                  report_to_parent: false,
+                  condition: 'quality-gate.output.verdict == "ACCEPT"',
+                },
+                { ...node("integrate", ["implement"]), report_to_parent: false },
+                { ...node("final-audit", ["integrate"]), report_to_parent: false },
+              ],
+            },
+          })
+
+          const gate = yield* takeWithin(childPrompts, "quality-gate did not start")
+          yield* Deferred.succeed(gate.release, "REJECT")
+
+          // D13 regression: the gate rejection must terminalize the whole
+          // subtree without executing it — implement skips on condition_false
+          // and integrate / final-audit cascade-skip because their only
+          // dependency is skipped. Pre-fix, skip ≡ satisfied ran the full
+          // chain and the audit "passed" a rejected gate.
+          yield* pollWithTimeout(
+            store.getWorkflow(dagID).pipe(
+              Effect.map((workflow) => workflow?.status === "completed" ? workflow : undefined),
+            ),
+            "gated workflow did not complete after the gate rejection",
+          )
+          const implement = yield* store.getNode(dagID, "implement")
+          expect(implement?.status).toBe("skipped")
+          expect(implement?.errorReason).toBe("condition_false")
+          const integrate = yield* store.getNode(dagID, "integrate")
+          expect(integrate?.status).toBe("skipped")
+          expect(integrate?.errorReason).toBe("orphan_cascade")
+          const audit = yield* store.getNode(dagID, "final-audit")
+          expect(audit?.status).toBe("skipped")
+          expect(audit?.errorReason).toBe("orphan_cascade")
+          // No downstream child session was ever spawned.
+          expect(Option.isNone(yield* Queue.poll(childPrompts))).toBe(true)
+
+          const parent = yield* takeWithin(parentPrompts, "gate wake did not reach the parent")
+          expect(promptText(parent.input)).toContain('Node "quality-gate" completed: REJECT')
+          yield* Deferred.succeed(parent.release, "success")
         }),
       ),
     )

@@ -1,10 +1,10 @@
 export * as DagStore from "./store"
 
-import { and, asc, desc, eq, gte, lte, inArray } from "drizzle-orm"
+import { and, asc, desc, eq, inArray } from "drizzle-orm"
 import { Context, Effect, Layer } from "effect"
 import { Database } from "../database/database"
 import { LayerNode } from "../effect/layer-node"
-import { WorkflowNodeTable, WorkflowTable, WorkflowViolationTable } from "./sql"
+import { WorkflowNodeTable, WorkflowTable } from "./sql"
 
 // ============================================================================
 // Row → domain types
@@ -58,17 +58,6 @@ export interface WakeSnapshot {
   readonly workflows: readonly WorkflowRow[]
 }
 
-export interface ViolationRow {
-  id: string
-  workflowId: string
-  nodeId: string | null
-  type: string
-  severity: string
-  message: string
-  details: Record<string, unknown> | null
-  timeCreated: number
-}
-
 /** Aggregated per-workflow progress for UI display. Shape matches the TUI's DagWorkflowSummary. */
 export interface WorkflowSummary {
   id: string
@@ -118,29 +107,6 @@ const mapNode = (r: typeof WorkflowNodeTable.$inferSelect): NodeRow => ({
   completedAt: r.completed_at,
 })
 
-const mapViolation = (r: typeof WorkflowViolationTable.$inferSelect): ViolationRow => ({
-  id: r.id,
-  workflowId: r.workflow_id,
-  nodeId: r.node_id,
-  type: r.type,
-  severity: r.severity,
-  message: r.message,
-  details: r.details,
-  timeCreated: r.time_created,
-})
-
-// ============================================================================
-// Query filters
-// ============================================================================
-
-export interface ViolationQuery {
-  workflowId?: string
-  severity?: string
-  type?: string
-  since?: number
-  until?: number
-}
-
 // ============================================================================
 // Service interface
 // ============================================================================
@@ -166,10 +132,6 @@ export interface Interface {
   readonly getUnreportedWakeWorkflows: (sessionID: string) => Effect.Effect<WorkflowRow[]>
   readonly getSessionsWithUnreportedWakes: () => Effect.Effect<string[]>
   readonly hasReportedWakeNodes: (sessionID: string) => Effect.Effect<boolean>
-
-  readonly listViolations: (workflowId: string) => Effect.Effect<ViolationRow[]>
-  readonly countBySeverity: (workflowId: string) => Effect.Effect<Record<string, number>>
-  readonly queryViolations: (query: ViolationQuery) => Effect.Effect<ViolationRow[]>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/v2/DagStore") {}
@@ -463,46 +425,6 @@ export const layer = Layer.effect(
           .all()
           .pipe(Effect.orDie)
         return rows.length > 0
-      }),
-
-      listViolations: Effect.fn("DagStore.listViolations")(function* (workflowId) {
-        const rows = yield* db
-          .select()
-          .from(WorkflowViolationTable)
-          .where(eq(WorkflowViolationTable.workflow_id, workflowId))
-          .orderBy(desc(WorkflowViolationTable.time_created))
-          .all()
-          .pipe(Effect.orDie)
-        return rows.map(mapViolation)
-      }),
-
-      countBySeverity: Effect.fn("DagStore.countBySeverity")(function* (workflowId) {
-        const rows = yield* db
-          .select()
-          .from(WorkflowViolationTable)
-          .where(eq(WorkflowViolationTable.workflow_id, workflowId))
-          .all()
-          .pipe(Effect.orDie)
-        const counts: Record<string, number> = {}
-        for (const r of rows) counts[r.severity] = (counts[r.severity] ?? 0) + 1
-        return counts
-      }),
-
-      queryViolations: Effect.fn("DagStore.queryViolations")(function* (query) {
-        const conditions = []
-        if (query.workflowId) conditions.push(eq(WorkflowViolationTable.workflow_id, query.workflowId))
-        if (query.severity) conditions.push(eq(WorkflowViolationTable.severity, query.severity))
-        if (query.type) conditions.push(eq(WorkflowViolationTable.type, query.type))
-        if (query.since) conditions.push(gte(WorkflowViolationTable.time_created, query.since))
-        if (query.until) conditions.push(lte(WorkflowViolationTable.time_created, query.until))
-        const rows = yield* db
-          .select()
-          .from(WorkflowViolationTable)
-          .where(conditions.length > 0 ? and(...conditions) : undefined)
-          .orderBy(desc(WorkflowViolationTable.time_created))
-          .all()
-          .pipe(Effect.orDie)
-        return rows.map(mapViolation)
       }),
     })
   }),

@@ -185,7 +185,9 @@ export function getValidNextWorkflowStatuses(currentStatus: WorkflowStatus): Wor
     case WorkflowStatus.RUNNING:
       return [WorkflowStatus.PAUSED, WorkflowStatus.STEPPING, WorkflowStatus.COMPLETED, WorkflowStatus.FAILED, WorkflowStatus.CANCELLED]
     case WorkflowStatus.STEPPING:
-      return [WorkflowStatus.RUNNING, WorkflowStatus.PAUSED, WorkflowStatus.COMPLETED, WorkflowStatus.FAILED, WorkflowStatus.CANCELLED]
+      // STEPPING -> STEPPING is the consecutive single-step path: each step
+      // command re-enters stepping to run exactly one more node.
+      return [WorkflowStatus.RUNNING, WorkflowStatus.PAUSED, WorkflowStatus.STEPPING, WorkflowStatus.COMPLETED, WorkflowStatus.FAILED, WorkflowStatus.CANCELLED]
     case WorkflowStatus.PAUSED:
       return [WorkflowStatus.RUNNING, WorkflowStatus.CANCELLED]
     case WorkflowStatus.COMPLETED:

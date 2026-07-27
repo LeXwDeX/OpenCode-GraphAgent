@@ -130,7 +130,7 @@ config:
         inline: "Review this design and submit a structured verdict: {{design}}"
 ```
 
-`required: true` cancels the workflow only when the gate node fails to execute
+`required: true` fails the workflow only when the gate node fails to execute
 or satisfy its output contract. A successful `REVISE` or `REJECT` result is a
 business verdict, not an execution failure. Use a downstream `condition` for a
 static ACCEPT path, or let the reported checkpoint wake the parent to perform a
@@ -486,6 +486,21 @@ rather than letting the original graph run to completion.
 
 When the same node or workflow keeps failing — via `orchestrator_unresponsive` (the woken agent took no action), a replan-attempt ceiling rejection, or repeated review failures — **change your approach** rather than retrying the identical plan. Try a different decomposition, a different model, a simpler prompt, or break the node into smaller steps. Repeating the same failing plan wastes budget without progress.
 
+### Crash recovery: a recovered workflow arrives paused
+
+After a process restart, nodes that were mid-flight are failed conservatively
+(`execution ownership lost on recovery`) — recovery never re-runs provider work
+implicitly. The workflow then PAUSES instead of terminalizing, and you receive
+the failed-node wake. Downstream nodes stay `pending`, so the graph is still
+replannable. Dispose of it in the same turn:
+
+- **Replan + resume (preferred)**: the failed node is terminal and immutable — add a replacement under a NEW id, rewire its pending dependents' `depends_on` to the new id, then `control(resume)`.
+- **Resume as-is**: accept the failure. A required-node failure terminalizes the workflow as `failed` (attributed to the node ids); optional failures degrade and continue.
+- **Cancel**: abandon the workflow.
+
+Never assume a crashed workflow resumes or retries on its own — it will wait,
+paused, until you act.
+
 ## Model Assignment Strategy
 
 Each node MAY specify `model: { modelID, providerID }` to pin a specific model.
@@ -541,7 +556,7 @@ All nodes share the same workspace. Write conflicts are an orchestration concern
 ## Design Principles
 
 - Each node is a real child session with its own message history, tools, and context window. There is no shared memory between nodes — data flows only through `depends_on` and `input_mapping`.
-- `required: true` means failure cancels the entire workflow. Use it for nodes whose output is indispensable (gates, core implementation). Omit it for nodes whose failure is recoverable.
+- `required: true` means failure fails the entire workflow (terminal status `failed`, attributed to the node ids; `cancelled` is reserved for explicit cancels). Use it for nodes whose output is indispensable (gates, core implementation). Omit it for nodes whose failure is recoverable.
 - A successful fan-in node must actually contain the requested comparison,
   synthesis, or final decision. Unresolved placeholders, missing dependency
   outputs, or a claim that inputs were aggregated are not successful
@@ -568,7 +583,7 @@ checkpoint naturally completed the current graph; an early
 **status** — Read the durable state of one workflow and all of its nodes. Pass `workflow_id`. Use it when the user explicitly asks for current state or once before a decision that requires fresh state, such as replan/control. Do not poll a running workflow merely to wait: node reports and terminal outcomes wake the parent session automatically.
 
 **control** — Control a running workflow:
-- `pause` — let running nodes finish, don't spawn new ones
+- `pause` — let running nodes finish, don't spawn new ones (pause does NOT stop nodes that are already running)
 - `resume` — resume scheduling
 - `cancel` — cancel the entire workflow
 - `replan` — submit a YAML fragment; running nodes can be `restart: true` or `cancel: true`; pending nodes absent from the fragment are cancelled
@@ -583,7 +598,7 @@ checkpoint naturally completed the current graph; an early
 | `name` | yes | Human-readable name |
 | `worker_type` | yes | Agent type (`explore`, `build`, `general`, `plan`, or custom) |
 | `depends_on` | yes | Array of node IDs this node waits for (`[]` for root) |
-| `required` | no | If true and this node fails, the workflow is cancelled. Default: false |
+| `required` | no | If true and this node fails, the workflow terminalizes as failed. Default: false |
 | `prompt_template` | yes | `{ id: "..." }` or `{ inline: "...", input: {...} }` |
 | `model` | no | `{ modelID, providerID }` override |
 | `condition` | no | Expression evaluated before spawn; node is skipped if false |

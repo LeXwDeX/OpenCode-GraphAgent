@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test"
-import { evaluateCondition, resolveInputMapping } from "@/dag/runtime/eval"
+import { conditionReference, evaluateCondition, resolveInputMapping } from "@/dag/runtime/eval"
 import { planReplan } from "@opencode-ai/core/dag/core/replan"
 import { WorkflowRuntime, buildGraph } from "@opencode-ai/core/dag/core/scheduling"
 import { CycleError } from "@opencode-ai/core/dag/core/graph"
@@ -32,6 +32,21 @@ describe("evaluateCondition", () => {
 
   it("returns ok:true value:true when path resolves to undefined with != ", () => {
     expect(evaluateCondition('missing.path != "expected"', {})).toEqual({ ok: true, value: true })
+  })
+})
+
+describe("conditionReference", () => {
+  it("extracts the referenced nodeID from a parseable condition", () => {
+    expect(conditionReference('gate.output.verdict == "ACCEPT"')).toBe("gate")
+    expect(conditionReference("explore-src.output.count > 0")).toBe("explore-src")
+  })
+
+  it("returns null for empty or unparseable conditions (runtime fails those loudly)", () => {
+    expect(conditionReference(undefined)).toBeNull()
+    expect(conditionReference("")).toBeNull()
+    expect(conditionReference("   ")).toBeNull()
+    expect(conditionReference("analysis.output.verdict ==")).toBeNull()
+    expect(conditionReference("foo ??? bar")).toBeNull()
   })
 })
 

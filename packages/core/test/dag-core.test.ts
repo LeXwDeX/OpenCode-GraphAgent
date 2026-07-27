@@ -23,6 +23,7 @@ import { FallbackTrigger } from "@opencode-ai/core/dag/core/types"
 import { validateRequiredNodes } from "@opencode-ai/core/dag/core/required-validator"
 import {
   buildGraph,
+  toSchedulingNodes,
   type SchedulingNode,
   WorkflowRuntime,
 } from "@opencode-ai/core/dag/core/scheduling"
@@ -183,7 +184,7 @@ describe("iron laws (transition tables)", () => {
     const transitions = [
       [WorkflowStatus.PENDING, [WorkflowStatus.RUNNING]],
       [WorkflowStatus.RUNNING, [WorkflowStatus.PAUSED, WorkflowStatus.STEPPING, WorkflowStatus.COMPLETED, WorkflowStatus.FAILED, WorkflowStatus.CANCELLED]],
-      [WorkflowStatus.STEPPING, [WorkflowStatus.RUNNING, WorkflowStatus.PAUSED, WorkflowStatus.COMPLETED, WorkflowStatus.FAILED, WorkflowStatus.CANCELLED]],
+      [WorkflowStatus.STEPPING, [WorkflowStatus.RUNNING, WorkflowStatus.PAUSED, WorkflowStatus.STEPPING, WorkflowStatus.COMPLETED, WorkflowStatus.FAILED, WorkflowStatus.CANCELLED]],
       [WorkflowStatus.PAUSED, [WorkflowStatus.RUNNING, WorkflowStatus.CANCELLED]],
       [WorkflowStatus.COMPLETED, [WorkflowStatus.ARCHIVED]],
       [WorkflowStatus.FAILED, [WorkflowStatus.ARCHIVED]],
@@ -692,5 +693,125 @@ describe("WorkflowRuntime", () => {
     rt.markSatisfied("c")
     rt.markUnsatisfied("a")
     expect(rt.isComplete()).toBe(true)
+  })
+})
+
+describe("WorkflowRuntime skipped semantics (D13)", () => {
+  it("markSkipped excludes pure-skip dependents from ready and flags them for cascade", () => {
+    const nodes: SchedulingNode[] = [
+      { id: "gate", dependsOn: [], status: "pending", required: true },
+      { id: "impl", dependsOn: ["gate"], status: "pending", required: true },
+      { id: "audit", dependsOn: ["impl"], status: "pending", required: true },
+    ]
+    const rt = new WorkflowRuntime(nodes, 4)
+    rt.markSatisfied("gate")
+    rt.markSkipped("impl")
+    // impl is the only dependency of audit and it is skipped — audit must NOT
+    // become ready (the pre-fix bug: skip ≡ satisfied let audit run).
+    expect(rt.getReadyNodes()).toEqual([])
+    expect(rt.getCascadeSkipNodes()).toEqual(["audit"])
+  })
+
+  it("cascade waves reach a fixpoint transitively", () => {
+    const nodes: SchedulingNode[] = [
+      { id: "a", dependsOn: [], status: "pending", required: true },
+      { id: "b", dependsOn: ["a"], status: "pending", required: true },
+      { id: "c", dependsOn: ["b"], status: "pending", required: true },
+    ]
+    const rt = new WorkflowRuntime(nodes, 4)
+    rt.markSkipped("a")
+    expect(rt.getCascadeSkipNodes()).toEqual(["b"])
+    rt.markSkipped("b")
+    expect(rt.getCascadeSkipNodes()).toEqual(["c"])
+    rt.markSkipped("c")
+    expect(rt.getCascadeSkipNodes()).toEqual([])
+    expect(rt.isComplete()).toBe(true)
+  })
+
+  it("a mixed fan-in with at least one satisfied dependency still runs", () => {
+    const nodes: SchedulingNode[] = [
+      { id: "left", dependsOn: [], status: "pending", required: false },
+      { id: "right", dependsOn: [], status: "pending", required: false },
+      { id: "fanin", dependsOn: ["left", "right"], status: "pending", required: true },
+    ]
+    const rt = new WorkflowRuntime(nodes, 4)
+    rt.markSatisfied("left")
+    rt.markSkipped("right")
+    // Graceful degradation is preserved: the fan-in sees the skip as a
+    // placeholder input instead of cascading.
+    expect(rt.getReadyNodes()).toEqual(["fanin"])
+    expect(rt.getCascadeSkipNodes()).toEqual([])
+  })
+
+  it("isComplete counts skipped as terminal and skip of a required node is not a required failure", () => {
+    const nodes: SchedulingNode[] = [
+      { id: "a", dependsOn: [], status: "pending", required: true },
+      { id: "b", dependsOn: ["a"], status: "pending", required: true },
+    ]
+    const rt = new WorkflowRuntime(nodes, 4)
+    rt.markSkipped("a")
+    rt.markSkipped("b")
+    expect(rt.isComplete()).toBe(true)
+    expect(rt.hasRequiredFailure()).toBe(false)
+  })
+
+  it("constructor seeds skipped nodes from durable statuses", () => {
+    const nodes: SchedulingNode[] = [
+      { id: "a", dependsOn: [], status: "skipped", required: true },
+      { id: "b", dependsOn: ["a"], status: "pending", required: true },
+    ]
+    const rt = new WorkflowRuntime(nodes, 4)
+    expect(rt.getReadyNodes()).toEqual([])
+    expect(rt.getCascadeSkipNodes()).toEqual(["b"])
+    expect(rt.isActive("a")).toBe(false)
+  })
+
+  it("cascade respects pause — a paused workflow must stay replannable", () => {
+    const nodes: SchedulingNode[] = [
+      { id: "a", dependsOn: [], status: "skipped", required: true },
+      { id: "b", dependsOn: ["a"], status: "pending", required: true },
+    ]
+    const rt = new WorkflowRuntime(nodes, 4)
+    rt.setPaused(true)
+    expect(rt.getCascadeSkipNodes()).toEqual([])
+    rt.setPaused(false)
+    expect(rt.getCascadeSkipNodes()).toEqual(["b"])
+  })
+})
+
+describe("toSchedulingNodes mapping", () => {
+  it("keeps skipped distinguishable from satisfied", () => {
+    const rows = [
+      { id: "done", status: "completed", dependsOn: [], required: true },
+      { id: "gone", status: "skipped", dependsOn: [], required: true },
+      { id: "dead", status: "failed", dependsOn: [], required: true },
+      { id: "live", status: "running", dependsOn: [], required: true },
+      { id: "wait", status: "queued", dependsOn: [], required: true },
+    ]
+    expect(toSchedulingNodes(rows).map((n) => n.status)).toEqual([
+      "satisfied",
+      "skipped",
+      "unsatisfied",
+      "running",
+      "pending",
+    ])
+  })
+})
+
+describe("planReplan fragment validation additions", () => {
+  it("rejects duplicate ids within the fragment", () => {
+    const plan = planReplan(
+      { nodes: [] },
+      { nodes: [{ id: "x", depends_on: [] }, { id: "x", depends_on: [] }] },
+    )
+    expect(plan.errors.join(" ")).toContain('duplicate node id "x"')
+  })
+
+  it("restart on a terminal node explains the replacement path", () => {
+    const plan = planReplan(
+      { nodes: [{ id: "f", status: NodeStatus.FAILED, depends_on: [] }] },
+      { nodes: [{ id: "f", depends_on: [], restart: true }] },
+    )
+    expect(plan.errors.join(" ")).toContain("add a replacement node under a new id")
   })
 })

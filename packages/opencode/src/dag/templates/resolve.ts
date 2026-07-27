@@ -4,8 +4,7 @@
  * Resolves a node's `prompt_template` declaration into a final prompt string:
  * - `id` reference → reads the `.md` file from project (`.opencode/dag-prompts/`)
  *   or global (`~/.config/opencode/dag-prompts/`) directory
- * - `inline` → writes the string to a temp file under `os.tmpdir()`, reads it,
- *   then deletes it after resolution
+ * - `inline` → used directly as the template source (no filesystem round-trip)
  *
  * Both paths go through `{{var}}` interpolation and `sanitize()`.
  *
@@ -57,28 +56,14 @@ export function renderTemplate(
 
 function readTemplateSource(ref: TemplateRef, projectDir: string): Effect.Effect<string, Error> {
   if (ref.inline !== undefined) {
-    return readInline(ref.inline)
+    // Inline content IS the template source — a temp-file write/read/delete
+    // round-trip adds spawn-path I/O and failure surface for no benefit.
+    return Effect.succeed(ref.inline)
   }
   if (ref.id) {
     return readById(ref.id, projectDir)
   }
   return Effect.fail(new Error("prompt_template must have either 'id' or 'inline'"))
-}
-
-function readInline(content: string): Effect.Effect<string, Error> {
-  return Effect.gen(function* () {
-    // Write to temp file (os.tmpdir() — NEVER hardcoded /tmp/)
-    const dir = yield* Effect.promise(() => fs.mkdtemp(path.join(os.tmpdir(), "dag-inline-")))
-    const filePath = path.join(dir, "prompt.md")
-    yield* Effect.promise(() => fs.writeFile(filePath, content, "utf-8"))
-    // Read it back (simulating the template-file read path)
-    const raw = yield* Effect.promise(() => fs.readFile(filePath, "utf-8"))
-    // Delete temp file (use-once-and-discard)
-    yield* Effect.promise(() => fs.rm(dir, { recursive: true, force: true })).pipe(
-      Effect.catch(() => Effect.void),
-    )
-    return raw
-  })
 }
 
 function readById(id: string, projectDir: string): Effect.Effect<string, Error> {
