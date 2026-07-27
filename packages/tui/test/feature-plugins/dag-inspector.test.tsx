@@ -528,4 +528,59 @@ describe("DagInspector", () => {
       viewer.app.renderer.destroy()
     }
   })
+
+  test("node rows render the worker type inline next to the name", async () => {
+    const viewer = await renderDagInspector({
+      workflows: [wfSummary({ id: "wf-1", nodeCount: 1 })],
+      nodes: [dagNode({ id: "n-1", name: "compile", worker_type: "review", status: "pending" })],
+    })
+    try {
+      await viewer.app.waitForFrame((frame) => frame.includes("compile review"))
+    } finally {
+      viewer.app.renderer.destroy()
+    }
+  })
+
+  test("footer only advertises controls valid for the workflow status", async () => {
+    const viewer = await renderDagInspector({
+      workflows: [wfSummary({ id: "wf-1", status: "paused" })],
+      nodes: [dagNode({ id: "n-1", name: "build", status: "pending" })],
+    })
+    try {
+      await viewer.app.waitForFrame((frame) => {
+        const footer = frame.split("\n").find((row) => row.includes("open session"))
+        if (!footer) return false
+        return (
+          footer.includes("resume") && footer.includes("cancel") && !footer.includes("pause") && !footer.includes("step")
+        )
+      })
+    } finally {
+      viewer.app.renderer.destroy()
+    }
+  })
+
+  test("footer row stays fixed while node selection changes detail content", async () => {
+    const viewer = await renderDagInspector({
+      workflows: [wfSummary({ id: "wf-1", nodeCount: 2, failedNodes: 1 })],
+      nodes: [
+        dagNode({ id: "a", name: "bare", status: "pending" }),
+        dagNode({ id: "b", name: "detailed", status: "failed", depends_on: ["a"], error_reason: "boom" }),
+      ],
+    })
+    try {
+      const footerRow = (frame: string) => frame.split("\n").findIndex((row) => row.includes("open session"))
+      let before = -1
+      // Selection starts on "bare" (header-only detail).
+      await viewer.app.waitForFrame((frame) => {
+        before = footerRow(frame)
+        return before >= 0 && frame.includes("bare")
+      })
+      // Moving to "detailed" adds dependency and error rows to the detail
+      // pane; the fixed-height pane must keep the footer on the same row.
+      viewer.commands.get("dag.down")!.run?.({} as never)
+      await viewer.app.waitForFrame((frame) => frame.includes("boom") && footerRow(frame) === before)
+    } finally {
+      viewer.app.renderer.destroy()
+    }
+  })
 })
