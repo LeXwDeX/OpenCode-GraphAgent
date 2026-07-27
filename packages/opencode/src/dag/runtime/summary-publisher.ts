@@ -72,6 +72,12 @@ export const layer = Layer.effect(
         // reads would occur. This satisfies the "stateless derived view"
         // contract: no cached summary is ever served from this map.
         const pending = new Set<string>()
+        // Second coalescing tier keyed by dagID: node events don't carry a
+        // sessionID, and resolving it eagerly meant one getWorkflow query PER
+        // EVENT before the debounce window could absorb the burst (P1-4).
+        // Coalesce by dagID first, resolve the sessionID once after the
+        // window, then hand off to the session-level debounce.
+        const pendingByDag = new Set<string>()
 
         const publishForSession = (sessionID: string) =>
           Effect.gen(function* () {
@@ -101,15 +107,26 @@ export const layer = Layer.effect(
             }).pipe(Effect.ensuring(Effect.sync(() => pending.delete(sessionID))))
           })
 
+        const schedulePublishByDag = (dagID: string) =>
+          Effect.gen(function* () {
+            if (pendingByDag.has(dagID)) return
+            pendingByDag.add(dagID)
+            yield* Effect.gen(function* () {
+              yield* Effect.sleep("50 millis")
+              const wf = yield* store.getWorkflow(dagID)
+              // Hand off to the session-level debounce (not publishForSession
+              // directly) so a concurrent session-keyed window absorbs this
+              // trigger instead of producing a duplicate read.
+              if (wf) yield* schedulePublish(wf.sessionId)
+            }).pipe(Effect.ensuring(Effect.sync(() => pendingByDag.delete(dagID))))
+          })
+
         const unsubscribe = yield* events.listen((evt) => {
           if (!SUMMARY_TRIGGER_EVENTS.some((def) => def.type === evt.type)) return Effect.void
           const data = evt.data as { dagID: string; sessionID?: string }
           const publish = data.sessionID
             ? schedulePublish(data.sessionID)
-            : Effect.gen(function* () {
-                const wf = yield* store.getWorkflow(data.dagID)
-                if (wf) yield* schedulePublish(wf.sessionId)
-              })
+            : schedulePublishByDag(data.dagID)
           return publish.pipe(
             Effect.catchCause((cause) =>
               Effect.logWarning("DagSummaryPublisher: failed to publish summaries", { dagID: data.dagID, cause }),

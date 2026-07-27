@@ -82,6 +82,27 @@ export function reviewImplementationFingerprint(
     : undefined
 }
 
+/**
+ * Mapping keys that carry raw implementation artifacts for a diff review
+ * (diff / patch / changed_files from the declared implementation node).
+ * These must reach the reviewer VERBATIM — the destructive sanitizer corrupts
+ * diffs that legitimately contain code fences or "system:" lines, so the
+ * spawn path exempts these keys from sanitize (P1-2).
+ */
+export function reviewEvidenceKeys(node: NodeConfig): string[] {
+  if (node.review?.phase !== "diff") return []
+  const implementationID = node.review.implementation_node_id
+  return Object.entries(node.input_mapping ?? {})
+    .filter(([, source]) => {
+      const [sourceID, output, field] = source.split(".")
+      return sourceID === implementationID
+        && output === "output"
+        && field !== undefined
+        && ["diff", "patch", "changed_files"].includes(field)
+    })
+    .map(([key]) => key)
+}
+
 export function validateReviewResult(output: unknown, currentFingerprint: string) {
   if (typeof output !== "object" || output === null || Array.isArray(output)) {
     return {

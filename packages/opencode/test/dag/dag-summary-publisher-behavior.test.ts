@@ -17,6 +17,7 @@ interface SummaryEmission {
 interface StoreControl {
   failures: number
   reads: Map<string, number>
+  lookups: Map<string, number>
   sessions: Map<string, string>
   summaries: Map<string, WorkflowSummary[]>
 }
@@ -29,6 +30,7 @@ function control() {
   return {
     failures: 0,
     reads: new Map<string, number>(),
+    lookups: new Map<string, number>(),
     sessions: new Map<string, string>(),
     summaries: new Map<string, WorkflowSummary[]>(),
   } satisfies StoreControl
@@ -65,7 +67,12 @@ function summary(id: string, completedNodes: number): WorkflowSummary {
 
 function runtime(state: StoreControl, bus: EventControl) {
   const store = Layer.mock(DagStore.Service, {
-    getWorkflow: (dagID) => Effect.succeed(state.sessions.get(dagID)).pipe(Effect.map((sid) => sid ? workflow(dagID, sid) : undefined)),
+    getWorkflow: (dagID) =>
+      Effect.sync(() => {
+        state.lookups.set(dagID, (state.lookups.get(dagID) ?? 0) + 1)
+        const sid = state.sessions.get(dagID)
+        return sid ? workflow(dagID, sid) : undefined
+      }),
     getWorkflowSummaries: (sessionID) =>
       Effect.sync(() => {
         state.reads.set(sessionID, (state.reads.get(sessionID) ?? 0) + 1)
@@ -170,6 +177,9 @@ describe("DagSummaryPublisher behavior", () => {
         )
 
         expect(state.reads.get("ses-burst")).toBe(1)
+        // P1-4: the sessionID lookup for sessionID-less node events happens
+        // once per debounce window, not once per event.
+        expect(state.lookups.get("dag-burst")).toBe(1)
         expect(collector.emissions).toEqual([
           { sessionID: "ses-burst", summaries: [summary("dag-burst", 5)] },
         ])

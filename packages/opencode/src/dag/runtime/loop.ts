@@ -15,6 +15,7 @@ import {
   reviewImplementationFingerprint,
   reviewContractForNode,
   validateReviewExecutionInput,
+  reviewEvidenceKeys,
 } from "../review-lifecycle"
 import { Agent } from "@/agent/agent"
 import { Session } from "@/session/session"
@@ -77,16 +78,20 @@ export const layer = Layer.effect(
             }
           }
           const ready = entry.runtime.getReadyNodes()
+          // P1-3: one snapshot per scheduling round. Every ready node's
+          // dependencies are already terminal (that's what made it ready), so
+          // their outputs cannot change during this loop — per-node re-reads
+          // were O(ready × nodes) pure overhead.
+          const nodesSnapshot = ready.length > 0 ? yield* store.getNodes(dagID) : []
           for (const nodeID of ready) {
-            const node = yield* store.getNode(dagID, nodeID)
+            const node = nodesSnapshot.find((n) => n.id === nodeID)
             if (!node) continue
             const nodeConfig = entry.config?.nodes.find((n) => n.id === nodeID)
 
             if (nodeConfig?.condition) {
-              const allNodes = yield* store.getNodes(dagID)
               const outputs: Record<string, unknown> = {}
               for (const dep of node.dependsOn) {
-                const depNode = allNodes.find((n) => n.id === dep)
+                const depNode = nodesSnapshot.find((n) => n.id === dep)
                 if (depNode) outputs[dep] = { output: depNode.output }
               }
               const condResult = evaluateCondition(nodeConfig.condition, outputs)
@@ -105,9 +110,8 @@ export const layer = Layer.effect(
             let resolvedMapping: Record<string, unknown> = {}
             const inputMapping = nodeConfig?.input_mapping ?? Object.fromEntries(node.dependsOn.map((dependency) => [dependency, dependency]))
             if (Object.keys(inputMapping).length > 0) {
-              const allNodes = yield* store.getNodes(dagID)
               resolvedMapping = resolveInputMapping(inputMapping, (depId) => {
-                const depNode = allNodes.find((n) => n.id === depId)
+                const depNode = nodesSnapshot.find((n) => n.id === depId)
                 if (!depNode) return null
                 if (depNode.output !== null) return depNode.output
                 if (depNode.status === "failed") {
@@ -123,8 +127,10 @@ export const layer = Layer.effect(
             }
 
             // Sanitize the dynamic node-output surface (LLM-generated upstream
-            // outputs) before interpolation and Context serialization.
-            resolvedMapping = sanitizeInput(resolvedMapping)
+            // outputs) before interpolation and Context serialization. Review
+            // implementation evidence (diff/patch artifacts) is exempted —
+            // wrapped, not rewritten — so the reviewer sees the real diff (P1-2).
+            resolvedMapping = sanitizeInput(resolvedMapping, nodeConfig ? reviewEvidenceKeys(nodeConfig) : undefined)
 
             if (nodeConfig) {
               const reviewInput = validateReviewExecutionInput(nodeConfig, resolvedMapping)

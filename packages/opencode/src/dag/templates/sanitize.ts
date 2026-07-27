@@ -42,13 +42,52 @@ export function sanitize(value: string): string {
  *
  * This is a first-line defense — the node's child session also has its own
  * system-prompt boundary. Both layers are present for the dynamic surface.
+ *
+ * `exemptKeys` (P1-2): top-level keys carrying review implementation evidence
+ * (diffs / patches) are preserved verbatim instead of destructively rewritten
+ * — a diff legitimately contains code fences and "system:" lines, and the
+ * diff-review contract requires the reviewer to see the real artifact. The
+ * exempted value is delimiter-wrapped and only an embedded closing delimiter
+ * is escaped, so the untrusted region stays marked without content loss.
  */
-export function sanitizeInput(input: Record<string, unknown>): Record<string, unknown> {
+export function sanitizeInput(
+  input: Record<string, unknown>,
+  exemptKeys?: readonly string[],
+): Record<string, unknown> {
+  const exempt = new Set(exemptKeys ?? [])
   const result: Record<string, unknown> = {}
   for (const [key, value] of Object.entries(input)) {
-    result[key] = sanitizeValue(value)
+    result[key] = exempt.has(key) ? preserveEvidence(value) : sanitizeValue(value)
   }
   return result
+}
+
+function preserveEvidence(value: unknown): unknown {
+  if (typeof value === "string") {
+    return `<implementation-evidence>\n${escapeEvidenceDelimiter(value)}\n</implementation-evidence>`
+  }
+  if (Array.isArray(value)) return value.map(escapeEvidenceDeep)
+  if (value !== null && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([key, entry]) => [key, escapeEvidenceDeep(entry)]),
+    )
+  }
+  return value
+}
+
+function escapeEvidenceDeep(value: unknown): unknown {
+  if (typeof value === "string") return escapeEvidenceDelimiter(value)
+  if (Array.isArray(value)) return value.map(escapeEvidenceDeep)
+  if (value !== null && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([key, entry]) => [key, escapeEvidenceDeep(entry)]),
+    )
+  }
+  return value
+}
+
+function escapeEvidenceDelimiter(value: string): string {
+  return value.replace(/<(\/?)(implementation-evidence)>/gi, "<\\$1$2>")
 }
 
 function sanitizeValue(value: unknown): unknown {
