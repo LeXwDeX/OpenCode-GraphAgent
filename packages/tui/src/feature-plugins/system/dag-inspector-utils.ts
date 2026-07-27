@@ -87,6 +87,47 @@ export function formatDagOutputPreview(output: unknown, maxLength = 200): string
   return flat.length > maxLength ? `${flat.slice(0, maxLength)}…` : flat
 }
 
+/** Countdown to a node's absolute deadline — "3m 12s left" while budget
+ * remains, "overdue" past it. Only meaningful for nodes still executing
+ * (running/queued); terminal nodes yield no label. Tolerates the SDK's
+ * Infinity/NaN number sentinels. */
+export function formatDagDeadline(
+  status: string,
+  deadlineMs: number | string | undefined,
+  now = Date.now(),
+): string | undefined {
+  if (status !== "running" && status !== "queued") return undefined
+  if (typeof deadlineMs !== "number" || !Number.isFinite(deadlineMs)) return undefined
+  const remaining = deadlineMs - now
+  if (remaining <= 0) return "overdue"
+  const totalSeconds = Math.round(remaining / 1000)
+  const minutes = Math.floor(totalSeconds / 60)
+  const seconds = totalSeconds % 60
+  if (minutes === 0) return `${seconds}s left`
+  return `${minutes}m ${seconds}s left`
+}
+
+/** Replan history annotation — replan_attempts increments on replan restart,
+ * so any positive count means this execution replaced a failed attempt.
+ * Accepts the SDK's Infinity/NaN string sentinels (non-finite → no label). */
+export function dagNodeHistoryLabel(node: { replan_attempts: number | string }): string | undefined {
+  const attempts = Number(node.replan_attempts)
+  if (!Number.isFinite(attempts) || attempts <= 0) return undefined
+  return `restarted ×${attempts}`
+}
+
+/** Progress fraction counting completed+skipped as settled (P2-9): a skipped
+ * node is a legitimate terminal outcome (condition gates), so a gated
+ * workflow finishes at N/N instead of lying with a smaller numerator.
+ * Accepts the SDK's Infinity/NaN string sentinels (coerced via Number). */
+export function formatDagProgress(summary: {
+  nodeCount: number | string
+  completedNodes: number | string
+  skippedNodes: number | string
+}): string {
+  return `${Number(summary.completedNodes) + Number(summary.skippedNodes)}/${Number(summary.nodeCount)}`
+}
+
 /**
  * Shared status→color mapping for every DAG surface (sidebar indicator,
  * sidebar panel, inspector) so one status never renders in different colors
@@ -111,6 +152,7 @@ export function dagNodeGlyph(status: string): string {
   if (status === "completed") return "✓"
   if (status === "failed") return "✗"
   if (status === "skipped" || status === "cancelled" || status === "aborted") return "⊘"
+  if (status === "queued") return "◌"
   return "○"
 }
 

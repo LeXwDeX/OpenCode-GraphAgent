@@ -45,6 +45,7 @@ function dagNode(overrides: Partial<DagNode> & { id: string }): DagNode {
     worker_type: "build",
     required: false,
     depends_on: [],
+    replan_attempts: 0,
     ...overrides,
   }
 }

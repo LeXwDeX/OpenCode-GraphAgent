@@ -11,12 +11,12 @@
 | 编号 | 级别 | 标题 | 类型 |
 |------|------|------|------|
 | [P0-1](#p0-1) | P0 | condition_false 被当作 satisfied，门禁拒绝被下游完全无视 | 正确性（已实证） |
-| [P0-2](#p0-2) | P0 | max_concurrency 只限流 LLM 调用，子会话被急切创建，QUEUED 是死状态 | 正确性 + 性能 |
+| [P0-2](#p0-2) | P0 | max_concurrency 只限流 LLM 调用，子会话被急切创建，QUEUED 是死状态 | 正确性 + 性能（**已修复：PR #122 queued admission**） |
 | [P0-3](#p0-3) | P0 | 连续单步（step）是状态机死路 | 正确性 |
 | [P1-1](#p1-1) | P1 | create 不校验 depends_on 引用 / 重复节点 ID / max_total_nodes | 正确性 |
-| [P1-2](#p1-2) | P1 | sanitizer 破坏性替换损坏 diff/代码产出物，与 diff-review 契约矛盾 | 正确性 |
-| [P1-3](#p1-3) | P1 | spawnReady 每节点重复全量读，O(ready × nodes) 查询 | 性能 |
-| [P1-4](#p1-4) | P1 | getWorkflowSummaries JS 聚合 + 事件热路径前置查询 | 性能 |
+| [P1-2](#p1-2) | P1 | sanitizer 破坏性替换损坏 diff/代码产出物，与 diff-review 契约矛盾 | 正确性（**已修复：PR #121 字段级豁免**） |
+| [P1-3](#p1-3) | P1 | spawnReady 每节点重复全量读，O(ready × nodes) 查询 | 性能（**已修复：PR #121 快照复用**） |
+| [P1-4](#p1-4) | P1 | getWorkflowSummaries JS 聚合 + 事件热路径前置查询 | 性能（**已修复：PR #121 SQL 聚合**） |
 | [P1-5](#p1-5) | P1 | 失败节点无法通过 replan restart 重跑（必须换新 ID），工具描述未告知 | 使用陷阱 |
 | [P2-1](#p2-1) | P2 | required 节点失败 → 工作流终态是 cancelled 而非 failed | 语义 |
 | [P2-2](#p2-2) | P2 | 崩溃恢复对 running 节点一律判失败，required 级联即整流程报废 | 语义（**已修复：recovery-pause**） |
@@ -24,9 +24,9 @@
 | [P2-4](#p2-4) | P2 | 死代码/死状态：ViolationTable、ARCHIVED、NodeStatus.PAUSED/ABORTED | 清理 |
 | [P2-5](#p2-5) | P2 | inline 模板走临时文件写读删，spawn 热路径纯多余 I/O | 性能 |
 | [P2-6](#p2-6) | P2 | condition DSL 表达力不足，且只能引用直接依赖 | 场景 |
-| [P2-7](#p2-7) | P2 | HTTP API 不对称：无 start / extend | 场景 |
-| [P2-8](#p2-8) | P2 | TUI：Inspector 无滚动、列表截断与导航不一致、无 step 控制、配色两套 | UX |
-| [P2-9](#p2-9) | P2 | summary 进度不计 skipped，工作流"跑完了但分子不满" | UX |
+| [P2-7](#p2-7) | P2 | HTTP API 不对称：无 start / extend | 场景（**已修复：PR #123**） |
+| [P2-8](#p2-8) | P2 | TUI：Inspector 无滚动、列表截断与导航不一致、无 step 控制、配色两套 | UX（**已修复：PR #120 + #124 残余项**） |
+| [P2-9](#p2-9) | P2 | summary 进度不计 skipped，工作流"跑完了但分子不满" | UX（**已修复：PR #122 计数 + #124 展示**） |
 | [P2-10](#p2-10) | P2 | pause 语义（不停止在跑节点）无任何文档/UI 提示 | UX |
 
 ---
@@ -204,6 +204,8 @@ condition == false
 <a id="p0-2"></a>
 ## P0-2：max_concurrency 只限流 LLM 调用，子会话被急切创建，QUEUED 是死状态
 
+> **状态**：已修复（PR #122：durable `dag.node.queued` 事件 + 子会话/NodeStarted 移入 permit 内；deadline 仍从录取时刻起算；queued 崩溃重启按 pending 重新排队不计 ownershipLost）
+
 **位置**：`packages/opencode/src/dag/runtime/spawn.ts:97-156`、`loop.ts:79-230`
 
 `spawnReady` 对每个 ready 节点立即执行 `spawnNode`，而 `sessions.create`（L97）与 `NodeStarted` 事件发布（L119）都发生在 **semaphore 取许可之前**（L156 才 `take(1)`）。后果链：
@@ -251,6 +253,8 @@ condition == false
 <a id="p1-2"></a>
 ## P1-2：sanitizer 破坏性替换损坏 diff/代码产出物，与 diff-review 契约矛盾
 
+> **状态**：已修复（PR #121：`reviewEvidenceKeys` 推导的实现证据字段原文保留，`<implementation-evidence>` 定界包裹；其余字段防注入面不变）
+
 **位置**：`packages/opencode/src/dag/templates/sanitize.ts:16-28`、`loop.ts:130`
 
 `sanitize` 把所有 <code>```</code> 替换为 <code>``</code>、行首 `system:` 替换为 `[REDACTED]:`、`you are now a` 替换为 `[REDACTED]`，并作用于**所有上游节点输出**（`resolvedMapping = sanitizeInput(...)`）。而 `review-lifecycle.ts` 的 diff-review 契约**要求**下游收到真实的 diff/patch 工件——任何含 code fence 的 diff、含 "system:" 的日志都会被静默改写，**审查者审的是被篡改的补丁**。防注入与工件保真当前不可兼得。
@@ -265,6 +269,8 @@ condition == false
 <a id="p1-3"></a>
 ## P1-3：spawnReady 每节点重复全量读，O(ready × nodes) 查询
 
+> **状态**：已修复（PR #121：每轮调度一次 getNodes 快照；ready 节点依赖已终态、本轮内输出不可变）
+
 **位置**：`loop.ts:89`（condition 分支）、`loop.ts:111`（input_mapping 分支）
 
 每个 ready 节点最多两次 `store.getNodes(dagID)` 全表读，一轮调度 N 个 ready 节点 = 最多 2N 次全量查询。**修复**：每轮 `spawnReady` 开头读一次 nodes 快照并复用（condition 求值与 mapping 解析都只需要终态依赖的 output，快照一致性足够）。
@@ -273,6 +279,8 @@ condition == false
 
 <a id="p1-4"></a>
 ## P1-4：getWorkflowSummaries JS 聚合 + 事件热路径前置查询
+
+> **状态**：已修复（PR #121：GROUP BY 计数下沉 SQL；无 sessionID 事件的 getWorkflow 前置查询移入 dagID 级去抖动窗口之后）
 
 **位置**：`packages/core/src/dag/store.ts:226-257`、`summary-publisher.ts:104-120`
 
@@ -372,6 +380,8 @@ condition == false
 <a id="p2-7"></a>
 ## P2-7：HTTP API 不对称——无 start / extend
 
+> **状态**：已修复（PR #123：`POST /dag` start + `control(extend)`，同时修正 control 响应 schema 剥掉 replan/extend 处置数组的既有缺陷；SDK regen + exercise 场景门禁）
+
 **位置**：`server/routes/instance/httpapi/handlers/dag.ts`
 
 control 支持 pause/resume/cancel/complete/step/replan，但**无 extend、无 start**——外部系统无法通过 HTTP 发起或追加工作流，只能由 agent 工具面发起。若 HTTP 面定位为完整控制面，需补齐并同步 SDK 再生成（`./packages/sdk/js/script/build.ts`）与 `test/server/httpapi-exercise` 场景。
@@ -380,6 +390,8 @@ control 支持 pause/resume/cancel/complete/step/replan，但**无 extend、无 
 
 <a id="p2-8"></a>
 ## P2-8：TUI Inspector / 面板缺陷合集
+
+> **状态**：已修复（主体 PR #120 三界面对齐；残余 PR #124：restarted ×N 历史标注 / running·queued 节点 deadline 倒计时 / queued 专属 glyph 与计数）
 
 **位置**：`packages/tui/src/feature-plugins/system/dag-inspector.tsx`、`sidebar/dag-panel.tsx`
 
@@ -399,6 +411,8 @@ control 支持 pause/resume/cancel/complete/step/replan，但**无 extend、无 
 
 <a id="p2-9"></a>
 ## P2-9：summary 进度不计 skipped
+
+> **状态**：已修复（计数面 PR #122：summary 增加 skippedNodes/queuedNodes；展示面 PR #124：进度分子 = completed+skipped）
 
 **位置**：`store.ts:242-250`（只计 completed/running/failed）
 
@@ -450,7 +464,15 @@ final-audit 的结构化输出为：
 第三批（性能 + 清理 + UX）：
   P1-3 / P1-4 / P2-*
 
-已完成：P0-1 / P0-3 / P1-1 / P1-5（报错面）/ P2-1 / P2-2（recovery-pause）/ P2-3（验证关闭+契约测试）/ P2-4（violation 读面清理）/ P2-5 / P2-6（引用校验）/ P2-8（TUI 对齐）/ P2-10（文案）
+已完成（全部 16 项清零）：
+  PR #119：P0-1 / P0-3 / P1-1 / P1-5 / P2-1 / P2-2（recovery-pause）/ P2-3（验证关闭+契约测试）/ P2-4 / P2-5 / P2-6 / P2-10
+  PR #120：P2-8 主体（TUI 三界面对齐）
+  PR #121（B 批）：P1-2（sanitize 字段级豁免）/ P1-3（spawn 快照）/ P1-4（SQL 聚合 + 去抖动前置查询消除）
+  PR #122（A 批）：P0-2（durable queued 录取 + permit 内建会话）/ P2-9 计数面（skipped/queued 进 summary）
+  PR #123（C 批）：P2-7（HTTP start/extend + control 响应 schema 修正 + SDK regen）
+  PR #124（D 批）：P2-8 残余（restarted ×N 历史标注 / deadline 倒计时 / queued 呈现）+ P2-9 展示语义（completed+skipped 进度分母）
+
+合入顺序（stacked）：#119 → #121 → #122 → #123 → #124；#120 独立，于 #124 内已合流。
 ```
 
 ---

@@ -5,10 +5,13 @@ import {
   dagControlProgressMessage,
   dagControlUnavailableMessage,
   dagNodeGlyph,
+  dagNodeHistoryLabel,
   dagStatusColor,
+  formatDagDeadline,
   formatDagDuration,
   formatDagError,
   formatDagOutputPreview,
+  formatDagProgress,
   type DagNode,
 } from "../../src/feature-plugins/system/dag-inspector-utils"
 
@@ -20,6 +23,7 @@ const node = (id: string, depends_on: string[] = [], name = id): DagNode => ({
   worker_type: "task",
   required: false,
   depends_on,
+  replan_attempts: 0,
 })
 
 describe("computeWaves", () => {
@@ -131,6 +135,7 @@ describe("shared status presentation", () => {
     expect(dagNodeGlyph("completed")).toBe("✓")
     expect(dagNodeGlyph("failed")).toBe("✗")
     expect(dagNodeGlyph("skipped")).toBe("⊘")
+    expect(dagNodeGlyph("queued")).toBe("◌")
     expect(dagNodeGlyph("pending")).toBe("○")
   })
 })
@@ -149,5 +154,25 @@ describe("node detail formatting", () => {
     expect(formatDagOutputPreview(null)).toBeUndefined()
     expect(formatDagOutputPreview("   ")).toBeUndefined()
     expect(formatDagOutputPreview("x".repeat(300))?.length).toBe(201)
+  })
+
+  test("deadline countdown only labels nodes still executing", () => {
+    expect(formatDagDeadline("running", 63_000, 1_000)).toBe("1m 2s left")
+    expect(formatDagDeadline("queued", 5_000, 1_000)).toBe("4s left")
+    expect(formatDagDeadline("running", 1_000, 5_000)).toBe("overdue")
+    expect(formatDagDeadline("completed", 63_000, 1_000)).toBeUndefined()
+    expect(formatDagDeadline("running", undefined, 1_000)).toBeUndefined()
+    expect(formatDagDeadline("running", "Infinity", 1_000)).toBeUndefined()
+  })
+
+  test("replan history label appears only after a restart", () => {
+    expect(dagNodeHistoryLabel({ replan_attempts: 0 })).toBeUndefined()
+    expect(dagNodeHistoryLabel({ replan_attempts: 1 })).toBe("restarted ×1")
+    expect(dagNodeHistoryLabel({ replan_attempts: 3 })).toBe("restarted ×3")
+  })
+
+  test("progress counts completed+skipped as settled (P2-9)", () => {
+    expect(formatDagProgress({ nodeCount: 9, completedNodes: 3, skippedNodes: 4 })).toBe("7/9")
+    expect(formatDagProgress({ nodeCount: 2, completedNodes: 0, skippedNodes: 0 })).toBe("0/2")
   })
 })
