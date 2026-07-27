@@ -1,6 +1,6 @@
 export * as DagStore from "./store"
 
-import { and, asc, desc, eq, inArray } from "drizzle-orm"
+import { and, asc, count, desc, eq, inArray } from "drizzle-orm"
 import { Context, Effect, Layer } from "effect"
 import { Database } from "../database/database"
 import { LayerNode } from "../effect/layer-node"
@@ -194,20 +194,27 @@ export const layer = Layer.effect(
           .all()
           .pipe(Effect.orDie)
         if (wfRows.length === 0) return []
-        const nodeRows = yield* db
-          .select({ workflowId: WorkflowNodeTable.workflow_id, status: WorkflowNodeTable.status })
+        // P1-4: aggregate in SQL — pulling every node row into JS made each
+        // dag.* event burst scale with total node count across the session.
+        const countRows = yield* db
+          .select({
+            workflowId: WorkflowNodeTable.workflow_id,
+            status: WorkflowNodeTable.status,
+            total: count(),
+          })
           .from(WorkflowNodeTable)
           .innerJoin(WorkflowTable, eq(WorkflowNodeTable.workflow_id, WorkflowTable.id))
           .where(eq(WorkflowTable.session_id, sessionId))
+          .groupBy(WorkflowNodeTable.workflow_id, WorkflowNodeTable.status)
           .all()
           .pipe(Effect.orDie)
-        const counts = nodeRows.reduce((all, node) => {
-          const current = all.get(node.workflowId) ?? { nodeCount: 0, completedNodes: 0, runningNodes: 0, failedNodes: 0 }
-          current.nodeCount++
-          if (node.status === "completed") current.completedNodes++
-          if (node.status === "running") current.runningNodes++
-          if (node.status === "failed") current.failedNodes++
-          all.set(node.workflowId, current)
+        const counts = countRows.reduce((all, row) => {
+          const current = all.get(row.workflowId) ?? { nodeCount: 0, completedNodes: 0, runningNodes: 0, failedNodes: 0 }
+          current.nodeCount += row.total
+          if (row.status === "completed") current.completedNodes += row.total
+          if (row.status === "running") current.runningNodes += row.total
+          if (row.status === "failed") current.failedNodes += row.total
+          all.set(row.workflowId, current)
           return all
         }, new Map<string, { nodeCount: number; completedNodes: number; runningNodes: number; failedNodes: number }>())
         return wfRows.map((wf) => ({
