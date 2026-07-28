@@ -170,7 +170,7 @@ describe("iron laws (transition tables)", () => {
       // →FAILED queue-wait timeout.
       [NodeStatus.QUEUED, [NodeStatus.QUEUED, NodeStatus.RUNNING, NodeStatus.PENDING, NodeStatus.SKIPPED, NodeStatus.FAILED]],
       [NodeStatus.RUNNING, [NodeStatus.COMPLETED, NodeStatus.FAILED, NodeStatus.PAUSED, NodeStatus.PENDING, NodeStatus.SKIPPED]],
-      [NodeStatus.PAUSED, [NodeStatus.RUNNING]],
+      [NodeStatus.PAUSED, [NodeStatus.RUNNING, NodeStatus.SKIPPED, NodeStatus.FAILED]],
       [NodeStatus.COMPLETED, []],
       [NodeStatus.FAILED, []],
       [NodeStatus.ABORTED, []],

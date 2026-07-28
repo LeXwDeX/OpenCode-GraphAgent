@@ -10,7 +10,9 @@
  *
  * When neither exists, a commented default `dag.jsonc` is seeded into the
  * global opencode config directory (same generation pattern as the main
- * config's loadGlobal). Files are read lazily at spawn-scheduling time — like
+ * config's loadGlobal) — but only when the caller opts in via `autoSeed`;
+ * the spawn-scheduling read path never writes. Files are read lazily at
+ * spawn-scheduling time — like
  * templates/resolve.ts, nothing is loaded at startup, and edits take effect on
  * the next scheduling round.
  */
@@ -55,11 +57,22 @@ const DEFAULT_CONTENT = `{
 }
 `
 
-export function load(projectDir: string): Effect.Effect<Info> {
+export function load(projectDir: string, options: { autoSeed?: boolean } = {}): Effect.Effect<Info> {
   return Effect.gen(function* () {
     const found = yield* Effect.promise(() => readFirst(candidates(projectDir)))
     if (!found) {
-      yield* Effect.promise(() => seedGlobalDefault()).pipe(Effect.ignore)
+      // Seeding writes to the user's global config dir — opt-in so read paths
+      // (spawn scheduling) stay side-effect free. EEXIST is the benign
+      // seed race; anything else (EACCES/EROFS/…) is logged, never thrown.
+      if (options.autoSeed) {
+        const seedError = yield* Effect.promise(() => seedGlobalDefault())
+        if (seedError) {
+          yield* Effect.logWarning("failed to seed global dag.jsonc", {
+            dir: globalConfigDir(),
+            code: seedError.code ?? String(seedError),
+          })
+        }
+      }
       return {}
     }
     const decoded = Schema.decodeUnknownOption(Info)(parseJsonc(found.text, [], { allowTrailingComma: true }) ?? {})
@@ -111,11 +124,19 @@ async function readFirst(paths: string[]) {
   return undefined
 }
 
-async function seedGlobalDefault() {
+async function seedGlobalDefault(): Promise<NodeJS.ErrnoException | undefined> {
   const file = path.join(globalConfigDir(), "dag.jsonc")
-  await fs.mkdir(path.dirname(file), { recursive: true })
-  // wx: never clobber a file that appeared between the read and the seed.
-  await fs.writeFile(file, DEFAULT_CONTENT, { flag: "wx" })
+  try {
+    await fs.mkdir(path.dirname(file), { recursive: true })
+    // wx: never clobber a file that appeared between the read and the seed.
+    await fs.writeFile(file, DEFAULT_CONTENT, { flag: "wx" })
+    return undefined
+  } catch (err) {
+    const error = err as NodeJS.ErrnoException
+    // EEXIST is the expected outcome of the read-then-seed race.
+    if (error.code === "EEXIST") return undefined
+    return error
+  }
 }
 
 function parseModelRef(ref: string | undefined) {

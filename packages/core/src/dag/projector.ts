@@ -16,6 +16,44 @@ const toMillis = (dt: DateTime.Utc) => DateTime.toEpochMillis(dt)
 const ws = (s: WorkflowStatus) => s as DagEvent.WorkflowStatus
 
 /**
+ * Event → status projection guards — the single source the drift test checks
+ * against the declared transition tables in core/types.ts. Every `from` entry
+ * must be a legal predecessor of `to` (self-transitions are idempotent
+ * re-application and exempt). Editing a guard here without updating the
+ * declared table (or vice versa) fails the consistency test in
+ * test/dag-projector-drift.test.ts instead of drifting silently.
+ */
+export const NodeStatusProjection = {
+  queued: { to: "queued", from: ["pending", "queued"] },
+  started: { to: "running", from: ["pending", "queued", "paused", "running"] },
+  // Publisher-side guardNode admits NodeCompleted only from running; the
+  // former pending/queued/paused tolerance had no producing path and
+  // contradicted the declared table.
+  completed: { to: "completed", from: ["running"] },
+  failed: { to: "failed", from: ["running", "pending", "queued"] },
+  skipped: { to: "skipped", from: ["pending", "queued", "running", "paused"] },
+  cancelled: { to: "failed", from: ["pending", "queued", "running", "paused"] },
+  restarted: { to: "pending", from: ["running"] },
+} as const
+
+export const WorkflowStatusProjection = {
+  started: { to: "running", from: ["pending"] },
+  paused: { to: "paused", from: ["running", "stepping"] },
+  resumed: { to: "running", from: ["paused", "stepping"] },
+  stepped: { to: "stepping", from: ["running", "stepping"] },
+  completed: { to: "completed", from: ["running", "stepping"] },
+  failed: { to: "failed", from: ["running", "stepping"] },
+  cancelled: { to: "cancelled", from: ["running", "paused", "stepping"] },
+  /**
+   * Additive-extend reopen — the ONLY sanctioned exception to terminal
+   * irreversibility: a naturally-completed workflow with a reporting leaf
+   * checkpoint may be reopened by _extend (see dag.ts reopenCompleted).
+   * The drift test exempts exactly this entry.
+   */
+  replanReopen: { to: "running", from: ["completed"] },
+} as const
+
+/**
  * DAG projector: EventV2 → read-model tables (CQRS).
  *
  * Mirrors SessionProjector. One `Layer.effectDiscard` that yields many
@@ -67,14 +105,14 @@ export const layer = Layer.effectDiscard(
           started_at: toMillis(event.data.timestamp),
           time_updated: toMillis(event.data.timestamp),
         })
-        .where(and(eq(WorkflowTable.id, event.data.dagID), eq(WorkflowTable.status, "pending")))
+        .where(and(eq(WorkflowTable.id, event.data.dagID), inArray(WorkflowTable.status, [...WorkflowStatusProjection.started.from])))
         .run()
         .pipe(Effect.orDie),
     )
 
-    yield* events.project(DagEvent.WorkflowPaused, setWorkflowStatus(ws("paused"), [ws("running"), ws("stepping")]))
-    yield* events.project(DagEvent.WorkflowResumed, setWorkflowStatus(ws("running"), [ws("paused"), ws("stepping")]))
-    yield* events.project(DagEvent.WorkflowStepped, setWorkflowStatus(ws("stepping"), [ws("running"), ws("stepping")]))
+    yield* events.project(DagEvent.WorkflowPaused, setWorkflowStatus(ws("paused"), [...WorkflowStatusProjection.paused.from]))
+    yield* events.project(DagEvent.WorkflowResumed, setWorkflowStatus(ws("running"), [...WorkflowStatusProjection.resumed.from]))
+    yield* events.project(DagEvent.WorkflowStepped, setWorkflowStatus(ws("stepping"), [...WorkflowStatusProjection.stepped.from]))
 
     const setWorkflowTerminal = (status: WorkflowStatus, from: WorkflowStatus[]) => (event: { data: { dagID: DagEvent.DagID; timestamp: DateTime.Utc }; durable?: { seq: number } }) =>
       db
@@ -84,9 +122,9 @@ export const layer = Layer.effectDiscard(
         .run()
         .pipe(Effect.orDie)
 
-    yield* events.project(DagEvent.WorkflowCompleted, setWorkflowTerminal(ws("completed"), [ws("running"), ws("stepping")]))
-    yield* events.project(DagEvent.WorkflowFailed, setWorkflowTerminal(ws("failed"), [ws("running"), ws("stepping")]))
-    yield* events.project(DagEvent.WorkflowCancelled, setWorkflowTerminal(ws("cancelled"), [ws("running"), ws("paused"), ws("stepping")]))
+    yield* events.project(DagEvent.WorkflowCompleted, setWorkflowTerminal(ws("completed"), [...WorkflowStatusProjection.completed.from]))
+    yield* events.project(DagEvent.WorkflowFailed, setWorkflowTerminal(ws("failed"), [...WorkflowStatusProjection.failed.from]))
+    yield* events.project(DagEvent.WorkflowCancelled, setWorkflowTerminal(ws("cancelled"), [...WorkflowStatusProjection.cancelled.from]))
 
     yield* events.project(DagEvent.WorkflowReplanned, (event) =>
       Effect.gen(function* () {
@@ -104,7 +142,7 @@ export const layer = Layer.effectDiscard(
           })
           .where(and(
             eq(WorkflowTable.id, event.data.dagID),
-            eq(WorkflowTable.status, "completed"),
+            inArray(WorkflowTable.status, [...WorkflowStatusProjection.replanReopen.from]),
           ))
           .run()
           .pipe(Effect.orDie)
@@ -180,7 +218,7 @@ export const layer = Layer.effectDiscard(
         .where(and(
           eq(WorkflowNodeTable.workflow_id, event.data.dagID),
           eq(WorkflowNodeTable.id, event.data.nodeID),
-          inArray(WorkflowNodeTable.status, ["pending", "queued"]),
+          inArray(WorkflowNodeTable.status, [...NodeStatusProjection.queued.from]),
         ))
         .run()
         .pipe(Effect.orDie),
@@ -209,7 +247,7 @@ export const layer = Layer.effectDiscard(
         .where(and(
           eq(WorkflowNodeTable.workflow_id, event.data.dagID),
           eq(WorkflowNodeTable.id, event.data.nodeID),
-          inArray(WorkflowNodeTable.status, ["pending", "queued", "paused", "running"]),
+          inArray(WorkflowNodeTable.status, [...NodeStatusProjection.started.from]),
         ))
         .run()
         .pipe(Effect.orDie),
@@ -225,13 +263,14 @@ export const layer = Layer.effectDiscard(
           seq: event.durable!.seq,
           time_updated: toMillis(event.data.timestamp),
         })
-        // Only complete nodes in non-terminal status. Prevents a stale
-        // NodeCompleted from flipping an already-terminal node (e.g. failed by
-        // a replan-ceiling check) back to completed.
+        // Only complete nodes the publisher could legally complete: guardNode
+        // admits NodeCompleted from running only, and a stale NodeCompleted
+        // must not flip an already-terminal node (e.g. failed by a
+        // replan-ceiling check) back to completed.
         .where(and(
           eq(WorkflowNodeTable.workflow_id, event.data.dagID),
           eq(WorkflowNodeTable.id, event.data.nodeID),
-          inArray(WorkflowNodeTable.status, ["pending", "queued", "running", "paused"]),
+          inArray(WorkflowNodeTable.status, [...NodeStatusProjection.completed.from]),
         ))
         .run()
         .pipe(Effect.orDie),
@@ -253,7 +292,7 @@ export const layer = Layer.effectDiscard(
         .where(and(
           eq(WorkflowNodeTable.workflow_id, event.data.dagID),
           eq(WorkflowNodeTable.id, event.data.nodeID),
-          inArray(WorkflowNodeTable.status, ["running", "pending", "queued"]),
+          inArray(WorkflowNodeTable.status, [...NodeStatusProjection.failed.from]),
         ))
         .run()
         .pipe(Effect.orDie),
@@ -271,7 +310,7 @@ export const layer = Layer.effectDiscard(
         .where(and(
           eq(WorkflowNodeTable.workflow_id, event.data.dagID),
           eq(WorkflowNodeTable.id, event.data.nodeID),
-          inArray(WorkflowNodeTable.status, ["pending", "queued", "running", "paused"]),
+          inArray(WorkflowNodeTable.status, [...NodeStatusProjection.skipped.from]),
         ))
         .run()
         .pipe(Effect.orDie),
@@ -284,7 +323,7 @@ export const layer = Layer.effectDiscard(
         .where(and(
           eq(WorkflowNodeTable.workflow_id, event.data.dagID),
           eq(WorkflowNodeTable.id, event.data.nodeID),
-          inArray(WorkflowNodeTable.status, ["pending", "queued", "running", "paused"]),
+          inArray(WorkflowNodeTable.status, [...NodeStatusProjection.cancelled.from]),
         ))
         .run()
         .pipe(Effect.orDie),
@@ -308,7 +347,7 @@ export const layer = Layer.effectDiscard(
         .where(and(
           eq(WorkflowNodeTable.workflow_id, event.data.dagID),
           eq(WorkflowNodeTable.id, event.data.nodeID),
-          eq(WorkflowNodeTable.status, "running"),
+          inArray(WorkflowNodeTable.status, [...NodeStatusProjection.restarted.from]),
         ))
         .run()
         .pipe(Effect.orDie),
