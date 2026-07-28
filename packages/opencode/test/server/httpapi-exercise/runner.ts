@@ -80,9 +80,13 @@ function withContext<A, E>(
     (ctx) =>
       Effect.gen(function* () {
         yield* trace(options, scenario, `${label} tmpdir cleanup start`)
-        yield* Effect.promise(async () => {
-          await ctx.dir?.[Symbol.asyncDispose]()
-        }).pipe(Effect.ignore)
+        // Finalizers run uninterruptibly — the scenario timeout cannot break a
+        // hung dispose, so the hard cap lives inside the promise itself.
+        yield* Effect.promise(() =>
+          bounded(`${scenario.name}: tmpdir dispose`, async () => {
+            await ctx.dir?.[Symbol.asyncDispose]()
+          }),
+        )
         yield* trace(options, scenario, `${label} tmpdir cleanup done`)
       }),
   ).pipe(
@@ -262,11 +266,43 @@ const resetState = Effect.promise(async () => {
   const modules = await runtime()
   Flag.OPENCODE_SERVER_PASSWORD = original.OPENCODE_SERVER_PASSWORD
   Flag.OPENCODE_SERVER_USERNAME = original.OPENCODE_SERVER_USERNAME
-  await disposeApps()
-  await modules.disposeAllInstances()
-  await modules.resetDatabase()
+  // This runs from Effect.ensuring, i.e. uninterruptibly — a single promise
+  // that never resolves here used to hang the whole runner with zero output
+  // (the 2026-07-27 CI incident). Bound every step independently so a stuck
+  // dispose degrades into a loud warning and the run continues.
+  await bounded("disposeApps", () => disposeApps())
+  await bounded("disposeAllInstances", () => modules.disposeAllInstances())
+  await bounded("resetDatabase", () => modules.resetDatabase())
   await Bun.sleep(25)
 })
+
+/**
+ * Hard-timeout wrapper for cleanup promises: never rejects, never hangs.
+ * On timeout the underlying promise is left behind (there is nothing safe to
+ * do with it) and the runner moves on instead of silently freezing.
+ */
+const CLEANUP_STEP_TIMEOUT_MS = 10_000
+
+async function bounded(label: string, work: () => Promise<unknown>, ms = CLEANUP_STEP_TIMEOUT_MS) {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timeout = new Promise<"timeout">((resolve) => {
+    timer = setTimeout(() => resolve("timeout"), ms)
+  })
+  const winner = await Promise.race([
+    work().then(
+      () => "done" as const,
+      (error: unknown) => {
+        console.error(`[cleanup] ${label} failed: ${String(error)}`)
+        return "done" as const
+      },
+    ),
+    timeout,
+  ])
+  clearTimeout(timer)
+  if (winner === "timeout") {
+    console.error(`[cleanup] ${label} exceeded ${ms}ms — forcing continuation (resource may leak)`)
+  }
+}
 
 /**
  * Create a DAG workflow fixture with mixed node statuses for HTTP happy-path tests.

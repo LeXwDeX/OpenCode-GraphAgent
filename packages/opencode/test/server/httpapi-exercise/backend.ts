@@ -12,31 +12,44 @@ type CallOptions = {
 }
 
 export function call(scenario: ActiveScenario, ctx: SeededContext<unknown>, options: CallOptions = {}) {
-  return Effect.promise(async () =>
-    capture(await app(await runtime(), options).request(toRequest(scenario, ctx)), scenario.capture),
+  // The signal parameter is load-bearing: Effect.promise is interruptible only
+  // when the callback declares it (evaluate.length !== 0). Without it the
+  // scenario timeout cannot break a stuck request and the runner hangs
+  // silently. The signal is also threaded into the Request so the handler
+  // side observes the abort.
+  return Effect.promise(async (signal) =>
+    capture(await app(await runtime(), options).request(toRequest(scenario, ctx, signal)), scenario.capture),
   )
 }
 
 export function callAuthProbe(scenario: ActiveScenario, credentials: "missing" | "valid" = "missing") {
-  return Effect.promise(async () => {
+  return Effect.promise(async (signal) => {
     const controller = new AbortController()
-    return Promise.race([
-      Promise.resolve(
-        app(await runtime(), { auth: { password: "secret" } }).request(
-          toAuthProbeRequest(scenario, credentials, controller.signal),
-        ),
-      ).then((response) => capture(response, scenario.capture)),
-      Bun.sleep(1_000).then(() => {
-        controller.abort("auth probe timed out")
-        return {
-          status: 0,
-          contentType: "",
-          text: "auth probe timed out",
-          body: undefined,
-          timedOut: true,
-        }
-      }),
-    ])
+    // Forward fiber interruption (scenario timeout) into the probe abort so
+    // neither the request nor the race below can outlive the scenario.
+    const abortOuter = () => controller.abort("scenario interrupted")
+    signal.addEventListener("abort", abortOuter, { once: true })
+    try {
+      return await Promise.race([
+        Promise.resolve(
+          app(await runtime(), { auth: { password: "secret" } }).request(
+            toAuthProbeRequest(scenario, credentials, controller.signal),
+          ),
+        ).then((response) => capture(response, scenario.capture)),
+        Bun.sleep(1_000).then(() => {
+          controller.abort("auth probe timed out")
+          return {
+            status: 0,
+            contentType: "",
+            text: "auth probe timed out",
+            body: undefined,
+            timedOut: true,
+          }
+        }),
+      ])
+    } finally {
+      signal.removeEventListener("abort", abortOuter)
+    }
   })
 }
 
@@ -77,12 +90,13 @@ function app(modules: Runtime, options: CallOptions) {
   })
 }
 
-function toRequest(scenario: ActiveScenario, ctx: SeededContext<unknown>) {
+function toRequest(scenario: ActiveScenario, ctx: SeededContext<unknown>, signal: AbortSignal) {
   const spec = scenario.request(ctx, ctx.state)
   return new Request(new URL(spec.path, "http://localhost"), {
     method: scenario.method,
     headers: spec.body === undefined ? spec.headers : { "content-type": "application/json", ...spec.headers },
     body: spec.body === undefined ? undefined : JSON.stringify(spec.body),
+    signal,
   })
 }
 
