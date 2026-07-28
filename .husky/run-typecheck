@@ -1,0 +1,31 @@
+#!/bin/sh
+# Shared typecheck runner for husky hooks.
+#
+# `bun typecheck` (turbo across the workspace) is the primary path. bun's
+# workspace discovery walks ancestor directories and dies with
+# CouldntReadCurrentDirectory in sandboxed checkouts whose parents are
+# unreadable — an environment defect, not a code failure. In exactly that
+# case, fall back to running every workspace package's own typecheck script
+# directly (the turbo typecheck task declares no dependsOn, so per-package
+# execution is equivalent). Real type errors still fail on either path.
+set -e
+
+out=$(bun typecheck 2>&1) && { printf '%s\n' "$out"; exit 0; }
+printf '%s\n' "$out"
+case "$out" in
+  *CouldntReadCurrentDirectory*) ;;
+  *) exit 1 ;;
+esac
+
+echo "bun workspace discovery unavailable — falling back to per-package typecheck"
+root=$(pwd)
+status=0
+# Mirrors the workspaces globs in package.json.
+for pkg in packages/* packages/console/* packages/stats/* packages/sdk/js; do
+  [ -f "$pkg/package.json" ] || continue
+  script=$(sed -n 's/.*"typecheck":[[:space:]]*"\([^"]*\)".*/\1/p' "$pkg/package.json" | head -1)
+  [ -n "$script" ] || continue
+  echo "typecheck: $pkg"
+  (cd "$pkg" && PATH="$root/node_modules/.bin:$PATH" sh -c "$script") || status=1
+done
+exit $status
