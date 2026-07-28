@@ -6,6 +6,7 @@ import { Session } from "@/session/session"
 import { SessionID } from "@/session/schema"
 import type { NodeConfig, WorkflowConfig } from "@/dag/dag"
 import { AdmissionRecord, ExecutionMode } from "@/dag/admission"
+import { TerminalViolationError } from "@opencode-ai/core/dag/core/types"
 
 const id = "workflow"
 
@@ -196,12 +197,16 @@ export const WorkflowTool = Tool.define<typeof Parameters, Metadata, Dag.Service
               }
             }
             case "control": {
-              if (!params.workflow_id || !params.operation) return yield* Effect.die(new Error("control requires 'workflow_id' and 'operation'"))
+              if (!params.workflow_id || !params.operation) {
+                return yield* Effect.die(new Error(
+                  `control requires 'workflow_id' and 'operation' (got workflow_id=${params.workflow_id ?? "<missing>"}, operation=${params.operation ?? "<missing>"}). Example: { action: "control", workflow_id: "dag_...", operation: "pause" }. On a cancel/replan intent, issue pause FIRST — it needs no fragment and freezes scheduling instantly while you compose the replan.`,
+                ))
+              }
               const wfId = params.workflow_id
               switch (params.operation) {
                 case "pause":
                   yield* dag.pause(wfId).pipe(Effect.orDie)
-                  return { title: "Workflow paused", output: `<workflow id="${wfId}" state="paused"/>\nNote: pause stops new node spawns only — nodes already running continue to completion.`, metadata: { workflowId: wfId } as Metadata }
+                  return { title: "Workflow paused", output: `<workflow id="${wfId}" state="paused"/>\nNote: pause stops new node spawns only — nodes already running continue to completion. To stop a running node, submit a replan fragment marking it restart: true or cancel: true (replan is valid while paused).`, metadata: { workflowId: wfId } as Metadata }
                 case "resume":
                   yield* dag.resume(wfId).pipe(Effect.orDie)
                   return { title: "Workflow resumed", output: `<workflow id="${wfId}" state="running"/>`, metadata: { workflowId: wfId } as Metadata }
@@ -212,8 +217,24 @@ export const WorkflowTool = Tool.define<typeof Parameters, Metadata, Dag.Service
                   yield* dag.complete(wfId).pipe(Effect.orDie)
                   return { title: "Workflow completed (early)", output: `<workflow id="${wfId}" state="completed"/>`, metadata: { workflowId: wfId } as Metadata }
                 case "replan": {
-                  if (!params.fragment) return yield* Effect.die(new Error("replan operation requires 'fragment'"))
-                  const r = yield* dag.replan(wfId, { nodes: params.fragment.nodes as NodeConfig[] }).pipe(Effect.orDie)
+                  if (!params.fragment) {
+                    return yield* Effect.die(new Error(
+                      "replan operation requires 'fragment' (a WorkflowGraphSchema with the node definitions to apply). If the fragment is not composed yet, issue control(pause) first so the graph cannot terminalize while you write it.",
+                    ))
+                  }
+                  const r = yield* dag.replan(wfId, { nodes: params.fragment.nodes as NodeConfig[] }).pipe(
+                    // The graph raced to terminal while the fragment was being
+                    // composed (the pause-first protocol was skipped). Surface
+                    // the recovery options instead of a bare iron-law rejection.
+                    Effect.catchIf(
+                      (err): err is TerminalViolationError => err instanceof TerminalViolationError,
+                      (err) =>
+                        Effect.die(new Error(
+                          `${err.message}. The workflow reached a terminal status before the replan arrived — terminal workflows are immutable. Recover by starting a new workflow with the updated node definitions (action: start), or extend if a reporting leaf checkpoint naturally completed the graph. Next time issue control(pause) BEFORE composing the fragment.`,
+                        )),
+                    ),
+                    Effect.orDie,
+                  )
                   const ignored = r.ignore.length > 0 ? `\nIgnored (terminal, immutable — add replacements under new ids to retry): ${r.ignore.join(", ")}` : ""
                   return {
                     title: `Workflow replanned: +${r.add.length} -${r.cancel.length} ↻${r.restart.length}`,

@@ -255,6 +255,6 @@ function dependsTransitively(config: WorkflowConfig, startID: string, targetID: 
   return visit(startID)
 }
 
-function isReviewWorker(workerType: string) {
+export function isReviewWorker(workerType: string) {
   return workerType === "review" || workerType.startsWith("review-")
 }

@@ -190,3 +190,14 @@ Do not poll `status` merely to wait. Atomic wake reports actionable checkpoints 
 Implement review-and-repair with finite `extend` or `control(replan)` operations. Target only the nodes and findings that require repair. You MUST NOT create cyclic `depends_on`, predeclare unbounded speculative repair waves, or start an unrelated replacement workflow.
 
 Declare a finite `max_node_replan_attempts`. When the ceiling is exhausted, stop with `BLOCKED`, report the remaining findings, and do not retry the identical plan.
+
+## Replan Protocol (pause-first)
+
+A replan fragment takes real time to compose — template rendering, model reasoning, node rewiring. While you compose it, the workflow keeps scheduling and can reach a terminal status, after which replan is rejected (terminal workflows are immutable). Freeze first, then think:
+
+1. On any user cancel/replan/model-change intent, IMMEDIATELY issue `control(pause)` in the same turn. Pause needs no fragment, applies in milliseconds, and stops new node spawns.
+2. Pause does not interrupt nodes that are already running. Decide their disposition inside the fragment: `restart: true` re-spawns a running node with the new definition (its in-flight child session is hard-aborted at re-spawn), `cancel: true` terminates it, absence keeps it running to completion.
+3. Compose the fragment, then issue `control(replan)` — replan is valid while paused.
+4. Issue `control(resume)` to restore scheduling.
+
+If the workflow terminalized before you paused, do not force the replan: start a new workflow carrying the updated definitions, and state which prior results are superseded.
