@@ -26,6 +26,17 @@ for pkg in packages/* packages/console/* packages/stats/* packages/sdk/js; do
   script=$(sed -n 's/.*"typecheck":[[:space:]]*"\([^"]*\)".*/\1/p' "$pkg/package.json" | head -1)
   [ -n "$script" ] || continue
   echo "typecheck: $pkg"
-  (cd "$pkg" && PATH="$root/node_modules/.bin:$PATH" sh -c "$script") || status=1
+  pkgout=$( (cd "$pkg" && PATH="$root/node_modules/.bin:$PATH" sh -c "$script") 2>&1 ) && continue
+  printf '%s\n' "$pkgout"
+  # Same environment-defect class as above: sandboxed hook contexts can deny
+  # the .tsbuildinfo write of `tsgo -b` (TS5033 "operation not permitted").
+  # Tolerate a failure ONLY when every reported TS error is that write denial
+  # — any real type error (or a crash with no TS output) still fails.
+  if printf '%s\n' "$pkgout" | grep -q "error TS5033.*operation not permitted" \
+    && ! printf '%s\n' "$pkgout" | grep "error TS" | grep -qv "error TS5033"; then
+    echo "warn: $pkg buildinfo write denied by environment (TS5033) — no type errors, continuing"
+    continue
+  fi
+  status=1
 done
 exit $status
