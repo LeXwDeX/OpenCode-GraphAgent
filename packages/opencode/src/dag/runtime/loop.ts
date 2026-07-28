@@ -61,6 +61,11 @@ export const layer = Layer.effect(
         const wakeInFlight = new Set<string>()
         const wakePending = new Set<string>()
 
+        // Seed the commented global dag.jsonc once per instance init — the
+        // per-round DagConfig.load below stays a pure read so the spawn
+        // scheduling hot path never writes to the user's config dir.
+        yield* DagConfig.load(ctx.directory, { autoSeed: true }).pipe(Effect.ignore)
+
         const spawnReady = Effect.fn("DagLoop.spawnReady")(function* (dagID: string) {
           const entry = runtimes.get(dagID)
           if (!entry) return
@@ -264,7 +269,20 @@ export const layer = Layer.effect(
           yield* promptSvc.cancel(childSessionId as never).pipe(Effect.ignore)
         })
 
+        // Subscription handlers must never die. dag.ts guards and checkCompletion
+        // use orDie, whose defects punch straight through Effect.ignore (it only
+        // absorbs the error channel) and would kill the forked runForEach fiber —
+        // leaving that event type permanently unhandled for the rest of the
+        // process. catchCause absorbs failures AND defects at the boundary.
+        const guarded = (event: string) => <A, E, R>(self: Effect.Effect<A, E, R>) =>
+          self.pipe(Effect.catchCause((cause) => Effect.logWarning("DagLoop handler failed", { event, cause })))
+
         const recoverWorkflow = Effect.fn("DagLoop.recoverWorkflow")(function* (wf: DagStore.WorkflowRow) {
+          // Cross-instance guard: DagLoop is per-directory InstanceState but the
+          // event bus and store are process-global. Only the instance whose
+          // project owns the workflow may adopt it — otherwise a multi-directory
+          // server spawns children under a foreign directory context.
+          if (wf.projectId !== ctx.project.id) return
           const dagID = wf.id
           const config = parseWorkflowConfig(wf.config)
           const recovery = yield* reconcileWorkflow(
@@ -337,6 +355,10 @@ export const layer = Layer.effect(
               if (runtimes.has(dagID)) return
               const wf = yield* store.getWorkflow(dagID).pipe(Effect.orDie)
               if (!wf) return
+              // Cross-instance guard: only the owning project's instance adopts
+              // (see recoverWorkflow). First-wave spawns must not race across
+              // directory contexts.
+              if (wf.projectId !== ctx.project.id) return
               const config = parseWorkflowConfig(wf.config)
               const nodes = yield* store.getNodes(dagID)
               const maxConcurrency = Math.max(1, config?.max_concurrency ?? Dag.DEFAULT_WORKFLOW_CONFIG.maxConcurrency)
@@ -350,7 +372,7 @@ export const layer = Layer.effect(
                   yield* checkCompletion(dagID)
                 }),
               )
-            }).pipe(Effect.ignore),
+            }).pipe(guarded("WorkflowStarted")),
           ),
           Effect.forkScoped({ startImmediately: true }),
         )
@@ -371,7 +393,24 @@ export const layer = Layer.effect(
                 if (!entry) return
                 yield* entry.evalLock.withPermits(1)(
                   Effect.gen(function* () {
-                    entry.fibers.delete(evt.data.nodeID as string)
+                    const nodeID = evt.data.nodeID as string
+                    // Cancel-skip race: workflow-level cancel publishes NodeSkipped
+                    // for running nodes, and this handler may win the cross-stream
+                    // race against WorkflowCancelled. Deleting the fiber here
+                    // uninterrupted would orphan it from the WorkflowCancelled
+                    // sweep and the child session would keep running until its
+                    // prompt finishes or times out. Stop it now, mirroring the
+                    // NodeCancelled handler. Completed nodes keep the plain
+                    // delete — their fiber published the event and is finishing.
+                    if (def === DagEvent.NodeSkipped) {
+                      const fiber = entry.fibers.get(nodeID)
+                      if (fiber) {
+                        const node = yield* store.getNode(dagID, nodeID)
+                        yield* abortChild(nodeID, node?.childSessionId ?? null).pipe(Effect.ignore)
+                        yield* Fiber.interrupt(fiber).pipe(Effect.ignore)
+                      }
+                    }
+                    entry.fibers.delete(nodeID)
                     const workflow = yield* store.getWorkflow(dagID)
                     entry.runtime.setPaused(workflow?.status === "paused")
                     entry.runtime.setStepMode(workflow?.status === "stepping")
@@ -392,7 +431,7 @@ export const layer = Layer.effect(
                 // the parent session may already be idle (no new idle event
                 // will fire), so we can't rely on the idle subscription alone.
                 yield* tryDeliverWake(entry.parentSessionID).pipe(Effect.ignore, Effect.forkScoped)
-              }).pipe(Effect.ignore),
+              }).pipe(guarded(def === DagEvent.NodeSkipped ? "NodeSkipped" : "NodeCompleted")),
             ),
             Effect.forkScoped({ startImmediately: true }),
           )
@@ -419,7 +458,7 @@ export const layer = Layer.effect(
                   yield* checkCompletion(dagID)
                 }),
               )
-            }).pipe(Effect.ignore),
+            }).pipe(guarded("NodeCancelled")),
           ),
           Effect.forkScoped({ startImmediately: true }),
         )
@@ -454,7 +493,7 @@ export const layer = Layer.effect(
                   }),
                 )
                 yield* tryDeliverWake(entry.parentSessionID).pipe(Effect.ignore, Effect.forkScoped)
-              }).pipe(Effect.ignore),
+              }).pipe(guarded("NodeFailed")),
           ),
           Effect.forkScoped({ startImmediately: true }),
         )
@@ -466,7 +505,7 @@ export const layer = Layer.effect(
               const entry = runtimes.get(evt.data.dagID as string)
               if (!entry) return
               yield* entry.evalLock.withPermits(1)(Effect.sync(() => entry.runtime.setPaused(true)))
-            }).pipe(Effect.ignore),
+            }).pipe(guarded("WorkflowPaused")),
           ),
           Effect.forkScoped({ startImmediately: true }),
         )
@@ -484,7 +523,7 @@ export const layer = Layer.effect(
                   yield* spawnReady(dagID)
                 }),
               )
-            }).pipe(Effect.ignore),
+            }).pipe(guarded("WorkflowStepped")),
           ),
           Effect.forkScoped({ startImmediately: true }),
         )
@@ -508,7 +547,7 @@ export const layer = Layer.effect(
                   yield* checkCompletion(dagID)
                 }),
               )
-            }).pipe(Effect.ignore),
+            }).pipe(guarded("WorkflowResumed")),
           ),
           Effect.forkScoped({ startImmediately: true }),
         )
@@ -533,7 +572,7 @@ export const layer = Layer.effect(
                   yield* checkCompletion(dagID)
                 }),
               )
-            }).pipe(Effect.ignore),
+            }).pipe(guarded("WorkflowReplanned")),
           ),
           Effect.forkScoped({ startImmediately: true }),
         )
@@ -564,7 +603,7 @@ export const layer = Layer.effect(
                 if (parentSessionID) {
                   yield* tryDeliverWake(parentSessionID).pipe(Effect.ignore, Effect.forkScoped)
                 }
-              }).pipe(Effect.ignore),
+              }).pipe(guarded("WorkflowTerminal")),
             ),
             Effect.forkScoped({ startImmediately: true }),
           )
@@ -744,11 +783,14 @@ export const layer = Layer.effect(
           }
         })
 
-        // Idle-event subscription: the primary wake trigger
+        // Idle-event subscription: the primary wake trigger. The handler only
+        // forks, so the subscription itself cannot die — guarded here so a
+        // defect inside a delivery attempt is logged instead of silently
+        // killing its fiber.
         yield* events.subscribe(SessionStatusEvent.Status).pipe(
           Stream.filter((evt) => evt.data.status.type === "idle"),
           Stream.runForEach((evt) =>
-            tryDeliverWake(evt.data.sessionID as string).pipe(Effect.ignore, Effect.forkScoped),
+            tryDeliverWake(evt.data.sessionID as string).pipe(guarded("WakeDelivery"), Effect.forkScoped),
           ),
           Effect.forkScoped({ startImmediately: true }),
         )
@@ -773,6 +815,14 @@ export const layer = Layer.effect(
           Effect.catch(() => Effect.succeed([] as string[])),
         )
         for (const sessionID of pendingWakeSessions) {
+          // Cross-instance guard: wake redelivery is store-global. A session's
+          // workflows share its project (enforced at dag.create), so the wake
+          // snapshot's own workflow rows carry the ownership proof — only
+          // drain sessions whose unreported workflows belong to this project.
+          const snapshot = yield* store.getWakeSnapshot(sessionID).pipe(
+            Effect.catch(() => Effect.succeed({ nodes: [], workflows: [] } satisfies DagStore.WakeSnapshot)),
+          )
+          if (!snapshot.workflows.some((wf) => wf.projectId === ctx.project.id)) continue
           yield* tryDeliverWake(sessionID).pipe(Effect.forkScoped)
         }
 

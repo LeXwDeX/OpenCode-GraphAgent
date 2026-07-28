@@ -27,8 +27,15 @@ afterEach(async () => {
 })
 
 describe("DagConfig.load", () => {
-  it("seeds a commented default dag.jsonc into the global config dir when none exists", async () => {
+  it("does not write anything by default when no config exists (pure read path)", async () => {
     const info = await Effect.runPromise(DagConfig.load(projectDir))
+    expect(info).toEqual({})
+    // The scheduling hot path must never seed — the global dir stays absent.
+    expect(fs.access(path.join(globalDir, "dag.jsonc"))).rejects.toThrow()
+  })
+
+  it("seeds a commented default dag.jsonc into the global config dir with autoSeed", async () => {
+    const info = await Effect.runPromise(DagConfig.load(projectDir, { autoSeed: true }))
     expect(info).toEqual({})
     const seeded = await fs.readFile(path.join(globalDir, "dag.jsonc"), "utf-8")
     expect(seeded).toContain("thinking_depth")
@@ -39,6 +46,15 @@ describe("DagConfig.load", () => {
     expect(reloaded).toEqual({ model: {} })
     expect(reloaded.thinking_depth).toBeUndefined()
     expect(DagConfig.tierModel(reloaded, { required: true, workerType: "build" })).toBeUndefined()
+  })
+
+  it("returns empty config when seeding fails for non-EEXIST reasons", async () => {
+    // Point the global dir AT A FILE so mkdir/writeFile fail with ENOTDIR —
+    // load must swallow it (warning only) and still return {}.
+    await fs.writeFile(path.join(dir, "not-a-dir"), "")
+    process.env.OPENCODE_CONFIG_DIR = path.join(dir, "not-a-dir")
+    const info = await Effect.runPromise(DagConfig.load(projectDir, { autoSeed: true }))
+    expect(info).toEqual({})
   })
 
   it("reads the global dag.jsonc with comments and trailing commas", async () => {
