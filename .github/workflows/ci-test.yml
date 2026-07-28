@@ -122,7 +122,16 @@ jobs:
       - name: Run HttpAPI Exerciser Gates
         if: runner.os == 'Linux'
         working-directory: packages/opencode
-        run: bun run test:httpapi
+        # The exerciser aggregates its report and prints it in one flush, so
+        # this step is silent while it runs. A latent uninterruptible hang
+        # (bare Effect.promise in scenario call/cleanup paths that the 30s
+        # scenario timeout cannot interrupt) froze the effect mode twice on
+        # 2026-07-27 — with no step timeout that occupies the runner for the
+        # default 6h. The full gate baseline is ~6m in CI, so 15m is generous;
+        # test:httpapi:ci adds --progress/--trace to effect mode so the log
+        # names the exact scenario and phase if it ever hangs again.
+        timeout-minutes: 15
+        run: bun run test:httpapi:ci
 
   e2e-tests:
     name: E2E Tests (${{ matrix.settings.name }})
