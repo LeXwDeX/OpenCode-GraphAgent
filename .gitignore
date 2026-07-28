@@ -47,3 +47,4 @@ tsconfig.tsbuildinfo
 .claude
 .opencode/commands/
 .opencode/skills
+.qoder
