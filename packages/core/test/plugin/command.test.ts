@@ -132,6 +132,39 @@ describe("CommandPlugin.Plugin", () => {
     }),
   )
 
+  it.effect("defines the pause-first replan protocol", () =>
+    Effect.sync(() => {
+      expect(CommandPlugin.OrchestrationPolicyContent).toContain("## Replan Protocol (pause-first)")
+      expect(CommandPlugin.OrchestrationPolicyContent).toContain("IMMEDIATELY issue `control(pause)`")
+      expect(CommandPlugin.OrchestrationPolicyContent).toContain("replan is valid while paused")
+      expect(CommandPlugin.OrchestrationPolicyContent).toContain("Pause does not interrupt nodes that are already running")
+      expect(CommandPlugin.WorkflowFactsContent).toContain("always pause FIRST")
+    }),
+  )
+
+  it.effect("defines productized orchestration domain playbooks", () =>
+    Effect.sync(() => {
+      expect(CommandPlugin.WorkflowContent).toContain("# Orchestration Domains")
+      expect(CommandPlugin.OrchestrationDomainsContent).toContain("## The Simulated Audit Loop")
+      expect(CommandPlugin.OrchestrationDomainsContent).toContain("NOT a cyclic edge and NOT a harness loop")
+      expect(CommandPlugin.OrchestrationDomainsContent).toContain("NEW ids (terminal nodes are")
+      for (const playbook of [
+        "## Playbook: Deep Review",
+        "## Playbook: Deep Speculation",
+        "## Playbook: Large Engineering",
+        "## Playbook: Solution Bake-off",
+        "## Playbook: Root-Cause Diagnosis",
+        "## Playbook: Audit Sweeps",
+      ]) {
+        expect(CommandPlugin.OrchestrationDomainsContent).toContain(playbook)
+      }
+      expect(CommandPlugin.OrchestrationDomainsContent).toContain("prosecutor")
+      expect(CommandPlugin.OrchestrationDomainsContent).toContain("zero human gates in the middle")
+      expect(CommandPlugin.OrchestrationDomainsContent).toContain("max_node_replan_attempts")
+      expect(CommandPlugin.OrchestrationDomainsContent).toContain("capability slot per Role")
+    }),
+  )
+
   it.effect("defines parent-session admission fixtures for standard deep and GRILL requests", () =>
     Effect.sync(() => {
       const fixtures = [

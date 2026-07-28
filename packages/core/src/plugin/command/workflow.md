@@ -474,7 +474,7 @@ Workflows are not static. After creating a workflow, use `extend` and `control(r
 
 - **Scale up**: a node reports the work is larger than expected → `extend` with additional parallel nodes to split the load.
 - **Cut short**: a node proves the remaining work is unnecessary → `control(complete)` to early-complete and skip pending nodes.
-- **Redirect**: a gate or review reveals a wrong direction → `control(replan)` with `restart: true` on the affected nodes and `cancel: true` on their downstream dependents.
+- **Redirect**: a gate or review reveals a wrong direction → `control(pause)` first to freeze scheduling, then `control(replan)` with `restart: true` on the affected nodes and `cancel: true` on their downstream dependents, then `control(resume)`.
 
 Only nodes with `report_to_parent: true` produce intermediate parent
 checkpoints, and those reports are delivered at the next actionable wake
@@ -583,10 +583,10 @@ checkpoint naturally completed the current graph; an early
 **status** — Read the durable state of one workflow and all of its nodes. Pass `workflow_id`. Use it when the user explicitly asks for current state or once before a decision that requires fresh state, such as replan/control. Do not poll a running workflow merely to wait: node reports and terminal outcomes wake the parent session automatically.
 
 **control** — Control a running workflow:
-- `pause` — let running nodes finish, don't spawn new ones (pause does NOT stop nodes that are already running)
+- `pause` — let running nodes finish, don't spawn new ones (pause does NOT stop nodes that are already running). On a cancel/replan intent, always pause FIRST: it needs no fragment and freezes scheduling while you compose the replan, so the graph cannot terminalize under you.
 - `resume` — resume scheduling
 - `cancel` — cancel the entire workflow
-- `replan` — submit a YAML fragment; running nodes can be `restart: true` or `cancel: true`; pending nodes absent from the fragment are cancelled
+- `replan` — submit a YAML fragment; running nodes can be `restart: true` or `cancel: true`; pending nodes absent from the fragment are cancelled. Valid while paused — the pause → compose fragment → replan → resume sequence is the safe path.
 - `complete` — early-complete: remaining pending nodes are skipped (non-violation)
 - `step` — advance exactly one ready node (the first by node ID lexicographic order), then wait. Use for controlled debugging or staged verification of a critical path. Unlike `pause`, which freezes all scheduling, `step` advances one node and re-waits. A second `step` while the stepped node is still running is rejected. Use `resume` to return to full-speed scheduling. Nodes are selected in lexicographic ID order for determinism.
 

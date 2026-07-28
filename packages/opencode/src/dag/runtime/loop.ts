@@ -24,6 +24,7 @@ import { SessionID } from "@/session/schema"
 import { SessionStatus } from "@/session/status"
 import { renderTemplate } from "../templates/resolve"
 import { sanitizeInput } from "../templates/sanitize"
+import { DagConfig } from "../config"
 import { spawnNode } from "./spawn"
 import { evaluateCondition, resolveInputMapping } from "./eval"
 import { reconcileWorkflow, makeSessionStatusChecker } from "./recovery"
@@ -83,6 +84,9 @@ export const layer = Layer.effect(
           // their outputs cannot change during this loop — per-node re-reads
           // were O(ready × nodes) pure overhead.
           const nodesSnapshot = ready.length > 0 ? yield* store.getNodes(dagID) : []
+          // dag.jsonc defaults are read once per scheduling round (lazy, like
+          // templates) so edits apply to the next round without a restart.
+          const dagConfig: DagConfig.Info = ready.length > 0 ? yield* DagConfig.load(ctx.directory) : {}
           for (const nodeID of ready) {
             const node = nodesSnapshot.find((n) => n.id === nodeID)
             if (!node) continue
@@ -218,6 +222,8 @@ export const layer = Layer.effect(
               reviewImplementationFingerprint: nodeConfig
                 ? reviewImplementationFingerprint(nodeConfig, resolvedMapping)
                 : undefined,
+              fallbackModel: DagConfig.tierModel(dagConfig, { required: node.required, workerType: node.workerType }),
+              variant: dagConfig.thinking_depth,
             }).pipe(
               Effect.tap((result) => Effect.sync(() => entry.fibers.set(nodeID, result.fiber))),
               Effect.provideService(Dag.Service, dag),

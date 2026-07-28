@@ -47,6 +47,10 @@ export interface NodeSpawnInput {
   timeoutMs?: number
   reportToParent?: boolean
   reviewImplementationFingerprint?: string
+  /** dag.jsonc tier default — slots between the agent model and the parent-session model. */
+  fallbackModel?: { modelID: string; providerID: string }
+  /** dag.jsonc thinking_depth — forwarded as the prompt variant (no-op unless the model defines it). */
+  variant?: string
 }
 
 export interface NodeSpawnResult {
@@ -88,6 +92,7 @@ export function spawnNode(
       : undefined
     const model = nodeModel
       ?? (agent.model ? { modelID: agent.model.modelID, providerID: agent.model.providerID } : undefined)
+      ?? (input.fallbackModel ? { modelID: input.fallbackModel.modelID as never, providerID: input.fallbackModel.providerID as never } : undefined)
       ?? (parent.model ? { modelID: parent.model.id, providerID: parent.model.providerID } : undefined)
     if (!model) {
       yield* dag.nodeFailed(input.dagID, input.nodeID, `no model configured for agent: ${agent.name}`, "exec_failed")
@@ -200,6 +205,7 @@ export function spawnNode(
             sessionID: childSession.id,
             model,
             agent: agent.name,
+            ...(input.variant ? { variant: input.variant } : {}),
             parts: input.promptParts,
           }).pipe(Effect.timeoutOption(remainingMs))
           if (Option.isNone(resultOpt)) {
