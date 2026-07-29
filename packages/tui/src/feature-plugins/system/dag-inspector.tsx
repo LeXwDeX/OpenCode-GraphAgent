@@ -7,7 +7,6 @@ import { useTerminalDimensions } from "@opentui/solid"
 import { Spinner } from "../../component/spinner"
 import { useBindings, useCommandShortcut } from "../../keymap"
 import { selectedForeground, useTheme } from "../../context/theme"
-import { SplitBorder } from "../../ui/border"
 import {
   computeNodeRowIndex,
   computeWaves,
@@ -28,10 +27,11 @@ import type { DagWorkflowSummary } from "@opencode-ai/sdk/v2"
 
 const id = "internal:system-dag-inspector"
 const ROUTE = "dag"
-// Workflow sidebar mirrors the chat sidebar: fixed width, panel background,
-// and only present on wide terminals (chat uses the same > 120 threshold).
-const SIDEBAR_WIDTH = 42
-const WIDE_TERMINAL_WIDTH = 120
+// The workflow list is primary navigation, not ambient metadata, so it is
+// always present. It only narrows on small terminals — never disappears.
+const NAV_WIDTH_MAX = 32
+const NAV_WIDTH_MIN = 18
+const NAV_WIDTH_SHARE = 0.3
 // Node detail content rows: header, dependencies, error/output preview. The
 // detail block adds two padding rows on top; fixed so changing the selection
 // never moves the footer.
@@ -54,10 +54,11 @@ function DagInspector(props: { api: TuiPluginApi }) {
   // so the full theme comes from the context, as in the diff viewer.
   const themeState = useTheme()
   const dimensions = useTerminalDimensions()
-  // Below this width the sidebar would squeeze the wave list into unreadable
-  // truncation, so it is dropped entirely and the summary block carries the
-  // workflow position instead.
-  const wide = createMemo(() => dimensions().width > WIDE_TERMINAL_WIDTH)
+  // Navigation stays on screen at every width; it yields columns to the wave
+  // list instead of vanishing, which is what a primary navigation pane owes.
+  const navWidth = createMemo(() =>
+    Math.max(NAV_WIDTH_MIN, Math.min(NAV_WIDTH_MAX, Math.floor(dimensions().width * NAV_WIDTH_SHARE))),
+  )
   const params = () =>
     ("params" in props.api.route.current ? props.api.route.current.params : undefined) as
       | { sessionID?: string; returnRoute?: { name: string; params?: Record<string, unknown> } }
@@ -394,9 +395,71 @@ function DagInspector(props: { api: TuiPluginApi }) {
 
   return (
     <box width="100%" height="100%">
-      <box flexGrow={1} minHeight={0} flexDirection="row">
-        {/* Main column — the chat message-area vocabulary: two-column side
-          padding, rail-and-panel blocks, no frame lines. */}
+      {/* Title row — identity, subject, scale. Bold reserved for identity. */}
+      <box flexDirection="row" gap={1} flexShrink={0} paddingTop={1} paddingLeft={2} paddingRight={2}>
+        <text fg={theme().text} flexShrink={0}>
+          <b>DAG</b>
+        </text>
+        <box flexGrow={1} minWidth={0}>
+          <text fg={theme().textMuted} wrapMode="none">
+            {selectedWorkflowSummary()?.title ?? "workflow inspector"}
+          </text>
+        </box>
+        <text fg={theme().textMuted} flexShrink={0}>
+          {workflows().length} {workflows().length === 1 ? "workflow" : "workflows"}
+        </text>
+      </box>
+
+      <box flexGrow={1} minHeight={0} flexDirection="row" marginTop={1}>
+        {/* Navigation pane — a distinct region marked by the panel surface and
+            its own padding rhythm rather than a drawn frame. Always present. */}
+        <box
+          width={navWidth()}
+          flexShrink={0}
+          minHeight={0}
+          backgroundColor={theme().backgroundPanel}
+          paddingTop={1}
+          paddingBottom={1}
+          paddingLeft={2}
+          paddingRight={2}
+        >
+          <scrollbox
+            ref={(element: ScrollBoxRenderable) => (workflowScroll = element)}
+            flexGrow={1}
+            minHeight={0}
+            verticalScrollbarOptions={{ visible: false }}
+            horizontalScrollbarOptions={{ visible: false }}
+          >
+            <For each={workflows()}>
+              {(wf) => {
+                const selected = () => selectedWorkflow() === wf.id
+                return (
+                  <box
+                    flexDirection="row"
+                    gap={1}
+                    width="100%"
+                    backgroundColor={selected() ? theme().backgroundElement : undefined}
+                    onMouseUp={() => setSelectedWorkflow(wf.id)}
+                  >
+                    <text fg={statusColor(wf.status)} flexShrink={0}>
+                      •
+                    </text>
+                    <box flexGrow={1} minWidth={0}>
+                      <text fg={theme().text} wrapMode="none">
+                        {wf.title}
+                      </text>
+                    </box>
+                    <text fg={theme().textMuted} flexShrink={0}>
+                      {formatDagProgress(wf)}
+                    </text>
+                  </box>
+                )
+              }}
+            </For>
+          </scrollbox>
+        </box>
+
+        {/* Content pane — waves and nodes. */}
         <box flexGrow={1} minWidth={0} minHeight={0} paddingTop={1} paddingLeft={2} paddingRight={2}>
           <box flexGrow={1} minHeight={0}>
             <Switch>
@@ -415,48 +478,21 @@ function DagInspector(props: { api: TuiPluginApi }) {
                 </box>
               </Match>
               <Match when={workflows().length > 0}>
-                {/* Selected workflow summary — the user-message block: status
-                  rail + panel background, mirroring the chat transcript. */}
-                <box
-                  flexShrink={0}
-                  border={["left"]}
-                  borderColor={statusColor(selectedWorkflowSummary()?.status ?? "")}
-                  customBorderChars={SplitBorder.customBorderChars}
-                >
-                  <box
-                    paddingTop={1}
-                    paddingBottom={1}
-                    paddingLeft={2}
-                    paddingRight={2}
-                    backgroundColor={theme().backgroundPanel}
-                    flexShrink={0}
-                  >
-                    <text fg={theme().text}>
-                      <b>{selectedWorkflowSummary()?.title ?? ""}</b>
-                    </text>
-                    <text wrapMode="none">
-                      <span style={{ fg: statusColor(selectedWorkflowSummary()?.status ?? "") }}>
-                        {selectedWorkflowSummary()?.status ?? "unknown"}
-                      </span>
-                      <span style={{ fg: theme().textMuted }}>
-                        {" · "}
-                        {nodes().length} {nodes().length === 1 ? "node" : "nodes"} · {layers().length}{" "}
-                        {layers().length === 1 ? "wave" : "waves"}
-                      </span>
-                      <Show when={actionMessage()}>
-                        <span style={{ fg: theme().warning }}> · {actionMessage()}</span>
-                      </Show>
-                      {/* Without the sidebar the summary block is the only
-                          place the workflow position can be read. */}
-                      <Show when={!wide() && workflows().length > 1}>
-                        <span style={{ fg: theme().textMuted }}>
-                          {" · workflow "}
-                          {workflows().findIndex((workflow) => workflow.id === selectedWorkflow()) + 1}/
-                          {workflows().length}
-                        </span>
-                      </Show>
-                    </text>
-                  </box>
+                {/* Status line — state colour plus muted scale, one row. */}
+                <box flexShrink={0}>
+                  <text wrapMode="none">
+                    <span style={{ fg: statusColor(selectedWorkflowSummary()?.status ?? "") }}>
+                      {selectedWorkflowSummary()?.status ?? "unknown"}
+                    </span>
+                    <span style={{ fg: theme().textMuted }}>
+                      {" · "}
+                      {nodes().length} {nodes().length === 1 ? "node" : "nodes"} · {layers().length}{" "}
+                      {layers().length === 1 ? "wave" : "waves"}
+                    </span>
+                    <Show when={actionMessage()}>
+                      <span style={{ fg: theme().warning }}> · {actionMessage()}</span>
+                    </Show>
+                  </text>
                 </box>
                 <scrollbox
                   ref={(element: ScrollBoxRenderable) => (nodeScroll = element)}
@@ -534,141 +570,73 @@ function DagInspector(props: { api: TuiPluginApi }) {
                     )}
                   </For>
                 </scrollbox>
-                {/* Node detail — the block-tool vocabulary: soft inset rail,
-                  panel background, fixed height so selection changes never
-                  move the footer. */}
+                {/* Node detail — a distinct region on the panel surface, fixed
+                    height so selection changes never move the footer. */}
                 <box
                   flexShrink={0}
                   marginTop={1}
                   height={NODE_DETAIL_HEIGHT + 2}
-                  border={["left"]}
-                  borderColor={selectedNodeDetail()?.error_reason ? theme().error : theme().background}
-                  customBorderChars={SplitBorder.customBorderChars}
+                  flexDirection="column"
+                  paddingTop={1}
+                  paddingBottom={1}
+                  paddingLeft={2}
+                  paddingRight={2}
+                  backgroundColor={theme().backgroundPanel}
                 >
-                  <box
-                    flexGrow={1}
-                    flexDirection="column"
-                    paddingTop={1}
-                    paddingBottom={1}
-                    paddingLeft={2}
-                    paddingRight={2}
-                    backgroundColor={theme().backgroundPanel}
-                  >
-                    <Show when={selectedNodeDetail()}>
-                      {(node) => (
-                        <>
-                          <box flexDirection="row" gap={1}>
-                            <text fg={theme().text} wrapMode="none" flexShrink={0}>
-                              {node().name}
-                            </text>
-                            <text fg={theme().textMuted} wrapMode="none">
-                              {node().worker_type}
-                              {node().model_id ? ` · ${node().model_id}` : ""}
-                              {formatDagDuration(node().started_at, node().completed_at)
-                                ? ` · ${formatDagDuration(node().started_at, node().completed_at)}`
-                                : ""}
-                              {dagNodeHistoryLabel(node()) ? ` · ${dagNodeHistoryLabel(node())}` : ""}
-                            </text>
-                            <Show when={formatDagDeadline(node().status, node().deadline_ms, now())}>
-                              {(deadline) => (
-                                <text wrapMode="none" flexShrink={0}>
-                                  <span style={{ fg: theme().textMuted }}>·</span>{" "}
-                                  <span style={{ fg: deadline() === "overdue" ? theme().error : theme().warning }}>
-                                    {deadline()}
-                                  </span>
-                                </text>
-                              )}
-                            </Show>
-                          </box>
-                          <Show when={node().depends_on.length > 0}>
-                            <text fg={theme().textMuted} wrapMode="none">
-                              depends on {node().depends_on.join(", ")}
-                            </text>
+                  <Show when={selectedNodeDetail()}>
+                    {(node) => (
+                      <>
+                        <box flexDirection="row" gap={1}>
+                          <text fg={theme().text} wrapMode="none" flexShrink={0}>
+                            {node().name}
+                          </text>
+                          <text fg={theme().textMuted} wrapMode="none">
+                            {node().worker_type}
+                            {node().model_id ? ` · ${node().model_id}` : ""}
+                            {formatDagDuration(node().started_at, node().completed_at)
+                              ? ` · ${formatDagDuration(node().started_at, node().completed_at)}`
+                              : ""}
+                            {dagNodeHistoryLabel(node()) ? ` · ${dagNodeHistoryLabel(node())}` : ""}
+                          </text>
+                          <Show when={formatDagDeadline(node().status, node().deadline_ms, now())}>
+                            {(deadline) => (
+                              <text wrapMode="none" flexShrink={0}>
+                                <span style={{ fg: theme().textMuted }}>·</span>{" "}
+                                <span style={{ fg: deadline() === "overdue" ? theme().error : theme().warning }}>
+                                  {deadline()}
+                                </span>
+                              </text>
+                            )}
                           </Show>
-                          <Switch>
-                            <Match when={node().error_reason}>
-                              <text fg={theme().error} wrapMode="none">
-                                {formatDagError(node().error_reason!)}
-                              </text>
-                            </Match>
-                            <Match when={formatDagOutputPreview(node().output)}>
-                              <text fg={theme().textMuted} wrapMode="none">
-                                {formatDagOutputPreview(node().output)}
-                              </text>
-                            </Match>
-                          </Switch>
-                        </>
-                      )}
-                    </Show>
-                  </box>
+                        </box>
+                        <Show when={node().depends_on.length > 0}>
+                          <text fg={theme().textMuted} wrapMode="none">
+                            depends on {node().depends_on.join(", ")}
+                          </text>
+                        </Show>
+                        <Switch>
+                          <Match when={node().error_reason}>
+                            <text fg={theme().error} wrapMode="none">
+                              {formatDagError(node().error_reason!)}
+                            </text>
+                          </Match>
+                          <Match when={formatDagOutputPreview(node().output)}>
+                            <text fg={theme().textMuted} wrapMode="none">
+                              {formatDagOutputPreview(node().output)}
+                            </text>
+                          </Match>
+                        </Switch>
+                      </>
+                    )}
+                  </Show>
                 </box>
               </Match>
             </Switch>
           </box>
         </box>
-
-        {/* Workflow sidebar — the chat sidebar vocabulary: fixed width, panel
-          background, bold title, dot-status rows. Fixed layout: present
-          whenever the terminal is wide, empty when there is nothing to list. */}
-        <Show when={wide()}>
-          <box
-            width={SIDEBAR_WIDTH}
-            height="100%"
-            flexShrink={0}
-            backgroundColor={theme().backgroundPanel}
-            paddingTop={1}
-            paddingBottom={1}
-            paddingLeft={2}
-            paddingRight={2}
-          >
-            <box flexShrink={0}>
-              <text fg={theme().text}>
-                <b>DAG</b>
-              </text>
-              <text fg={theme().textMuted}>
-                {workflows().length} {workflows().length === 1 ? "workflow" : "workflows"}
-              </text>
-            </box>
-            <scrollbox
-              ref={(element: ScrollBoxRenderable) => (workflowScroll = element)}
-              flexGrow={1}
-              marginTop={1}
-              verticalScrollbarOptions={{ visible: false }}
-              horizontalScrollbarOptions={{ visible: false }}
-            >
-              <For each={workflows()}>
-                {(wf) => {
-                  const selected = () => selectedWorkflow() === wf.id
-                  return (
-                    <box
-                      flexDirection="row"
-                      gap={1}
-                      width="100%"
-                      backgroundColor={selected() ? theme().backgroundElement : undefined}
-                      onMouseUp={() => setSelectedWorkflow(wf.id)}
-                    >
-                      <text fg={statusColor(wf.status)} flexShrink={0}>
-                        •
-                      </text>
-                      <box flexGrow={1} minWidth={0}>
-                        <text fg={theme().text} wrapMode="none">
-                          {wf.title}
-                        </text>
-                      </box>
-                      <text fg={theme().textMuted} flexShrink={0}>
-                        {formatDagProgress(wf)}
-                      </text>
-                    </box>
-                  )
-                }}
-              </For>
-            </scrollbox>
-          </box>
-        </Show>
       </box>
 
-      {/* Footer hints — the chat footer vocabulary: a full-width bottom row
-          that the sidebar never squeezes; key in text color, label muted. */}
+      {/* Footer hints — key in text colour, label muted, full width. */}
       <box flexDirection="row" gap={2} flexShrink={0} paddingLeft={2} paddingRight={2} paddingBottom={1}>
         <For each={footerHints()}>
           {(hint) => (
