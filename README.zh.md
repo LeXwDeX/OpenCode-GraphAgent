@@ -1,142 +1,145 @@
-<!--
-SPDX-License-Identifier: AGPL-3.0-or-later
-Copyright (c) 2026 the fork author (see NOTICE file for attribution).
-Licensed under GNU AGPL v3; modifications must be open-sourced.
--->
-
 <p align="center">
   <a href="./README.md">English</a> ·
   <a href="./README.zh.md"><b>简体中文</b></a>
 </p>
 
-# OpenCode-DAG
+# OpenCode-GraphAgent
 
-> **[opencode](https://github.com/anomalyco/opencode) 的增强版 fork，内置生产级 DAG 工作流引擎，用于多智能体编排。**
+> [opencode](https://github.com/anomalyco/opencode) 的 fork，加了一个 DAG 工作流引擎：编码智能体把任务拆成一张子智能体依赖图，然后驱动它跑完。状态持久化，崩溃能恢复，在终端里就能看图、控图。
 
 基于 MIT 许可的 [opencode](https://github.com/anomalyco/opencode) 终端 AI 智能体构建。**与 OpenCode 团队无任何隶属或背书关系。**
 
 ---
 
-## 分支状态
+## 为什么是 DAG
 
-| 分支 | 基线 | 内容 | 状态 |
-|--------|------|---------|--------|
-| **`main`** | v1.17.11 | Hooks + Goal + 工具优化 | ✅ **稳定** |
-| **`dag-branch`** | main + DAG | DAG 工作流引擎（114 files） | 🔧 **开发中** —— 适配 v1.17.11 API 中 |
+任务一旦涉及分阶段依赖、可并行的独立工作，或者中间需要一道质量门禁，单智能体循环就不太够用了。这个引擎的设计基于四个判断：
 
-> [!IMPORTANT]
-> **DAG 工作流引擎正在从 v1.15.10 移植**到 v1.17.11 代码库。
-> 它位于 `dag-branch` 上，**目前尚不可用**。`main` 分支已完全可用，
-> 包含 Hooks、Goal 自动循环和工具异常暴露——全部为生产就绪状态。
+1. **决策和跑量分开。** 必须做对的事（任务分解、门禁、仲裁、最终综合）交给 advanced 模型层；量大的事（探索、实现、分角度分析）在 standard 层扇出。standard 层靠冗余换精度：横向是独立并行的切片汇入一个仲裁节点，纵向是结论跨波次对照代码和测试重新验证。
+2. **先把需求问清楚，再建图。** 复杂任务（`deep` 模式）建图前要过一轮有界问答（1、3 或 5 轮），产出带版本号和指纹的 Requirement Brief，裁定只有 `READY`、`NOT_READY`、`WAIVED` 三种。轮数用完还有阻塞问题，结果就是 `NOT_READY`，不会悄悄放行。
+3. **门禁结论必须有下文。** 检查点返回 `REVISE` / `REJECT` / `BLOCKED` 时，父智能体要在同一个唤醒回合里处置它：extend、replan、开新工作流，或者说明理由后停下。只复述结论就结束回合，按契约算编排失败。
+4. **恢复靠证据，不靠猜。** 所有状态变更都是持久化事件，状态转换要过声明式状态机的守卫，终态不可逆（只有一个写进规范的例外），读模型是 CQRS 投影。崩溃后只依据持久化证据和解现场，不会凭空重放模型调用。
+
+## DAG 工作流引擎
+
+引擎位于 [`packages/core/src/dag`](./packages/core/src/dag)（状态机、依赖图、调度、事件投影、SQLite 读模型）和 [`packages/opencode/src/dag`](./packages/opencode/src/dag)（工作流服务、执行循环、节点生成、准入、审查生命周期、崩溃恢复、模板）。智能体通过单个 `workflow` 工具驱动它；人通过 TUI 或 HTTP API 观察和控制它。
+
+### 图定义
+
+每个节点可声明：
+
+| 字段 | 用途 |
+|---|---|
+| `depends_on` | 依赖边；创建时做环检测和悬空引用校验 |
+| `worker_type` | 执行节点的智能体（`explore`、`build`、`general` 或任意已配置 agent） |
+| `prompt_template` | 通过 `id` 引用模板（`.opencode/dag-prompts/`，随仓库附带 12 个）或 `inline` 内联，支持 `{{var}}` 插值 |
+| `input_mapping` | 把上游节点输出映射为模板变量（`"count": "node-b.output.count"`） |
+| `condition` | 基于上游输出的表达式；为假则跳过节点，纯依赖它的下游级联跳过 |
+| `output_schema` | JSON Schema；子智能体必须调用 `submit_result` 提交匹配的结构化结果 |
+| `required` | 必需节点失败会使整个工作流失败 |
+| `report_to_parent` | 节点到达终态时唤醒父智能体 |
+| `model` | 可选的节点级模型指定；否则按 节点 → `node_defaults` → agent → `dag.jsonc` 分层 → 父会话 解析 |
+| `review` | `design` 或 `diff` 审查阶段，带实现指纹契约（见下） |
+
+工作流级参数：`max_concurrency`（默认 5）、`max_node_replan_attempts`（5）、`max_total_nodes`（100）、节点级 `timeout_ms`（默认 10 分钟，排队等待计入预算）。
+
+### 调度与执行
+
+- 节点通过与 `task` 工具相同的代码路径生成真实子会话，按依赖顺序逐波执行，由并发信号量约束。节点在准入时持久化为 `queued`，子会话拿到并发许可后才创建，所以 100 个节点的扇出不会一次拉起 100 个会话。
+- **动态重规划**，暂停优先：`pause` 立即冻结调度，`replan` 将片段（添加 / 替换 / 取消 / 重启节点）原子性合并进运行中的图，`resume` 继续。终态节点不可变，想重试失败的节点，就换个新 id 加一个替代节点。`extend` 追加节点，也允许重新打开一个自然完成的工作流（终态不可逆的唯一例外，写进了规范）。
+- **单步模式**逐节点执行，便于调试。
+- **父智能体不轮询。** `report_to_parent` 节点或工作流到达终态时，引擎用合成消息唤醒父智能体。检查点节点输出规范化裁定（`ACCEPT` / `REVISE` / `REJECT` / `BLOCKED`），下一步走向由处置契约约束。迭代是一轮轮有界的、由裁定触发的重规划，图里不存在环形边。
+
+### 状态机与持久化
+
+- 工作流和节点状态各有声明式转换表；所有变更先过守卫，非法转换和终态违规是类型化错误（HTTP 返回 409 而非 500）。
+- 所有变更以持久化 `dag.*` 事件发布；投影器在发布事务*内部*写入 SQLite 读模型。历史来自事件回放，没有日志表。另有一个漂移测试盯着投影器守卫和声明的转换表，改了一边没改另一边，测试会挂。
+- **崩溃恢复**是惰性的、按工作流、基于证据：残留 `running` 的节点对照其子会话的持久化状态和解。子会话已经跑完的，回填捕获输出；执行权确实丢了的，工作流转入暂停，交给父智能体决定处置（replan / resume / cancel）。恢复过程不会自行接管或重启模型调用。
+
+### deep 模式：准入与审查
+
+- 准入问答覆盖六个维度（目标、范围、约束与假设、验收标准、证据、风险），策略有界：`LIGHT`（1 轮）、`STANDARD`（3 轮）、`GRILL`（5 轮，对抗式）。产出的 Requirement Brief 计算指纹（规范化形式的 SHA-256）；实质性变更使指纹失效并回到问答。消费后的准入记录随工作流持久化，恢复时不重放问答。
+- 审查节点必须如实声明阶段：`design` 审查实现前的产物；`diff` 审查实际实现，要求声明实现节点、通过验证的验证节点，并回显实现指纹。实现一变指纹就变，旧的 `ACCEPT` 过不了门禁。
+
+### 观察与控制
+
+- **TUI DAG 检查器**（命令面板 → `dag.open`）：工作流列表、按波次排序的节点视图（实时状态）、节点详情（依赖、错误、输出预览、截止倒计时），`p`/`r`/`s`/`x` 对应暂停/恢复/单步/取消，`enter` 进入节点的子会话。
+- **侧边栏面板**：按会话展示工作流进度（完成/运行/失败/排队），可展开节点列表，由瞬态摘要事件驱动，打开时再拉一次兜底，不做轮询。
+- **HTTP API**（与工具入口共用同一代码路径）：
+
+  ```
+  GET  /dag                              列出工作流
+  POST /dag                              创建工作流
+  GET  /dag/session/:sessionID           按会话列出工作流
+  GET  /dag/session/:sessionID/summary   进度摘要
+  GET  /dag/:dagID                       工作流详情
+  GET  /dag/:dagID/nodes                 节点列表
+  GET  /dag/:dagID/nodes/:nodeID         节点详情
+  POST /dag/:dagID/control               pause/resume/cancel/replan/extend/step/complete
+  ```
+
+### 配置
+
+`dag.jsonc`（项目 `.opencode/` 优先于全局配置目录，首次使用时自动生成带注释的默认文件）里设置两个模型层：`advanced` 给关键节点（`required: true` 和审查类 worker），`standard` 给其余节点，另外还有子会话的 `thinking_depth` 推理深度。其余全部继承 opencode 主配置。
 
 ---
 
-## 本 fork 的独特之处
+## 本 fork 的其他改动
 
-### 📌 `main` 上的稳定功能
+- **Hooks API**：兼容 Claude Code hooks 协议，26 个 hook 事件（`PreToolUse`、`PostToolUse`、`SessionStart`、`PermissionRequest`、`WorktreeCreate` 等）× 5 种执行类型（`command`、`mcp`、`http`、`prompt`、`agent`），从全局/项目/worktree 的 `hooks.json` 链加载，也可以经 HTTP 按会话注册，支持可选的工作区信任门控。详见 [hooks 参考](./packages/core/src/plugin/skill/configure-hooks.md)。
+- **工具健壮性**：修复 LLM 输出里损坏的多字节 Unicode 转义（JSON 修复），校验错误带字段级提示，工具文档扩充，子进程管道修复。
+- **CJK 与 IME 修复**：终端 UI 里中日韩文输入的修正（IME 组字刷新、全角文本处理），另有 [`patches/`](./patches) 下的韩文 IME 修复脚本。
+- **Worktree 隔离**：按工作流的 `git worktree` 隔离，附实验性的 sandbox-worktree HTTP 端点。
+- 早期的「Goal 自动循环」和 `/goal`、`/subgoal`、`/workflow` 斜杠命令已经移除，自主执行统一走 `workflow` 工具和它的唤醒机制。
 
-#### Hooks API（26 events × 5 execution types）
-
-完整的 Claude Code hooks 协议兼容性：`command`、`mcp`、`http`、`prompt`、`agent` 五种 hook 类型，共 26 个 hook 事件，涵盖 `PreToolUse`、`PostToolUse`、`SessionStart`、`PermissionRequest`、`WorktreeCreate` 等。Hooks 从全局 / 项目 / worktree 的 `hooks.json` 链中加载，也可在运行时通过 HTTP API 按会话注册；可选的工作区信任门控（`requireTrust` + `/trust` 命令）将 hook 执行限制在你已批准的目录内。
-
-详见 [hooks 参考](./packages/core/src/plugin/skill/configure-hooks.md)。
-
-#### Goal 自动循环
-
-一个自主智能体循环，持续驱动智能体朝用户定义的目标推进。LLM 评判器在每个回合后判断目标是否已达成或是否需要更多回合，整个过程在可配置的回合预算内运行。`/goal <target>` 设置目标，`/subgoal` 添加子目标，`/goal resume` 继续一个暂停的目标。
-
-#### 工具异常暴露
-
-- **JSON 修复**：`safeParseJson` + `fixJsonUnicodeEscapes` —— 修复 LLM 生成的 JSON 中损坏的多字节 Unicode 转义
-- **Question 工具校验**：结构化的错误格式化，带字段级提示和正确调用示例
-- **工具描述**：扩展了 `question`、`task`、`skill`、`webfetch`、`websearch` 的 `.txt` 文档，新增 Parameters + Returns 章节
-- **Shell 管道修复**：所有 `ChildProcess.make` 调用使用 `stdout/stderr: "pipe"` + reader fiber 优雅排空
-
-### 🔧 `dag-branch` 上的开发中功能
-
-#### DAG 工作流引擎（AGPL-3.0）
-
-一个**有向无环图（DAG）工作流引擎**，让 LLM 智能体在单个会话内编排复杂的多节点并行任务。
-
-> ⚠️ **状态**：从 v1.15.10 fork 原样复制（114 files）。217 个类型错误待 API 适配（将同步 `Database.use` → 基于 Effect 的 `Database.Service`、`Bus` → `EventV2Bridge` 等）。尚不可编译。
-
-| 能力 | 描述 |
-|---|---|
-| **自动调度** | 按依赖顺序生成子智能体，尽可能并行 |
-| **动态重规划** | 运行中添加/删除/更新节点并调整并发度 |
-| **状态机完整性** | 四条铁律：禁止绕过状态机、终态不可逆、事件必须广播、先持久化再变更 |
-| **终端 TUI** | 完整的 DAG 控制面板，带块字符拓扑图、树视图、节点对话框、实时更新 |
-| **崩溃恢复** | 重启时检测并恢复孤立的运行中工作流 |
-| **条件分支** | 节点可根据上游输出有条件地执行或跳过 |
-| **子 DAG 嵌套** | `dag` worker 类型生成递归子工作流（max depth 3） |
-| **持久化审计** | 6-table SQLite schema，所有状态转换可追溯 |
-
-### CJK 与本地化修复
-
-针对中文/日文/韩文文本处理的全面修复：分词、全角标点、文件路径、终端 UI 中的 IME 输入。详见[修复列表](./docs/localization/zh-hans-fixes.md)。
-
-### 双重隔离：Sandbox + Worktree
-
-- **Sandbox** —— 带 LSP 诊断的临时目录，用于安全的代码实验
-- **Worktree** —— 每个工作流一个 `git worktree`，实现并行多智能体编辑隔离
+上游全部能力（多 Provider、内置 LSP、客户端/服务器架构、TUI/桌面/Web 客户端）均完整保留。
 
 ---
 
 ## 安装
 
-```bash
-curl -fsSL https://opencode.ai/install | bash
+预构建 CLI 二进制（Linux / macOS / Windows，附 SHA256SUMS）发布在 [releases 页面](https://github.com/LeXwDeX/OpenCode-GraphAgent/releases)。从 `main` 构建的是正式版；从 `dev` 构建的是预发布版。
 
-# Package managers
-npm i -g opencode-ai@latest
-brew install anomalyco/tap/opencode
-scoop install opencode
-# ...and more — see upstream docs
+从源码构建（需要 [Bun](https://bun.sh) 1.3+）：
+
+```bash
+bun install
+bun dev              # TUI
+bun dev serve        # headless API 服务（端口 4096）
+
+# 独立二进制
+./packages/opencode/script/build.ts --single
 ```
 
-> [!TIP]
-> 安装前请移除低于 0.1.x 的旧版本。
+> 本 fork 未发布到 npm/brew/scoop。上游的 `opencode-ai` 包安装的是上游 opencode，不是本 fork。
 
 ---
 
-## 保留上游全部能力 —— 并提供更多
+## 质量门禁
 
-所有上游 MIT 许可的能力均完整保留：
-
-- **桌面应用**（macOS / Windows / Linux）—— 从 [releases](https://github.com/anomalyco/opencode/releases) 下载
-- **Build 与 Plan 智能体** —— 用 `Tab` 在完全访问和只读模式间切换
-- **多 Provider** —— Claude、OpenAI、Google、本地模型，通过 [OpenCode Zen](https://opencode.ai/zen)
-- **内置 LSP** —— 来自语言服务器的实时诊断
-- **客户端/服务器架构** —— 本地运行，从移动端远程驱动
-
-本 fork 在此基础上新增了 DAG 引擎、CJK 修复、sandbox 编码工作区和目标跟踪——且不破坏任何现有功能。
-
----
+- **CI**：每个 PR 跑 typecheck；`main` 门禁额外运行全量单元测试（Linux）、Playwright e2e（Linux + Windows）、HTTP API 契约测试器、以及生成 SDK 的新鲜度校验。
+- **DAG 专项测试**：核心调度单元测试、投影器/状态机漂移测试、工作流生命周期集成测试、每条 DAG 路由的 HTTP API 演练场景。
+- **规范**：引擎行为由 [openspec](./openspec/specs) 规范固定（执行引擎、状态机强制、调度器恢复、单步语义、结构化输出、回放幂等性等）。
 
 ## 许可证
 
-本仓库采用**混合许可证模型**：
+混合许可证模型：
 
-| 内容 | 许可证 | 位置 |
-|---------|---------|----------|
-| 上游 opencode 代码（绝大多数） | **MIT** | [`LICENSE`](./LICENSE) |
-| 自研 DAG 工作流引擎 | **GNU AGPL v3** | [`packages/opencode/src/dag/LICENSE`](./packages/opencode/src/dag/LICENSE) |
+| 内容 | 许可证 | 文本 |
+|---------|---------|------|
+| 上游 opencode 代码（绝大多数） | MIT | [`LICENSE`](./LICENSE) |
+| DAG 工作流引擎（fork 自研） | AGPL-3.0-or-later | [`packages/core/src/dag/LICENSE`](./packages/core/src/dag/LICENSE)、[`packages/opencode/src/dag/LICENSE`](./packages/opencode/src/dag/LICENSE) |
 
-完整的边界详情见 [`NOTICE`](./NOTICE)。
-
-> ⚖️ **为何用 AGPL？** DAG 引擎是核心差异化成果。AGPL 确保任何衍生品——包括 SaaS 部署——都必须回馈开源。
-
----
+精确的文件边界列在 [`NOTICE`](./NOTICE) 中。AGPL 覆盖 DAG 引擎及其衍生品，包括网络服务部署；不碰 DAG 引擎的话，仓库其余部分按 MIT 用就行。
 
 ## 文档
 
-- [`docs/harness-dag.md`](./docs/harness-dag.md) —— DAG 引擎架构与用法
-- [`docs/localization/zh-hans-fixes.md`](./docs/localization/zh-hans-fixes.md) —— CJK 修复目录
-- [`NOTICE`](./NOTICE) —— 许可证边界与归属
+- [`docs/harness-dag.md`](./docs/harness-dag.md) —— deep 模式准入与审查生命周期
+- [`openspec/specs`](./openspec/specs) —— 引擎行为规范
+- [`.opencode/dag-prompts`](./.opencode/dag-prompts) —— 内置节点 prompt 模板
 - [`AGENTS.md`](./AGENTS.md) —— 贡献与开发指南
 
-## 社区
+## 链接
 
-- 📖 [上游 opencode 社区](https://opencode.ai)
-- 📝 [Fork issue 跟踪](./issues)
-- 🔗 [GitHub](https://github.com/LeXwDeX/OpenCode-DAG)
+- [GitHub](https://github.com/LeXwDeX/OpenCode-GraphAgent) · [Issues](https://github.com/LeXwDeX/OpenCode-GraphAgent/issues)
+- [上游 opencode](https://opencode.ai)

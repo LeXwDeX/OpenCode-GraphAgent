@@ -44,7 +44,7 @@ case "$VERSION" in
   fork-release)
     echo "=== 测试 GitHub FORK-RELEASE 版本 ==="
     echo "请从 GitHub Actions 下载最新的 release binary:"
-    echo "  https://github.com/LeXwDeX/OpenCode-DAG/actions/runs/28419729354"
+    echo "  https://github.com/LeXwDeX/OpenCode-GraphAgent/actions/runs/28419729354"
     echo ""
     echo "下载后解压测试:"
     echo "  tar -xzf opencode-linux-x64.tar.gz"

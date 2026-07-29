@@ -4,7 +4,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/opencode-dag/config_assistant/internal/config"
+	"github.com/LeXwDeX/OpenCode-GraphAgent/config_assistant/internal/config"
 )
 
 func managedDisplay() string {
