@@ -209,6 +209,69 @@ describe("validateAgainstSchema", () => {
     expect(validateAgainstSchema(5.5, { type: "integer" }).ok).toBe(false)
     expect(validateAgainstSchema("5", { type: "integer" }).ok).toBe(false)
   })
+
+  it("rejects values outside enum and accepts members", () => {
+    const schema = { type: "string", enum: ["ACCEPT", "REJECT"] }
+    expect(validateAgainstSchema("ACCEPT", schema).ok).toBe(true)
+    expect(validateAgainstSchema("REJECT", schema).ok).toBe(true)
+    const bad = validateAgainstSchema("MAYBE", schema)
+    expect(bad.ok).toBe(false)
+    if (!bad.ok) {
+      expect(bad.error).toContain("ACCEPT")
+      expect(bad.error).toContain("MAYBE")
+    }
+  })
+
+  it("enum comparison is case-sensitive", () => {
+    expect(validateAgainstSchema("accept", { enum: ["ACCEPT"] }).ok).toBe(false)
+  })
+
+  it("validates mixed-type enum values", () => {
+    const schema = { enum: [1, "one", true, null] }
+    expect(validateAgainstSchema(1, schema).ok).toBe(true)
+    expect(validateAgainstSchema("one", schema).ok).toBe(true)
+    expect(validateAgainstSchema(true, schema).ok).toBe(true)
+    expect(validateAgainstSchema(null, schema).ok).toBe(true)
+    expect(validateAgainstSchema(2, schema).ok).toBe(false)
+    expect(validateAgainstSchema(false, schema).ok).toBe(false)
+  })
+
+  it("validates bare enum without type", () => {
+    expect(validateAgainstSchema("x", { enum: ["x", "y"] }).ok).toBe(true)
+    expect(validateAgainstSchema("z", { enum: ["x", "y"] }).ok).toBe(false)
+  })
+
+  it("validates const with structural deep equality (key order irrelevant)", () => {
+    expect(validateAgainstSchema("fixed", { const: "fixed" }).ok).toBe(true)
+    expect(validateAgainstSchema("other", { const: "fixed" }).ok).toBe(false)
+    const schema = { const: { a: 1, b: { c: [1, 2] } } }
+    expect(validateAgainstSchema({ b: { c: [1, 2] }, a: 1 }, schema).ok).toBe(true)
+    expect(validateAgainstSchema({ a: 1, b: { c: [2, 1] } }, schema).ok).toBe(false)
+    expect(validateAgainstSchema({ a: 1 }, schema).ok).toBe(false)
+  })
+
+  it("validates enum nested inside properties and items", () => {
+    const schema = {
+      type: "object",
+      properties: {
+        verdict: { type: "string", enum: ["ACCEPT", "REJECT"] },
+        tags: { type: "array", items: { enum: ["a", "b"] } },
+      },
+    }
+    expect(validateAgainstSchema({ verdict: "ACCEPT", tags: ["a", "b"] }, schema).ok).toBe(true)
+    const badField = validateAgainstSchema({ verdict: "MAYBE" }, schema)
+    expect(badField.ok).toBe(false)
+    if (!badField.ok) expect(badField.error).toContain('field "verdict"')
+    const badItem = validateAgainstSchema({ tags: ["a", "c"] }, schema)
+    expect(badItem.ok).toBe(false)
+    if (!badItem.ok) expect(badItem.error).toContain("item[1]")
+  })
+
+  it("reports type mismatch before enum membership", () => {
+    const result = validateAgainstSchema(1, { type: "string", enum: ["a"] })
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.error).toContain('expected type "string"')
+  })
 })
 
 describe("validatePayload", () => {
@@ -248,6 +311,23 @@ describe("spawnNode submit_result capture", () => {
     const completed = events.find((e) => e.type === "nodeCompleted")
     expect(completed).toBeDefined()
     expect(completed!.output).toEqual({ status: "ok" })
+  })
+
+  it("(b2) enum-invalid verdict then valid retry → nodeCompleted with valid payload", async () => {
+    const { events, dagLayer } = makeEventTracker()
+    const schema = {
+      type: "object",
+      required: ["verdict"],
+      properties: { verdict: { type: "string", enum: ["ACCEPT", "REJECT"] } },
+    }
+    await runSpawn(
+      dagLayer,
+      makePromptLayerWithCapture(reply("text"), [{ verdict: "MAYBE" }, { verdict: "ACCEPT" }], schema),
+      schema,
+    )
+    const completed = events.find((e) => e.type === "nodeCompleted")
+    expect(completed).toBeDefined()
+    expect(completed!.output).toEqual({ verdict: "ACCEPT" })
   })
 
   it("(c) schema declared, no submit_result call → nodeFailed with verdict_fail", async () => {

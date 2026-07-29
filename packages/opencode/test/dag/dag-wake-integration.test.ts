@@ -1042,4 +1042,39 @@ describe("DagLoop atomic wake integration", () => {
       ),
     )
   })
+
+  it("does not misfire orchestrator_unresponsive while downstream work spawns after a completion", async () => {
+    await Effect.runPromise(
+      runWakeTest(({ dag, store, status, childPrompts, parentPrompts }) =>
+        Effect.gen(function* () {
+          const dagID = yield* dag.create({
+            projectID: "project-1",
+            sessionID: "ses_parent",
+            title: "No unresponsive misfire",
+            config: { name: "no-unresponsive-misfire", nodes: [node("a"), node("b", ["a"])] },
+          })
+          const a = yield* takeWithin(childPrompts, "a did not start")
+          yield* Deferred.succeed(a.release, "A done")
+          // Extra wake trigger racing b's spawn: the unresponsive check reads
+          // its five conditions under the entry's evalLock, so it sees either
+          // the pre-spawn ready set or the post-spawn fiber ownership — never
+          // the torn markRunning→fibers.set middle that used to read as a
+          // stalled orchestrator.
+          yield* status.set("ses_parent" as never, { type: "idle" })
+          const b = yield* takeWithin(childPrompts, "b did not start after a completed")
+          yield* Effect.sleep("100 millis")
+          expect((yield* store.getWorkflow(dagID))?.status).toBe("running")
+          yield* Deferred.succeed(b.release, "B done")
+          yield* pollWithTimeout(
+            store.getWorkflow(dagID).pipe(
+              Effect.map((workflow) => workflow?.status === "completed" ? workflow : undefined),
+            ),
+            "workflow did not complete",
+          )
+          const parent = yield* takeWithin(parentPrompts, "terminal wake did not reach the parent")
+          yield* Deferred.succeed(parent.release, "success")
+        }),
+      ),
+    )
+  })
 })
