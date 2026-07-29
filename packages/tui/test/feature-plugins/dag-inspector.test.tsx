@@ -623,33 +623,23 @@ describe("DagInspector", () => {
     }
   })
 
-  test("the workflow sidebar only appears on wide terminals", async () => {
-    const wide = await renderDagInspector({
-      width: 130,
-      workflows: [wfSummary({ id: "wf-1", title: "Evidence pipeline" })],
-      nodes: [dagNode({ id: "n-1", name: "collect", status: "running" })],
-    })
-    try {
-      // The sidebar header is the marker: it renders "DAG" plus a workflow count.
-      await wide.app.waitForFrame((frame) => frame.includes("1 workflow"))
-    } finally {
-      wide.app.renderer.destroy()
-    }
-
-    const narrow = await renderDagInspector({
-      width: 100,
-      workflows: [
-        wfSummary({ id: "wf-1", title: "Evidence pipeline" }),
-        wfSummary({ id: "wf-2", title: "Second workflow" }),
-      ],
-      nodes: [dagNode({ id: "n-1", name: "collect", status: "running" })],
-    })
-    try {
-      // Sidebar dropped; the summary block carries the position instead so the
-      // left/right workflow cursor stays legible.
-      await narrow.app.waitForFrame((frame) => frame.includes("workflow 1/2") && !frame.includes("2 workflows"))
-    } finally {
-      narrow.app.renderer.destroy()
+  test("the workflow navigation pane survives every terminal width", async () => {
+    // Primary navigation must never disappear; it only narrows. A previous
+    // revision borrowed the chat sidebar's > 120 gate and lost the list here.
+    for (const width of [130, 100, 70]) {
+      const viewer = await renderDagInspector({
+        width,
+        workflows: [
+          wfSummary({ id: "wf-1", title: "alpha" }),
+          wfSummary({ id: "wf-2", title: "beta", status: "paused" }),
+        ],
+        nodes: [dagNode({ id: "n-1", name: "collect", status: "running" })],
+      })
+      try {
+        await viewer.app.waitForFrame((frame) => frame.includes("alpha") && frame.includes("beta"))
+      } finally {
+        viewer.app.renderer.destroy()
+      }
     }
   })
 })
