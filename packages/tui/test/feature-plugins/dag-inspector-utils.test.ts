@@ -67,9 +67,7 @@ describe("computeWaves", () => {
 describe("formatDagError", () => {
   test("removes Effect and provider error wrappers without hiding the useful message", () => {
     expect(
-      formatDagError(
-        "Cause([Die(ProviderModelNotFoundError: Model not found: local/local/glm. Did you mean: glm?)])",
-      ),
+      formatDagError("Cause([Die(ProviderModelNotFoundError: Model not found: local/local/glm. Did you mean: glm?)])"),
     ).toBe("Model not found: local/local/glm. Did you mean: glm?")
   })
 })
@@ -79,18 +77,10 @@ describe("DAG control state", () => {
     expect(dagControlUnavailableMessage("running", "pause")).toBeUndefined()
     expect(dagControlUnavailableMessage("stepping", "pause")).toBeUndefined()
     expect(dagControlUnavailableMessage("paused", "resume")).toBeUndefined()
-    expect(dagControlUnavailableMessage("completed", "pause")).toBe(
-      "Workflow is completed and cannot be paused",
-    )
-    expect(dagControlUnavailableMessage("cancelled", "cancel")).toBe(
-      "Workflow is cancelled and cannot be cancelled",
-    )
-    expect(dagControlUnavailableMessage("pending", "cancel")).toBe(
-      "Workflow is pending and cannot be cancelled",
-    )
-    expect(dagControlUnavailableMessage("archived", "cancel")).toBe(
-      "Workflow is archived and cannot be cancelled",
-    )
+    expect(dagControlUnavailableMessage("completed", "pause")).toBe("Workflow is completed and cannot be paused")
+    expect(dagControlUnavailableMessage("cancelled", "cancel")).toBe("Workflow is cancelled and cannot be cancelled")
+    expect(dagControlUnavailableMessage("pending", "cancel")).toBe("Workflow is pending and cannot be cancelled")
+    expect(dagControlUnavailableMessage("archived", "cancel")).toBe("Workflow is archived and cannot be cancelled")
   })
 
   test("formats progress without component-level branching", () => {
@@ -118,13 +108,13 @@ describe("DAG control state", () => {
 })
 
 describe("computeNodeRowIndex", () => {
-  test("counts one row per wave header plus one row per node", () => {
+  test("counts wave headers, nodes, and inter-wave spacer rows", () => {
     const layers = computeWaves([node("a"), node("b", ["a"]), node("c", ["a"]), node("d", ["b", "c"])])
-    // rows: 0 wave1 header, 1 a, 2 wave2 header, 3 b, 4 c, 5 wave3 header, 6 d
+    // rows: 0 wave1 header, 1 a, 2 spacer, 3 wave2 header, 4 b, 5 c, 6 spacer, 7 wave3 header, 8 d
     expect(computeNodeRowIndex(layers, "a")).toBe(1)
-    expect(computeNodeRowIndex(layers, "b")).toBe(3)
-    expect(computeNodeRowIndex(layers, "c")).toBe(4)
-    expect(computeNodeRowIndex(layers, "d")).toBe(6)
+    expect(computeNodeRowIndex(layers, "b")).toBe(4)
+    expect(computeNodeRowIndex(layers, "c")).toBe(5)
+    expect(computeNodeRowIndex(layers, "d")).toBe(8)
     expect(computeNodeRowIndex(layers, "missing")).toBeUndefined()
   })
 })

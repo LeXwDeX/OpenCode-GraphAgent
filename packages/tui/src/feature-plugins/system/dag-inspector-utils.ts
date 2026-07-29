@@ -44,12 +44,14 @@ export function computeWaves(nodes: readonly DagNode[]): DagNode[][] {
 
 /**
  * Visual row index of a node inside the rendered wave list, counting one row
- * per wave header and one row per node. Used to scroll the selected node into
- * view — valid only while every node renders as a single row.
+ * per wave header, one row per node, and one blank spacer row between waves.
+ * Used to scroll the selected node into view — valid only while every node
+ * renders as a single row.
  */
 export function computeNodeRowIndex(layers: readonly (readonly DagNode[])[], nodeID: string): number | undefined {
   let row = 0
-  for (const layer of layers) {
+  for (const [index, layer] of layers.entries()) {
+    if (index > 0) row++ // spacer between waves
     row++ // wave header
     for (const node of layer) {
       if (node.id === nodeID) return row
@@ -60,15 +62,16 @@ export function computeNodeRowIndex(layers: readonly (readonly DagNode[])[], nod
 }
 
 export function formatDagError(error: string) {
-  return error
-    .replace(/^Cause\(\[Die\((.*)\)\]\)$/, "$1")
-    .replace(/^ProviderModelNotFoundError:\s*/, "")
+  return error.replace(/^Cause\(\[Die\((.*)\)\]\)$/, "$1").replace(/^ProviderModelNotFoundError:\s*/, "")
 }
 
 /** Compact "3m 12s" duration between two epoch-millis timestamps. The SDK
  * serializes numbers with Infinity/NaN sentinels — non-finite inputs yield
  * no duration. */
-export function formatDagDuration(startedAt: number | string | undefined, completedAt: number | string | undefined): string | undefined {
+export function formatDagDuration(
+  startedAt: number | string | undefined,
+  completedAt: number | string | undefined,
+): string | undefined {
   if (typeof startedAt !== "number" || !Number.isFinite(startedAt)) return undefined
   const end = typeof completedAt === "number" && Number.isFinite(completedAt) ? completedAt : Date.now()
   const totalSeconds = Math.max(0, Math.round((end - startedAt) / 1000))
@@ -170,7 +173,13 @@ export function dagControlAllowed(status: string | undefined, operation: DagCont
 export function dagControlUnavailableMessage(status: string | undefined, operation: DagControlOperation) {
   if (dagControlAllowed(status, operation)) return undefined
   const action =
-    operation === "pause" ? "paused" : operation === "resume" ? "resumed" : operation === "step" ? "stepped" : "cancelled"
+    operation === "pause"
+      ? "paused"
+      : operation === "resume"
+        ? "resumed"
+        : operation === "step"
+          ? "stepped"
+          : "cancelled"
   return `Workflow is ${status ?? "unavailable"} and cannot be ${action}`
 }
 
