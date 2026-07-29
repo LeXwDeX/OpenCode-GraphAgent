@@ -384,7 +384,7 @@ function DagInspector(props: { api: TuiPluginApi }) {
   return (
     <box width="100%" height="100%">
       <PanelGroup axis="y" width="100%" height="100%">
-        <Panel border="none" flexShrink={0} padding={0} paddingLeft={1}>
+        <Panel border="none" flexShrink={0} padding={0} paddingLeft={1} paddingRight={1}>
           <text fg={theme().text}>DAG </text>
           <text fg={theme().textMuted}>{selectedWorkflowSummary()?.title ?? "workflow inspector"}</text>
           <box flexGrow={1} />
@@ -429,6 +429,8 @@ function DagInspector(props: { api: TuiPluginApi }) {
                             flexDirection="row"
                             gap={1}
                             width="100%"
+                            paddingLeft={1}
+                            paddingRight={1}
                             backgroundColor={selected() ? theme().primary : undefined}
                             onMouseUp={() => setSelectedWorkflow(wf.id)}
                           >
@@ -450,9 +452,22 @@ function DagInspector(props: { api: TuiPluginApi }) {
                   </scrollbox>
                 </Panel>
 
+                {/* The right pane draws its own left border on every content
+                    block; the horizontal separators' ┬/├/┴ edge glyphs land in
+                    the same column, forming one continuous frame around both
+                    panes — the same construction as the diff-viewer's patch
+                    pane next to its file tree. */}
                 <Panel flexGrow={1} minHeight={0} border="none">
                   <Separator axis="x" start="edge-out" />
-                  <box flexDirection="row" gap={1} paddingLeft={1} flexShrink={0}>
+                  <box
+                    flexDirection="row"
+                    gap={1}
+                    paddingLeft={1}
+                    paddingRight={1}
+                    flexShrink={0}
+                    border={["left"]}
+                    borderColor={theme().border}
+                  >
                     <text fg={statusColor(selectedWorkflowSummary()?.status ?? "")} flexShrink={0}>
                       •
                     </text>
@@ -469,73 +484,97 @@ function DagInspector(props: { api: TuiPluginApi }) {
                     </text>
                   </box>
                   <Separator axis="x" start="edge" />
-                  <scrollbox
-                    ref={(element: ScrollBoxRenderable) => (nodeScroll = element)}
-                    flexGrow={1}
-                    minHeight={0}
-                    verticalScrollbarOptions={{ visible: false }}
-                    horizontalScrollbarOptions={{ visible: false }}
-                  >
-                    <For each={layers()}>
-                      {(layer, layerIdx) => (
-                        <>
-                          {/* Wave header: nodes at the same topological depth, NOT a barrier */}
-                          <box flexDirection="row" gap={1} width="100%" paddingLeft={1}>
-                            <text fg={theme().textMuted} wrapMode="none">
-                              wave {layerIdx() + 1} · {layer.length} {layer.length === 1 ? "node" : "nodes"}
-                            </text>
-                          </box>
-                          <For each={layer}>
-                            {(node) => {
-                              const selected = () => selectedNode() === node.id
-                              return (
-                                <box
-                                  flexDirection="row"
-                                  gap={1}
-                                  width="100%"
-                                  paddingLeft={2}
-                                  backgroundColor={selected() ? theme().primary : undefined}
-                                  onMouseUp={() => setSelectedNode(node.id)}
-                                >
-                                  <Show
-                                    when={node.status !== "running"}
-                                    fallback={<Spinner color={selected() ? theme().background : theme().textMuted} />}
+                  {/* Border lives on the wrapper, not the rows, so the left
+                      edge stays continuous when the node list is shorter than
+                      the viewport. */}
+                  <box flexGrow={1} minHeight={0} border={["left"]} borderColor={theme().border}>
+                    <scrollbox
+                      ref={(element: ScrollBoxRenderable) => (nodeScroll = element)}
+                      flexGrow={1}
+                      minHeight={0}
+                      verticalScrollbarOptions={{ visible: false }}
+                      horizontalScrollbarOptions={{ visible: false }}
+                    >
+                      <For each={layers()}>
+                        {(layer, layerIdx) => (
+                          <>
+                            {/* Blank spacer between waves keeps the blocks visually
+                                separate; computeNodeRowIndex counts it for scrolling. */}
+                            {layerIdx() !== 0 ? <box height={1} /> : null}
+                            {/* Wave header: nodes at the same topological depth, NOT a barrier */}
+                            <box flexDirection="row" gap={1} width="100%" paddingLeft={1} paddingRight={1}>
+                              <text fg={theme().accent} wrapMode="none">
+                                wave {layerIdx() + 1}
+                              </text>
+                              <text fg={theme().textMuted} wrapMode="none">
+                                · {layer.length} {layer.length === 1 ? "node" : "nodes"}
+                              </text>
+                            </box>
+                            <For each={layer}>
+                              {(node) => {
+                                const selected = () => selectedNode() === node.id
+                                const settled = () =>
+                                  node.status === "completed" ||
+                                  node.status === "skipped" ||
+                                  node.status === "cancelled" ||
+                                  node.status === "aborted"
+                                return (
+                                  <box
+                                    flexDirection="row"
+                                    gap={1}
+                                    width="100%"
+                                    paddingLeft={2}
+                                    paddingRight={1}
+                                    backgroundColor={selected() ? theme().primary : undefined}
+                                    onMouseUp={() => setSelectedNode(node.id)}
                                   >
-                                    <text fg={selected() ? theme().background : statusColor(node.status)} flexShrink={0}>
-                                      {dagNodeGlyph(node.status)}
-                                    </text>
-                                  </Show>
-                                  <box flexShrink={1} minWidth={0}>
-                                    <text
-                                      fg={
-                                        selected()
-                                          ? theme().background
-                                          : node.status === "running"
-                                            ? theme().text
-                                            : theme().textMuted
-                                      }
-                                      wrapMode="none"
+                                    <Show
+                                      when={node.status !== "running"}
+                                      fallback={<Spinner color={selected() ? theme().background : theme().textMuted} />}
                                     >
-                                      {node.name}
+                                      <text
+                                        fg={selected() ? theme().background : statusColor(node.status)}
+                                        flexShrink={0}
+                                      >
+                                        {dagNodeGlyph(node.status)}
+                                      </text>
+                                    </Show>
+                                    <box flexShrink={1} minWidth={0}>
+                                      <text
+                                        fg={
+                                          selected() ? theme().background : settled() ? theme().textMuted : theme().text
+                                        }
+                                        wrapMode="none"
+                                      >
+                                        {node.name}
+                                      </text>
+                                    </box>
+                                    <text
+                                      fg={selected() ? theme().background : theme().textMuted}
+                                      wrapMode="none"
+                                      flexShrink={0}
+                                    >
+                                      {node.worker_type}
                                     </text>
                                   </box>
-                                  <text
-                                    fg={selected() ? theme().background : theme().textMuted}
-                                    wrapMode="none"
-                                    flexShrink={0}
-                                  >
-                                    {node.worker_type}
-                                  </text>
-                                </box>
-                              )
-                            }}
-                          </For>
-                        </>
-                      )}
-                    </For>
-                  </scrollbox>
-                  <Separator axis="x" start="edge-in" />
-                  <box flexDirection="column" paddingLeft={1} flexShrink={0} height={NODE_DETAIL_HEIGHT}>
+                                )
+                              }}
+                            </For>
+                          </>
+                        )}
+                      </For>
+                    </scrollbox>
+                  </box>
+                  <Separator axis="x" start="edge" />
+                  <box
+                    flexDirection="column"
+                    paddingLeft={1}
+                    paddingRight={1}
+                    flexShrink={0}
+                    height={NODE_DETAIL_HEIGHT}
+                    border={["left"]}
+                    borderColor={theme().border}
+                  >
                     <Show when={selectedNodeDetail()}>
                       {(node) => (
                         <>
@@ -583,13 +622,16 @@ function DagInspector(props: { api: TuiPluginApi }) {
                       )}
                     </Show>
                   </box>
+                  {/* Bottom rail: closes the frame flush with the workflow
+                      list's bottom border, mirroring the diff-viewer. */}
+                  <Separator axis="x" start="edge-in" />
                 </Panel>
               </PanelGroup>
             </Match>
           </Switch>
         </box>
 
-        <Panel flexShrink={0} gap={2} paddingLeft={1} border="none">
+        <Panel flexShrink={0} gap={2} paddingLeft={1} paddingRight={1} border="none">
           <For each={footerHints()}>
             {(hint) => (
               <text fg={theme().text}>
