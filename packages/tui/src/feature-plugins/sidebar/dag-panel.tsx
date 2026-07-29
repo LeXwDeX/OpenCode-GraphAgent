@@ -4,7 +4,7 @@ import type { DagNode, DagWorkflowSummary } from "@opencode-ai/sdk/v2"
 import type { BuiltinTuiPlugin } from "../builtins"
 import { createEffect, createMemo, createSignal, For, Show } from "solid-js"
 import { Spinner } from "../../component/spinner"
-import { dagNodeGlyph, dagStatusColor, formatDagProgress } from "../system/dag-inspector-utils"
+import { computeWaves, dagNodeGlyph, dagStatusColor, formatDagProgress } from "../system/dag-inspector-utils"
 
 const id = "internal:sidebar-dag-panel"
 
@@ -19,6 +19,10 @@ function WorkflowRow(props: {
 }) {
   const theme = () => props.api.theme.current
   const [nodes, setNodes] = createSignal<DagNode[]>([])
+  // The API returns nodes in reverse insertion order (desc seq); flatten the
+  // topological waves so the list reads top-down in execution order, matching
+  // the DAG inspector.
+  const orderedNodes = createMemo(() => computeWaves(nodes()).flat())
 
   const total = () => Number(props.summary.nodeCount)
   const completed = () => Number(props.summary.completedNodes)
@@ -71,7 +75,7 @@ function WorkflowRow(props: {
       </box>
       <Show when={props.expanded}>
         <box flexDirection="column" paddingLeft={2}>
-          <For each={nodes()}>
+          <For each={orderedNodes()}>
             {(node) => (
               <box flexDirection="row" gap={1}>
                 <Show when={node.status !== "running"} fallback={<Spinner color={theme().textMuted} />}>
@@ -124,13 +128,14 @@ function DagPanel(props: { api: TuiPluginApi; session_id: string }) {
   return (
     <Show when={dags().length > 0}>
       <box>
-        <box flexDirection="row" gap={1} onMouseDown={() => dags().length > 2 && setOpen((x) => !x)}>
-          <Show when={dags().length > 2}>
-            <text fg={theme().text}>{open() ? "▼" : "▶"}</text>
-          </Show>
+        {/* Always collapsible (unlike MCP's >2 threshold): an expanded workflow
+            renders a node list, so even a single DAG is tall enough to hide.
+            The chevron also keeps the header aligned with MCP's "▼ MCP". */}
+        <box flexDirection="row" gap={1} onMouseDown={() => setOpen((x) => !x)}>
+          <text fg={theme().text}>{open() ? "▼" : "▶"}</text>
           <text fg={theme().text}>
             <b>DAG</b>
-            <Show when={!open() && dags().length > 2}>
+            <Show when={!open()}>
               <span style={{ fg: theme().textMuted }}>
                 {" "}
                 ({active().length} active{terminal().length > 0 ? `, ${terminal().length} done` : ""})
@@ -138,7 +143,7 @@ function DagPanel(props: { api: TuiPluginApi; session_id: string }) {
             </Show>
           </text>
         </box>
-        <Show when={dags().length <= 2 || open()}>
+        <Show when={open()}>
           <For each={active()}>
             {(summary) => (
               <WorkflowRow
