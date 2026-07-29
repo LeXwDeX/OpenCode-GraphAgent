@@ -106,6 +106,49 @@ describe("CommandPlugin.Plugin", () => {
     }),
   )
 
+  it.effect("binds the tiered orchestration doctrine and depth ladder", () =>
+    Effect.sync(() => {
+      expect(CommandPlugin.OrchestrationPolicyContent).toContain("## Tiered Orchestration Doctrine")
+      expect(CommandPlugin.OrchestrationPolicyContent).toContain("**Breadth (space for accuracy)**")
+      expect(CommandPlugin.OrchestrationPolicyContent).toContain("**Depth (iteration for accuracy)**")
+      expect(CommandPlugin.OrchestrationPolicyContent).toContain(
+        "The advanced tier MUST NOT do bulk work the standard tier can fan out",
+      )
+      expect(CommandPlugin.OrchestrationPolicyContent).toContain("The standard tier MUST NOT render a final verdict")
+      // Tier placement is the mechanical lever (config.ts tierModel): required/review → advanced.
+      expect(CommandPlugin.OrchestrationPolicyContent).toContain("`review`/`review-*` workers resolve to")
+      expect(CommandPlugin.OrchestrationPolicyContent).toContain("## Depth Ladder")
+      expect(CommandPlugin.OrchestrationPolicyContent).toContain("A single wave of parallel opinions is not a")
+      expect(CommandPlugin.WorkflowFactsContent).toContain("Tiered Orchestration Doctrine")
+      expect(CommandPlugin.OrchestrationDomainsContent).toContain("two accuracy axes")
+    }),
+  )
+
+  it.effect("grades the review profile and mandates claim verification", () =>
+    Effect.sync(() => {
+      expect(CommandPlugin.OrchestrationPolicyContent).toContain("four waves minimum")
+      expect(CommandPlugin.OrchestrationPolicyContent).toContain("unverified_claims")
+      expect(CommandPlugin.OrchestrationPolicyContent).toContain("claim-verification wave")
+      expect(CommandPlugin.OrchestrationPolicyContent).toContain("MUST NOT be a silent end of the graph")
+      expect(CommandPlugin.OrchestrationDomainsContent).toContain("**Verification wave (mandatory for module scope and larger)**")
+      expect(CommandPlugin.OrchestrationDomainsContent).toContain("never the end of the task")
+    }),
+  )
+
+  it.effect("binds verdict disposal at the terminal boundary", () =>
+    Effect.sync(() => {
+      expect(CommandPlugin.OrchestrationPolicyContent).toContain("## Verdict Disposal Contract")
+      expect(CommandPlugin.OrchestrationPolicyContent).toContain("same wake turn")
+      expect(CommandPlugin.OrchestrationPolicyContent).toContain(
+        "Merely summarizing a non-ACCEPT verdict and ending the turn is an",
+      )
+      expect(CommandPlugin.OrchestrationPolicyContent).toContain("escapes that guard")
+      expect(CommandPlugin.OrchestrationPolicyContent).toContain("Silence is not a stop decision")
+      expect(CommandPlugin.WorkflowFactsContent).toContain("Verdict Disposal Contract")
+      expect(CommandPlugin.OrchestrationDomainsContent).toContain("Verdict Disposal Contract")
+    }),
+  )
+
   it.effect("distinguishes required-node failure from business verdicts", () =>
     Effect.sync(() => {
       expect(CommandPlugin.OrchestrationPolicyContent).toContain("`required: true` handles execution failure")
@@ -297,6 +340,9 @@ describe("CommandPlugin.Plugin", () => {
       expect(reviewExample).toContain("required: [verdict, summary, findings, required_actions, next_action]")
       expect(reviewExample).toContain("required: [operation, targets]")
       expect(reviewExample).toContain("enum: [continue, extend, replan, complete, stop]")
+      // The arbiter must not be a silent terminal leaf: a conditioned
+      // continuation node keeps non-ACCEPT verdicts from dead-ending the graph.
+      expect(reviewExample).toContain("condition: 'arbitrate.output.verdict != \"ACCEPT\"'")
       expect(CommandPlugin.WorkflowFactsContent).toContain("an early\n`control(complete)` workflow remains terminal")
       expect(CommandPlugin.DagFlowContent).toContain("must actually contain the requested synthesis")
     }),

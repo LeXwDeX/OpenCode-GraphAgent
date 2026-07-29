@@ -1,5 +1,55 @@
 # Orchestration Policy
 
+This file is the operating procedure. Where background prose or an example
+elsewhere appears to permit a shallower graph, this procedure wins.
+
+## Tiered Orchestration Doctrine
+
+Every non-trivial orchestration is a tiered division of labor:
+
+- **Advanced-tier nodes** own the decisions that must be correct: task
+  decomposition, gates, claim verification, arbitration, final synthesis.
+- **Standard-tier nodes** own the volume: exploration, mechanical
+  implementation, per-angle analysis, test execution.
+
+Tier placement is mechanical, not a model-ID choice: `required: true` nodes
+and `review`/`review-*` workers resolve to the advanced model tier of
+`dag.jsonc`; every other node resolves to standard. Mark conductor and critic
+nodes accordingly instead of inventing model identifiers. With a single
+configured tier the role split still applies — compensate for the weaker
+judge with more redundancy below.
+
+The standard tier buys accuracy with redundancy on two axes:
+
+- **Breadth (space for accuracy)**: independent slices fan out concurrently —
+  work packages, hypotheses, review dimensions, or N samples of the same
+  question when one cheap pass is unreliable — and fan in to one
+  advanced-tier arbiter.
+- **Depth (iteration for accuracy)**: unreliable or high-stakes conclusions
+  are re-earned across waves — analyze → verify claims against ground truth →
+  deepen on what survived — bounded by `max_node_replan_attempts`.
+
+Hard rules:
+
+1. The advanced tier MUST NOT do bulk work the standard tier can fan out.
+2. The standard tier MUST NOT render a final verdict: every deciding fan-in
+   routes through an advanced-tier gate or arbiter.
+3. A standard-tier claim stays unverified until a verification step has
+   checked it against ground truth (code, tests, executable evidence).
+
+## Depth Ladder
+
+Hard minimums by target size; user constraints may lower them only when
+explicit ("quick pass", "single agent", a stated budget) — a bare task phrase
+like "review X" never does.
+
+- **File or function scope**: one analysis wave plus one synthesis node.
+- **Module scope**: at least exploration → independent analysis → claim
+  verification → arbitration. A single wave of parallel opinions is not a
+  review; it is a poll.
+- **Subsystem or repo scope**: a domain playbook with planned continuation
+  waves (verdict-driven replan or extend), never a one-shot graph.
+
 ## Execution Mode Selection
 
 Choose the smallest execution mode that can safely complete the request:
@@ -7,6 +57,10 @@ Choose the smallest execution mode that can safely complete the request:
 1. Use direct execution when one agent can finish the task in its current context without dependent phases.
 2. Use a single `task` subagent when one configured specialist is sufficient and no graph-level coordination is needed.
 3. Use a `workflow` DAG when the task has staged dependencies, independently parallelizable work, a quality gate, unknown-size discovery, or an explicit multi-role or multi-model requirement.
+
+"Smallest" is measured against the Depth Ladder: a mode or graph that cannot
+deliver the ladder's hard minimum for the target size is not safe, merely
+small.
 
 Outside an explicit `/dag-flow` request, select a DAG only when the request contains both a scenario signal and a structural signal. Scenario signals include multi-role review, brainstorming, swarm or cluster work, multi-model analysis, and end-to-end development. Structural signals include independent viewpoints, multiple work packages, staged gates, unknown-size discovery, and requested iteration. A lone keyword such as "review" is not sufficient.
 
@@ -112,13 +166,39 @@ Pin a model only when the user supplies an exact provider/model pair for a node 
 
 Qualitative labels such as "strong", "fast", or "cheap" may guide capability and role selection, but you MUST NOT invent a model identifier. If the user did not name an exact configured model, use the fallback chain.
 
+Prefer expressing "strong model for judgment, fast model for volume" through
+tier placement — `required: true` and `review`/`review-*` workers resolve to
+the advanced tier of `dag.jsonc`, everything else to standard — rather than
+per-node pins.
+
 ## Profile: Brainstorm
 
 Use capability slots such as `scope_explorer`, `viewpoint_generator`, `skeptic`, `constraint_analyst`, and `synthesizer`. Run at least two independent viewpoint nodes in parallel, give them distinct perspectives, then fan in to one synthesizer that compares trade-offs and answers the user's question. The profile is read-only by default.
 
 ## Profile: Review
 
-Start with scope discovery only when the review target is unclear. Assign distinct review dimensions—such as specification fit, architecture, correctness, testing, and security—to independent eligible reviewers, then fan in to one downstream arbiter. The arbiter deduplicates findings, resolves conflicts, and emits a structured decision. The profile is read-only by default.
+Scale the graph with the Depth Ladder before compiling, then wire the
+verdict's continuation path.
+
+- File or function target: assign distinct review dimensions—such as
+  specification fit, architecture, correctness, testing, and security—to
+  independent eligible reviewers, then fan in to one downstream arbiter.
+- Module target or larger, four waves minimum:
+  1. scope exploration fanning out over the target's real structure;
+  2. distinct review dimensions in parallel, every reviewer REQUIRED to cite
+     file:line evidence and to list claims it could not verify as
+     `unverified_claims`;
+  3. a claim-verification wave that checks disputed and unverified claims
+     against the actual code, so unproven assertions never reach the verdict;
+  4. one downstream arbiter (advanced tier) that rules finding-by-finding on
+     verified evidence, deduplicates findings, resolves conflicts, and emits
+     a structured decision.
+- The arbiter MUST NOT be a silent end of the graph: either gate an in-graph
+  continuation node on `condition: 'arbiter.output.verdict != "ACCEPT"'`, or
+  rely on the Verdict Disposal Contract at the wake boundary — choose one
+  deliberately at compile time.
+
+The profile is read-only by default.
 
 ## Profile: Develop
 
@@ -165,6 +245,30 @@ type says review.
 `required: true` handles execution failure; it does not interpret a successful business verdict. A gate that successfully returns `REVISE` or `REJECT` is a completed node, not a failed node.
 
 Declare `output_schema` for gates and arbiters and normalize `verdict` to `ACCEPT`, `REVISE`, `REJECT`, or `BLOCKED`. Use a downstream `condition` for a static branch. When the decision changes graph shape, set a checkpoint and let the parent select an existing workflow control action.
+
+## Verdict Disposal Contract
+
+A gate, arbiter, or auditor verdict is a work order, not a summary. When a
+checkpoint reports `REVISE`, `REJECT`, or `BLOCKED`, the parent MUST dispose
+of it in the same wake turn with exactly one of:
+
+1. `extend` — append a bounded correction or deep-dive wave targeting the
+   findings. This remains valid after a reporting leaf checkpoint naturally
+   completed the workflow.
+2. `control(pause)` → `control(replan)` → `control(resume)` — when the live
+   graph must change shape.
+3. A new workflow — when the previous one terminalized and the follow-up
+   needs a fresh graph; state which prior results carry over.
+4. A reasoned stop — tell the user, finding by finding, why no further wave
+   is warranted. Silence is not a stop decision.
+
+Merely summarizing a non-ACCEPT verdict and ending the turn is an
+orchestration failure. The runtime's `orchestrator_unresponsive` guard only
+fires for workflows that are still live; a checkpoint that terminalizes its
+workflow escapes that guard, so this contract is the only enforcement at the
+terminal boundary and applies with full force exactly there. For `BLOCKED`
+on a ceiling breach, do not retry the identical plan — report residual
+findings and stop or change approach.
 
 ## Actionable Checkpoints
 
