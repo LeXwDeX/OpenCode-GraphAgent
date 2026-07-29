@@ -49,6 +49,13 @@ export function validateAgainstSchema(value: unknown, schema: Record<string, unk
       return { ok: false, error: `expected type "boolean", got ${typeof value}` }
   }
 
+  if ("const" in schema && !deepEqual(value, schema["const"]))
+    return { ok: false, error: `expected const ${truncate(JSON.stringify(schema["const"]))}, got ${truncate(JSON.stringify(value))}` }
+
+  const enumVals = schema["enum"]
+  if (Array.isArray(enumVals) && !enumVals.some((v) => deepEqual(value, v)))
+    return { ok: false, error: `expected one of ${truncate(JSON.stringify(enumVals))}, got ${truncate(JSON.stringify(value))}` }
+
   const required = schema["required"]
   if (Array.isArray(required) && typeof value === "object" && value !== null && !Array.isArray(value)) {
     const obj = value as Record<string, unknown>
@@ -79,4 +86,27 @@ export function validateAgainstSchema(value: unknown, schema: Record<string, unk
   }
 
   return { ok: true }
+}
+
+function truncate(text: string | undefined): string {
+  if (text === undefined) return "undefined"
+  if (text.length <= 200) return text
+  return text.slice(0, 200) + "\u2026"
+}
+
+// Structural equality for JSON values (const/enum come from workflow config
+// JSON, so no cycles). JSON.stringify comparison is unreliable: key order.
+function deepEqual(a: unknown, b: unknown): boolean {
+  if (Object.is(a, b)) return true
+  if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) return false
+  if (Array.isArray(a) !== Array.isArray(b)) return false
+  if (Array.isArray(a) && Array.isArray(b)) {
+    if (a.length !== b.length) return false
+    return a.every((item, i) => deepEqual(item, b[i]))
+  }
+  const aObj = a as Record<string, unknown>
+  const bObj = b as Record<string, unknown>
+  const aKeys = Object.keys(aObj)
+  if (aKeys.length !== Object.keys(bObj).length) return false
+  return aKeys.every((key) => key in bObj && deepEqual(aObj[key], bObj[key]))
 }

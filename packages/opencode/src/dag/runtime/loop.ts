@@ -394,6 +394,14 @@ export const layer = Layer.effect(
                 yield* entry.evalLock.withPermits(1)(
                   Effect.gen(function* () {
                     const nodeID = evt.data.nodeID as string
+                    // Same DB cross-check as the NodeFailed handler: projection
+                    // is transactional with publish, so a row that no longer
+                    // matches the event's terminal status means a later
+                    // restart/replan reset it — drop the stale event without
+                    // touching the new generation's fiber.
+                    const expected = def === DagEvent.NodeSkipped ? "skipped" : "completed"
+                    const node = yield* store.getNode(dagID, nodeID)
+                    const confirmed = node?.status === expected
                     // Cancel-skip race: workflow-level cancel publishes NodeSkipped
                     // for running nodes, and this handler may win the cross-stream
                     // race against WorkflowCancelled. Deleting the fiber here
@@ -402,23 +410,25 @@ export const layer = Layer.effect(
                     // prompt finishes or times out. Stop it now, mirroring the
                     // NodeCancelled handler. Completed nodes keep the plain
                     // delete — their fiber published the event and is finishing.
-                    if (def === DagEvent.NodeSkipped) {
+                    if (confirmed && def === DagEvent.NodeSkipped) {
                       const fiber = entry.fibers.get(nodeID)
                       if (fiber) {
-                        const node = yield* store.getNode(dagID, nodeID)
                         yield* abortChild(nodeID, node?.childSessionId ?? null).pipe(Effect.ignore)
                         yield* Fiber.interrupt(fiber).pipe(Effect.ignore)
                       }
                     }
-                    entry.fibers.delete(nodeID)
+                    if (confirmed) entry.fibers.delete(nodeID)
+                    if (!confirmed) {
+                      yield* Effect.logDebug("DagLoop dropped stale node terminal event", { dagID, nodeID, expected, dbStatus: node?.status ?? "missing" })
+                    }
                     const workflow = yield* store.getWorkflow(dagID)
                     entry.runtime.setPaused(workflow?.status === "paused")
                     entry.runtime.setStepMode(workflow?.status === "stepping")
                     // Guard against stale events: a node already cancelled
                     // (markUnsatisfied) or already satisfied must not be flipped
                     // back. Mirrors the NodeFailed handler's isActive guard.
-                    if (entry.runtime.isActive(evt.data.nodeID as string)) {
-                      settle(entry, evt.data.nodeID as string)
+                    if (confirmed && entry.runtime.isActive(nodeID)) {
+                      settle(entry, nodeID)
                       // In stepMode, do NOT auto-advance — wait for the next
                       // explicit step command. checkCompletion still runs so
                       // required-node failure / early completion is detected.
@@ -473,18 +483,29 @@ export const layer = Layer.effect(
                 yield* entry.evalLock.withPermits(1)(
                   Effect.gen(function* () {
                     const nid = evt.data.nodeID as string
-                    const fiber = entry.fibers.get(nid)
-                    entry.fibers.delete(nid)
+                    // Generation arbitration via DB status: each projector runs
+                    // INSIDE the durable publish transaction (core/dag/projector.ts),
+                    // so by the time this handler consumes the event the row
+                    // already reflects it. If the row is no longer "failed", a
+                    // later NodeRestarted/replan reset the node — this event
+                    // belongs to a previous generation and must not touch the
+                    // new one (including the fiber map, which may already hold
+                    // the new attempt's fiber). No generation field needed.
+                    const node = yield* store.getNode(dagID, nid)
                     // #3: only markUnsatisfied if the runtime still tracks this
                     // node as non-terminal. A stale NodeFailed event (e.g. from
                     // a replan-ceiling check after the node already completed)
                     // would incorrectly flip a satisfied node to unsatisfied.
-                    if (entry.runtime.isActive(nid)) {
-                      const node = yield* store.getNode(dagID, nid)
-                      yield* abortChild(nid, node?.childSessionId ?? null).pipe(Effect.ignore)
+                    if (node?.status === "failed" && entry.runtime.isActive(nid)) {
+                      const fiber = entry.fibers.get(nid)
+                      entry.fibers.delete(nid)
+                      yield* abortChild(nid, node.childSessionId ?? null).pipe(Effect.ignore)
                       if (fiber) yield* Fiber.interrupt(fiber).pipe(Effect.ignore)
                       entry.runtime.markUnsatisfied(nid)
                       if (!entry.runtime.isStepMode()) yield* spawnReady(dagID)
+                    }
+                    if (node?.status !== "failed") {
+                      yield* Effect.logDebug("DagLoop dropped stale NodeFailed", { dagID, nodeID: nid, dbStatus: node?.status ?? "missing" })
                     }
                     // In stepMode, checkCompletion (which can trigger autonomous
                     // fail/complete) still runs, but spawnReady is skipped —
@@ -568,6 +589,19 @@ export const layer = Layer.effect(
                   if (wf) entry.config = parseWorkflowConfig(wf.config)
                   const nodes = yield* store.getNodes(dagID)
                   entry.runtime.rebuildGraph(toSchedulingNodes(nodes))
+                  // Replan resets restarted nodes to pending. Old fibers of nodes
+                  // that are no longer running/queued must be interrupted here:
+                  // nothing else will (there is no NodeRestarted subscriber), and
+                  // a leftover fiber's timeout path publishes NodeFailed — a legal
+                  // pending→failed transition guardNode cannot reject — poisoning
+                  // the new generation. Mirrors the workflow-terminal sweep.
+                  for (const [nodeID, fiber] of [...entry.fibers]) {
+                    const node = nodes.find((n) => n.id === nodeID)
+                    if (node && (node.status === "running" || node.status === "queued")) continue
+                    yield* abortChild(nodeID, node?.childSessionId ?? null).pipe(Effect.ignore)
+                    yield* Fiber.interrupt(fiber).pipe(Effect.ignore)
+                    entry.fibers.delete(nodeID)
+                  }
                   yield* spawnReady(dagID)
                   yield* checkCompletion(dagID)
                 }),
@@ -700,13 +734,25 @@ export const layer = Layer.effect(
                   for (const dagID of deliveredUnresponsiveDagIDs) {
                     const entry = runtimes.get(dagID)
                     if (!entry) continue
-                    if (entry.runtime.isPaused() || entry.runtime.isStepMode()) continue
-                    // Suppress the net only when current-process execution
-                    // ownership proves that a running node is making progress.
-                    if (entry.runtime.hasRunningMatching((id) => entry.fibers.has(id))) continue
-                    if (entry.runtime.getReadyNodes().length > 0) continue
-                    if (entry.runtime.isComplete()) continue
-                    yield* dag.fail(dagID, "orchestrator_unresponsive").pipe(Effect.ignore)
+                    // Torn-read fix: every runtime/fibers mutation happens as a
+                    // pair inside this entry's evalLock (markRunning+fibers.set
+                    // in spawnReady, settle+spawnReady in the terminal handlers),
+                    // so reading the five conditions under the same lock waits
+                    // out the markRunning→fibers.set window instead of misreading
+                    // it as a stalled orchestrator. dag.fail stays outside the
+                    // lock to avoid holding evalLock across the KeyedMutex.
+                    const shouldFail = yield* entry.evalLock.withPermits(1)(
+                      Effect.sync(() =>
+                        !entry.runtime.isPaused()
+                        && !entry.runtime.isStepMode()
+                        // Suppress the net only when current-process execution
+                        // ownership proves that a running node is making progress.
+                        && !entry.runtime.hasRunningMatching((id) => entry.fibers.has(id))
+                        && entry.runtime.getReadyNodes().length === 0
+                        && !entry.runtime.isComplete(),
+                      ),
+                    )
+                    if (shouldFail) yield* dag.fail(dagID, "orchestrator_unresponsive").pipe(Effect.ignore)
                   }
                 }
                 return
