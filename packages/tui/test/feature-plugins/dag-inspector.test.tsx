@@ -35,6 +35,7 @@ type RenderOpts = {
   nodes?: DagNode[]
   initialRoute?: TuiRouteCurrent
   summary?: (sessionID: string) => Promise<{ data: DagWorkflowSummary[] }>
+  width?: number
 }
 
 function dagNode(overrides: Partial<DagNode> & { id: string }): DagNode {
@@ -55,7 +56,9 @@ async function renderDagInspector(opts: RenderOpts = {}) {
     string,
     NonNullable<Parameters<TuiPluginApi["keymap"]["registerLayer"]>[0]["commands"]>[number]
   >()
-  const [current, setCurrent] = createSignal<TuiRouteCurrent>(opts.initialRoute ?? { name: "dag", params: { sessionID: SESSION_ID } })
+  const [current, setCurrent] = createSignal<TuiRouteCurrent>(
+    opts.initialRoute ?? { name: "dag", params: { sessionID: SESSION_ID } },
+  )
   let renderInspector: TuiRouteDefinition["render"] | undefined
 
   // Updatable workflow state for change detection.
@@ -156,7 +159,7 @@ async function renderDagInspector(opts: RenderOpts = {}) {
     )
   }
 
-  const app = await testRender(() => <Harness />, { width: 100, height: 30 })
+  const app = await testRender(() => <Harness />, { width: opts.width ?? 130, height: 30 })
   await waitForCommand(app, commands, "dag.open")
   if (current().name === "dag") await waitForCommand(app, commands, "dag.close")
   // Give the initial fetchNodes a chance to resolve.
@@ -206,13 +209,25 @@ async function waitForCondition(fn: () => boolean, timeout = 2000) {
   }
 }
 
+type RegisteredCommands = Map<
+  string,
+  NonNullable<Parameters<TuiPluginApi["keymap"]["registerLayer"]>[0]["commands"]>[number]
+>
+
+/** Invoke a route command the way a keypress would. The keymap passes a real
+ * command context at runtime; tests only exercise the side effects, so the
+ * unused context is asserted away once here instead of at every call site. */
+function runCommand(commands: RegisteredCommands, name: string) {
+  void commands.get(name)!.run?.({} as never)
+}
+
 describe("DagInspector", () => {
   test("/dag dispatches dag.open locally without submitting a model command", async () => {
     const returnRoute = { name: "session", params: { sessionID: SESSION_ID } }
     const viewer = await renderDagInspector({ initialRoute: returnRoute })
     try {
       expect(viewer.commands.get("dag.open")?.slashName).toBe("dag")
-      viewer.commands.get("dag.open")!.run?.({} as never)
+      runCommand(viewer.commands, "dag.open")
       await waitForCommand(viewer.app, viewer.commands, "dag.close")
 
       expect(viewer.navigations().at(-1)).toEqual({
@@ -333,13 +348,16 @@ describe("DagInspector", () => {
 
   test("closing the inspector prevents further fetches", async () => {
     const viewer = await renderDagInspector({
-      initialRoute: { name: "dag", params: { sessionID: SESSION_ID, returnRoute: { name: "session", params: { sessionID: SESSION_ID } } } },
+      initialRoute: {
+        name: "dag",
+        params: { sessionID: SESSION_ID, returnRoute: { name: "session", params: { sessionID: SESSION_ID } } },
+      },
       workflows: [wfSummary({ id: "wf-1" })],
       nodes: [dagNode({ id: "n-1", name: "build", status: "pending" })],
     })
     try {
       // Close the inspector — navigates away, unmounts the component.
-      viewer.commands.get("dag.close")!.run?.({} as never)
+      runCommand(viewer.commands, "dag.close")
       await Bun.sleep(20)
 
       const before = viewer.nodesCalls().length
@@ -359,7 +377,7 @@ describe("DagInspector", () => {
       nodes: [dagNode({ id: "n-1", name: "build", status: "running", child_session_id: "child_ses_1" })],
     })
     try {
-      viewer.commands.get("dag.enter")!.run?.({} as never)
+      runCommand(viewer.commands, "dag.enter")
       expect(viewer.navigations()).toContainEqual(
         expect.objectContaining({ name: "session", params: expect.objectContaining({ sessionID: "child_ses_1" }) }),
       )
@@ -385,14 +403,14 @@ describe("DagInspector", () => {
     }
   })
 
-  test("pressing p pauses a running workflow", async () => {
+  test("dag.pause pauses a running workflow", async () => {
     const viewer = await renderDagInspector({
       workflows: [wfSummary({ id: "wf-1", status: "running" })],
       nodes: [dagNode({ id: "n-1", name: "build", status: "running" })],
     })
     try {
       await viewer.app.waitForFrame((frame) => frame.includes("build"))
-      viewer.app.mockInput.pressKey("p")
+      runCommand(viewer.commands, "dag.pause")
       await waitForCondition(() => viewer.controlCalls().length > 0)
       expect(viewer.controlCalls()).toContainEqual({ dagID: "wf-1", operation: "pause" })
     } finally {
@@ -400,14 +418,14 @@ describe("DagInspector", () => {
     }
   })
 
-  test("pressing p pauses a stepping workflow", async () => {
+  test("dag.pause pauses a stepping workflow", async () => {
     const viewer = await renderDagInspector({
       workflows: [wfSummary({ id: "wf-1", status: "stepping" })],
       nodes: [dagNode({ id: "n-1", name: "build", status: "running" })],
     })
     try {
       await viewer.app.waitForFrame((frame) => frame.includes("build"))
-      viewer.app.mockInput.pressKey("p")
+      runCommand(viewer.commands, "dag.pause")
       await waitForCondition(() => viewer.controlCalls().length > 0)
       expect(viewer.controlCalls()).toContainEqual({ dagID: "wf-1", operation: "pause" })
     } finally {
@@ -415,17 +433,33 @@ describe("DagInspector", () => {
     }
   })
 
-  test("pressing p on a terminal workflow explains why pause is unavailable", async () => {
+  test("dag.pause on a terminal workflow explains why pause is unavailable", async () => {
     const viewer = await renderDagInspector({
       workflows: [wfSummary({ id: "wf-1", status: "completed", completedNodes: 2 })],
       nodes: [dagNode({ id: "n-1", name: "build", status: "completed" })],
     })
     try {
       await viewer.app.waitForFrame((frame) => frame.includes("build"))
-      viewer.app.mockInput.pressKey("p")
+      runCommand(viewer.commands, "dag.pause")
       await waitForCondition(() => viewer.toasts().length > 0)
       expect(viewer.controlCalls()).toEqual([])
       expect(viewer.toasts().at(-1)?.message).toMatch(/completed.*cannot be paused/i)
+    } finally {
+      viewer.app.renderer.destroy()
+    }
+  })
+
+  test("control operations stay reachable through the command palette", async () => {
+    const viewer = await renderDagInspector({
+      workflows: [wfSummary({ id: "wf-1", status: "running" })],
+      nodes: [dagNode({ id: "n-1", name: "build", status: "running" })],
+    })
+    try {
+      await viewer.app.waitForFrame((frame) => frame.includes("build"))
+      // Unbound by default, so the palette namespace is the only way in.
+      for (const name of ["dag.pause", "dag.resume", "dag.step", "dag.cancel"]) {
+        expect(viewer.commands.get(name)?.namespace).toBe("palette")
+      }
     } finally {
       viewer.app.renderer.destroy()
     }
@@ -453,7 +487,7 @@ describe("DagInspector", () => {
       nodes: [dagNode({ id: "n-1", name: "build", status: "pending" })],
     })
     try {
-      viewer.commands.get("dag.enter")!.run?.({} as never)
+      runCommand(viewer.commands, "dag.enter")
       expect(viewer.toasts().some((t) => /no session/i.test(t.message))).toBe(true)
     } finally {
       viewer.app.renderer.destroy()
@@ -467,7 +501,7 @@ describe("DagInspector", () => {
       workflows: [wfSummary({ id: "wf-1" })],
     })
     try {
-      viewer.commands.get("dag.close")!.run?.({} as never)
+      runCommand(viewer.commands, "dag.close")
       expect(viewer.navigations().at(-1)).toEqual(
         expect.objectContaining({ name: "session", params: { sessionID: SESSION_ID } }),
       )
@@ -489,7 +523,7 @@ describe("DagInspector", () => {
       await waitForCondition(() => viewer.nodesCalls().some((id) => id === "wf-1"))
 
       // Switch selection wf-1 -> wf-2.
-      viewer.commands.get("dag.next_workflow")!.run?.({} as never)
+      runCommand(viewer.commands, "dag.next_workflow")
       // The new selection fetches wf-2's nodes.
       await waitForCondition(() => viewer.nodesCalls().some((id) => id === "wf-2"))
 
@@ -541,7 +575,7 @@ describe("DagInspector", () => {
     }
   })
 
-  test("footer only advertises controls valid for the workflow status", async () => {
+  test("footer advertises only the cursor affordances, never the control operations", async () => {
     const viewer = await renderDagInspector({
       workflows: [wfSummary({ id: "wf-1", status: "paused" })],
       nodes: [dagNode({ id: "n-1", name: "build", status: "pending" })],
@@ -550,8 +584,13 @@ describe("DagInspector", () => {
       await viewer.app.waitForFrame((frame) => {
         const footer = frame.split("\n").find((row) => row.includes("open session"))
         if (!footer) return false
+        // A paused workflow would previously have advertised resume/cancel here.
         return (
-          footer.includes("resume") && footer.includes("cancel") && !footer.includes("pause") && !footer.includes("step")
+          footer.includes("close") &&
+          !footer.includes("resume") &&
+          !footer.includes("cancel") &&
+          !footer.includes("pause") &&
+          !footer.includes("step")
         )
       })
     } finally {
@@ -577,10 +616,40 @@ describe("DagInspector", () => {
       })
       // Moving to "detailed" adds dependency and error rows to the detail
       // pane; the fixed-height pane must keep the footer on the same row.
-      viewer.commands.get("dag.down")!.run?.({} as never)
+      runCommand(viewer.commands, "dag.down")
       await viewer.app.waitForFrame((frame) => frame.includes("boom") && footerRow(frame) === before)
     } finally {
       viewer.app.renderer.destroy()
+    }
+  })
+
+  test("the workflow sidebar only appears on wide terminals", async () => {
+    const wide = await renderDagInspector({
+      width: 130,
+      workflows: [wfSummary({ id: "wf-1", title: "Evidence pipeline" })],
+      nodes: [dagNode({ id: "n-1", name: "collect", status: "running" })],
+    })
+    try {
+      // The sidebar header is the marker: it renders "DAG" plus a workflow count.
+      await wide.app.waitForFrame((frame) => frame.includes("1 workflow"))
+    } finally {
+      wide.app.renderer.destroy()
+    }
+
+    const narrow = await renderDagInspector({
+      width: 100,
+      workflows: [
+        wfSummary({ id: "wf-1", title: "Evidence pipeline" }),
+        wfSummary({ id: "wf-2", title: "Second workflow" }),
+      ],
+      nodes: [dagNode({ id: "n-1", name: "collect", status: "running" })],
+    })
+    try {
+      // Sidebar dropped; the summary block carries the position instead so the
+      // left/right workflow cursor stays legible.
+      await narrow.app.waitForFrame((frame) => frame.includes("workflow 1/2") && !frame.includes("2 workflows"))
+    } finally {
+      narrow.app.renderer.destroy()
     }
   })
 })
