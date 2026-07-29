@@ -2,11 +2,13 @@
 # 🔍 CI · Typecheck
 # ----------------------------------------------------------------------------
 # Purpose : TypeScript type checking across all packages (bun typecheck)
+#           plus oxlint warning ratchet (bun run lint, --max-warnings gate)
 # Trigger : Push to `main`/`dev`, PRs targeting `main`/`dev`, manual dispatch
-# Jobs    : typecheck — single Linux runner, `bun typecheck`
+# Jobs    : typecheck — single Linux runner, `bun run lint` + `bun typecheck`
 # Gate    : Required status check on BOTH `dev` and `main` rulesets — it is
 #           the fast gate for feat/fix → dev PRs (full test suite only gates
-#           dev → main, see ci-test.yml).
+#           dev → main, see ci-test.yml). Lint lives inside this job so it
+#           blocks merges without editing the rulesets' required checks.
 # Notes   : No push trigger on feat/* or fix/* (frequent changes); PRs cover
 #           them.
 # ============================================================================
@@ -34,6 +36,9 @@ jobs:
 
       - name: Setup Bun
         uses: ./.github/actions/setup-bun
+
+      - name: Run lint
+        run: bun run lint
 
       - name: Run typecheck
         run: bun typecheck
