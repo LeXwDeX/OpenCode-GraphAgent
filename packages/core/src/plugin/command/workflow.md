@@ -7,6 +7,8 @@
 
 The `workflow` tool orchestrates heavy tasks as dependency-graph multi-agent workflows. Each node runs as a real child session with its own agent, tools, and optionally its own model. This skill covers when to start a workflow, how to structure it, and how to adapt it at runtime.
 
+Compile every graph under the Tiered Orchestration Doctrine and Depth Ladder in the orchestration policy below: advanced-tier judgment nodes conduct and check, standard-tier nodes carry the volume, and accuracy is bought with breadth (concurrent fan-out) and depth (verdict-gated waves) rather than with a single trusted pass.
+
 ## When to start a workflow
 
 A task is an implicit workflow candidate only when it has both a scenario
@@ -41,179 +43,15 @@ waiver audit fields.
 
 ## Orchestration Lifecycle
 
-Heavy tasks follow a meta-workflow: multiple workflows chained together, each producing a decision that shapes the next. The lifecycle is not a rigid template — assess the task and enter at the phase that matches its current state.
+Heavy tasks follow a meta-workflow: multiple workflows chained together, each producing a decision that shapes the next. The lifecycle is the two accuracy axes applied in sequence — breadth to cover the surface, depth to earn the verdict:
 
-### Phase 1 — Explore + Brainstorm
+1. **Explore + brainstorm** — exploration nodes fan out over the codebase while independent generators propose approaches; a required synthesizer converges them into a design plus architecture inventory.
+2. **Design review gate** — an advanced-tier gate node (`report_to_parent: true`, normalized verdict `output_schema`) rules on the design. `required: true` fails the workflow only when the gate node fails to execute or satisfy its output contract; a successful `REVISE` or `REJECT` is a business verdict, not an execution failure. Route the static ACCEPT path through a downstream `condition`, and dispose of a reported non-ACCEPT verdict per the Verdict Disposal Contract. Dependencies cannot cross workflow boundaries — a gate in a separate workflow receives the prior result as static input.
+3. **Parallel execution** — the accepted design decomposes into module-level worker nodes with disjoint write sets, fanning into a required assembler.
+4. **Verify + diff review + audit** — production assurance follows `implementation → verification(PASS) → diff review → final gate/audit` with fingerprint echo; `REJECT` routes through corrected implementation and verification before a new diff review. Progress tracking is updated to reflect what shipped.
+5. **Expansion decision** — iterate (bounded `control(replan)` of affected nodes), extend (additional parallel nodes), separate phase (a new workflow once the previous is terminal), or complete (`control(complete)`).
 
-Goal: fill in design gaps and understand the project architecture before committing to execution.
-
-When the task description is underspecified, the architecture is unfamiliar, or multiple solution approaches exist, start here. A single workflow runs diverge-converge (multiple generators propose approaches) in parallel with exploration nodes (code-explore, test-explore, config-explore) that map the codebase. The workflow outputs a completed design + architecture inventory.
-
-```yaml
-action: start
-config:
-  name: explore-and-brainstorm
-  nodes:
-    - id: explore-code
-      name: explore-code
-      worker_type: explore
-      depends_on: []
-      prompt_template: { id: code-explore }
-      required: true
-
-    - id: explore-tests
-      name: explore-tests
-      worker_type: explore
-      depends_on: []
-      prompt_template: { id: test-explore }
-
-    - id: gen-approach-a
-      name: gen-approach-a
-      worker_type: general
-      depends_on: [explore-code]
-      prompt_template: { inline: "Propose an approach based on findings." }
-
-    - id: gen-approach-b
-      name: gen-approach-b
-      worker_type: general
-      depends_on: [explore-code]
-      prompt_template: { inline: "Propose an alternative approach based on findings." }
-
-    - id: converge-design
-      name: converge-design
-      worker_type: general
-      depends_on: [explore-code, explore-tests, gen-approach-a, gen-approach-b]
-      required: true
-      prompt_template: { id: plan }
-```
-
-### Phase 2 — Design Review Gate
-
-Goal: validate the design before execution begins.
-
-A gate node reviews the Phase 1 output. When the gate is in the same workflow,
-declare the design node as a dependency and map its output explicitly. If a
-separate workflow performs the review, the parent must embed the accepted
-Phase 1 result as static input; dependencies cannot cross workflow boundaries.
-If the design is rejected, replan Phase 1 with adjusted direction. If accepted,
-proceed to execution.
-
-```yaml
-action: start
-config:
-  name: design-review-gate
-  nodes:
-    - id: converge-design
-      name: converge-design
-      worker_type: general
-      depends_on: []
-      prompt_template:
-        inline: "Produce the design that must pass architecture review."
-
-    - id: arch-gate
-      name: arch-gate
-      worker_type: general
-      depends_on: [converge-design]
-      input_mapping:
-        design: converge-design
-      required: true
-      report_to_parent: true
-      output_schema:
-        type: object
-        required: [verdict, summary]
-        properties:
-          verdict:
-            type: string
-            enum: [ACCEPT, REVISE, REJECT, BLOCKED]
-          summary: { type: string }
-      prompt_template:
-        inline: "Review this design and submit a structured verdict: {{design}}"
-```
-
-`required: true` fails the workflow only when the gate node fails to execute
-or satisfy its output contract. A successful `REVISE` or `REJECT` result is a
-business verdict, not an execution failure. Use a downstream `condition` for a
-static ACCEPT path, or let the reported checkpoint wake the parent to perform a
-bounded `control(replan)`.
-
-### Phase 3 — Parallel Execution
-
-Goal: implement across independent modules concurrently.
-
-The design from Phase 2 is decomposed into module-level nodes. Each module is a worker node. Modules with no dependencies between them run concurrently (fan-out). A required assembler node collects results.
-
-```yaml
-action: start
-config:
-  name: parallel-execution
-  nodes:
-    - id: module-auth
-      name: module-auth
-      worker_type: build
-      depends_on: []
-      prompt_template: { id: implement }
-      required: true
-
-    - id: module-server
-      name: module-server
-      worker_type: build
-      depends_on: []
-      prompt_template: { id: implement }
-      required: true
-
-    - id: module-cli
-      name: module-cli
-      worker_type: build
-      depends_on: []
-      prompt_template: { id: implement }
-
-    - id: assemble
-      name: assemble
-      worker_type: build
-      depends_on: [module-auth, module-server, module-cli]
-      required: true
-      prompt_template: { id: patcher-assemble }
-```
-
-### Phase 4 — Verify + Diff Review + Audit
-
-Goal: verify integration, review the actual implementation, merge results, and
-update progress tracking.
-
-Production assurance follows `implementation → verification(PASS) → diff
-review → final gate/audit`. A diff review maps the implementation's actual diff
-and fingerprint plus the verification output. If it returns `REJECT`, route the
-findings through corrected implementation and verification before a new diff
-review. A final auditor then confirms completeness. Progress tracking
-(todowrite, OpenSpec tasks, or project board) is updated to reflect what
-shipped.
-
-### Phase 5 — Expansion Decision
-
-After Phase 4, assess whether the task is complete or needs another cycle:
-
-- **Iterate**: gaps found in audit → prefer bounded `control(replan)` of the affected nodes in the current workflow.
-- **Extend**: new work discovered during execution → `extend` the Phase 3 workflow with additional parallel nodes.
-- **Separate phase**: start a new workflow only when the previous phase is terminal and a separately authorized phase needs a fresh graph.
-- **Complete**: all modules shipped, audit passed → `control(complete)` on the active workflow, task done.
-
-### Lifecycle Summary
-
-```
-Phase 1 (explore + brainstorm)
-    ↓ design output
-Phase 2 (review gate)
-    ↓ pass / fail → replan Phase 1
-Phase 3 (parallel execution)
-    ↓ module outputs
-Phase 4 (audit + merge + progress update)
-    ↓
-Phase 5 (expand? iterate? complete?)
-    ↓ iterate → back to Phase 1 or 3
-    ↓ complete → done
-```
-
-Not every task needs all five phases. A well-specified task may skip directly to Phase 3. A task with a clear design but uncertain scope may start at Phase 2. The lifecycle is a decision tree, not a pipeline.
+Not every task needs all five phases: a well-specified task may enter at phase 3, a clear design with uncertain scope at phase 2. The lifecycle is a decision tree, not a pipeline. Concrete graph YAML for each shape is under Collaboration Patterns below.
 
 ## Node inputs and model selection
 
@@ -363,7 +201,7 @@ config:
 
 ### 3. Adversarial Review
 
-Multiple reviewer nodes with different perspectives examine the same artifact. A final arbiter synthesizes their verdicts.
+Multiple reviewer nodes with different perspectives examine the same artifact. A final arbiter synthesizes their verdicts. The arbiter must not be a silent terminal leaf: gate an in-graph continuation node on its verdict (shown below), or dispose of the reported verdict at the wake boundary per the Verdict Disposal Contract.
 
 ```yaml
 action: start
@@ -374,7 +212,7 @@ config:
       name: implement
       worker_type: build
       depends_on: []
-      prompt_template: { id: implement }
+      prompt_template: { id: implement, input: { spec: "Implement the requested change per the task description" } }
       required: true
 
     - id: review-arch
@@ -421,13 +259,25 @@ config:
               targets: { type: array }
       prompt_template:
         inline: "Three reviewers produced findings. Submit one structured ACCEPT, REVISE, REJECT, or BLOCKED decision with deduplicated findings, required actions, and the next bounded workflow action."
+
+    - id: deep-dive
+      name: deep-dive
+      worker_type: general
+      depends_on: [arbitrate]
+      condition: 'arbitrate.output.verdict != "ACCEPT"'
+      report_to_parent: true
+      prompt_template:
+        inline: "The arbiter did not accept. Verify each required action against the actual code and produce a corrected, evidence-backed action plan."
 ```
 
 Reviewer nodes may use different exact models when the user selected them;
 otherwise omit `model` and let workflow, agent, and parent configuration provide
 the defaults. The arbiter is `required: true` — its execution failure signals
 that the artifact could not be confidently accepted, while its successful
-business verdict must still be interpreted.
+business verdict must still be interpreted. On `ACCEPT` the conditioned
+`deep-dive` node is skipped and the workflow completes; on any other verdict
+it runs with the arbiter's findings as context, so a non-ACCEPT outcome can
+never silently terminalize the graph.
 
 ### 4. Diverge-Converge (Brainstorm)
 
@@ -480,7 +330,12 @@ Only nodes with `report_to_parent: true` produce intermediate parent
 checkpoints, and those reports are delivered at the next actionable wake
 boundary. Terminal workflow state also wakes the parent. Do not poll `status`
 merely to wait. When a report suggests the task decomposition was wrong, replan
-rather than letting the original graph run to completion.
+rather than letting the original graph run to completion. Note the terminal
+boundary: the runtime's mandatory-action guard only covers workflows that are
+still live, so a checkpoint that terminalizes its workflow delivers its
+verdict with no runtime enforcement — the Verdict Disposal Contract in the
+orchestration policy governs exactly that case (`extend` remains valid after
+a reporting leaf naturally completed the graph).
 
 ### Escalation: change approach after repeated failures
 
@@ -513,15 +368,20 @@ selection and never invent an identifier from a qualitative request.
 - Fast models for mechanical implementation — well-specified edits where speed and cost matter.
 - Diverse models in adversarial review — reduces single-model blind spots.
 
+The two-tier defaults in `dag.jsonc` implement this split mechanically:
+`required: true` nodes and `review`/`review-*` workers resolve to the
+`advanced` tier, every other node to `standard`. Prefer expressing the split
+through tier placement rather than per-node pins.
+
 ## Prompt Templates
 
-Templates are read-only prompt fragments under `.opencode/dag-prompts/*.md`. Reference them by ID; they are read on spawn. Available templates:
+Templates are read-only prompt fragments under `.opencode/dag-prompts/*.md`. Reference them by ID; they are read on spawn. Some templates declare required `{{variable}}` inputs — supply them via static `prompt_template.input` or `input_mapping`, because an unresolved placeholder fails the node loudly at spawn. Available templates:
 
-- `code-explore`: Search codebase structure, output file paths + responsibilities
-- `test-explore`: Search test structure, output coverage gaps
-- `config-explore`: Search config/deploy files, output config inventory
+- `code-explore` (requires `target`): Search codebase structure, output file paths + responsibilities
+- `test-explore` (requires `target`): Search test structure, output coverage gaps
+- `config-explore` (requires `target`): Search config/deploy files, output config inventory
 - `arch-gate`: Review architecture constraints and approve direction
-- `implement`: Implement per specification
+- `implement` (requires `spec`): Implement per specification
 - `verify`: Verify completeness and compatibility
 - `plan`: Synthesize findings into a structured plan
 - `review-arch`: Review from architecture perspective
@@ -529,6 +389,8 @@ Templates are read-only prompt fragments under `.opencode/dag-prompts/*.md`. Ref
 - `review-style`: Review from code style perspective
 - `patcher-assemble`: Assemble clean patch from completed work
 - `integration-test`: Run integration tests and report
+
+Templates without a required variable consume their upstream inputs through the structured context appended from `depends_on` outputs. The review templates additionally force an `unverified_claims` section, which a verification wave downstream can check against the actual code.
 
 For ad-hoc prompts, use `prompt_template: { inline: "...", input: {...} }`.
 Static `prompt_template.input` supplies literal, local template values; it does
