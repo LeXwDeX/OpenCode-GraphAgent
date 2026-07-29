@@ -75,16 +75,18 @@ export const Definitions = {
   diff_help: keybind("?", "Show more diff viewer shortcuts"),
 
   dag_open: keybind("none", "Open DAG inspector"),
-  dag_close: keybind("escape,q", "Close DAG inspector"),
+  dag_close: keybind("escape", "Close DAG inspector"),
   dag_enter: keybind("return", "Enter selected DAG node's session"),
-  dag_down: keybind("j,down", "Select next DAG node"),
-  dag_up: keybind("k,up", "Select previous DAG node"),
-  dag_next_workflow: keybind("l,right,tab", "Select next DAG workflow"),
-  dag_previous_workflow: keybind("h,left", "Select previous DAG workflow"),
-  dag_pause: keybind("p", "Pause selected DAG workflow"),
-  dag_resume: keybind("r", "Resume selected DAG workflow"),
-  dag_step: keybind("s", "Step selected DAG workflow (run one node)"),
-  dag_cancel: keybind("x", "Cancel selected DAG workflow"),
+  dag_down: keybind("down", "Select next DAG node"),
+  dag_up: keybind("up", "Select previous DAG node"),
+  dag_next_workflow: keybind("right", "Select next DAG workflow"),
+  dag_previous_workflow: keybind("left", "Select previous DAG workflow"),
+  // Control operations stay unbound by default and are reached through the
+  // command palette; the inspector advertises only cursor, enter and escape.
+  dag_pause: keybind("none", "Pause selected DAG workflow"),
+  dag_resume: keybind("none", "Resume selected DAG workflow"),
+  dag_step: keybind("none", "Step selected DAG workflow (run one node)"),
+  dag_cancel: keybind("none", "Cancel selected DAG workflow"),
 
   editor_open: keybind("<leader>e", "Open external editor"),
   theme_list: keybind("<leader>t", "List available themes"),
