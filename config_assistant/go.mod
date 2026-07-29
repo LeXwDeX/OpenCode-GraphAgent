@@ -1,4 +1,4 @@
-module github.com/opencode-dag/config_assistant
+module github.com/LeXwDeX/OpenCode-GraphAgent/config_assistant
 
 go 1.26.5
 

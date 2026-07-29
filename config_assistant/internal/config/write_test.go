@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/opencode-dag/config_assistant/internal/models"
+	"github.com/LeXwDeX/OpenCode-GraphAgent/config_assistant/internal/models"
 )
 
 func TestGenerateFromModelsSetsMainModel(t *testing.T) {
