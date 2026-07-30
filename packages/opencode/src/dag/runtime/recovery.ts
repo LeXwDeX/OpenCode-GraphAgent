@@ -19,16 +19,21 @@
 
 import { Effect, Clock } from "effect"
 import { Dag } from "../dag"
+import type { NodeConfig } from "../dag"
 import { Session } from "@/session/session"
 import { SessionID } from "@/session/schema"
 import type { DagStore } from "@opencode-ai/core/dag/store"
 import { isTransitionRejection } from "@opencode-ai/core/dag/core/types"
+import { reviewImplementationFingerprint } from "../review-lifecycle"
+import { resolveInputMapping } from "./eval"
+import { settleCapturedOutput } from "./capture"
+import type { CapturedSettlement } from "./capture"
 
 export function reconcileWorkflow(
   dagID: string,
   checkSessionStatus: (childSessionID: string) => Effect.Effect<"active" | "completed" | "failed" | "unknown", Error>,
   cancelSession?: (sessionID: string) => Effect.Effect<void, Error>,
-  workflowConfig?: { nodes: { id: string; output_schema?: Record<string, unknown> }[] } | undefined,
+  workflowConfig?: { nodes: Pick<NodeConfig, "id" | "output_schema" | "review" | "input_mapping">[] } | undefined,
 ): Effect.Effect<{ reconciled: number; ownershipLost: number }, Error, Dag.Service> {
   return Effect.gen(function* () {
     const dag = yield* Dag.Service
@@ -83,19 +88,15 @@ export function reconcileWorkflow(
       if (sessionStatus === "completed") {
         const nodeConfig = workflowConfig?.nodes.find((n) => n.id === node.id)
         if (nodeConfig?.output_schema) {
-          if (node.capturedOutput !== undefined && node.capturedOutput !== null) {
-            yield* settle(node.id, dag.nodeCompleted(dagID, node.id, node.capturedOutput))
-          } else {
-            yield* settle(
-              node.id,
-              dag.nodeFailed(
-                dagID,
-                node.id,
-                "output_schema declared but submit_result was never successfully called (recovered)",
-                "verdict_fail",
-              ),
-            )
-          }
+          // Same settlement decision as spawn's completion gate — recovery
+          // must not become a bypass of the review-result contract again (B1).
+          const settlement = recoveredSettlement(nodeConfig, nodes, node.capturedOutput)
+          yield* settle(
+            node.id,
+            settlement.kind === "complete"
+              ? dag.nodeCompleted(dagID, node.id, settlement.output)
+              : dag.nodeFailed(dagID, node.id, settlement.reason, "verdict_fail"),
+          )
         } else {
           yield* settle(node.id, dag.nodeCompleted(dagID, node.id, undefined))
         }
@@ -146,6 +147,31 @@ export function reconcileWorkflow(
 
     return { reconciled, ownershipLost }
   })
+}
+
+/**
+ * Recovery-side wrapper around the shared settlement decision
+ * (capture.ts settleCapturedOutput). Resolves the implementation fingerprint
+ * from durable sibling rows — the same source input_mapping reads from — then
+ * delegates. An unresolvable fingerprint fails conservatively: re-running the
+ * review is always safe; completing an unvalidated one is not.
+ *
+ * Known asymmetry vs the spawn path: loop.ts passes the fingerprint through
+ * sanitizeInput before spawning, this path reads the raw durable value. A
+ * fingerprint the sanitizer would rewrite can therefore only produce a
+ * spurious mismatch → forced re-run, never a false accept; typical hashes are
+ * untouched by the sanitizer.
+ */
+function recoveredSettlement(
+  nodeConfig: Pick<NodeConfig, "review" | "input_mapping">,
+  rows: readonly DagStore.NodeRow[],
+  captured: unknown,
+): CapturedSettlement {
+  if (nodeConfig.review?.phase !== "diff") return settleCapturedOutput(captured, undefined, " (recovered)")
+  const resolved = resolveInputMapping(nodeConfig.input_mapping, (nodeID) => rows.find((row) => row.id === nodeID)?.output)
+  const fingerprint = reviewImplementationFingerprint(nodeConfig, resolved)
+  if (!fingerprint) return { kind: "fail", reason: "review implementation fingerprint could not be resolved from durable state (recovered)" }
+  return settleCapturedOutput(captured, fingerprint, " (recovered)")
 }
 
 export function makeSessionStatusChecker(
