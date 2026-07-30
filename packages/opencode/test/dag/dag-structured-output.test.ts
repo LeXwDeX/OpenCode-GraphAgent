@@ -140,8 +140,13 @@ describe("evaluateCondition", () => {
     expect(evaluateCondition('check.output.status == "fail"', outputs)).toEqual({ ok: true, value: false })
   })
 
-  it("returns ok:true value:false when path is missing (comparison with undefined)", () => {
-    expect(evaluateCondition("missing.output.field > 0", {})).toEqual({ ok: true, value: false })
+  it("fails loudly when a numeric comparison's path is missing (silent skip was the worst failure mode)", () => {
+    const result = evaluateCondition("missing.output.field > 0", {})
+    expect(result.ok).toBe(false)
+  })
+
+  it("equality with a missing path still evaluates (undefined never equals a literal)", () => {
+    expect(evaluateCondition("missing.output.field == done", {})).toEqual({ ok: true, value: false })
   })
 })
 

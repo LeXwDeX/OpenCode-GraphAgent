@@ -73,7 +73,7 @@ export function validateReviewExecutionInput(
 }
 
 export function reviewImplementationFingerprint(
-  node: NodeConfig,
+  node: Pick<NodeConfig, "review" | "input_mapping">,
   resolvedMapping: Record<string, unknown>,
 ) {
   if (node.review?.phase !== "diff") return undefined
