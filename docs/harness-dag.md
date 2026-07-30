@@ -51,13 +51,19 @@ QA 覆盖六个维度：目标、范围、约束与假设、验收标准、证�
 }
 ```
 
-准入记录还包含 `protocol_version`、`brief_revision`、`qa_mode`、`verdict`、
-`state` 和 `fingerprint`。目标、范围、约束、假设或验收标准发生实质变化时，
-应增加 Brief 修订号、生成新指纹，并把旧准入置为 `INVALIDATED` 后重新问答。
+YAML 准入输入只包含 `brief_revision`、`qa_mode`、`verdict`、`brief`，以及
+WAIVED 所需的审计字段。不要在输入中提供 `protocol_version`、`state` 或
+`fingerprint`：工作流边界会设置协议版本，从 verdict 初始化状态，规范化 Brief
+后计算小写十六进制 SHA-256 指纹；只有成功启动后才把持久化状态转为
+`CONSUMED`。
 
-`action: start` 调用中，`mode` 和 `admission` 与 `config` 同级，而不是
-`config` 的子字段。指纹计算会裁剪目标和所有数组字符串、删除空项、对数组排序，
-按 Brief 的固定字段顺序序列化为紧凑 JSON，再计算小写十六进制 SHA-256。
+启动、扩展和 replan 的图配置都先写入 `.yaml` 或 `.yml` 文件，工具调用只传
+`action`、`spec_path` 和该动作所需的少量标识字段。启动文件中，`mode`、
+`admission` 与 `config` 同级。校验失败时保留并修改同一文件后重试，不要重新
+生成整段 tool-call 参数。
+
+目标、范围、约束、假设或验收标准发生实质变化时，应增加 Brief 修订号，
+使旧指纹失效并重新问答；新指纹仍由工作流边界生成。
 
 ## Verdict 与恢复路径
 
@@ -109,7 +115,7 @@ REJECT
 准入和 review 元数据；若显式声明了不完整的 diff review 元数据，引擎只产生
 非阻塞诊断。
 
-本能力扩展的是模型可调用的 `workflow` 工具配置。现有 HTTP DAG
+本能力扩展的是模型可调用的 `workflow` 工具文件输入。现有 HTTP DAG
 查询仍返回持久化工作流行和字符串化 `config`，HTTP 请求/响应 schema、
 SDK 的 DAG summary 类型以及 TUI re-export 均未改变，因此不需要重新生成
 JavaScript SDK。

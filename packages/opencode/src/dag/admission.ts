@@ -62,6 +62,16 @@ export const AdmissionRecord = Schema.Struct({
 })
 export type AdmissionRecord = typeof AdmissionRecord.Type
 
+export const AdmissionInput = Schema.Struct({
+  brief_revision: Schema.Number,
+  qa_mode: Schema.Literals(Modes),
+  verdict: Schema.Literals(Verdicts),
+  brief: RequirementBrief,
+  waiver_reason: Schema.optional(Schema.String),
+  acknowledged_risks: Schema.optional(StringArray),
+})
+export type AdmissionInput = typeof AdmissionInput.Type
+
 const Transitions = {
   UNASSESSED: ["QUESTIONING", "WAIVED"],
   QUESTIONING: ["READY", "NOT_READY", "WAIVED"],
@@ -102,6 +112,20 @@ export function fingerprintBrief(brief: RequirementBrief) {
     blocking_questions: normalizedStrings(brief.blocking_questions),
   }
   return new Bun.CryptoHasher("sha256").update(JSON.stringify(canonical)).digest("hex")
+}
+
+export function createAdmissionRecord(input: AdmissionInput): AdmissionRecord {
+  return {
+    protocol_version: 1,
+    brief_revision: input.brief_revision,
+    qa_mode: input.qa_mode,
+    verdict: input.verdict,
+    state: input.verdict,
+    fingerprint: fingerprintBrief(input.brief),
+    brief: input.brief,
+    ...(input.waiver_reason ? { waiver_reason: input.waiver_reason } : {}),
+    ...(input.acknowledged_risks ? { acknowledged_risks: input.acknowledged_risks } : {}),
+  }
 }
 
 export function validateAdmission(record: AdmissionRecord) {

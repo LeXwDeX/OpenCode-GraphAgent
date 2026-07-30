@@ -9,13 +9,17 @@ import { Question } from "@/question"
 import { Session } from "@/session/session"
 import { SessionID } from "@/session/schema"
 import type { NodeConfig, WorkflowConfig } from "@/dag/dag"
-import { AdmissionRecord, ExecutionMode } from "@/dag/admission"
+import { AdmissionInput, createAdmissionRecord, ExecutionMode } from "@/dag/admission"
 import { TerminalViolationError } from "@opencode-ai/core/dag/core/types"
+import { FSUtil } from "@opencode-ai/core/fs-util"
+import { assertExternalDirectoryEffect } from "./external-directory"
+import path from "node:path"
 
 const id = "workflow"
+const MAX_WORKFLOW_SPEC_BYTES = 1_000_000
 
 // ============================================================================
-// Schemas (flat Struct with action discriminator — matches codebase convention)
+// File schemas stay rich; tool-call parameters below stay shallow.
 // ============================================================================
 
 const NodeSchema = Schema.Struct({
@@ -78,18 +82,32 @@ const WorkflowGraphSchema = Schema.Struct({
   nodes: Schema.Array(NodeSchema).annotate({ description: "Node declarations" }),
 })
 
+const StartSpec = Schema.Struct({
+  title: Schema.optional(Schema.String),
+  mode: Schema.optional(ExecutionMode),
+  admission: Schema.optional(AdmissionInput),
+  config: WorkflowGraphSchema,
+})
+
+const ExtendSpec = Schema.Struct({
+  nodes: Schema.Array(NodeSchema),
+})
+
+const ReplanSpec = Schema.Struct({
+  fragment: WorkflowGraphSchema,
+})
+
+const decodeStartSpec = Schema.decodeUnknownEffect(StartSpec)
+const decodeExtendSpec = Schema.decodeUnknownEffect(ExtendSpec)
+const decodeReplanSpec = Schema.decodeUnknownEffect(ReplanSpec)
+
 export const Parameters = Schema.Struct({
   action: Schema.Literals(["start", "extend", "control", "status"]).annotate({ description: "start: create workflow; extend: add nodes; control: pause/resume/cancel/replan/step/complete; status: inspect durable workflow and node state" }),
-  config: Schema.optional(WorkflowGraphSchema).annotate({ description: "(start) Workflow graph definition" }),
-  mode: Schema.optional(ExecutionMode).annotate({ description: "(start) standard by default; deep requires completed parent-session admission QA" }),
-  admission: Schema.optional(AdmissionRecord).annotate({ description: "(start deep) Structured Requirement Brief and READY/WAIVED verdict" }),
+  spec_path: Schema.optional(Schema.String).annotate({ description: "(start/extend/control replan) Path to a YAML workflow spec. Relative paths resolve from the session directory" }),
   session_id: Schema.optional(Schema.String).annotate({ description: "(start) Parent session ID" }),
   project_id: Schema.optional(Schema.String).annotate({ description: "(start) Optional Project ID; must match the parent session project" }),
-  title: Schema.optional(Schema.String).annotate({ description: "(start) Workflow title" }),
   workflow_id: Schema.optional(Schema.String).annotate({ description: "(extend/control/status) Target workflow ID" }),
-  nodes: Schema.optional(Schema.Array(NodeSchema)).annotate({ description: "(extend) Nodes to add" }),
   operation: Schema.optional(Schema.Literals(["pause", "resume", "cancel", "replan", "step", "complete"])).annotate({ description: "(control) Operation to perform" }),
-  fragment: Schema.optional(WorkflowGraphSchema).annotate({ description: "(control replan) Replan fragment with node definitions" }),
 })
 
 // ============================================================================
@@ -165,15 +183,19 @@ export const WorkflowTool = Tool.define<
               }
             }
             case "start": {
-              if (!params.config) return yield* Effect.die(new Error("start requires 'config'"))
               const sessionID = SessionID.make(params.session_id ?? ctx.sessionID)
               const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
               if (params.project_id && params.project_id !== session.projectID) {
                 return yield* Effect.die(new Error("project_id must match the parent session project"))
               }
+              const specFile = yield* readWorkflowSpec(params.spec_path, session.directory, ctx).pipe(Effect.orDie)
+              const spec = yield* decodeStartSpec(specFile.value).pipe(
+                Effect.mapError((error) => new Error(`Invalid workflow spec ${specFile.path}: ${String(error)}`)),
+                Effect.orDie,
+              )
               const missingModels = yield* findNodesWithoutModel({
-                nodes: params.config.nodes,
-                defaults: params.config.node_defaults,
+                nodes: spec.config.nodes,
+                defaults: spec.config.node_defaults,
                 directory: session.directory,
                 parent: session.model,
                 agents,
@@ -207,23 +229,29 @@ export const WorkflowTool = Tool.define<
               const dagID = yield* dag.create({
                 projectID: session.projectID,
                 sessionID,
-                title: params.title ?? params.config.name,
+                title: spec.title ?? spec.config.name,
                 config: {
-                  ...params.config,
-                  mode: params.mode ?? "standard",
-                  ...(params.admission ? { admission: params.admission } : {}),
+                  ...spec.config,
+                  mode: spec.mode ?? "standard",
+                  ...(spec.admission ? { admission: createAdmissionRecord(spec.admission) } : {}),
                 } as WorkflowConfig,
               }).pipe(Effect.orDie)
-              const mode = params.mode ?? "standard"
+              const mode = spec.mode ?? "standard"
               return {
-                title: `Workflow started: ${params.config.name}`,
-                output: `<workflow id="${dagID}" state="running" mode="${mode}">\n${params.config.nodes.length} nodes registered.\nDo not poll this workflow. It runs asynchronously and will wake the parent session when attention is required.\n</workflow>`,
+                title: `Workflow started: ${spec.config.name}`,
+                output: `<workflow id="${dagID}" state="running" mode="${mode}">\n${spec.config.nodes.length} nodes registered.\nDo not poll this workflow. It runs asynchronously and will wake the parent session when attention is required.\n</workflow>`,
                 metadata: { workflowId: dagID } as Metadata,
               }
             }
             case "extend": {
-              if (!params.workflow_id || !params.nodes) return yield* Effect.die(new Error("extend requires 'workflow_id' and 'nodes'"))
-              const r = yield* dag.extend(params.workflow_id, params.nodes as NodeConfig[]).pipe(Effect.orDie)
+              if (!params.workflow_id) return yield* Effect.die(new Error("extend requires 'workflow_id'"))
+              const session = yield* sessions.get(SessionID.make(ctx.sessionID)).pipe(Effect.orDie)
+              const specFile = yield* readWorkflowSpec(params.spec_path, session.directory, ctx).pipe(Effect.orDie)
+              const spec = yield* decodeExtendSpec(specFile.value).pipe(
+                Effect.mapError((error) => new Error(`Invalid workflow spec ${specFile.path}: ${String(error)}`)),
+                Effect.orDie,
+              )
+              const r = yield* dag.extend(params.workflow_id, spec.nodes as NodeConfig[]).pipe(Effect.orDie)
               return {
                 title: `Workflow extended: ${r.add.length} nodes added`,
                 output: `<workflow id="${params.workflow_id}" action="extend">\nAdded: ${r.add.join(", ")}\n</workflow>`,
@@ -233,14 +261,14 @@ export const WorkflowTool = Tool.define<
             case "control": {
               if (!params.workflow_id || !params.operation) {
                 return yield* Effect.die(new Error(
-                  `control requires 'workflow_id' and 'operation' (got workflow_id=${params.workflow_id ?? "<missing>"}, operation=${params.operation ?? "<missing>"}). Example: { action: "control", workflow_id: "dag_...", operation: "pause" }. On a cancel/replan intent, issue pause FIRST — it needs no fragment and freezes scheduling instantly while you compose the replan.`,
+                  `control requires 'workflow_id' and 'operation' (got workflow_id=${params.workflow_id ?? "<missing>"}, operation=${params.operation ?? "<missing>"}). Example: { action: "control", workflow_id: "dag_...", operation: "pause" }. On a cancel/replan intent, issue pause FIRST — it needs no spec file and freezes scheduling instantly while you compose the replan.`,
                 ))
               }
               const wfId = params.workflow_id
               switch (params.operation) {
                 case "pause":
                   yield* dag.pause(wfId).pipe(Effect.orDie)
-                  return { title: "Workflow paused", output: `<workflow id="${wfId}" state="paused"/>\nNote: pause stops new node spawns only — nodes already running continue to completion. To stop a running node, submit a replan fragment marking it restart: true or cancel: true (replan is valid while paused).`, metadata: { workflowId: wfId } as Metadata }
+                  return { title: "Workflow paused", output: `<workflow id="${wfId}" state="paused"/>\nNote: pause stops new node spawns only — nodes already running continue to completion. To stop a running node, submit a replan spec marking it restart: true or cancel: true (replan is valid while paused).`, metadata: { workflowId: wfId } as Metadata }
                 case "resume":
                   yield* dag.resume(wfId).pipe(Effect.orDie)
                   return { title: "Workflow resumed", output: `<workflow id="${wfId}" state="running"/>`, metadata: { workflowId: wfId } as Metadata }
@@ -251,12 +279,13 @@ export const WorkflowTool = Tool.define<
                   yield* dag.complete(wfId).pipe(Effect.orDie)
                   return { title: "Workflow completed (early)", output: `<workflow id="${wfId}" state="completed"/>`, metadata: { workflowId: wfId } as Metadata }
                 case "replan": {
-                  if (!params.fragment) {
-                    return yield* Effect.die(new Error(
-                      "replan operation requires 'fragment' (a WorkflowGraphSchema with the node definitions to apply). If the fragment is not composed yet, issue control(pause) first so the graph cannot terminalize while you write it.",
-                    ))
-                  }
-                  const r = yield* dag.replan(wfId, { nodes: params.fragment.nodes as NodeConfig[] }).pipe(
+                  const session = yield* sessions.get(SessionID.make(ctx.sessionID)).pipe(Effect.orDie)
+                  const specFile = yield* readWorkflowSpec(params.spec_path, session.directory, ctx).pipe(Effect.orDie)
+                  const spec = yield* decodeReplanSpec(specFile.value).pipe(
+                    Effect.mapError((error) => new Error(`Invalid workflow spec ${specFile.path}: ${String(error)}`)),
+                    Effect.orDie,
+                  )
+                  const r = yield* dag.replan(wfId, { nodes: spec.fragment.nodes as NodeConfig[] }).pipe(
                     // The graph raced to terminal while the fragment was being
                     // composed (the pause-first protocol was skipped). Surface
                     // the recovery options instead of a bare iron-law rejection.
@@ -264,7 +293,7 @@ export const WorkflowTool = Tool.define<
                       (err): err is TerminalViolationError => err instanceof TerminalViolationError,
                       (err) =>
                         Effect.die(new Error(
-                          `${err.message}. The workflow reached a terminal status before the replan arrived — terminal workflows are immutable. Recover by starting a new workflow with the updated node definitions (action: start), or extend if a reporting leaf checkpoint naturally completed the graph. Next time issue control(pause) BEFORE composing the fragment.`,
+                          `${err.message}. The workflow reached a terminal status before the replan arrived — terminal workflows are immutable. Recover by writing a new start spec with the updated node definitions and passing its spec_path, or extend if a reporting leaf checkpoint naturally completed the graph. Next time issue control(pause) BEFORE composing the spec file.`,
                         )),
                     ),
                     Effect.orDie,
@@ -290,6 +319,48 @@ export const WorkflowTool = Tool.define<
     } satisfies Tool.DefWithoutID<typeof Parameters, Metadata>
   }),
 )
+
+function readWorkflowSpec(specPath: string | undefined, directory: string, ctx: Tool.Context) {
+  return Effect.gen(function* () {
+    if (!specPath) {
+      return yield* Effect.fail(new Error(
+        "Workflow configuration requires 'spec_path'. Write the YAML spec to a file, then retry with its path.",
+      ))
+    }
+    const filepath = path.isAbsolute(specPath) ? path.normalize(specPath) : path.resolve(directory, specPath)
+    if (![".yaml", ".yml"].includes(path.extname(filepath).toLowerCase())) {
+      return yield* Effect.fail(new Error(`Workflow spec must be a .yaml or .yml file: ${filepath}`))
+    }
+    if (!FSUtil.contains(directory, filepath)) {
+      yield* assertExternalDirectoryEffect(ctx, filepath, {
+        bypass: Boolean(ctx.extra?.["bypassCwdCheck"]),
+      })
+    }
+
+    const file = Bun.file(filepath)
+    if (!(yield* Effect.promise(() => file.exists()))) {
+      return yield* Effect.fail(new Error(`Workflow spec not found: ${filepath}`))
+    }
+    if (file.size > MAX_WORKFLOW_SPEC_BYTES) {
+      return yield* Effect.fail(new Error(
+        `Workflow spec is too large: ${file.size} bytes exceeds ${MAX_WORKFLOW_SPEC_BYTES}`,
+      ))
+    }
+    const content = yield* Effect.tryPromise({
+      try: () => file.text(),
+      catch: (error) => new Error(`Failed to read workflow spec ${filepath}: ${String(error)}`),
+    })
+    const value = yield* Effect.try({
+      try: () => Bun.YAML.parse(content),
+      catch: (error) => workflowSpecParseError(filepath, error),
+    })
+    return { path: filepath, value }
+  })
+}
+
+function workflowSpecParseError(filepath: string, error: unknown) {
+  return new Error(`Invalid workflow YAML ${filepath}: ${error instanceof Error ? error.message : String(error)}`)
+}
 
 function findNodesWithoutModel(input: {
   nodes: ReadonlyArray<Schema.Schema.Type<typeof NodeSchema>>

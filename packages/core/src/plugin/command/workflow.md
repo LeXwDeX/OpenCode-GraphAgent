@@ -34,12 +34,47 @@ as independent workstreams, cross-domain uncertainty, high blast radius,
 conflicting constraints, evidence gathering, or multiple verification
 perspectives.
 
-Before a deep start, qualify the request interactively in the parent session
-and pass `mode: deep` plus a versioned `READY` or informed `WAIVED` admission
-record beside `config` in the `action: start` tool call. Do not put admission
-QA inside the graph: its answers define the graph. Use the orchestration policy
-below for QA modes, round budgets, verdict recovery, revision invalidation, and
-waiver audit fields.
+Before any graph-carrying action (`start`, `extend`, or `control(replan)`),
+write its configuration to a `.yaml` or `.yml` file, then pass only
+`spec_path` beside the shallow action fields. Never inline graph nodes,
+admission, or replan fragments in the tool call. Keep the file after a
+validation failure, edit only the reported problem, and retry the same path.
+
+Before a deep start, qualify the request interactively in the parent session.
+The start YAML places `mode: deep`, a versioned `READY` or informed `WAIVED`
+admission input, and `config` at the same level. The admission input contains
+`brief_revision`, `qa_mode`, `verdict`, `brief`, and waiver audit fields when
+applicable; the workflow boundary owns `protocol_version`, `state`, and
+`fingerprint`. Do not put admission QA inside the graph: its answers define the
+graph. Use the orchestration policy below for QA modes, round budgets, verdict
+recovery, revision invalidation, and waiver audit fields.
+
+A deep start spec has this outer shape:
+
+```yaml
+title: Deep review
+mode: deep
+admission:
+  brief_revision: 1
+  qa_mode: STANDARD
+  verdict: READY
+  brief:
+    goal: Review the requested implementation
+    scope:
+      in: [requested modules]
+      out: [unrelated modules]
+    constraints: [read-only reviewers]
+    assumptions: [the working tree is the review target]
+    acceptance_criteria: [all material findings are evidence-backed]
+    evidence_required: [code references, relevant test results]
+    risks: [missed cross-module regressions]
+    review_plan: [parallel review, claim verification, final arbitration]
+    open_questions: []
+    blocking_questions: []
+config:
+  name: deep-review
+  nodes: []
+```
 
 ## Orchestration Lifecycle
 
@@ -92,14 +127,16 @@ the workflow uncreated so the user can configure a model and retry.
 
 ## Collaboration Patterns
 
-Four structural patterns cover the common cases. Real workflows often combine them.
+Four structural patterns cover the common cases. Real workflows often combine
+them. Every YAML block below is workflow spec file content. Save the selected
+shape to a `.yaml` file, then call the tool with
+`{ action: "start", spec_path: "<that-file>.yaml" }`.
 
 ### 1. Staged Pipeline with Gate
 
 Sequential phases where each depends on the previous. Insert a gate node between phases to block downstream execution until quality is confirmed.
 
 ```yaml
-action: start
 config:
   name: staged-gate
   nodes:
@@ -148,7 +185,6 @@ the parent an actionable replan or stop decision.
 One preparatory node feeds N independent worker nodes, which fan back into a single assembler.
 
 ```yaml
-action: start
 config:
   name: parallel-fan-out
   nodes:
@@ -191,7 +227,6 @@ config:
 Multiple reviewer nodes with different perspectives examine the same artifact. A final arbiter synthesizes their verdicts. The arbiter must not be a silent terminal leaf: gate an in-graph continuation node on its verdict (shown below), or dispose of the reported verdict at the wake boundary per the Verdict Disposal Contract.
 
 ```yaml
-action: start
 config:
   name: adversarial-review
   nodes:
@@ -270,7 +305,6 @@ never silently terminalize the graph.
 Multiple independent generators produce candidate solutions; a converger selects and refines.
 
 ```yaml
-action: start
 config:
   name: diverge-converge
   nodes:
@@ -381,7 +415,9 @@ For ad-hoc prompts, use `prompt_template: { inline: "...", input: {...} }`.
 Static `prompt_template.input` supplies literal, local template values; it does
 not read upstream node output. Inline templates interpolate those static values
 and direct dependency variables. Use `input_mapping` when an upstream output
-needs a stable variable name or field selection.
+needs a stable variable name or field selection. When a mapped placeholder
+contains an object or array, interpolation renders it as indented JSON; it must
+never appear as `[object Object]`.
 
 ## Budget Declaration
 
@@ -415,17 +451,19 @@ All nodes share the same workspace. Write conflicts are an orchestration concern
 
 ### Actions
 
-**start** — Create a workflow from a YAML-declared graph. Pass the graph as
-`{ action: "start", config: { name, nodes, ...defaultsAndBudgets } }`; `nodes`
-at the tool-call top level is only for `extend`, not `start`. Returns the
-workflow ID. Nodes declare `depends_on` (node IDs); layers and execution order
-are computed automatically.
+**start** — Create a workflow from a YAML spec with `config` and optional
+`title`, `mode`, and admission input at the file root. Write the file first,
+then call `{ action: "start", spec_path: ".opencode/workflows/name.yaml" }`.
+Returns the workflow ID. Nodes declare `depends_on` (node IDs); layers and
+execution order are computed automatically.
 
 **extend** — Add nodes to a running workflow. Existing nodes are unaffected;
 new nodes are immediately eligible for scheduling if their dependencies are
 met. It also accepts a genuinely additive wave after a reporting leaf
 checkpoint naturally completed the current graph; an early
-`control(complete)` workflow remains terminal.
+`control(complete)` workflow remains terminal. Put the new nodes under a
+file-root `nodes` array, then call
+`{ action: "extend", workflow_id: "dag_...", spec_path: "extend.yaml" }`.
 
 **status** — Read the durable state of one workflow and all of its nodes. Pass `workflow_id`. Use it when the user explicitly asks for current state or once before a decision that requires fresh state, such as replan/control. Do not poll a running workflow merely to wait: node reports and terminal outcomes wake the parent session automatically.
 
@@ -433,7 +471,7 @@ checkpoint naturally completed the current graph; an early
 - `pause` — let running nodes finish, don't spawn new ones (pause does NOT stop nodes that are already running). On a cancel/replan intent, always pause FIRST: it needs no fragment and freezes scheduling while you compose the replan, so the graph cannot terminalize under you.
 - `resume` — resume scheduling
 - `cancel` — cancel the entire workflow
-- `replan` — submit a YAML fragment; running nodes can be `restart: true` or `cancel: true`; pending nodes absent from the fragment are cancelled. Valid while paused — the pause → compose fragment → replan → resume sequence is the safe path.
+- `replan` — write a YAML file with a file-root `fragment` object containing the graph fields and node definitions, then pass its `spec_path`; running nodes can be `restart: true` or `cancel: true`; pending nodes absent from the fragment are cancelled. Valid while paused — the pause → compose file → replan → resume sequence is the safe path.
 - `complete` — early-complete: remaining pending nodes are skipped (non-violation)
 - `step` — advance exactly one ready node (the first by node ID lexicographic order), then wait. Use for controlled debugging or staged verification of a critical path. Unlike `pause`, which freezes all scheduling, `step` advances one node and re-waits. A second `step` while the stepped node is still running is rejected. Use `resume` to return to full-speed scheduling. Nodes are selected in lexicographic ID order for determinism.
 

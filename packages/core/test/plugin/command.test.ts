@@ -281,11 +281,12 @@ describe("CommandPlugin.Plugin", () => {
       expect(CommandPlugin.OrchestrationPolicyContent).toContain("invalidate the prior fingerprint")
       expect(CommandPlugin.OrchestrationPolicyContent).toContain("SHA-256 hash")
       expect(CommandPlugin.WorkflowFactsContent).toContain(
-        "pass `mode: deep` plus a versioned `READY` or informed `WAIVED` admission",
+        "The start YAML places `mode: deep`, a versioned `READY` or informed `WAIVED`",
       )
       expect(CommandPlugin.WorkflowFactsContent).toContain(
-        "beside `config` in the `action: start` tool call",
+        "the workflow boundary owns `protocol_version`, `state`, and\n`fingerprint`",
       )
+      expect(CommandPlugin.WorkflowFactsContent).toContain("pass only\n`spec_path` beside the shallow action fields")
       expect(CommandPlugin.WorkflowFactsContent).not.toContain("`config.mode`")
     }),
   )
@@ -316,7 +317,8 @@ describe("CommandPlugin.Plugin", () => {
 
       expect(graphExamples.length).toBeGreaterThan(0)
       for (const example of graphExamples) {
-        expect(example).toContain("action: start\nconfig:")
+        expect(example).toMatch(/^config:/m)
+        expect(example).not.toMatch(/^action:/m)
         expect(example).toMatch(/\n  nodes:/)
         expect(example).not.toMatch(/^nodes:/m)
         expect(example.match(/^\s+- id:/gm)?.length).toBe(example.match(/^ {6}name:/gm)?.length)
@@ -328,6 +330,7 @@ describe("CommandPlugin.Plugin", () => {
       expect(CommandPlugin.WorkflowFactsContent).not.toContain('input: { findings: "from explore" }')
       expect(CommandPlugin.WorkflowFactsContent).not.toContain("Gate failure cancels the workflow automatically")
       expect(CommandPlugin.WorkflowFactsContent).toContain("Static `prompt_template.input`")
+      expect(CommandPlugin.WorkflowFactsContent).toContain("it must\nnever appear as `[object Object]`")
       expect(CommandPlugin.WorkflowFactsContent).toContain(
         "Workflow definitions MUST NOT specify `node.model` or\n`config.node_defaults.model`",
       )

@@ -125,25 +125,26 @@ Maintain a versioned Requirement Brief with this structure:
 ```
 
 Before start, show a concise brief summary and verdict:
-`READY | NOT_READY | WAIVED`, plus QA mode, brief revision, fingerprint, and
-remaining blockers. `READY` requires a non-empty goal, scope boundaries,
+`READY | NOT_READY | WAIVED`, plus QA mode, brief revision, and remaining
+blockers. `READY` requires a non-empty goal, scope boundaries,
 acceptance criteria, evidence obligations, review plan, and no blocking
 questions. For `NOT_READY`, remain in the parent conversation and offer:
 continue QA, reduce scope, use `standard`, or explicitly waive. A `WAIVED`
 start is informed only when both `waiver_reason` and `acknowledged_risks` are
 non-empty; preserve them for audit.
 
-Compute `fingerprint` exactly as the workflow boundary does: trim `goal`; for
-every array in the Brief, trim strings, remove blanks, and sort them; preserve
-the documented key order; then SHA-256 hash the compact JSON object and encode
-it as lowercase hexadecimal. Use normal local calculation tools rather than
-inventing a digest.
+Do not supply `protocol_version`, `state`, or `fingerprint` in the YAML
+admission input. Those are durable audit fields owned by the workflow boundary:
+it sets protocol version 1, initializes state from the verdict, normalizes the
+Brief for fingerprint computation, and computes the lowercase hexadecimal
+SHA-256 hash. A successful deep start alone transitions the durable record to
+`CONSUMED`.
 
 Material changes to goal, scope, constraints, assumptions, or acceptance
 criteria create a new brief revision, invalidate the prior fingerprint, and
-return admission to questioning. Only a successful deep workflow start consumes
-a `READY` or `WAIVED` record. Do not replay QA from a consumed record after
-recovery.
+return admission to questioning. The workflow boundary generates the
+replacement fingerprint from the revised Brief. Do not replay QA from a
+consumed record after recovery.
 
 ## Role Resolution
 

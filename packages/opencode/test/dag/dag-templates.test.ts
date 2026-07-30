@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test"
 import { Effect } from "effect"
 import { sanitize, sanitizeInput } from "@/dag/templates/sanitize"
-import { resolveTemplate } from "@/dag/templates/resolve"
+import { renderTemplate, resolveTemplate } from "@/dag/templates/resolve"
 import * as os from "node:os"
 import * as path from "node:path"
 import * as fs from "node:fs/promises"
@@ -145,6 +145,26 @@ describe("resolveTemplate", () => {
     )
     const result = await Effect.runPromise(program)
     expect(result).toBe("Hello World!")
+  })
+
+  it("serializes structured dynamic input instead of emitting object coercion text", async () => {
+    const result = await Effect.runPromise(
+      renderTemplate(
+        { inline: "仲裁结果：{{arbitration}}" },
+        "/tmp",
+        {
+          arbitration: {
+            verdict: "REJECT",
+            findings: [{ severity: "HIGH", summary: "Missing validation" }],
+            required_actions: ["Validate input"],
+          },
+        },
+      ),
+    )
+
+    expect(result.text).toContain('"verdict": "REJECT"')
+    expect(result.text).toContain('"severity": "HIGH"')
+    expect(result.text).not.toContain("[object Object]")
   })
 
   it("resolves inline with sanitized input", async () => {
