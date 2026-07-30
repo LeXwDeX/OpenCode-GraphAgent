@@ -3,7 +3,8 @@
 # ----------------------------------------------------------------------------
 # Purpose : Run unit + Playwright e2e tests across Linux & Windows
 # Trigger : Push to `main`/`dev`, PRs targeting `main`, manual dispatch
-# Jobs    : unit  — `bun turbo test` on linux only (windows dropped — see
+# Jobs    : unit  — `bun turbo test` + config_assistant Go tests on linux
+#                    only (windows dropped — see
 #                    unit-tests matrix comment; free windows-latest runners
 #                    can't fit the suite in a reasonable CI budget)
 #           e2e   — Playwright chromium on linux + windows (matrix)
@@ -68,6 +69,13 @@ jobs:
         with:
           node-version: "24"
 
+      - name: Setup Go
+        if: runner.os == 'Linux'
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: config_assistant/go.mod
+          cache-dependency-path: config_assistant/go.sum
+
       - name: Setup Bun
         uses: ./.github/actions/setup-bun
         with:
@@ -108,6 +116,11 @@ jobs:
         run: GITHUB_ACTIONS=false bun turbo test
         env:
           OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER: ${{ runner.os == 'Windows' && 'true' || 'false' }}
+
+      - name: Run config assistant tests
+        if: runner.os == 'Linux'
+        working-directory: config_assistant
+        run: go test ./...
 
       - name: Check generated client
         if: runner.os == 'Linux'

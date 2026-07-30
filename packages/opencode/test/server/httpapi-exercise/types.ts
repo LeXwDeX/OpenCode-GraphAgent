@@ -1,10 +1,8 @@
 import type { Duration, Effect } from "effect"
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
-import type { Config } from "../../../src/config/config"
 import type { Project } from "../../../src/project/project"
 import type { Worktree } from "../../../src/worktree"
-import type { MessageV2 } from "../../../src/session/message-v2"
 import type { SessionID } from "../../../src/session/schema"
 export const OpenApiMethods = ["get", "post", "put", "delete", "patch"] as const
 export const Methods = ["GET", "POST", "PUT", "DELETE", "PATCH"] as const
@@ -67,6 +65,8 @@ export type ScenarioContext = {
   tuiRequest: (request: { path: string; body: unknown }) => Effect.Effect<void>
   /** Create a DAG workflow owned by sessionID with the given node configs. Returns the dagID. */
   dag: (input: { sessionID: SessionID; title?: string; nodes: DagNodeSeed[] }) => Effect.Effect<DagWorkflowInfo>
+  /** Create a DAG workflow under a different project in the shared database. */
+  foreignDag: (input: { title?: string; nodes: DagNodeSeed[] }) => Effect.Effect<DagWorkflowInfo>
 }
 
 /** Scenario context after `.seeded(...)`; `state` preserves the seed return type in the DSL. */

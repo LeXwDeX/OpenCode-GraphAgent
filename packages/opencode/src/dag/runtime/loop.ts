@@ -16,6 +16,7 @@ import {
   reviewContractForNode,
   validateReviewExecutionInput,
   reviewEvidenceKeys,
+  unresolvedReviewOutcomes,
 } from "../review-lifecycle"
 import { Agent } from "@/agent/agent"
 import { Session } from "@/session/session"
@@ -252,7 +253,8 @@ export const layer = Layer.effect(
           // cancellation handler can reach this point before WorkflowReplanned
           // rebuilds the in-memory graph. Durable active nodes prove that the
           // apparent completion belongs to an obsolete graph generation.
-          const hasUnseenActiveNode = (yield* store.getNodes(dagID)).some(
+          const nodes = yield* store.getNodes(dagID)
+          const hasUnseenActiveNode = nodes.some(
             (node) => !isNodeTerminalStatus(node.status as never) && !entry.runtime.containsNode(node.id),
           )
           if (hasUnseenActiveNode) return
@@ -263,6 +265,13 @@ export const layer = Layer.effect(
           // terminal status attributes the outcome correctly (P2-1).
           if (entry.runtime.hasRequiredFailure()) {
             yield* dag.fail(dagID, `required node(s) failed: ${entry.runtime.getRequiredFailures().join(", ")}`)
+            return
+          }
+          const unresolvedReviews = entry.config
+            ? unresolvedReviewOutcomes(entry.config, nodes)
+            : []
+          if (unresolvedReviews.length > 0) {
+            yield* dag.fail(dagID, `unresolved review outcome(s): ${unresolvedReviews.join(", ")}`)
             return
           }
           yield* dag.complete(dagID)

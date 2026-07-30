@@ -561,6 +561,104 @@ describe("DagLoop atomic wake integration", () => {
     ),
   )
 
+  integration.live("rejects early completion while a deep diff review is unresolved", () =>
+    runWakeTest(({ dag, store, childPrompts }) =>
+      Effect.gen(function* () {
+        const brief = {
+          goal: "Keep explicit completion behind the deep review gate",
+          scope: { in: ["DAG completion"], out: ["standard workflow semantics"] },
+          constraints: ["review rejection cannot become success"],
+          assumptions: ["the review graph is valid"],
+          acceptance_criteria: ["complete rejects unresolved reviews"],
+          evidence_required: ["integration test"],
+          risks: ["manual completion bypass"],
+          review_plan: ["verify the final ACCEPT gate"],
+          open_questions: [],
+          blocking_questions: [],
+        }
+        const dagID = yield* dag.create({
+          projectID: "project-1",
+          sessionID: "ses_parent",
+          title: "Deep early completion",
+          config: {
+            name: "deep-early-completion",
+            mode: "deep",
+            admission: {
+              protocol_version: 1,
+              brief_revision: 1,
+              qa_mode: "STANDARD",
+              verdict: "READY",
+              state: "READY",
+              fingerprint: fingerprintBrief(brief),
+              brief,
+            },
+            nodes: [
+              {
+                ...node("implement"),
+                output_schema: {
+                  type: "object",
+                  properties: {
+                    diff: { type: "string" },
+                    fingerprint: { type: "string" },
+                  },
+                  required: ["diff", "fingerprint"],
+                },
+              },
+              {
+                ...node("verify", ["implement"]),
+                output_schema: {
+                  type: "object",
+                  properties: { verdict: { enum: ["PASS", "FAIL"] } },
+                  required: ["verdict"],
+                },
+              },
+              {
+                ...node("review-diff", ["verify"]),
+                worker_type: "review",
+                review: {
+                  phase: "diff",
+                  implementation_node_id: "implement",
+                  verification_node_id: "verify",
+                },
+                input_mapping: {
+                  diff: "implement.output.diff",
+                  implementation_fingerprint: "implement.output.fingerprint",
+                  verification: "verify.output",
+                },
+                condition: 'verify.output.verdict == "PASS"',
+                output_schema: {
+                  type: "object",
+                  properties: {
+                    verdict: { enum: ["ACCEPT", "REJECT"] },
+                    implementation_fingerprint: { type: "string" },
+                  },
+                  required: ["verdict", "implementation_fingerprint"],
+                },
+              },
+              {
+                ...node("final-audit", ["review-diff"]),
+                worker_type: "audit",
+                input_mapping: { review: "review-diff.output" },
+                condition: 'review-diff.output.verdict == "ACCEPT"',
+              },
+            ],
+          },
+        })
+
+        yield* takeWithin(childPrompts, "implementation did not start")
+        const completion = yield* dag.complete(dagID).pipe(
+          Effect.as(undefined),
+          Effect.catch((error) => Effect.succeed(error)),
+        )
+        expect(completion).toBeInstanceOf(Error)
+        if (!(completion instanceof Error)) throw new Error("deep completion unexpectedly succeeded")
+        expect(completion.message).toContain("unresolved review outcome")
+        expect((yield* store.getWorkflow(dagID))?.status).toBe("running")
+        expect((yield* store.getNode(dagID, "review-diff"))?.status).toBe("pending")
+      }),
+    ),
+  )
+
   integration.live("keeps a completed non-reporting leaf workflow terminal", () =>
     runWakeTest(({ dag, store, childPrompts }) =>
       Effect.gen(function* () {
@@ -940,6 +1038,151 @@ describe("DagLoop atomic wake integration", () => {
                   wake_eligible: false,
                   wake_reported: false,
                   seq: 1,
+                },
+              ]).run()
+            }),
+          ).pipe(Effect.orDie),
+      ),
+    )
+  })
+
+  it("fails a recovered deep workflow when verification skips every diff review", async () => {
+    await Effect.runPromise(
+      runWakeTest(
+        ({ store, parentPrompts }) =>
+          Effect.gen(function* () {
+            const workflow = yield* pollWithTimeout(
+              store.getWorkflow("dag_recovered_review_rejection").pipe(
+                Effect.map((row) => row?.status === "failed" ? row : undefined),
+              ),
+              "recovered workflow without an accepted review did not fail",
+            )
+            expect((yield* store.getNode(workflow.id, "review-diff"))?.status).toBe("skipped")
+            expect((yield* store.getNode(workflow.id, "final-audit"))?.status).toBe("skipped")
+
+            const parent = yield* takeWithin(parentPrompts, "review rejection failure did not wake the parent")
+            expect(promptText(parent.input)).toContain(
+              '[DAG Workflow failed] Workflow "Recovered review rejection" has reached terminal status.',
+            )
+            yield* Deferred.succeed(parent.release, "success")
+          }),
+        ({ database }) =>
+          database.db.transaction((tx) =>
+            Effect.gen(function* () {
+              const nodes = [
+                {
+                  ...node("implement"),
+                  output_schema: {
+                    type: "object",
+                    properties: {
+                      diff: { type: "string" },
+                      fingerprint: { type: "string" },
+                    },
+                    required: ["diff", "fingerprint"],
+                  },
+                },
+                {
+                  ...node("verify", ["implement"]),
+                  output_schema: {
+                    type: "object",
+                    properties: { verdict: { enum: ["PASS", "FAIL"] } },
+                    required: ["verdict"],
+                  },
+                },
+                {
+                  ...node("review-diff", ["verify"]),
+                  worker_type: "review",
+                  review: {
+                    phase: "diff" as const,
+                    implementation_node_id: "implement",
+                    verification_node_id: "verify",
+                  },
+                  input_mapping: {
+                    diff: "implement.output.diff",
+                    implementation_fingerprint: "implement.output.fingerprint",
+                    verification: "verify.output",
+                  },
+                  condition: 'verify.output.verdict == "PASS"',
+                  output_schema: {
+                    type: "object",
+                    properties: {
+                      verdict: { enum: ["ACCEPT", "REJECT"] },
+                      implementation_fingerprint: { type: "string" },
+                    },
+                    required: ["verdict", "implementation_fingerprint"],
+                  },
+                },
+                {
+                  ...node("final-audit", ["review-diff"]),
+                  worker_type: "audit",
+                  input_mapping: { review: "review-diff.output" },
+                  condition: 'review-diff.output.verdict == "ACCEPT"',
+                },
+              ]
+              yield* tx.insert(WorkflowTable).values({
+                id: "dag_recovered_review_rejection",
+                project_id: "project-1" as never,
+                session_id: "ses_parent" as never,
+                title: "Recovered review rejection",
+                status: "running",
+                config: JSON.stringify({
+                  name: "dag_recovered_review_rejection",
+                  mode: "deep",
+                  nodes,
+                }),
+                seq: 10,
+                wake_reported: false,
+              }).run()
+              yield* tx.insert(WorkflowNodeTable).values([
+                {
+                  id: "implement",
+                  workflow_id: "dag_recovered_review_rejection",
+                  name: "implement",
+                  worker_type: "build",
+                  status: "completed",
+                  required: true,
+                  depends_on: [],
+                  output: { diff: "diff --git a/a b/a", fingerprint: "fp-1" },
+                  wake_eligible: false,
+                  wake_reported: true,
+                  seq: 6,
+                },
+                {
+                  id: "verify",
+                  workflow_id: "dag_recovered_review_rejection",
+                  name: "verify",
+                  worker_type: "build",
+                  status: "completed",
+                  required: true,
+                  depends_on: ["implement"],
+                  output: { verdict: "FAIL" },
+                  wake_eligible: false,
+                  wake_reported: true,
+                  seq: 5,
+                },
+                {
+                  id: "review-diff",
+                  workflow_id: "dag_recovered_review_rejection",
+                  name: "review-diff",
+                  worker_type: "review",
+                  status: "pending",
+                  required: true,
+                  depends_on: ["verify"],
+                  wake_eligible: false,
+                  wake_reported: false,
+                  seq: 4,
+                },
+                {
+                  id: "final-audit",
+                  workflow_id: "dag_recovered_review_rejection",
+                  name: "final-audit",
+                  worker_type: "audit",
+                  status: "pending",
+                  required: true,
+                  depends_on: ["review-diff"],
+                  wake_eligible: false,
+                  wake_reported: false,
+                  seq: 3,
                 },
               ]).run()
             }),

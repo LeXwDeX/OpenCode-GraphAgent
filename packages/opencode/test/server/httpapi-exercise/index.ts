@@ -1920,6 +1920,142 @@ const scenarios: Scenario[] = [
       }),
     ),
 
+  // Project-isolation regressions: the instance API must treat foreign
+  // sessions/workflows as nonexistent even though they share the same DB.
+  http.protected
+    .get("/dag", "dag.list.isolation")
+    .seeded((ctx) =>
+      ctx.foreignDag({
+        title: "Foreign list workflow",
+        nodes: [{ id: "foreign", name: "Foreign", worker_type: "general", depends_on: [], required: true }],
+      }),
+    )
+    .jsonEffect(200, (body, ctx) =>
+      Effect.sync(() => {
+        array(body)
+        check(
+          !body.some((item) => isRecord(item) && item.id === ctx.state.dagID),
+          "dag.list must not expose workflows owned by another project",
+        )
+      }),
+    ),
+
+  http.protected
+    .get("/dag/{dagID}", "dag.detail.isolation")
+    .seeded((ctx) =>
+      ctx.foreignDag({
+        title: "Foreign detail workflow",
+        nodes: [{ id: "foreign", name: "Foreign", worker_type: "general", depends_on: [], required: true }],
+      }),
+    )
+    .at((ctx) => ({
+      path: route("/dag/{dagID}", { dagID: ctx.state.dagID }),
+      headers: ctx.headers(),
+    }))
+    .status(404),
+
+  http.protected
+    .get("/dag/session/{sessionID}", "dag.bySession.isolation")
+    .seeded((ctx) =>
+      ctx.foreignDag({
+        title: "Foreign session workflows",
+        nodes: [{ id: "foreign", name: "Foreign", worker_type: "general", depends_on: [], required: true }],
+      }),
+    )
+    .at((ctx) => ({
+      path: route("/dag/session/{sessionID}", { sessionID: ctx.state.sessionID }),
+      headers: ctx.headers(),
+    }))
+    .status(404),
+
+  http.protected
+    .get("/dag/session/{sessionID}/summary", "dag.summary.isolation")
+    .seeded((ctx) =>
+      ctx.foreignDag({
+        title: "Foreign session summary",
+        nodes: [{ id: "foreign", name: "Foreign", worker_type: "general", depends_on: [], required: true }],
+      }),
+    )
+    .at((ctx) => ({
+      path: route("/dag/session/{sessionID}/summary", { sessionID: ctx.state.sessionID }),
+      headers: ctx.headers(),
+    }))
+    .status(404),
+
+  http.protected
+    .get("/dag/{dagID}/nodes", "dag.nodes.isolation")
+    .seeded((ctx) =>
+      ctx.foreignDag({
+        title: "Foreign workflow nodes",
+        nodes: [{ id: "foreign", name: "Foreign", worker_type: "general", depends_on: [], required: true }],
+      }),
+    )
+    .at((ctx) => ({
+      path: route("/dag/{dagID}/nodes", { dagID: ctx.state.dagID }),
+      headers: ctx.headers(),
+    }))
+    .status(404),
+
+  http.protected
+    .get("/dag/{dagID}/nodes/{nodeID}", "dag.nodeDetail.isolation")
+    .seeded((ctx) =>
+      ctx.foreignDag({
+        title: "Foreign workflow node detail",
+        nodes: [{ id: "foreign", name: "Foreign", worker_type: "general", depends_on: [], required: true }],
+      }),
+    )
+    .at((ctx) => ({
+      path: route("/dag/{dagID}/nodes/{nodeID}", { dagID: ctx.state.dagID, nodeID: "foreign" }),
+      headers: ctx.headers(),
+    }))
+    .status(404),
+
+  http.protected
+    .post("/dag/{dagID}/control", "dag.control.isolation")
+    .mutating()
+    .seeded((ctx) =>
+      ctx.foreignDag({
+        title: "Foreign control workflow",
+        nodes: [{ id: "foreign", name: "Foreign", worker_type: "general", depends_on: [], required: true }],
+      }),
+    )
+    .at((ctx) => ({
+      path: route("/dag/{dagID}/control", { dagID: ctx.state.dagID }),
+      headers: ctx.headers(),
+      body: { operation: "pause" },
+    }))
+    .status(404),
+
+  http.protected
+    .post("/dag", "dag.start.isolation")
+    .mutating()
+    .seeded((ctx) =>
+      ctx.foreignDag({
+        title: "Foreign start owner",
+        nodes: [{ id: "foreign", name: "Foreign", worker_type: "general", depends_on: [], required: true }],
+      }),
+    )
+    .at((ctx) => ({
+      path: "/dag",
+      headers: ctx.headers(),
+      body: {
+        session_id: ctx.state.sessionID,
+        title: "Cross-project start",
+        config: {
+          name: "cross-project-start",
+          nodes: [{
+            id: "n1",
+            name: "N1",
+            worker_type: "general",
+            depends_on: [],
+            required: true,
+            prompt_template: { inline: "noop" },
+          }],
+        },
+      },
+    }))
+    .status(404),
+
   // 404 scenarios (pre-existing, retained)
   http.protected
     .get("/dag/{dagID}", "dag.detail")
@@ -1928,7 +2064,7 @@ const scenarios: Scenario[] = [
   http.protected
     .get("/dag/{dagID}/nodes", "dag.nodes")
     .at(() => ({ path: route("/dag/{dagID}/nodes", { dagID: "dag_nonexistent" }), headers: {} as Record<string, string> }))
-    .json(200, (body) => { array(body); check(body.length === 0, "nonexistent workflow should have no nodes") }),
+    .status(404),
   http.protected
     .get("/dag/{dagID}/nodes/{nodeID}", "dag.nodeDetail")
     .at(() => ({ path: route("/dag/{dagID}/nodes/{nodeID}", { dagID: "dag_nonexistent", nodeID: "n1" }), headers: {} as Record<string, string> }))

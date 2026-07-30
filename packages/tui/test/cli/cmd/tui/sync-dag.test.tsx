@@ -8,10 +8,11 @@ import type { DagWorkflowSummary } from "@opencode-ai/sdk/v2"
 
 const sid = "ses_dag_1"
 
-function summaryEvent(summaries: DagWorkflowSummary[], sessionID = sid): GlobalEvent {
+function summaryEvent(summaries: DagWorkflowSummary[], sessionID = sid, workspace?: string): GlobalEvent {
   return {
     directory,
     project: "proj_test",
+    ...(workspace ? { workspace } : {}),
     payload: {
       id: `evt_dag_summary_${Date.now()}_${Math.random()}`,
       type: "dag.workflow.summary.updated",
@@ -69,6 +70,24 @@ describe("tui sync dag slice", () => {
 
       expect(sync.data.dag[sid]).toHaveLength(1)
       expect(sync.data.dag[sid][0].completedNodes).toBe(3)
+    } finally {
+      app.renderer.destroy()
+    }
+  })
+
+  test("ignores summary events routed to another workspace", async () => {
+    await using tmp = await tmpdir()
+    await Bun.write(`${tmp.path}/kv.json`, "{}")
+    const { app, emit, project, sync } = await mount(undefined, tmp.path)
+
+    try {
+      project.workspace.set("wrk-current")
+      emit(summaryEvent([summary(1, 2)], sid, "wrk-foreign"))
+      await Bun.sleep(50)
+      expect(sync.data.dag[sid] ?? []).toEqual([])
+
+      emit(summaryEvent([summary(2, 2)], sid, "wrk-current"))
+      await wait(() => sync.data.dag[sid]?.[0]?.completedNodes === 2)
     } finally {
       app.renderer.destroy()
     }
