@@ -97,7 +97,9 @@ function interpolate(template: string, input: Record<string, unknown>) {
   const unresolvedPlaceholders: string[] = []
   const text = template.replace(INTERPOLATION_RE, (match, key: string) => {
     const value = input[key]
-    if (value !== null && value !== undefined) return String(value)
+    if (value !== null && value !== undefined) {
+      return typeof value === "object" ? JSON.stringify(value, null, 2) : String(value)
+    }
     unresolvedPlaceholders.push(key)
     return match
   })

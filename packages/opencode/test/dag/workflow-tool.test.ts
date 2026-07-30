@@ -1,5 +1,5 @@
-import { describe, expect, it } from "bun:test"
-import { Effect, Exit, Layer, Schema } from "effect"
+import { afterAll, beforeAll, describe, expect, it } from "bun:test"
+import { Cause, Effect, Exit, Layer, Schema } from "effect"
 import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
@@ -21,6 +21,16 @@ import { ProjectV2 } from "@opencode-ai/core/project"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 
 const projectID = ProjectV2.ID.make("project_test")
+let workflowSpecDirectory = ""
+
+beforeAll(async () => {
+  workflowSpecDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "workflow-spec-"))
+})
+
+afterAll(async () => {
+  await fs.rm(workflowSpecDirectory, { recursive: true, force: true })
+})
+
 const admissionBrief = {
   goal: "Qualify and execute a deep workflow",
   scope: {
@@ -61,6 +71,18 @@ function admissionFor(
           acknowledged_risks: ["Production rollout is unresolved"],
         }
       : {}),
+  }
+}
+
+function admissionInputFor(verdict: "READY" | "NOT_READY" | "WAIVED") {
+  const record = admissionFor(verdict)
+  return {
+    brief_revision: record.brief_revision,
+    qa_mode: record.qa_mode,
+    verdict: record.verdict,
+    brief: record.brief,
+    ...(record.waiver_reason ? { waiver_reason: record.waiver_reason } : {}),
+    ...(record.acknowledged_risks ? { acknowledged_risks: record.acknowledged_risks } : {}),
   }
 }
 
@@ -207,7 +229,7 @@ const runtime = testEffect(
           id,
           slug: "workflow-test",
           projectID,
-          directory: "/project",
+          directory: workflowSpecDirectory,
           title: "Workflow test",
           version: "test",
           time: { created: 0, updated: 0 },
@@ -259,11 +281,18 @@ const missingModelRuntime = testEffect(
   ),
 )
 
+function writeWorkflowSpec(name: string, value: unknown) {
+  const filepath = path.join(workflowSpecDirectory, `${name}.yaml`)
+  return Effect.promise(() => Bun.write(filepath, JSON.stringify(value, null, 2))).pipe(
+    Effect.as(filepath),
+  )
+}
+
 describe("workflow tool schema (negative tests)", () => {
   it("action field accepts start/extend/control/status", () => {
     const decode = Schema.decodeUnknownSync(Parameters)
-    expect(() => decode({ action: "start", config: { name: "test", nodes: [], max_concurrency: 3 } })).not.toThrow()
-    expect(() => decode({ action: "extend", workflow_id: "wf-1", nodes: [] })).not.toThrow()
+    expect(() => decode({ action: "start", spec_path: ".opencode/workflows/test.yaml" })).not.toThrow()
+    expect(() => decode({ action: "extend", workflow_id: "wf-1", spec_path: ".opencode/workflows/extend.yaml" })).not.toThrow()
     expect(() => decode({ action: "control", workflow_id: "wf-1", operation: "pause" })).not.toThrow()
     expect(() => decode({ action: "status", workflow_id: "wf-1" })).not.toThrow()
   })
@@ -298,55 +327,23 @@ describe("workflow tool schema (negative tests)", () => {
     expect(() => decode({ action: "control", workflow_id: "wf-1", operation: "start" })).toThrow()
   })
 
-  it("leaves omitted node defaults unresolved and strips graph-level model fields", () => {
-    const decode = Schema.decodeUnknownSync(Parameters)
-    const input = decode({
-      action: "start",
-      config: {
-        name: "required-default",
-        node_defaults: {
-          required: true,
-          report_to_parent: true,
-          worker_config: { timeout_ms: 1234 },
-          model: { providerID: "configured", modelID: "configured/model" },
-        },
-        nodes: [
-          {
-            id: "optional-node",
-            name: "Optional node",
-            worker_type: "build",
-            depends_on: [],
-            prompt_template: { inline: "work" },
-            model: { providerID: "configured", modelID: "configured/model" },
-          },
-        ],
-      },
-    })
-
-    expect(input.config?.nodes[0]?.required).toBeUndefined()
-    expect(input.config?.node_defaults).toEqual({
-      required: true,
-      report_to_parent: true,
-      worker_config: { timeout_ms: 1234 },
-    })
-    expect(input.config?.nodes[0]).not.toHaveProperty("model")
-  })
-
-  it("decodes deep mode and structured admission", () => {
+  it("keeps workflow graph and admission internals out of tool-call parameters", () => {
     const decode = Schema.decodeUnknownSync(Parameters)
     expect(decode({
       action: "start",
+      spec_path: ".opencode/workflows/deep.yaml",
       mode: "deep",
-      admission: admissionFor("READY"),
+      admission: admissionFor("READY", "CONSUMED"),
       config: {
         name: "deep-schema",
         nodes: [],
       },
-    })).toEqual(expect.objectContaining({
-      mode: "deep",
-      admission: expect.objectContaining({ verdict: "READY" }),
-    }))
+    })).toEqual({
+      action: "start",
+      spec_path: ".opencode/workflows/deep.yaml",
+    })
   })
+
 })
 
 describe("workflow tool execution", () => {
@@ -427,20 +424,155 @@ describe("workflow tool execution", () => {
     }),
   )
 
+  runtime.effect("deep start repairs one YAML file and owns admission audit fields", () =>
+    Effect.gen(function* () {
+      published.length = 0
+      const specPath = path.join(workflowSpecDirectory, "deep.yaml")
+      yield* Effect.promise(() =>
+        Bun.write(
+          specPath,
+          `title: Deep ready
+mode: deep
+admission:
+  brief_revision: 1
+  qa_mode: STANDARD
+  verdict: READY
+config:
+  name: deep-ready
+  nodes: []
+`,
+        ),
+      )
+
+      const info = yield* WorkflowTool
+      const workflow = yield* info.init()
+      const context = {
+        sessionID: SessionID.make("ses_workflow_parent"),
+        messageID: MessageID.ascending(),
+        agent: "build",
+        abort: new AbortController().signal,
+        messages: [],
+        metadata: () => Effect.void,
+        ask: () => Effect.void,
+      } satisfies Tool.Context
+      const invalid = yield* workflow.execute(
+        {
+          action: "start",
+          spec_path: "deep.yaml",
+        },
+        context,
+      ).pipe(Effect.exit)
+
+      expect(Exit.isFailure(invalid)).toBe(true)
+      if (Exit.isFailure(invalid)) {
+        expect(Cause.pretty(invalid.cause)).toContain('["admission"]["brief"]')
+      }
+      expect(published).toHaveLength(0)
+
+      yield* Effect.promise(() =>
+        Bun.write(
+          specPath,
+          `title: Deep ready
+mode: deep
+admission:
+  protocol_version: 999
+  brief_revision: 1
+  qa_mode: STANDARD
+  verdict: READY
+  state: CONSUMED
+  fingerprint: ${"0".repeat(64)}
+  brief:
+    goal: Qualify and execute a deep workflow
+    scope:
+      in: [workflow start, review lifecycle]
+      out: [new admission UI]
+    constraints: [standard workflows stay compatible]
+    assumptions: [the parent session can ask questions]
+    acceptance_criteria: [deep start requires READY or WAIVED]
+    evidence_required: [unit tests, integration tests]
+    risks: [waiver misuse]
+    review_plan: [verify, review the implementation diff]
+    open_questions: []
+    blocking_questions: []
+config:
+  name: deep-ready
+  nodes: []
+`,
+        ),
+      )
+
+      const result = yield* workflow.execute(
+        {
+          action: "start",
+          spec_path: "deep.yaml",
+        },
+        context,
+      )
+
+      expect(result.output).toContain('mode="deep"')
+      const created = published.find((event) => event.type === DagEvent.WorkflowCreated.type)?.data as {
+        config?: string
+      }
+      expect(JSON.parse(created.config ?? "{}")).toEqual(expect.objectContaining({
+        mode: "deep",
+        admission: expect.objectContaining({
+          protocol_version: 1,
+          verdict: "READY",
+          state: "CONSUMED",
+          fingerprint: fingerprintBrief(admissionBrief),
+        }),
+      }))
+    }),
+  )
+
+  runtime.effect("invalid YAML reports its source file without workflow side effects", () =>
+    Effect.gen(function* () {
+      published.length = 0
+      const specPath = path.join(workflowSpecDirectory, "invalid.yaml")
+      yield* Effect.promise(() => Bun.write(specPath, "config:\n  nodes: [\n"))
+      const info = yield* WorkflowTool
+      const workflow = yield* info.init()
+      const exit = yield* workflow.execute(
+        {
+          action: "start",
+          spec_path: specPath,
+        },
+        {
+          sessionID: SessionID.make("ses_workflow_parent"),
+          messageID: MessageID.ascending(),
+          agent: "build",
+          abort: new AbortController().signal,
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        } satisfies Tool.Context,
+      ).pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) {
+        expect(Cause.pretty(exit.cause)).toContain(`Invalid workflow YAML ${specPath}:`)
+      }
+      expect(published).toHaveLength(0)
+    }),
+  )
+
   runtime.effect("start derives the project ID from the parent session", () =>
     Effect.gen(function* () {
       published.length = 0
       const parentID = SessionID.make("ses_workflow_parent")
       const info = yield* WorkflowTool
       const workflow = yield* info.init()
+      const specPath = yield* writeWorkflowSpec("project-id-regression", {
+        config: {
+          name: "project-id-regression",
+          nodes: [],
+        },
+      })
 
       const result = yield* workflow.execute(
         {
           action: "start",
-          config: {
-            name: "project-id-regression",
-            nodes: [],
-          },
+          spec_path: specPath,
         },
         {
           sessionID: parentID,
@@ -481,22 +613,30 @@ describe("workflow tool execution", () => {
           '{ "model": {} }\n',
         )
       )
+      yield* Effect.promise(() =>
+        Bun.write(
+          path.join(missingModelDirectory, "missing-model.yaml"),
+          JSON.stringify({
+            config: {
+              name: "missing-model",
+              nodes: [{
+                id: "worker",
+                name: "Worker",
+                worker_type: "build",
+                depends_on: [],
+                prompt_template: { inline: "work" },
+              }],
+            },
+          }),
+        )
+      )
 
       const info = yield* WorkflowTool
       const workflow = yield* info.init()
       const result = yield* workflow.execute(
         {
           action: "start",
-          config: {
-            name: "missing-model",
-            nodes: [{
-              id: "worker",
-              name: "Worker",
-              worker_type: "build",
-              depends_on: [],
-              prompt_template: { inline: "work" },
-            }],
-          },
+          spec_path: "missing-model.yaml",
         },
         {
           sessionID: SessionID.make("ses_workflow_parent"),
@@ -517,61 +657,23 @@ describe("workflow tool execution", () => {
     }),
   )
 
-  runtime.effect("deep start consumes and persists a READY admission", () =>
-    Effect.gen(function* () {
-      published.length = 0
-      const info = yield* WorkflowTool
-      const workflow = yield* info.init()
-      const result = yield* workflow.execute(
-        {
-          action: "start",
-          mode: "deep",
-          admission: admissionFor("READY"),
-          config: {
-            name: "deep-ready",
-            nodes: [],
-          },
-        },
-        {
-          sessionID: SessionID.make("ses_workflow_parent"),
-          messageID: MessageID.ascending(),
-          agent: "build",
-          abort: new AbortController().signal,
-          messages: [],
-          metadata: () => Effect.void,
-          ask: () => Effect.void,
-        } satisfies Tool.Context,
-      )
-
-      expect(result.output).toContain('mode="deep"')
-      const created = published.find((event) => event.type === DagEvent.WorkflowCreated.type)?.data as {
-        config?: string
-      }
-      expect(JSON.parse(created.config ?? "{}")).toEqual(expect.objectContaining({
-        mode: "deep",
-        admission: expect.objectContaining({
-          verdict: "READY",
-          state: "CONSUMED",
-          fingerprint: admissionFor("READY").fingerprint,
-        }),
-      }))
-    }),
-  )
-
   runtime.effect("deep start consumes and retains an informed WAIVED admission", () =>
     Effect.gen(function* () {
       published.length = 0
       const info = yield* WorkflowTool
       const workflow = yield* info.init()
+      const specPath = yield* writeWorkflowSpec("deep-waived", {
+        mode: "deep",
+        admission: admissionInputFor("WAIVED"),
+        config: {
+          name: "deep-waived",
+          nodes: [],
+        },
+      })
       yield* workflow.execute(
         {
           action: "start",
-          mode: "deep",
-          admission: admissionFor("WAIVED"),
-          config: {
-            name: "deep-waived",
-            nodes: [],
-          },
+          spec_path: specPath,
         },
         {
           sessionID: SessionID.make("ses_workflow_parent"),
@@ -596,34 +698,56 @@ describe("workflow tool execution", () => {
     }),
   )
 
-  runtime.effect("deep start blocks every non-admitted state without side effects", () =>
+  runtime.effect("deep start blocks missing or non-ready admission without side effects", () =>
     Effect.gen(function* () {
       const info = yield* WorkflowTool
       const workflow = yield* info.init()
       const cases = [
-        { name: "missing", admission: undefined },
-        { name: "not-ready", admission: admissionFor("NOT_READY") },
-        { name: "invalidated", admission: admissionFor("NOT_READY", "INVALIDATED") },
         {
-          name: "bad-fingerprint",
-          admission: {
-            ...admissionFor("READY"),
-            fingerprint: "0".repeat(64),
+          name: "missing",
+          value: {
+            mode: "deep",
+            config: {
+              name: "deep-missing",
+              nodes: [],
+            },
+          },
+        },
+        {
+          name: "not-ready",
+          value: {
+            mode: "deep",
+            admission: admissionInputFor("NOT_READY"),
+            config: {
+              name: "deep-not-ready",
+              nodes: [],
+            },
+          },
+        },
+        {
+          name: "waived-without-audit",
+          value: {
+            mode: "deep",
+            admission: {
+              ...admissionInputFor("WAIVED"),
+              waiver_reason: undefined,
+              acknowledged_risks: undefined,
+            },
+            config: {
+              name: "deep-waived-without-audit",
+              nodes: [],
+            },
           },
         },
       ]
 
       for (const item of cases) {
         published.length = 0
+        const specPath = yield* writeWorkflowSpec(`blocked-${item.name}`, item.value)
         const exit = yield* workflow.execute(
           {
             action: "start",
-            mode: "deep",
-            admission: item.admission,
-            config: {
-              name: `deep-${item.name}`,
-              nodes: [],
-            },
+            spec_path: specPath,
           },
           {
             sessionID: SessionID.make("ses_workflow_parent"),
@@ -647,22 +771,25 @@ describe("workflow tool execution", () => {
       published.length = 0
       const info = yield* WorkflowTool
       const workflow = yield* info.init()
+      const specPath = yield* writeWorkflowSpec("required-default", {
+        config: {
+          name: "required-default",
+          nodes: [
+            {
+              id: "optional-node",
+              name: "Optional node",
+              worker_type: "build",
+              depends_on: [],
+              prompt_template: { inline: "work" },
+            },
+          ],
+        },
+      })
 
       yield* workflow.execute(
         {
           action: "start",
-          config: {
-            name: "required-default",
-            nodes: [
-              {
-                id: "optional-node",
-                name: "Optional node",
-                worker_type: "build",
-                depends_on: [],
-                prompt_template: { inline: "work" },
-              },
-            ],
-          },
+          spec_path: specPath,
         },
         {
           sessionID: SessionID.make("ses_workflow_parent"),
@@ -686,37 +813,40 @@ describe("workflow tool execution", () => {
       published.length = 0
       const info = yield* WorkflowTool
       const workflow = yield* info.init()
+      const specPath = yield* writeWorkflowSpec("configured-defaults", {
+        config: {
+          name: "configured-defaults",
+          node_defaults: {
+            required: true,
+            report_to_parent: true,
+            worker_config: { timeout_ms: 1234 },
+          },
+          nodes: [
+            {
+              id: "inherits",
+              name: "Inherits defaults",
+              worker_type: "general",
+              depends_on: [],
+              prompt_template: { inline: "work" },
+            },
+            {
+              id: "overrides",
+              name: "Overrides defaults",
+              worker_type: "general",
+              depends_on: [],
+              required: false,
+              report_to_parent: false,
+              worker_config: { timeout_ms: 4321 },
+              prompt_template: { inline: "work" },
+            },
+          ],
+        },
+      })
 
       yield* workflow.execute(
         {
           action: "start",
-          config: {
-            name: "configured-defaults",
-            node_defaults: {
-              required: true,
-              report_to_parent: true,
-              worker_config: { timeout_ms: 1234 },
-            },
-            nodes: [
-              {
-                id: "inherits",
-                name: "Inherits defaults",
-                worker_type: "general",
-                depends_on: [],
-                prompt_template: { inline: "work" },
-              },
-              {
-                id: "overrides",
-                name: "Overrides defaults",
-                worker_type: "general",
-                depends_on: [],
-                required: false,
-                report_to_parent: false,
-                worker_config: { timeout_ms: 4321 },
-                prompt_template: { inline: "work" },
-              },
-            ],
-          },
+          spec_path: specPath,
         },
         {
           sessionID: SessionID.make("ses_workflow_parent"),
@@ -762,20 +892,23 @@ describe("workflow tool execution", () => {
       published.length = 0
       const info = yield* WorkflowTool
       const workflow = yield* info.init()
+      const specPath = yield* writeWorkflowSpec("extend-defaults", {
+        nodes: [
+          {
+            id: "added",
+            name: "Added node",
+            worker_type: "general",
+            depends_on: [],
+            prompt_template: { inline: "work" },
+          },
+        ],
+      })
 
       yield* workflow.execute(
         {
           action: "extend",
           workflow_id: "dag_defaults",
-          nodes: [
-            {
-              id: "added",
-              name: "Added node",
-              worker_type: "general",
-              depends_on: [],
-              prompt_template: { inline: "work" },
-            },
-          ],
+          spec_path: specPath,
         },
         {
           sessionID: SessionID.make("ses_workflow_parent"),
@@ -815,24 +948,27 @@ describe("workflow tool execution", () => {
       published.length = 0
       const info = yield* WorkflowTool
       const workflow = yield* info.init()
+      const specPath = yield* writeWorkflowSpec("replan-defaults", {
+        fragment: {
+          name: "replan-fragment",
+          nodes: [
+            {
+              id: "replanned",
+              name: "Replanned node",
+              worker_type: "general",
+              depends_on: [],
+              prompt_template: { inline: "work" },
+            },
+          ],
+        },
+      })
 
       yield* workflow.execute(
         {
           action: "control",
           workflow_id: "dag_defaults",
           operation: "replan",
-          fragment: {
-            name: "replan-fragment",
-            nodes: [
-              {
-                id: "replanned",
-                name: "Replanned node",
-                worker_type: "general",
-                depends_on: [],
-                prompt_template: { inline: "work" },
-              },
-            ],
-          },
+          spec_path: specPath,
         },
         {
           sessionID: SessionID.make("ses_workflow_parent"),
@@ -878,10 +1014,7 @@ describe("workflow tool execution", () => {
           {
             action: "start",
             project_id: "project_other",
-            config: {
-              name: "project-id-mismatch",
-              nodes: [],
-            },
+            spec_path: "project-id-mismatch.yaml",
           },
           {
             sessionID: parentID,
