@@ -28,12 +28,11 @@ import { deriveSubagentSessionPermission } from "@/agent/subagent-permissions"
 import { SessionPrompt } from "@/session/prompt"
 import { Dag } from "../dag"
 import { DagModel } from "../model"
-import { validateReviewResult } from "../review-lifecycle"
 import { isTransitionRejection } from "@opencode-ai/core/dag/core/types"
 import type { DagStore } from "@opencode-ai/core/dag/store"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
-import { registerCaptureSlot, clearCaptureSlot } from "./capture"
+import { registerCaptureSlot, clearCaptureSlot, settleCapturedOutput } from "./capture"
 
 type PromptParts = SessionPrompt.PromptInput["parts"]
 
@@ -68,12 +67,26 @@ export function spawnNode(
     const promptSvc = yield* SessionPrompt.Service
     const scope = yield* Scope.Scope
 
+    // Pre-admission failures settle here and return an empty fiber (same
+    // shape as the !admitted path below) instead of Effect.fail — failing
+    // would make the caller's catchCause publish a second, guard-rejected
+    // NodeFailed (noise).
+    const failWithoutFiber = (reason: string, label: string) =>
+      Effect.gen(function* () {
+        yield* dag.nodeFailed(input.dagID, input.nodeID, reason, "exec_failed").pipe(
+          Effect.catchIf(
+            isTransitionRejection,
+            () => Effect.logWarning(`nodeFailed (${label}) guard rejected — node already terminal`),
+          ),
+        )
+        return { fiber: yield* Effect.forkIn(scope)(Effect.void) }
+      })
+
     const agent = yield* agentService.get(input.node.workerType).pipe(
       Effect.catchCause(() => Effect.succeed(undefined)),
     )
     if (!agent) {
-      yield* dag.nodeFailed(input.dagID, input.nodeID, `unknown worker_type: ${input.node.workerType}`, "exec_failed")
-      return yield* Effect.fail(new Error(`Unknown worker_type: ${input.node.workerType}`))
+      return yield* failWithoutFiber(`unknown worker_type: ${input.node.workerType}`, "unknown worker_type")
     }
 
     const parent = yield* sessions.get(SessionID.make(input.parentSessionID))
@@ -97,8 +110,7 @@ export function spawnNode(
       parent: parent.model ? { modelID: parent.model.id, providerID: parent.model.providerID } : undefined,
     })
     if (!resolvedModel) {
-      yield* dag.nodeFailed(input.dagID, input.nodeID, `no model configured for agent: ${agent.name}`, "exec_failed")
-      return yield* Effect.fail(new Error(`No model configured for agent: ${agent.name}`))
+      return yield* failWithoutFiber(`no model configured for agent: ${agent.name}`, "no model")
     }
     const model = {
       modelID: ModelV2.ID.make(resolvedModel.modelID),
@@ -227,46 +239,19 @@ export function spawnNode(
           if (input.outputSchema) {
             clearCaptureSlot(childSession.id)
             const updatedNode = yield* dag.store.getNode(input.dagID, input.nodeID).pipe(Effect.orDie)
-            const captured = updatedNode?.capturedOutput
-            if (captured !== undefined && captured !== null) {
-              if (input.reviewImplementationFingerprint) {
-                const reviewResult = validateReviewResult(
-                  captured,
-                  input.reviewImplementationFingerprint,
-                )
-                if (!reviewResult.valid) {
-                  yield* dag.nodeFailed(
-                    input.dagID,
-                    input.nodeID,
-                    `Review result contract failed: ${reviewResult.errors.join("; ")}`,
-                    "verdict_fail",
-                  ).pipe(
-                    Effect.catchIf(
-                      isTransitionRejection,
-                      () => Effect.logWarning("nodeFailed (review result contract) guard rejected — node already terminal"),
-                    ),
-                  )
-                  return
-                }
-              }
-              yield* dag.nodeCompleted(input.dagID, input.nodeID, captured).pipe(
-                Effect.catchIf(
-                  isTransitionRejection,
-                  () => Effect.logWarning("nodeCompleted guard rejected — node already terminal"),
-                ),
-              )
-            } else {
-              yield* dag.nodeFailed(
-                input.dagID, input.nodeID,
-                "output_schema declared but submit_result was never successfully called",
-                "verdict_fail",
-              ).pipe(
-                Effect.catchIf(
-                  isTransitionRejection,
-                  () => Effect.logWarning("nodeFailed (verdict_fail) guard rejected — node already terminal"),
-                ),
-              )
-            }
+            // Single settlement decision shared with crash recovery
+            // (capture.ts settleCapturedOutput) — the review-result contract
+            // must never be enforced in one path and not the other.
+            const settlement = settleCapturedOutput(updatedNode?.capturedOutput, input.reviewImplementationFingerprint)
+            yield* (settlement.kind === "complete"
+              ? dag.nodeCompleted(input.dagID, input.nodeID, settlement.output)
+              : dag.nodeFailed(input.dagID, input.nodeID, settlement.reason, "verdict_fail")
+            ).pipe(
+              Effect.catchIf(
+                isTransitionRejection,
+                () => Effect.logWarning(`${settlement.kind === "complete" ? "nodeCompleted" : "nodeFailed (verdict_fail)"} guard rejected — node already terminal`),
+              ),
+            )
           } else {
             const rawText = resultOpt.value.parts.findLast((p) => p.type === "text")?.text ?? ""
             if (rawText.trim() === "") {

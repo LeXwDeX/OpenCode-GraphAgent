@@ -30,6 +30,7 @@ import {
 } from "./admission"
 import { unresolvedReviewOutcomes, validateReviewLifecycle } from "./review-lifecycle"
 import { conditionReference } from "./runtime/eval"
+import { unsupportedSchemaKeywords } from "./runtime/capture"
 
 // Re-export domain types
 export const ID = DagEvent.DagID
@@ -204,6 +205,22 @@ function conditionReferenceErrors(nodes: readonly NodeConfig[]): string[] {
   })
 }
 
+// The runtime validator enforces a JSON Schema subset; anything outside it is
+// inert. Warn (not reject) at create/replan so authors learn their constraint
+// won't fire before a payload silently sails past it.
+function warnUnsupportedSchemaKeywords(nodes: readonly NodeConfig[]) {
+  return Effect.forEach(
+    nodes.flatMap((node) => {
+      if (!node.output_schema) return []
+      const keywords = unsupportedSchemaKeywords(node.output_schema)
+      return keywords.length > 0 ? [{ nodeID: node.id, keywords }] : []
+    }),
+    (hit) =>
+      Effect.logWarning("output_schema uses keywords the subset validator does not enforce — they will be ignored at runtime", hit),
+    { discard: true },
+  )
+}
+
 export interface Interface {
   readonly create: (input: {
     projectID: string
@@ -304,6 +321,7 @@ export const layer = Layer.effect(
       if (conditionErrors.length > 0) {
         return yield* Effect.fail(new Error(`Invalid workflow config: ${conditionErrors.join("; ")}`))
       }
+      yield* warnUnsupportedSchemaKeywords(config.nodes)
       // Enforce the total node ceiling at creation, not only on replan — the
       // ceiling is a lifetime cap and the initial graph counts toward it.
       const maxTotalNodes = config.max_total_nodes ?? DEFAULT_WORKFLOW_CONFIG.maxTotalNodes
@@ -518,6 +536,7 @@ export const layer = Layer.effect(
       if (conditionErrors.length > 0) {
         return yield* Effect.fail(new Error(`Replan rejected: ${conditionErrors.join("; ")}`))
       }
+      yield* warnUnsupportedSchemaKeywords(normalizedFragment.nodes)
 
       const maxReplanAttempts = wfConfig?.max_node_replan_attempts ?? DEFAULT_WORKFLOW_CONFIG.maxNodeReplanAttempts
       const maxTotalNodes = wfConfig?.max_total_nodes ?? DEFAULT_WORKFLOW_CONFIG.maxTotalNodes

@@ -20,14 +20,16 @@ const CONDITION_RE = /^(.+?)\s*(==|!=|>=|<=|>|<)\s*(.+)$/
  * Supported syntax: `nodeID.output.field == value` or `nodeID.output.field > N`.
  *
  * Returns `{ ok: true, value }` — `value` is true (run the node) or false (skip).
- * Returns `{ ok: false, error }` when the expression cannot be parsed — the
- * caller MUST fail the node rather than running it on an unevaluable condition.
+ * Returns `{ ok: false, error }` when the expression cannot be parsed, or when
+ * a numeric comparison's operand is not a number (missing field path, plain
+ * text output) — the caller MUST fail the node rather than running or silently
+ * skipping it on an unevaluable condition.
  *
  * @example
  * ```ts
  * evaluateCondition(
- *   "explore-src.output.findings.size > 0",
- *   { "explore-src": { output: { findings: [1,2,3] } } }
+ *   "explore-src.output.findings_count > 0",
+ *   { "explore-src": { output: { findings_count: 3 } } }
  * ) // → { ok: true, value: true }
  * ```
  */
@@ -44,15 +46,34 @@ export function evaluateCondition(
   const lhs = resolvePath(lhsRaw.trim(), outputs)
   const rhs = parseValue(rhsRaw.trim())
 
-  switch (op) {
-    case "==": return { ok: true, value: lhs === rhs }
-    case "!=": return { ok: true, value: lhs !== rhs }
-    case ">": return { ok: true, value: (lhs as number) > (rhs as number) }
-    case "<": return { ok: true, value: (lhs as number) < (rhs as number) }
-    case ">=": return { ok: true, value: (lhs as number) >= (rhs as number) }
-    case "<=": return { ok: true, value: (lhs as number) <= (rhs as number) }
-    default: return { ok: true, value: true }
+  // Numeric comparisons on non-numeric or non-finite operands (missing field
+  // path, plain-text output, NaN, "Infinity" parsed by parseValue) must fail
+  // the node loudly — the alternative is a silent condition_false skip that
+  // cascades through required downstream nodes, the same failure mode
+  // conditionReference guards against at create time.
+  if (op === ">" || op === "<" || op === ">=" || op === "<=") {
+    if (typeof lhs !== "number" || !Number.isFinite(lhs))
+      return { ok: false, error: `condition "${condition}": left operand resolved to ${describeOperand(lhs)}, expected a finite number` }
+    if (typeof rhs !== "number" || !Number.isFinite(rhs))
+      return { ok: false, error: `condition "${condition}": right operand ${describeOperand(rhs)} is not a finite number` }
+    if (op === ">") return { ok: true, value: lhs > rhs }
+    if (op === "<") return { ok: true, value: lhs < rhs }
+    if (op === ">=") return { ok: true, value: lhs >= rhs }
+    return { ok: true, value: lhs <= rhs }
   }
+
+  // CONDITION_RE only produces the six operators; after the numeric block
+  // only equality remains.
+  if (op === "==") return { ok: true, value: lhs === rhs }
+  return { ok: true, value: lhs !== rhs }
+}
+
+function describeOperand(value: unknown): string {
+  if (value === undefined) return "undefined (field path not found)"
+  if (value === null) return "null"
+  if (typeof value === "number") return String(value)
+  if (typeof value === "string") return `string "${value.length > 50 ? value.slice(0, 50) + "\u2026" : value}"`
+  return typeof value
 }
 
 /**

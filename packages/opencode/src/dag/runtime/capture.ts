@@ -8,6 +8,8 @@
  * via NodeStarted, so each attempt starts with a clean slate).
  */
 
+import { validateReviewResult } from "../review-lifecycle"
+
 const schemas = new Map<string, Record<string, unknown>>()
 
 export function registerCaptureSlot(sessionID: string, schema: Record<string, unknown>): void {
@@ -33,21 +35,12 @@ export function validatePayload(sessionID: string, payload: unknown): { ok: true
 }
 
 export function validateAgainstSchema(value: unknown, schema: Record<string, unknown>): { ok: true } | { ok: false; error: string } {
+  // JSON Schema allows `type` to be a single name or an array of names
+  // (nullable/union types like ["string","null"]) — the value must match one.
   const type = schema["type"]
-  if (typeof type === "string") {
-    if (type === "object" && (typeof value !== "object" || value === null || Array.isArray(value)))
-      return { ok: false, error: `expected type "object", got ${Array.isArray(value) ? "array" : typeof value}` }
-    if (type === "array" && !Array.isArray(value))
-      return { ok: false, error: `expected type "array", got ${typeof value}` }
-    if (type === "string" && typeof value !== "string")
-      return { ok: false, error: `expected type "string", got ${typeof value}` }
-    if (type === "number" && typeof value !== "number")
-      return { ok: false, error: `expected type "number", got ${typeof value}` }
-    if (type === "integer" && (typeof value !== "number" || !Number.isInteger(value)))
-      return { ok: false, error: `expected type "integer", got ${typeof value === "number" && !Number.isInteger(value) ? "non-integer number" : typeof value}` }
-    if (type === "boolean" && typeof value !== "boolean")
-      return { ok: false, error: `expected type "boolean", got ${typeof value}` }
-  }
+  const declared = typeof type === "string" ? [type] : Array.isArray(type) ? type.filter((t): t is string => typeof t === "string") : []
+  if (declared.length > 0 && !declared.some((t) => matchesScalarType(value, t)))
+    return { ok: false, error: `expected type ${declared.length === 1 ? `"${declared[0]}"` : JSON.stringify(declared)}, got ${describeType(value)}` }
 
   if ("const" in schema && !deepEqual(value, schema["const"]))
     return { ok: false, error: `expected const ${truncate(JSON.stringify(schema["const"]))}, got ${truncate(JSON.stringify(value))}` }
@@ -56,36 +49,177 @@ export function validateAgainstSchema(value: unknown, schema: Record<string, unk
   if (Array.isArray(enumVals) && !enumVals.some((v) => deepEqual(value, v)))
     return { ok: false, error: `expected one of ${truncate(JSON.stringify(enumVals))}, got ${truncate(JSON.stringify(value))}` }
 
+  if (typeof value === "number") {
+    const minimum = schema["minimum"]
+    if (typeof minimum === "number" && value < minimum)
+      return { ok: false, error: `expected minimum ${minimum}, got ${value}` }
+    const maximum = schema["maximum"]
+    if (typeof maximum === "number" && value > maximum)
+      return { ok: false, error: `expected maximum ${maximum}, got ${value}` }
+    const exclusiveMinimum = schema["exclusiveMinimum"]
+    if (typeof exclusiveMinimum === "number" && value <= exclusiveMinimum)
+      return { ok: false, error: `expected exclusiveMinimum ${exclusiveMinimum}, got ${value}` }
+    const exclusiveMaximum = schema["exclusiveMaximum"]
+    if (typeof exclusiveMaximum === "number" && value >= exclusiveMaximum)
+      return { ok: false, error: `expected exclusiveMaximum ${exclusiveMaximum}, got ${value}` }
+  }
+
+  if (typeof value === "string") {
+    const minLength = schema["minLength"]
+    if (typeof minLength === "number" && value.length < minLength)
+      return { ok: false, error: `expected minLength ${minLength}, got length ${value.length}` }
+    const maxLength = schema["maxLength"]
+    if (typeof maxLength === "number" && value.length > maxLength)
+      return { ok: false, error: `expected maxLength ${maxLength}, got length ${value.length}` }
+    const pattern = schema["pattern"]
+    if (typeof pattern === "string" && !safeRegexTest(pattern, value))
+      return { ok: false, error: `expected value to match pattern ${pattern}` }
+  }
+
+  if (Array.isArray(value)) {
+    const minItems = schema["minItems"]
+    if (typeof minItems === "number" && value.length < minItems)
+      return { ok: false, error: `expected minItems ${minItems}, got ${value.length}` }
+    const maxItems = schema["maxItems"]
+    if (typeof maxItems === "number" && value.length > maxItems)
+      return { ok: false, error: `expected maxItems ${maxItems}, got ${value.length}` }
+    if (schema["uniqueItems"] === true) {
+      const duplicate = value.findIndex((item, index) => value.slice(0, index).some((prev) => deepEqual(prev, item)))
+      if (duplicate !== -1)
+        return { ok: false, error: `expected uniqueItems, found duplicate at index ${duplicate}` }
+    }
+  }
+
   const required = schema["required"]
-  if (Array.isArray(required) && typeof value === "object" && value !== null && !Array.isArray(value)) {
-    const obj = value as Record<string, unknown>
+  if (Array.isArray(required) && isSchemaObject(value)) {
     for (const field of required) {
-      if (typeof field === "string" && !(field in obj))
+      if (typeof field === "string" && !(field in value))
         return { ok: false, error: `missing required field: "${field}"` }
     }
   }
 
   const properties = schema["properties"]
-  if (typeof properties === "object" && properties !== null && typeof value === "object" && value !== null && !Array.isArray(value)) {
-    const obj = value as Record<string, unknown>
-    const props = properties as Record<string, unknown>
-    for (const [key, propSchema] of Object.entries(props)) {
-      if (key in obj && typeof propSchema === "object" && propSchema !== null) {
-        const result = validateAgainstSchema(obj[key], propSchema as Record<string, unknown>)
+  if (isSchemaObject(properties) && isSchemaObject(value)) {
+    for (const [key, propSchema] of Object.entries(properties)) {
+      if (key in value && isSchemaObject(propSchema)) {
+        const result = validateAgainstSchema(value[key], propSchema)
         if (!result.ok) return { ok: false, error: `field "${key}": ${result.error}` }
       }
+    }
+    if (schema["additionalProperties"] === false) {
+      const extra = Object.keys(value).find((key) => !(key in properties))
+      if (extra !== undefined)
+        return { ok: false, error: `unexpected additional property: "${extra}"` }
     }
   }
 
   const items = schema["items"]
-  if (Array.isArray(value) && typeof items === "object" && items !== null) {
+  if (Array.isArray(value) && isSchemaObject(items)) {
     for (let i = 0; i < value.length; i++) {
-      const result = validateAgainstSchema(value[i], items as Record<string, unknown>)
+      const result = validateAgainstSchema(value[i], items)
       if (!result.ok) return { ok: false, error: `item[${i}]: ${result.error}` }
     }
   }
 
   return { ok: true }
+}
+
+/**
+ * Shared settlement decision for a node that declared an output_schema —
+ * the single source of truth for spawn's completion gate AND crash recovery,
+ * so the review-result contract cannot drift between the two paths again
+ * (that drift was exactly the B1 recovery bypass). A falsy fingerprint means
+ * there is no review contract to enforce (loop's validateReviewExecutionInput
+ * guarantees diff reviews always reach spawn with one).
+ */
+export type CapturedSettlement =
+  | { readonly kind: "complete"; readonly output: unknown }
+  | { readonly kind: "fail"; readonly reason: string }
+
+export function settleCapturedOutput(captured: unknown, reviewFingerprint: string | undefined, suffix = ""): CapturedSettlement {
+  if (captured === undefined || captured === null)
+    return { kind: "fail", reason: `output_schema declared but submit_result was never successfully called${suffix}` }
+  if (reviewFingerprint) {
+    const result = validateReviewResult(captured, reviewFingerprint)
+    if (!result.valid) return { kind: "fail", reason: `Review result contract failed${suffix}: ${result.errors.join("; ")}` }
+  }
+  return { kind: "complete", output: captured }
+}
+
+/**
+ * Keywords this subset validator enforces. Anything else present in an
+ * output_schema is silently inert at runtime — surface it at workflow
+ * create/replan time via unsupportedSchemaKeywords so authors aren't misled.
+ */
+const SUPPORTED_KEYWORDS = new Set([
+  "type", "const", "enum", "required", "properties", "items",
+  "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum",
+  "minLength", "maxLength", "pattern",
+  "minItems", "maxItems", "uniqueItems", "additionalProperties",
+  // Annotations with no validation semantics — harmless, don't warn.
+  "title", "description", "default", "examples", "$schema",
+])
+
+export function unsupportedSchemaKeywords(schema: Record<string, unknown>): string[] {
+  const found = new Set<string>()
+  const visit = (node: Record<string, unknown>) => {
+    for (const key of Object.keys(node)) {
+      if (!SUPPORTED_KEYWORDS.has(key)) found.add(key)
+    }
+    // Only the boolean `false` form is enforced; the schema form is inert.
+    if (isSchemaObject(node["additionalProperties"])) found.add("additionalProperties (schema form)")
+    const properties = node["properties"]
+    if (isSchemaObject(properties)) {
+      for (const child of Object.values(properties)) {
+        if (isSchemaObject(child)) visit(child)
+      }
+    }
+    const items = node["items"]
+    if (isSchemaObject(items)) visit(items)
+    // Tuple form items:[...] is not enforced by the validator either — flag it
+    // and still descend so nested unsupported keywords surface.
+    if (Array.isArray(items)) {
+      found.add("items (tuple form)")
+      for (const child of items) {
+        if (isSchemaObject(child)) visit(child)
+      }
+    }
+  }
+  visit(schema)
+  return [...found].sort()
+}
+
+function isSchemaObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+function matchesScalarType(value: unknown, type: string): boolean {
+  if (type === "object") return typeof value === "object" && value !== null && !Array.isArray(value)
+  if (type === "array") return Array.isArray(value)
+  if (type === "string") return typeof value === "string"
+  if (type === "number") return typeof value === "number"
+  if (type === "integer") return typeof value === "number" && Number.isInteger(value)
+  if (type === "boolean") return typeof value === "boolean"
+  if (type === "null") return value === null
+  // Unknown type name: permissive, consistent with subset semantics.
+  return true
+}
+
+function describeType(value: unknown): string {
+  if (value === null) return "null"
+  if (Array.isArray(value)) return "array"
+  if (typeof value === "number" && !Number.isInteger(value)) return "non-integer number"
+  return typeof value
+}
+
+// Schema patterns come from workflow config; a malformed regex must not crash
+// validation, it just fails the constraint.
+function safeRegexTest(pattern: string, value: string): boolean {
+  try {
+    return new RegExp(pattern).test(value)
+  } catch {
+    return false
+  }
 }
 
 function truncate(text: string | undefined): string {
