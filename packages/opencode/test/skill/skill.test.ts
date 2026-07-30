@@ -77,6 +77,49 @@ const withHome = <A, E, R>(home: string, self: Effect.Effect<A, E, R>) =>
   )
 
 describe("skill", () => {
+  it.live("does not register workflow as a built-in skill", () =>
+    provideTmpdirInstance(
+      () =>
+        Effect.gen(function* () {
+          const skill = yield* Skill.Service
+          expect(yield* skill.get("workflow")).toBeUndefined()
+          expect((yield* skill.all()).filter((item) => item.location === "<built-in>").map((item) => item.name)).toEqual([
+            "customize-opencode",
+            "configure-hooks",
+          ])
+        }),
+      { git: true },
+    ),
+  )
+
+  it.live("still discovers a user-defined workflow skill", () =>
+    provideTmpdirInstance(
+      (dir) =>
+        Effect.gen(function* () {
+          yield* Effect.promise(() =>
+            Bun.write(
+              path.join(dir, ".opencode", "skill", "workflow", "SKILL.md"),
+              `---
+name: workflow
+description: User-defined workflow guidance.
+---
+
+# User Workflow
+`,
+            ),
+          )
+
+          const skill = yield* Skill.Service
+          expect(yield* skill.get("workflow")).toMatchObject({
+            name: "workflow",
+            description: "User-defined workflow guidance.",
+          })
+          expect((yield* skill.get("workflow"))?.location).not.toBe("<built-in>")
+        }),
+      { git: true },
+    ),
+  )
+
   it.live("discovers skills from .opencode/skill/ directory", () =>
     provideTmpdirInstance(
       (dir) =>

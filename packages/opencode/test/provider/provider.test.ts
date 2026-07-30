@@ -6,7 +6,13 @@ import { ModelsDev } from "@opencode-ai/core/models-dev"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Global } from "@opencode-ai/core/global"
-import { disposeAllInstances, provideInstanceEffect, tmpdirScoped, TestInstance } from "../fixture/fixture"
+import {
+  disposeAllInstancesEffect,
+  provideInstanceEffect,
+  testInstanceStoreLayer,
+  tmpdirScoped,
+  TestInstance,
+} from "../fixture/fixture"
 import { markPluginDependenciesReady } from "../fixture/plugin"
 import { Auth } from "@/auth"
 import { Config } from "@/config/config"
@@ -17,6 +23,7 @@ import { Provider } from "@/provider/provider"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Filesystem } from "@/util/filesystem"
 import { InstanceLayer } from "@/project/instance-layer"
+import { InstanceState } from "@/effect/instance-state"
 import { testEffect } from "../lib/effect"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
@@ -47,13 +54,12 @@ const remove = (k: string) =>
     yield* Env.use.remove(k)
   })
 
-afterEach(async () => {
+afterEach(() => {
   for (const [key, value] of originalEnv) {
     if (value === undefined) delete process.env[key]
     else process.env[key] = value
   }
   originalEnv.clear()
-  await disposeAllInstances()
 })
 
 const providerLayer = (flags: Partial<RuntimeFlags.Info> = {}) =>
@@ -1649,7 +1655,7 @@ it.instance(
 // scoped tmpdir + provideInstance pattern via it.effect.
 
 const provideMultiInstance = <A, E, R>(eff: Effect.Effect<A, E, R>) =>
-  eff.pipe(Effect.provide(InstanceLayer.layer), Effect.provide(CrossSpawnSpawner.defaultLayer))
+  eff.pipe(Effect.provide(testInstanceStoreLayer), Effect.provide(CrossSpawnSpawner.defaultLayer))
 
 it.effect("plugin config providers persist after instance dispose", () =>
   Effect.gen(function* () {
@@ -1692,18 +1698,23 @@ it.effect("plugin config providers persist after instance dispose", () =>
       const plugin = yield* Plugin.Service
       const provider = yield* Provider.Service
       yield* plugin.init()
-      return yield* provider.list()
+      const providers = yield* provider.list()
+      return {
+        context: yield* InstanceState.context,
+        providers,
+      }
     }).pipe(provideInstanceEffect(dir))
 
     const first = yield* loadAndList
-    expect(first[ProviderV2.ID.make("demo")]).toBeDefined()
-    expect(first[ProviderV2.ID.make("demo")].models[ModelV2.ID.make("chat")]).toBeDefined()
+    expect(first.providers[ProviderV2.ID.make("demo")]).toBeDefined()
+    expect(first.providers[ProviderV2.ID.make("demo")].models[ModelV2.ID.make("chat")]).toBeDefined()
 
-    yield* Effect.promise(() => disposeAllInstances())
+    yield* disposeAllInstancesEffect
 
     const second = yield* loadAndList
-    expect(second[ProviderV2.ID.make("demo")]).toBeDefined()
-    expect(second[ProviderV2.ID.make("demo")].models[ModelV2.ID.make("chat")]).toBeDefined()
+    expect(second.context).not.toBe(first.context)
+    expect(second.providers[ProviderV2.ID.make("demo")]).toBeDefined()
+    expect(second.providers[ProviderV2.ID.make("demo")].models[ModelV2.ID.make("chat")]).toBeDefined()
   }).pipe(provideMultiInstance),
 )
 
@@ -1715,6 +1726,7 @@ it.instance(
     const root = path.join(configDir, "plugin")
     yield* Effect.promise(() => mkdir(root, { recursive: true }))
     yield* Effect.promise(() => markPluginDependenciesReady(configDir))
+    yield* Effect.promise(() => markPluginDependenciesReady(Global.Path.config))
     yield* Effect.promise(() =>
       Bun.write(
         path.join(root, "provider-filter.ts"),

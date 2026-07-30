@@ -70,6 +70,66 @@ export default {
         );
       `)
       yield* tx.run(`
+        CREATE TABLE \`workflow_node\` (
+          \`id\` text NOT NULL,
+          \`workflow_id\` text NOT NULL,
+          \`name\` text NOT NULL,
+          \`worker_type\` text NOT NULL,
+          \`status\` text NOT NULL,
+          \`required\` integer DEFAULT true NOT NULL,
+          \`depends_on\` text NOT NULL,
+          \`model_id\` text,
+          \`model_provider_id\` text,
+          \`child_session_id\` text,
+          \`output\` text,
+          \`error_reason\` text,
+          \`captured_output\` text,
+          \`deadline_ms\` integer,
+          \`wake_eligible\` integer DEFAULT false NOT NULL,
+          \`wake_reported\` integer DEFAULT false NOT NULL,
+          \`replan_attempts\` integer DEFAULT 0 NOT NULL,
+          \`seq\` integer NOT NULL,
+          \`started_at\` integer,
+          \`completed_at\` integer,
+          \`time_created\` integer NOT NULL,
+          \`time_updated\` integer NOT NULL,
+          CONSTRAINT \`workflow_node_pk\` PRIMARY KEY(\`workflow_id\`, \`id\`),
+          CONSTRAINT \`fk_workflow_node_workflow_id_workflow_id_fk\` FOREIGN KEY (\`workflow_id\`) REFERENCES \`workflow\`(\`id\`) ON DELETE CASCADE
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`workflow\` (
+          \`id\` text PRIMARY KEY,
+          \`project_id\` text NOT NULL,
+          \`session_id\` text NOT NULL,
+          \`title\` text NOT NULL,
+          \`status\` text NOT NULL,
+          \`config\` text NOT NULL,
+          \`seq\` integer NOT NULL,
+          \`wake_reported\` integer DEFAULT false NOT NULL,
+          \`started_at\` integer,
+          \`completed_at\` integer,
+          \`time_created\` integer NOT NULL,
+          \`time_updated\` integer NOT NULL,
+          CONSTRAINT \`fk_workflow_project_id_project_id_fk\` FOREIGN KEY (\`project_id\`) REFERENCES \`project\`(\`id\`) ON DELETE CASCADE,
+          CONSTRAINT \`fk_workflow_session_id_session_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session\`(\`id\`) ON DELETE CASCADE
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`workflow_violation\` (
+          \`id\` text PRIMARY KEY,
+          \`workflow_id\` text NOT NULL,
+          \`node_id\` text,
+          \`type\` text NOT NULL,
+          \`severity\` text NOT NULL,
+          \`message\` text NOT NULL,
+          \`details\` text,
+          \`time_created\` integer NOT NULL,
+          \`time_updated\` integer NOT NULL,
+          CONSTRAINT \`fk_workflow_violation_workflow_id_workflow_id_fk\` FOREIGN KEY (\`workflow_id\`) REFERENCES \`workflow\`(\`id\`) ON DELETE CASCADE
+        );
+      `)
+      yield* tx.run(`
         CREATE TABLE \`event_sequence\` (
           \`aggregate_id\` text PRIMARY KEY,
           \`seq\` integer NOT NULL,
@@ -84,13 +144,6 @@ export default {
           \`type\` text NOT NULL,
           \`data\` text NOT NULL,
           CONSTRAINT \`fk_event_aggregate_id_event_sequence_aggregate_id_fk\` FOREIGN KEY (\`aggregate_id\`) REFERENCES \`event_sequence\`(\`aggregate_id\`) ON DELETE CASCADE
-        );
-      `)
-      yield* tx.run(`
-        CREATE TABLE \`goal_state\` (
-          \`session_id\` text PRIMARY KEY,
-          \`payload\` text NOT NULL,
-          \`updated_at\` integer NOT NULL
         );
       `)
       yield* tx.run(`
@@ -243,9 +296,23 @@ export default {
           CONSTRAINT \`fk_session_share_session_id_session_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session\`(\`id\`) ON DELETE CASCADE
         );
       `)
+      yield* tx.run(`CREATE INDEX \`workflow_node_workflow_idx\` ON \`workflow_node\` (\`workflow_id\`);`)
+      yield* tx.run(
+        `CREATE INDEX \`workflow_node_workflow_status_idx\` ON \`workflow_node\` (\`workflow_id\`,\`status\`);`,
+      )
+      yield* tx.run(
+        `CREATE UNIQUE INDEX \`workflow_node_workflow_id_seq_idx\` ON \`workflow_node\` (\`workflow_id\`,\`id\`,\`seq\`);`,
+      )
+      yield* tx.run(`CREATE INDEX \`workflow_project_idx\` ON \`workflow\` (\`project_id\`);`)
+      yield* tx.run(`CREATE INDEX \`workflow_session_idx\` ON \`workflow\` (\`session_id\`);`)
+      yield* tx.run(`CREATE INDEX \`workflow_status_idx\` ON \`workflow\` (\`status\`);`)
+      yield* tx.run(`CREATE UNIQUE INDEX \`workflow_id_seq_idx\` ON \`workflow\` (\`id\`,\`seq\`);`)
+      yield* tx.run(`CREATE INDEX \`workflow_violation_workflow_idx\` ON \`workflow_violation\` (\`workflow_id\`);`)
+      yield* tx.run(
+        `CREATE INDEX \`workflow_violation_severity_idx\` ON \`workflow_violation\` (\`workflow_id\`,\`severity\`);`,
+      )
       yield* tx.run(`CREATE UNIQUE INDEX \`event_aggregate_seq_idx\` ON \`event\` (\`aggregate_id\`,\`seq\`);`)
       yield* tx.run(`CREATE INDEX \`event_aggregate_type_seq_idx\` ON \`event\` (\`aggregate_id\`,\`type\`,\`seq\`);`)
-      yield* tx.run(`CREATE INDEX \`goal_state_updated_at_idx\` ON \`goal_state\` (\`updated_at\`);`)
       yield* tx.run(
         `CREATE UNIQUE INDEX \`permission_project_action_resource_idx\` ON \`permission\` (\`project_id\`,\`action\`,\`resource\`);`,
       )

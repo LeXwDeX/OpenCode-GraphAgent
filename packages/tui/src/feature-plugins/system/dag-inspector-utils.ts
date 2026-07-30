@@ -1,0 +1,191 @@
+/** Pure topology helpers for the DAG inspector. Extracted for unit testing,
+ * mirroring the diff-viewer-file-tree-utils pattern in this directory. */
+
+import type { DagNode } from "@opencode-ai/sdk/v2"
+
+export type { DagNode }
+
+/**
+ * Group nodes into topological "waves": wave N contains every node whose
+ * dependencies are all satisfied by waves 0..N-1. A wave is a rendering
+ * grouping (same topological depth), NOT an execution barrier.
+ *
+ * Nodes inside a wave are sorted by name for stable rendering. Nodes that are
+ * part of a dependency cycle (or depend on a missing node) can never be
+ * satisfied and are dropped — the loop stops at the first empty wave rather
+ * than spinning forever.
+ */
+export function computeWaves(nodes: readonly DagNode[]): DagNode[][] {
+  if (nodes.length === 0) return []
+  const done = new Set<string>()
+  const remaining = new Set(nodes.map((n) => n.id))
+  const deps = new Map(nodes.map((n) => [n.id, n.depends_on]))
+  const byID = new Map(nodes.map((n) => [n.id, n]))
+  const result: DagNode[][] = []
+  while (remaining.size > 0) {
+    const wave: DagNode[] = []
+    for (const id of remaining) {
+      const d = deps.get(id) ?? []
+      if (d.every((dep) => done.has(dep) || !byID.has(dep))) {
+        const node = byID.get(id)
+        if (node) wave.push(node)
+      }
+    }
+    if (wave.length === 0) break
+    wave.sort((a, b) => a.name.localeCompare(b.name))
+    result.push(wave)
+    for (const n of wave) {
+      done.add(n.id)
+      remaining.delete(n.id)
+    }
+  }
+  return result
+}
+
+/**
+ * Visual row index of a node inside the rendered wave list, counting one row
+ * per wave header, one row per node, and one blank spacer row between waves.
+ * Used to scroll the selected node into view — valid only while every node
+ * renders as a single row.
+ */
+export function computeNodeRowIndex(layers: readonly (readonly DagNode[])[], nodeID: string): number | undefined {
+  let row = 0
+  for (const [index, layer] of layers.entries()) {
+    if (index > 0) row++ // spacer between waves
+    row++ // wave header
+    for (const node of layer) {
+      if (node.id === nodeID) return row
+      row++
+    }
+  }
+  return undefined
+}
+
+export function formatDagError(error: string) {
+  return error.replace(/^Cause\(\[Die\((.*)\)\]\)$/, "$1").replace(/^ProviderModelNotFoundError:\s*/, "")
+}
+
+/** Compact "3m 12s" duration between two epoch-millis timestamps. The SDK
+ * serializes numbers with Infinity/NaN sentinels — non-finite inputs yield
+ * no duration. */
+export function formatDagDuration(
+  startedAt: number | string | undefined,
+  completedAt: number | string | undefined,
+): string | undefined {
+  if (typeof startedAt !== "number" || !Number.isFinite(startedAt)) return undefined
+  const end = typeof completedAt === "number" && Number.isFinite(completedAt) ? completedAt : Date.now()
+  const totalSeconds = Math.max(0, Math.round((end - startedAt) / 1000))
+  const minutes = Math.floor(totalSeconds / 60)
+  const seconds = totalSeconds % 60
+  if (minutes === 0) return `${seconds}s`
+  return `${minutes}m ${seconds}s`
+}
+
+/** Single-line preview of a node's output for the detail pane. */
+export function formatDagOutputPreview(output: unknown, maxLength = 200): string | undefined {
+  if (output === undefined || output === null) return undefined
+  const text = typeof output === "string" ? output : JSON.stringify(output)
+  const flat = text.replace(/\s+/g, " ").trim()
+  if (flat === "") return undefined
+  return flat.length > maxLength ? `${flat.slice(0, maxLength)}…` : flat
+}
+
+/** Countdown to a node's absolute deadline — "3m 12s left" while budget
+ * remains, "overdue" past it. Only meaningful for nodes still executing
+ * (running/queued); terminal nodes yield no label. Tolerates the SDK's
+ * Infinity/NaN number sentinels. */
+export function formatDagDeadline(
+  status: string,
+  deadlineMs: number | string | undefined,
+  now = Date.now(),
+): string | undefined {
+  if (status !== "running" && status !== "queued") return undefined
+  if (typeof deadlineMs !== "number" || !Number.isFinite(deadlineMs)) return undefined
+  const remaining = deadlineMs - now
+  if (remaining <= 0) return "overdue"
+  const totalSeconds = Math.round(remaining / 1000)
+  const minutes = Math.floor(totalSeconds / 60)
+  const seconds = totalSeconds % 60
+  if (minutes === 0) return `${seconds}s left`
+  return `${minutes}m ${seconds}s left`
+}
+
+/** Replan history annotation — replan_attempts increments on replan restart,
+ * so any positive count means this execution replaced a failed attempt.
+ * Accepts the SDK's Infinity/NaN string sentinels (non-finite → no label). */
+export function dagNodeHistoryLabel(node: { replan_attempts: number | string }): string | undefined {
+  const attempts = Number(node.replan_attempts)
+  if (!Number.isFinite(attempts) || attempts <= 0) return undefined
+  return `restarted ×${attempts}`
+}
+
+/** Progress fraction counting completed+skipped as settled (P2-9): a skipped
+ * node is a legitimate terminal outcome (condition gates), so a gated
+ * workflow finishes at N/N instead of lying with a smaller numerator.
+ * Accepts the SDK's Infinity/NaN string sentinels (coerced via Number). */
+export function formatDagProgress(summary: {
+  nodeCount: number | string
+  completedNodes: number | string
+  skippedNodes: number | string
+}): string {
+  return `${Number(summary.completedNodes) + Number(summary.skippedNodes)}/${Number(summary.nodeCount)}`
+}
+
+/**
+ * Shared status→color mapping for every DAG surface (sidebar indicator,
+ * sidebar panel, inspector) so one status never renders in different colors
+ * across views. Accepts both workflow and node statuses. Generic over the
+ * theme's color type (RGBA at runtime).
+ */
+export function dagStatusColor<Color>(
+  theme: { success: Color; error: Color; warning: Color; text: Color; textMuted: Color },
+  status: string,
+): Color {
+  if (status === "completed") return theme.success
+  if (status === "failed") return theme.error
+  if (status === "paused" || status === "stepping") return theme.warning
+  if (status === "running") return theme.textMuted
+  if (status === "pending" || status === "queued") return theme.textMuted
+  if (status === "skipped" || status === "cancelled" || status === "aborted") return theme.textMuted
+  return theme.text
+}
+
+/** Status glyph for node rows — mirrors the todo-item ✓ vocabulary. */
+export function dagNodeGlyph(status: string): string {
+  if (status === "completed") return "✓"
+  if (status === "failed") return "✗"
+  if (status === "skipped" || status === "cancelled" || status === "aborted") return "⊘"
+  if (status === "queued") return "◌"
+  return "○"
+}
+
+export type DagControlOperation = "pause" | "resume" | "cancel" | "step"
+
+/** Whether a control operation applies to the workflow's current status.
+ * Shared by keybinding feedback and the footer's contextual hints so the
+ * hint bar never advertises an operation that would only produce a toast. */
+export function dagControlAllowed(status: string | undefined, operation: DagControlOperation): boolean {
+  if (operation === "pause" || operation === "step") return status === "running" || status === "stepping"
+  if (operation === "resume") return status === "paused" || status === "stepping"
+  return status === "running" || status === "stepping" || status === "paused"
+}
+
+export function dagControlUnavailableMessage(status: string | undefined, operation: DagControlOperation) {
+  if (dagControlAllowed(status, operation)) return undefined
+  const action =
+    operation === "pause"
+      ? "paused"
+      : operation === "resume"
+        ? "resumed"
+        : operation === "step"
+          ? "stepped"
+          : "cancelled"
+  return `Workflow is ${status ?? "unavailable"} and cannot be ${action}`
+}
+
+export function dagControlProgressMessage(operation: DagControlOperation) {
+  if (operation === "pause") return "Pausing workflow..."
+  if (operation === "resume") return "Resuming workflow..."
+  if (operation === "step") return "Stepping workflow..."
+  return "Cancelling workflow..."
+}

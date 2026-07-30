@@ -15,6 +15,7 @@ import { SessionRunState } from "@/session/run-state"
 import { SessionStatus } from "@/session/status"
 
 import { TaskTool, type TaskPromptOps } from "../../src/tool/task"
+import { WorkflowTool } from "../../src/tool/workflow"
 import { Truncate } from "@/tool/truncate"
 import { ToolRegistry } from "@/tool/registry"
 import { RuntimeFlags } from "@/effect/runtime-flags"
@@ -165,6 +166,149 @@ describe("tool.task", () => {
             description: "Zebra agent",
             mode: "subagent",
           },
+          alpha: {
+            description: "Alpha agent",
+            mode: "subagent",
+          },
+        },
+      },
+    },
+  )
+
+  it.instance(
+    "workflow description lists configured subagents in stable name order",
+    () =>
+      Effect.gen(function* () {
+        const agent = yield* Agent.Service
+        const build = yield* agent.get("build")
+        const registry = yield* ToolRegistry.Service
+        const get = Effect.fnUntraced(function* () {
+          const tools = yield* registry.tools({ ...ref, agent: build })
+          return tools.find((tool) => tool.id === WorkflowTool.id)?.description ?? ""
+        })
+        const first = yield* get()
+        const second = yield* get()
+
+        expect(first).toBe(second)
+        expect(first.indexOf("- alpha: Alpha agent")).toBeGreaterThan(-1)
+        expect(first).toContain("- alpha: Alpha agent [model: inherited]")
+        expect(first.indexOf("- zebra: Zebra agent")).toBeGreaterThan(first.indexOf("- alpha: Alpha agent"))
+      }),
+    {
+      config: {
+        agent: {
+          zebra: {
+            description: "Zebra agent",
+            mode: "subagent",
+          },
+          alpha: {
+            description: "Alpha agent",
+            mode: "subagent",
+          },
+        },
+      },
+    },
+  )
+
+  it.instance(
+    "workflow description excludes primary hidden and denied agents",
+    () =>
+      Effect.gen(function* () {
+        const agent = yield* Agent.Service
+        const build = yield* agent.get("build")
+        const registry = yield* ToolRegistry.Service
+        const description =
+          (yield* registry.tools({ ...ref, agent: build })).find((tool) => tool.id === WorkflowTool.id)?.description ?? ""
+        const taskDescription =
+          (yield* registry.tools({ ...ref, agent: build })).find((tool) => tool.id === TaskTool.id)?.description ?? ""
+
+        expect(description).toContain("- alpha: Alpha agent")
+        expect(description).not.toContain("denied-agent")
+        expect(description).not.toContain("hidden-agent")
+        expect(description).not.toContain("primary-agent")
+        expect(taskDescription).toContain("- hidden-agent: Hidden agent")
+      }),
+    {
+      config: {
+        permission: {
+          task: {
+            "*": "allow",
+            "denied-agent": "deny",
+          },
+        },
+        agent: {
+          alpha: {
+            description: "Alpha agent",
+            mode: "subagent",
+          },
+          "denied-agent": {
+            description: "Denied agent",
+            mode: "subagent",
+          },
+          "hidden-agent": {
+            description: "Hidden agent",
+            mode: "subagent",
+            hidden: true,
+          },
+          "primary-agent": {
+            description: "Primary agent",
+            mode: "primary",
+          },
+        },
+      },
+    },
+  )
+
+  it.instance(
+    "workflow description exposes concise role metadata without prompts or permissions",
+    () =>
+      Effect.gen(function* () {
+        const agent = yield* Agent.Service
+        const build = yield* agent.get("build")
+        const registry = yield* ToolRegistry.Service
+        const description =
+          (yield* registry.tools({ ...ref, agent: build })).find((tool) => tool.id === WorkflowTool.id)?.description ?? ""
+
+        expect(description).toContain("- alpha: Alpha agent [model: configured]")
+        expect(description).not.toContain("SECRET SYSTEM PROMPT")
+        expect(description).not.toContain("dangerous-command")
+      }),
+    {
+      config: {
+        agent: {
+          alpha: {
+            description: "Alpha agent",
+            mode: "subagent",
+            model: "test/test-model",
+            prompt: "SECRET SYSTEM PROMPT",
+            permission: {
+              "dangerous-command": "deny",
+            },
+          },
+        },
+      },
+    },
+  )
+
+  it.instance(
+    "workflow catalog leaves the task tool agent guidance compatible",
+    () =>
+      Effect.gen(function* () {
+        const agent = yield* Agent.Service
+        const build = yield* agent.get("build")
+        const registry = yield* ToolRegistry.Service
+        const tools = yield* registry.tools({ ...ref, agent: build })
+        const taskDescription = tools.find((tool) => tool.id === TaskTool.id)?.description ?? ""
+        const workflowDescription = tools.find((tool) => tool.id === WorkflowTool.id)?.description ?? ""
+
+        expect(taskDescription).toContain("Available agent types and the tools they have access to:")
+        expect(taskDescription).toContain("- alpha: Alpha agent")
+        expect(taskDescription).not.toContain("Available workflow worker_type values:")
+        expect(workflowDescription).toContain("Available workflow worker_type values:")
+      }),
+    {
+      config: {
+        agent: {
           alpha: {
             description: "Alpha agent",
             mode: "subagent",

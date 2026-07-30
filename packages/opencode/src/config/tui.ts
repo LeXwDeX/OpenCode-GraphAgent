@@ -14,7 +14,6 @@ import { FSUtil } from "@opencode-ai/core/fs-util"
 import { CurrentWorkingDirectory } from "./tui-cwd"
 import { ConfigPlugin } from "@/config/plugin"
 import { TuiKeybind } from "@opencode-ai/tui/config/keybind"
-import { InstallationLocal, InstallationVersion } from "@opencode-ai/core/installation/version"
 import { makeRuntime } from "@opencode-ai/core/effect/runtime"
 import { Filesystem } from "@/util/filesystem"
 import { ConfigVariable } from "@/config/variable"
@@ -237,7 +236,7 @@ export const layer = Layer.effect(
             add: [
               {
                 name: "@opencode-ai/plugin",
-                version: InstallationLocal ? undefined : InstallationVersion,
+                version: ConfigPlugin.dependencyVersion(),
               },
             ],
           })

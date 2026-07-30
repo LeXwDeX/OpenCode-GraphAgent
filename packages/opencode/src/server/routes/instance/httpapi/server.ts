@@ -11,6 +11,7 @@ import { BackgroundJob } from "@/background/job"
 import { Command } from "@/command"
 import { Config } from "@/config/config"
 import { Workspace } from "@/control-plane/workspace"
+import { Dag } from "@/dag/dag"
 import { Env } from "@/env"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Format } from "@/format"
@@ -45,7 +46,6 @@ import { Skill } from "@/skill"
 import { Discovery } from "@/skill/discovery"
 import { Snapshot } from "@/snapshot"
 import { Storage } from "@/storage/storage"
-import { Goal } from "@/goal/goal"
 import { SettingsHook } from "@/hook/settings"
 import { HookRewakeLive } from "@/hook/rewake-live"
 import { SessionHooks } from "@/hook/session-hooks"
@@ -84,6 +84,7 @@ import { eventHandlers } from "./handlers/event"
 import { configHandlers } from "./handlers/config"
 import { controlHandlers } from "./handlers/control"
 import { controlPlaneHandlers } from "./handlers/control-plane"
+import { dagHandlers } from "./handlers/dag"
 import { experimentalHandlers } from "./handlers/experimental"
 import { fileHandlers } from "./handlers/file"
 import { globalHandlers } from "./handlers/global"
@@ -162,6 +163,7 @@ const instanceApiRoutes = HttpApiBuilder.layer(InstanceHttpApi).pipe(
     sessionHandlers,
     syncHandlers,
     tuiHandlers,
+    dagHandlers,
     workspaceHandlers,
   ]),
 )
@@ -232,6 +234,7 @@ const app = LayerNode.group([
   BackgroundJob.node,
   RuntimeFlags.node,
   EventV2Bridge.node,
+  Dag.node,
   SessionRunState.node,
   SessionProcessor.node,
   SessionCompaction.node,
@@ -260,7 +263,6 @@ const app = LayerNode.group([
   ProjectV2.node,
   ProjectCopy.node,
   PtyTicket.node,
-  Goal.node,
   // SettingsHook + SessionHooks: previously defined but never wired into
   // the server app graph, so every consumer using
   // `Option.getOrUndefined(yield* Effect.serviceOption(SettingsHook.Service))`

@@ -1,5 +1,6 @@
 export * as Reference from "./reference"
 
+import { existsSync } from "fs"
 import { Context, Effect, Layer, Scope, Types } from "effect"
 import { Reference } from "@opencode-ai/schema/reference"
 import { Global } from "./global"
@@ -84,21 +85,44 @@ export const layer = Layer.effect(
             const target = Repository.cachePath(global.repos, repository)
             if (seen.has(target) && seen.get(target) !== source.branch) continue
             seen.set(target, source.branch)
-            materialized.set(
-              name,
-              new Info({
+            if (existsSync(target)) {
+              materialized.set(
                 name,
-                path: AbsolutePath.make(target),
-                description: source.description,
-                hidden: source.hidden,
-                source,
-              }),
-            )
+                new Info({
+                  name,
+                  path: AbsolutePath.make(target),
+                  description: source.description,
+                  hidden: source.hidden,
+                  source,
+                }),
+              )
+            } else {
+              yield* Effect.logWarning("reference unavailable", {
+                name,
+                repository: source.repository,
+                branch: source.branch,
+                reason: "no cached materialization",
+              })
+            }
             yield* cache.ensure({ reference: repository, branch: source.branch, refresh: true }).pipe(
+              Effect.tap((result) => {
+                materialized.set(
+                  name,
+                  new Info({
+                    name,
+                    path: AbsolutePath.make(result.localPath),
+                    description: source.description,
+                    hidden: source.hidden,
+                    source,
+                  }),
+                )
+                return events.publish(Event.Updated, {})
+              }),
               Effect.catchCause((cause) =>
-                Effect.logWarning("failed to materialize reference", {
+                Effect.logWarning("reference unavailable", {
                   name,
                   repository: source.repository,
+                  branch: source.branch,
                   cause,
                 }),
               ),

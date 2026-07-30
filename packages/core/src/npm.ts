@@ -11,12 +11,21 @@ import { LayerNode } from "./effect/layer-node"
 import { filesystem } from "./effect/layer-node-platform"
 import { makeRuntime } from "./effect/runtime"
 import { NpmConfig } from "./npm-config"
+import { PluginSdk } from "./plugin-sdk"
 
 export class InstallFailedError extends Schema.TaggedErrorClass<InstallFailedError>()("NpmInstallFailedError", {
   add: Schema.Array(Schema.String).pipe(Schema.optional),
   dir: Schema.String,
   cause: Schema.optional(Schema.Defect()),
 }) {}
+
+export class BundledPackageUnavailableError extends Schema.TaggedErrorClass<BundledPackageUnavailableError>()(
+  "NpmBundledPackageUnavailableError",
+  {
+    name: Schema.String,
+    path: Schema.String,
+  },
+) {}
 
 export interface EntryPoint {
   readonly directory: string
@@ -66,6 +75,10 @@ interface ArboristNode {
 
 interface ArboristTree {
   edgesOut: Map<string, { to?: ArboristNode }>
+}
+
+function packagePath(dir: string, name: string) {
+  return path.join(dir, "node_modules", ...name.split("/"))
 }
 
 export const layer = Layer.effect(
@@ -142,12 +155,86 @@ export const layer = Layer.effect(
       )
       if (!canWrite) return
 
-      const add = input?.add.map((pkg) => [pkg.name, pkg.version].filter(Boolean).join("@")) ?? []
+      const requested = input?.add ?? []
+      const add = requested.map((pkg) => [pkg.name, pkg.version].filter(Boolean).join("@"))
+      const remaining: typeof requested = []
+
+      for (const pkg of requested) {
+        if (pkg.name !== PluginSdk.packageName) {
+          remaining.push(pkg)
+          continue
+        }
+
+        const target = packagePath(dir, pkg.name)
+        if (yield* afs.existsSafe(target)) {
+          yield* Effect.logInfo("npm dependency source selected", {
+            source: "project-local",
+            dir,
+            package: pkg.name,
+            version: pkg.version,
+            target,
+          })
+          continue
+        }
+
+        const bundled = PluginSdk.bundledPath()
+        if (yield* afs.existsSafe(path.join(bundled, "package.json"))) {
+          yield* fs.makeDirectory(path.dirname(target), { recursive: true }).pipe(Effect.orElseSucceed(() => undefined))
+          yield* fs.copy(bundled, target).pipe(
+            Effect.tap(() =>
+              Effect.logInfo("npm dependency source selected", {
+                source: "bundled",
+                dir,
+                package: pkg.name,
+                version: pkg.version,
+                bundled,
+                target,
+              }),
+            ),
+            Effect.catch((cause) =>
+              Effect.logWarning("npm bundled dependency unavailable", {
+                source: "unavailable",
+                dir,
+                package: pkg.name,
+                version: pkg.version,
+                bundled,
+                target,
+                cause,
+              }            ).pipe(Effect.andThen(Effect.sync(() => remaining.push(pkg)))),
+            ),
+          )
+          continue
+        }
+
+        yield* Effect.logWarning("npm bundled dependency unavailable", {
+          source: "unavailable",
+          dir,
+          package: pkg.name,
+          version: pkg.version,
+          bundled,
+          cause: new BundledPackageUnavailableError({ name: pkg.name, path: bundled }),
+        })
+        remaining.push(pkg)
+      }
+
+      if (remaining.length !== requested.length) {
+        yield* fs.remove(path.join(dir, "package-lock.json")).pipe(Effect.orElseSucceed(() => undefined))
+      }
+
+      if (remaining.length) {
+        yield* Effect.logInfo("npm dependency source selected", {
+          source: "registry",
+          dir,
+          packages: remaining.map((pkg) => ({ name: pkg.name, version: pkg.version })),
+        })
+      }
+
+      const installAdd = remaining.map((pkg) => [pkg.name, pkg.version].filter(Boolean).join("@"))
       if (
         yield* Effect.gen(function* () {
           const nodeModulesExists = yield* afs.existsSafe(path.join(dir, "node_modules"))
           if (!nodeModulesExists) {
-            yield* reify({ add, dir })
+            yield* reify({ add: installAdd, dir })
             return true
           }
           return false
@@ -166,7 +253,7 @@ export const layer = Layer.effect(
           ...Object.keys(pkgAny?.devDependencies || {}),
           ...Object.keys(pkgAny?.peerDependencies || {}),
           ...Object.keys(pkgAny?.optionalDependencies || {}),
-          ...(input?.add || []).map((pkg) => pkg.name),
+          ...remaining.map((pkg) => pkg.name),
         ])
 
         const root = lockAny?.packages?.[""] || {}
@@ -179,7 +266,7 @@ export const layer = Layer.effect(
 
         for (const name of declared) {
           if (!locked.has(name)) {
-            yield* reify({ dir, add })
+            yield* reify({ dir, add: installAdd })
             return
           }
         }

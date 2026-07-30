@@ -131,13 +131,8 @@ function stateApi(sync: ReturnType<typeof useSync>): TuiPluginApi["state"] {
       todo(sessionID) {
         return sync.data.todo[sessionID] ?? []
       },
-      goal(sessionID) {
-        const g = sync.data.goal[sessionID]
-        // SDK serializes turnsUsed/maxTurns as JSON Schema number (number | "NaN" | "Infinity");
-        // at runtime these are always finite numbers from the DB. Coerce at the boundary.
-        return g
-          ? { goal: g.goal, status: g.status, turnsUsed: Number(g.turnsUsed), maxTurns: Number(g.maxTurns) }
-          : undefined
+      dag(sessionID) {
+        return sync.data.dag[sessionID] ?? []
       },
       messages(sessionID) {
         return sync.data.message[sessionID] ?? []

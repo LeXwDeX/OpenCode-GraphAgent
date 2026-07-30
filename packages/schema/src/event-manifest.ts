@@ -1,6 +1,7 @@
 export * as EventManifest from "./event-manifest"
 
 import { Catalog } from "./catalog"
+import { DagSummary } from "./dag-summary"
 import { Durable } from "./durable-event-manifest"
 import { Event } from "./event"
 import { FileSystem } from "./filesystem"
@@ -67,6 +68,7 @@ export const Definitions = Event.inventory(
   ...InstallationEvent.Definitions,
   ...featureDefinitions,
   ...SessionTodo.Event.Definitions,
+  ...DagSummary.Event.Definitions,
   ...LspEvent.Definitions,
   ...PermissionV1.Event.Definitions,
   ...TuiEvent.Definitions,

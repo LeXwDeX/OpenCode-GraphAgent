@@ -6,6 +6,7 @@ import { Effect, Layer, Option } from "effect"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Global } from "@opencode-ai/core/global"
 import { Npm } from "@opencode-ai/core/npm"
+import { PluginSdk } from "@opencode-ai/core/plugin-sdk"
 import { EffectFlock } from "@opencode-ai/core/util/effect-flock"
 import { tmpdir } from "./fixture/tmpdir"
 
@@ -87,5 +88,40 @@ describe("Npm.install", () => {
 
     await expect(fs.stat(path.join(tmp.path, "node_modules", "prod-pkg"))).resolves.toBeDefined()
     await expect(fs.stat(path.join(tmp.path, "node_modules", "dev-pkg"))).rejects.toThrow()
+  })
+
+  test("skips registry when plugin dependency already exists locally", async () => {
+    await using tmp = await tmpdir()
+    await fs.mkdir(path.join(tmp.path, "node_modules", "@opencode-ai", "plugin"), { recursive: true })
+    await writePackage(path.join(tmp.path, "node_modules", "@opencode-ai", "plugin"), { name: "@opencode-ai/plugin" })
+
+    await Effect.gen(function* () {
+      const npm = yield* Npm.Service
+      yield* npm.install(tmp.path, { add: [{ name: "@opencode-ai/plugin", version: "1.17.11-main.3" }] })
+    }).pipe(Effect.scoped, Effect.provide(npmLayer(path.join(tmp.path, "cache"))), Effect.runPromise)
+
+    await expect(fs.stat(path.join(tmp.path, "package-lock.json"))).rejects.toThrow()
+  })
+
+  test("copies bundled plugin dependency before registry fallback", async () => {
+    await using tmp = await tmpdir()
+    const bundled = path.join(tmp.path, "bundled-plugin-sdk")
+    process.env.OPENCODE_PLUGIN_SDK_PATH = bundled
+    await fs.mkdir(path.join(bundled, "src"), { recursive: true })
+    await writePackage(bundled, { name: "@opencode-ai/plugin", exports: { ".": "./src/index.ts", "./tui": "./src/tui.ts" } })
+    await Bun.write(path.join(bundled, "src", "index.ts"), "export const plugin = true\n")
+    await Bun.write(path.join(bundled, "src", "tui.ts"), "export const tui = true\n")
+
+    try {
+      await Effect.gen(function* () {
+        const npm = yield* Npm.Service
+        yield* npm.install(tmp.path, { add: [{ name: "@opencode-ai/plugin" }] })
+      }).pipe(Effect.scoped, Effect.provide(npmLayer(path.join(tmp.path, "cache"))), Effect.runPromise)
+
+      await expect(fs.stat(path.join(tmp.path, "node_modules", "@opencode-ai", "plugin", "src", "tui.ts"))).resolves.toBeDefined()
+      await expect(fs.stat(path.join(tmp.path, "package-lock.json"))).rejects.toThrow()
+    } finally {
+      delete process.env.OPENCODE_PLUGIN_SDK_PATH
+    }
   })
 })

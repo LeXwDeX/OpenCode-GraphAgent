@@ -9,7 +9,6 @@ import { SessionRevert } from "@/session/revert"
 import { SessionStatus } from "@/session/status"
 import { SessionSummary } from "@/session/summary"
 import { Todo } from "@/session/todo"
-import { SessionGoal } from "@opencode-ai/schema/session-goal"
 import { MessageID, PartID, SessionID } from "@/session/schema"
 import { Snapshot } from "@/snapshot"
 import { Schema, Struct } from "effect"
@@ -114,7 +113,6 @@ export const SessionPaths = {
   get: `${root}/:sessionID`,
   children: `${root}/:sessionID/children`,
   todo: `${root}/:sessionID/todo`,
-  goal: `${root}/:sessionID/goal`,
   hook: `${root}/:sessionID/hook`,
   hookRemove: `${root}/:sessionID/hook/:hookID`,
   diff: `${root}/:sessionID/diff`,
@@ -199,18 +197,6 @@ export const SessionApi = HttpApi.make("session")
             identifier: "session.todo",
             summary: "Get session todos",
             description: "Retrieve the todo list associated with a specific session, showing tasks and action items.",
-          }),
-        ),
-        HttpApiEndpoint.get("goal", SessionPaths.goal, {
-          params: { sessionID: SessionID },
-          query: WorkspaceRoutingQuery,
-          success: described(Schema.optional(SessionGoal.Info), "Goal state"),
-          error: [HttpApiError.BadRequest, ApiNotFoundError],
-        }).annotateMerge(
-          OpenApi.annotations({
-            identifier: "session.goal",
-            summary: "Get session goal",
-            description: "Retrieve the autonomous goal state for a session, if one is set.",
           }),
         ),
         HttpApiEndpoint.post("hookAdd", SessionPaths.hook, {

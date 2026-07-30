@@ -1,0 +1,7 @@
+Submit structured output for a DAG workflow node.
+
+This tool is only relevant when you are running as a child session of a DAG workflow node that declared an output_schema. Call this tool with a JSON object that matches the declared schema to submit your structured result.
+
+If the payload does not match the schema, the tool returns a validation error — correct the payload and call again within the same session. The result is not final until this tool succeeds.
+
+If you are not in a DAG workflow child session, this tool has no effect.

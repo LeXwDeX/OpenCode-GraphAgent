@@ -44,7 +44,6 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { SessionMessageID } from "@opencode-ai/schema/session-message-id"
-import { Goal } from "@/goal/goal"
 import { landSystemMessages } from "@/hook/trigger-result"
 
 const runtime = makeRuntime(Database.Service, Database.defaultLayer)
@@ -495,10 +494,6 @@ export const layer: Layer.Layer<
     const background = yield* BackgroundJob.Service
     const events = yield* EventV2Bridge.Service
     const flags = yield* RuntimeFlags.Service
-    // Goal cleanup is optional — Session must not require Goal at construction
-    // (that would force every Session.defaultLayer consumer to provide Goal's
-    // transitive deps). Resolved lazily via serviceOption.
-    const goalOpt = yield* Effect.serviceOption(Goal.Service)
     // SettingsHook (for the SessionEnd trigger in remove()) is likewise optional.
     // It is resolved HERE, at construction time, because that is the only point
     // at which a caller-provided SettingsHook mock/layer is in this layer's
@@ -643,10 +638,6 @@ export const layer: Layer.Layer<
             .trigger({ event: "SessionEnd", reason: "delete" }, { sessionID, transcriptPath: "" })
             .pipe(Effect.catch(() => Effect.succeed({ additionalContexts: [], systemMessages: [] })))
           yield* landSystemMessages(seResult, { sessionID })
-        }
-        // Cleanup goal state (only when Goal service is available in context)
-        if (goalOpt._tag === "Some") {
-          yield* goalOpt.value.clear(sessionID).pipe(Effect.catchCause(() => Effect.void))
         }
         yield* events.remove(sessionID)
       } catch (error) {
@@ -1100,6 +1091,6 @@ export function* listGlobal(input?: {
   }
 }
 
-export const node = LayerNode.make(layer, [BackgroundJob.node, RuntimeFlags.node, Database.node, EventV2Bridge.node, Goal.node])
+export const node = LayerNode.make(layer, [BackgroundJob.node, RuntimeFlags.node, Database.node, EventV2Bridge.node])
 
 export * as Session from "./session"

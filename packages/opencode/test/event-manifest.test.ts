@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test"
 import { SessionEvent } from "@opencode-ai/core/session/event"
 import { EventManifest as SchemaEventManifest } from "@opencode-ai/schema/event-manifest"
 import { Todo } from "@/session/todo"
-import { GoalEvent } from "@/goal/events"
+import { SessionGoal } from "@opencode-ai/schema/session-goal"
 import { EventManifest } from "@/event-manifest"
 
 describe("public event manifest", () => {
@@ -10,11 +10,11 @@ describe("public event manifest", () => {
     expect(EventManifest.Definitions).toBe(SchemaEventManifest.Definitions)
     expect(EventManifest.Latest).toBe(SchemaEventManifest.Latest)
     expect(EventManifest.Durable).toBe(SchemaEventManifest.Durable)
-    expect(EventManifest.Latest.size).toBe(91)
+    expect(EventManifest.Latest.size).toBe(92)
     expect(EventManifest.Latest.get("session.next.step.ended")).toBe(SessionEvent.Step.Ended)
     expect(EventManifest.Latest.get("todo.updated")).toBe(Todo.Event.Updated)
-    expect(EventManifest.Latest.get("goal.updated")).toBe(GoalEvent.Updated)
-    expect(EventManifest.Latest.get("goal.cleared")).toBe(GoalEvent.Cleared)
+    expect(EventManifest.Latest.get("goal.updated")).toBe(SessionGoal.Event.Updated)
+    expect(EventManifest.Latest.get("goal.cleared")).toBe(SessionGoal.Event.Cleared)
     expect(EventManifest.Latest.has("ide.installed")).toBe(false)
     expect(EventManifest.Latest.has("server.connected")).toBe(true)
     expect(EventManifest.Latest.has("global.disposed")).toBe(true)

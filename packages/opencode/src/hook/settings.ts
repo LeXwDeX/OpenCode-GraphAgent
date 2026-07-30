@@ -1729,7 +1729,7 @@ export const layer = Layer.effect(
         // InstanceState.get on every call, and the cache returns the SAME
         // state object, so the mutation is visible without invalidating the
         // cache. The finalizer closes the watcher when the instance scope is
-        // disposed (same scope-based cleanup discipline as GoalLoop.state).
+        // disposed (same scope-based cleanup discipline as DagLoop.state).
         //
         // The reload Effect computes both merged settings and scope-tagged
         // summaries in one pass; lastSummaries carries the summaries into the

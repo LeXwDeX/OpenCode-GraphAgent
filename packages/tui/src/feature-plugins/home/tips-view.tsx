@@ -186,6 +186,7 @@ const TIPS: Tip[] = [
   (shortcuts) => press(shortcuts.messagesCopy(), "to copy the assistant's last message to clipboard"),
   (shortcuts) => press(shortcuts.commandList(), "to see all available actions and commands"),
   "Run {highlight}/connect{/highlight} to add API keys for 75+ supported LLM providers",
+  "Run {highlight}/dag-flow <task>{/highlight} to start a DAG workflow, then {highlight}/dag{/highlight} to inspect it",
   (shortcuts) => `The leader key is ${shortcutText(shortcuts.leader())}; combine with other keys for quick actions`,
   (shortcuts) => press(shortcuts.modelCycleRecent(), "to quickly switch between recently used models"),
   (shortcuts) => press(shortcuts.sessionSidebarToggle(), "in a session to show or hide the sidebar panel"),

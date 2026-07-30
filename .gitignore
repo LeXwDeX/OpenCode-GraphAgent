@@ -28,10 +28,12 @@ target
 
 # Local dev files
 opencode-dev
+packages/opencode/script/config.json
 UPCOMING_CHANGELOG.md
 logs/
 *.bun-build
 tsconfig.tsbuildinfo
+
 # opencode runtime-generated local project config (created when running the built binary in a package dir)
 **/.opencode/settings.json
 
@@ -40,3 +42,10 @@ tsconfig.tsbuildinfo
 
 # hooks file
 .opencode/hooks.json
+
+# agent files
+.agents
+.claude
+.opencode/commands/
+.opencode/skills
+.qoder

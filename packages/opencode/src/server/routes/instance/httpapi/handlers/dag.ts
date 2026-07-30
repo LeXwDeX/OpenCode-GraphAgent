@@ -1,0 +1,193 @@
+import { Effect } from "effect"
+import { HttpApiBuilder } from "effect/unstable/httpapi"
+import { InstanceHttpApi } from "../api"
+import { InvalidRequestError, ConflictError, notFound } from "../errors"
+import { Dag } from "@/dag/dag"
+import { Session } from "@/session/session"
+import { SessionID } from "@/session/schema"
+import { InvalidTransitionError, TerminalViolationError } from "@opencode-ai/core/dag/core/types"
+import type { DagStore } from "@opencode-ai/core/dag/store"
+
+/** Map a DAG control op's typed transition failure into a 409 Conflict, not a 500 defect. */
+function mapTransitionConflict<Success>(effect: Effect.Effect<Success, Error>) {
+  return effect.pipe(
+    Effect.catch((error: unknown) => {
+      if (error instanceof InvalidTransitionError || error instanceof TerminalViolationError) {
+        return Effect.fail(new ConflictError({ message: error.message, resource: "workflow" }))
+      }
+      // Any other Error is re-thrown as a defect (truly unexpected — surfaces as 500).
+      return Effect.die(error)
+    }),
+  )
+}
+
+/**
+ * DAG HTTP handlers — read-only queries delegate to DagStore; control mutations
+ * delegate to Dag.Service. Same code path as the agent tool surface.
+ */
+export const dagHandlers = HttpApiBuilder.group(InstanceHttpApi, "dag", (handlers) =>
+  Effect.gen(function* () {
+    const dag = yield* Dag.Service
+    const sessions = yield* Session.Service
+
+    const wf = (r: DagStore.WorkflowRow) => ({
+      id: r.id,
+      project_id: r.projectId,
+      session_id: r.sessionId,
+      title: r.title,
+      status: r.status,
+      config: r.config,
+      seq: r.seq,
+      time_created: r.timeCreated,
+      time_updated: r.timeUpdated,
+      ...(r.startedAt !== null ? { started_at: r.startedAt } : {}),
+      ...(r.completedAt !== null ? { completed_at: r.completedAt } : {}),
+    })
+
+    const node = (r: DagStore.NodeRow) => ({
+      id: r.id,
+      workflow_id: r.workflowId,
+      name: r.name,
+      worker_type: r.workerType,
+      status: r.status,
+      required: r.required,
+      depends_on: r.dependsOn,
+      ...(r.modelId !== null ? { model_id: r.modelId } : {}),
+      ...(r.modelProviderId !== null ? { model_provider_id: r.modelProviderId } : {}),
+      ...(r.childSessionId !== null ? { child_session_id: r.childSessionId } : {}),
+      ...(r.output !== null ? { output: r.output } : {}),
+      ...(r.errorReason !== null ? { error_reason: r.errorReason } : {}),
+      ...(r.deadlineMs !== null ? { deadline_ms: r.deadlineMs } : {}),
+      replan_attempts: r.replanAttempts,
+      ...(r.startedAt !== null ? { started_at: r.startedAt } : {}),
+      ...(r.completedAt !== null ? { completed_at: r.completedAt } : {}),
+    })
+
+    const list = Effect.fn("DagHttpApi.list")(function* () {
+      const rows = yield* dag.store.listWorkflows().pipe(Effect.orDie)
+      return rows.map(wf)
+    })
+
+    const bySession = Effect.fn("DagHttpApi.bySession")(function* (ctx: { params: { sessionID: string } }) {
+      const rows = yield* dag.store.listBySession(ctx.params.sessionID).pipe(Effect.orDie)
+      return rows.map(wf)
+    })
+
+    const summary = Effect.fn("DagHttpApi.summary")(function* (ctx: { params: { sessionID: string } }) {
+      const summaries = yield* dag.store.getWorkflowSummaries(ctx.params.sessionID).pipe(Effect.orDie)
+      return summaries.map((s) => ({
+        id: s.id,
+        title: s.title,
+        status: s.status,
+        nodeCount: s.nodeCount,
+        completedNodes: s.completedNodes,
+        runningNodes: s.runningNodes,
+        failedNodes: s.failedNodes,
+        skippedNodes: s.skippedNodes,
+        queuedNodes: s.queuedNodes,
+      }))
+    })
+
+    const detail = Effect.fn("DagHttpApi.detail")(function* (ctx: { params: { dagID: string } }) {
+      const row = yield* dag.store.getWorkflow(ctx.params.dagID).pipe(Effect.orDie)
+      if (!row) return yield* Effect.fail(notFound(`Workflow not found: ${ctx.params.dagID}`))
+      return wf(row)
+    })
+
+    const nodes = Effect.fn("DagHttpApi.nodes")(function* (ctx: { params: { dagID: string } }) {
+      const rows = yield* dag.store.getNodes(ctx.params.dagID).pipe(Effect.orDie)
+      return rows.map(node)
+    })
+
+    const nodeDetail = Effect.fn("DagHttpApi.nodeDetail")(function* (ctx: { params: { dagID: string; nodeID: string } }) {
+      const row = yield* dag.store.getNode(ctx.params.dagID, ctx.params.nodeID).pipe(Effect.orDie)
+      if (!row) return yield* Effect.fail(notFound(`Node not found: ${ctx.params.nodeID}`))
+      return node(row)
+    })
+
+    const start = Effect.fn("DagHttpApi.start")(function* (ctx: { payload: { session_id: string; title?: string; config: unknown } }) {
+      const config = ctx.payload.config
+      if (!config || typeof config !== "object" || !Array.isArray((config as Record<string, unknown>).nodes)) {
+        return yield* Effect.fail(new InvalidRequestError({ message: "start requires 'config' with a 'nodes' array" }))
+      }
+      const session = yield* sessions.get(SessionID.make(ctx.payload.session_id)).pipe(
+        Effect.catch(() => Effect.fail(notFound(`Session not found: ${ctx.payload.session_id}`))),
+      )
+      const cfg = config as Dag.WorkflowConfig
+      // Same code path as the workflow tool's start action — create validates
+      // the config (duplicate ids / dangling deps / condition refs / ceiling)
+      // and fail-fast errors surface as 400, not 500 defects.
+      const dagID = yield* dag.create({
+        projectID: session.projectID,
+        sessionID: session.id,
+        title: ctx.payload.title ?? cfg.name,
+        config: cfg,
+      }).pipe(
+        Effect.catch((error) => Effect.fail(new InvalidRequestError({ message: error.message }))),
+      )
+      const row = yield* dag.store.getWorkflow(dagID).pipe(Effect.orDie)
+      if (!row) return yield* Effect.die(new Error(`created workflow missing from store: ${dagID}`))
+      return wf(row)
+    })
+
+    const control = Effect.fn("DagHttpApi.control")(function* (ctx: { params: { dagID: string }; payload: { operation: string; fragment?: unknown } }) {
+      const { dagID } = ctx.params
+      const op = ctx.payload.operation
+
+      // Pre-check existence so non-existent workflows return 404, not a 500 defect.
+      const existing = yield* dag.store.getWorkflow(dagID).pipe(Effect.orDie)
+      if (!existing) return yield* Effect.fail(notFound(`Workflow not found: ${dagID}`))
+
+      // Control ops may fail with InvalidTransitionError/TerminalViolationError for
+      // semantically invalid operations (e.g. pause on a completed workflow). Map those
+      // to 409 Conflict instead of letting .orDie promote them to 500 defects.
+      if (op === "pause") {
+        yield* mapTransitionConflict(dag.pause(dagID))
+        return { status: "ok" }
+      }
+      if (op === "step") {
+        yield* mapTransitionConflict(dag.step(dagID))
+        return { status: "ok" }
+      }
+      if (op === "resume") {
+        yield* mapTransitionConflict(dag.resume(dagID))
+        return { status: "ok" }
+      }
+      if (op === "cancel") {
+        yield* mapTransitionConflict(dag.cancel(dagID))
+        return { status: "ok" }
+      }
+      if (op === "complete") {
+        yield* mapTransitionConflict(dag.complete(dagID))
+        return { status: "ok" }
+      }
+      if (op === "replan") {
+        const fragment = ctx.payload.fragment
+        if (!fragment || typeof fragment !== "object" || !Array.isArray((fragment as Record<string, unknown>).nodes)) {
+          return yield* Effect.fail(new InvalidRequestError({ message: "replan requires 'fragment' with a 'nodes' array" }))
+        }
+        const result = yield* mapTransitionConflict(dag.replan(dagID, fragment as { nodes: Dag.NodeConfig[] }))
+        return { status: "ok", ...result }
+      }
+      if (op === "extend") {
+        const fragment = ctx.payload.fragment
+        if (!fragment || typeof fragment !== "object" || !Array.isArray((fragment as Record<string, unknown>).nodes)) {
+          return yield* Effect.fail(new InvalidRequestError({ message: "extend requires 'fragment' with a 'nodes' array" }))
+        }
+        const result = yield* mapTransitionConflict(dag.extend(dagID, (fragment as { nodes: Dag.NodeConfig[] }).nodes))
+        return { status: "ok", ...result }
+      }
+      return yield* Effect.fail(new InvalidRequestError({ message: `Unknown operation: ${op}` }))
+    })
+
+    return handlers
+      .handle("list", list)
+      .handle("start", start)
+      .handle("bySession", bySession)
+      .handle("summary", summary)
+      .handle("detail", detail)
+      .handle("nodes", nodes)
+      .handle("nodeDetail", nodeDetail)
+      .handle("control", control)
+  }),
+)

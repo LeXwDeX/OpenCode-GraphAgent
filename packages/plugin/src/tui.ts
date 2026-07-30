@@ -15,6 +15,7 @@ import type {
   SessionStatus,
   TextPart,
   Config as SdkConfig,
+  DagWorkflowSummary,
 } from "@opencode-ai/sdk/v2"
 import type { CliRenderer, KeyEvent, RGBA, Renderable, SlotMode } from "@opentui/core"
 import type { Binding, Keymap } from "@opentui/keymap"
@@ -388,11 +389,11 @@ export type TuiState = {
     get: (sessionID: string) => Session | undefined
     diff: (sessionID: string) => ReadonlyArray<TuiSidebarFileItem>
     todo: (sessionID: string) => ReadonlyArray<TuiSidebarTodoItem>
-    goal: (sessionID: string) => TuiSidebarGoalItem | undefined
     messages: (sessionID: string) => ReadonlyArray<Message>
     status: (sessionID: string) => SessionStatus | undefined
     permission: (sessionID: string) => ReadonlyArray<PermissionRequest>
     question: (sessionID: string) => ReadonlyArray<QuestionRequest>
+    dag: (sessionID: string) => ReadonlyArray<TuiSidebarDagItem>
   }
   part: (messageID: string) => ReadonlyArray<Part>
   lsp: () => ReadonlyArray<TuiSidebarLspItem>
@@ -447,18 +448,13 @@ export type TuiSidebarLspItem = Pick<LspStatus, "id" | "root" | "status">
 
 export type TuiSidebarTodoItem = Pick<Todo, "content" | "status">
 
-export type TuiSidebarGoalItem = {
-  goal: string
-  status: string
-  turnsUsed: number
-  maxTurns: number
-}
-
 export type TuiSidebarFileItem = {
   file: string
   additions: number
   deletions: number
 }
+
+export type TuiSidebarDagItem = DagWorkflowSummary
 
 export type TuiHostSlotMap = {
   app: {}

@@ -18,6 +18,8 @@
   "exports": {
     "./session/runner": "./src/session/runner/index.ts",
     "./system-context": "./src/system-context/index.ts",
+    "./dag/core/*": "./src/dag/core/*.ts",
+    "./dag/*": "./src/dag/*.ts",
     "./*": "./src/*.ts"
   },
   "imports": {

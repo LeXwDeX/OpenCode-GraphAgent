@@ -46,6 +46,7 @@ import { SystemPrompt } from "../../src/session/system"
 import { Shell } from "@opencode-ai/core/shell"
 import { Snapshot } from "../../src/snapshot"
 import { ToolRegistry } from "@/tool/registry"
+import { Dag } from "@/dag/dag"
 import { Truncate } from "@/tool/truncate"
 import { SettingsHook, type HookPayload } from "@/hook/settings"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
@@ -180,12 +181,23 @@ let stopBlockAlways = false
 let stopSystemMessages: string[] = []
 let stopAdditionalContexts: string[] = []
 let subagentStopBlockAlways = false
+let userPromptAdmissionStarted: Deferred.Deferred<void> | undefined
+let userPromptAdmissionGate: Deferred.Deferred<void> | undefined
 const hookRecorderLayer = Layer.succeed(
   SettingsHook.Service,
   SettingsHook.Service.of({
     trigger: (payload) =>
-      Effect.sync(() => {
+      Effect.gen(function* () {
         hookRecorded.push(payload)
+        if (
+          payload.event === "UserPromptSubmit"
+          && payload.prompt.includes("hold-human-admission")
+          && userPromptAdmissionStarted
+          && userPromptAdmissionGate
+        ) {
+          yield* Deferred.succeed(userPromptAdmissionStarted, undefined).pipe(Effect.ignore)
+          yield* Deferred.await(userPromptAdmissionGate)
+        }
         let blocked: { reason: string; command: string } | undefined
         if (payload.event === "Stop") {
           if (stopBlockAlways || stopBlockNext > 0) {
@@ -242,6 +254,7 @@ function makePrompt(input?: { mcpInstructions?: MCP.ServerInstructions[]; proces
   const todo = Todo.layer.pipe(Layer.provideMerge(deps))
   const registry = ToolRegistry.layer.pipe(
     Layer.provide(Skill.defaultLayer),
+    Layer.provide(Dag.defaultLayer),
     Layer.provide(FetchHttpClient.layer),
     Layer.provide(CrossSpawnSpawner.defaultLayer),
     Layer.provide(Git.defaultLayer),
@@ -1674,6 +1687,150 @@ it.instance("concurrent loop callers all receive same error result", () =>
   }),
 )
 
+it.instance("idle-only synthetic admission cannot overtake a concurrent human prompt", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+    const admissionStarted = yield* Deferred.make<void>()
+    const admissionGate = yield* Deferred.make<void>()
+    userPromptAdmissionStarted = admissionStarted
+    userPromptAdmissionGate = admissionGate
+    yield* Effect.addFinalizer(() =>
+      Effect.sync(() => {
+        userPromptAdmissionStarted = undefined
+        userPromptAdmissionGate = undefined
+      }),
+    )
+    yield* llm.hang
+
+    const human = yield* prompt
+      .prompt({
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        parts: [{ type: "text", text: "hold-human-admission" }],
+      })
+      .pipe(Effect.forkChild({ startImmediately: true }))
+    yield* awaitWithTimeout(
+      Deferred.await(admissionStarted),
+      "human prompt did not enter admission",
+    )
+
+    const wake = yield* prompt
+      .promptIfIdle({
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        parts: [{ type: "text", text: "synthetic DAG wake", synthetic: true }],
+      })
+      .pipe(Effect.forkChild({ startImmediately: true }))
+
+    yield* Deferred.succeed(admissionGate, undefined)
+    const wakeResult = yield* awaitWithTimeout(
+      Fiber.join(wake),
+      "idle-only prompt did not reject after human admission won",
+    )
+    expect(wakeResult._tag).toBe("None")
+    expect(
+      (yield* sessions.messages({ sessionID: chat.id }))
+        .flatMap((message) => message.parts)
+        .some((part) => part.type === "text" && part.text === "synthetic DAG wake"),
+    ).toBe(false)
+
+    yield* llm.wait(1)
+    yield* prompt.cancel(chat.id)
+    yield* Fiber.await(human)
+  }),
+)
+
+it.instance("interrupting idle-only admission releases the reserved runner", () =>
+  Effect.gen(function* () {
+    const { prompt, run, chat } = yield* boot()
+    const admissionStarted = yield* Deferred.make<void>()
+    const admissionGate = yield* Deferred.make<void>()
+    userPromptAdmissionStarted = admissionStarted
+    userPromptAdmissionGate = admissionGate
+    yield* Effect.addFinalizer(() =>
+      Deferred.succeed(admissionGate, undefined).pipe(
+        Effect.ignore,
+        Effect.andThen(
+          Effect.sync(() => {
+            userPromptAdmissionStarted = undefined
+            userPromptAdmissionGate = undefined
+          }),
+        ),
+      ),
+    )
+
+    const wake = yield* prompt
+      .promptIfIdle({
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        parts: [{ type: "text", text: "hold-human-admission", synthetic: true }],
+      })
+      .pipe(Effect.forkChild({ startImmediately: true }))
+    yield* awaitWithTimeout(
+      Deferred.await(admissionStarted),
+      "idle-only prompt did not enter admission",
+    )
+
+    yield* Fiber.interrupt(wake)
+    yield* pollWithTimeout(
+      run.assertNotBusy(chat.id).pipe(
+        Effect.match({
+          onFailure: () => undefined,
+          onSuccess: () => true as const,
+        }),
+      ),
+      "interrupted idle-only admission left the runner busy",
+      "1 second",
+    )
+  }),
+)
+
+it.instance("idle-only prompt resolves only after the full provider turn completes", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+    let releaseTurn: (value: unknown) => void = () => {}
+    yield* llm.hold("wake handled", new Promise((resolve) => {
+      releaseTurn = resolve
+    }))
+
+    const wake = yield* prompt
+      .promptIfIdle({
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        parts: [{ type: "text", text: "synthetic DAG wake", synthetic: true }],
+      })
+      .pipe(Effect.forkChild({ startImmediately: true }))
+    yield* awaitWithTimeout(llm.wait(1), "idle-only prompt did not reach the provider")
+
+    // The DAG orchestrator-unresponsive net (DagLoop.tryDeliverWake) re-reads
+    // the wake batch as soon as promptIfIdle resolves and fails the workflow
+    // if it still looks stalled. That judgement is only sound while
+    // promptIfIdle waits for the FULL provider turn (runLoop) — resolving
+    // after admission alone would create a mis-kill window. Pin the contract.
+    const early = yield* Fiber.join(wake).pipe(
+      Effect.timeoutOrElse({ duration: "250 millis", orElse: () => Effect.succeed("still-running" as const) }),
+    )
+    expect(early).toBe("still-running")
+
+    releaseTurn(undefined)
+    const result = yield* awaitWithTimeout(
+      Fiber.join(wake),
+      "idle-only prompt did not resolve after turn completion",
+    )
+    expect(result._tag).toBe("Some")
+  }),
+)
+
 it.instance("prompt submitted during an active run is included in the next LLM input", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig(providerCfg)
@@ -2086,6 +2243,38 @@ unix(
       }),
     ),
   30_000,
+)
+
+it.instance("stores the slash invocation as visible text and hides the expanded command template", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig((url) => ({
+      ...providerCfg(url),
+      command: {
+        probe: {
+          template: "Expanded command instructions:\n$ARGUMENTS",
+        },
+      },
+    }))
+    const { prompt, sessions, chat } = yield* boot()
+    yield* llm.text("done")
+
+    yield* prompt.command({
+      sessionID: chat.id,
+      command: "probe",
+      arguments: "inspect layout",
+    })
+
+    const user = (yield* sessions.messages({ sessionID: chat.id })).find((message) => message.info.role === "user")
+    const texts = user?.parts.filter((part): part is SessionV1.TextPart => part.type === "text") ?? []
+
+    expect(texts.filter((part) => !part.synthetic).map((part) => part.text)).toEqual([
+      "/probe inspect layout",
+    ])
+    expect(texts.filter((part) => part.synthetic).map((part) => part.text)).toContain(
+      "Expanded command instructions:\ninspect layout",
+    )
+    expect(JSON.stringify(yield* llm.inputs)).toContain("Expanded command instructions")
+  }),
 )
 
 unixNoLLMServer(

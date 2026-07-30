@@ -1,9 +1,11 @@
-import { Cause, Deferred, Effect, Exit, Fiber, Latch, Schema, Scope, SynchronizedRef } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber, Latch, Option, Schema, Scope, SynchronizedRef } from "effect"
 
 export interface Runner<A, E = never> {
   readonly state: State<A, E>
   readonly busy: boolean
   readonly ensureRunning: (work: Effect.Effect<A, E>) => Effect.Effect<A, E>
+  readonly ensureRunningHandle: (work: Effect.Effect<A, E>) => Effect.Effect<Effect.Effect<A, E>>
+  readonly startIfIdle: (work: Effect.Effect<A, E>) => Effect.Effect<Option.Option<Effect.Effect<A, E>>>
   readonly startShell: (work: Effect.Effect<A, E>, ready?: Latch.Latch) => Effect.Effect<A, E | Busy>
   readonly cancel: Effect.Effect<void>
 }
@@ -112,7 +114,7 @@ export const make = <A, E = never>(
       yield* Fiber.interrupt(shell.fiber)
     })
 
-  const ensureRunning = (work: Effect.Effect<A, E>) =>
+  const ensureRunningHandle = (work: Effect.Effect<A, E>) =>
     SynchronizedRef.modifyEffect(
       ref,
       Effect.fnUntraced(function* (st) {
@@ -129,13 +131,28 @@ export const make = <A, E = never>(
             return [awaitDone(run.done), { _tag: "ShellThenRun", shell: st.shell, run }] as const
           }
           case "Idle": {
+            yield* onBusy
             const done = yield* Deferred.make<A, E | Cancelled>()
             const run = yield* startRun(work, done)
             return [awaitDone(done), { _tag: "Running", run }] as const
           }
         }
       }),
-    ).pipe(Effect.flatten)
+    )
+
+  const ensureRunning = (work: Effect.Effect<A, E>) => ensureRunningHandle(work).pipe(Effect.flatten)
+
+  const startIfIdle = (work: Effect.Effect<A, E>) =>
+    SynchronizedRef.modifyEffect(
+      ref,
+      Effect.fnUntraced(function* (st) {
+        if (st._tag !== "Idle") return [Option.none<Effect.Effect<A, E>>(), st] as const
+        yield* onBusy
+        const done = yield* Deferred.make<A, E | Cancelled>()
+        const run = yield* startRun(work, done)
+        return [Option.some(awaitDone(done)), { _tag: "Running", run }] as const
+      }),
+    )
 
   const startShell = (work: Effect.Effect<A, E>, ready?: Latch.Latch): Effect.Effect<A, E | Busy> =>
     SynchronizedRef.modifyEffect(
@@ -209,6 +226,8 @@ export const make = <A, E = never>(
       return state()._tag !== "Idle"
     },
     ensureRunning,
+    ensureRunningHandle,
+    startIfIdle,
     startShell,
     cancel,
   }

@@ -1,0 +1,26 @@
+# Start a DAG Workflow
+
+The user invoked `/dag-flow` to start a new orchestration task.
+
+<dag-flow-task>
+$ARGUMENTS
+</dag-flow-task>
+
+If the content inside `<dag-flow-task>` is empty or contains only whitespace, ask the user what task should be orchestrated. Do not call the `workflow` tool until the user provides a task.
+
+For a non-empty task:
+
+1. Before starting, classify the task as `brainstorm`, `review`, or `develop`, then compile only the phases and dependency edges that profile actually needs.
+2. During compilation, preserve every user constraint in the graph, including named `@agent` roles, exact model selections, read-only or "Do not modify files" scope, required checks, forbidden actions, and requested deliverables.
+3. Resolve capability slots against the eligible configured worker types shown in the `workflow` tool description. Do not invent a missing role or model; if a required capability cannot be resolved, do not start and report the gap.
+4. Scale the graph to the task's blast radius. A small, well-bounded target gets the smallest useful dependency graph. A large or system-level target (an entire module, subsystem, or codebase) is never satisfied by a single wave of parallel opinions: stage exploration, independent analysis, evidence verification, and synthesis as separate dependent waves. Keep independent viewpoints or work packages parallel and use real fan-in nodes for synthesis, arbitration, integration, and final reporting.
+5. For a large-target review or audit, require every reviewer to cite file:line evidence and to mark claims it could not verify. Insert a verification wave between the reviewers and the arbiter that checks disputed or unverified claims against the actual code, so the arbiter rules on verified findings only. Give the arbiter `report_to_parent: true` with a normalized verdict and `next_action`; on `REVISE` or `REJECT`, drive bounded concurrent deep-dive nodes into the confirmed problem areas via `control(replan)` or `extend` instead of ending the orchestration at the arbiter's report.
+6. Call the `workflow` tool with `action=start` in this response. Merely printing a plan, graph, JSON, or YAML does not mean a workflow was started.
+7. Do not claim the workflow is running unless the tool call succeeds.
+8. On success, report the exact Workflow ID and initial state returned by the tool, then tell the user to run `/dag` for live inspection.
+9. The workflow runs asynchronously and wakes this parent session when attention or a terminal result is ready. Do not poll it with `action=status`, sleep, retry, or loop merely to wait. End the current response after the brief success report.
+10. On failure, state that the workflow was not started and report the actual error. Never invent a Workflow ID.
+11. Do not start replacement workflows merely to repair an orchestration mistake. Report the failure and its exact cause unless the user explicitly asked for automatic retries.
+12. A completed aggregate node must actually contain the requested synthesis. Never describe unresolved placeholders or an aggregate-node error message as a successful final result.
+
+Use the orchestration guidance below to design and manage the workflow.

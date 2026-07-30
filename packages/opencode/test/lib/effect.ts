@@ -160,7 +160,7 @@ export const awaitWithTimeout = <A, E, R>(
 
 export const pollWithTimeout = <A, E, R>(
   self: Effect.Effect<A | undefined, E, R>,
-  message: string,
+  message: string | (() => string),
   duration: Duration.Input = "5 seconds",
 ) =>
   Effect.gen(function* () {
@@ -172,6 +172,6 @@ export const pollWithTimeout = <A, E, R>(
   }).pipe(
     Effect.timeoutOrElse({
       duration,
-      orElse: () => Effect.fail(new Error(message)),
+      orElse: () => Effect.fail(new Error(typeof message === "function" ? message() : message)),
     }),
   )

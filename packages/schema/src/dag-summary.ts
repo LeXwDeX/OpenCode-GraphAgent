@@ -1,0 +1,39 @@
+export * as DagSummary from "./dag-summary"
+
+import { Schema } from "effect"
+import { define, inventory } from "./event"
+import { SessionID } from "./session-id"
+
+/** Aggregated per-workflow progress for TUI display. Mirrors DagStore.WorkflowSummary. */
+export const WorkflowSummary = Schema.Struct({
+  id: Schema.String,
+  title: Schema.String,
+  status: Schema.String,
+  nodeCount: Schema.Number,
+  completedNodes: Schema.Number,
+  runningNodes: Schema.Number,
+  failedNodes: Schema.Number,
+  // P2-9: skipped is a legitimate terminal state (condition gates) — progress
+  // displays count completed+skipped as settled so a gated workflow doesn't
+  // finish with a "3/9" denominator lie. queued surfaces true concurrency.
+  skippedNodes: Schema.Number,
+  queuedNodes: Schema.Number,
+}).annotate({ identifier: "DagWorkflowSummary" })
+export type WorkflowSummary = typeof WorkflowSummary.Type
+
+/**
+ * Ephemeral (non-durable) event emitted by the stateless summary publisher
+ * (packages/opencode/src/dag/runtime/summary-publisher.ts). Carries the full
+ * `WorkflowSummary[]` for a session, recomputed fresh from DagStore on every
+ * emission. NOT registered in the durable-event manifest — consumers must
+ * tolerate missed events during disconnects (the TUI re-fetches on bootstrap
+ * as the safety net).
+ */
+const Updated = define({
+  type: "dag.workflow.summary.updated",
+  schema: {
+    sessionID: SessionID,
+    summaries: Schema.Array(WorkflowSummary),
+  },
+})
+export const Event = { Updated, Definitions: inventory(Updated) }

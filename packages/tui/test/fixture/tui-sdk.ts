@@ -17,6 +17,7 @@ export function eventSource(): EventSource {
 
 export function createEventSource() {
   let fn: ((event: GlobalEvent) => void) | undefined
+  let reconnectFns = new Set<() => void>()
   let stream: ReadableStreamDefaultController<Uint8Array> | undefined
   const pending: Uint8Array[] = []
   return {
@@ -25,6 +26,12 @@ export function createEventSource() {
         fn = handler
         return () => {
           if (fn === handler) fn = undefined
+        }
+      },
+      onReconnect: (handler: () => void) => {
+        reconnectFns.add(handler)
+        return () => {
+          reconnectFns.delete(handler)
         }
       },
     } satisfies EventSource,
@@ -41,6 +48,9 @@ export function createEventSource() {
       )
       if (stream) return stream.enqueue(chunk)
       pending.push(chunk)
+    },
+    reconnect() {
+      for (const handler of reconnectFns) handler()
     },
     response() {
       return new Response(

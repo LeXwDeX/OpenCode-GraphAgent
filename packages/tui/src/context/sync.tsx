@@ -19,8 +19,10 @@ import type {
   VcsInfo,
   SnapshotFileDiff,
   ConsoleState,
-  Goal,
+  DagWorkflowSummary,
 } from "@opencode-ai/sdk/v2"
+
+export type { DagWorkflowSummary }
 import { createStore, produce, reconcile } from "solid-js/store"
 import { useProject } from "./project"
 import { useEvent } from "./event"
@@ -29,7 +31,7 @@ import { useTuiStartup } from "./runtime"
 import { createSimpleContext } from "./helper"
 import { useExit } from "./exit"
 import { useArgs } from "./args"
-import { batch, onMount } from "solid-js"
+import { batch, onCleanup, onMount } from "solid-js"
 import path from "path"
 import { useKV } from "./kv"
 import { TuiLog } from "../util/log"
@@ -90,9 +92,6 @@ export const {
       todo: {
         [sessionID: string]: Todo[]
       }
-      goal: {
-        [sessionID: string]: Goal | undefined
-      }
       message: {
         [sessionID: string]: Message[]
       }
@@ -108,6 +107,9 @@ export const {
       }
       formatter: FormatterStatus[]
       vcs: VcsInfo | undefined
+      dag: {
+        [sessionID: string]: DagWorkflowSummary[]
+      }
     }>({
       provider_next: {
         all: [],
@@ -131,7 +133,6 @@ export const {
       session_status: {},
       session_diff: {},
       todo: {},
-      goal: {},
       message: {},
       part: {},
       lsp: [],
@@ -139,6 +140,7 @@ export const {
       mcp_resource: {},
       formatter: [],
       vcs: undefined,
+      dag: {},
     })
 
     const event = useEvent()
@@ -255,12 +257,12 @@ export const {
           setStore("todo", event.properties.sessionID, event.properties.todos)
           break
 
-        case "goal.updated":
-          setStore("goal", event.properties.sessionID, event.properties.goal)
-          break
-
-        case "goal.cleared":
-          setStore("goal", event.properties.sessionID, undefined)
+        // ── DAG workflow summary ────────────────────────────────────
+        // Stateless derived-view publisher (server-side) emits the full
+        // WorkflowSummary[] for a session whenever any dag.* event changes
+        // its visible progress. We just store it — no client-side aggregation.
+        case "dag.workflow.summary.updated":
+          setStore("dag", event.properties.sessionID, event.properties.summaries)
           break
 
         case "session.diff":
@@ -530,6 +532,21 @@ export const {
             sdk.client.provider.auth({ workspace }).then((x) => setStore("provider_auth", reconcile(x.data ?? {}))),
             sdk.client.vcs.get({ workspace }).then((x) => setStore("vcs", reconcile(x.data))),
             project.workspace.sync(),
+            // DAG summaries: fetch per visible session as the initial baseline.
+            // The summary publisher's ephemeral events keep these fresh thereafter;
+            // this fetch is the safety net for events missed before subscribe.
+            // Chained off sessionListPromise so store.session is populated first,
+            // and runs on both fresh start and --continue.
+            sessionListPromise.then((sessions) =>
+              Promise.all(
+                sessions.map((s) =>
+                  sdk.client.dag
+                    .summary({ sessionID: s.id, workspace })
+                    .then((x) => setStore("dag", s.id, reconcile(x.data ?? [])))
+                    .catch(() => {}),
+                ),
+              ),
+            ),
           ]).then(() => {
             setStore("status", "complete")
           })
@@ -548,8 +565,42 @@ export const {
         })
     }
 
+    // Reconnect recovery for DAG summaries: the summary publisher emits
+    // ephemeral events that are not durable. When the SSE stream reconnects,
+    // any events missed during the disconnect are unrecoverable by replay.
+    // This snapshots every session already represented in `store.dag` (the
+    // exact recovery set, not the visible-session query used by bootstrap)
+    // and replaces each slice with a fresh complete response. Deduplicated
+    // against an in-flight flag so rapid reconnects don't stack requests.
+    const refreshDagSummaries = (): Promise<void> => {
+      const sessionIDs = Object.keys(store.dag)
+      if (sessionIDs.length === 0) return Promise.resolve()
+      const workspace = project.workspace.current()
+      return Promise.all(
+        sessionIDs.map((sessionID) =>
+          sdk.client.dag
+            .summary({ sessionID, workspace })
+            .then((x) => setStore("dag", sessionID, reconcile(x.data ?? [])))
+            .catch(() => {}),
+        ),
+      ).then(() => undefined)
+    }
+
+    let dagReconnectInFlight = false
+    const unsubscribeReconnect = sdk.event.on("reconnected", () => {
+      if (dagReconnectInFlight) return
+      dagReconnectInFlight = true
+      refreshDagSummaries().finally(() => {
+        dagReconnectInFlight = false
+      })
+    })
+
     onMount(() => {
       void bootstrap()
+    })
+
+    onCleanup(() => {
+      unsubscribeReconnect()
     })
 
     const result = {
@@ -595,12 +646,11 @@ export const {
           const tracker = { messages: new Set<string>(), parts: new Set<string>() }
           hydratingSessions.set(sessionID, tracker)
           const task = (async () => {
-            const [session, messages, todo, diff, goal] = await Promise.all([
+            const [session, messages, todo, diff] = await Promise.all([
               sdk.client.session.get({ sessionID }, { throwOnError: true }),
               sdk.client.session.messages({ sessionID, limit: 100 }),
               sdk.client.session.todo({ sessionID }),
               sdk.client.session.diff({ sessionID }),
-              sdk.client.session.goal({ sessionID }).catch(() => ({ data: undefined })),
             ])
             setStore(
               produce((draft) => {
@@ -608,7 +658,6 @@ export const {
                 if (match.found) draft.session[match.index] = session.data!
                 if (!match.found) draft.session.splice(match.index, 0, session.data!)
                 draft.todo[sessionID] = todo.data ?? []
-                draft.goal[sessionID] = goal.data ?? undefined
                 const currentMessages = draft.message[sessionID] ?? []
                 const infos = (messages.data ?? []).flatMap((message) => {
                   if (!tracker.messages.has(message.info.id)) return [message.info]

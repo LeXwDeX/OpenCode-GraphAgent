@@ -4,7 +4,7 @@ import { fileURLToPath } from "url"
 import path from "path"
 import { SqliteClient } from "@effect/sql-sqlite-bun"
 import { EffectDrizzleSqlite } from "@opencode-ai/effect-drizzle-sqlite"
-import { Effect, Layer } from "effect"
+import { Effect, Exit, Layer } from "effect"
 import { eq, inArray, sql } from "drizzle-orm"
 import { DatabaseMigration } from "@opencode-ai/core/database/migration"
 import { migrations } from "@opencode-ai/core/database/migration.gen"
@@ -15,6 +15,9 @@ import eventSourcedSessionInputMigration from "@opencode-ai/core/database/migrat
 import contextEpochAgentMigration from "@opencode-ai/core/database/migration/20260605042240_add_context_epoch_agent"
 import simplifyIntegrationCredentialsMigration from "@opencode-ai/core/database/migration/20260611192811_lush_chimera"
 import simplifySessionInputMigration from "@opencode-ai/core/database/migration/20260622202450_simplify_session_input"
+import capturedOutputMigration from "@opencode-ai/core/database/migration/20260715035022_captured_output"
+import fearlessCammiMigration from "@opencode-ai/core/database/migration/20260717034735_fearless_cammi"
+import dagWorkflowNodeIdentityMigration from "@opencode-ai/core/database/migration/20260720013828_dag-workflow-node-identity"
 import { EventV2 } from "@opencode-ai/core/event"
 import { ProjectV2 } from "@opencode-ai/core/project"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
@@ -93,6 +96,146 @@ describe("DatabaseMigration", () => {
           { name: "session_message_session_time_created_id_idx" },
           { name: "session_message_session_type_seq_idx" },
         ])
+      }),
+    )
+  })
+
+  test("upgrades DAG node storage without duplicate columns or cross-workflow collisions", async () => {
+    await run(
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        yield* db.run(sql`CREATE TABLE workflow (id text PRIMARY KEY)`)
+        yield* db.run(sql`
+          CREATE TABLE workflow_node (
+            id text PRIMARY KEY,
+            workflow_id text NOT NULL,
+            name text NOT NULL,
+            worker_type text NOT NULL,
+            status text NOT NULL,
+            required integer NOT NULL DEFAULT 1,
+            depends_on text NOT NULL,
+            model_id text,
+            model_provider_id text,
+            child_session_id text,
+            output text,
+            error_reason text,
+            deadline_ms integer,
+            wake_eligible integer NOT NULL DEFAULT false,
+            wake_reported integer NOT NULL DEFAULT false,
+            replan_attempts integer NOT NULL DEFAULT 0,
+            seq integer NOT NULL,
+            started_at integer,
+            completed_at integer,
+            time_created integer NOT NULL,
+            time_updated integer NOT NULL
+          )
+        `)
+        yield* db.run(sql`CREATE TABLE goal_state (id text PRIMARY KEY)`)
+        yield* db.run(sql`CREATE INDEX goal_state_updated_at_idx ON goal_state (id)`)
+        yield* db.run(sql`INSERT INTO workflow (id) VALUES ('dag-one'), ('dag-two')`)
+        yield* db.run(sql`
+          INSERT INTO workflow_node (id, workflow_id, name, worker_type, status, required, depends_on, seq, time_created, time_updated)
+          VALUES ('shared', 'dag-one', 'First', 'build', 'pending', 1, '[]', 1, 1, 1)
+        `)
+
+        yield* DatabaseMigration.applyOnly(db, [capturedOutputMigration, fearlessCammiMigration, dagWorkflowNodeIdentityMigration])
+
+        expect(
+          (yield* db.all<{ name: string; pk: number }>(sql`PRAGMA table_info(workflow_node)`))
+            .filter((column) => ["workflow_id", "id"].includes(column.name))
+            .map(({ name, pk }) => ({ name, pk })),
+        ).toEqual([
+          { name: "id", pk: 2 },
+          { name: "workflow_id", pk: 1 },
+        ])
+        expect(yield* db.get(sql`SELECT name, captured_output AS capturedOutput FROM workflow_node WHERE workflow_id = 'dag-one' AND id = 'shared'`)).toEqual({
+          name: "First",
+          capturedOutput: null,
+        })
+        expect(yield* db.get(sql`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'goal_state'`)).toBeUndefined()
+
+        yield* db.run(sql`
+          INSERT INTO workflow_node (id, workflow_id, name, worker_type, status, required, depends_on, seq, time_created, time_updated)
+          VALUES ('shared', 'dag-two', 'Second', 'review', 'pending', 1, '[]', 1, 2, 2)
+        `)
+        expect(yield* db.all(sql`SELECT workflow_id AS workflowId, name FROM workflow_node WHERE id = 'shared' ORDER BY workflow_id`)).toEqual([
+          { workflowId: "dag-one", name: "First" },
+          { workflowId: "dag-two", name: "Second" },
+        ])
+      }),
+    )
+  })
+
+  test("preserves FK constraints after DAG node identity migration", async () => {
+    await run(
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        yield* db.run(sql`PRAGMA foreign_keys = ON`)
+        yield* db.run(sql`
+          CREATE TABLE workflow (
+            id text PRIMARY KEY,
+            project_id text NOT NULL,
+            session_id text NOT NULL,
+            title text NOT NULL,
+            status text NOT NULL,
+            config text NOT NULL,
+            seq integer NOT NULL,
+            wake_reported integer NOT NULL DEFAULT false,
+            started_at integer,
+            completed_at integer,
+            time_created integer NOT NULL,
+            time_updated integer NOT NULL
+          )
+        `)
+        yield* db.run(sql`
+          CREATE TABLE workflow_node (
+            id text PRIMARY KEY,
+            workflow_id text NOT NULL,
+            name text NOT NULL,
+            worker_type text NOT NULL,
+            status text NOT NULL,
+            required integer NOT NULL DEFAULT 1,
+            depends_on text NOT NULL,
+            model_id text,
+            model_provider_id text,
+            child_session_id text,
+            output text,
+            error_reason text,
+            captured_output text,
+            deadline_ms integer,
+            wake_eligible integer NOT NULL DEFAULT false,
+            wake_reported integer NOT NULL DEFAULT false,
+            replan_attempts integer NOT NULL DEFAULT 0,
+            seq integer NOT NULL,
+            started_at integer,
+            completed_at integer,
+            time_created integer NOT NULL,
+            time_updated integer NOT NULL,
+            FOREIGN KEY (workflow_id) REFERENCES workflow(id) ON DELETE CASCADE
+          )
+        `)
+        yield* db.run(sql`
+          INSERT INTO workflow (id, project_id, session_id, title, status, config, seq, time_created, time_updated)
+          VALUES ('dag-fk', 'proj', 'ses', 'FK Test', 'running', '{}', 0, 1, 1)
+        `)
+        yield* db.run(sql`
+          INSERT INTO workflow_node (id, workflow_id, name, worker_type, status, required, depends_on, seq, time_created, time_updated)
+          VALUES ('n1', 'dag-fk', 'Node', 'build', 'pending', 1, '[]', 0, 1, 1)
+        `)
+
+        yield* DatabaseMigration.applyOnly(db, [dagWorkflowNodeIdentityMigration])
+
+        yield* db.run(sql`PRAGMA foreign_keys = ON`)
+        expect(yield* db.all(sql`PRAGMA foreign_key_check`)).toEqual([])
+
+        const insertExit = yield* db.run(sql`
+          INSERT INTO workflow_node (id, workflow_id, name, worker_type, status, required, depends_on, seq, time_created, time_updated)
+          VALUES ('n2', 'nonexistent', 'Bad', 'build', 'pending', 1, '[]', 0, 1, 1)
+        `).pipe(Effect.exit)
+        expect(Exit.isFailure(insertExit)).toBe(true)
+
+        yield* db.run(sql`DELETE FROM workflow WHERE id = 'dag-fk'`)
+        expect(yield* db.all(sql`SELECT id FROM workflow_node WHERE workflow_id = 'dag-fk'`)).toEqual([])
       }),
     )
   })

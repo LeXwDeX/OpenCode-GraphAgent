@@ -5,6 +5,7 @@ import fs from "fs"
 import path from "path"
 import { fileURLToPath } from "url"
 import { createSolidTransformPlugin } from "@opentui/solid/bun-plugin"
+import { PluginSdk } from "@opencode-ai/core/plugin-sdk"
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -46,6 +47,15 @@ const createEmbeddedWebUIBundle = async () => {
     ...entries,
     `}`,
   ].join("\n")
+}
+
+const copyBundledPluginSdk = async (targetDir: string) => {
+  const source = path.resolve(dir, "../plugin")
+  const target = path.join(targetDir, PluginSdk.vendorPath)
+  await fs.promises.rm(target, { recursive: true, force: true })
+  await fs.promises.mkdir(path.dirname(target), { recursive: true })
+  await fs.promises.cp(path.join(source, "src"), path.join(target, "src"), { recursive: true })
+  await fs.promises.copyFile(path.join(source, "package.json"), path.join(target, "package.json"))
 }
 
 const embeddedFileMap = skipEmbedWebUi ? null : await createEmbeddedWebUIBundle()
@@ -226,6 +236,7 @@ for (const item of targets) {
       2,
     ),
   )
+  await copyBundledPluginSdk(`dist/${name}/bin`)
   binaries[name] = Script.version
 }
 

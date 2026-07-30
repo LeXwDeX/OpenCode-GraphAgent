@@ -42,7 +42,7 @@ import { Truncate } from "@/tool/truncate"
 import { Image } from "@/image/image"
 import { decodeDataUrl } from "@/util/data-url"
 import { Process } from "@/util/process"
-import { Cause, Effect, Exit, Latch, Layer, Option, Scope, Context, Schema, Types } from "effect"
+import { Cause, Deferred, Effect, Exit, Latch, Layer, Option, Scope, Context, Schema, Types } from "effect"
 import { InstanceState } from "@/effect/instance-state"
 import { TaskTool, type TaskPromptOps } from "@/tool/task"
 import { SessionRunState } from "./run-state"
@@ -64,7 +64,7 @@ import { SettingsHook, HOOK_REWAKE_SENTINEL, type TriggerResult } from "@/hook/s
 import { applyPreHookDecision } from "@/hook/pre-hook-decision"
 import { dispatchTrust } from "@/hook/workspace-trust"
 import { HookStartContext } from "@/hook/start-context"
-import { Goal } from "@/goal/goal"
+import { KeyedMutex } from "@opencode-ai/core/effect/keyed-mutex"
 
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -111,6 +111,7 @@ function isOrphanedInterruptedTool(part: SessionV1.ToolPart) {
 export interface Interface {
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
   readonly prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
+  readonly promptIfIdle: (input: PromptInput) => Effect.Effect<Option.Option<SessionV1.WithParts>, Image.Error>
   readonly loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts>
   readonly shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError>
   readonly command: (input: CommandInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
@@ -152,7 +153,7 @@ export const layer = Layer.effect(
     const { db } = database
     const settingsHook = Option.getOrUndefined(yield* Effect.serviceOption(SettingsHook.Service))
     const startContext = Option.getOrUndefined(yield* Effect.serviceOption(HookStartContext.Service))
-    const goal = Option.getOrUndefined(yield* Effect.serviceOption(Goal.Service))
+    const promptLocks = KeyedMutex.makeUnsafe<SessionID>()
     const ops = Effect.fn("SessionPrompt.ops")(function* () {
       return {
         cancel: (sessionID: SessionID) => cancel(sessionID),
@@ -1297,9 +1298,7 @@ export const layer = Layer.effect(
       return { info, parts }
     }, Effect.scoped)
 
-    const prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error> = Effect.fn(
-      "SessionPrompt.prompt",
-    )(function* (input: PromptInput) {
+    const admitPrompt = Effect.fn("SessionPrompt.admitPrompt")(function* (input: PromptInput) {
       const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
       yield* revert.cleanup(session)
       const message = yield* createUserMessage(input)
@@ -1335,7 +1334,7 @@ export const layer = Layer.effect(
                   synthetic: true,
                 } satisfies SessionV1.TextPart),
         })
-        if (hookResult.blocked) return message
+        if (hookResult.blocked) return { message, run: false as const }
       }
 
       // SettingsHook: drain HookStartContext queued by SessionStart hooks (only if not blocked)
@@ -1364,9 +1363,57 @@ export const layer = Layer.effect(
         yield* sessions.setPermission({ sessionID: session.id, permission: permissions })
       }
 
-      if (input.noReply === true) return message
-      return yield* loop({ sessionID: input.sessionID })
+      return { message, run: input.noReply !== true }
     })
+
+    const prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error> = Effect.fn(
+      "SessionPrompt.prompt",
+    )(function* (input: PromptInput) {
+      const wait = yield* promptLocks.withLock(input.sessionID)(
+        Effect.gen(function* () {
+          const admitted = yield* admitPrompt(input)
+          if (!admitted.run) return Effect.succeed(admitted.message)
+          return yield* state.ensureRunningHandle(
+            input.sessionID,
+            lastAssistant(input.sessionID),
+            runLoop(input.sessionID),
+          )
+        }),
+      )
+      return yield* wait
+    })
+
+    const promptIfIdle: Interface["promptIfIdle"] = Effect.fn("SessionPrompt.promptIfIdle")(
+      function* (input: PromptInput) {
+        const wait = yield* promptLocks.withLock(input.sessionID)(
+          Effect.uninterruptibleMask((restore) =>
+            Effect.gen(function* () {
+              const admission = yield* Deferred.make<
+                Exit.Exit<{ readonly message: SessionV1.WithParts; readonly run: boolean }, Image.Error>
+              >()
+              const wait = yield* state.startIfIdle(
+                input.sessionID,
+                lastAssistant(input.sessionID),
+                Effect.gen(function* () {
+                  const admitted = yield* Deferred.await(admission)
+                  if (Exit.isFailure(admitted)) return yield* Effect.failCause(admitted.cause)
+                  if (!admitted.value.run) return admitted.value.message
+                  return yield* runLoop(input.sessionID)
+                }).pipe(Effect.orDie),
+              )
+              if (Option.isNone(wait)) return wait
+
+              const admitted = yield* restore(admitPrompt(input)).pipe(Effect.exit)
+              yield* Deferred.succeed(admission, admitted)
+              if (Exit.isFailure(admitted)) return yield* Effect.failCause(admitted.cause)
+              return wait
+            }),
+          ),
+        )
+        if (Option.isNone(wait)) return Option.none()
+        return Option.some(yield* wait.value)
+      },
+    )
 
     const lastAssistant = Effect.fnUntraced(function* (sessionID: SessionID) {
       const match = yield* sessions.findMessage(sessionID, (m) => m.info.role !== "user").pipe(Effect.orDie)
@@ -1664,12 +1711,11 @@ export const layer = Layer.effect(
 
             yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
 
-            const [skills, env, instructions, mcpInstructions, goalDocs, hooksDocs, modelMsgs] = yield* Effect.all([
+            const [skills, env, instructions, mcpInstructions, hooksDocs, modelMsgs] = yield* Effect.all([
               sys.skills(agent),
               sys.environment(model),
               instruction.system().pipe(Effect.orDie),
               sys.mcp(agent, session.permission),
-              sys.goal(sessionID),
               sys.hooks(),
               MessageV2.toModelMessagesEffect(msgs, model),
             ])
@@ -1678,7 +1724,6 @@ export const layer = Layer.effect(
               ...instructions,
               ...(mcpInstructions ? [mcpInstructions] : []),
               ...(skills ? [skills] : []),
-              ...goalDocs,
               ...hooksDocs,
             ]
             const format = lastUser.format ?? { type: "text" as const }
@@ -1815,95 +1860,6 @@ export const layer = Layer.effect(
         yield* sessions.touch(input.sessionID)
         return { info: userMsg, parts: [cmdText, responsePart] }
       }
-      // Goal/Subgoal command dispatch — early return BEFORE command registry lookup
-      if (goal && (input.command === "goal" || input.command === "subgoal")) {
-        const dispatch = input.command === "goal" ? goal.dispatch : goal.dispatchSubgoal
-        const dispatchResult = yield* dispatch(input.sessionID, input.arguments).pipe(
-          Effect.catchCause((cause) =>
-            Effect.gen(function* () {
-              yield* Effect.logError("goal dispatch failed", { command: input.command, cause: String(cause) })
-              return undefined
-            }),
-          ),
-        )
-        if (!dispatchResult) {
-          // Dispatch failed — return error message to user instead of silent fallthrough
-          const m = yield* currentModel(input.sessionID)
-          const agentName = input.agent ?? (yield* agents.defaultAgent())
-          const userMsg: SessionV1.User = {
-            id: input.messageID ?? MessageID.ascending(),
-            role: "user",
-            sessionID: input.sessionID,
-            time: { created: Date.now() },
-            agent: agentName,
-            model: { providerID: m.providerID, modelID: m.modelID },
-          }
-          yield* sessions.updateMessage(userMsg)
-          const errorPart: SessionV1.TextPart = {
-            id: PartID.ascending(),
-            messageID: userMsg.id,
-            sessionID: input.sessionID,
-            type: "text",
-            text: `⚠️ /${input.command} 执行失败，请检查日志。`,
-            synthetic: true,
-          }
-          yield* sessions.updatePart(errorPart)
-          yield* sessions.touch(input.sessionID)
-          return { info: userMsg, parts: [errorPart] }
-        }
-        if (dispatchResult) {
-          const m = yield* currentModel(input.sessionID)
-          const agentName = input.agent ?? (yield* agents.defaultAgent())
-          const userMsg: SessionV1.User = {
-            id: input.messageID ?? MessageID.ascending(),
-            role: "user",
-            sessionID: input.sessionID,
-            time: { created: Date.now() },
-            agent: agentName,
-            model: { providerID: m.providerID, modelID: m.modelID },
-          }
-          yield* sessions.updateMessage(userMsg)
-          const cmdText: SessionV1.TextPart = {
-            id: PartID.ascending(),
-            messageID: userMsg.id,
-            sessionID: input.sessionID,
-            type: "text",
-            text: `/${input.command} ${input.arguments}`.trim(),
-          }
-          yield* sessions.updatePart(cmdText)
-          // Non-synthetic so UserMessage renders it — the command confirmation
-          // (e.g. "⏸ 目标已暂停") must be visible. Matches the goal "done" case
-          // (loop.ts), which emits visible goal messages as non-synthetic parts.
-          const text = dispatchResult.announce ?? dispatchResult.text
-          const responsePart: SessionV1.TextPart = {
-            id: PartID.ascending(),
-            messageID: userMsg.id,
-            sessionID: input.sessionID,
-            type: "text",
-            text,
-          }
-          yield* sessions.updatePart(responsePart)
-          yield* sessions.touch(input.sessionID)
-          if (dispatchResult.type === "kick" && input.command === "goal") {
-            // Drain SessionStart hook contexts before loop
-            if (startContext) {
-              const contexts = yield* startContext.consume(input.sessionID)
-              for (const ctx of contexts) {
-                yield* sessions.updatePart({
-                  id: PartID.ascending(),
-                  messageID: responsePart.messageID,
-                  sessionID: input.sessionID,
-                  type: "text",
-                  text: ctx,
-                  synthetic: true,
-                } satisfies SessionV1.TextPart)
-              }
-            }
-            return yield* loop({ sessionID: input.sessionID })
-          }
-          return { info: userMsg, parts: [cmdText, responsePart] }
-        }
-      }
 
       const cmd = yield* commands.get(input.command)
       if (!cmd) {
@@ -1915,30 +1871,8 @@ export const layer = Layer.effect(
       }
       const agentName = cmd.agent ?? input.agent
 
-      const raw = input.arguments.match(argsRegex) ?? []
-      const args = raw.map((arg) => arg.replace(quoteTrimRegex, ""))
       const templateCommand = yield* Effect.promise(async () => cmd.template)
-
-      const placeholders = templateCommand.match(placeholderRegex) ?? []
-      let last = 0
-      for (const item of placeholders) {
-        const value = Number(item.slice(1))
-        if (value > last) last = value
-      }
-
-      const withArgs = templateCommand.replaceAll(placeholderRegex, (_, index) => {
-        const position = Number(index)
-        const argIndex = position - 1
-        if (argIndex >= args.length) return ""
-        if (position === last) return args.slice(argIndex).join(" ")
-        return args[argIndex]
-      })
-      const usesArgumentsPlaceholder = templateCommand.includes("$ARGUMENTS")
-      let template = withArgs.replaceAll("$ARGUMENTS", input.arguments)
-
-      if (placeholders.length === 0 && !usesArgumentsPlaceholder && input.arguments.trim()) {
-        template = template + "\n\n" + input.arguments
-      }
+      let template = expandCommandTemplate(templateCommand, input.arguments)
 
       const shellMatches = ConfigMarkdown.shell(template)
       if (shellMatches.length > 0) {
@@ -1994,7 +1928,14 @@ export const layer = Layer.effect(
               prompt: templateParts.find((y) => y.type === "text")?.text ?? "",
             },
           ]
-        : [...uniqueTemplateParts, ...(input.parts ?? [])]
+        : [
+            {
+              type: "text" as const,
+              text: `/${input.command}${input.arguments ? ` ${input.arguments}` : ""}`,
+            },
+            ...uniqueTemplateParts.map((part) => (part.type === "text" ? { ...part, synthetic: true } : part)),
+            ...(input.parts ?? []),
+          ]
 
       const userAgent = isSubtask ? (input.agent ?? (yield* agents.defaultInfo()).name) : agent.name
       const userModel = isSubtask
@@ -2029,6 +1970,7 @@ export const layer = Layer.effect(
     return Service.of({
       cancel,
       prompt,
+      promptIfIdle,
       loop,
       shell,
       command,
@@ -2176,6 +2118,25 @@ const argsRegex = /(?:\[Image\s+\d+\]|"[^"]*"|'[^']*'|[^\s"']+)/gi
 const placeholderRegex = /\$(\d+)/g
 const quoteTrimRegex = /^["']|["']$/g
 
+/** @internal Exported for command-template regression tests. */
+export function expandCommandTemplate(template: string, input: string) {
+  const args = (input.match(argsRegex) ?? []).map((arg) => arg.replace(quoteTrimRegex, ""))
+  const placeholders = template.match(placeholderRegex) ?? []
+  const last = placeholders.reduce((max, item) => Math.max(max, Number(item.slice(1))), 0)
+  const expanded = template
+    .replaceAll(placeholderRegex, (_, index) => {
+      const position = Number(index)
+      const argIndex = position - 1
+      if (argIndex >= args.length) return ""
+      if (position === last) return args.slice(argIndex).join(" ")
+      return args[argIndex]
+    })
+    .replaceAll("$ARGUMENTS", input)
+
+  if (placeholders.length > 0 || template.includes("$ARGUMENTS") || !input.trim()) return expanded
+  return `${expanded}\n\n${input}`
+}
+
 export const node = LayerNode.make(layer, [
   SessionStatus.node,
   Session.node,
@@ -2203,7 +2164,7 @@ export const node = LayerNode.make(layer, [
   EventV2Bridge.node,
   RuntimeFlags.node,
   Database.node,
-  Goal.node, HookStartContext.node, SettingsHook.node,
+  HookStartContext.node, SettingsHook.node,
 ])
 
 export * as SessionPrompt from "./prompt"

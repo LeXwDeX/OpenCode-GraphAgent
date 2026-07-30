@@ -54,8 +54,10 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 import { HookStartContext } from "@/hook/start-context"
 import { SettingsHook } from "@/hook/settings"
 import { HookRewakeLive } from "@/hook/rewake-live"
-import { Goal } from "@/goal/goal"
-import { GoalLoop } from "@/goal/loop"
+import { Dag } from "@/dag/dag"
+import { DagStore } from "@opencode-ai/core/dag/store"
+import { DagLoop } from "@/dag/runtime/loop"
+import { DagSummaryPublisher } from "@/dag/runtime/summary-publisher"
 
 export const AppLayer = Layer.mergeAll(
   Layer.mergeAll(
@@ -78,13 +80,14 @@ export const AppLayer = Layer.mergeAll(
     Question.defaultLayer,
     Permission.defaultLayer,
     Todo.defaultLayer,
-    Goal.defaultLayer,
     Session.defaultLayer,
     SessionStatus.defaultLayer,
     BackgroundJob.defaultLayer,
     RuntimeFlags.defaultLayer,
     EventV2Bridge.defaultLayer,
     SessionRunState.defaultLayer,
+    DagStore.defaultLayer,
+    Dag.defaultLayer,
   ),
   Layer.mergeAll(
     SessionProcessor.defaultLayer,
@@ -115,14 +118,12 @@ export const AppLayer = Layer.mergeAll(
   Layer.provideMerge(Ripgrep.defaultLayer),
   Layer.provideMerge(InstanceLayer.layer),
   Layer.provideMerge(Observability.layer),
-  // GoalLoop + SettingsHook go in provideMerge (NOT mergeAll) because they need
+  // SettingsHook goes in provideMerge (NOT mergeAll) because it needs
   // services from BOTH group1 and group2. mergeAll siblings cannot see each
   // other's outputs, but provideMerge gives the layer access to the full
-  // accumulated context (group1 + group2 merged). Both use defaultLayer = layer
-  // (no self-provides) so their construction deps resolve from this ambient
-  // context rather than from isolated sub-contexts that can't satisfy the full
-  // transitive chain.
-  Layer.provideMerge(GoalLoop.defaultLayer),
+  // accumulated context (group1 + group2 merged).
+  Layer.provideMerge(DagLoop.defaultLayer),
+  Layer.provideMerge(DagSummaryPublisher.defaultLayer),
   Layer.provideMerge(SettingsHook.defaultLayer),
 )
 

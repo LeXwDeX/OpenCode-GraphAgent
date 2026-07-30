@@ -5,6 +5,7 @@ import path from "path"
 import fs from "fs/promises"
 import { setTimeout as sleep } from "node:timers/promises"
 import { afterAll } from "bun:test"
+import { markPluginDependenciesReady } from "./fixture/plugin"
 
 // Set XDG env vars FIRST, before any src/ imports
 const dir = path.join(os.tmpdir(), "opencode-test-data-" + process.pid)
@@ -48,6 +49,10 @@ process.env["OPENCODE_TEST_HOME"] = testHome
 // Set test managed config directory to isolate tests from system managed settings
 const testManagedConfigDir = path.join(dir, "managed")
 process.env["OPENCODE_TEST_MANAGED_CONFIG_DIR"] = testManagedConfigDir
+
+// Keep process-global AppRuntime construction in any test from starting a
+// registry install that can hold the shared config dependency lock.
+await markPluginDependenciesReady(path.join(dir, "config", "opencode"))
 
 // Write the cache version file to prevent global/index.ts from clearing the cache
 const cacheDir = path.join(dir, "cache", "opencode")

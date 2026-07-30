@@ -1,4 +1,6 @@
 import { describe, expect } from "bun:test"
+import fs from "fs/promises"
+import path from "path"
 import { Effect, Exit, Layer, Scope } from "effect"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import { Global } from "@opencode-ai/core/global"
@@ -7,6 +9,7 @@ import { Repository } from "@opencode-ai/core/repository"
 import { RepositoryCache } from "@opencode-ai/core/repository-cache"
 import { EventV2 } from "@opencode-ai/core/event"
 import { it } from "./lib/effect"
+import { tmpdir } from "./fixture/tmpdir"
 
 const cache = Layer.mock(RepositoryCache.Service, {
   ensure: () => Effect.die("unexpected Git materialization"),
@@ -44,6 +47,7 @@ describe("Reference", () => {
     Effect.gen(function* () {
       const references = yield* Reference.Service
       const repository = Repository.parseRemote("owner/repo")
+      yield* Effect.promise(() => fs.mkdir(Repository.cachePath(Global.Path.repos, repository), { recursive: true }))
       const source = Reference.GitSource.make({ type: "git", repository: "owner/repo", branch: "main" })
       yield* references.transform((editor) => editor.add("sdk", source))
 
@@ -67,6 +71,7 @@ describe("Reference", () => {
     Effect.gen(function* () {
       const references = yield* Reference.Service
       const repository = Repository.parseRemote("owner/repo")
+      yield* Effect.promise(() => fs.mkdir(Repository.cachePath(Global.Path.repos, repository), { recursive: true }))
       const source = Reference.GitSource.make({
         type: "git",
         repository: "owner/repo",
@@ -88,6 +93,27 @@ describe("Reference", () => {
       Effect.provide(cache),
       Effect.provide(EventV2.defaultLayer),
       Effect.provide(Global.defaultLayer),
+    ),
+  )
+
+  it.effect("omits uncached Git references while refresh fails", () =>
+    Effect.acquireUseRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) =>
+        Effect.gen(function* () {
+          const references = yield* Reference.Service
+          const source = Reference.GitSource.make({ type: "git", repository: "owner/repo", branch: "main" })
+          yield* references.transform((editor) => editor.add("sdk", source))
+
+          expect(yield* references.list()).toEqual([])
+        }).pipe(
+          Effect.scoped,
+          Effect.provide(Reference.layer),
+          Effect.provide(cache),
+          Effect.provide(EventV2.defaultLayer),
+          Effect.provide(Global.layerWith({ state: path.join(tmp.path, "state"), repos: path.join(tmp.path, "repos") })),
+        ),
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
     ),
   )
 })

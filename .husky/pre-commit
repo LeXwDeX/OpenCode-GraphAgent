@@ -1,3 +1,4 @@
 #!/bin/sh
 set -e
-bun typecheck
+sh .husky/run-lint
+sh .husky/run-typecheck

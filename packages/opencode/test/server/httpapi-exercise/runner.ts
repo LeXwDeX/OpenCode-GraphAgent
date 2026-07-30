@@ -10,9 +10,10 @@ import { MessageID, PartID } from "../../../src/session/schema"
 import { call, callAuthProbe, disposeApps } from "./backend"
 import { original } from "./environment"
 import { runtime } from "./runtime"
-import type { ActiveScenario, Options, ProjectOptions, Result, Scenario, ScenarioContext, SeededContext } from "./types"
+import type { ActiveScenario, Options, ProjectOptions, Result, Scenario, ScenarioContext, SeededContext, DagNodeSeed } from "./types"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
+import type { SessionID } from "../../../src/session/schema"
 
 export function runScenario(options: Options) {
   return (scenario: Scenario) => {
@@ -79,9 +80,13 @@ function withContext<A, E>(
     (ctx) =>
       Effect.gen(function* () {
         yield* trace(options, scenario, `${label} tmpdir cleanup start`)
-        yield* Effect.promise(async () => {
-          await ctx.dir?.[Symbol.asyncDispose]()
-        }).pipe(Effect.ignore)
+        // Finalizers run uninterruptibly — the scenario timeout cannot break a
+        // hung dispose, so the hard cap lives inside the promise itself.
+        yield* Effect.promise(() =>
+          bounded(`${scenario.name}: tmpdir dispose`, async () => {
+            await ctx.dir?.[Symbol.asyncDispose]()
+          }),
+        )
         yield* trace(options, scenario, `${label} tmpdir cleanup done`)
       }),
   ).pipe(
@@ -177,14 +182,13 @@ function withContext<A, E>(
           messages: (sessionID) =>
             run(modules.Session.Service.use((svc) => svc.messages({ sessionID }).pipe(Effect.orDie))),
           todos: (sessionID, todos) => run(modules.Todo.Service.use((svc) => svc.update({ sessionID, todos }))),
-          goal: (sessionID, goalText, maxTurns) =>
-            run(modules.Goal.Service.use((svc) => svc.set(sessionID, goalText, maxTurns))).pipe(Effect.asVoid),
           worktree: (input) => run(modules.Worktree.Service.use((svc) => svc.create(input).pipe(Effect.orDie))),
           worktreeRemove: (directory) =>
             run(modules.Worktree.Service.use((svc) => svc.remove({ directory })).pipe(Effect.ignore)),
           llmText: (value) => Effect.suspend(() => llm().text(value)),
           llmWait: (count) => Effect.suspend(() => llm().wait(count)),
           tuiRequest: (request) => Effect.sync(() => modules.Tui.submitTuiRequest(request)),
+          dag: (input) => run(createDagFixture(input.sessionID, input.title, input.nodes)),
         }
         yield* trace(options, scenario, `${label} seed start`)
         const state = yield* scenario.seed(base)
@@ -262,8 +266,70 @@ const resetState = Effect.promise(async () => {
   const modules = await runtime()
   Flag.OPENCODE_SERVER_PASSWORD = original.OPENCODE_SERVER_PASSWORD
   Flag.OPENCODE_SERVER_USERNAME = original.OPENCODE_SERVER_USERNAME
-  await disposeApps()
-  await modules.disposeAllInstances()
-  await modules.resetDatabase()
+  // This runs from Effect.ensuring, i.e. uninterruptibly — a single promise
+  // that never resolves here used to hang the whole runner with zero output
+  // (the 2026-07-27 CI incident). Bound every step independently so a stuck
+  // dispose degrades into a loud warning and the run continues.
+  await bounded("disposeApps", () => disposeApps())
+  await bounded("disposeAllInstances", () => modules.disposeAllInstances())
+  await bounded("resetDatabase", () => modules.resetDatabase())
   await Bun.sleep(25)
 })
+
+/**
+ * Hard-timeout wrapper for cleanup promises: never rejects, never hangs.
+ * On timeout the underlying promise is left behind (there is nothing safe to
+ * do with it) and the runner moves on instead of silently freezing.
+ */
+const CLEANUP_STEP_TIMEOUT_MS = 10_000
+
+async function bounded(label: string, work: () => Promise<unknown>, ms = CLEANUP_STEP_TIMEOUT_MS) {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timeout = new Promise<"timeout">((resolve) => {
+    timer = setTimeout(() => resolve("timeout"), ms)
+  })
+  const winner = await Promise.race([
+    work().then(
+      () => "done" as const,
+      (error: unknown) => {
+        console.error(`[cleanup] ${label} failed: ${String(error)}`)
+        return "done" as const
+      },
+    ),
+    timeout,
+  ])
+  clearTimeout(timer)
+  if (winner === "timeout") {
+    console.error(`[cleanup] ${label} exceeded ${ms}ms — forcing continuation (resource may leak)`)
+  }
+}
+
+/**
+ * Create a DAG workflow fixture with mixed node statuses for HTTP happy-path tests.
+ * Creates the workflow owned by the session, using the instance's real project ID
+ * so the FK constraint on workflow.project_id is satisfied.
+ */
+function createDagFixture(sessionID: SessionID, title: string | undefined, nodes: DagNodeSeed[]) {
+  return Effect.gen(function* () {
+    const modules = yield* Effect.promise(() => runtime())
+    const dag = yield* modules.Dag.Service
+    const project = (yield* modules.InstanceRef)!.project
+    const dagID = yield* dag.create({
+      projectID: project.id,
+      sessionID,
+      title: title ?? "DAG fixture",
+      config: {
+        name: title ?? "DAG fixture",
+        nodes: nodes.map((n) => ({
+          id: n.id,
+          name: n.name,
+          worker_type: n.worker_type,
+          depends_on: n.depends_on,
+          required: n.required,
+          prompt_template: { inline: n.id },
+        })),
+      },
+    }).pipe(Effect.orDie)
+    return { dagID, sessionID } as const
+  })
+}

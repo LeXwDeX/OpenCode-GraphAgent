@@ -44,4 +44,13 @@ describe("SkillPlugin.Plugin", () => {
       )
     }),
   )
+
+  it.effect("does not register workflow as a built-in skill", () =>
+    Effect.gen(function* () {
+      const skill = yield* SkillV2.Service
+      yield* SkillPlugin.Plugin.effect(host({ skill: { ...skill, reload: skill.reload } }))
+
+      expect((yield* skill.list()).some((item) => item.name === "workflow")).toBe(false)
+    }),
+  )
 })

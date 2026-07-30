@@ -1,5 +1,6 @@
 import { describe, expect } from "bun:test"
-import { Effect } from "effect"
+import { Effect, Layer } from "effect"
+import { HttpClient, HttpClientResponse } from "effect/unstable/http"
 import { Catalog } from "@opencode-ai/core/catalog"
 import { Credential } from "@opencode-ai/core/credential"
 import { Integration } from "@opencode-ai/core/integration"
@@ -11,7 +12,20 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { testEffect } from "../lib/effect"
 import { PluginTestLayer } from "./fixture"
 
-const it = testEffect(PluginTestLayer)
+// OpencodePlugin fetches remote provider config from console.opencode.ai whenever a
+// credential is active. Stub the HttpClient so tests never hit the network; 404 means
+// "no remote config" and keeps the plugin on its local defaults.
+const stubHttpLayer = Layer.succeed(
+  HttpClient.HttpClient,
+  HttpClient.make((request) =>
+    Effect.succeed(HttpClientResponse.fromWeb(request, new Response(null, { status: 404 }))),
+  ),
+)
+
+const it = testEffect(Layer.mergeAll(PluginTestLayer, stubHttpLayer))
+
+// The connected-server test talks to a local Bun.serve and needs the real HttpClient.
+const itLive = testEffect(PluginTestLayer)
 
 const addPlugin = Effect.fn(function* () {
   const plugin = yield* PluginV2.Service
@@ -63,7 +77,7 @@ describe("OpencodePlugin", () => {
     }),
   )
 
-  it.live("loads providers and models from the connected OpenCode server", () =>
+  itLive.live("loads providers and models from the connected OpenCode server", () =>
     Effect.acquireUseRelease(
       Effect.sync(() => {
         const authorization: Array<string | null> = []

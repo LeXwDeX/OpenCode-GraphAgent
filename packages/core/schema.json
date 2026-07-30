@@ -1,9 +1,9 @@
 {
   "version": "7",
   "dialect": "sqlite",
-  "id": "0d9aac12-bbf1-43fd-ad20-b275b2a83cb7",
+  "id": "a26723c8-be88-4c4e-85cf-0c1ecd3cf638",
   "prevIds": [
-    "f14a9b18-8207-487e-a3d3-227e629ba9ad"
+    "747f1cfb-b2d5-45f6-b46b-c38e470bb2d5"
   ],
   "ddl": [
     {
@@ -31,15 +31,23 @@
       "entityType": "tables"
     },
     {
+      "name": "workflow_node",
+      "entityType": "tables"
+    },
+    {
+      "name": "workflow",
+      "entityType": "tables"
+    },
+    {
+      "name": "workflow_violation",
+      "entityType": "tables"
+    },
+    {
       "name": "event_sequence",
       "entityType": "tables"
     },
     {
       "name": "event",
-      "entityType": "tables"
-    },
-    {
-      "name": "goal_state",
       "entityType": "tables"
     },
     {
@@ -468,6 +476,436 @@
     },
     {
       "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "id",
+      "entityType": "columns",
+      "table": "workflow_node"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "workflow_id",
+      "entityType": "columns",
+      "table": "workflow_node"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "name",
+      "entityType": "columns",
+      "table": "workflow_node"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "worker_type",
+      "entityType": "columns",
+      "table": "workflow_node"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "status",
+      "entityType": "columns",
+      "table": "workflow_node"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "true",
+      "generated": null,
+      "name": "required",
+      "entityType": "columns",
+      "table": "workflow_node"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "depends_on",
+      "entityType": "columns",
+      "table": "workflow_node"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "model_id",
+      "entityType": "columns",
+      "table": "workflow_node"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "model_provider_id",
+      "entityType": "columns",
+      "table": "workflow_node"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "child_session_id",
+      "entityType": "columns",
+      "table": "workflow_node"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "output",
+      "entityType": "columns",
+      "table": "workflow_node"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "error_reason",
+      "entityType": "columns",
+      "table": "workflow_node"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "captured_output",
+      "entityType": "columns",
+      "table": "workflow_node"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "deadline_ms",
+      "entityType": "columns",
+      "table": "workflow_node"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "false",
+      "generated": null,
+      "name": "wake_eligible",
+      "entityType": "columns",
+      "table": "workflow_node"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "false",
+      "generated": null,
+      "name": "wake_reported",
+      "entityType": "columns",
+      "table": "workflow_node"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "0",
+      "generated": null,
+      "name": "replan_attempts",
+      "entityType": "columns",
+      "table": "workflow_node"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "seq",
+      "entityType": "columns",
+      "table": "workflow_node"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "started_at",
+      "entityType": "columns",
+      "table": "workflow_node"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "completed_at",
+      "entityType": "columns",
+      "table": "workflow_node"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_created",
+      "entityType": "columns",
+      "table": "workflow_node"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_updated",
+      "entityType": "columns",
+      "table": "workflow_node"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "id",
+      "entityType": "columns",
+      "table": "workflow"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "project_id",
+      "entityType": "columns",
+      "table": "workflow"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "session_id",
+      "entityType": "columns",
+      "table": "workflow"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "title",
+      "entityType": "columns",
+      "table": "workflow"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "status",
+      "entityType": "columns",
+      "table": "workflow"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "config",
+      "entityType": "columns",
+      "table": "workflow"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "seq",
+      "entityType": "columns",
+      "table": "workflow"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "false",
+      "generated": null,
+      "name": "wake_reported",
+      "entityType": "columns",
+      "table": "workflow"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "started_at",
+      "entityType": "columns",
+      "table": "workflow"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "completed_at",
+      "entityType": "columns",
+      "table": "workflow"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_created",
+      "entityType": "columns",
+      "table": "workflow"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_updated",
+      "entityType": "columns",
+      "table": "workflow"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "id",
+      "entityType": "columns",
+      "table": "workflow_violation"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "workflow_id",
+      "entityType": "columns",
+      "table": "workflow_violation"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "node_id",
+      "entityType": "columns",
+      "table": "workflow_violation"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "type",
+      "entityType": "columns",
+      "table": "workflow_violation"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "severity",
+      "entityType": "columns",
+      "table": "workflow_violation"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "message",
+      "entityType": "columns",
+      "table": "workflow_violation"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "details",
+      "entityType": "columns",
+      "table": "workflow_violation"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_created",
+      "entityType": "columns",
+      "table": "workflow_violation"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_updated",
+      "entityType": "columns",
+      "table": "workflow_violation"
+    },
+    {
+      "type": "text",
       "notNull": false,
       "autoincrement": false,
       "default": null,
@@ -545,36 +983,6 @@
       "name": "data",
       "entityType": "columns",
       "table": "event"
-    },
-    {
-      "type": "text",
-      "notNull": false,
-      "autoincrement": false,
-      "default": null,
-      "generated": null,
-      "name": "session_id",
-      "entityType": "columns",
-      "table": "goal_state"
-    },
-    {
-      "type": "text",
-      "notNull": true,
-      "autoincrement": false,
-      "default": null,
-      "generated": null,
-      "name": "payload",
-      "entityType": "columns",
-      "table": "goal_state"
-    },
-    {
-      "type": "integer",
-      "notNull": true,
-      "autoincrement": false,
-      "default": null,
-      "generated": null,
-      "name": "updated_at",
-      "entityType": "columns",
-      "table": "goal_state"
     },
     {
       "type": "text",
@@ -1548,6 +1956,66 @@
     },
     {
       "columns": [
+        "workflow_id"
+      ],
+      "tableTo": "workflow",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "CASCADE",
+      "nameExplicit": false,
+      "name": "fk_workflow_node_workflow_id_workflow_id_fk",
+      "entityType": "fks",
+      "table": "workflow_node"
+    },
+    {
+      "columns": [
+        "project_id"
+      ],
+      "tableTo": "project",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "CASCADE",
+      "nameExplicit": false,
+      "name": "fk_workflow_project_id_project_id_fk",
+      "entityType": "fks",
+      "table": "workflow"
+    },
+    {
+      "columns": [
+        "session_id"
+      ],
+      "tableTo": "session",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "CASCADE",
+      "nameExplicit": false,
+      "name": "fk_workflow_session_id_session_id_fk",
+      "entityType": "fks",
+      "table": "workflow"
+    },
+    {
+      "columns": [
+        "workflow_id"
+      ],
+      "tableTo": "workflow",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "CASCADE",
+      "nameExplicit": false,
+      "name": "fk_workflow_violation_workflow_id_workflow_id_fk",
+      "entityType": "fks",
+      "table": "workflow_violation"
+    },
+    {
+      "columns": [
         "aggregate_id"
       ],
       "tableTo": "event_sequence",
@@ -1723,6 +2191,16 @@
     },
     {
       "columns": [
+        "workflow_id",
+        "id"
+      ],
+      "nameExplicit": false,
+      "name": "workflow_node_pk",
+      "entityType": "pks",
+      "table": "workflow_node"
+    },
+    {
+      "columns": [
         "project_id",
         "directory"
       ],
@@ -1788,6 +2266,24 @@
     },
     {
       "columns": [
+        "id"
+      ],
+      "nameExplicit": false,
+      "name": "workflow_pk",
+      "table": "workflow",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
+        "id"
+      ],
+      "nameExplicit": false,
+      "name": "workflow_violation_pk",
+      "table": "workflow_violation",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
         "aggregate_id"
       ],
       "nameExplicit": false,
@@ -1802,15 +2298,6 @@
       "nameExplicit": false,
       "name": "event_pk",
       "table": "event",
-      "entityType": "pks"
-    },
-    {
-      "columns": [
-        "session_id"
-      ],
-      "nameExplicit": false,
-      "name": "goal_state_pk",
-      "table": "goal_state",
       "entityType": "pks"
     },
     {
@@ -1897,6 +2384,152 @@
     {
       "columns": [
         {
+          "value": "workflow_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "workflow_node_workflow_idx",
+      "entityType": "indexes",
+      "table": "workflow_node"
+    },
+    {
+      "columns": [
+        {
+          "value": "workflow_id",
+          "isExpression": false
+        },
+        {
+          "value": "status",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "workflow_node_workflow_status_idx",
+      "entityType": "indexes",
+      "table": "workflow_node"
+    },
+    {
+      "columns": [
+        {
+          "value": "workflow_id",
+          "isExpression": false
+        },
+        {
+          "value": "id",
+          "isExpression": false
+        },
+        {
+          "value": "seq",
+          "isExpression": false
+        }
+      ],
+      "isUnique": true,
+      "where": null,
+      "origin": "manual",
+      "name": "workflow_node_workflow_id_seq_idx",
+      "entityType": "indexes",
+      "table": "workflow_node"
+    },
+    {
+      "columns": [
+        {
+          "value": "project_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "workflow_project_idx",
+      "entityType": "indexes",
+      "table": "workflow"
+    },
+    {
+      "columns": [
+        {
+          "value": "session_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "workflow_session_idx",
+      "entityType": "indexes",
+      "table": "workflow"
+    },
+    {
+      "columns": [
+        {
+          "value": "status",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "workflow_status_idx",
+      "entityType": "indexes",
+      "table": "workflow"
+    },
+    {
+      "columns": [
+        {
+          "value": "id",
+          "isExpression": false
+        },
+        {
+          "value": "seq",
+          "isExpression": false
+        }
+      ],
+      "isUnique": true,
+      "where": null,
+      "origin": "manual",
+      "name": "workflow_id_seq_idx",
+      "entityType": "indexes",
+      "table": "workflow"
+    },
+    {
+      "columns": [
+        {
+          "value": "workflow_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "workflow_violation_workflow_idx",
+      "entityType": "indexes",
+      "table": "workflow_violation"
+    },
+    {
+      "columns": [
+        {
+          "value": "workflow_id",
+          "isExpression": false
+        },
+        {
+          "value": "severity",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "workflow_violation_severity_idx",
+      "entityType": "indexes",
+      "table": "workflow_violation"
+    },
+    {
+      "columns": [
+        {
           "value": "aggregate_id",
           "isExpression": false
         },
@@ -1933,20 +2566,6 @@
       "name": "event_aggregate_type_seq_idx",
       "entityType": "indexes",
       "table": "event"
-    },
-    {
-      "columns": [
-        {
-          "value": "updated_at",
-          "isExpression": false
-        }
-      ],
-      "isUnique": false,
-      "where": null,
-      "origin": "manual",
-      "name": "goal_state_updated_at_idx",
-      "entityType": "indexes",
-      "table": "goal_state"
     },
     {
       "columns": [

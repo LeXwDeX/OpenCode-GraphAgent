@@ -1,3 +1,5 @@
+/// <reference path="../markdown.d.ts" />
+
 export * as CommandPlugin from "./command"
 
 import { define } from "./internal"
@@ -5,6 +7,17 @@ import { Effect } from "effect"
 import { Location } from "../location"
 import PROMPT_INITIALIZE from "./command/initialize.txt"
 import PROMPT_REVIEW from "./command/review.txt"
+import DAG_FLOW_PROMPT from "./command/dag-flow.txt"
+import workflowContent from "./command/workflow.md" with { type: "text" }
+import orchestrationPolicy from "./command/orchestration-policy.md" with { type: "text" }
+import orchestrationDomains from "./command/orchestration-domains.md" with { type: "text" }
+
+export const DagFlowDescription = "Start a dependency-graph multi-agent workflow for the supplied task"
+export const WorkflowFactsContent = workflowContent
+export const OrchestrationPolicyContent = orchestrationPolicy
+export const OrchestrationDomainsContent = orchestrationDomains
+export const WorkflowContent = `${WorkflowFactsContent}\n\n${OrchestrationPolicyContent}\n\n${OrchestrationDomainsContent}`
+export const DagFlowContent = `${DAG_FLOW_PROMPT}\n\n${WorkflowContent}`
 
 export const Plugin = define({
   id: "command",
@@ -19,6 +32,10 @@ export const Plugin = define({
         command.template = PROMPT_REVIEW.replace("${path}", location.project.directory)
         command.description = "review changes [commit|branch|pr], defaults to uncommitted"
         command.subtask = true
+      })
+      draft.update("dag-flow", (command) => {
+        command.template = DagFlowContent
+        command.description = DagFlowDescription
       })
     })
   }),

@@ -1,0 +1,322 @@
+export * as DagEvent from "./dag-event"
+
+import { Schema } from "effect"
+import { Event } from "./event"
+import { DateTimeUtcFromMillis, NonNegativeInt } from "./schema"
+import { withStatics } from "./schema"
+import { descending } from "./identifier"
+import { SessionID } from "./session-id"
+import { ProjectID } from "./project-id"
+import { Provider } from "./provider"
+import { Model } from "./model"
+
+// ============================================================================
+// Branded IDs
+// ============================================================================
+
+export const DagID = Schema.String.check(Schema.isStartsWith("dag")).pipe(
+  Schema.brand("DagID"),
+  withStatics((schema) => {
+    const create = () => schema.make("dag_" + descending())
+    return {
+      create,
+      descending: (id?: string) => (id === undefined ? create() : schema.make(id)),
+    }
+  }),
+)
+export type DagID = typeof DagID.Type
+
+export const NodeID = Schema.String.pipe(Schema.brand("DagNodeID"))
+export type NodeID = typeof NodeID.Type
+
+/**
+ * Optional model override for a node. When absent, the node uses its resolved
+ * agent's model or falls back to the workflow-owning session's model — same
+ * resolution path as the `task` tool. Lets the main agent pin different models
+ * per node (e.g. GPT-5.5 for review, Sonnet-5 for code).
+ */
+export const NodeModel = Schema.Struct({
+  modelID: Model.ID,
+  providerID: Provider.ID,
+})
+export type NodeModel = typeof NodeModel.Type
+
+// ============================================================================
+// Shared fragments
+// ============================================================================
+
+const Base = {
+  timestamp: DateTimeUtcFromMillis,
+  dagID: DagID,
+}
+
+const options = {
+  durable: {
+    aggregate: "dagID",
+    version: 1,
+  },
+} as const
+
+// ============================================================================
+// Status enums (mirrors core/types.ts but as Schema literals for events)
+// ============================================================================
+
+export const WorkflowStatus = Schema.Literals([
+  "pending",
+  "running",
+  "paused",
+  "stepping",
+  "completed",
+  "failed",
+  "cancelled",
+  "archived",
+])
+export type WorkflowStatus = typeof WorkflowStatus.Type
+
+export const NodeStatus = Schema.Literals([
+  "pending",
+  "queued",
+  "running",
+  "paused",
+  "completed",
+  "failed",
+  "aborted",
+  "skipped",
+])
+export type NodeStatus = typeof NodeStatus.Type
+
+// ============================================================================
+// Workflow lifecycle events
+// ============================================================================
+
+export const WorkflowCreated = Event.define({
+  type: "dag.workflow.created",
+  ...options,
+  schema: {
+    ...Base,
+    projectID: ProjectID,
+    sessionID: SessionID,
+    title: Schema.String,
+    config: Schema.String, // YAML string (validated separately by the runtime)
+    status: WorkflowStatus,
+  },
+})
+export type WorkflowCreated = typeof WorkflowCreated.Type
+
+export const WorkflowStarted = Event.define({
+  type: "dag.workflow.started",
+  ...options,
+  schema: Base,
+})
+export type WorkflowStarted = typeof WorkflowStarted.Type
+
+export const WorkflowPaused = Event.define({
+  type: "dag.workflow.paused",
+  ...options,
+  schema: Base,
+})
+export type WorkflowPaused = typeof WorkflowPaused.Type
+
+export const WorkflowResumed = Event.define({
+  type: "dag.workflow.resumed",
+  ...options,
+  schema: Base,
+})
+export type WorkflowResumed = typeof WorkflowResumed.Type
+
+export const WorkflowStepped = Event.define({
+  type: "dag.workflow.stepped",
+  ...options,
+  schema: {
+    ...Base,
+    nodeID: Schema.optional(NodeID),
+  },
+})
+export type WorkflowStepped = typeof WorkflowStepped.Type
+
+export const WorkflowCompleted = Event.define({
+  type: "dag.workflow.completed",
+  ...options,
+  schema: {
+    ...Base,
+    durationMs: NonNegativeInt,
+  },
+})
+export type WorkflowCompleted = typeof WorkflowCompleted.Type
+
+export const WorkflowFailed = Event.define({
+  type: "dag.workflow.failed",
+  ...options,
+  schema: {
+    ...Base,
+    reason: Schema.String,
+    failedNodes: Schema.Array(NodeID),
+  },
+})
+export type WorkflowFailed = typeof WorkflowFailed.Type
+
+export const WorkflowCancelled = Event.define({
+  type: "dag.workflow.cancelled",
+  ...options,
+  schema: Base,
+})
+export type WorkflowCancelled = typeof WorkflowCancelled.Type
+
+export const WorkflowReplanned = Event.define({
+  type: "dag.workflow.replanned",
+  ...options,
+  schema: {
+    ...Base,
+    added: NonNegativeInt,
+    removed: NonNegativeInt,
+    replaced: NonNegativeInt,
+    restarted: NonNegativeInt,
+  },
+})
+export type WorkflowReplanned = typeof WorkflowReplanned.Type
+
+export const WorkflowConfigUpdated = Event.define({
+  type: "dag.workflow.config_updated",
+  ...options,
+  schema: {
+    ...Base,
+    config: Schema.String, // merged YAML/JSON string (single source of truth after replan)
+  },
+})
+export type WorkflowConfigUpdated = typeof WorkflowConfigUpdated.Type
+
+// ============================================================================
+// Node lifecycle events
+// ============================================================================
+
+export const NodeRegistered = Event.define({
+  type: "dag.node.registered",
+  ...options,
+  schema: {
+    ...Base,
+    nodeID: NodeID,
+    name: Schema.String,
+    workerType: Schema.String,
+    dependsOn: Schema.Array(NodeID),
+    required: Schema.Boolean,
+    model: Schema.optional(NodeModel),
+  },
+})
+export type NodeRegistered = typeof NodeRegistered.Type
+
+// Admission: the scheduler accepted the node into an execution attempt but it
+// has not acquired an execution permit yet — no child session exists. The
+// deadline starts here so queue wait counts toward the node's budget (P0-2).
+export const NodeQueued = Event.define({
+  type: "dag.node.queued",
+  ...options,
+  schema: {
+    ...Base,
+    nodeID: NodeID,
+    deadlineMs: Schema.optional(Schema.Number),
+  },
+})
+export type NodeQueued = typeof NodeQueued.Type
+
+export const NodeStarted = Event.define({
+  type: "dag.node.started",
+  ...options,
+  schema: {
+    ...Base,
+    nodeID: NodeID,
+    childSessionID: SessionID,
+    deadlineMs: Schema.optional(Schema.Number),
+    wakeEligible: Schema.optional(Schema.Boolean),
+  },
+})
+export type NodeStarted = typeof NodeStarted.Type
+
+export const NodeCompleted = Event.define({
+  type: "dag.node.completed",
+  ...options,
+  schema: {
+    ...Base,
+    nodeID: NodeID,
+    output: Schema.Unknown,
+    durationMs: NonNegativeInt,
+  },
+})
+export type NodeCompleted = typeof NodeCompleted.Type
+
+export const NodeFailed = Event.define({
+  type: "dag.node.failed",
+  ...options,
+  schema: {
+    ...Base,
+    nodeID: NodeID,
+    reason: Schema.String,
+    trigger: Schema.Literals(["exec_failed", "push_exhausted", "verdict_fail", "timeout"]),
+  },
+})
+export type NodeFailed = typeof NodeFailed.Type
+
+export const NodeSkipped = Event.define({
+  type: "dag.node.skipped",
+  ...options,
+  schema: {
+    ...Base,
+    nodeID: NodeID,
+    reason: Schema.Literals(["condition_false", "agent_complete", "orphan_cascade", "workflow_cancelled", "workflow_failed"]),
+  },
+})
+export type NodeSkipped = typeof NodeSkipped.Type
+
+export const NodeCancelled = Event.define({
+  type: "dag.node.cancelled",
+  ...options,
+  schema: {
+    ...Base,
+    nodeID: NodeID,
+  },
+})
+export type NodeCancelled = typeof NodeCancelled.Type
+
+export const NodeRestarted = Event.define({
+  type: "dag.node.restarted",
+  ...options,
+  schema: {
+    ...Base,
+    nodeID: NodeID,
+    childSessionID: SessionID,
+  },
+})
+export type NodeRestarted = typeof NodeRestarted.Type
+
+// ============================================================================
+// Inventories + tagged unions
+// ============================================================================
+
+export const DurableDefinitions = Event.inventory(
+  WorkflowCreated,
+  WorkflowStarted,
+  WorkflowPaused,
+  WorkflowResumed,
+  WorkflowStepped,
+  WorkflowCompleted,
+  WorkflowFailed,
+  WorkflowCancelled,
+  WorkflowReplanned,
+  WorkflowConfigUpdated,
+  NodeRegistered,
+  NodeQueued,
+  NodeStarted,
+  NodeCompleted,
+  NodeFailed,
+  NodeSkipped,
+  NodeCancelled,
+  NodeRestarted,
+)
+
+export const Definitions = DurableDefinitions
+
+export const Durable = Schema.Union(DurableDefinitions, { mode: "oneOf" }).pipe(Schema.toTaggedUnion("type"))
+export type DurableEvent = typeof Durable.Type
+
+export const All = Schema.Union(Definitions, { mode: "oneOf" }).pipe(Schema.toTaggedUnion("type"))
+export type Event = typeof All.Type
+export type Type = Event["type"]

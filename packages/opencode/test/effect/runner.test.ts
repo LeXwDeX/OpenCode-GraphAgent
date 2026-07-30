@@ -1,5 +1,5 @@
 import { describe, expect } from "bun:test"
-import { Cause, Deferred, Effect, Exit, Fiber, Latch, Ref, Scope } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber, Latch, Option, Ref, Scope } from "effect"
 import { Runner } from "@/effect/runner"
 import { it } from "../lib/effect"
 
@@ -110,6 +110,47 @@ describe("Runner", () => {
       expect(a).toBe("first-result")
       expect(b).toBe("first-result")
       expect(yield* Ref.get(ran)).toEqual(["first"])
+    }),
+  )
+
+  it.live(
+    "ensureRunningHandle reserves the runner before its result is awaited",
+    Effect.gen(function* () {
+      const s = yield* Scope.Scope
+      const runner = Runner.make<string>(s)
+      const gate = yield* Deferred.make<void>()
+
+      const handle = yield* runner.ensureRunningHandle(Deferred.await(gate).pipe(Effect.as("done")))
+      expect(runner.busy).toBe(true)
+      expect(runner.state._tag).toBe("Running")
+
+      yield* Deferred.succeed(gate, undefined)
+      expect(yield* handle).toBe("done")
+      expect(runner.busy).toBe(false)
+    }),
+  )
+
+  it.live(
+    "startIfIdle atomically rejects replacement work while the first run is active",
+    Effect.gen(function* () {
+      const s = yield* Scope.Scope
+      const runner = Runner.make<string>(s)
+      const gate = yield* Deferred.make<void>()
+      const replacementRan = yield* Ref.make(false)
+
+      const first = yield* runner.startIfIdle(Deferred.await(gate).pipe(Effect.as("first")))
+      const second = yield* runner.startIfIdle(
+        Ref.set(replacementRan, true).pipe(Effect.as("second")),
+      )
+
+      expect(Option.isSome(first)).toBe(true)
+      expect(Option.isNone(second)).toBe(true)
+      expect(yield* Ref.get(replacementRan)).toBe(false)
+      expect(runner.busy).toBe(true)
+
+      yield* Deferred.succeed(gate, undefined)
+      if (Option.isSome(first)) expect(yield* first.value).toBe("first")
+      expect(runner.busy).toBe(false)
     }),
   )
 

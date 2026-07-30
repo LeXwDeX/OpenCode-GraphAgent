@@ -1,4 +1,5 @@
 import { Glob } from "@opencode-ai/core/util/glob"
+import { InstallationChannel, InstallationVersion } from "@opencode-ai/core/installation/version"
 import { ConfigPluginV1 } from "@opencode-ai/core/v1/config/plugin"
 import { pathToFileURL } from "url"
 import { isPathPluginSpec, parsePluginSpecifier, resolvePathPluginTarget } from "@/plugin/shared"
@@ -35,6 +36,12 @@ export function pluginSpecifier(plugin: ConfigPluginV1.Spec): string {
 
 export function pluginOptions(plugin: ConfigPluginV1.Spec): ConfigPluginV1.Options | undefined {
   return Array.isArray(plugin) ? plugin[1] : undefined
+}
+
+export function dependencyVersion(input = { channel: InstallationChannel, version: InstallationVersion }) {
+  if (input.channel !== "latest") return undefined
+  if (!/^\d+\.\d+\.\d+$/.test(input.version)) return undefined
+  return input.version
 }
 
 // Path-like specs are resolved relative to the config file that declared them so merges later on do not

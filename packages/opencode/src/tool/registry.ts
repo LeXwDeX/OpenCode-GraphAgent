@@ -12,12 +12,14 @@ import { ReadTool } from "./read"
 import { TaskTool } from "./task"
 import { Database } from "@opencode-ai/core/database/database"
 import { TodoWriteTool } from "./todo"
-import { GoalTool } from "./goal"
 import { SettingsHook } from "@/hook/settings"
 import { WebFetchTool } from "./webfetch"
 import { WriteTool } from "./write"
 import { InvalidTool } from "./invalid"
 import { SkillTool } from "./skill"
+import { WorkflowTool } from "./workflow"
+import { SubmitResultTool } from "./submit_result"
+import { Dag } from "@/dag/dag"
 import * as Tool from "./tool"
 import { Config } from "@/config/config"
 import { type ToolContext as PluginToolContext, type ToolDefinition } from "@opencode-ai/plugin"
@@ -69,6 +71,12 @@ type State = {
   read: ReadDef
 }
 
+type AgentCatalogOptions = {
+  heading: string
+  includeHidden: boolean
+  includeModelState: boolean
+}
+
 export interface Interface {
   readonly ids: () => Effect.Effect<string[]>
   readonly all: () => Effect.Effect<Tool.Def[]>
@@ -96,7 +104,6 @@ export const layer = Layer.effect(
     const read = yield* ReadTool
     const question = yield* QuestionTool
     const todo = yield* TodoWriteTool
-    const goaltool = yield* GoalTool
     const lsptool = yield* LspTool
     const plan = yield* PlanExitTool
     const webfetch = yield* WebFetchTool
@@ -108,6 +115,8 @@ export const layer = Layer.effect(
     const greptool = yield* GrepTool
     const patchtool = yield* ApplyPatchTool
     const skilltool = yield* SkillTool
+    const workflow = yield* WorkflowTool
+    const submitResult = yield* SubmitResultTool
     const agent = yield* Agent.Service
 
     const state = yield* InstanceState.make<State>(
@@ -209,10 +218,11 @@ export const layer = Layer.effect(
           task: Tool.init(task),
           fetch: Tool.init(webfetch),
           todo: Tool.init(todo),
-          goal: Tool.init(goaltool),
           search: Tool.init(websearch),
           skill: Tool.init(skilltool),
           patch: Tool.init(patchtool),
+          workflow: Tool.init(workflow),
+          submitResult: Tool.init(submitResult),
           question: Tool.init(question),
           lsp: Tool.init(lsptool),
           plan: Tool.init(plan),
@@ -232,10 +242,11 @@ export const layer = Layer.effect(
             tool.task,
             tool.fetch,
             tool.todo,
-            tool.goal,
             tool.search,
             tool.skill,
             tool.patch,
+            tool.workflow,
+            tool.submitResult,
             ...(flags.experimentalLspTool ? [tool.lsp] : []),
             ...(flags.experimentalPlanMode && flags.client === "cli" ? [tool.plan] : []),
           ],
@@ -254,19 +265,21 @@ export const layer = Layer.effect(
       return (yield* all()).map((tool) => tool.id)
     })
 
-    const describeTask = Effect.fn("ToolRegistry.describeTask")(function* (agent: Agent.Info) {
-      const items = (yield* agents.list()).filter((item) => item.mode !== "primary")
-      const filtered = items.filter(
-        (item) => Permission.evaluate("task", item.name, agent.permission).action !== "deny",
-      )
-      const list = filtered.toSorted((a, b) => a.name.localeCompare(b.name))
-      const description = list
+    const describeAgents = Effect.fn("ToolRegistry.describeAgents")(function* (
+      caller: Agent.Info,
+      options: AgentCatalogOptions,
+    ) {
+      const description = (yield* agents.list())
+        .filter((item) => item.mode !== "primary")
+        .filter((item) => options.includeHidden || !item.hidden)
+        .filter((item) => Permission.evaluate("task", item.name, caller.permission).action !== "deny")
+        .toSorted((a, b) => a.name.localeCompare(b.name))
         .map(
           (item) =>
-            `- ${item.name}: ${item.description ?? "This subagent should only be called manually by the user."}`,
+            `- ${item.name}: ${item.description ?? "This subagent should only be called manually by the user."}${options.includeModelState ? ` [model: ${item.model ? "configured" : "inherited"}]` : ""}`,
         )
         .join("\n")
-      return ["Available agent types and the tools they have access to:", description].join("\n")
+      return [options.heading, description].join("\n")
     })
 
     const tools: Interface["tools"] = Effect.fn("ToolRegistry.tools")(function* (input) {
@@ -298,7 +311,23 @@ export const layer = Layer.effect(
               : undefined
           return {
             id: tool.id,
-            description: [output.description, tool.id === TaskTool.id ? yield* describeTask(input.agent) : undefined]
+            description: [
+              output.description,
+              tool.id === TaskTool.id
+                ? yield* describeAgents(input.agent, {
+                    heading: "Available agent types and the tools they have access to:",
+                    includeHidden: true,
+                    includeModelState: false,
+                  })
+                : undefined,
+              tool.id === WorkflowTool.id
+                ? yield* describeAgents(input.agent, {
+                    heading: "Available workflow worker_type values:",
+                    includeHidden: false,
+                    includeModelState: true,
+                  })
+                : undefined,
+            ]
               .filter(Boolean)
               .join("\n"),
             parameters: output.parameters,
@@ -337,6 +366,7 @@ export const defaultLayer = Layer.suspend(() =>
       Layer.provide(FSUtil.defaultLayer),
       Layer.provide(Ripgrep.defaultLayer),
       Layer.provide(EventV2Bridge.defaultLayer),
+      Layer.provide(Dag.defaultLayer),
       Layer.provide(FetchHttpClient.layer),
       Layer.provide(Format.defaultLayer),
       Layer.provide(CrossSpawnSpawner.defaultLayer),
@@ -442,6 +472,7 @@ export const node = LayerNode.make(layer.pipe(Layer.provide(Ripgrep.defaultLayer
   RuntimeFlags.node,
   Database.node,
   SettingsHook.node,
+  Dag.node,
 ])
 
 export * as ToolRegistry from "./registry"
