@@ -16,8 +16,11 @@ import { Truncate } from "@/tool/truncate"
 import { Parameters, WorkflowTool } from "@/tool/workflow"
 import { testEffect } from "../lib/effect"
 import { fingerprintBrief, type State } from "@/dag/admission"
+import { ModelV2 } from "@opencode-ai/core/model"
+import { ProjectV2 } from "@opencode-ai/core/project"
+import { ProviderV2 } from "@opencode-ai/core/provider"
 
-const projectID = "project_test"
+const projectID = ProjectV2.ID.make("project_test")
 const admissionBrief = {
   goal: "Qualify and execute a deep workflow",
   scope: {
@@ -202,10 +205,17 @@ const runtime = testEffect(
       get: (id: Parameters<Session.Interface["get"]>[0]) =>
         Effect.succeed({
           id,
+          slug: "workflow-test",
           projectID,
           directory: "/project",
-          model: { providerID: "test" as never, id: "test-model" as never },
-        } as unknown as Session.Info),
+          title: "Workflow test",
+          version: "test",
+          time: { created: 0, updated: 0 },
+          model: {
+            providerID: ProviderV2.ID.make("test"),
+            id: ModelV2.ID.make("test-model"),
+          },
+        } satisfies Session.Info),
     }),
   ),
 )
@@ -238,9 +248,13 @@ const missingModelRuntime = testEffect(
       get: (id: Parameters<Session.Interface["get"]>[0]) =>
         Effect.succeed({
           id,
+          slug: "workflow-test",
           projectID,
           directory: missingModelDirectory,
-        } as Session.Info),
+          title: "Workflow test",
+          version: "test",
+          time: { created: 0, updated: 0 },
+        } satisfies Session.Info),
     }),
   ),
 )

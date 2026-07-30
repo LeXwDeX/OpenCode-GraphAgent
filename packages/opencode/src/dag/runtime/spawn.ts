@@ -31,6 +31,8 @@ import { DagModel } from "../model"
 import { validateReviewResult } from "../review-lifecycle"
 import { InvalidTransitionError, TerminalViolationError } from "@opencode-ai/core/dag/core/types"
 import type { DagStore } from "@opencode-ai/core/dag/store"
+import { ModelV2 } from "@opencode-ai/core/model"
+import { ProviderV2 } from "@opencode-ai/core/provider"
 import { registerCaptureSlot, clearCaptureSlot } from "./capture"
 
 type PromptParts = SessionPrompt.PromptInput["parts"]
@@ -87,8 +89,8 @@ export function spawnNode(
         : undefined
     const nodeModel = persistedNodeModel
       ? {
-          modelID: persistedNodeModel.modelID as never,
-          providerID: persistedNodeModel.providerID as never,
+          modelID: persistedNodeModel.modelID,
+          providerID: persistedNodeModel.providerID,
         }
       : undefined
     const resolvedModel = DagModel.resolve({
@@ -102,8 +104,8 @@ export function spawnNode(
       return yield* Effect.fail(new Error(`No model configured for agent: ${agent.name}`))
     }
     const model = {
-      modelID: resolvedModel.modelID as never,
-      providerID: resolvedModel.providerID as never,
+      modelID: ModelV2.ID.make(resolvedModel.modelID),
+      providerID: ProviderV2.ID.make(resolvedModel.providerID),
     }
 
     const childPermission = deriveSubagentSessionPermission({

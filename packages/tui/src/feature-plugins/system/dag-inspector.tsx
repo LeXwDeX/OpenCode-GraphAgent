@@ -48,6 +48,8 @@ function scrollRowIntoView(scroll: ScrollBoxRenderable | undefined, index: numbe
   }
 }
 
+const ACTIVE_WORKFLOW_STATUSES = new Set(["running", "paused", "stepping"])
+
 function cancelActiveWorkflow(api: TuiPluginApi) {
   const current = api.route.current
   const params = ("params" in current ? current.params : undefined) as { sessionID?: string } | undefined
@@ -60,7 +62,7 @@ function cancelActiveWorkflow(api: TuiPluginApi) {
     .summary({ sessionID })
     .then((response) => {
       const active = (response.data ?? []).filter((workflow) =>
-        ["running", "paused", "stepping"].includes(String(workflow.status)),
+        ACTIVE_WORKFLOW_STATUSES.has(workflow.status),
       )
       if (active.length === 0) {
         api.ui.toast({ variant: "info", message: "No active DAG workflow to cancel" })
@@ -74,7 +76,7 @@ function cancelActiveWorkflow(api: TuiPluginApi) {
       }
       const workflow = active[0]
       if (!workflow) return
-      return api.client.dag.control({ dagID: workflow.id, operation: "cancel" }).then(() => {
+      void api.client.dag.control({ dagID: workflow.id, operation: "cancel" }).then(() => {
         api.ui.toast({ variant: "info", message: `Workflow ${workflow.title} cancel requested` })
         api.ui.dialog.clear()
       })
