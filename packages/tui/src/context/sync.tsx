@@ -262,6 +262,7 @@ export const {
         // WorkflowSummary[] for a session whenever any dag.* event changes
         // its visible progress. We just store it — no client-side aggregation.
         case "dag.workflow.summary.updated":
+          if (workspace !== undefined && workspace !== project.workspace.current()) break
           setStore("dag", event.properties.sessionID, event.properties.summaries)
           break
 

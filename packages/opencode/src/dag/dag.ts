@@ -28,7 +28,7 @@ import {
   transitionAdmission,
   validateAdmission,
 } from "./admission"
-import { validateReviewLifecycle } from "./review-lifecycle"
+import { unresolvedReviewOutcomes, validateReviewLifecycle } from "./review-lifecycle"
 import { conditionReference } from "./runtime/eval"
 
 // Re-export domain types
@@ -85,6 +85,18 @@ export interface WorkflowConfig {
   max_total_nodes?: number
   node_defaults?: NodeDefaults
   nodes: NodeConfig[]
+}
+
+export class ReviewGateError extends Error {
+  readonly dagID: string
+  readonly reviewIDs: string[]
+
+  constructor(dagID: string, reviewIDs: string[]) {
+    super(`Cannot complete deep workflow ${dagID}: unresolved review outcome(s): ${reviewIDs.join(", ")}`)
+    this.name = "ReviewGateError"
+    this.dagID = dagID
+    this.reviewIDs = reviewIDs
+  }
 }
 
 export function normalizeModel(model: NodeConfig["model"]) {
@@ -452,6 +464,12 @@ export const layer = Layer.effect(
     })
     const complete = Effect.fn("Dag.complete")(function* (dagID: string) {
       yield* guardWorkflow(dagID, WorkflowStatus.COMPLETED)
+      const workflow = yield* store.getWorkflow(dagID).pipe(Effect.orDie)
+      const config = workflow ? parseWorkflowConfig(workflow.config) : undefined
+      const unresolvedReviews = config
+        ? unresolvedReviewOutcomes(config, yield* store.getNodes(dagID))
+        : []
+      if (unresolvedReviews.length > 0) yield* Effect.fail(new ReviewGateError(dagID, unresolvedReviews))
       yield* terminateNonTerminalNodes(dagID, "agent_complete", "", false)
       yield* events.publish(DagEvent.WorkflowCompleted, { dagID: dagID as ID, durationMs: 0 as never, timestamp: yield* DateTime.now })
     })

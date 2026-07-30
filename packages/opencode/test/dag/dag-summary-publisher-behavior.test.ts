@@ -5,6 +5,7 @@ import { DagEvent } from "@opencode-ai/schema/dag-event"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { DagSummaryPublisher } from "@/dag/runtime/summary-publisher"
 import { GlobalBus } from "@/bus/global"
+import { InstanceState } from "@/effect/instance-state"
 import { it, pollWithTimeout } from "../lib/effect"
 
 const ts = (n: number) => DateTime.makeUnsafe(n)
@@ -12,12 +13,14 @@ const ts = (n: number) => DateTime.makeUnsafe(n)
 interface SummaryEmission {
   sessionID: string
   summaries: WorkflowSummary[]
+  workspace?: string
 }
 
 interface StoreControl {
   failures: number
   reads: Map<string, number>
   lookups: Map<string, number>
+  projects: Map<string, string>
   sessions: Map<string, string>
   summaries: Map<string, WorkflowSummary[]>
 }
@@ -31,15 +34,16 @@ function control() {
     failures: 0,
     reads: new Map<string, number>(),
     lookups: new Map<string, number>(),
+    projects: new Map<string, string>(),
     sessions: new Map<string, string>(),
     summaries: new Map<string, WorkflowSummary[]>(),
   } satisfies StoreControl
 }
 
-function workflow(id: string, sessionId: string): WorkflowRow {
+function workflow(id: string, sessionId: string, projectId: string): WorkflowRow {
   return {
     id,
-    projectId: "global",
+    projectId,
     sessionId,
     title: id,
     status: "running",
@@ -73,7 +77,7 @@ function runtime(state: StoreControl, bus: EventControl) {
       Effect.sync(() => {
         state.lookups.set(dagID, (state.lookups.get(dagID) ?? 0) + 1)
         const sid = state.sessions.get(dagID)
-        return sid ? workflow(dagID, sid) : undefined
+        return sid ? workflow(dagID, sid, state.projects.get(dagID) ?? "global") : undefined
       }),
     getWorkflowSummaries: (sessionID) =>
       Effect.sync(() => {
@@ -101,36 +105,51 @@ function runtime(state: StoreControl, bus: EventControl) {
 function startCollector() {
   const emissions: SummaryEmission[] = []
   const handler = (event: {
+    workspace?: string
     payload?: { type?: string; properties?: { sessionID?: string; summaries?: WorkflowSummary[] } }
   }) => {
     if (event.payload?.type !== "dag.workflow.summary.updated") return
     emissions.push({
       sessionID: event.payload.properties!.sessionID!,
       summaries: event.payload.properties!.summaries!,
+      ...(event.workspace ? { workspace: event.workspace } : {}),
     })
   }
   GlobalBus.on("event", handler)
   return { emissions, stop: () => GlobalBus.off("event", handler) }
 }
 
-function publishNodeEvents(bus: EventControl, dagID: string, count: number) {
+function publishNodeEvents(
+  bus: EventControl,
+  dagID: string,
+  count: number,
+  foreignDirectory = false,
+  workspaceID?: string,
+) {
   if (!bus.listener) return Effect.die(new Error("publisher listener is not ready"))
-  return Effect.forEach(
-    Array.from({ length: count }, (_, index) => index),
-    (index) => bus.listener!({
-      type: DagEvent.NodeRegistered.type,
-      data: {
-        dagID,
-        nodeID: `${dagID}-node-${index}`,
-        name: `Node ${index}`,
-        workerType: "build",
-        dependsOn: [],
-        required: true,
-        timestamp: ts(index),
-      },
-    } as never),
-    { discard: true },
-  )
+  return Effect.gen(function* () {
+    const instance = yield* InstanceState.context
+    yield* Effect.forEach(
+      Array.from({ length: count }, (_, index) => index),
+      (index) => bus.listener!({
+        type: DagEvent.NodeRegistered.type,
+        data: {
+          dagID,
+          nodeID: `${dagID}-node-${index}`,
+          name: `Node ${index}`,
+          workerType: "build",
+          dependsOn: [],
+          required: true,
+          timestamp: ts(index),
+        },
+        location: {
+          directory: foreignDirectory ? `${instance.directory}-foreign` : instance.directory,
+          ...(workspaceID ? { workspaceID } : {}),
+        },
+      } as never),
+      { discard: true },
+    )
+  })
 }
 
 function withCollector<A, E, R>(use: (collector: ReturnType<typeof startCollector>) => Effect.Effect<A, E, R>) {
@@ -240,6 +259,69 @@ describe("DagSummaryPublisher behavior", () => {
 
         expect(state.reads.get("ses-retry")).toBe(2)
         expect(collector.emissions[0].summaries).toEqual([summary("dag-retry", 2)])
+      }),
+    ).pipe(Effect.provide(runtime(state, bus)))
+  })
+
+  it.instance("ignores DAG events emitted by another project instance", () => {
+    const state = control()
+    const bus = {} satisfies EventControl
+    state.sessions.set("dag-foreign", "ses-foreign")
+    state.summaries.set("ses-foreign", [summary("dag-foreign", 1)])
+
+    return withCollector((collector) =>
+      Effect.gen(function* () {
+        yield* (yield* DagSummaryPublisher.Service).init()
+        yield* publishNodeEvents(bus, "dag-foreign", 1, true)
+        yield* Effect.sleep("150 millis")
+
+        expect(state.lookups.size).toBe(0)
+        expect(state.reads.size).toBe(0)
+        expect(collector.emissions).toEqual([])
+      }),
+    ).pipe(Effect.provide(runtime(state, bus)))
+  })
+
+  it.instance("ignores another project even when its event uses the same directory", () => {
+    const state = control()
+    const bus = {} satisfies EventControl
+    state.sessions.set("dag-foreign-project", "ses-foreign-project")
+    state.projects.set("dag-foreign-project", "foreign-project")
+    state.summaries.set("ses-foreign-project", [summary("dag-foreign-project", 1)])
+
+    return withCollector((collector) =>
+      Effect.gen(function* () {
+        yield* (yield* DagSummaryPublisher.Service).init()
+        yield* publishNodeEvents(bus, "dag-foreign-project", 1)
+        yield* Effect.sleep("150 millis")
+
+        expect(state.lookups.get("dag-foreign-project")).toBe(1)
+        expect(state.reads.size).toBe(0)
+        expect(collector.emissions).toEqual([])
+      }),
+    ).pipe(Effect.provide(runtime(state, bus)))
+  })
+
+  it.instance("routes summary emissions to the workspace carried by the DAG event", () => {
+    const state = control()
+    const bus = {} satisfies EventControl
+    state.sessions.set("dag-workspace", "ses-workspace")
+    state.summaries.set("ses-workspace", [summary("dag-workspace", 1)])
+
+    return withCollector((collector) =>
+      Effect.gen(function* () {
+        yield* (yield* DagSummaryPublisher.Service).init()
+        yield* publishNodeEvents(bus, "dag-workspace", 1, false, "wrk-origin")
+        yield* pollWithTimeout(
+          Effect.sync(() => collector.emissions[0]),
+          "workspace summary was not emitted",
+        )
+
+        expect(collector.emissions[0]).toEqual({
+          sessionID: "ses-workspace",
+          summaries: [summary("dag-workspace", 1)],
+          workspace: "wrk-origin",
+        })
       }),
     ).pipe(Effect.provide(runtime(state, bus)))
   })

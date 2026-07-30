@@ -5,6 +5,7 @@ import { InvalidRequestError, ConflictError, notFound } from "../errors"
 import { Dag } from "@/dag/dag"
 import { Session } from "@/session/session"
 import { SessionID } from "@/session/schema"
+import { InstanceState } from "@/effect/instance-state"
 import { InvalidTransitionError, TerminalViolationError } from "@opencode-ai/core/dag/core/types"
 import type { DagStore } from "@opencode-ai/core/dag/store"
 
@@ -12,7 +13,11 @@ import type { DagStore } from "@opencode-ai/core/dag/store"
 function mapTransitionConflict<Success>(effect: Effect.Effect<Success, Error>) {
   return effect.pipe(
     Effect.catch((error: unknown) => {
-      if (error instanceof InvalidTransitionError || error instanceof TerminalViolationError) {
+      if (
+        error instanceof InvalidTransitionError
+        || error instanceof TerminalViolationError
+        || error instanceof Dag.ReviewGateError
+      ) {
         return Effect.fail(new ConflictError({ message: error.message, resource: "workflow" }))
       }
       // Any other Error is re-thrown as a defect (truly unexpected — surfaces as 500).
@@ -63,17 +68,42 @@ export const dagHandlers = HttpApiBuilder.group(InstanceHttpApi, "dag", (handler
       ...(r.completedAt !== null ? { completed_at: r.completedAt } : {}),
     })
 
+    const workflowInProject = Effect.fn("DagHttpApi.workflowInProject")(function* (dagID: string) {
+      const row = yield* dag.store.getWorkflow(dagID).pipe(Effect.orDie)
+      if (row?.projectId !== (yield* InstanceState.context).project.id) return undefined
+      return row
+    })
+
+    const requireWorkflow = Effect.fn("DagHttpApi.requireWorkflow")(function* (dagID: string) {
+      const row = yield* workflowInProject(dagID)
+      if (!row) return yield* Effect.fail(notFound(`Workflow not found: ${dagID}`))
+      return row
+    })
+
+    const requireSession = Effect.fn("DagHttpApi.requireSession")(function* (sessionID: string) {
+      const session = yield* sessions.get(SessionID.make(sessionID)).pipe(
+        Effect.catch(() => Effect.fail(notFound(`Session not found: ${sessionID}`))),
+      )
+      if (session.projectID !== (yield* InstanceState.context).project.id) {
+        return yield* Effect.fail(notFound(`Session not found: ${sessionID}`))
+      }
+      return session
+    })
+
     const list = Effect.fn("DagHttpApi.list")(function* () {
       const rows = yield* dag.store.listWorkflows().pipe(Effect.orDie)
-      return rows.map(wf)
+      const projectID = (yield* InstanceState.context).project.id
+      return rows.filter((row) => row.projectId === projectID).map(wf)
     })
 
     const bySession = Effect.fn("DagHttpApi.bySession")(function* (ctx: { params: { sessionID: string } }) {
+      yield* requireSession(ctx.params.sessionID)
       const rows = yield* dag.store.listBySession(ctx.params.sessionID).pipe(Effect.orDie)
       return rows.map(wf)
     })
 
     const summary = Effect.fn("DagHttpApi.summary")(function* (ctx: { params: { sessionID: string } }) {
+      yield* requireSession(ctx.params.sessionID)
       const summaries = yield* dag.store.getWorkflowSummaries(ctx.params.sessionID).pipe(Effect.orDie)
       return summaries.map((s) => ({
         id: s.id,
@@ -89,17 +119,17 @@ export const dagHandlers = HttpApiBuilder.group(InstanceHttpApi, "dag", (handler
     })
 
     const detail = Effect.fn("DagHttpApi.detail")(function* (ctx: { params: { dagID: string } }) {
-      const row = yield* dag.store.getWorkflow(ctx.params.dagID).pipe(Effect.orDie)
-      if (!row) return yield* Effect.fail(notFound(`Workflow not found: ${ctx.params.dagID}`))
-      return wf(row)
+      return wf(yield* requireWorkflow(ctx.params.dagID))
     })
 
     const nodes = Effect.fn("DagHttpApi.nodes")(function* (ctx: { params: { dagID: string } }) {
+      yield* requireWorkflow(ctx.params.dagID)
       const rows = yield* dag.store.getNodes(ctx.params.dagID).pipe(Effect.orDie)
       return rows.map(node)
     })
 
     const nodeDetail = Effect.fn("DagHttpApi.nodeDetail")(function* (ctx: { params: { dagID: string; nodeID: string } }) {
+      yield* requireWorkflow(ctx.params.dagID)
       const row = yield* dag.store.getNode(ctx.params.dagID, ctx.params.nodeID).pipe(Effect.orDie)
       if (!row) return yield* Effect.fail(notFound(`Node not found: ${ctx.params.nodeID}`))
       return node(row)
@@ -110,9 +140,7 @@ export const dagHandlers = HttpApiBuilder.group(InstanceHttpApi, "dag", (handler
       if (!config || typeof config !== "object" || !Array.isArray((config as Record<string, unknown>).nodes)) {
         return yield* Effect.fail(new InvalidRequestError({ message: "start requires 'config' with a 'nodes' array" }))
       }
-      const session = yield* sessions.get(SessionID.make(ctx.payload.session_id)).pipe(
-        Effect.catch(() => Effect.fail(notFound(`Session not found: ${ctx.payload.session_id}`))),
-      )
+      const session = yield* requireSession(ctx.payload.session_id)
       const cfg = config as Dag.WorkflowConfig
       // Same code path as the workflow tool's start action — create validates
       // the config (duplicate ids / dangling deps / condition refs / ceiling)
@@ -135,8 +163,7 @@ export const dagHandlers = HttpApiBuilder.group(InstanceHttpApi, "dag", (handler
       const op = ctx.payload.operation
 
       // Pre-check existence so non-existent workflows return 404, not a 500 defect.
-      const existing = yield* dag.store.getWorkflow(dagID).pipe(Effect.orDie)
-      if (!existing) return yield* Effect.fail(notFound(`Workflow not found: ${dagID}`))
+      yield* requireWorkflow(dagID)
 
       // Control ops may fail with InvalidTransitionError/TerminalViolationError for
       // semantically invalid operations (e.g. pause on a completed workflow). Map those

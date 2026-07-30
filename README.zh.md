@@ -38,7 +38,6 @@
 | `output_schema` | JSON Schema；子智能体必须调用 `submit_result` 提交匹配的结构化结果 |
 | `required` | 必需节点失败会使整个工作流失败 |
 | `report_to_parent` | 节点到达终态时唤醒父智能体 |
-| `model` | 可选的节点级模型指定；否则按 节点 → `node_defaults` → agent → `dag.jsonc` 分层 → 父会话 解析 |
 | `review` | `design` 或 `diff` 审查阶段，带实现指纹契约（见下） |
 
 工作流级参数：`max_concurrency`（默认 5）、`max_node_replan_attempts`（5）、`max_total_nodes`（100）、节点级 `timeout_ms`（默认 10 分钟，排队等待计入预算）。
@@ -90,6 +89,7 @@
 - **工具健壮性**：修复 LLM 输出里损坏的多字节 Unicode 转义（JSON 修复），校验错误带字段级提示，工具文档扩充，子进程管道修复。
 - **CJK 与 IME 修复**：终端 UI 里中日韩文输入的修正（IME 组字刷新、全角文本处理），另有 [`patches/`](./patches) 下的韩文 IME 修复脚本。
 - **Worktree 隔离**：按工作流的 `git worktree` 隔离，附实验性的 sandbox-worktree HTTP 端点。
+- **配置助手**：[`config_assistant`](./config_assistant) 下提供独立 Go TUI，用于定位、校验和编辑 opencode 配置（`cd config_assistant && go run ./cmd/ocfg`）。
 - 早期的「Goal 自动循环」和 `/goal`、`/subgoal`、`/workflow` 斜杠命令已经移除，自主执行统一走 `workflow` 工具和它的唤醒机制。
 
 上游全部能力（多 Provider、内置 LSP、客户端/服务器架构、TUI/桌面/Web 客户端）均完整保留。
@@ -117,9 +117,8 @@ bun dev serve        # headless API 服务（端口 4096）
 
 ## 质量门禁
 
-- **CI**：每个 PR 跑 typecheck；`main` 门禁额外运行全量单元测试（Linux）、Playwright e2e（Linux + Windows）、HTTP API 契约测试器、以及生成 SDK 的新鲜度校验。
+- **CI**：每个 PR 跑 typecheck；`main` 门禁额外运行 Bun/Turbo 单元测试与配置助手 Go 测试（Linux）、Playwright e2e（Linux + Windows）、HTTP API 契约测试器、以及生成 SDK 的新鲜度校验。
 - **DAG 专项测试**：核心调度单元测试、投影器/状态机漂移测试、工作流生命周期集成测试、每条 DAG 路由的 HTTP API 演练场景。
-- **规范**：引擎行为由 [openspec](./openspec/specs) 规范固定（执行引擎、状态机强制、调度器恢复、单步语义、结构化输出、回放幂等性等）。
 
 ## 许可证
 
@@ -135,7 +134,6 @@ bun dev serve        # headless API 服务（端口 4096）
 ## 文档
 
 - [`docs/harness-dag.md`](./docs/harness-dag.md) —— deep 模式准入与审查生命周期
-- [`openspec/specs`](./openspec/specs) —— 引擎行为规范
 - [`.opencode/dag-prompts`](./.opencode/dag-prompts) —— 内置节点 prompt 模板
 - [`AGENTS.md`](./AGENTS.md) —— 贡献与开发指南
 
