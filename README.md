@@ -38,7 +38,6 @@ Each node declares:
 | `output_schema` | JSON Schema; the child agent must call `submit_result` with a matching structured payload |
 | `required` | Failure of a required node fails the workflow |
 | `report_to_parent` | Wake the parent agent when this node reaches a terminal state |
-| `model` | Optional per-node model pin; otherwise resolves node → `node_defaults` → agent → `dag.jsonc` tier → parent session |
 | `review` | `design` or `diff` review phase with an implementation-fingerprint contract (below) |
 
 Workflow-level knobs: `max_concurrency` (default 5), `max_node_replan_attempts` (5), `max_total_nodes` (100), per-node `timeout_ms` (default 10 min, queue wait counts toward the deadline).
@@ -90,6 +89,7 @@ Workflow-level knobs: `max_concurrency` (default 5), `max_node_replan_attempts` 
 - **Tool robustness**: JSON repair for broken multi-byte Unicode escapes in LLM output, structured validation errors with field-level hints, expanded tool docs, child-process pipe fixes.
 - **CJK & IME fixes**: corrections for Chinese/Japanese/Korean input in the terminal UI (IME composition flushing, full-width text handling), plus a Korean IME fix script under [`patches/`](./patches).
 - **Worktree isolation**: per-workflow `git worktree` isolation, with experimental sandbox-worktree HTTP endpoints.
+- **Configuration assistant**: a standalone Go TUI under [`config_assistant`](./config_assistant) for locating, validating, and editing opencode configuration (`cd config_assistant && go run ./cmd/ocfg`).
 - An earlier "Goal auto-loop" and the `/goal`, `/subgoal`, `/workflow` slash commands are gone; autonomous execution now goes through the `workflow` tool and its wake mechanism.
 
 All upstream capabilities (multi-provider, built-in LSP, client/server architecture, TUI/desktop/web clients) are preserved.
@@ -117,7 +117,7 @@ bun dev serve        # headless API server (port 4096)
 
 ## Quality gates
 
-- **CI**: typecheck on every PR; the `main` gate additionally runs the full unit suite (Linux), Playwright e2e (Linux + Windows), an HTTP API contract exerciser, and generated-SDK freshness checks.
+- **CI**: typecheck on every PR; the `main` gate additionally runs the Bun/Turbo unit suite and config-assistant Go tests (Linux), Playwright e2e (Linux + Windows), an HTTP API contract exerciser, and generated-SDK freshness checks.
 - **DAG-specific tests**: core scheduling unit tests, projector/state-machine drift tests, workflow lifecycle integration tests, and HTTP API exercise scenarios for every DAG route.
 
 ## License

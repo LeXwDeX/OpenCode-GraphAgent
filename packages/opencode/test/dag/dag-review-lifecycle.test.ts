@@ -6,6 +6,7 @@ import {
   validateReviewExecutionInput,
   validateReviewLifecycle,
   validateReviewResult,
+  unresolvedReviewOutcomes,
 } from "@/dag/review-lifecycle"
 
 function node(id: string, overrides: Partial<NodeConfig> = {}): NodeConfig {
@@ -96,6 +97,12 @@ function validDiffFlow() {
         required: ["verdict", "implementation_fingerprint"],
       },
     }),
+    node("final-audit", {
+      worker_type: "audit",
+      depends_on: ["review-diff"],
+      input_mapping: { review: "review-diff.output" },
+      condition: 'review-diff.output.verdict == "ACCEPT"',
+    }),
   ]
 }
 
@@ -135,10 +142,49 @@ describe("DAG review lifecycle", () => {
     ]))).toEqual({ valid: true, errors: [], warnings: [] })
   })
 
-  it("accepts implementation to verification PASS to diff review", () => {
+  it("accepts implementation to verification PASS to diff review to final audit", () => {
     expect(validateReviewLifecycle(workflow("deep", validDiffFlow()))).toEqual({
       valid: true,
       errors: [],
+      warnings: [],
+    })
+  })
+
+  it("rejects a deep diff review without a downstream final ACCEPT gate", () => {
+    const nodes = validDiffFlow().filter((item) => item.id !== "final-audit")
+    expect(validateReviewLifecycle(workflow("deep", nodes))).toEqual({
+      valid: false,
+      errors: [
+        "review-diff: deep diff review must feed a required final gate conditioned on verdict ACCEPT",
+      ],
+      warnings: [],
+    })
+  })
+
+  it("validates explicit diff-review metadata even on a non-review worker", () => {
+    const nodes = validDiffFlow().filter((item) => item.id !== "final-audit")
+    const review = nodes[2]
+    if (!review) throw new Error("fixture is incomplete")
+    review.worker_type = "general"
+    expect(validateReviewLifecycle(workflow("deep", nodes))).toEqual({
+      valid: false,
+      errors: [
+        "review-diff: deep diff review must feed a required final gate conditioned on verdict ACCEPT",
+      ],
+      warnings: [],
+    })
+  })
+
+  it("rejects a final gate that mentions ACCEPT but runs only for REJECT", () => {
+    const nodes = validDiffFlow()
+    const gate = nodes[3]
+    if (!gate) throw new Error("fixture is incomplete")
+    gate.condition = 'review-diff.output.verdict != "ACCEPT"'
+    expect(validateReviewLifecycle(workflow("deep", nodes))).toEqual({
+      valid: false,
+      errors: [
+        "review-diff: deep diff review must feed a required final gate conditioned on verdict ACCEPT",
+      ],
       warnings: [],
     })
   })
@@ -319,6 +365,90 @@ describe("DAG review lifecycle", () => {
     })
   })
 
+  it("keeps a deep workflow from succeeding with an unresolved review outcome", () => {
+    const rejected = workflow("deep", validDiffFlow())
+    expect(unresolvedReviewOutcomes(rejected, [
+      {
+        id: "review-diff",
+        status: "completed",
+        output: { verdict: "REJECT", implementation_fingerprint: "sha256:revision-1" },
+      },
+    ])).toEqual(["review-diff"])
+    expect(unresolvedReviewOutcomes(rejected, [
+      { id: "review-diff", status: "skipped", output: undefined },
+      { id: "final-audit", status: "skipped", output: undefined },
+    ])).toEqual(["review-diff"])
+    expect(unresolvedReviewOutcomes(rejected, [
+      {
+        id: "review-diff",
+        status: "completed",
+        output: { verdict: "ACCEPT", implementation_fingerprint: "sha256:revision-1" },
+      },
+      { id: "final-audit", status: "skipped", output: undefined },
+    ])).toEqual(["review-diff"])
+
+    const corrected = [
+      ...rejected.nodes,
+      node("implement-fix", {
+        depends_on: ["review-diff"],
+        condition: 'review-diff.output.verdict == "REJECT"',
+      }),
+      node("verify-fix", { depends_on: ["implement-fix"] }),
+      node("review-diff-2", {
+        worker_type: "review",
+        depends_on: ["verify-fix"],
+        review: {
+          phase: "diff",
+          implementation_node_id: "implement-fix",
+          verification_node_id: "verify-fix",
+        },
+      }),
+      node("final-audit-2", {
+        worker_type: "audit",
+        depends_on: ["review-diff-2"],
+        input_mapping: { review: "review-diff-2.output" },
+        condition: 'review-diff-2.output.verdict == "ACCEPT"',
+      }),
+    ]
+    expect(unresolvedReviewOutcomes(workflow("deep", corrected), [
+      {
+        id: "review-diff",
+        status: "completed",
+        output: { verdict: "REJECT", implementation_fingerprint: "sha256:revision-1" },
+      },
+      {
+        id: "review-diff-2",
+        status: "completed",
+        output: { verdict: "ACCEPT", implementation_fingerprint: "sha256:revision-2" },
+      },
+      { id: "final-audit-2", status: "completed", output: "audited" },
+    ])).toEqual([])
+    expect(unresolvedReviewOutcomes(workflow("deep", corrected), [
+      {
+        id: "review-diff",
+        status: "completed",
+        output: { verdict: "ACCEPT", implementation_fingerprint: "sha256:revision-1" },
+      },
+      { id: "final-audit", status: "completed", output: "audited" },
+      { id: "review-diff-2", status: "skipped", output: undefined },
+      { id: "final-audit-2", status: "skipped", output: undefined },
+    ])).toEqual([])
+    expect(unresolvedReviewOutcomes(workflow("deep", corrected), [
+      {
+        id: "review-diff",
+        status: "completed",
+        output: { verdict: "ACCEPT", implementation_fingerprint: "sha256:revision-1" },
+      },
+      { id: "final-audit", status: "completed", output: "audited" },
+      {
+        id: "review-diff-2",
+        status: "completed",
+        output: { verdict: "REJECT", implementation_fingerprint: "sha256:revision-2" },
+      },
+      { id: "final-audit-2", status: "skipped", output: undefined },
+    ])).toEqual(["review-diff-2"])
+  })
+
   it("accepts a rejected-review correction wave only after reimplementation and verification", () => {
     const first = validDiffFlow()
     const correction = [
@@ -364,6 +494,12 @@ describe("DAG review lifecycle", () => {
           },
           required: ["verdict", "implementation_fingerprint"],
         },
+      }),
+      node("final-audit-2", {
+        worker_type: "audit",
+        depends_on: ["review-diff-2"],
+        input_mapping: { review: "review-diff-2.output" },
+        condition: 'review-diff-2.output.verdict == "ACCEPT"',
       }),
     ]
 

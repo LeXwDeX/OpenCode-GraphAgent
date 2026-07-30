@@ -1,16 +1,22 @@
 export * as DagReviewLifecycle from "./review-lifecycle"
 
 import type { NodeConfig, WorkflowConfig } from "./dag"
+import { evaluateCondition } from "./runtime/eval"
 
 export function validateReviewLifecycle(config: WorkflowConfig) {
   const issues = config.nodes.flatMap((node) => {
-    if (!isReviewWorker(node.worker_type)) return []
     if (!node.review) {
+      if (!isReviewWorker(node.worker_type)) return []
       if ((config.mode ?? "standard") === "standard") return []
       return [`${node.id}: deep review worker must declare review.phase as "design" or "diff"`]
     }
     if (node.review.phase === "design") return []
-    return validateDiffReview(config, node.id)
+    return [
+      ...validateDiffReview(config, node.id),
+      ...((config.mode ?? "standard") === "deep"
+        ? validateFinalReviewGate(config, node.id)
+        : []),
+    ]
   })
 
   if ((config.mode ?? "standard") === "standard") {
@@ -140,6 +146,37 @@ export function validateReviewResult(output: unknown, currentFingerprint: string
   }
 }
 
+export function unresolvedReviewOutcomes(
+  config: WorkflowConfig,
+  nodes: ReadonlyArray<{ id: string; status: string; output: unknown }>,
+) {
+  if ((config.mode ?? "standard") !== "deep") return []
+  const rows = new Map(nodes.map((node) => [node.id, node]))
+  const reviews = config.nodes.filter((node) => node.review?.phase === "diff")
+  return reviews.flatMap((review) => {
+    if (
+      isCorrectionReview(config, reviews, review)
+      && rows.get(review.id)?.status !== "completed"
+    ) return []
+    if (reviewAccepted(config, rows, review)) return []
+    const corrected = reviews.some((candidate) => {
+      const implementationID = candidate.review?.implementation_node_id
+      if (!implementationID || !dependsTransitively(config, implementationID, review.id)) return false
+      return reviewAccepted(config, rows, candidate)
+    })
+    return corrected ? [] : [review.id]
+  })
+}
+
+function isCorrectionReview(config: WorkflowConfig, reviews: NodeConfig[], review: NodeConfig) {
+  const implementationID = review.review?.implementation_node_id
+  return implementationID !== undefined
+    && reviews.some((candidate) =>
+      candidate.id !== review.id
+      && dependsTransitively(config, implementationID, candidate.id),
+    )
+}
+
 export function reviewContractForNode(node: NodeConfig) {
   if (!node.review) return undefined
   if (node.review.phase === "design") {
@@ -215,6 +252,45 @@ function validateDiffReview(config: WorkflowConfig, reviewID: string) {
   ]
 }
 
+function validateFinalReviewGate(config: WorkflowConfig, reviewID: string) {
+  const gate = finalReviewGates(config, reviewID).length > 0
+  return gate
+    ? []
+    : [`${reviewID}: deep diff review must feed a required final gate conditioned on verdict ACCEPT`]
+}
+
+function finalReviewGates(config: WorkflowConfig, reviewID: string) {
+  return config.nodes.filter((node) =>
+    node.id !== reviewID
+    && node.required
+    && dependsTransitively(config, node.id, reviewID)
+    && Object.values(node.input_mapping ?? {}).some((source) =>
+      source === `${reviewID}.output` || source.startsWith(`${reviewID}.output.`),
+    )
+    && acceptsReviewVerdict(node.condition, reviewID),
+  )
+}
+
+function reviewAccepted(
+  config: WorkflowConfig,
+  rows: ReadonlyMap<string, { status: string; output: unknown }>,
+  review: NodeConfig,
+) {
+  const row = rows.get(review.id)
+  return row?.status === "completed"
+    && reviewVerdict(row.output) === "ACCEPT"
+    && finalReviewGates(config, review.id).some((gate) => rows.get(gate.id)?.status === "completed")
+}
+
+function acceptsReviewVerdict(condition: string | undefined, reviewID: string) {
+  const output = (verdict: "ACCEPT" | "REJECT") => ({
+    [reviewID]: { output: { verdict } },
+  })
+  const accepted = evaluateCondition(condition, output("ACCEPT"))
+  const rejected = evaluateCondition(condition, output("REJECT"))
+  return accepted.ok && accepted.value && rejected.ok && !rejected.value
+}
+
 function hasReviewResultSchema(schema: Record<string, unknown> | undefined) {
   if (!schema || schema.type !== "object") return false
   const required = schema.required
@@ -240,6 +316,12 @@ function hasPassVerdict(value: unknown): boolean {
   if (value === "PASS") return true
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false
   return "verdict" in value && value.verdict === "PASS"
+}
+
+function reviewVerdict(value: unknown): "ACCEPT" | "REJECT" | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined
+  if (!("verdict" in value)) return undefined
+  return value.verdict === "ACCEPT" || value.verdict === "REJECT" ? value.verdict : undefined
 }
 
 function dependsTransitively(config: WorkflowConfig, startID: string, targetID: string) {

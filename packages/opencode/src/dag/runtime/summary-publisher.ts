@@ -61,8 +61,8 @@ export const layer = Layer.effect(
     const state = yield* InstanceState.make(
       Effect.fn("DagSummaryPublisher.state")(function* (ctx) {
         const scope = yield* Scope.Scope
-        // Per-session debounce map. Keys are sessionIDs with an in-flight
-        // recompute; a bounded window collapses a burst into one read.
+        // Per workspace/session debounce map. Keys identify a routed session
+        // with an in-flight recompute; a bounded window collapses a burst.
         //
         // NOTE: This is request-coalescing state for I/O deduplication, NOT
         // a parallel projection of DAG state. The summary is always recomputed
@@ -72,19 +72,20 @@ export const layer = Layer.effect(
         // reads would occur. This satisfies the "stateless derived view"
         // contract: no cached summary is ever served from this map.
         const pending = new Set<string>()
-        // Second coalescing tier keyed by dagID: node events don't carry a
-        // sessionID, and resolving it eagerly meant one getWorkflow query PER
-        // EVENT before the debounce window could absorb the burst (P1-4).
-        // Coalesce by dagID first, resolve the sessionID once after the
-        // window, then hand off to the session-level debounce.
+        // Second coalescing tier keyed by workspace/dagID: node events don't
+        // carry a sessionID, and resolving it eagerly meant one getWorkflow
+        // query PER EVENT before the debounce window could absorb the burst
+        // (P1-4). Resolve the sessionID once after the window, then hand off
+        // to the workspace/session debounce.
         const pendingByDag = new Set<string>()
 
-        const publishForSession = (sessionID: string) =>
+        const publishForSession = (sessionID: string, workspace: string | undefined) =>
           Effect.gen(function* () {
             const summaries = yield* store.getWorkflowSummaries(sessionID)
             GlobalBus.emit("event", {
               directory: ctx.directory,
               project: ctx.project.id,
+              workspace,
               payload: {
                 type: "dag.workflow.summary.updated",
                 properties: { sessionID, summaries },
@@ -92,44 +93,52 @@ export const layer = Layer.effect(
             })
           })
 
-        const schedulePublish = (sessionID: string) =>
+        const schedulePublish = (sessionID: string, workspace: string | undefined) =>
           Effect.gen(function* () {
-            // Coalesce: if a recompute is already scheduled for this session,
+            const key = `${workspace ?? ""}\0${sessionID}`
+            // Coalesce: if a recompute is already scheduled for this route,
             // let it absorb this trigger rather than queueing a second read.
             // The coalesced early return MUST NOT touch `pending` — only the
             // owning fiber clears its own slot, otherwise a coalesced caller
             // would delete the owner's entry and reopen the window.
-            if (pending.has(sessionID)) return
-            pending.add(sessionID)
+            if (pending.has(key)) return
+            pending.add(key)
             yield* Effect.gen(function* () {
               yield* Effect.sleep("50 millis")
-              yield* publishForSession(sessionID)
-            }).pipe(Effect.ensuring(Effect.sync(() => pending.delete(sessionID))))
+              yield* publishForSession(sessionID, workspace)
+            }).pipe(Effect.ensuring(Effect.sync(() => pending.delete(key))))
           })
 
-        const schedulePublishByDag = (dagID: string) =>
+        const schedulePublishByDag = (dagID: string, workspace: string | undefined) =>
           Effect.gen(function* () {
-            if (pendingByDag.has(dagID)) return
-            pendingByDag.add(dagID)
+            const key = `${workspace ?? ""}\0${dagID}`
+            if (pendingByDag.has(key)) return
+            pendingByDag.add(key)
             yield* Effect.gen(function* () {
               yield* Effect.sleep("50 millis")
               const wf = yield* store.getWorkflow(dagID)
+              if (wf?.projectId !== ctx.project.id) return
               // Hand off to the session-level debounce (not publishForSession
               // directly) so a concurrent session-keyed window absorbs this
               // trigger instead of producing a duplicate read.
-              if (wf) yield* schedulePublish(wf.sessionId)
-            }).pipe(Effect.ensuring(Effect.sync(() => pendingByDag.delete(dagID))))
+              yield* schedulePublish(wf.sessionId, workspace)
+            }).pipe(Effect.ensuring(Effect.sync(() => pendingByDag.delete(key))))
           })
 
         const unsubscribe = yield* events.listen((evt) => {
           if (!SUMMARY_TRIGGER_EVENTS.some((def) => def.type === evt.type)) return Effect.void
-          const data = evt.data as { dagID: string; sessionID?: string }
-          const publish = data.sessionID
-            ? schedulePublish(data.sessionID)
-            : schedulePublishByDag(data.dagID)
-          return publish.pipe(
+          if (evt.location?.directory !== ctx.directory) return Effect.void
+          const data = evt.data
+          if (
+            typeof data !== "object"
+            || data === null
+            || !("dagID" in data)
+            || typeof data.dagID !== "string"
+          ) return Effect.void
+          const dagID = data.dagID
+          return schedulePublishByDag(dagID, evt.location.workspaceID).pipe(
             Effect.catchCause((cause) =>
-              Effect.logWarning("DagSummaryPublisher: failed to publish summaries", { dagID: data.dagID, cause }),
+              Effect.logWarning("DagSummaryPublisher: failed to publish summaries", { dagID, cause }),
             ),
             Effect.forkIn(scope),
             Effect.asVoid,

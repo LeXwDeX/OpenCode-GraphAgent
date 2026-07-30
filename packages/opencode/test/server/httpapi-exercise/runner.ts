@@ -1,19 +1,21 @@
 import { Flag } from "@opencode-ai/core/flag/flag"
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
+import { Database } from "@opencode-ai/core/database/database"
+import { Project } from "@opencode-ai/core/project"
+import { ProjectTable } from "@opencode-ai/core/project/sql"
+import { AbsolutePath } from "@opencode-ai/core/schema"
+import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Cause, Duration, Effect, Layer, Scope } from "effect"
 import { TestLLMServer } from "../../lib/llm-server"
-import type { Config } from "../../../src/config/config"
 
-import type { MessageV2 } from "../../../src/session/message-v2"
-import { MessageID, PartID } from "../../../src/session/schema"
+import { MessageID, PartID, SessionID } from "../../../src/session/schema"
 import { call, callAuthProbe, disposeApps } from "./backend"
 import { original } from "./environment"
 import { runtime } from "./runtime"
 import type { ActiveScenario, Options, ProjectOptions, Result, Scenario, ScenarioContext, SeededContext, DagNodeSeed } from "./types"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
-import type { SessionID } from "../../../src/session/schema"
 
 export function runScenario(options: Options) {
   return (scenario: Scenario) => {
@@ -189,6 +191,7 @@ function withContext<A, E>(
           llmWait: (count) => Effect.suspend(() => llm().wait(count)),
           tuiRequest: (request) => Effect.sync(() => modules.Tui.submitTuiRequest(request)),
           dag: (input) => run(createDagFixture(input.sessionID, input.title, input.nodes)),
+          foreignDag: (input) => run(createForeignDagFixture(input.title, input.nodes)),
         }
         yield* trace(options, scenario, `${label} seed start`)
         const state = yield* scenario.seed(base)
@@ -327,6 +330,46 @@ function createDagFixture(sessionID: SessionID, title: string | undefined, nodes
           depends_on: n.depends_on,
           required: n.required,
           prompt_template: { inline: n.id },
+        })),
+      },
+    }).pipe(Effect.orDie)
+    return { dagID, sessionID } as const
+  })
+}
+
+function createForeignDagFixture(title: string | undefined, nodes: DagNodeSeed[]) {
+  return Effect.gen(function* () {
+    const modules = yield* Effect.promise(() => runtime())
+    const dag = yield* modules.Dag.Service
+    const { db } = yield* Database.Service
+    const projectID = Project.ID.make("prj_httpapi_foreign")
+    const sessionID = SessionID.make("ses_httpapi_foreign")
+    yield* db.insert(ProjectTable).values({
+      id: projectID,
+      worktree: AbsolutePath.make("/foreign-httpapi-project"),
+      sandboxes: [],
+    }).onConflictDoNothing().run().pipe(Effect.orDie)
+    yield* db.insert(SessionTable).values({
+      id: sessionID,
+      project_id: projectID,
+      slug: "foreign-httpapi",
+      directory: AbsolutePath.make("/foreign-httpapi-project"),
+      title: "Foreign HTTP API session",
+      version: "test",
+    }).run().pipe(Effect.orDie)
+    const dagID = yield* dag.create({
+      projectID,
+      sessionID,
+      title: title ?? "Foreign DAG fixture",
+      config: {
+        name: title ?? "Foreign DAG fixture",
+        nodes: nodes.map((item) => ({
+          id: item.id,
+          name: item.name,
+          worker_type: item.worker_type,
+          depends_on: item.depends_on,
+          required: item.required,
+          prompt_template: { inline: item.id },
         })),
       },
     }).pipe(Effect.orDie)
