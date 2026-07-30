@@ -2,6 +2,10 @@ import * as Tool from "./tool"
 import { CommandPlugin } from "@opencode-ai/core/plugin/command"
 import { Effect, Schema } from "effect"
 import { Dag } from "@/dag/dag"
+import { DagConfig } from "@/dag/config"
+import { DagModel } from "@/dag/model"
+import { Agent } from "@/agent/agent"
+import { Question } from "@/question"
 import { Session } from "@/session/session"
 import { SessionID } from "@/session/schema"
 import type { NodeConfig, WorkflowConfig } from "@/dag/dag"
@@ -41,9 +45,6 @@ const NodeSchema = Schema.Struct({
     description: "If true, the parent agent is woken when this node completes or fails. Inherits config.node_defaults.report_to_parent",
   }),
   condition: Schema.optional(Schema.String).annotate({ description: "Expression evaluated before spawn; node is skipped if false" }),
-  model: Schema.optional(Schema.Struct({ modelID: Schema.String, providerID: Schema.String })).annotate({
-    description: 'Optional node override. modelID is provider-local, e.g. { providerID: "local-proxy-compatible", modelID: "glm-5.2" }, never repeat providerID inside modelID. Omit to inherit config.node_defaults.model, then the agent or parent-session model',
-  }),
   restart: Schema.optional(Schema.Boolean).annotate({ description: "(replan only) Re-spawn this running node with new prompt. Running nodes only — terminal (completed/failed/skipped) nodes are immutable; to retry a failed node, add a replacement node under a new id" }),
   cancel: Schema.optional(Schema.Boolean).annotate({ description: "(replan only) Cancel this node" }),
   output_schema: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)).annotate({ description: "JSON Schema; child agent must call submit_result to submit structured output" }),
@@ -67,15 +68,9 @@ const WorkflowGraphSchema = Schema.Struct({
         }),
       ),
       report_to_parent: Schema.optional(Schema.Boolean),
-      model: Schema.optional(
-        Schema.Struct({
-          modelID: Schema.String,
-          providerID: Schema.String,
-        }),
-      ),
     }),
   ).annotate({
-    description: "Defaults inherited by nodes that omit required, worker_config, report_to_parent, or model",
+    description: "Defaults inherited by nodes that omit required, worker_config, or report_to_parent",
   }),
   max_concurrency: Schema.optional(Schema.Number).annotate({ description: "Max parallel nodes. Default: 5" }),
   max_node_replan_attempts: Schema.optional(Schema.Number).annotate({ description: "Max replan restarts per node ID. Default: 5" }),
@@ -103,11 +98,17 @@ export const Parameters = Schema.Struct({
 
 type Metadata = { workflowId?: string; added?: string[]; cancel?: string[]; restart?: string[]; replace?: string[] }
 
-export const WorkflowTool = Tool.define<typeof Parameters, Metadata, Dag.Service | Session.Service>(
+export const WorkflowTool = Tool.define<
+  typeof Parameters,
+  Metadata,
+  Dag.Service | Session.Service | Agent.Service | Question.Service
+>(
   id,
   Effect.gen(function* () {
     const dag = yield* Dag.Service
     const sessions = yield* Session.Service
+    const agents = yield* Agent.Service
+    const question = yield* Question.Service
 
     return {
       description: CommandPlugin.WorkflowContent,
@@ -169,6 +170,39 @@ export const WorkflowTool = Tool.define<typeof Parameters, Metadata, Dag.Service
               const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
               if (params.project_id && params.project_id !== session.projectID) {
                 return yield* Effect.die(new Error("project_id must match the parent session project"))
+              }
+              const missingModels = yield* findNodesWithoutModel({
+                nodes: params.config.nodes,
+                defaults: params.config.node_defaults,
+                directory: session.directory,
+                parent: session.model,
+                agents,
+              })
+              if (missingModels.length > 0) {
+                yield* question.ask({
+                  sessionID,
+                  questions: [{
+                    header: "DAG model",
+                    question: `No model is available for DAG node${missingModels.length > 1 ? "s" : ""} ${missingModels.map((node) => `"${node}"`).join(", ")}. Configure the advanced/standard tiers in dag.jsonc, a model on the selected worker agent, or a parent-session model before starting. How would you like to proceed?`,
+                    custom: false,
+                    options: [
+                      {
+                        label: "Configure first",
+                        description: "Do not start the workflow; configure a model and retry.",
+                      },
+                      {
+                        label: "Cancel workflow",
+                        description: "Abandon this workflow start.",
+                      },
+                    ],
+                  }],
+                  tool: ctx.callID ? { messageID: ctx.messageID, callID: ctx.callID } : undefined,
+                }).pipe(Effect.orDie)
+                return {
+                  title: "Workflow not started: model required",
+                  output: `No workflow was created. Missing model for: ${missingModels.join(", ")}. Configure dag.jsonc, the worker agent, or the parent session, then retry.`,
+                  metadata: {},
+                }
               }
               const dagID = yield* dag.create({
                 projectID: session.projectID,
@@ -256,3 +290,37 @@ export const WorkflowTool = Tool.define<typeof Parameters, Metadata, Dag.Service
     } satisfies Tool.DefWithoutID<typeof Parameters, Metadata>
   }),
 )
+
+function findNodesWithoutModel(input: {
+  nodes: ReadonlyArray<Schema.Schema.Type<typeof NodeSchema>>
+  defaults?: Schema.Schema.Type<typeof WorkflowGraphSchema>["node_defaults"]
+  directory: string
+  parent?: Session.Info["model"]
+  agents: Agent.Interface
+}) {
+  if (input.nodes.length === 0) return Effect.succeed([])
+  return Effect.gen(function* () {
+    const config = yield* DagConfig.load(input.directory)
+    return yield* Effect.filter(
+      input.nodes,
+      (node) =>
+        Effect.gen(function* () {
+          const agent = yield* input.agents.get(node.worker_type).pipe(
+            Effect.map((info) => info as Agent.Info | undefined),
+            Effect.catchCause(() => Effect.succeed(undefined)),
+          )
+          return DagModel.resolve({
+            tier: DagConfig.tierModel(config, {
+              required: node.required ?? input.defaults?.required ?? Dag.DEFAULT_WORKFLOW_CONFIG.nodeRequired,
+              workerType: node.worker_type,
+            }),
+            agent: agent?.model,
+            parent: input.parent
+              ? { modelID: input.parent.id, providerID: input.parent.providerID }
+              : undefined,
+          }) === undefined
+        }),
+      { concurrency: "unbounded" },
+    ).pipe(Effect.map((nodes) => nodes.map((node) => node.id)))
+  })
+}

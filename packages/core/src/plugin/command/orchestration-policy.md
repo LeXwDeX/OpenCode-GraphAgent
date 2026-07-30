@@ -158,18 +158,21 @@ If a required capability has no eligible role, report the missing capability and
 
 ## Model Assignment
 
-Omit `node.model` by default. Let the existing configuration fallback remain authoritative:
+Never emit `node.model` or `config.node_defaults.model`. Model assignment belongs
+to runtime configuration, not the workflow graph:
 
-`node.model` → `config.node_defaults.model` → configured agent model → parent session model
+`dag.jsonc` tier → configured agent model → parent session model
 
-Pin a model only when the user supplies an exact provider/model pair for a node or policy slot. Store the provider in `providerID` and only the provider-local `modelID` in `modelID`; never repeat the provider prefix inside `modelID`.
-
-Qualitative labels such as "strong", "fast", or "cheap" may guide capability and role selection, but you MUST NOT invent a model identifier. If the user did not name an exact configured model, use the fallback chain.
+Qualitative labels such as "strong", "fast", or "cheap" guide tier placement,
+but you MUST NOT invent a model identifier. If every configured source is
+missing, the workflow tool starts parent-session QA and does not create the
+workflow. Ask the user to configure a `dag.jsonc` tier, the selected agent, or
+the parent-session model, then retry.
 
 Prefer expressing "strong model for judgment, fast model for volume" through
 tier placement — `required: true` and `review`/`review-*` workers resolve to
 the advanced tier of `dag.jsonc`, everything else to standard — rather than
-per-node pins.
+graph-level model fields.
 
 ## Profile: Brainstorm
 

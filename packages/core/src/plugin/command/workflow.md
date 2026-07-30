@@ -5,7 +5,7 @@
 
 # Workflow Orchestration
 
-The `workflow` tool orchestrates heavy tasks as dependency-graph multi-agent workflows. Each node runs as a real child session with its own agent, tools, and optionally its own model. This skill covers when to start a workflow, how to structure it, and how to adapt it at runtime.
+The `workflow` tool orchestrates heavy tasks as dependency-graph multi-agent workflows. Each node runs as a real child session with its own agent and tools. This skill covers when to start a workflow, how to structure it, and how to adapt it at runtime.
 
 Compile every graph under the Tiered Orchestration Doctrine and Depth Ladder in the orchestration policy below: advanced-tier judgment nodes conduct and check, standard-tier nodes carry the volume, and accuracy is bought with breadth (concurrent fan-out) and depth (verdict-gated waves) rather than with a single trusted pass.
 
@@ -81,27 +81,14 @@ config:
     report_to_parent: false
     worker_config:
       timeout_ms: 600000
-    model:
-      providerID: local-proxy-compatible
-      modelID: glm-5.2
 ```
 
-This is the preferred place for a workflow-wide model. If both the node and
-`config.node_defaults.model` omit it, resolution continues to the selected
-agent model and then the parent session model.
-
-When overriding a model, split the provider and provider-local model ID:
-
-```yaml
-model:
-  providerID: local-proxy-compatible
-  modelID: glm-5.2
-```
-
-Do not put `local-proxy-compatible/glm-5.2` into `modelID` while also setting `providerID`; that repeats the provider prefix.
-Omit `node.model` unless the user supplied an exact provider/model selection.
-Qualitative requests such as "use a strong model" must not be converted into an
-invented model identifier.
+Never emit `node.model` or `config.node_defaults.model`. Model selection is
+configuration-owned: critical nodes (`required: true` and review workers) use
+the `advanced` tier in `dag.jsonc`, other nodes use `standard`, then resolution
+falls back to the selected agent model and the parent-session model. If no
+source provides a model, the workflow tool starts parent-session QA and leaves
+the workflow uncreated so the user can configure a model and retry.
 
 ## Collaboration Patterns
 
@@ -270,9 +257,8 @@ config:
         inline: "The arbiter did not accept. Verify each required action against the actual code and produce a corrected, evidence-backed action plan."
 ```
 
-Reviewer nodes may use different exact models when the user selected them;
-otherwise omit `model` and let workflow, agent, and parent configuration provide
-the defaults. The arbiter is `required: true` — its execution failure signals
+Reviewer nodes use the `advanced` tier from `dag.jsonc`. The arbiter is
+`required: true` — its execution failure signals
 that the artifact could not be confidently accepted, while its successful
 business verdict must still be interpreted. On `ACCEPT` the conditioned
 `deep-dive` node is skipped and the workflow completes; on any other verdict
@@ -358,20 +344,19 @@ paused, until you act.
 
 ## Model Assignment Strategy
 
-Each node MAY specify `model: { modelID, providerID }` to pin a specific model.
-`modelID` is the provider-local model ID; never repeat `providerID` inside it.
-If omitted, resolution follows `config.node_defaults.model`, then the configured
-agent model and then the parent session model. Pin only an exact user-supplied
-selection and never invent an identifier from a qualitative request.
+Workflow definitions MUST NOT specify `node.model` or
+`config.node_defaults.model`. Resolution follows the `dag.jsonc` tier, then the
+configured agent model, then the parent-session model. If all three are absent,
+the workflow tool asks the user to configure a model and does not create the
+workflow.
 
 - Expensive models for planning, review, and arbitration — high-stakes decisions where reasoning quality matters.
 - Fast models for mechanical implementation — well-specified edits where speed and cost matter.
 - Diverse models in adversarial review — reduces single-model blind spots.
 
-The two-tier defaults in `dag.jsonc` implement this split mechanically:
+The two-tier defaults in `dag.jsonc` implement the split mechanically:
 `required: true` nodes and `review`/`review-*` workers resolve to the
-`advanced` tier, every other node to `standard`. Prefer expressing the split
-through tier placement rather than per-node pins.
+`advanced` tier, every other node to `standard`.
 
 ## Prompt Templates
 
@@ -462,7 +447,6 @@ checkpoint naturally completed the current graph; an early
 | `depends_on` | yes | Array of node IDs this node waits for (`[]` for root) |
 | `required` | no | If true and this node fails, the workflow terminalizes as failed. Default: false |
 | `prompt_template` | yes | `{ id: "..." }` or `{ inline: "...", input: {...} }` |
-| `model` | no | `{ modelID, providerID }` override |
 | `condition` | no | Expression evaluated before spawn; node is skipped if false |
 | `input_mapping` | no | Map upstream node outputs into template variables |
 | `report_to_parent` | no | If true, the parent agent is woken when this node completes or fails. The workflow's terminal status always wakes the parent regardless of this flag |

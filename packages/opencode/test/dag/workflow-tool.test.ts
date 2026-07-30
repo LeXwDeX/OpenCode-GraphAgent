@@ -1,10 +1,14 @@
 import { describe, expect, it } from "bun:test"
 import { Effect, Exit, Layer, Schema } from "effect"
+import fs from "node:fs/promises"
+import os from "node:os"
+import path from "node:path"
 import { Dag } from "@/dag/dag"
 import { Agent } from "@/agent/agent"
 import { DagStore } from "@opencode-ai/core/dag/store"
 import { DagEvent } from "@opencode-ai/schema/dag-event"
 import { EventV2Bridge } from "@/event-v2-bridge"
+import { Question } from "@/question"
 import { Session } from "@/session/session"
 import { MessageID, SessionID } from "@/session/schema"
 import type { Tool } from "@/tool/tool"
@@ -190,9 +194,53 @@ const runtime = testEffect(
     Layer.mock(Truncate.Service, {
       output: (content) => Effect.succeed({ content, truncated: false }),
     }),
+    Layer.mock(Question.Service, {
+      ask: () => Effect.succeed([["Configure first"]]),
+    }),
     dag,
     Layer.mock(Session.Service, {
-      get: (id: Parameters<Session.Interface["get"]>[0]) => Effect.succeed({ id, projectID } as Session.Info),
+      get: (id: Parameters<Session.Interface["get"]>[0]) =>
+        Effect.succeed({
+          id,
+          projectID,
+          directory: "/project",
+          model: { providerID: "test" as never, id: "test-model" as never },
+        } as unknown as Session.Info),
+    }),
+  ),
+)
+
+let missingModelDirectory = ""
+const questionsAsked: Question.Info[] = []
+const missingModelRuntime = testEffect(
+  Layer.mergeAll(
+    Layer.mock(Agent.Service, {
+      get: () =>
+        Effect.succeed({
+          name: "build",
+          mode: "all",
+          permission: [],
+          options: {},
+        }),
+    }),
+    Layer.mock(Truncate.Service, {
+      output: (content) => Effect.succeed({ content, truncated: false }),
+    }),
+    Layer.mock(Question.Service, {
+      ask: (input) =>
+        Effect.sync(() => {
+          questionsAsked.push(...input.questions)
+          return [["Configure first"]]
+        }),
+    }),
+    dag,
+    Layer.mock(Session.Service, {
+      get: (id: Parameters<Session.Interface["get"]>[0]) =>
+        Effect.succeed({
+          id,
+          projectID,
+          directory: missingModelDirectory,
+        } as Session.Info),
     }),
   ),
 )
@@ -236,7 +284,7 @@ describe("workflow tool schema (negative tests)", () => {
     expect(() => decode({ action: "control", workflow_id: "wf-1", operation: "start" })).toThrow()
   })
 
-  it("leaves omitted node defaults unresolved for the workflow config", () => {
+  it("leaves omitted node defaults unresolved and strips graph-level model fields", () => {
     const decode = Schema.decodeUnknownSync(Parameters)
     const input = decode({
       action: "start",
@@ -255,6 +303,7 @@ describe("workflow tool schema (negative tests)", () => {
             worker_type: "build",
             depends_on: [],
             prompt_template: { inline: "work" },
+            model: { providerID: "configured", modelID: "configured/model" },
           },
         ],
       },
@@ -265,8 +314,8 @@ describe("workflow tool schema (negative tests)", () => {
       required: true,
       report_to_parent: true,
       worker_config: { timeout_ms: 1234 },
-      model: { providerID: "configured", modelID: "configured/model" },
     })
+    expect(input.config?.nodes[0]).not.toHaveProperty("model")
   })
 
   it("decodes deep mode and structured admission", () => {
@@ -400,6 +449,57 @@ describe("workflow tool execution", () => {
         config?: string
       }
       expect(JSON.parse(created.config ?? "{}").mode).toBe("standard")
+    }),
+  )
+
+  missingModelRuntime.effect("start asks QA and creates nothing when no model can be resolved", () =>
+    Effect.gen(function* () {
+      published.length = 0
+      questionsAsked.length = 0
+      missingModelDirectory = yield* Effect.acquireRelease(
+        Effect.promise(() => fs.mkdtemp(path.join(os.tmpdir(), "workflow-model-"))),
+        (directory) => Effect.promise(() => fs.rm(directory, { recursive: true, force: true })),
+      )
+      yield* Effect.promise(() => fs.mkdir(path.join(missingModelDirectory, ".opencode"), { recursive: true }))
+      yield* Effect.promise(() =>
+        Bun.write(
+          path.join(missingModelDirectory, ".opencode", "dag.jsonc"),
+          '{ "model": {} }\n',
+        )
+      )
+
+      const info = yield* WorkflowTool
+      const workflow = yield* info.init()
+      const result = yield* workflow.execute(
+        {
+          action: "start",
+          config: {
+            name: "missing-model",
+            nodes: [{
+              id: "worker",
+              name: "Worker",
+              worker_type: "build",
+              depends_on: [],
+              prompt_template: { inline: "work" },
+            }],
+          },
+        },
+        {
+          sessionID: SessionID.make("ses_workflow_parent"),
+          messageID: MessageID.ascending(),
+          agent: "build",
+          abort: new AbortController().signal,
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        } satisfies Tool.Context,
+      )
+
+      expect(result.title).toBe("Workflow not started: model required")
+      expect(result.metadata.workflowId).toBeUndefined()
+      expect(questionsAsked).toHaveLength(1)
+      expect(questionsAsked[0]?.question).toContain('"worker"')
+      expect(published).toHaveLength(0)
     }),
   )
 
@@ -582,10 +682,6 @@ describe("workflow tool execution", () => {
               required: true,
               report_to_parent: true,
               worker_config: { timeout_ms: 1234 },
-              model: {
-                providerID: "local-proxy-compatible",
-                modelID: "local-proxy-compatible/glm-5.2",
-              },
             },
             nodes: [
               {
@@ -604,7 +700,6 @@ describe("workflow tool execution", () => {
                 report_to_parent: false,
                 worker_config: { timeout_ms: 4321 },
                 prompt_template: { inline: "work" },
-                model: { providerID: "other", modelID: "other-model" },
               },
             ],
           },
@@ -636,7 +731,6 @@ describe("workflow tool execution", () => {
           required: true,
           report_to_parent: true,
           worker_config: { timeout_ms: 1234 },
-          model: { providerID: "local-proxy-compatible", modelID: "glm-5.2" },
         }),
       )
       expect(config.nodes[1]).toEqual(
@@ -644,64 +738,8 @@ describe("workflow tool execution", () => {
           required: false,
           report_to_parent: false,
           worker_config: { timeout_ms: 4321 },
-          model: { providerID: "other", modelID: "other-model" },
         }),
       )
-    }),
-  )
-
-  runtime.effect("start canonicalizes a provider-qualified model ID", () =>
-    Effect.gen(function* () {
-      published.length = 0
-      const info = yield* WorkflowTool
-      const workflow = yield* info.init()
-
-      yield* workflow.execute(
-        {
-          action: "start",
-          config: {
-            name: "canonical-model",
-            nodes: [
-              {
-                id: "worker",
-                name: "Worker",
-                worker_type: "general",
-                depends_on: [],
-                prompt_template: { inline: "work" },
-                model: {
-                  providerID: "local-proxy-compatible",
-                  modelID: "local-proxy-compatible/glm-5.2",
-                },
-              },
-            ],
-          },
-        },
-        {
-          sessionID: SessionID.make("ses_workflow_parent"),
-          messageID: MessageID.ascending(),
-          agent: "build",
-          abort: new AbortController().signal,
-          messages: [],
-          metadata: () => Effect.void,
-          ask: () => Effect.void,
-        } satisfies Tool.Context,
-      )
-
-      expect(published.find((event) => event.type === DagEvent.NodeRegistered.type)?.data).toEqual(
-        expect.objectContaining({
-          model: {
-            providerID: "local-proxy-compatible",
-            modelID: "glm-5.2",
-          },
-        }),
-      )
-      const created = published.find((event) => event.type === DagEvent.WorkflowCreated.type)?.data as {
-        config?: string
-      }
-      expect(JSON.parse(created.config ?? "{}").nodes[0].model).toEqual({
-        providerID: "local-proxy-compatible",
-        modelID: "glm-5.2",
-      })
     }),
   )
 
