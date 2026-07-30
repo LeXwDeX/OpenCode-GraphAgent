@@ -240,6 +240,47 @@ describe("DagInspector", () => {
     }
   })
 
+  test("/dag-cancel cancels the only active workflow in the current session", async () => {
+    const viewer = await renderDagInspector({
+      initialRoute: { name: "session", params: { sessionID: SESSION_ID } },
+      serverWorkflows: [
+        wfSummary({ id: "wf-running", status: "running" }),
+        wfSummary({ id: "wf-complete", status: "completed" }),
+      ],
+    })
+    try {
+      expect(viewer.commands.get("dag.cancel.active")?.slashName).toBe("dag-cancel")
+      runCommand(viewer.commands, "dag.cancel.active")
+      await waitForCondition(() => viewer.controlCalls().length > 0)
+      expect(viewer.controlCalls()).toEqual([{ dagID: "wf-running", operation: "cancel" }])
+    } finally {
+      viewer.app.renderer.destroy()
+    }
+  })
+
+  test("/dag-cancel opens the inspector instead of guessing when multiple workflows are active", async () => {
+    const returnRoute = { name: "session", params: { sessionID: SESSION_ID } }
+    const viewer = await renderDagInspector({
+      initialRoute: returnRoute,
+      serverWorkflows: [
+        wfSummary({ id: "wf-running", status: "running" }),
+        wfSummary({ id: "wf-paused", status: "paused" }),
+      ],
+    })
+    try {
+      runCommand(viewer.commands, "dag.cancel.active")
+      await waitForCondition(() => viewer.navigations().length > 0)
+      expect(viewer.controlCalls()).toEqual([])
+      expect(viewer.navigations().at(-1)).toEqual({
+        name: "dag",
+        params: { sessionID: SESSION_ID, returnRoute },
+      })
+      expect(viewer.toasts().at(-1)?.message).toContain("Multiple active workflows")
+    } finally {
+      viewer.app.renderer.destroy()
+    }
+  })
+
   test("opening dag refreshes workflows from the server when sync state is empty", async () => {
     const viewer = await renderDagInspector({
       serverWorkflows: [wfSummary({ id: "wf-server", title: "Live server workflow", nodeCount: 1 })],

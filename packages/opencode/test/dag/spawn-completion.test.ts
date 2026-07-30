@@ -154,6 +154,39 @@ describe("spawnNode completion bridge", () => {
     expect(findEvent(events, "nodeCompleted")).toBeDefined()
   })
 
+  it("prefers the configured DAG tier over the worker agent model", async () => {
+    const { events, dagLayer } = makeEventTracker()
+    let promptModel: SessionPrompt.PromptInput["model"]
+    const prompt = Layer.mock(SessionPrompt.Service, {
+      prompt: (input) =>
+        Effect.sync(() => {
+          promptModel = input.model
+          return reply("done")
+        }),
+    })
+
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const result = yield* spawnNode(Semaphore.makeUnsafe(1), {
+            ...makeSpawnInput(),
+            fallbackModel: {
+              providerID: "configured",
+              modelID: "dag-tier-model",
+            },
+          })
+          yield* Fiber.await(result.fiber)
+        }),
+      ).pipe(Effect.provide(Layer.mergeAll(dagLayer, agentLayer, sessionLayer, prompt))) as Effect.Effect<never>,
+    )
+
+    expect(promptModel as unknown).toEqual({
+      providerID: "configured",
+      modelID: "dag-tier-model",
+    })
+    expect(findEvent(events, "nodeCompleted")).toBeDefined()
+  })
+
   it("canonicalizes a provider-qualified model from a persisted node", async () => {
     const { events, dagLayer } = makeEventTracker()
     let promptModel: SessionPrompt.PromptInput["model"]

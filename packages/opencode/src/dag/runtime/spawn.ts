@@ -27,9 +27,12 @@ import { SessionID, MessageID } from "@/session/schema"
 import { deriveSubagentSessionPermission } from "@/agent/subagent-permissions"
 import { SessionPrompt } from "@/session/prompt"
 import { Dag } from "../dag"
+import { DagModel } from "../model"
 import { validateReviewResult } from "../review-lifecycle"
 import { InvalidTransitionError, TerminalViolationError } from "@opencode-ai/core/dag/core/types"
 import type { DagStore } from "@opencode-ai/core/dag/store"
+import { ModelV2 } from "@opencode-ai/core/model"
+import { ProviderV2 } from "@opencode-ai/core/provider"
 import { registerCaptureSlot, clearCaptureSlot } from "./capture"
 
 type PromptParts = SessionPrompt.PromptInput["parts"]
@@ -47,7 +50,7 @@ export interface NodeSpawnInput {
   timeoutMs?: number
   reportToParent?: boolean
   reviewImplementationFingerprint?: string
-  /** dag.jsonc tier default — slots between the agent model and the parent-session model. */
+  /** dag.jsonc tier default — authoritative unless a persisted legacy node model exists. */
   fallbackModel?: { modelID: string; providerID: string }
   /** dag.jsonc thinking_depth — forwarded as the prompt variant (no-op unless the model defines it). */
   variant?: string
@@ -86,17 +89,23 @@ export function spawnNode(
         : undefined
     const nodeModel = persistedNodeModel
       ? {
-          modelID: persistedNodeModel.modelID as never,
-          providerID: persistedNodeModel.providerID as never,
+          modelID: persistedNodeModel.modelID,
+          providerID: persistedNodeModel.providerID,
         }
       : undefined
-    const model = nodeModel
-      ?? (agent.model ? { modelID: agent.model.modelID, providerID: agent.model.providerID } : undefined)
-      ?? (input.fallbackModel ? { modelID: input.fallbackModel.modelID as never, providerID: input.fallbackModel.providerID as never } : undefined)
-      ?? (parent.model ? { modelID: parent.model.id, providerID: parent.model.providerID } : undefined)
-    if (!model) {
+    const resolvedModel = DagModel.resolve({
+      node: nodeModel,
+      tier: input.fallbackModel,
+      agent: agent.model,
+      parent: parent.model ? { modelID: parent.model.id, providerID: parent.model.providerID } : undefined,
+    })
+    if (!resolvedModel) {
       yield* dag.nodeFailed(input.dagID, input.nodeID, `no model configured for agent: ${agent.name}`, "exec_failed")
       return yield* Effect.fail(new Error(`No model configured for agent: ${agent.name}`))
+    }
+    const model = {
+      modelID: ModelV2.ID.make(resolvedModel.modelID),
+      providerID: ProviderV2.ID.make(resolvedModel.providerID),
     }
 
     const childPermission = deriveSubagentSessionPermission({

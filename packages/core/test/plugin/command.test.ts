@@ -81,13 +81,14 @@ describe("CommandPlugin.Plugin", () => {
 
   it.effect("documents config-first model fallback without invented identifiers", () =>
     Effect.sync(() => {
-      expect(CommandPlugin.OrchestrationPolicyContent).toContain("Omit `node.model` by default")
       expect(CommandPlugin.OrchestrationPolicyContent).toContain(
-        "`node.model` → `config.node_defaults.model` → configured agent model → parent session model",
+        "Never emit `node.model` or `config.node_defaults.model`",
       )
-      expect(CommandPlugin.OrchestrationPolicyContent).toContain("exact provider/model pair")
-      expect(CommandPlugin.OrchestrationPolicyContent).toContain("providerID")
-      expect(CommandPlugin.OrchestrationPolicyContent).toContain("provider-local `modelID`")
+      expect(CommandPlugin.OrchestrationPolicyContent).toContain(
+        "`dag.jsonc` tier → configured agent model → parent session model",
+      )
+      expect(CommandPlugin.OrchestrationPolicyContent).toContain("workflow tool starts parent-session QA")
+      expect(CommandPlugin.OrchestrationPolicyContent).toContain("does not create the\nworkflow")
       expect(CommandPlugin.OrchestrationPolicyContent).toContain("MUST NOT invent a model identifier")
     }),
   )
@@ -327,8 +328,12 @@ describe("CommandPlugin.Plugin", () => {
       expect(CommandPlugin.WorkflowFactsContent).not.toContain('input: { findings: "from explore" }')
       expect(CommandPlugin.WorkflowFactsContent).not.toContain("Gate failure cancels the workflow automatically")
       expect(CommandPlugin.WorkflowFactsContent).toContain("Static `prompt_template.input`")
-      expect(CommandPlugin.WorkflowFactsContent).toContain("provider-local model ID")
-      expect(CommandPlugin.WorkflowFactsContent).toContain("agent model and then the parent session model")
+      expect(CommandPlugin.WorkflowFactsContent).toContain(
+        "Workflow definitions MUST NOT specify `node.model` or\n`config.node_defaults.model`",
+      )
+      expect(CommandPlugin.WorkflowFactsContent).toMatch(
+        /`dag\.jsonc` tier, then the\s+configured agent model, then the parent-session model/,
+      )
       expect(CommandPlugin.WorkflowFactsContent).toContain("Propose-then-assemble")
       const reviewExample = CommandPlugin.WorkflowFactsContent
         .slice(

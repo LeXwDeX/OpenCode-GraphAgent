@@ -48,6 +48,47 @@ function scrollRowIntoView(scroll: ScrollBoxRenderable | undefined, index: numbe
   }
 }
 
+const ACTIVE_WORKFLOW_STATUSES = new Set(["running", "paused", "stepping"])
+
+function cancelActiveWorkflow(api: TuiPluginApi) {
+  const current = api.route.current
+  const params = ("params" in current ? current.params : undefined) as { sessionID?: string } | undefined
+  const sessionID = params?.sessionID
+  if (!sessionID) {
+    api.ui.toast({ variant: "info", message: "No session selected for DAG cancellation" })
+    return
+  }
+  void api.client.dag
+    .summary({ sessionID })
+    .then((response) => {
+      const active = (response.data ?? []).filter((workflow) =>
+        ACTIVE_WORKFLOW_STATUSES.has(workflow.status),
+      )
+      if (active.length === 0) {
+        api.ui.toast({ variant: "info", message: "No active DAG workflow to cancel" })
+        return
+      }
+      if (active.length > 1) {
+        api.ui.toast({ variant: "info", message: "Multiple active workflows; select one in the DAG inspector" })
+        api.route.navigate(ROUTE, { sessionID, returnRoute: current })
+        api.ui.dialog.clear()
+        return
+      }
+      const workflow = active[0]
+      if (!workflow) return
+      void api.client.dag.control({ dagID: workflow.id, operation: "cancel" }).then(() => {
+        api.ui.toast({ variant: "info", message: `Workflow ${workflow.title} cancel requested` })
+        api.ui.dialog.clear()
+      })
+    })
+    .catch((error: unknown) => {
+      api.ui.toast({
+        variant: "error",
+        message: `DAG cancel failed: ${error instanceof Error ? error.message : String(error)}`,
+      })
+    })
+}
+
 function DagInspector(props: { api: TuiPluginApi }) {
   const theme = () => props.api.theme.current
   // The plugin-facing theme omits the resolver flags selectedForeground needs,
@@ -674,6 +715,16 @@ const tui: TuiPlugin = async (api) => {
             returnRoute: current,
           })
           api.ui.dialog.clear()
+        },
+      },
+      {
+        name: "dag.cancel.active",
+        title: "Cancel active DAG workflow",
+        slashName: "dag-cancel",
+        category: "Workflow",
+        namespace: "palette",
+        run() {
+          cancelActiveWorkflow(api)
         },
       },
     ],
