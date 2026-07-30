@@ -106,6 +106,11 @@ export class TerminalViolationError extends DagCoreError {
   }
 }
 
+/** Returns true when a concurrent status change made the requested transition obsolete. */
+export function isTransitionRejection(error: unknown): error is InvalidTransitionError | TerminalViolationError {
+  return error instanceof InvalidTransitionError || error instanceof TerminalViolationError
+}
+
 export class StateNotPersistedError extends DagCoreError {
   constructor(workflowId: string, reason?: string) {
     super(

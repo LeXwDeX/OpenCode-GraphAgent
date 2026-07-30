@@ -1,6 +1,6 @@
 export * as DagLoop from "./loop"
 
-import { Effect, Layer, Context, Stream, Semaphore, Fiber, Option } from "effect"
+import { Cause, Effect, Layer, Context, Stream, Semaphore, Fiber, Option } from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { InstanceState } from "@/effect/instance-state"
 import { EventV2Bridge } from "@/event-v2-bridge"
@@ -8,7 +8,7 @@ import { DagEvent } from "@opencode-ai/schema/dag-event"
 import { SessionStatusEvent } from "@opencode-ai/schema/session-status-event"
 import { DagStore } from "@opencode-ai/core/dag/store"
 import { WorkflowRuntime, toSchedulingNodes } from "@opencode-ai/core/dag/core/scheduling"
-import { isWorkflowTerminalStatus } from "@opencode-ai/core/dag/core/types"
+import { isNodeTerminalStatus, isWorkflowTerminalStatus } from "@opencode-ai/core/dag/core/types"
 import { Dag, type WorkflowConfig, parseWorkflowConfig } from "../dag"
 import { projectBriefForNode } from "../admission"
 import {
@@ -236,7 +236,7 @@ export const layer = Layer.effect(
               Effect.provideService(Session.Service, sessionSvc),
               Effect.provideService(SessionPrompt.Service, promptSvc),
               Effect.catchCause((cause) =>
-                dag.nodeFailed(dagID, nodeID, String(cause), "exec_failed"),
+                dag.nodeFailed(dagID, nodeID, Cause.pretty(cause), "exec_failed"),
               ),
               Effect.ignore,
             )
@@ -247,6 +247,15 @@ export const layer = Layer.effect(
           const entry = runtimes.get(dagID)
           if (!entry) return
           if (!entry.runtime.isComplete()) return
+          // Replan registers replacement nodes before cancelling nodes from the
+          // old runtime graph. Event types are consumed independently, so the
+          // cancellation handler can reach this point before WorkflowReplanned
+          // rebuilds the in-memory graph. Durable active nodes prove that the
+          // apparent completion belongs to an obsolete graph generation.
+          const hasUnseenActiveNode = (yield* store.getNodes(dagID)).some(
+            (node) => !isNodeTerminalStatus(node.status as never) && !entry.runtime.containsNode(node.id),
+          )
+          if (hasUnseenActiveNode) return
           const wf = yield* store.getWorkflow(dagID).pipe(Effect.orDie)
           if (wf && isWorkflowTerminalStatus(wf.status as never)) return
           // A required-node failure is a workflow FAILURE, not a cancellation —

@@ -189,6 +189,53 @@ function runLoopTest<A>(
 }
 
 describe("DagLoop replan vs stale NodeFailed", () => {
+  it("does not terminalize the old graph while a replacement graph is being applied", async () => {
+    await Effect.runPromise(
+      runLoopTest(({ dag, store, childPrompts }) =>
+        Effect.gen(function* () {
+          const dagID = yield* dag.create({
+            projectID: "project-1",
+            sessionID: "ses_parent",
+            title: "Replan completion guard",
+            config: {
+              name: "replan-completion-guard",
+              nodes: [{ ...node("a"), required: false }],
+            },
+          })
+          expect((yield* takeWithin(childPrompts, "a did not start")).title).toBe("a")
+
+          const plan = yield* dag.replan(dagID, {
+            nodes: [
+              { ...node("a"), required: false, cancel: true },
+              node("b"),
+            ],
+          })
+          expect(plan.cancel).toEqual(["a"])
+          expect(plan.add).toEqual(["b"])
+
+          const state = yield* pollWithTimeout(
+            Effect.all({
+              workflow: store.getWorkflow(dagID),
+              replacement: store.getNode(dagID, "b"),
+            }).pipe(
+              Effect.map((current) =>
+                current.workflow?.status !== "running" || current.replacement?.status === "running"
+                  ? current
+                  : undefined,
+              ),
+            ),
+            "replacement graph did not settle",
+          )
+          expect(state.workflow?.status).toBe("running")
+          const replacement = yield* takeWithin(childPrompts, "replacement b did not start")
+          expect(replacement.title).toBe("b")
+          expect(state.replacement?.status).toBe("running")
+          yield* Deferred.succeed(replacement.release, "done")
+        }),
+      ),
+    )
+  })
+
   it("interrupts the replan-restarted node's old fiber so its timeout cannot poison the new generation", async () => {
     await Effect.runPromise(
       runLoopTest(({ dag, store, childPrompts, parentPrompts }) =>

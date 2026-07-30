@@ -29,16 +29,13 @@ import { SessionPrompt } from "@/session/prompt"
 import { Dag } from "../dag"
 import { DagModel } from "../model"
 import { validateReviewResult } from "../review-lifecycle"
-import { InvalidTransitionError, TerminalViolationError } from "@opencode-ai/core/dag/core/types"
+import { isTransitionRejection } from "@opencode-ai/core/dag/core/types"
 import type { DagStore } from "@opencode-ai/core/dag/store"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { registerCaptureSlot, clearCaptureSlot } from "./capture"
 
 type PromptParts = SessionPrompt.PromptInput["parts"]
-
-const isTransitionRejection = (err: unknown): err is InvalidTransitionError | TerminalViolationError =>
-  err instanceof InvalidTransitionError || err instanceof TerminalViolationError
 
 export interface NodeSpawnInput {
   dagID: string
@@ -315,7 +312,7 @@ export function spawnNode(
         Effect.catchCause((cause) =>
           Effect.gen(function* () {
             if (Cause.interruptors(cause).size > 0) return
-            yield* dag.nodeFailed(input.dagID, input.nodeID, String(cause), "exec_failed").pipe(
+            yield* dag.nodeFailed(input.dagID, input.nodeID, Cause.pretty(cause), "exec_failed").pipe(
               Effect.catchIf(
                 isTransitionRejection,
                 () => Effect.logWarning("nodeFailed guard rejected — node already terminal"),
