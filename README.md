@@ -119,7 +119,6 @@ bun dev serve        # headless API server (port 4096)
 
 - **CI**: typecheck on every PR; the `main` gate additionally runs the full unit suite (Linux), Playwright e2e (Linux + Windows), an HTTP API contract exerciser, and generated-SDK freshness checks.
 - **DAG-specific tests**: core scheduling unit tests, projector/state-machine drift tests, workflow lifecycle integration tests, and HTTP API exercise scenarios for every DAG route.
-- **Specs**: engine behavior is pinned by [openspec](./openspec/specs) specifications (execution engine, state-machine enforcement, scheduler recovery, step semantics, structured output, replay idempotency, and more).
 
 ## License
 
@@ -135,7 +134,6 @@ Exact file boundaries are listed in [`NOTICE`](./NOTICE). The AGPL covers the DA
 ## Docs
 
 - [`docs/harness-dag.md`](./docs/harness-dag.md) — deep-mode admission & review lifecycle
-- [`openspec/specs`](./openspec/specs) — engine behavior specifications
 - [`.opencode/dag-prompts`](./.opencode/dag-prompts) — built-in node prompt templates
 - [`AGENTS.md`](./AGENTS.md) — contribution & development guide
 

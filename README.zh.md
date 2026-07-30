@@ -119,7 +119,6 @@ bun dev serve        # headless API 服务（端口 4096）
 
 - **CI**：每个 PR 跑 typecheck；`main` 门禁额外运行全量单元测试（Linux）、Playwright e2e（Linux + Windows）、HTTP API 契约测试器、以及生成 SDK 的新鲜度校验。
 - **DAG 专项测试**：核心调度单元测试、投影器/状态机漂移测试、工作流生命周期集成测试、每条 DAG 路由的 HTTP API 演练场景。
-- **规范**：引擎行为由 [openspec](./openspec/specs) 规范固定（执行引擎、状态机强制、调度器恢复、单步语义、结构化输出、回放幂等性等）。
 
 ## 许可证
 
@@ -135,7 +134,6 @@ bun dev serve        # headless API 服务（端口 4096）
 ## 文档
 
 - [`docs/harness-dag.md`](./docs/harness-dag.md) —— deep 模式准入与审查生命周期
-- [`openspec/specs`](./openspec/specs) —— 引擎行为规范
 - [`.opencode/dag-prompts`](./.opencode/dag-prompts) —— 内置节点 prompt 模板
 - [`AGENTS.md`](./AGENTS.md) —— 贡献与开发指南
 
