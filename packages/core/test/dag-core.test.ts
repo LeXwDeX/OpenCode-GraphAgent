@@ -617,6 +617,8 @@ describe("WorkflowRuntime", () => {
 
   it("rebuildGraph reflects new topology", () => {
     const rt = new WorkflowRuntime(linearNodes(), 4)
+    expect(rt.containsNode("a")).toBe(true)
+    expect(rt.containsNode("x")).toBe(false)
     rt.markSatisfied("a")
     rt.markSatisfied("b")
     const newNodes: SchedulingNode[] = [
@@ -624,6 +626,8 @@ describe("WorkflowRuntime", () => {
       { id: "y", dependsOn: ["x"], status: "pending", required: false },
     ]
     rt.rebuildGraph(newNodes)
+    expect(rt.containsNode("a")).toBe(false)
+    expect(rt.containsNode("x")).toBe(true)
     expect(rt.getReadyNodes()).toEqual(["x"])
     expect(rt.isComplete()).toBe(false)
   })

@@ -246,7 +246,8 @@ describe("spawnNode completion bridge", () => {
 
     const failed = findEvent(events, "nodeFailed")
     expect(failed).toBeDefined()
-    expect(failed!.reason).toContain("LLM exploded")
+    expect(failed!.reason).toContain("Error: LLM exploded")
+    expect(failed!.reason).not.toContain("Cause([Die(")
 
     expect(findEvent(events, "nodeCompleted")).toBeUndefined()
   })

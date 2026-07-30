@@ -1,9 +1,10 @@
 import { describe, expect, it } from "bun:test"
-import { Effect, Layer } from "effect"
+import { Effect, Exit, Layer } from "effect"
 import { reconcileWorkflow } from "@/dag/runtime/recovery"
 import { Dag } from "@/dag/dag"
 import type { DagStore } from "@opencode-ai/core/dag/store"
 import { WorkflowRuntime, toSchedulingNodes } from "@opencode-ai/core/dag/core/scheduling"
+import { TerminalViolationError } from "@opencode-ai/core/dag/core/types"
 import { makeNodeRow } from "./fixtures"
 
 type TrackedEvent = {
@@ -302,6 +303,40 @@ describe("reconcileWorkflow", () => {
       reason: "output_schema declared but submit_result was never successfully called (recovered)",
       trigger: "verdict_fail",
     })
+  })
+
+  it("continues recovery when a concurrent settlement already terminalized the node", async () => {
+    const nodes = [makeNodeRow({ id: "n1", status: "running", childSessionId: "ses_1" })]
+    const dagLayer = Layer.mock(Dag.Service, {
+      store: {
+        getNodes: () => Effect.succeed(nodes),
+      } as unknown as DagStore.Interface,
+      nodeCompleted: () => Effect.fail(new TerminalViolationError("n1", "failed", "completed")),
+    })
+    const checkStatus = () => Effect.succeed("completed" as const)
+
+    const exit = await Effect.runPromiseExit(
+      reconcileWorkflow("wf-1", checkStatus).pipe(Effect.provide(dagLayer)),
+    )
+
+    expect(Exit.isSuccess(exit)).toBe(true)
+  })
+
+  it("does not hide non-transition settlement failures", async () => {
+    const nodes = [makeNodeRow({ id: "n1", status: "running", childSessionId: "ses_1" })]
+    const dagLayer = Layer.mock(Dag.Service, {
+      store: {
+        getNodes: () => Effect.succeed(nodes),
+      } as unknown as DagStore.Interface,
+      nodeCompleted: () => Effect.fail(new Error("database unavailable")),
+    })
+    const checkStatus = () => Effect.succeed("completed" as const)
+
+    const exit = await Effect.runPromiseExit(
+      reconcileWorkflow("wf-1", checkStatus).pipe(Effect.provide(dagLayer)),
+    )
+
+    expect(Exit.isFailure(exit)).toBe(true)
   })
 })
 

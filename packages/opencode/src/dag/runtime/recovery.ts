@@ -22,6 +22,7 @@ import { Dag } from "../dag"
 import { Session } from "@/session/session"
 import { SessionID } from "@/session/schema"
 import type { DagStore } from "@opencode-ai/core/dag/store"
+import { isTransitionRejection } from "@opencode-ai/core/dag/core/types"
 
 export function reconcileWorkflow(
   dagID: string,
@@ -32,6 +33,18 @@ export function reconcileWorkflow(
   return Effect.gen(function* () {
     const dag = yield* Dag.Service
     const nodes = yield* dag.store.getNodes(dagID)
+    const settle = (nodeID: string, action: Effect.Effect<void, Error>) =>
+      action.pipe(
+        Effect.catchIf(
+          isTransitionRejection,
+          (error) =>
+            Effect.logDebug("DAG recovery ignored a concurrent transition rejection", {
+              dagID,
+              nodeID,
+              error,
+            }),
+        ),
+      )
     let reconciled = 0
     let ownershipLost = 0
 
@@ -55,7 +68,10 @@ export function reconcileWorkflow(
         // Crash landed between admission and session creation — no durable
         // outcome exists, so this is an invented failure like ownership loss.
         ownershipLost++
-        yield* dag.nodeFailed(dagID, node.id, "node was running but had no child session on recovery", "exec_failed")
+        yield* settle(
+          node.id,
+          dag.nodeFailed(dagID, node.id, "node was running but had no child session on recovery", "exec_failed"),
+        )
         reconciled++
         continue
       }
@@ -68,16 +84,27 @@ export function reconcileWorkflow(
         const nodeConfig = workflowConfig?.nodes.find((n) => n.id === node.id)
         if (nodeConfig?.output_schema) {
           if (node.capturedOutput !== undefined && node.capturedOutput !== null) {
-            yield* dag.nodeCompleted(dagID, node.id, node.capturedOutput)
+            yield* settle(node.id, dag.nodeCompleted(dagID, node.id, node.capturedOutput))
           } else {
-            yield* dag.nodeFailed(dagID, node.id, "output_schema declared but submit_result was never successfully called (recovered)", "verdict_fail")
+            yield* settle(
+              node.id,
+              dag.nodeFailed(
+                dagID,
+                node.id,
+                "output_schema declared but submit_result was never successfully called (recovered)",
+                "verdict_fail",
+              ),
+            )
           }
         } else {
-          yield* dag.nodeCompleted(dagID, node.id, undefined)
+          yield* settle(node.id, dag.nodeCompleted(dagID, node.id, undefined))
         }
         reconciled++
       } else if (sessionStatus === "failed") {
-        yield* dag.nodeFailed(dagID, node.id, "child session failed (recovered)", "exec_failed")
+        yield* settle(
+          node.id,
+          dag.nodeFailed(dagID, node.id, "child session failed (recovered)", "exec_failed"),
+        )
         reconciled++
       } else {
         ownershipLost++
@@ -96,16 +123,22 @@ export function reconcileWorkflow(
         if (node.deadlineMs !== null) {
           const now = yield* Clock.currentTimeMillis
           if (now >= node.deadlineMs) {
-            yield* dag.nodeFailed(dagID, node.id, "deadline exceeded on recovery", "timeout")
+            yield* settle(
+              node.id,
+              dag.nodeFailed(dagID, node.id, "deadline exceeded on recovery", "timeout"),
+            )
             reconciled++
             continue
           }
         }
-        yield* dag.nodeFailed(
-          dagID,
+        yield* settle(
           node.id,
-          "execution ownership lost on recovery",
-          "exec_failed",
+          dag.nodeFailed(
+            dagID,
+            node.id,
+            "execution ownership lost on recovery",
+            "exec_failed",
+          ),
         )
         reconciled++
       }

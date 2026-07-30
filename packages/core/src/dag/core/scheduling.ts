@@ -136,6 +136,11 @@ export class WorkflowRuntime {
     return false
   }
 
+  /** Returns true when the current runtime graph contains the node. */
+  containsNode(nodeID: string): boolean {
+    return this.graph.hasNode(nodeID)
+  }
+
   /** Returns true if the node is in running or pending (not yet terminal) state. */
   isActive(nodeID: string): boolean {
     return (
