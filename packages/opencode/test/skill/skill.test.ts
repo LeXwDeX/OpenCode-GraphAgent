@@ -86,6 +86,7 @@ describe("skill", () => {
           expect((yield* skill.all()).filter((item) => item.location === "<built-in>").map((item) => item.name)).toEqual([
             "customize-opencode",
             "configure-hooks",
+            "create-dag-workflow",
           ])
         }),
       { git: true },

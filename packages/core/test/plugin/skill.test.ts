@@ -45,6 +45,20 @@ describe("SkillPlugin.Plugin", () => {
     }),
   )
 
+  it.effect("registers the built-in create-dag-workflow skill", () =>
+    Effect.gen(function* () {
+      const skill = yield* SkillV2.Service
+      yield* SkillPlugin.Plugin.effect(host({ skill: { ...skill, reload: skill.reload } }))
+
+      expect(yield* skill.list()).toContainEqual(
+        expect.objectContaining({
+          name: "create-dag-workflow",
+          description: expect.stringContaining("reusable DAG workflow"),
+        }),
+      )
+    }),
+  )
+
   it.effect("does not register workflow as a built-in skill", () =>
     Effect.gen(function* () {
       const skill = yield* SkillV2.Service

@@ -3,11 +3,12 @@
   <a href="./README.zh.md"><b>简体中文</b></a>
 </p>
 
-# OpenCode-GraphAgent
+# GraphAgent
 
-> [opencode](https://github.com/anomalyco/opencode) 的 fork，加了一个 DAG 工作流引擎：编码智能体把任务拆成一张子智能体依赖图，然后驱动它跑完。状态持久化，崩溃能恢复，在终端里就能看图、控图。
+> 一个把任务拆成子智能体依赖图、并驱动它跑完的编码智能体。状态持久化，崩溃能恢复，整张图在终端里就能看、能控。
 
-基于 MIT 许可的 [opencode](https://github.com/anomalyco/opencode) 终端 AI 智能体构建。**与 OpenCode 团队无任何隶属或背书关系。**
+GraphAgent 是本项目对外的产品名；仓库以 **OpenCode-GraphAgent** 发布，是 MIT 许可的
+[opencode](https://github.com/anomalyco/opencode) 终端 AI 智能体的 fork，在其之上加了 DAG 工作流引擎。**与 OpenCode 团队无任何隶属或背书关系。**
 
 ---
 
@@ -19,6 +20,71 @@
 2. **先把需求问清楚，再建图。** 复杂任务（`deep` 模式）建图前要过一轮有界问答（1、3 或 5 轮），产出带版本号和指纹的 Requirement Brief，裁定只有 `READY`、`NOT_READY`、`WAIVED` 三种。轮数用完还有阻塞问题，结果就是 `NOT_READY`，不会悄悄放行。
 3. **门禁结论必须有下文。** 检查点返回 `REVISE` / `REJECT` / `BLOCKED` 时，父智能体要在同一个唤醒回合里处置它：extend、replan、开新工作流，或者说明理由后停下。只复述结论就结束回合，按契约算编排失败。
 4. **恢复靠证据，不靠猜。** 所有状态变更都是持久化事件，状态转换要过声明式状态机的守卫，终态不可逆（只有一个写进规范的例外），读模型是 CQRS 投影。崩溃后只依据持久化证据和解现场，不会凭空重放模型调用。
+
+## 工作流怎么用
+
+不配置也能直接试：给它一件有阶段、有可并行部分、或者中间需要一道审查门禁的活，智能体自己会建图并跑起来。想把它变成你自己的一套固定流程，有三件事：
+
+### 1. 选定模型分层 —— `.opencode/dag.jsonc`
+
+节点从不指定自己的模型。图只声明*哪些节点是关键的*，由配置决定*用什么跑*：
+
+```jsonc
+{
+  // 关键节点：required: true，以及审查/仲裁类 worker。
+  "model": {
+    "advanced": "anthropic/claude-sonnet-4-5",
+    "standard": "anthropic/claude-haiku-4-5"
+  },
+  // DAG 子会话的推理深度变体，仅当模型定义了同名变体时生效。
+  "thinking_depth": "medium"
+}
+```
+
+项目的 `.opencode/dag.jsonc` 优先于 opencode 配置目录下的全局文件；首次使用时会在全局目录生成一份带注释的默认文件。只配一层时，它就是统一默认值。每个节点的解析顺序是：分层 → worker agent 模型 → 父会话模型；三者都给不出模型时，工作流不会被创建，而是回来问你去配一个。
+
+### 2. 把要复用的工作流存起来 —— `.opencode/workflows/`
+
+工作流 spec 就是一个描述图的 YAML 文件。把它放进工作流目录，它就有了**名字**：
+
+| 作用域 | 路径 | 可用范围 |
+|---|---|---|
+| 项目级 | `.opencode/workflows/<name>.yaml` | 本仓库，随仓库提交 —— 团队拿到的是同一套流程 |
+| 全局级 | `<opencode 配置目录>/workflows/<name>.yaml` | 本机所有项目 |
+
+文件名（去掉扩展名）就是名字，同名时项目级遮蔽全局级。一个最小的 spec：
+
+```yaml
+title: Dependency audit
+config:
+  name: dependency-audit
+  nodes:
+    - id: inventory
+      name: inventory
+      worker_type: explore
+      depends_on: []
+      required: true
+      prompt_template:
+        id: config-explore
+        input:
+          target: "package.json files and lockfiles"
+
+    - id: report
+      name: report
+      worker_type: general
+      depends_on: [inventory]
+      report_to_parent: true
+      prompt_template:
+        inline: "Flag outdated or duplicated dependencies in {{inventory}} and propose an upgrade order."
+```
+
+之后直接说「跑 dependency-audit 工作流」就行 —— 智能体按名字启动，不需要路径。临时 spec 的用法完全不变：看起来像路径的 `spec_path`（含路径分隔符，或带 `.yaml`/`.yml` 扩展名）仍按会话目录相对解析，不走工作流库。
+
+### 3. 让智能体替你写
+
+内置的 **`create-dag-workflow`** skill 覆盖 spec 编写：两个作用域、文件结构、存盘 spec 必须守的规矩（不能钉死模型、`worker_type` 必须存在、模板必需变量必须给全），以及怎么验证。说一句「把这个存成可复用的工作流」，智能体会先跟你确认阶段和门禁，把文件写进你选的作用域，再真跑一次证明它能用。
+
+节点 prompt 来自 `.opencode/dag-prompts/*.md` —— 随仓库附带 12 个，通过 `prompt_template.id` 引用。往那儿加一个 `.md` 就多一个模板；全局工作流建议用 `inline` prompt，否则会依赖某个仓库本地的模板。
 
 ## DAG 工作流引擎
 
@@ -77,9 +143,17 @@
   POST /dag/:dagID/control               pause/resume/cancel/replan/extend/step/complete
   ```
 
-### 配置
+### 项目配置文件
 
-`dag.jsonc`（项目 `.opencode/` 优先于全局配置目录，首次使用时自动生成带注释的默认文件）里设置两个模型层：`advanced` 给关键节点（`required: true` 和审查类 worker），`standard` 给其余节点，另外还有子会话的 `thinking_depth` 推理深度。其余全部继承 opencode 主配置。
+DAG 相关的东西都放在 `.opencode/` 下，在 opencode 配置目录（`OPENCODE_CONFIG_DIR`，否则 `~/.config/opencode`）里有对应的全局版本。其余全部继承 opencode 主配置。
+
+| 路径 | 用途 | 全局对应 |
+|---|---|---|
+| `.opencode/dag.jsonc` | 模型分层（`advanced` / `standard`）与子会话 `thinking_depth` | `<配置目录>/dag.jsonc`，首次使用时生成带注释的默认文件 |
+| `.opencode/workflows/*.yaml` | 存盘的工作流 spec，可按名字启动 | `<配置目录>/workflows/*.yaml` |
+| `.opencode/dag-prompts/*.md` | 由 `prompt_template.id` 引用的节点 prompt 模板 | ——（仅项目级） |
+
+`dag.jsonc` 和工作流库都是惰性读取，改完下一次启动工作流就生效，不用重启。
 
 ---
 
@@ -133,6 +207,8 @@ bun dev serve        # headless API 服务（端口 4096）
 
 ## 文档
 
+- [存盘工作流编写指南](./packages/core/src/plugin/skill/create-dag-workflow.md) —— `create-dag-workflow` skill 正文
+- [`.opencode/workflows/change-review.yaml`](./.opencode/workflows/change-review.yaml) —— 一个能用的存盘工作流，按 `change-review` 启动
 - [`docs/harness-dag.md`](./docs/harness-dag.md) —— deep 模式准入与审查生命周期
 - [`.opencode/dag-prompts`](./.opencode/dag-prompts) —— 内置节点 prompt 模板
 - [`AGENTS.md`](./AGENTS.md) —— 贡献与开发指南

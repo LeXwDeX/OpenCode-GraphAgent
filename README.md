@@ -3,11 +3,15 @@
   <a href="./README.zh.md">简体中文</a>
 </p>
 
-# OpenCode-GraphAgent
+# GraphAgent
 
-> A fork of [opencode](https://github.com/anomalyco/opencode) that adds a DAG workflow engine: the coding agent decomposes a task into a dependency graph of child agents and drives it to completion. State is durable, crashes are recoverable, and the whole thing can be inspected and controlled from the terminal.
+> A coding agent that decomposes a task into a dependency graph of child agents and drives it to completion. State is durable, crashes are recoverable, and the whole graph can be inspected and controlled from the terminal.
 
-Built on top of the MIT-licensed [opencode](https://github.com/anomalyco/opencode) terminal AI agent. **Not affiliated with or endorsed by the OpenCode team.**
+GraphAgent is the product name for this project; the repository is published as
+**OpenCode-GraphAgent**, a fork of the MIT-licensed
+[opencode](https://github.com/anomalyco/opencode) terminal AI agent that adds
+the DAG workflow engine. **Not affiliated with or endorsed by the OpenCode
+team.**
 
 ---
 
@@ -19,6 +23,91 @@ A single agent loop struggles once a task has staged dependencies, parallelizabl
 2. **Ask before building the graph.** Complex work (`deep` mode) goes through a bounded Q&A pass first (1, 3, or 5 rounds), producing a versioned, fingerprinted Requirement Brief with a `READY` / `NOT_READY` / `WAIVED` verdict. If the question budget runs out with blockers still open, the verdict is `NOT_READY`. There is no silent pass.
 3. **Gate verdicts need a follow-up.** When a checkpoint returns `REVISE` / `REJECT` / `BLOCKED`, the parent agent has to dispose of it in the same wake turn: extend, replan, start a new workflow, or stop with stated reasons. Summarizing the verdict and ending the turn counts as an orchestration failure under the contract.
 4. **Recover from evidence, not guesses.** Every state change is a durable event, transitions go through a declared state machine's guards, terminal states are irreversible (one exception, written into the spec), and the read model is a CQRS projection. After a crash, recovery reconciles from durable evidence and never fabricates provider work.
+
+## Using workflows
+
+Nothing has to be configured to try it: ask for work that has stages, parallel
+parts, or a review gate in the middle, and the agent designs a graph and runs
+it. Three things turn that into a repeatable setup of your own.
+
+### 1. Choose the model tiers — `.opencode/dag.jsonc`
+
+Nodes never name their own model. The graph declares *which nodes are critical*
+and configuration decides *what runs them*:
+
+```jsonc
+{
+  // Critical nodes: required: true, plus review/arbiter workers.
+  "model": {
+    "advanced": "anthropic/claude-sonnet-4-5",
+    "standard": "anthropic/claude-haiku-4-5"
+  },
+  // Reasoning variant for DAG child sessions, when the model defines one.
+  "thinking_depth": "medium"
+}
+```
+
+A project `.opencode/dag.jsonc` overrides the global one in the opencode config
+dir; a commented default is seeded there on first use. With only one tier
+configured, it serves as the unified default. Resolution order per node is
+tier → worker agent model → parent session model; when none of them yields a
+model, the workflow is not created and you are asked to configure one.
+
+### 2. Save the workflows you rerun — `.opencode/workflows/`
+
+A workflow spec is a YAML file describing the graph. Put it in a workflow
+directory and it gains a **name**:
+
+| Scope | Path | Availability |
+|---|---|---|
+| Project | `.opencode/workflows/<name>.yaml` | This repo, committed with it — the whole team gets the same procedure |
+| Global | `<opencode config dir>/workflows/<name>.yaml` | Every project on the machine |
+
+The filename stem is the name, and a project file shadows a global one with the
+same name. A minimal spec:
+
+```yaml
+title: Dependency audit
+config:
+  name: dependency-audit
+  nodes:
+    - id: inventory
+      name: inventory
+      worker_type: explore
+      depends_on: []
+      required: true
+      prompt_template:
+        id: config-explore
+        input:
+          target: "package.json files and lockfiles"
+
+    - id: report
+      name: report
+      worker_type: general
+      depends_on: [inventory]
+      report_to_parent: true
+      prompt_template:
+        inline: "Flag outdated or duplicated dependencies in {{inventory}} and propose an upgrade order."
+```
+
+Then just say "run the dependency-audit workflow" — the agent starts it by
+name, no path needed. Ad-hoc specs still work exactly as before: a `spec_path`
+that looks like a path (has a separator or a `.yaml`/`.yml` extension) is read
+relative to the session directory instead of the library.
+
+### 3. Let the agent author it
+
+The built-in **`create-dag-workflow`** skill covers spec authoring: the two
+scopes, the file shape, the rules a saved spec must respect (no pinned models,
+`worker_type` must exist, required template variables must be supplied), and
+how to verify it. Ask to "save this as a reusable workflow" and the agent
+establishes the phases and gates with you, writes the file into the scope you
+pick, and proves it by starting it once.
+
+Node prompts come from `.opencode/dag-prompts/*.md` — 12 templates ship
+in-repo, referenced by `prompt_template.id`. Add your own `.md` file there to
+make a new template available; a global workflow should prefer `inline` prompts
+so it does not depend on a repo-local template.
 
 ## DAG workflow engine
 
@@ -77,9 +166,20 @@ Workflow-level knobs: `max_concurrency` (default 5), `max_node_replan_attempts` 
   POST /dag/:dagID/control               pause/resume/cancel/replan/extend/step/complete
   ```
 
-### Configuration
+### Project configuration files
 
-`dag.jsonc` (project `.opencode/` overrides global config dir; a commented default is seeded on first use) sets two model tiers: `advanced` for critical nodes (`required: true`, review workers), `standard` for everything else, plus a `thinking_depth` reasoning variant for child sessions. Everything else inherits the main opencode configuration.
+Everything DAG-specific lives under `.opencode/`, with a global counterpart in
+the opencode config dir (`OPENCODE_CONFIG_DIR`, else `~/.config/opencode`).
+Everything else inherits the main opencode configuration.
+
+| Path | Purpose | Global counterpart |
+|---|---|---|
+| `.opencode/dag.jsonc` | Model tiers (`advanced` / `standard`) and `thinking_depth` for child sessions | `<config dir>/dag.jsonc`, seeded with comments on first use |
+| `.opencode/workflows/*.yaml` | Saved workflow specs, startable by name | `<config dir>/workflows/*.yaml` |
+| `.opencode/dag-prompts/*.md` | Node prompt templates referenced by `prompt_template.id` | — (project-scoped) |
+
+Both `dag.jsonc` and the workflow library are read lazily, so an edit applies to
+the next workflow start without a restart.
 
 ---
 
@@ -133,6 +233,8 @@ Exact file boundaries are listed in [`NOTICE`](./NOTICE). The AGPL covers the DA
 
 ## Docs
 
+- [Saved workflow authoring guide](./packages/core/src/plugin/skill/create-dag-workflow.md) — the `create-dag-workflow` skill body
+- [`.opencode/workflows/change-review.yaml`](./.opencode/workflows/change-review.yaml) — a working saved workflow, startable as `change-review`
 - [`docs/harness-dag.md`](./docs/harness-dag.md) — deep-mode admission & review lifecycle
 - [`.opencode/dag-prompts`](./.opencode/dag-prompts) — built-in node prompt templates
 - [`AGENTS.md`](./AGENTS.md) — contribution & development guide

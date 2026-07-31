@@ -42,6 +42,14 @@ const CONFIGURE_HOOKS_SKILL_NAME = "configure-hooks"
 const CONFIGURE_HOOKS_SKILL_DESCRIPTION = SkillPlugin.ConfigureHooksDescription
 const CONFIGURE_HOOKS_SKILL_BODY = SkillPlugin.ConfigureHooksContent
 
+// Built-in skill. The workflow tool documents how to design a graph but not
+// where a reusable one is stored, so without this skill a well-formed spec ends
+// up as a throwaway file the next session cannot find. The description is what
+// makes the model realize a workflow can be saved at all.
+const CREATE_DAG_WORKFLOW_SKILL_NAME = "create-dag-workflow"
+const CREATE_DAG_WORKFLOW_SKILL_DESCRIPTION = SkillPlugin.CreateDagWorkflowDescription
+const CREATE_DAG_WORKFLOW_SKILL_BODY = SkillPlugin.CreateDagWorkflowContent
+
 export const Info = Schema.Struct({
   name: Schema.String,
   description: Schema.optional(Schema.String),
@@ -294,6 +302,12 @@ export const layer = Layer.effect(
           description: CONFIGURE_HOOKS_SKILL_DESCRIPTION,
           location: "<built-in>",
           content: CONFIGURE_HOOKS_SKILL_BODY,
+        }
+        s.skills[CREATE_DAG_WORKFLOW_SKILL_NAME] = {
+          name: CREATE_DAG_WORKFLOW_SKILL_NAME,
+          description: CREATE_DAG_WORKFLOW_SKILL_DESCRIPTION,
+          location: "<built-in>",
+          content: CREATE_DAG_WORKFLOW_SKILL_BODY,
         }
         yield* loadSkills(s, yield* InstanceState.get(discovered), events)
         return s
