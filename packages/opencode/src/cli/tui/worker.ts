@@ -10,12 +10,40 @@ import { Heap } from "@/cli/heap"
 import { AppRuntime } from "@/effect/app-runtime"
 import { Effect } from "effect"
 import { disposeAllInstancesAndEmitGlobalDisposed } from "@/server/global-lifecycle"
+import { Global } from "@opencode-ai/core/global"
+import { appendFileSync } from "node:fs"
+import path from "node:path"
 
 Heap.start()
 
-const onUnhandledRejection = (_error: unknown) => {}
+// Crash observability: swallowing these silently leaves the worker running in a
+// corrupt state with no diagnostic trail (TUI appears hung with zero logs).
+// Log to the shared log file synchronously so the line survives process.exit.
+const logFatal = (kind: string, error: unknown) => {
+  const detail = error instanceof Error ? (error.stack ?? error.message) : String(error)
+  const line = `timestamp=${new Date().toISOString()} level=ERROR service=tui-worker kind=${kind} error=${JSON.stringify(detail)}\n`
+  try {
+    appendFileSync(path.join(Global.Path.log, "opencode.log"), line)
+  } catch {
+    // The log directory may be gone; never let the crash handler itself throw.
+  }
+}
 
-const onUncaughtException = (_error: Error) => {}
+const onUnhandledRejection = (error: unknown) => {
+  // Keep the worker alive: stray rejections from background tasks are not
+  // proof of corrupt state, but they must be observable.
+  logFatal("unhandledRejection", error)
+}
+
+const onUncaughtException = (error: Error) => {
+  // Process state is unknown past this point; notify the parent and exit so
+  // the TUI can surface the failure instead of hanging on dead RPC calls.
+  logFatal("uncaughtException", error)
+  try {
+    Rpc.emit("worker.fatal", { message: error.message, stack: error.stack })
+  } catch {}
+  process.exit(1)
+}
 
 process.on("unhandledRejection", onUnhandledRejection)
 process.on("uncaughtException", onUncaughtException)

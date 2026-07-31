@@ -886,6 +886,13 @@ export const layer = Layer.effect(
           const match = yield* readToolCall(toolCallID)
           if (!match) continue
           const part = match.part
+          // The tool may have settled between the grace period and this read;
+          // never overwrite a completed/errored part with a forced abort.
+          if (part.state.status !== "running" && part.state.status !== "pending") continue
+          // Claim the call synchronously so a concurrent completeToolCall or
+          // failToolCall (both re-read ctx.toolcalls) can no longer settle it
+          // while we publish and persist the forced error below.
+          delete ctx.toolcalls[toolCallID]
           if (mirrorAssistant && match.call.assistantMessageID) {
             yield* events.publish(SessionEvent.Tool.Failed, {
               sessionID: ctx.sessionID,

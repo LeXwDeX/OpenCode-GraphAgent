@@ -606,7 +606,13 @@ function makeUsageService(sdk: OpencodeClient) {
           ) as Record<ProviderV2.ID, Provider.Info>
           return UsageService.findContextLimit(providers, params.providerID, params.modelID)
         })
-        .catch(() => undefined)
+        .catch(() => {
+          // A transient lookup failure must not be cached forever — drop the
+          // in-flight entry so the next call retries instead of permanently
+          // disabling context usage for this model/directory combination.
+          if (limits.get(key) === next) limits.delete(key)
+          return undefined
+        })
       limits.set(key, next)
       return yield* Effect.promise(() => next)
     },
