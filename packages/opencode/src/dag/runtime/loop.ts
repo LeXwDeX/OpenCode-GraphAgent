@@ -59,6 +59,11 @@ export const layer = Layer.effect(
     const state = yield* InstanceState.make(
       Effect.fn("DagLoop.state")(function* (ctx) {
         const runtimes = new Map<string, WorkflowEntry>()
+        // Adoption in-flight reservations: recoverWorkflow spans async yield
+        // points before it publishes its entry into `runtimes`, so a plain
+        // runtimes.has check is check-then-act. Reserved synchronously at
+        // adoption entry, released when the adoption settles.
+        const recovering = new Set<string>()
         const wakeInFlight = new Set<string>()
         const wakePending = new Set<string>()
 
@@ -302,67 +307,92 @@ export const layer = Layer.effect(
           // server spawns children under a foreign directory context.
           if (wf.projectId !== ctx.project.id) return
           const dagID = wf.id
-          const config = parseWorkflowConfig(wf.config)
-          const recovery = yield* reconcileWorkflow(
-            dagID,
-            checkSessionStatus,
-            (sid) => promptSvc.cancel(sid as never),
-            config,
-          ).pipe(
-            Effect.provideService(Dag.Service, dag),
-          )
-          // P2-2 recovery-pause: reconciliation invented failures (ownership
-          // lost / no child session / deadline enforced offline) without any
-          // durable proof of the child's outcome. Letting spawnReady cascade
-          // skips and checkCompletion terminalize now would weld the workflow
-          // into a terminal status the parent never sanctioned — and terminal
-          // nodes are immutable, so replan could no longer rewire downstream.
-          // Pause instead: pending nodes stay replannable, the durable
-          // NodeFailed wake rows reach the parent at the paused delivery
-          // boundary, and disposition (replan / resume / cancel) stays under
-          // explicit workflow control.
-          const pausedForRecovery = recovery.ownershipLost > 0 && wf.status === "running"
-          if (pausedForRecovery) {
-            yield* dag.pause(dagID)
-            yield* Effect.logWarning("DagLoop paused workflow after recovery invented node failures", {
+          // Idempotency guard: the startup scan and the WorkflowReplanned
+          // handler's re-adoption path can both reach here for the same
+          // workflow (e.g. a replan call arriving while the scan is still
+          // reconciling it). A duplicate adoption would reconcile twice and
+          // overwrite the runtimes entry — orphaning the first entry's fibers
+          // from every interrupt sweep. Reserve synchronously before the
+          // first yield so the second caller drops out immediately.
+          if (runtimes.has(dagID) || recovering.has(dagID)) return
+          recovering.add(dagID)
+          try {
+            const config = parseWorkflowConfig(wf.config)
+            const recovery = yield* reconcileWorkflow(
               dagID,
-              reconciled: recovery.reconciled,
-              ownershipLost: recovery.ownershipLost,
-            })
-          }
-          if (recovery.ownershipLost > 0 && !pausedForRecovery) {
-            yield* Effect.logWarning("DagLoop terminalized recovered nodes after execution ownership loss", {
-              dagID,
-              reconciled: recovery.reconciled,
-              ownershipLost: recovery.ownershipLost,
-            })
-          }
-          const nodes = yield* store.getNodes(dagID)
-          const maxConcurrency = Math.max(1, config?.max_concurrency ?? Dag.DEFAULT_WORKFLOW_CONFIG.maxConcurrency)
-          const runtime = new WorkflowRuntime(toSchedulingNodes(nodes), maxConcurrency)
-          const semaphore = Semaphore.makeUnsafe(maxConcurrency)
-          const isPaused = wf.status === "paused" || pausedForRecovery
-          const isStepping = wf.status === "stepping"
-          if (isPaused) runtime.setPaused(true)
-          if (isStepping) runtime.setStepMode(true)
-          const entry: WorkflowEntry = { runtime, semaphore, evalLock: Semaphore.makeUnsafe(1), parentSessionID: wf.sessionId, config, fibers: new Map() }
-          runtimes.set(dagID, entry)
-          // Reconciliation settles every persisted running attempt before the
-          // runtime is rebuilt. Recovery never adopts or restarts provider work;
-          // a new execution attempt must come from explicit workflow control.
-          if (!isPaused && !isStepping) {
-            yield* entry.evalLock.withPermits(1)(
-              Effect.gen(function* () {
-                yield* spawnReady(dagID)
-                yield* checkCompletion(dagID)
-              }),
+              checkSessionStatus,
+              (sid) => promptSvc.cancel(sid as never),
+              config,
+            ).pipe(
+              Effect.provideService(Dag.Service, dag),
             )
-          }
-          // Deliver the invented-failure wake rows now instead of waiting for
-          // the next idle event — the workflow just paused itself and the
-          // parent is the only actor that can dispose of it.
-          if (pausedForRecovery) {
-            yield* tryDeliverWake(wf.sessionId).pipe(Effect.ignore, Effect.forkScoped)
+            // P2-2 recovery-pause: reconciliation invented failures (ownership
+            // lost / no child session / deadline enforced offline) without any
+            // durable proof of the child's outcome. Letting spawnReady cascade
+            // skips and checkCompletion terminalize now would weld the workflow
+            // into a terminal status the parent never sanctioned — and terminal
+            // nodes are immutable, so replan could no longer rewire downstream.
+            // Pause instead: pending nodes stay replannable, the durable
+            // NodeFailed wake rows reach the parent at the paused delivery
+            // boundary, and disposition (replan / resume / cancel) stays under
+            // explicit workflow control.
+            const pausedForRecovery = recovery.ownershipLost > 0 && wf.status === "running"
+            if (pausedForRecovery) {
+              // A concurrent control op (cancel/fail) can terminalize the
+              // workflow while reconciliation runs — the pause guard then
+              // rejects. Abandon adoption instead of tracking a workflow this
+              // instance no longer controls.
+              const pauseAccepted = yield* dag.pause(dagID).pipe(
+                Effect.as(true),
+                Effect.catchCause((cause) =>
+                  Effect.logWarning("DagLoop recovery pause rejected — abandoning adoption", { dagID, cause }).pipe(
+                    Effect.as(false),
+                  ),
+                ),
+              )
+              if (!pauseAccepted) return
+              yield* Effect.logWarning("DagLoop paused workflow after recovery invented node failures", {
+                dagID,
+                reconciled: recovery.reconciled,
+                ownershipLost: recovery.ownershipLost,
+              })
+            }
+            if (recovery.ownershipLost > 0 && !pausedForRecovery) {
+              yield* Effect.logWarning("DagLoop terminalized recovered nodes after execution ownership loss", {
+                dagID,
+                reconciled: recovery.reconciled,
+                ownershipLost: recovery.ownershipLost,
+              })
+            }
+            const nodes = yield* store.getNodes(dagID)
+            const maxConcurrency = Math.max(1, config?.max_concurrency ?? Dag.DEFAULT_WORKFLOW_CONFIG.maxConcurrency)
+            const runtime = new WorkflowRuntime(toSchedulingNodes(nodes), maxConcurrency)
+            const semaphore = Semaphore.makeUnsafe(maxConcurrency)
+            const isPaused = wf.status === "paused" || pausedForRecovery
+            const isStepping = wf.status === "stepping"
+            if (isPaused) runtime.setPaused(true)
+            if (isStepping) runtime.setStepMode(true)
+            const entry: WorkflowEntry = { runtime, semaphore, evalLock: Semaphore.makeUnsafe(1), parentSessionID: wf.sessionId, config, fibers: new Map() }
+            runtimes.set(dagID, entry)
+            // Reconciliation settles every persisted running attempt before the
+            // runtime is rebuilt. Recovery never adopts or restarts provider work;
+            // a new execution attempt must come from explicit workflow control.
+            if (!isPaused && !isStepping) {
+              yield* entry.evalLock.withPermits(1)(
+                Effect.gen(function* () {
+                  yield* spawnReady(dagID)
+                  yield* checkCompletion(dagID)
+                }),
+              )
+            }
+            // Deliver the invented-failure wake rows now instead of waiting for
+            // the next idle event — the workflow just paused itself and the
+            // parent is the only actor that can dispose of it.
+            if (pausedForRecovery) {
+              yield* tryDeliverWake(wf.sessionId).pipe(Effect.ignore, Effect.forkScoped)
+            }
+          } finally {
+            recovering.delete(dagID)
           }
         })
 
@@ -537,13 +567,28 @@ export const layer = Layer.effect(
           Effect.forkScoped({ startImmediately: true }),
         )
 
+        // Workflow-control handlers cross-check the durable row under the
+        // evalLock before mutating runtime flags: projection is transactional
+        // with publish, so the row reflects this event or a later one — never
+        // an earlier one. Applying the event's implied flags blindly lets a
+        // cross-stream ordering (pause/resume/step race) clobber a newer
+        // control decision. Mirrors the node handlers' DB arbitration.
+        const refreshControlFlags = Effect.fnUntraced(function* (dagID: string, entry: WorkflowEntry) {
+          const workflow = yield* store.getWorkflow(dagID)
+          if (!workflow || isWorkflowTerminalStatus(workflow.status as never)) return undefined
+          entry.runtime.setPaused(workflow.status === "paused")
+          entry.runtime.setStepMode(workflow.status === "stepping")
+          return workflow
+        })
+
         yield* events.subscribe(DagEvent.WorkflowPaused).pipe(
           Stream.filter((e) => runtimes.has(e.data.dagID as string)),
           Stream.runForEach((evt) =>
             Effect.gen(function* () {
-              const entry = runtimes.get(evt.data.dagID as string)
+              const dagID = evt.data.dagID as string
+              const entry = runtimes.get(dagID)
               if (!entry) return
-              yield* entry.evalLock.withPermits(1)(Effect.sync(() => entry.runtime.setPaused(true)))
+              yield* entry.evalLock.withPermits(1)(refreshControlFlags(dagID, entry))
             }).pipe(guarded("WorkflowPaused")),
           ),
           Effect.forkScoped({ startImmediately: true }),
@@ -558,7 +603,15 @@ export const layer = Layer.effect(
               if (!entry) return
               yield* entry.evalLock.withPermits(1)(
                 Effect.gen(function* () {
-                  entry.runtime.setStepMode(true)
+                  const workflow = yield* refreshControlFlags(dagID, entry)
+                  if (workflow?.status !== "stepping") return
+                  // Dag.step validated "no in-flight node" on a DB snapshot
+                  // taken outside this evalLock; a terminal-event handler can
+                  // spawn in between (its DB status read predated the stepped
+                  // projection). Spawning now would put a second node in
+                  // flight under stepping — leave advancement to the next
+                  // explicit step command instead.
+                  if (entry.runtime.hasRunning()) return
                   yield* spawnReady(dagID)
                 }),
               )
@@ -576,9 +629,8 @@ export const layer = Layer.effect(
               if (!entry) return
               yield* entry.evalLock.withPermits(1)(
                 Effect.gen(function* () {
-                  entry.runtime.setPaused(false)
-                  entry.runtime.setStepMode(false)
-                  yield* spawnReady(dagID)
+                  const workflow = yield* refreshControlFlags(dagID, entry)
+                  if (workflow?.status === "running") yield* spawnReady(dagID)
                   // A workflow can be resumed with every node already settled
                   // (e.g. recovery-pause on a single lost node). Without this,
                   // nothing else re-runs completion and the workflow hangs in
