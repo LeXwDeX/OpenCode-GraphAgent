@@ -289,12 +289,14 @@ function writeWorkflowSpec(name: string, value: unknown) {
 }
 
 describe("workflow tool schema (negative tests)", () => {
-  it("action field accepts start/extend/control/status", () => {
+  it("action field accepts start/extend/control/status/list", () => {
     const decode = Schema.decodeUnknownSync(Parameters)
     expect(() => decode({ action: "start", spec_path: ".opencode/workflows/test.yaml" })).not.toThrow()
     expect(() => decode({ action: "extend", workflow_id: "wf-1", spec_path: ".opencode/workflows/extend.yaml" })).not.toThrow()
     expect(() => decode({ action: "control", workflow_id: "wf-1", operation: "pause" })).not.toThrow()
     expect(() => decode({ action: "status", workflow_id: "wf-1" })).not.toThrow()
+    // list browses the saved-spec library and needs no workflow_id.
+    expect(() => decode({ action: "list" })).not.toThrow()
   })
 
   it("action field rejects unknown actions", () => {
@@ -307,9 +309,8 @@ describe("workflow tool schema (negative tests)", () => {
     expect(() => decode({ action: "node_complete" })).toThrow()
   })
 
-  it("no unsupported read-only actions exist (list/history/logs)", () => {
+  it("no unsupported read-only actions exist (history/logs)", () => {
     const decode = Schema.decodeUnknownSync(Parameters)
-    expect(() => decode({ action: "list" })).toThrow()
     expect(() => decode({ action: "history" })).toThrow()
     expect(() => decode({ action: "logs" })).toThrow()
   })
@@ -1033,3 +1034,152 @@ config:
     }),
   )
 })
+
+describe("workflow tool saved workflows", () => {
+  // The global scope reads Flag.OPENCODE_CONFIG_DIR from the env; point it at a
+  // fresh directory so the real user config dir is never touched.
+  const withGlobalConfigDir = <A, E, R>(self: (globalDir: string) => Effect.Effect<A, E, R>) =>
+    Effect.acquireUseRelease(
+      Effect.promise(async () => {
+        const globalDir = await fs.mkdtemp(path.join(os.tmpdir(), "workflow-global-"))
+        const previous = process.env.OPENCODE_CONFIG_DIR
+        process.env.OPENCODE_CONFIG_DIR = globalDir
+        return { globalDir, previous }
+      }),
+      (state) => self(state.globalDir),
+      (state) =>
+        Effect.promise(async () => {
+          if (state.previous === undefined) delete process.env.OPENCODE_CONFIG_DIR
+          else process.env.OPENCODE_CONFIG_DIR = state.previous
+          await fs.rm(state.globalDir, { recursive: true, force: true })
+        }),
+    )
+
+  const savedSpec = (name: string) =>
+    `title: ${name} title\nconfig:\n  name: ${name}\n  nodes: []\n`
+
+  const contextWith = (asked: unknown[]) =>
+    ({
+      sessionID: SessionID.make("ses_workflow_parent"),
+      messageID: MessageID.ascending(),
+      agent: "build",
+      abort: new AbortController().signal,
+      messages: [],
+      metadata: () => Effect.void,
+      ask: (input: unknown) =>
+        Effect.sync(() => {
+          asked.push(input)
+        }),
+    }) satisfies Tool.Context
+
+  runtime.effect("start resolves a bare name against the project workflow library", () =>
+    withGlobalConfigDir(() =>
+      Effect.gen(function* () {
+        published.length = 0
+        yield* Effect.promise(() =>
+          Bun.write(
+            path.join(workflowSpecDirectory, ".opencode", "workflows", "saved-project.yaml"),
+            savedSpec("saved-project"),
+          ),
+        )
+        const info = yield* WorkflowTool
+        const workflow = yield* info.init()
+        const asked: unknown[] = []
+
+        const result = yield* workflow.execute({ action: "start", spec_path: "saved-project" }, contextWith(asked))
+
+        expect(result.output).toContain('state="running"')
+        expect(result.title).toBe("Workflow started: saved-project")
+        expect(asked).toHaveLength(0)
+      }),
+    ),
+  )
+
+  runtime.effect("start resolves a global saved workflow without an external-directory prompt", () =>
+    withGlobalConfigDir((globalDir) =>
+      Effect.gen(function* () {
+        published.length = 0
+        yield* Effect.promise(() =>
+          Bun.write(path.join(globalDir, "workflows", "saved-global.yaml"), savedSpec("saved-global")),
+        )
+        const info = yield* WorkflowTool
+        const workflow = yield* info.init()
+        const asked: unknown[] = []
+
+        const result = yield* workflow.execute({ action: "start", spec_path: "saved-global" }, contextWith(asked))
+
+        expect(result.title).toBe("Workflow started: saved-global")
+        // The library's two scopes are curated config, so a resolved name never
+        // asks for external-directory permission.
+        expect(asked).toHaveLength(0)
+      }),
+    ),
+  )
+
+  runtime.effect("an unresolved name fails with the directories that were searched", () =>
+    withGlobalConfigDir((globalDir) =>
+      Effect.gen(function* () {
+        published.length = 0
+        const info = yield* WorkflowTool
+        const workflow = yield* info.init()
+        const exit = yield* workflow
+          .execute({ action: "start", spec_path: "not-saved" }, contextWith([]))
+          .pipe(Effect.exit)
+
+        expect(Exit.isFailure(exit)).toBe(true)
+        if (Exit.isFailure(exit)) {
+          const message = Cause.pretty(exit.cause)
+          expect(message).toContain('Saved workflow not found: "not-saved"')
+          expect(message).toContain(path.join(workflowSpecDirectory, ".opencode", "workflows"))
+          expect(message).toContain(path.join(globalDir, "workflows"))
+        }
+        expect(published).toHaveLength(0)
+      }),
+    ),
+  )
+
+  runtime.effect("list reports both scopes with the project entry shadowing the global one", () =>
+    withGlobalConfigDir((globalDir) =>
+      Effect.gen(function* () {
+        yield* Effect.promise(() =>
+          Promise.all([
+            Bun.write(path.join(globalDir, "workflows", "shared.yaml"), savedSpec("global-shared")),
+            Bun.write(path.join(globalDir, "workflows", "global-only.yaml"), savedSpec("global-only")),
+            Bun.write(
+              path.join(workflowSpecDirectory, ".opencode", "workflows", "shared.yaml"),
+              savedSpec("project-shared"),
+            ),
+          ]),
+        )
+        const info = yield* WorkflowTool
+        const workflow = yield* info.init()
+
+        const result = yield* workflow.execute({ action: "list" }, contextWith([]))
+
+        expect(result.output).toContain("shared [project] — project-shared title")
+        expect(result.output).toContain("global-only [global] — global-only title")
+        expect(result.output).not.toContain("global-shared")
+      }),
+    ),
+  )
+
+  runtime.effect("list explains where to save a spec when the library is empty", () =>
+    withGlobalConfigDir((globalDir) =>
+      Effect.gen(function* () {
+        // A previous case may have seeded the project scope — start clean.
+        yield* Effect.promise(() =>
+          fs.rm(path.join(workflowSpecDirectory, ".opencode", "workflows"), { recursive: true, force: true }),
+        )
+        const info = yield* WorkflowTool
+        const workflow = yield* info.init()
+
+        const result = yield* workflow.execute({ action: "list" }, contextWith([]))
+
+        expect(result.title).toBe("No saved workflows")
+        expect(result.output).toContain(path.join(workflowSpecDirectory, ".opencode", "workflows"))
+        expect(result.output).toContain(path.join(globalDir, "workflows"))
+      }),
+    ),
+  )
+})
+

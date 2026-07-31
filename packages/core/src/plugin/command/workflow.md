@@ -76,6 +76,26 @@ config:
   nodes: []
 ```
 
+## Saved workflows
+
+A `spec_path` with no path separator and no `.yaml`/`.yml` extension is a
+**name** resolved against the workflow library instead of the filesystem:
+
+1. `.opencode/workflows/<name>.yaml` — project scope, committed with the repo
+2. `<opencode config dir>/workflows/<name>.yaml` — global scope, available in every project
+
+The project scope wins when both hold the name. `workflow(action: "list")`
+reports the saved names with their scope, title, and node count; a name that
+resolves nowhere fails with the directories that were searched.
+
+Prefer a saved workflow when the user names a recurring procedure ("run the
+code review workflow"): starting it is one call, and its graph has already been
+reviewed. Compose a fresh spec file when the task is one-off or when the saved
+graph does not fit — a path-shaped `spec_path` keeps the original
+session-relative behavior. To turn a working one-off spec into a saved
+workflow, move the file into one of the two directories under a descriptive
+name.
+
 ## Orchestration Lifecycle
 
 Heavy tasks follow a meta-workflow: multiple workflows chained together, each producing a decision that shapes the next. The lifecycle is the two accuracy axes applied in sequence — breadth to cover the surface, depth to earn the verdict:
@@ -453,9 +473,14 @@ All nodes share the same workspace. Write conflicts are an orchestration concern
 
 **start** — Create a workflow from a YAML spec with `config` and optional
 `title`, `mode`, and admission input at the file root. Write the file first,
-then call `{ action: "start", spec_path: ".opencode/workflows/name.yaml" }`.
+then call `{ action: "start", spec_path: ".opencode/workflows/name.yaml" }`, or
+pass a saved workflow name (`{ action: "start", spec_path: "code-review" }`).
 Returns the workflow ID. Nodes declare `depends_on` (node IDs); layers and
 execution order are computed automatically.
+
+**list** — Show the saved workflow specs in the library (project and global
+scope) with their names, titles, and node counts. This lists reusable specs,
+not running workflows; use `status` for a workflow's live state.
 
 **extend** — Add nodes to a running workflow. Existing nodes are unaffected;
 new nodes are immediately eligible for scheduling if their dependencies are
@@ -496,5 +521,5 @@ file-root `nodes` array, then call
 ### What NOT to expect
 
 - No `node_complete` action — completion is automatic
-- No `list` / `history` actions — inspect a known workflow with `status`; broader browsing remains TUI-only
+- No `history` action — inspect a known workflow with `status`; browsing running workflows remains TUI-only (`list` shows saved specs, not running workflows)
 - No topology templates — templates are prompt fragments only; you design the graph

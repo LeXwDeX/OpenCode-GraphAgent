@@ -1,0 +1,72 @@
+title: Change review
+config:
+  name: change-review
+  max_concurrency: 3
+  node_defaults:
+    required: false
+    report_to_parent: false
+    worker_config:
+      timeout_ms: 900000
+  nodes:
+    - id: survey
+      name: survey
+      worker_type: explore
+      depends_on: []
+      required: true
+      prompt_template:
+        id: code-explore
+        input:
+          target: "the uncommitted changes in this repository (git status, git diff) and the modules they touch"
+
+    - id: review-logic
+      name: review-logic
+      worker_type: general
+      depends_on: [survey]
+      prompt_template: { id: review-logic }
+
+    - id: review-arch
+      name: review-arch
+      worker_type: general
+      depends_on: [survey]
+      prompt_template: { id: review-arch }
+
+    - id: verify
+      name: verify
+      worker_type: build
+      depends_on: [survey]
+      prompt_template:
+        inline: |
+          Run the repository's commit gates against the changed packages and report the raw results.
+          From each affected package directory (never the repo root): `bun typecheck`, then `bun test` for the
+          test files covering the changed code. Report failures verbatim; do not fix anything.
+
+    - id: arbitrate
+      name: arbitrate
+      worker_type: general
+      depends_on: [review-logic, review-arch, verify]
+      required: true
+      report_to_parent: true
+      output_schema:
+        type: object
+        required: [verdict, summary, findings]
+        properties:
+          verdict:
+            type: string
+            enum: [ACCEPT, REVISE, REJECT, BLOCKED]
+          summary: { type: string }
+          findings:
+            type: array
+            items:
+              type: object
+              required: [severity, location, problem]
+              properties:
+                severity:
+                  type: string
+                  enum: [blocker, major, minor, nit]
+                location: { type: string }
+                problem: { type: string }
+      prompt_template:
+        inline: |
+          Two reviewers and one verification run examined the same change. Submit a single deduplicated
+          verdict. A failing gate in {{verify}} is a blocker regardless of review opinion. Drop any reviewer
+          claim you cannot tie to a specific file and line.
