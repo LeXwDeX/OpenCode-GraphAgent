@@ -1711,14 +1711,17 @@ export const layer = Layer.effect(
 
             yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
 
-            const [skills, env, instructions, mcpInstructions, hooksDocs, modelMsgs] = yield* Effect.all([
-              sys.skills(agent),
-              sys.environment(model),
-              instruction.system().pipe(Effect.orDie),
-              sys.mcp(agent, session.permission),
-              sys.hooks(),
-              MessageV2.toModelMessagesEffect(msgs, model),
-            ])
+            const [skills, env, instructions, mcpInstructions, hooksDocs, modelMsgs] = yield* Effect.all(
+              [
+                sys.skills(agent),
+                sys.environment(model),
+                instruction.system().pipe(Effect.orDie),
+                sys.mcp(agent, session.permission),
+                sys.hooks(),
+                MessageV2.toModelMessagesEffect(msgs, model),
+              ],
+              { concurrency: "unbounded" },
+            )
             const system = [
               ...env,
               ...instructions,

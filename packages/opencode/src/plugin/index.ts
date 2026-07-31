@@ -250,11 +250,23 @@ export const layer = Layer.effect(
 
         const unsubscribe = yield* events.listen((event) => {
           if (event.location?.directory !== ctx.directory) return Effect.void
-          return Effect.sync(() => {
-            for (const hook of hooks) {
-              void hook["event"]?.({ event: { id: event.id, type: event.type, properties: event.data } as any })
-            }
-          })
+          // Fire-and-forget by design (bus delivery must not block on plugin
+          // hooks), but rejections have to be observed: a bare `void promise`
+          // produces unhandledRejection — crashing headless runs and leaving
+          // only a log line in TUI worker runs.
+          return Effect.forEach(
+            hooks,
+            (hook) =>
+              Effect.tryPromise({
+                try: () => Promise.resolve(hook["event"]?.({ event: { id: event.id, type: event.type, properties: event.data } as any })),
+                catch: errorMessage,
+              }).pipe(
+                Effect.tapError((error) => Effect.logError("plugin event hook failed", { type: event.type, error })),
+                Effect.ignore,
+                Effect.forkDetach,
+              ),
+            { discard: true },
+          )
         })
         yield* Effect.addFinalizer(() => unsubscribe)
 

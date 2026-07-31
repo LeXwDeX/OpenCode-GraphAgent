@@ -546,7 +546,6 @@ export async function handler(
             return provider
           })
           .filter((p) => p.priority <= topPriority)
-          .flatMap((provider) => Array<typeof provider>(provider.weight).fill(provider))
 
         // Use the last 4 characters of session ID to select a provider
         let h = 0
@@ -554,8 +553,12 @@ export async function handler(
         for (let i = l - 4; i < l; i++) {
           h = (h * 31 + stickyId.charCodeAt(i)) | 0 // 32-bit int
         }
-        const index = (h >>> 0) % providers.length // make unsigned + range 0..length-1
-        const provider = providers[index || 0]
+        // Weighted pick over cumulative weights — same slot layout as
+        // physically expanding each provider `weight` times, without the
+        // O(Σweight) array allocation per request.
+        const totalWeight = providers.reduce((sum, p) => sum + p.weight, 0)
+        let slot = totalWeight > 0 ? (h >>> 0) % totalWeight : 0
+        const provider = providers.find((p) => (slot -= p.weight) < 0) ?? providers[0]
 
         // sticky provider does not exist => use selected provider
         if (!stickyProviderId) return provider

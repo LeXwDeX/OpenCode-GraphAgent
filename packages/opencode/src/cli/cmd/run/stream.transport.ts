@@ -456,6 +456,15 @@ function createLayer(input: StreamInput) {
         let replayDisabled = false
         let replayPending: SessionResizeReplayInput | undefined
         const buffered: Event[] = []
+        // Untracked-session events are re-buffered indefinitely by
+        // drainBuffered (they only become useful if their session turns into
+        // a tracked subagent tab shortly after). Cap the backlog dropping the
+        // oldest so unrelated sessions cannot grow memory without bound.
+        const BUFFERED_EVENT_LIMIT = 1000
+        const buffer = (event: Event) => {
+          buffered.push(event)
+          if (buffered.length > BUFFERED_EVENT_LIMIT) buffered.splice(0, buffered.length - BUFFERED_EVENT_LIMIT)
+        }
         const replayedParts = new Set<string>()
         const recovering = new Set<string>()
         const tracked = (sessionID: string | undefined) =>
@@ -560,7 +569,19 @@ function createLayer(input: StreamInput) {
 
           recovering.add(partID)
           try {
+            // Recovery is bounded: the question request either already exists
+            // server-side (found within a few polls) or will never appear. An
+            // unbounded loop polls one HTTP list call per 250ms until session
+            // close whenever the server fails to register the question.
+            const deadline = Date.now() + 120_000
             while (!closed && !abort.signal.aborted && !input.footer.isClosed) {
+              if (Date.now() >= deadline) {
+                input.trace?.write("question.recover.timeout", {
+                  sessionID: input.sessionID,
+                  partID,
+                })
+                return
+              }
               if (state.data.questions.length > 0 || !state.data.tools.has(partID)) {
                 return
               }
@@ -865,8 +886,20 @@ function createLayer(input: StreamInput) {
         })
 
         const poll = Effect.fn("RunStreamTransport.poll")(function* (next: Wait, signal: AbortSignal) {
+          // Prompt sends arm the wait but leave live=false until a session
+          // event arrives (promptAsync is durable admission — the session can
+          // still be idle right after the HTTP call returns, so setting live
+          // eagerly would let the completion gate fire before the drain
+          // starts). If the server stays idle with no events long past the
+          // admission window, no drain is coming; escape instead of hanging
+          // the turn forever.
+          let idleStreak = 0
           while (state.wait === next && !signal.aborted && !input.footer.isClosed && !closed) {
             yield* Effect.sleep("250 millis")
+            if (next.armed && !next.live) {
+              idleStreak = (yield* idle(false)) ? idleStreak + 1 : 0
+              if (idleStreak >= 8) next.live = true
+            }
             yield* complete(next, false)
           }
         })
@@ -1151,7 +1184,7 @@ function createLayer(input: StreamInput) {
                 if (booting || replaying) {
                   if (sessionID) {
                     input.trace?.write("recv.event", event)
-                    buffered.push(event)
+                    buffer(event)
                   }
                   return
                 }
@@ -1159,7 +1192,7 @@ function createLayer(input: StreamInput) {
                 if (!tracked(sessionID)) {
                   if (sessionID) {
                     input.trace?.write("recv.event", event)
-                    buffered.push(event)
+                    buffer(event)
                   }
                   return
                 }

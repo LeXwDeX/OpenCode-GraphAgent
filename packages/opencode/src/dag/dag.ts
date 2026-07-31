@@ -8,6 +8,7 @@ import { DagStore } from "@opencode-ai/core/dag/store"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Database } from "@opencode-ai/core/database/database"
 import { KeyedMutex } from "@opencode-ai/core/effect/keyed-mutex"
+import { isRecord } from "@/util/record"
 import { validateRequiredNodes } from "@opencode-ai/core/dag/core/required-validator"
 import { buildGraph, WorkflowRuntime, toSchedulingNodes } from "@opencode-ai/core/dag/core/scheduling"
 import { CycleError } from "@opencode-ai/core/dag/core/graph"
@@ -186,7 +187,18 @@ const parseJsonOption = Schema.decodeUnknownOption(Schema.UnknownFromJsonString)
 
 export function parseWorkflowConfig(raw: string): WorkflowConfig | undefined {
   const parsed = parseJsonOption(raw)
-  if (Option.isNone(parsed) || typeof parsed.value !== "object" || parsed.value === null) return undefined
+  if (Option.isNone(parsed)) return undefined
+  const candidate: unknown = parsed.value
+  if (!isRecord(candidate)) return undefined
+  // Guard the invariants every caller relies on (config.nodes.map, node.id,
+  // depends_on iteration) instead of trusting the persisted row blindly. Kept
+  // structural rather than a full strict schema: rejecting a legacy row that
+  // callers could still consume would break recovery of in-flight workflows.
+  if (!Array.isArray(candidate.nodes)) return undefined
+  const nodesValid = candidate.nodes.every(
+    (node) => isRecord(node) && typeof node.id === "string" && Array.isArray(node.depends_on),
+  )
+  if (!nodesValid) return undefined
   return parsed.value as WorkflowConfig
 }
 

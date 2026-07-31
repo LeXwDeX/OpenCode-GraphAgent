@@ -8,7 +8,7 @@ import {
   isContextOverflowFailure,
   type ProviderErrorEvent,
 } from "@opencode-ai/llm"
-import { Cause, DateTime, Effect, FiberSet, Layer, Option, Semaphore, Stream } from "effect"
+import { Cause, DateTime, Deferred, Effect, FiberSet, Layer, Option, Semaphore, Stream } from "effect"
 import { AgentV2 } from "../../agent"
 import { Config } from "../../config"
 import { Database } from "../../database/database"
@@ -136,7 +136,17 @@ export const layer = Layer.effect(
     })
 
     const awaitToolFibers = (fibers: FiberSet.FiberSet<void, ToolOutputStore.Error>) =>
-      Effect.raceFirst(FiberSet.join(fibers), FiberSet.awaitEmpty(fibers))
+      Effect.raceFirst(
+        FiberSet.join(fibers),
+        // awaitEmpty also succeeds when the last fiber failed: the FiberSet
+        // observer deletes from the backing set before completing the join
+        // deferred, so both racers become ready in the same tick. Re-check the
+        // deferred so a lost race cannot swallow a tool settlement failure.
+        FiberSet.awaitEmpty(fibers).pipe(
+          Effect.andThen(Deferred.isDone(fibers.deferred)),
+          Effect.flatMap((failed) => (failed ? FiberSet.join(fibers) : Effect.void)),
+        ),
+      )
 
     // Match V1: dismissing a question halts the loop instead of becoming model-facing tool output.
     const isQuestionRejected = (cause: Cause.Cause<unknown>) =>

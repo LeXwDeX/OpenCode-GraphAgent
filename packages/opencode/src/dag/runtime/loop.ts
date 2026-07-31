@@ -809,20 +809,27 @@ export const layer = Layer.effect(
                     // in spawnReady, settle+spawnReady in the terminal handlers),
                     // so reading the five conditions under the same lock waits
                     // out the markRunning→fibers.set window instead of misreading
-                    // it as a stalled orchestrator. dag.fail stays outside the
-                    // lock to avoid holding evalLock across the KeyedMutex.
-                    const shouldFail = yield* entry.evalLock.withPermits(1)(
-                      Effect.sync(() =>
-                        !entry.runtime.isPaused()
-                        && !entry.runtime.isStepMode()
-                        // Suppress the net only when current-process execution
-                        // ownership proves that a running node is making progress.
-                        && !entry.runtime.hasRunningMatching((id) => entry.fibers.has(id))
-                        && entry.runtime.getReadyNodes().length === 0
-                        && !entry.runtime.isComplete(),
-                      ),
+                    // it as a stalled orchestrator. dag.fail must run under the
+                    // SAME permit: releasing the lock between the check and the
+                    // fail lets a terminal-event handler spawn new ready nodes in
+                    // the window, and the stale verdict would then kill a
+                    // progressing workflow. evalLock→workflowLock nesting is the
+                    // established order here (checkCompletion inside evalLock
+                    // takes the same KeyedMutex); dag.ts never acquires evalLock,
+                    // so no reverse ordering exists.
+                    yield* entry.evalLock.withPermits(1)(
+                      Effect.gen(function* () {
+                        const shouldFail =
+                          !entry.runtime.isPaused()
+                          && !entry.runtime.isStepMode()
+                          // Suppress the net only when current-process execution
+                          // ownership proves that a running node is making progress.
+                          && !entry.runtime.hasRunningMatching((id) => entry.fibers.has(id))
+                          && entry.runtime.getReadyNodes().length === 0
+                          && !entry.runtime.isComplete()
+                        if (shouldFail) yield* dag.fail(dagID, "orchestrator_unresponsive").pipe(Effect.ignore)
+                      }),
                     )
-                    if (shouldFail) yield* dag.fail(dagID, "orchestrator_unresponsive").pipe(Effect.ignore)
                   }
                 }
                 return
@@ -927,8 +934,16 @@ export const layer = Layer.effect(
         // Terminal rows can survive a process crash after projection but before
         // parent delivery. Re-enter the normal serialized drain for every
         // affected parent session without waiting for a new status event.
+        // Store failures here are defects (the store's error channel is never);
+        // absorb them with a warning so layer construction survives, but never
+        // silently — a swallowed failure means wake redelivery is lost until
+        // the next process restart.
         const pendingWakeSessions = yield* store.getSessionsWithUnreportedWakes().pipe(
-          Effect.catch(() => Effect.succeed([] as string[])),
+          Effect.catchCause((cause) =>
+            Effect.logWarning("DagLoop failed to list sessions with unreported wakes", { cause }).pipe(
+              Effect.as([] as string[]),
+            ),
+          ),
         )
         for (const sessionID of pendingWakeSessions) {
           // Cross-instance guard: wake redelivery is store-global. A session's
@@ -936,7 +951,11 @@ export const layer = Layer.effect(
           // snapshot's own workflow rows carry the ownership proof — only
           // drain sessions whose unreported workflows belong to this project.
           const snapshot = yield* store.getWakeSnapshot(sessionID).pipe(
-            Effect.catch(() => Effect.succeed({ nodes: [], workflows: [] } satisfies DagStore.WakeSnapshot)),
+            Effect.catchCause((cause) =>
+              Effect.logWarning("DagLoop failed to read wake snapshot", { sessionID, cause }).pipe(
+                Effect.as({ nodes: [], workflows: [] } satisfies DagStore.WakeSnapshot),
+              ),
+            ),
           )
           if (!snapshot.workflows.some((wf) => wf.projectId === ctx.project.id)) continue
           yield* tryDeliverWake(sessionID).pipe(Effect.forkScoped)
