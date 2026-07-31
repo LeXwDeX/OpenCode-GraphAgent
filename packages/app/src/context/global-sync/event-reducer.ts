@@ -1,4 +1,5 @@
 import { Binary } from "@opencode-ai/core/util/binary"
+import { batch } from "solid-js"
 import { produce, reconcile, type SetStoreFunction, type Store } from "solid-js/store"
 import type {
   Message,
@@ -302,21 +303,25 @@ export function applyDirectoryEvent(input: {
       if (!result.found) break
       const field = props.field as keyof (typeof parts)[number]
       const current = parts[result.index]?.[field]
-      input.setStore(
-        "part_text_accum_delta",
-        props.partID,
-        (existing) => (existing ?? (typeof current === "string" ? current : "")) + props.delta,
-      )
-      input.setStore(
-        "part",
-        props.messageID,
-        produce((draft) => {
-          const part = draft[result.index]
-          const field = props.field as keyof typeof part
-          const existing = part[field] as string | undefined
-          ;(part[field] as string) = (existing ?? "") + props.delta
-        }),
-      )
+      // Hot path: one batch per delta so subscribers see a single reactive
+      // notification instead of two (accumulator + part) per streamed token.
+      batch(() => {
+        input.setStore(
+          "part_text_accum_delta",
+          props.partID,
+          (existing) => (existing ?? (typeof current === "string" ? current : "")) + props.delta,
+        )
+        input.setStore(
+          "part",
+          props.messageID,
+          produce((draft) => {
+            const part = draft[result.index]
+            const field = props.field as keyof typeof part
+            const existing = part[field] as string | undefined
+            ;(part[field] as string) = (existing ?? "") + props.delta
+          }),
+        )
+      })
       break
     }
     case "vcs.branch.updated": {

@@ -207,6 +207,20 @@ export const TuiThreadCommand = cmd({
         worker.terminate()
       }
 
+      // A dead worker leaves every pending RPC hanging forever; surface the
+      // crash and exit instead of freezing the TUI with no diagnostics.
+      const fatal = (reason: string) => {
+        if (stopped) return
+        stopped = true
+        process.off("SIGUSR2", reload)
+        worker.terminate()
+        UI.error("server worker crashed: " + reason)
+        process.exit(1)
+      }
+      client.on<{ message: string; stack?: string }>("worker.fatal", (data) => fatal(data.message))
+      worker.addEventListener("error", (event) => fatal(errorMessage(event.error ?? event.message)))
+      worker.addEventListener("close", () => fatal("worker exited unexpectedly"))
+
       const prompt = await input(args.prompt)
       const config = await TuiConfig.get()
 

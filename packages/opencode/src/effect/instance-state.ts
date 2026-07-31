@@ -28,6 +28,12 @@ export const make = <A, E = never, R = never>(
 ): Effect.Effect<InstanceState<A, E, Exclude<R, Scope.Scope>>, never, R | Scope.Scope> =>
   Effect.gen(function* () {
     const cache = yield* ScopedCache.make<string, A, E, R>({
+      // Deliberately unbounded: eviction is coordinated per-directory by
+      // InstanceStore.disposeDirectory (via the disposer registered below),
+      // which tears down every service's state for that directory together.
+      // A capacity/TTL here would evict one service's entry independently —
+      // closing its scope (releasing resources still held by live fibers)
+      // while sibling services keep their old state for the same directory.
       capacity: Number.POSITIVE_INFINITY,
       lookup: () =>
         Effect.gen(function* () {

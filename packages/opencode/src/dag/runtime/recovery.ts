@@ -22,6 +22,7 @@ import { Dag } from "../dag"
 import type { NodeConfig } from "../dag"
 import { Session } from "@/session/session"
 import { SessionID } from "@/session/schema"
+import type { SessionV1 } from "@opencode-ai/core/v1/session"
 import type { DagStore } from "@opencode-ai/core/dag/store"
 import { isTransitionRejection } from "@opencode-ai/core/dag/core/types"
 import { reviewImplementationFingerprint } from "../review-lifecycle"
@@ -81,9 +82,9 @@ export function reconcileWorkflow(
         continue
       }
 
-      const sessionStatus = yield* checkSessionStatus(node.childSessionId).pipe(
-        Effect.catch(() => Effect.succeed("unknown" as const)),
-      )
+      // Checker failures propagate: aborting this reconcile (callers log and
+      // retry on next access) beats inventing a nodeFailed from a read error.
+      const sessionStatus = yield* checkSessionStatus(node.childSessionId)
 
       if (sessionStatus === "completed") {
         const nodeConfig = workflowConfig?.nodes.find((n) => n.id === node.id)
@@ -179,12 +180,15 @@ export function makeSessionStatusChecker(
 ): (childSessionID: string) => Effect.Effect<"active" | "completed" | "failed" | "unknown", Error> {
   return (childSessionID) =>
     Effect.gen(function* () {
+      // Only a missing session is legitimate "unknown"; any other failure must
+      // propagate so recovery aborts instead of inventing node failures from
+      // fabricated evidence. DB-level errors are already defects (orDie).
       const info = yield* sessions.get(SessionID.make(childSessionID)).pipe(
-        Effect.catch(() => Effect.succeed(undefined)),
+        Effect.catchTag("NotFoundError", () => Effect.succeed(undefined)),
       )
       if (!info) return "unknown" as const
       const msgs = yield* sessions.messages({ sessionID: SessionID.make(childSessionID), limit: 1 }).pipe(
-        Effect.catch(() => Effect.succeed([] as never)),
+        Effect.catchTag("NotFoundError", () => Effect.succeed([] as SessionV1.WithParts[])),
       )
       if (msgs.length === 0) return "unknown" as const
       const last = msgs[msgs.length - 1]

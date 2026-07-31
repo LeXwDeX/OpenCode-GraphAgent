@@ -121,7 +121,23 @@ export async function convertToOpenAIResponsesInput({
         const reasoningMessages: Record<string, OpenAIResponsesReasoning> = {}
         const toolCallParts: Record<string, LanguageModelV3ToolCallPart> = {}
 
-        for (const part of content) {
+        // Request-build hot path: parse provider options for all reasoning
+        // parts in one batch instead of awaiting once per part inside the
+        // loop. Each parse is independent pure validation, so batching keeps
+        // ordering and the cross-part reasoningMessages state intact.
+        const reasoningOptions = await Promise.all(
+          content.map((part) =>
+            part.type === "reasoning"
+              ? parseProviderOptions({
+                  provider: "copilot",
+                  providerOptions: part.providerOptions,
+                  schema: openaiResponsesReasoningProviderOptionsSchema,
+                })
+              : Promise.resolve(undefined),
+          ),
+        )
+
+        for (const [partIndex, part] of content.entries()) {
           switch (part.type) {
             case "text": {
               input.push({
@@ -183,11 +199,7 @@ export async function convertToOpenAIResponsesInput({
             }
 
             case "reasoning": {
-              const providerOptions = await parseProviderOptions({
-                provider: "copilot",
-                providerOptions: part.providerOptions,
-                schema: openaiResponsesReasoningProviderOptionsSchema,
-              })
+              const providerOptions = reasoningOptions[partIndex]
 
               const reasoningId = providerOptions?.itemId
 
