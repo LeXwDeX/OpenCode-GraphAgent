@@ -254,13 +254,26 @@ export interface Interface {
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Dag") {}
 
+// The per-workflow KeyedMutex is single-permit and NOT reentrant: a guarded
+// command invoked without the lock races its status guards, and one invoked
+// while the lock is already held deadlocks silently (the permit never frees).
+// The witness turns that convention into a type — only withWorkflowLock mints
+// a WorkflowLock, so every guarded command below carries compile-time proof
+// that it runs inside the lock's critical section. Internal composition
+// (extend → replan → nodeFailed) forwards the caller's witness instead of
+// re-acquiring the lock.
+declare const WorkflowLockHeld: unique symbol
+type WorkflowLock = { readonly [WorkflowLockHeld]: true }
+
 export const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const events = yield* EventV2Bridge.Service
     const store = yield* DagStore.Service
     const workflowLocks = KeyedMutex.makeUnsafe<string>()
-    const withWorkflowLock = (dagID: string) => workflowLocks.withLock(dagID)
+    const lockWitness = {} as WorkflowLock
+    const withWorkflowLock = (dagID: string) => <A, E, R>(body: (lock: WorkflowLock) => Effect.Effect<A, E, R>) =>
+      workflowLocks.withLock(dagID)(Effect.suspend(() => body(lockWitness)))
 
     const guardWorkflow = Effect.fn("Dag.guardWorkflow")(function* (dagID: string, target: WorkflowStatus) {
       const wf = yield* store.getWorkflow(dagID).pipe(Effect.orDie)
@@ -418,21 +431,24 @@ export const layer = Layer.effect(
       return dagID
     })
 
-    const pause = Effect.fn("Dag.pause")(function* (dagID: string) {
+    const pause = Effect.fn("Dag.pause")(function* (lock: WorkflowLock, dagID: string) {
       yield* guardWorkflow(dagID, WorkflowStatus.PAUSED)
       yield* events.publish(DagEvent.WorkflowPaused, { dagID: dagID as ID, timestamp: yield* DateTime.now })
     })
-    const resume = Effect.fn("Dag.resume")(function* (dagID: string) {
+    const resume = Effect.fn("Dag.resume")(function* (lock: WorkflowLock, dagID: string) {
       yield* guardWorkflow(dagID, WorkflowStatus.RUNNING)
       yield* events.publish(DagEvent.WorkflowResumed, { dagID: dagID as ID, timestamp: yield* DateTime.now })
     })
 
-    const step = Effect.fn("Dag.step")(function* (dagID: string) {
+    const step = Effect.fn("Dag.step")(function* (lock: WorkflowLock, dagID: string) {
       // Guard: only `running` → `stepping` is valid.
       yield* guardWorkflow(dagID, WorkflowStatus.STEPPING)
-      // Reject if a node is still in-flight (one-at-a-time stepping).
+      // Reject if a node is still in-flight (one-at-a-time stepping). Queued
+      // counts as in-flight: the node is durably admitted and will start once
+      // a permit frees (P0-2) — stepping alongside it would put two nodes in
+      // flight.
       const nodes = yield* store.getNodes(dagID)
-      const hasInFlight = nodes.some((n) => n.status === "running")
+      const hasInFlight = nodes.some((n) => n.status === "running" || n.status === "queued")
       if (hasInFlight) return yield* Effect.fail(new Error(`Node still in-flight: cannot step ${dagID}`))
       // Compute ready nodes using a transient WorkflowRuntime.
       const schedulingNodes = toSchedulingNodes(nodes)
@@ -451,7 +467,7 @@ export const layer = Layer.effect(
     // nodes always get NodeSkipped.  The projector's status guards make this
     // safe against races — a node that transitioned between the read and the
     // publish is silently left at its current status.
-    const terminateNonTerminalNodes = Effect.fnUntraced(function* (dagID: string, skipReason: "agent_complete" | "workflow_cancelled" | "workflow_failed", failReason: string, failRunning: boolean) {
+    const terminateNonTerminalNodes = Effect.fnUntraced(function* (lock: WorkflowLock, dagID: string, skipReason: "agent_complete" | "workflow_cancelled" | "workflow_failed", failReason: string, failRunning: boolean) {
       const nodes = yield* store.getNodes(dagID)
       for (const node of nodes) {
         if (isNodeTerminalStatus(node.status as NodeStatus)) continue
@@ -475,12 +491,12 @@ export const layer = Layer.effect(
       }
     })
 
-    const cancel = Effect.fn("Dag.cancel")(function* (dagID: string) {
+    const cancel = Effect.fn("Dag.cancel")(function* (lock: WorkflowLock, dagID: string) {
       yield* guardWorkflow(dagID, WorkflowStatus.CANCELLED)
       yield* events.publish(DagEvent.WorkflowCancelled, { dagID: dagID as ID, timestamp: yield* DateTime.now })
-      yield* terminateNonTerminalNodes(dagID, "workflow_cancelled", "workflow_cancelled", false)
+      yield* terminateNonTerminalNodes(lock, dagID, "workflow_cancelled", "workflow_cancelled", false)
     })
-    const complete = Effect.fn("Dag.complete")(function* (dagID: string) {
+    const complete = Effect.fn("Dag.complete")(function* (lock: WorkflowLock, dagID: string) {
       yield* guardWorkflow(dagID, WorkflowStatus.COMPLETED)
       const workflow = yield* store.getWorkflow(dagID).pipe(Effect.orDie)
       const config = workflow ? parseWorkflowConfig(workflow.config) : undefined
@@ -488,17 +504,18 @@ export const layer = Layer.effect(
         ? unresolvedReviewOutcomes(config, yield* store.getNodes(dagID))
         : []
       if (unresolvedReviews.length > 0) yield* Effect.fail(new ReviewGateError(dagID, unresolvedReviews))
-      yield* terminateNonTerminalNodes(dagID, "agent_complete", "", false)
+      yield* terminateNonTerminalNodes(lock, dagID, "agent_complete", "", false)
       yield* events.publish(DagEvent.WorkflowCompleted, { dagID: dagID as ID, durationMs: 0 as never, timestamp: yield* DateTime.now })
     })
 
-    const fail = Effect.fn("Dag.fail")(function* (dagID: string, reason: string) {
+    const fail = Effect.fn("Dag.fail")(function* (lock: WorkflowLock, dagID: string, reason: string) {
       yield* guardWorkflow(dagID, WorkflowStatus.FAILED)
       yield* events.publish(DagEvent.WorkflowFailed, { dagID: dagID as ID, reason, failedNodes: [] as never, timestamp: yield* DateTime.now })
-      yield* terminateNonTerminalNodes(dagID, "workflow_failed", reason, true)
+      yield* terminateNonTerminalNodes(lock, dagID, "workflow_failed", reason, true)
     })
 
     const _replan = Effect.fn("Dag._replan")(function* (
+      lock: WorkflowLock,
       dagID: string,
       fragment: { nodes: NodeConfig[] },
       reopenCompleted = false,
@@ -567,7 +584,7 @@ export const layer = Layer.effect(
       for (const id of plan.restart) {
         const existing = nodeById.get(id)
         if (existing && existing.replanAttempts >= maxReplanAttempts) {
-          yield* nodeFailed(dagID, id, "replan attempt ceiling exceeded", "exec_failed").pipe(Effect.ignore)
+          yield* nodeFailed(lock, dagID, id, "replan attempt ceiling exceeded", "exec_failed").pipe(Effect.ignore)
           ceilingBreached.push(id)
         }
       }
@@ -650,7 +667,7 @@ export const layer = Layer.effect(
       return { cancel: effectivePlan.cancel, restart: effectivePlan.restart, replace: effectivePlan.replace, add: effectivePlan.add, ignore: effectivePlan.ignore }
     })
 
-    const _extend = Effect.fn("Dag._extend")(function* (dagID: string, newNodes: NodeConfig[]) {
+    const _extend = Effect.fn("Dag._extend")(function* (lock: WorkflowLock, dagID: string, newNodes: NodeConfig[]) {
       const wf = yield* store.getWorkflow(dagID)
       if (!wf) return yield* Effect.fail(new Error(`Workflow not found: ${dagID}`))
       const nodes = yield* store.getNodes(dagID)
@@ -689,30 +706,30 @@ export const layer = Layer.effect(
       // terminal, as do public replan and non-additive terminal mutations.
       // Internal call to _replan — shares the caller's lock holding period,
       // does NOT re-acquire the per-workflow lock or go through Service.of.
-      return yield* _replan(dagID, { nodes: [...preserved, ...newNodes] }, reopenCompleted)
+      return yield* _replan(lock, dagID, { nodes: [...preserved, ...newNodes] }, reopenCompleted)
     })
 
-    const nodeQueued = Effect.fn("Dag.nodeQueued")(function* (dagID: string, nodeID: string, deadlineMs?: number) {
+    const nodeQueued = Effect.fn("Dag.nodeQueued")(function* (lock: WorkflowLock, dagID: string, nodeID: string, deadlineMs?: number) {
       yield* guardNode(dagID, nodeID, NodeStatus.QUEUED)
       yield* events.publish(DagEvent.NodeQueued, { dagID: dagID as ID, nodeID: nodeID as never, deadlineMs, timestamp: yield* DateTime.now })
     })
-    const nodeStarted = Effect.fn("Dag.nodeStarted")(function* (dagID: string, nodeID: string, childSessionID: string, deadlineMs?: number, wakeEligible?: boolean) {
+    const nodeStarted = Effect.fn("Dag.nodeStarted")(function* (lock: WorkflowLock, dagID: string, nodeID: string, childSessionID: string, deadlineMs?: number, wakeEligible?: boolean) {
       yield* guardNode(dagID, nodeID, NodeStatus.RUNNING)
       yield* events.publish(DagEvent.NodeStarted, { dagID: dagID as ID, nodeID: nodeID as never, childSessionID: childSessionID as never, deadlineMs, wakeEligible, timestamp: yield* DateTime.now })
     })
-    const nodeCompleted = Effect.fn("Dag.nodeCompleted")(function* (dagID: string, nodeID: string, output: unknown) {
+    const nodeCompleted = Effect.fn("Dag.nodeCompleted")(function* (lock: WorkflowLock, dagID: string, nodeID: string, output: unknown) {
       yield* guardNode(dagID, nodeID, NodeStatus.COMPLETED)
       yield* events.publish(DagEvent.NodeCompleted, { dagID: dagID as ID, nodeID: nodeID as never, output, durationMs: 0 as never, timestamp: yield* DateTime.now })
     })
-    const nodeFailed = Effect.fn("Dag.nodeFailed")(function* (dagID: string, nodeID: string, reason: string, trigger: string) {
+    const nodeFailed = Effect.fn("Dag.nodeFailed")(function* (lock: WorkflowLock, dagID: string, nodeID: string, reason: string, trigger: string) {
       yield* guardNode(dagID, nodeID, NodeStatus.FAILED)
       yield* events.publish(DagEvent.NodeFailed, { dagID: dagID as ID, nodeID: nodeID as never, reason, trigger: trigger as never, timestamp: yield* DateTime.now })
     })
-    const nodeSkipped = Effect.fn("Dag.nodeSkipped")(function* (dagID: string, nodeID: string, reason: string) {
+    const nodeSkipped = Effect.fn("Dag.nodeSkipped")(function* (lock: WorkflowLock, dagID: string, nodeID: string, reason: string) {
       yield* guardNode(dagID, nodeID, NodeStatus.SKIPPED)
       yield* events.publish(DagEvent.NodeSkipped, { dagID: dagID as ID, nodeID: nodeID as never, reason: reason as never, timestamp: yield* DateTime.now })
     })
-    const nodeCancelled = Effect.fn("Dag.nodeCancelled")(function* (dagID: string, nodeID: string) {
+    const nodeCancelled = Effect.fn("Dag.nodeCancelled")(function* (lock: WorkflowLock, dagID: string, nodeID: string) {
       // Cancellation is valid from any non-terminal status; no single target
       // NodeStatus is a legal transition from all of pending/queued/running/paused
       // (e.g. PAUSED -> SKIPPED is not in the table), so guard on terminality.
@@ -728,7 +745,7 @@ export const layer = Layer.effect(
         timestamp: yield* DateTime.now,
       })
     })
-    const nodeRestarted = Effect.fn("Dag.nodeRestarted")(function* (dagID: string, nodeID: string, childSessionID: string) {
+    const nodeRestarted = Effect.fn("Dag.nodeRestarted")(function* (lock: WorkflowLock, dagID: string, nodeID: string, childSessionID: string) {
       yield* guardNode(dagID, nodeID, NodeStatus.PENDING)
       yield* events.publish(DagEvent.NodeRestarted, { dagID: dagID as ID, nodeID: nodeID as never, childSessionID: childSessionID as never, timestamp: yield* DateTime.now })
     })
@@ -736,22 +753,22 @@ export const layer = Layer.effect(
     return Service.of({
       create,
       store,
-      pause: (dagID) => withWorkflowLock(dagID)(pause(dagID)),
-      resume: (dagID) => withWorkflowLock(dagID)(resume(dagID)),
-      step: (dagID) => withWorkflowLock(dagID)(step(dagID)),
-      cancel: (dagID) => withWorkflowLock(dagID)(cancel(dagID)),
-      complete: (dagID) => withWorkflowLock(dagID)(complete(dagID)),
-      fail: (dagID, reason) => withWorkflowLock(dagID)(fail(dagID, reason)),
-      replan: (dagID, fragment) => withWorkflowLock(dagID)(_replan(dagID, fragment)),
-      extend: (dagID, nodes) => withWorkflowLock(dagID)(_extend(dagID, nodes)),
-      nodeQueued: (dagID, nodeID, deadlineMs) => withWorkflowLock(dagID)(nodeQueued(dagID, nodeID, deadlineMs)),
+      pause: (dagID) => withWorkflowLock(dagID)((lock) => pause(lock, dagID)),
+      resume: (dagID) => withWorkflowLock(dagID)((lock) => resume(lock, dagID)),
+      step: (dagID) => withWorkflowLock(dagID)((lock) => step(lock, dagID)),
+      cancel: (dagID) => withWorkflowLock(dagID)((lock) => cancel(lock, dagID)),
+      complete: (dagID) => withWorkflowLock(dagID)((lock) => complete(lock, dagID)),
+      fail: (dagID, reason) => withWorkflowLock(dagID)((lock) => fail(lock, dagID, reason)),
+      replan: (dagID, fragment) => withWorkflowLock(dagID)((lock) => _replan(lock, dagID, fragment)),
+      extend: (dagID, nodes) => withWorkflowLock(dagID)((lock) => _extend(lock, dagID, nodes)),
+      nodeQueued: (dagID, nodeID, deadlineMs) => withWorkflowLock(dagID)((lock) => nodeQueued(lock, dagID, nodeID, deadlineMs)),
       nodeStarted: (dagID, nodeID, childSessionID, deadlineMs, wakeEligible) =>
-        withWorkflowLock(dagID)(nodeStarted(dagID, nodeID, childSessionID, deadlineMs, wakeEligible)),
-      nodeCompleted: (dagID, nodeID, output) => withWorkflowLock(dagID)(nodeCompleted(dagID, nodeID, output)),
-      nodeFailed: (dagID, nodeID, reason, trigger) => withWorkflowLock(dagID)(nodeFailed(dagID, nodeID, reason, trigger)),
-      nodeSkipped: (dagID, nodeID, reason) => withWorkflowLock(dagID)(nodeSkipped(dagID, nodeID, reason)),
-      nodeCancelled: (dagID, nodeID) => withWorkflowLock(dagID)(nodeCancelled(dagID, nodeID)),
-      nodeRestarted: (dagID, nodeID, childSessionID) => withWorkflowLock(dagID)(nodeRestarted(dagID, nodeID, childSessionID)),
+        withWorkflowLock(dagID)((lock) => nodeStarted(lock, dagID, nodeID, childSessionID, deadlineMs, wakeEligible)),
+      nodeCompleted: (dagID, nodeID, output) => withWorkflowLock(dagID)((lock) => nodeCompleted(lock, dagID, nodeID, output)),
+      nodeFailed: (dagID, nodeID, reason, trigger) => withWorkflowLock(dagID)((lock) => nodeFailed(lock, dagID, nodeID, reason, trigger)),
+      nodeSkipped: (dagID, nodeID, reason) => withWorkflowLock(dagID)((lock) => nodeSkipped(lock, dagID, nodeID, reason)),
+      nodeCancelled: (dagID, nodeID) => withWorkflowLock(dagID)((lock) => nodeCancelled(lock, dagID, nodeID)),
+      nodeRestarted: (dagID, nodeID, childSessionID) => withWorkflowLock(dagID)((lock) => nodeRestarted(lock, dagID, nodeID, childSessionID)),
     })
   }),
 )
