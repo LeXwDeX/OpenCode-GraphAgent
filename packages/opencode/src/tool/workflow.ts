@@ -3,6 +3,7 @@ import { CommandPlugin } from "@opencode-ai/core/plugin/command"
 import { Effect, Schema } from "effect"
 import { Dag } from "@/dag/dag"
 import { DagConfig } from "@/dag/config"
+import { DagWorkflows } from "@/dag/workflows"
 import { DagModel } from "@/dag/model"
 import { Agent } from "@/agent/agent"
 import { Question } from "@/question"
@@ -82,7 +83,8 @@ const WorkflowGraphSchema = Schema.Struct({
   nodes: Schema.Array(NodeSchema).annotate({ description: "Node declarations" }),
 })
 
-const StartSpec = Schema.Struct({
+// Exported so the committed workflow library can be validated in tests.
+export const StartSpec = Schema.Struct({
   title: Schema.optional(Schema.String),
   mode: Schema.optional(ExecutionMode),
   admission: Schema.optional(AdmissionInput),
@@ -102,8 +104,8 @@ const decodeExtendSpec = Schema.decodeUnknownEffect(ExtendSpec)
 const decodeReplanSpec = Schema.decodeUnknownEffect(ReplanSpec)
 
 export const Parameters = Schema.Struct({
-  action: Schema.Literals(["start", "extend", "control", "status"]).annotate({ description: "start: create workflow; extend: add nodes; control: pause/resume/cancel/replan/step/complete; status: inspect durable workflow and node state" }),
-  spec_path: Schema.optional(Schema.String).annotate({ description: "(start/extend/control replan) Path to a YAML workflow spec. Relative paths resolve from the session directory" }),
+  action: Schema.Literals(["start", "extend", "control", "status", "list"]).annotate({ description: "start: create workflow; extend: add nodes; control: pause/resume/cancel/replan/step/complete; status: inspect durable workflow and node state; list: show saved workflow specs in the library (not running workflows)" }),
+  spec_path: Schema.optional(Schema.String).annotate({ description: '(start/extend/control replan) A saved workflow name from the library (e.g. "code-review"), or a path to a YAML workflow spec. Relative paths resolve from the session directory' }),
   session_id: Schema.optional(Schema.String).annotate({ description: "(start) Parent session ID" }),
   project_id: Schema.optional(Schema.String).annotate({ description: "(start) Optional Project ID; must match the parent session project" }),
   workflow_id: Schema.optional(Schema.String).annotate({ description: "(extend/control/status) Target workflow ID" }),
@@ -134,6 +136,31 @@ export const WorkflowTool = Tool.define<
       execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context<Metadata>) =>
         Effect.gen(function* () {
           switch (params.action) {
+            case "list": {
+              const session = yield* sessions.get(SessionID.make(ctx.sessionID)).pipe(Effect.orDie)
+              const entries = yield* DagWorkflows.list(session.directory)
+              if (entries.length === 0) {
+                return {
+                  title: "No saved workflows",
+                  output: `The workflow library is empty. Searched ${DagWorkflows.searchPaths(session.directory).join(" and ")}. Save a spec as <name>.yaml in one of those directories to start it later by name.`,
+                  metadata: {},
+                }
+              }
+              return {
+                title: `${entries.length} saved workflow${entries.length > 1 ? "s" : ""}`,
+                output: entries
+                  .map((entry) =>
+                    [
+                      `${entry.name} [${entry.scope}]`,
+                      entry.title ? ` — ${entry.title}` : "",
+                      entry.nodes === undefined ? "" : ` (${entry.nodes} nodes)`,
+                      `\n  ${entry.path}`,
+                    ].join(""),
+                  )
+                  .join("\n"),
+                metadata: {},
+              }
+            }
             case "status": {
               if (!params.workflow_id) return yield* Effect.die(new Error("status requires 'workflow_id'"))
               const workflow = yield* dag.store.getWorkflow(params.workflow_id).pipe(Effect.orDie)
@@ -324,18 +351,10 @@ function readWorkflowSpec(specPath: string | undefined, directory: string, ctx: 
   return Effect.gen(function* () {
     if (!specPath) {
       return yield* Effect.fail(new Error(
-        "Workflow configuration requires 'spec_path'. Write the YAML spec to a file, then retry with its path.",
+        `Workflow configuration requires 'spec_path'. Pass a saved workflow name (workflow(action: "list") shows them) or write the YAML spec to a file and retry with its path.`,
       ))
     }
-    const filepath = path.isAbsolute(specPath) ? path.normalize(specPath) : path.resolve(directory, specPath)
-    if (![".yaml", ".yml"].includes(path.extname(filepath).toLowerCase())) {
-      return yield* Effect.fail(new Error(`Workflow spec must be a .yaml or .yml file: ${filepath}`))
-    }
-    if (!FSUtil.contains(directory, filepath)) {
-      yield* assertExternalDirectoryEffect(ctx, filepath, {
-        bypass: Boolean(ctx.extra?.["bypassCwdCheck"]),
-      })
-    }
+    const filepath = yield* resolveSpecPath(specPath, directory, ctx)
 
     const file = Bun.file(filepath)
     if (!(yield* Effect.promise(() => file.exists()))) {
@@ -355,6 +374,33 @@ function readWorkflowSpec(specPath: string | undefined, directory: string, ctx: 
       catch: (error) => workflowSpecParseError(filepath, error),
     })
     return { path: filepath, value }
+  })
+}
+
+function resolveSpecPath(specPath: string, directory: string, ctx: Tool.Context) {
+  return Effect.gen(function* () {
+    // A bare name addresses the workflow library. Its two scopes are curated
+    // assets the user placed under `.opencode/` or the config dir — the same
+    // trust level as dag.jsonc — so a resolved name needs no
+    // external-directory prompt even when the global scope lands outside the
+    // session directory. Arbitrary paths below keep the prompt.
+    if (DagWorkflows.isName(specPath)) {
+      const entry = yield* DagWorkflows.resolve(specPath, directory)
+      if (entry) return entry.path
+      return yield* Effect.fail(new Error(
+        `Saved workflow not found: "${specPath}". Searched ${DagWorkflows.searchPaths(directory).join(" and ")}. Run workflow(action: "list") to see what is available, or pass a path to a .yaml spec file.`,
+      ))
+    }
+    const filepath = path.isAbsolute(specPath) ? path.normalize(specPath) : path.resolve(directory, specPath)
+    if (![".yaml", ".yml"].includes(path.extname(filepath).toLowerCase())) {
+      return yield* Effect.fail(new Error(`Workflow spec must be a .yaml or .yml file: ${filepath}`))
+    }
+    if (!FSUtil.contains(directory, filepath)) {
+      yield* assertExternalDirectoryEffect(ctx, filepath, {
+        bypass: Boolean(ctx.extra?.["bypassCwdCheck"]),
+      })
+    }
+    return filepath
   })
 }
 
