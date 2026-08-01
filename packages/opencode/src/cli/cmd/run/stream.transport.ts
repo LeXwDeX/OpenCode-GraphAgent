@@ -66,6 +66,13 @@ type Trace = {
 
 const StreamClosed = undefined as never
 
+// Consecutive 250ms ticks of idle before a turn that was armed but never
+// went live is reported as a failure. 40 ticks = 10 s. The margin covers
+// cold-start / IO-loaded paths where the drain takes a moment to flip the
+// session status from idle to busy after prompt admission; anything longer
+// than this is almost certainly a drain that will never start.
+const IDLE_ESCAPE_TICKS = 40
+
 type StreamInput = {
   sdk: OpencodeClient
   directory?: string
@@ -890,15 +897,28 @@ function createLayer(input: StreamInput) {
           // event arrives (promptAsync is durable admission — the session can
           // still be idle right after the HTTP call returns, so setting live
           // eagerly would let the completion gate fire before the drain
-          // starts). If the server stays idle with no events long past the
-          // admission window, no drain is coming; escape instead of hanging
-          // the turn forever.
+          // starts). Reaching the streak below means the server accepted the
+          // prompt yet produced no event of any kind and never left idle, so
+          // no drain is coming.
           let idleStreak = 0
           while (state.wait === next && !signal.aborted && !input.footer.isClosed && !closed) {
             yield* Effect.sleep("250 millis")
             if (next.armed && !next.live) {
               idleStreak = (yield* idle(false)) ? idleStreak + 1 : 0
-              if (idleStreak >= 8) next.live = true
+              if (idleStreak >= IDLE_ESCAPE_TICKS) {
+                // Resolving the wait here would report a turn that never ran as
+                // an ordinary empty success — a silent wrong answer, worse than
+                // the hang this escape exists to break. Fail only this turn;
+                // state.fault would poison every later prompt on the transport.
+                state.wait = undefined
+                yield* Deferred.fail(
+                  next.done,
+                  new Error(
+                    `The server accepted the prompt but the session reported no activity for ${(IDLE_ESCAPE_TICKS * 250) / 1000}s, so the run never started. Check the opencode server log.`,
+                  ),
+                ).pipe(Effect.ignore)
+                return
+              }
             }
             yield* complete(next, false)
           }

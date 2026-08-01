@@ -154,10 +154,10 @@ describe("DagWorkflows.list", () => {
     expect(entries.map((entry) => entry.name)).toEqual(["real"])
   })
 
-  it("falls back to config.name when the spec declares no title", async () => {
+  it("leaves title undefined when the spec declares none", async () => {
     await writeProject("untitled.yaml", "config:\n  name: from-config\n  nodes: []")
     const entries = await Effect.runPromise(DagWorkflows.list(projectDir))
-    expect(entries[0]?.title).toBe("from-config")
+    expect(entries[0]?.title).toBeUndefined()
     expect(entries[0]?.nodes).toBe(0)
   })
 })

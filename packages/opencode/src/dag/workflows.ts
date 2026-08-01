@@ -120,10 +120,6 @@ async function describe(file: string): Promise<{ title?: string; nodes?: number 
   if (!isRecord(parsed)) return {}
   const config = isRecord(parsed["config"]) ? parsed["config"] : undefined
   const title = typeof parsed["title"] === "string" ? parsed["title"] : undefined
-  const name = config && typeof config["name"] === "string" ? config["name"] : undefined
   const nodes = config && Array.isArray(config["nodes"]) ? config["nodes"].length : undefined
-  return {
-    ...(title ?? name ? { title: title ?? name } : {}),
-    ...(nodes === undefined ? {} : { nodes }),
-  }
+  return { ...(title ? { title } : {}), ...(nodes === undefined ? {} : { nodes }) }
 }
