@@ -15,6 +15,20 @@ team.**
 
 ---
 
+## Graph engineering, before it had a name
+
+GraphAgent treats a graph as an **executable, durable, inspectable contract** — not a diagram of agents and not a prompt chain with arrows added afterward. The public history landed the first complete DAG-engine commit on **2026-07-02**. The paper [*What makes prompts a graph: necessary and sufficient conditions for prompt graph engineering*](https://arxiv.org/abs/2607.27578), which formalized explicit structure, prompt/topology separation, executable semantics, and the graph as a first-class artifact, appeared on **2026-07-30**. The implementation was already running four weeks before the vocabulary caught up.
+
+Our graph-engineering doctrine is operational:
+
+1. **Edges must carry work.** A dependency exists only when the downstream node consumes the upstream artifact. Delete ceremonial sequencing and run truly independent work in parallel.
+2. **A template is a reference topology, not a cage.** The parent agent may expand or prune lanes to match the task, but every prune records its reason and replacement coverage.
+3. **Prediction, verification, and merge have different owners.** A `reasoner` simulates likely execution paths, a fresh-context reviewer checks the preceding local wave, and exactly one arbiter owns the verdict. These gates cannot be pruned.
+4. **Iteration is a bounded local graph rewrite.** `PASS` finalizes, `LOOP` adds a new correction/review wave through pause → replan → resume, and `BLOCKED` stops with evidence. Completed nodes never form a hidden cycle.
+5. **Reality outranks self-report.** State is event-sourced, recovery follows durable evidence, tests and code settle claims, and humans retain pause/step/cancel/replan authority where mistakes are expensive.
+
+The repository ships three opinionated reference graphs: design decision deep-dive, parallel project delivery, and deep review of an existing subsystem. `/dag-flow` selects the closest shape from the request, injects the current task, and derives the actual DAG while preserving its fail-closed gates. See the [Graph Engineering workflow catalog](./.opencode/workflows/GRAPH-ENGINEERING.md). The designs adapt useful patterns from the MIT-licensed [graph-engineering](https://github.com/codejunkie99/graph-engineering) project to this runtime's stronger execution, recovery, and control contracts.
+
 ## Why a DAG
 
 A single agent loop struggles once a task has staged dependencies, parallelizable independent work, or a quality gate in the middle. Four judgments shaped this engine:
@@ -234,7 +248,8 @@ Exact file boundaries are listed in [`NOTICE`](./NOTICE). The AGPL covers the DA
 ## Docs
 
 - [Saved workflow authoring guide](./packages/core/src/plugin/skill/create-dag-workflow.md) — the `create-dag-workflow` skill body
-- [`.opencode/workflows/change-review.yaml`](./.opencode/workflows/change-review.yaml) — a working saved workflow, startable as `change-review`
+- [Graph Engineering workflow catalog](./.opencode/workflows/GRAPH-ENGINEERING.md) and [source research](./docs/graph-engineering-template-research.md) — reusable shapes, evidence, and migration choices
+- [`.opencode/workflows/change-review.yaml`](./.opencode/workflows/change-review.yaml) — compact change review, startable as `change-review`
 - [`docs/harness-dag.md`](./docs/harness-dag.md) — deep-mode admission & review lifecycle
 - [`.opencode/dag-prompts`](./.opencode/dag-prompts) — built-in node prompt templates
 - [`AGENTS.md`](./AGENTS.md) — contribution & development guide

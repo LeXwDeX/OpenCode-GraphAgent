@@ -12,6 +12,20 @@ GraphAgent 是本项目对外的产品名；仓库以 **OpenCode-GraphAgent** �
 
 ---
 
+## 「Graph Engineering」这个名字出现前，GraphAgent 已经在跑
+
+在 GraphAgent 里，graph 是一份**可执行、可持久化、可观测、可控制的契约**。节点干活，边传产物，运行时负责调度和恢复。公开 Git 历史显示，第一版完整 DAG 引擎在 **2026-07-02** 已经提交；论文 [*What makes prompts a graph: necessary and sufficient conditions for prompt graph engineering*](https://arxiv.org/abs/2607.27578) 到 **2026-07-30** 才把显式结构、prompt/拓扑分离、可执行语义和 graph 一等制品化归纳出来。术语晚了四周，工具没有等它。
+
+这套东西落到了五条运行规则里：
+
+1. **每条边都要有用。** 如果下游不读上游产物，这条依赖就该删。真正独立的工作直接并行。
+2. **模板是参考拓扑，不是固定脚本。** 主 Agent 可以按任务扩展或剪枝，但每次剪枝都必须写明理由和替代覆盖证据。
+3. **推演、复审、裁决分开做。** `reasoner` 模拟潜在执行路径，fresh-context reviewer 复审前一个局部波次，最后由唯一 arbiter 给出裁决；这些门禁不可剪掉。
+4. **迭代是有界的局部改图。** `PASS` 才能定稿，`LOOP` 通过 pause → replan → resume 增加新的修正与复审波次，`BLOCKED` 带证据停止；终态节点不会被伪装成环。
+5. **代码和测试说了算。** 状态变更写入事件，崩溃恢复只认持久化证据。到了代价高的边界，人可以 pause、step、cancel 或 replan。
+
+仓库已经附带三类强约束参考图：设计决策深挖、并行项目落地、已完成子系统深度 Review。`/dag-flow` 会先按需求选择最接近的中高规模样板，注入本次任务，再派生实际 DAG；可以扩展和剪枝，但不能绕过 fail-closed 门禁。入口见 [Graph Engineering 工作流目录](./.opencode/workflows/GRAPH-ENGINEERING.md)。这些 YAML 把 MIT 许可的 [graph-engineering](https://github.com/codejunkie99/graph-engineering) 项目里有价值的模式，适配到了本项目更严格的执行、恢复和控制契约上。
+
 ## 为什么是 DAG
 
 任务一旦涉及分阶段依赖、可并行的独立工作，或者中间需要一道质量门禁，单智能体循环就不太够用了。这个引擎的设计基于四个判断：
@@ -208,7 +222,8 @@ bun dev serve        # headless API 服务（端口 4096）
 ## 文档
 
 - [存盘工作流编写指南](./packages/core/src/plugin/skill/create-dag-workflow.md) —— `create-dag-workflow` skill 正文
-- [`.opencode/workflows/change-review.yaml`](./.opencode/workflows/change-review.yaml) —— 一个能用的存盘工作流，按 `change-review` 启动
+- [Graph Engineering 工作流目录](./.opencode/workflows/GRAPH-ENGINEERING.md)和[来源调研](./docs/graph-engineering-template-research.md) —— 可复用样板、证据与迁移取舍
+- [`.opencode/workflows/change-review.yaml`](./.opencode/workflows/change-review.yaml) —— 轻量变更审查图，按 `change-review` 启动
 - [`docs/harness-dag.md`](./docs/harness-dag.md) —— deep 模式准入与审查生命周期
 - [`.opencode/dag-prompts`](./.opencode/dag-prompts) —— 内置节点 prompt 模板
 - [`AGENTS.md`](./AGENTS.md) —— 贡献与开发指南

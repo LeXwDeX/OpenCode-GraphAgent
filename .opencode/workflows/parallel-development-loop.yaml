@@ -1,0 +1,282 @@
+# Medium/high-scale reference topology. The parent agent derives the real module
+# fan-out and may expand or prune non-protected workers. It must preserve both
+# review gates, verification, one final arbiter, and the final PASS condition.
+# Every prune requires prune_reason + replacement_coverage. LOOP adds a new local
+# correction/review wave through replan; it never creates a graph cycle.
+title: "Parallel development: module wave → local audit → wiring → reasoning → parallel review"
+config:
+  name: parallel-development-loop
+  max_concurrency: 5
+  max_node_replan_attempts: 3
+  max_total_nodes: 32
+  node_defaults:
+    required: false
+    report_to_parent: false
+    worker_config:
+      timeout_ms: 900000
+  nodes:
+    - id: freeze-design
+      name: "Freeze scope, modules, write sets, and acceptance"
+      worker_type: plan
+      depends_on: []
+      required: true
+      output_schema:
+        type: object
+        required: [scope, modules, write_sets, acceptance_criteria, system_logic]
+        properties:
+          scope: { type: string }
+          modules: { type: array, items: { type: object } }
+          write_sets: { type: array, items: { type: object } }
+          acceptance_criteria: { type: array, items: { type: string } }
+          system_logic: { type: string }
+      prompt_template:
+        inline: |
+          Turn the approved design into an implementation contract. Define module
+          boundaries, real dependency edges, disjoint write sets, interface contracts,
+          integration order, executable acceptance criteria, and the system logic that
+          later reasoning must simulate.
+
+          This is a reference graph: the parent may replace the three baseline module
+          workers with the actual fan-out. Prune only irrelevant workers and record a
+          prune_reason plus replacement_coverage. If write sets overlap, serialize or
+          assign one merge owner instead of pretending the work is parallel.
+
+    - id: develop-core
+      name: "Develop core/domain module slice"
+      worker_type: build
+      depends_on: [freeze-design]
+      prompt_template:
+        inline: |
+          Implement only the assigned core/domain slice and its declared write set.
+          Do not edit another worker's files. If the upstream contract does not provide
+          a disjoint write set, stop and report BLOCKED. Return changed files, checks
+          run, unresolved integration needs, and evidence for each acceptance criterion.
+
+    - id: develop-adapters
+      name: "Develop adapters/integration module slice"
+      worker_type: build
+      depends_on: [freeze-design]
+      prompt_template:
+        inline: |
+          Implement only the assigned adapter/integration slice and its declared write
+          set. Respect the frozen interfaces. If the write set overlaps another worker,
+          stop and report BLOCKED. Return changed files, checks run, unresolved wiring
+          needs, and acceptance evidence.
+
+    - id: develop-tests
+      name: "Develop test and verification slice"
+      worker_type: build
+      depends_on: [freeze-design]
+      prompt_template:
+        inline: |
+          Implement the independent test/verification slice from observable contracts,
+          not from copied implementation logic. Stay inside the declared write set.
+          Return changed files, commands, results, missing fixtures, and acceptance
+          criteria that still lack executable evidence.
+
+    - id: audit-module-wave
+      name: "Fresh audit of the parallel module wave"
+      worker_type: general
+      depends_on: [develop-core, develop-adapters, develop-tests]
+      required: true
+      report_to_parent: true
+      output_schema:
+        type: object
+        required: [verdict, reason, evidence, loop_scope, stop_reason, next_action, prune_decisions]
+        properties:
+          verdict:
+            type: string
+            enum: [PASS, LOOP, BLOCKED]
+          reason: { type: string }
+          evidence: { type: array, items: { type: string } }
+          loop_scope: { type: array, items: { type: string } }
+          stop_reason:
+            type: string
+            enum: [goal_met, correction_required, evidence_missing, no_progress, round_cap, budget_cap]
+          next_action:
+            type: string
+            enum: [wire, replan, stop]
+          prune_decisions:
+            type: array
+            items:
+              type: object
+              required: [node, prune_reason, replacement_coverage]
+              properties:
+                node: { type: string }
+                prune_reason: { type: string }
+                replacement_coverage: { type: string }
+      prompt_template:
+        inline: |
+          Review only the immediately preceding parallel module wave. Check actual
+          changed files, write-set ownership, interface compatibility, acceptance
+          coverage, missing outputs, and claimed command results.
+
+          PASS requires evidence for every material acceptance criterion and no write
+          collision. LOOP means a bounded subset must be recreated as new correction
+          nodes followed by a new fresh audit. BLOCKED means evidence, ownership, or a
+          required decision is unavailable. List the minimal loop_scope and exact
+          reason. Every prune requires prune_reason and replacement_coverage; missing
+          either forbids PASS.
+
+          Parent disposal contract: PASS → wiring; LOOP → pause/replan/resume only the
+          affected module slice plus a new audit; BLOCKED → stop. Never continue to
+          wiring from a LOOP or BLOCKED result.
+
+    - id: wire-modules
+      name: "Wire and reconcile module boundaries"
+      worker_type: build
+      depends_on: [develop-core, develop-adapters, develop-tests, audit-module-wave]
+      condition: 'audit-module-wave.output.verdict == "PASS"'
+      required: true
+      output_schema:
+        type: object
+        required: [summary, changed_files, diff, fingerprint, system_logic]
+        properties:
+          summary: { type: string }
+          changed_files: { type: array, items: { type: string } }
+          diff: { type: string }
+          fingerprint: { type: string }
+          system_logic: { type: string }
+      prompt_template:
+        inline: |
+          You are the single integration owner. Reconcile interfaces and wire the
+          accepted module outputs. Do not redesign unrelated modules. Run the narrowest
+          relevant integration checks, then return the actual final diff, changed file
+          list, a reproducible diff fingerprint, and a system-logic description of the
+          resulting execution paths for the reasoner.
+
+    - id: simulate-wired-system
+      name: "Reason through the wired execution paths"
+      worker_type: reasoner
+      depends_on: [wire-modules]
+      required: true
+      prompt_template:
+        inline: |
+          reason_target: system_logic
+          subject: Use the upstream system-logic description of the wired implementation.
+          goal: Predict contradictions, unreachable states, boundary gaps, partial-failure behavior, concurrency hazards, and ownership conflicts before final review.
+          known_constraints: Predictions are hypotheses, not code evidence. Cite the upstream path or assumption behind every finding.
+          focus_dimensions: [Internal Contradiction, Boundary / Edge Case, Coverage Hole, State / Flow Consistency, Responsibility / Ownership]
+
+    - id: verify-wired-system
+      name: "Run deterministic project verification"
+      worker_type: general
+      depends_on: [wire-modules]
+      required: true
+      output_schema:
+        type: object
+        required: [verdict, commands, evidence, failures]
+        properties:
+          verdict:
+            type: string
+            enum: [PASS, FAIL, BLOCKED]
+          commands: { type: array, items: { type: string } }
+          evidence: { type: array, items: { type: string } }
+          failures: { type: array, items: { type: string } }
+      prompt_template:
+        inline: |
+          Inspect repository instructions and run the smallest complete verification
+          set for the wired change: generated-artifact checks, typecheck, unit or
+          integration tests, and contract checks when applicable. Report exact commands
+          and results. Missing, stale, or unverifiable evidence is BLOCKED, never PASS.
+
+    - id: review-logic
+      name: "Fresh review: logic and failure paths"
+      worker_type: general
+      depends_on: [wire-modules, simulate-wired-system, verify-wired-system]
+      prompt_template:
+        inline: |
+          Independently review the actual wired diff for logic correctness, state
+          transitions, boundaries, concurrency, recovery, and failure behavior. Treat
+          reasoner findings only as hypotheses; confirm or refute each against code,
+          diff, or reproducible verification evidence. Return evidence-backed findings,
+          unverified claims, and ACCEPT or REJECT.
+
+    - id: review-architecture
+      name: "Fresh review: architecture and wiring"
+      worker_type: general
+      depends_on: [wire-modules, simulate-wired-system, verify-wired-system]
+      prompt_template:
+        inline: |
+          Independently review the actual wired diff for module boundaries, dependency
+          direction, ownership, interface drift, integration completeness, and repository
+          architecture rules. Every finding needs file:line or command evidence. Return
+          unverified claims separately and conclude ACCEPT or REJECT.
+
+    - id: review-tests
+      name: "Fresh review: acceptance and regression evidence"
+      worker_type: general
+      depends_on: [wire-modules, simulate-wired-system, verify-wired-system]
+      prompt_template:
+        inline: |
+          Independently map every frozen acceptance criterion and material execution
+          path to a test, check, or explicit missing-evidence finding. Inspect whether
+          tests exercise the implementation rather than duplicate it. Return the
+          coverage matrix, evidence-backed findings, unverified claims, and ACCEPT or
+          REJECT.
+
+    - id: arbitrate-final-review
+      name: "Arbitrate the parallel review wave"
+      worker_type: general
+      depends_on: [simulate-wired-system, verify-wired-system, review-logic, review-architecture, review-tests]
+      required: true
+      report_to_parent: true
+      output_schema:
+        type: object
+        required: [verdict, reason, evidence, findings, loop_scope, stop_reason, next_action, prune_decisions]
+        properties:
+          verdict:
+            type: string
+            enum: [PASS, LOOP, BLOCKED]
+          reason: { type: string }
+          evidence: { type: array, items: { type: string } }
+          findings: { type: array, items: { type: object } }
+          loop_scope: { type: array, items: { type: string } }
+          stop_reason:
+            type: string
+            enum: [goal_met, correction_required, evidence_missing, no_progress, round_cap, budget_cap]
+          next_action:
+            type: string
+            enum: [finalize, replan, stop]
+          prune_decisions:
+            type: array
+            items:
+              type: object
+              required: [node, prune_reason, replacement_coverage]
+              properties:
+                node: { type: string }
+                prune_reason: { type: string }
+                replacement_coverage: { type: string }
+      prompt_template:
+        inline: |
+          Act as the only merge owner for the final review wave. Deduplicate findings,
+          resolve reviewer conflicts against actual evidence, and audit completeness.
+
+          Fail closed:
+          - PASS requires deterministic verification PASS, no unresolved material
+            finding, and evidence for every acceptance criterion.
+          - LOOP requires a bounded correction scope. Name only the implementation,
+            wiring, reasoning, verification, or review nodes that must be recreated.
+          - BLOCKED is mandatory when evidence is missing, reviewers cannot resolve a
+            material claim, ownership is unclear, or a graph ceiling is reached.
+          - A reasoner prediction is never evidence by itself.
+          - Every prune requires prune_reason and replacement_coverage; missing either
+            forbids PASS.
+
+          Parent disposal contract: PASS → finalize; LOOP → pause/replan/resume a new
+          local correction + reasoning + review wave; BLOCKED → stop with reasons.
+          Never reinterpret LOOP as advisory acceptance.
+
+    - id: finalize-delivery
+      name: "Finalize reviewed delivery"
+      worker_type: general
+      depends_on: [wire-modules, verify-wired-system, arbitrate-final-review]
+      condition: 'arbitrate-final-review.output.verdict == "PASS"'
+      required: true
+      report_to_parent: true
+      prompt_template:
+        inline: |
+          Produce the final delivery summary from the accepted implementation and
+          verification evidence: changed modules, commands and results, acceptance
+          coverage, residual risks, and rollback or follow-up notes. Do not claim work
+          that is not present in the upstream evidence.

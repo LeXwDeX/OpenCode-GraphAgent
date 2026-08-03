@@ -89,12 +89,14 @@ reports the saved names with their scope, title, and node count; a name that
 resolves nowhere fails with the directories that were searched.
 
 Prefer a saved workflow when the user names a recurring procedure ("run the
-code review workflow"): starting it is one call, and its graph has already been
-reviewed. Compose a fresh spec file when the task is one-off or when the saved
-graph does not fit — a path-shaped `spec_path` keeps the original
-session-relative behavior. To turn a working one-off spec into a saved
-workflow, move the file into one of the two directories under a descriptive
-name.
+code review workflow") and the saved target/inputs already match: starting it
+is one call, and its graph has already been reviewed. `/dag-flow` may also read
+a saved workflow as a topology reference, then derive a one-off spec that
+injects the current task, retargets module lanes, and records additions/prunes.
+Compose a fresh spec file when the task is one-off or no reference fits — a
+path-shaped `spec_path` keeps the original session-relative behavior. To turn a
+working one-off spec into a saved workflow, move the file into one of the two
+directories under a descriptive name.
 
 ## Orchestration Lifecycle
 
@@ -522,4 +524,4 @@ file-root `nodes` array, then call
 
 - No `node_complete` action — completion is automatic
 - No `history` action — inspect a known workflow with `status`; browsing running workflows remains TUI-only (`list` shows saved specs, not running workflows)
-- No topology templates — templates are prompt fragments only; you design the graph
+- No runtime-side magical topology selection — `/dag-flow` selects and adapts saved reference graphs in the parent agent; the workflow runtime executes only the resulting YAML
