@@ -27,7 +27,7 @@ Our graph-engineering doctrine is operational:
 4. **Iteration is a bounded local graph rewrite.** `PASS` finalizes, `LOOP` adds a new correction/review wave through pause → replan → resume, and `BLOCKED` stops with evidence. Completed nodes never form a hidden cycle.
 5. **Reality outranks self-report.** State is event-sourced, recovery follows durable evidence, tests and code settle claims, and humans retain pause/step/cancel/replan authority where mistakes are expensive.
 
-The repository ships three opinionated reference graphs: design decision deep-dive, parallel project delivery, and deep review of an existing subsystem. `/dag-flow` selects the closest shape from the request, injects the current task, and derives the actual DAG while preserving its fail-closed gates. See the [Graph Engineering workflow catalog](./.opencode/workflows/GRAPH-ENGINEERING.md). The designs adapt useful patterns from the MIT-licensed [graph-engineering](https://github.com/codejunkie99/graph-engineering) project to this runtime's stronger execution, recovery, and control contracts.
+The repository ships three opinionated reference graphs: design decision deep-dive, parallel project delivery, and deep review of an existing subsystem. `/dag-flow` selects the closest shape from the request, injects the current task, and derives the actual DAG while preserving its fail-closed gates. See the [Graph Engineering workflow catalog](./.opencode/workflows/GRAPH-ENGINEERING.md).
 
 ## Why a DAG
 
@@ -248,9 +248,8 @@ Exact file boundaries are listed in [`NOTICE`](./NOTICE). The AGPL covers the DA
 ## Docs
 
 - [Saved workflow authoring guide](./packages/core/src/plugin/skill/create-dag-workflow.md) — the `create-dag-workflow` skill body
-- [Graph Engineering workflow catalog](./.opencode/workflows/GRAPH-ENGINEERING.md) and [source research](./docs/graph-engineering-template-research.md) — reusable shapes, evidence, and migration choices
+- [Graph Engineering workflow catalog](./.opencode/workflows/GRAPH-ENGINEERING.md) — reference topologies and adaptation contracts
 - [`.opencode/workflows/change-review.yaml`](./.opencode/workflows/change-review.yaml) — compact change review, startable as `change-review`
-- [`docs/harness-dag.md`](./docs/harness-dag.md) — deep-mode admission & review lifecycle
 - [`.opencode/dag-prompts`](./.opencode/dag-prompts) — built-in node prompt templates
 - [`AGENTS.md`](./AGENTS.md) — contribution & development guide
 

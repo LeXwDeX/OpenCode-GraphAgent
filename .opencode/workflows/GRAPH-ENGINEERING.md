@@ -1,18 +1,8 @@
 # Graph Engineering workflow catalog
 
-These workflows adapt the useful execution patterns from
-[codejunkie99/graph-engineering](https://github.com/codejunkie99/graph-engineering)
-to GraphAgent's durable YAML runtime. The source repository is MIT-licensed; its
-copyright and license are available in the linked repository. The YAML files here
-are project-specific adaptations, not verbatim copies.
-
-The adaptations were cross-checked against the executable examples in
-[GraphARC](https://github.com/CodeGraphContext/GraphARC), Anthropic's
-[workflow patterns](https://www.anthropic.com/engineering/building-effective-agents)
-and [multi-agent production notes](https://www.anthropic.com/engineering/multi-agent-research-system),
-plus Google's controlled study on
-[when agent teams help or hurt](https://research.google/blog/towards-a-science-of-scaling-agent-systems-when-and-why-agent-systems-work/).
-No Python or framework runtime was copied.
+GraphAgent treats these workflows as durable, executable reference topologies.
+The parent agent selects the closest shape, injects the current task, and derives
+the actual DAG while preserving its protected fail-closed gates.
 
 ## Reference graphs
 
@@ -46,6 +36,6 @@ DAG-module lanes unless that module is the real target.
 | `LOOP` | Pause, add a fresh local correction/review wave with new node IDs, resume | Reason, minimal `loop_scope`, acceptance condition, `stop_reason` |
 | `BLOCKED` | Stop and report; do not reinterpret as advisory success | Missing evidence/decision, unresolved contradiction, no progress, or a reached cap |
 
-These graphs copy topology ideas, not framework code or the upstream repository's
-nine disconnected knowledge-graph prompts. The full source comparison and license
-notes are in [`docs/graph-engineering-template-research.md`](../../docs/graph-engineering-template-research.md).
+These graphs are project-authored execution contracts, not framework-specific
+examples. Their value lies in enforceable edges, evidence gates, bounded local
+loops, and explicit parent-agent disposal rules.
