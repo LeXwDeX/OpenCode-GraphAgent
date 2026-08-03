@@ -1,0 +1,397 @@
+# Medium/high-scale reference topology for reviewing an existing project area.
+# The parent agent may retarget, expand, or prune exploration/reviewer lanes, but
+# must preserve independent verification, one arbiter, and PASS-only completion.
+# Every prune requires prune_reason + replacement_coverage. LOOP is a replan that
+# adds fresh targeted review/verification/arbiter nodes; the DAG never gains a cycle.
+title: "Deep Review: DAG Workflow Module (adaptive reference)"
+config:
+  name: deep-review-dag-module
+  max_concurrency: 5
+  max_node_replan_attempts: 3
+  max_total_nodes: 30
+  node_defaults:
+    required: false
+    report_to_parent: false
+    worker_config:
+      timeout_ms: 600000
+  nodes:
+    # Wave 1: Exploration (parallel)
+    - id: explore-core
+      name: "Explore DAG Core"
+      worker_type: explore
+      depends_on: []
+      prompt_template:
+        inline: |
+          Explore the DAG workflow core module at packages/opencode/src/dag/.
+          Focus on: dag.ts (workflow lifecycle, state machine, withWorkflowLock), admission.ts (deep admission QA state machine), config.ts (dag.jsonc tier resolution), model.ts (model resolution chain), review-lifecycle.ts (review contract validation).
+
+          Output:
+          1. File inventory with line counts and primary responsibilities
+          2. Key exported functions and their call relationships
+          3. State machine transitions (workflow states, admission states)
+          4. Cross-file dependency graph within the core
+          5. External dependencies (Effect, Schema, other src/ modules)
+          6. Any immediately visible concerns (complexity hotspots, large functions)
+
+    - id: explore-runtime
+      name: "Explore DAG Runtime"
+      worker_type: explore
+      depends_on: []
+      prompt_template:
+        inline: |
+          Explore the DAG runtime subsystem at packages/opencode/src/dag/runtime/.
+          Focus on: scheduler/executor, capture.ts (output capture), recovery.ts (crash recovery, settle), summary-publisher.ts (derived-view publishing), and any other files in this directory.
+
+          Output:
+          1. File inventory with responsibilities
+          2. Scheduling algorithm and concurrency model
+          3. Crash recovery mechanism (how paused workflows resume)
+          4. State persistence layer (what's durable, what's ephemeral)
+          5. Event emission and bus integration
+          6. Potential race conditions or ordering hazards
+
+    - id: explore-templates
+      name: "Explore Templates & Workflows"
+      worker_type: explore
+      depends_on: []
+      prompt_template:
+        inline: |
+          Explore the DAG templates and workflows subsystem:
+          - packages/opencode/src/dag/templates/ (prompt template rendering, sanitization)
+          - packages/opencode/src/dag/workflows.ts (saved workflow library, spec resolution)
+
+          Output:
+          1. Template rendering pipeline (how inline/id templates resolve)
+          2. Sanitization logic (what's escaped, injection vectors)
+          3. Workflow spec parsing and validation
+          4. Library resolution order (project vs global scope)
+          5. Input mapping and variable interpolation mechanics
+          6. Edge cases in template resolution
+
+    - id: explore-integrations
+      name: "Explore DAG Integrations"
+      worker_type: explore
+      depends_on: []
+      prompt_template:
+        inline: |
+          Explore the DAG module's peripheral integrations:
+          1. TUI: packages/tui/src/feature-plugins/system/dag-inspector.tsx and related files (sidebar indicator, summary pipeline, sync.tsx dag slice)
+          2. Schema: packages/schema/ — find all dag-related event definitions (dag.workflow.*, dag.node.*)
+          3. HTTP API: find routes serving DAG operations (workflow start/status/control/extend)
+          4. SDK: packages/sdk/js — generated client methods for DAG operations
+
+          Output:
+          1. Integration surface map (which server types flow to which consumers)
+          2. Event definitions and their manifest inclusion status
+          3. TUI sync mechanism (bootstrap fetch + event stream)
+          4. Type sharing pattern (SDK-generated vs hand-duplicated)
+          5. Any drift between server schema and TUI/SDK consumers
+
+    # Wave 2: Review (parallel, 5 dimensions)
+    - id: review-architecture
+      name: "Review: Architecture"
+      worker_type: general
+      depends_on: [explore-core, explore-runtime, explore-templates, explore-integrations]
+      prompt_template:
+        inline: |
+          You are an ARCHITECTURE REVIEWER for the DAG workflow module. Read-only — do not modify any file.
+
+          Review target: packages/opencode/src/dag/ and its integrations (TUI dag-inspector, schema events, HTTP API routes).
+
+          Exploration results are provided as upstream context. Use them as a starting map, but verify against actual code.
+
+          Review criteria:
+          - Module boundaries: are responsibilities cleanly separated?
+          - Dependency direction: do dependencies point inward (domain ← infra)?
+          - Layer violations: does runtime leak into config? Does TUI aggregate server-side data?
+          - Self-containment: does each Layer/defaultLayer provide its own dependencies?
+          - Coupling: are there hidden coupling points between admission, lifecycle, and runtime?
+          - Extension invariants from AGENTS.md: LayerNode wiring, serviceOption lazy resolution
+
+          MANDATORY output format:
+          1. findings: array of {severity: CRITICAL|HIGH|MEDIUM|LOW, title, description, evidence: "file:line", recommendation}
+          2. unverified_claims: array of strings — assertions you could NOT confirm with file:line evidence
+          3. summary: 2-3 sentence overall assessment
+
+    - id: review-logic
+      name: "Review: Logic Correctness"
+      worker_type: general
+      depends_on: [explore-core, explore-runtime, explore-templates, explore-integrations]
+      prompt_template:
+        inline: |
+          You are a LOGIC CORRECTNESS REVIEWER for the DAG workflow module. Read-only — do not modify any file.
+
+          Review target: packages/opencode/src/dag/ and its integrations.
+
+          Exploration results are provided as upstream context. Verify against actual code.
+
+          Review criteria:
+          - State machine completeness: are all transitions valid? Any unreachable states?
+          - Lock correctness: withWorkflowLock — can it deadlock? Starve? Leak?
+          - Concurrency: scheduler layer computation, max_concurrency enforcement, race conditions
+          - Error handling: are Effect errors properly typed and propagated?
+          - Boundary conditions: empty graphs, single-node, cyclic depends_on detection
+          - Admission state machine: can it reach invalid states? Fingerprint collision?
+          - Recovery: settle() correctness after crash — can it lose state or duplicate work?
+
+          MANDATORY output format:
+          1. findings: array of {severity: CRITICAL|HIGH|MEDIUM|LOW, title, description, evidence: "file:line", recommendation}
+          2. unverified_claims: array of strings
+          3. summary: 2-3 sentence overall assessment
+
+    - id: review-style
+      name: "Review: Code Style & Conventions"
+      worker_type: general
+      depends_on: [explore-core, explore-runtime, explore-templates, explore-integrations]
+      prompt_template:
+        inline: |
+          You are a CODE STYLE & CONVENTIONS REVIEWER for the DAG workflow module. Read-only — do not modify any file.
+
+          Review target: packages/opencode/src/dag/ and its integrations.
+
+          Review against the AGENTS.md Style Guide:
+          - No unnecessary destructuring (use dot notation)
+          - No import aliases or star imports
+          - const over let, ternaries over reassignment
+          - No else statements (early returns)
+          - No single-use helper extraction
+          - Effect generators: bind services to named variables
+          - Schema definitions: snake_case field names
+          - Dynamic imports for heavy modules in startup-sensitive paths
+          - No comments unless non-obvious constraints
+
+          Also check:
+          - Naming consistency across the module
+          - Type annotation discipline (rely on inference where possible)
+          - File organization and export patterns
+
+          MANDATORY output format:
+          1. findings: array of {severity: CRITICAL|HIGH|MEDIUM|LOW, title, description, evidence: "file:line", recommendation}
+          2. unverified_claims: array of strings
+          3. summary: 2-3 sentence overall assessment
+
+    - id: review-testability
+      name: "Review: Testability & Coverage"
+      worker_type: general
+      depends_on: [explore-core, explore-runtime, explore-templates, explore-integrations]
+      prompt_template:
+        inline: |
+          You are a TESTABILITY & COVERAGE REVIEWER for the DAG workflow module. Read-only — do not modify any file.
+
+          Review target: packages/opencode/src/dag/ and its test files (search for *.test.ts in or near the dag directory).
+
+          Review criteria:
+          - Test existence: which critical paths have NO tests?
+          - State machine coverage: are all transitions tested?
+          - Boundary conditions: empty input, malformed YAML, cyclic graphs
+          - Integration tests: is the TUI↔server contract tested?
+          - Mock discipline: are tests testing real implementation or duplicating logic?
+          - Test isolation: can tests run independently? Any shared mutable state?
+          - Recovery paths: is crash recovery (settle) tested?
+          - Concurrency: are race conditions exercised in tests?
+
+          Search for test files: look in packages/opencode/test/ for dag-related tests.
+
+          MANDATORY output format:
+          1. findings: array of {severity: CRITICAL|HIGH|MEDIUM|LOW, title, description, evidence: "file:line or test-file path", recommendation}
+          2. unverified_claims: array of strings
+          3. coverage_gaps: array of {path: string, untested_scenarios: string[]}
+          4. summary: 2-3 sentence overall assessment
+
+    - id: review-robustness
+      name: "Review: Runtime Robustness"
+      worker_type: general
+      depends_on: [explore-core, explore-runtime, explore-templates, explore-integrations]
+      prompt_template:
+        inline: |
+          You are a RUNTIME ROBUSTNESS REVIEWER for the DAG workflow module. Read-only — do not modify any file.
+
+          Review target: packages/opencode/src/dag/ with focus on runtime behavior.
+
+          Review criteria:
+          - Crash recovery: what happens if the process dies mid-node-spawn? Mid-state-transition?
+          - State persistence: is durable state written atomically? Can partial writes corrupt?
+          - Lock behavior: what happens if a lock holder crashes? Is there a timeout?
+          - Resource leaks: are child sessions always cleaned up? Timers cleared?
+          - Backpressure: what if max_concurrency nodes all hang? Is there a global timeout?
+          - Event loss: if GlobalBus events are missed, do consumers recover? (TUI bootstrap fetch)
+          - Memory: unbounded growth in workflow state for long-running workflows?
+          - Graceful degradation: what fails first under resource pressure?
+
+          MANDATORY output format:
+          1. findings: array of {severity: CRITICAL|HIGH|MEDIUM|LOW, title, description, evidence: "file:line", recommendation}
+          2. unverified_claims: array of strings
+          3. failure_scenarios: array of {scenario: string, impact: string, likelihood: HIGH|MEDIUM|LOW}
+          4. summary: 2-3 sentence overall assessment
+
+    # Wave 3: Claim Verification
+    - id: verify-claims
+      name: "Verify Disputed Claims"
+      worker_type: general
+      depends_on: [review-architecture, review-logic, review-style, review-testability, review-robustness]
+      required: true
+      output_schema:
+        type: object
+        required: [verdict, verified_claims, disputed_findings_resolution, critical_findings_status, coverage_gaps, evidence_quality]
+        properties:
+          verdict:
+            type: string
+            enum: [VERIFIED, GAPS, BLOCKED]
+          verified_claims: { type: array, items: { type: object } }
+          disputed_findings_resolution: { type: array, items: { type: object } }
+          critical_findings_status: { type: array, items: { type: object } }
+          coverage_gaps: { type: array, items: { type: object } }
+          evidence_quality: { type: string }
+      prompt_template:
+        inline: |
+          You are a CLAIM VERIFIER. Read-only — do not modify any file.
+
+          Five reviewers produced findings and unverified_claims about the DAG workflow
+          module. You are the fresh-context review of that entire local review wave.
+          Check every unverified/disputed/CRITICAL/HIGH claim, then audit whether the
+          requested scope and acceptance criteria were actually covered. Sample material
+          MEDIUM/LOW claims instead of trusting reviewer self-report.
+
+          Upstream context contains all 5 reviewer outputs. Extract:
+          1. All items in each reviewer's unverified_claims array
+          2. Any findings where reviewers disagree (conflicting severity or conclusions)
+          3. Any CRITICAL/HIGH findings — these MUST be verified regardless
+          4. Any requested file area, integration, risk, or review criterion with no
+             evidence-bearing reviewer output
+          5. Any parent-declared prune lacking prune_reason or replacement_coverage
+
+          For each claim, read the actual source file at the cited location and determine:
+          - CONFIRMED: the code does what the reviewer claims (cite the exact line)
+          - REFUTED: the code does NOT do what the reviewer claims (explain why)
+          - PARTIALLY_CONFIRMED: the claim is directionally correct but imprecise
+          - UNRESOLVABLE: cannot determine from static analysis alone
+
+          Verdict:
+          - VERIFIED: every material scope/criterion is covered and no material claim is
+            left unresolved
+          - GAPS: a bounded fresh review can close named coverage or evidence gaps
+          - BLOCKED: required evidence cannot be obtained or the review wave is not
+            auditable
+
+          Submit the structured result. coverage_gaps must name the missing scope,
+          evidence, and the smallest reviewer lane that should be added in a LOOP.
+
+    # Wave 4: Arbitration
+    - id: arbitrate
+      name: "Arbiter: Final Verdict"
+      worker_type: general
+      depends_on: [verify-claims]
+      required: true
+      report_to_parent: true
+      output_schema:
+        type: object
+        required: [verdict, reason, evidence, findings, loop_scope, stop_reason, next_action, prune_decisions]
+        properties:
+          verdict:
+            type: string
+            enum: [PASS, LOOP, BLOCKED]
+          reason: { type: string }
+          evidence:
+            type: array
+            items: { type: string }
+          findings:
+            type: array
+            items:
+              type: object
+              required: [severity, title, evidence, status]
+              properties:
+                severity:
+                  type: string
+                  enum: [CRITICAL, HIGH, MEDIUM, LOW]
+                title:
+                  type: string
+                description:
+                  type: string
+                evidence:
+                  type: string
+                status:
+                  type: string
+                  enum: [CONFIRMED, REFUTED, PARTIALLY_CONFIRMED]
+                recommendation:
+                  type: string
+          loop_scope:
+            type: array
+            items:
+              type: string
+          stop_reason:
+            type: string
+            enum: [goal_met, correction_required, evidence_missing, no_progress, round_cap, budget_cap]
+          next_action:
+            type: string
+            enum: [finalize, replan, stop]
+          prune_decisions:
+            type: array
+            items:
+              type: object
+              required: [node, prune_reason, replacement_coverage]
+              properties:
+                node: { type: string }
+                prune_reason: { type: string }
+                replacement_coverage: { type: string }
+      prompt_template:
+        inline: |
+          You are the ARBITER for this deep review of the DAG workflow module. You rule on VERIFIED evidence only.
+
+          The verification wave has checked all unverified claims and disputed findings. Use its output as your primary evidence base. The 5 reviewer outputs are also available for context.
+
+          Your job:
+          1. For each CONFIRMED finding, assess its true severity (reviewers may over/under-rate)
+          2. For each REFUTED claim, discard it — do not include in findings
+          3. For PARTIALLY_CONFIRMED, include with corrected description
+          4. Deduplicate findings that describe the same root cause
+          5. Rank findings by impact
+          6. Determine the fail-closed gate verdict:
+             - PASS: no unresolved material finding; scope and evidence coverage are complete
+             - LOOP: a bounded targeted review can resolve specific omissions or disputes
+             - BLOCKED: evidence is insufficient, a critical contradiction is unresolved,
+               progress stalled, or a graph ceiling was reached
+          7. LOOP must name the minimal new review/verification scope. It never means
+             rerun the whole graph or restart completed nodes.
+          8. Audit every parent-declared prune. Missing prune_reason or
+             replacement_coverage forbids PASS.
+          9. State reason, evidence, stop_reason, and the exact next action. A bare
+             conclusion is not a valid verdict.
+
+          Parent disposal contract: PASS → finalize; LOOP → pause/replan/resume fresh
+          targeted review + verification + arbiter nodes; BLOCKED → stop. The parent
+          must not reinterpret LOOP as advisory acceptance.
+
+          Submit your structured verdict via submit_result.
+
+    # Continuation: prepare a bounded local review loop
+    - id: deep-dive
+      name: "Plan the targeted fresh-context review loop"
+      worker_type: general
+      depends_on: [arbitrate]
+      condition: 'arbitrate.output.verdict == "LOOP"'
+      required: true
+      report_to_parent: true
+      prompt_template:
+        inline: |
+          The arbiter required LOOP. Produce a minimal replan fragment proposal for a
+          new local review wave. Include only the missing or disputed scope, assign new
+          node IDs, preserve real artifact dependencies, add a fresh verifier and a new
+          arbiter, and stay within the workflow caps. This is read-only: do not fix code.
+
+          Return the loop reason, new nodes, dependencies, evidence each node must
+          collect, acceptance condition, and stop reason. The parent must pause, replan,
+          and resume; it must never restart completed nodes or create a cycle.
+
+    - id: finalize-review
+      name: "Publish the accepted deep-review report"
+      worker_type: general
+      depends_on: [arbitrate]
+      condition: 'arbitrate.output.verdict == "PASS"'
+      required: true
+      report_to_parent: true
+      prompt_template:
+        inline: |
+          Publish the final evidence-backed review report. Include scope coverage,
+          confirmed findings, discarded/refuted claims, verification evidence, residual
+          low-risk issues, and the final PASS reason. Do not introduce new findings or
+          claims that were not verified upstream.

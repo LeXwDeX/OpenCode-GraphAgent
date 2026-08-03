@@ -1,0 +1,121 @@
+# Reference topology. The parent agent may expand or prune non-protected nodes,
+# but must preserve audit-small-loop and finalize-design. Every prune requires a
+# prune_reason plus replacement_coverage. LOOP is implemented by replan with new
+# revision/audit nodes; completed nodes are never restarted in place.
+title: "Design decision deep dive: grill → reason → audit → finalize"
+config:
+  name: design-decision-loop
+  max_concurrency: 2
+  max_node_replan_attempts: 3
+  max_total_nodes: 18
+  node_defaults:
+    required: false
+    report_to_parent: false
+    worker_config:
+      timeout_ms: 600000
+  nodes:
+    - id: frame-decision
+      name: "Internally grill the design decision"
+      worker_type: general
+      depends_on: []
+      required: true
+      output_schema:
+        type: object
+        required: [goal, assumptions, alternatives, failure_questions, draft_design]
+        properties:
+          goal: { type: string }
+          assumptions: { type: array, items: { type: string } }
+          alternatives: { type: array, items: { type: object } }
+          failure_questions: { type: array, items: { type: string } }
+          draft_design: { type: string }
+      prompt_template:
+        inline: |
+          Act as an internal grill-me pass over the parent request. Do not ask the
+          user questions from this child session. Reconstruct the real decision,
+          challenge hidden assumptions, compare serious alternatives, and identify
+          the cases that would make the design fail.
+
+          Produce a concrete draft design, not a list of generic advice. Mark every
+          unresolved fact explicitly; never invent an answer to make the draft look
+          complete. Submit the structured result.
+
+    - id: simulate-design
+      name: "Reason through execution paths"
+      worker_type: reasoner
+      depends_on: [frame-decision]
+      required: true
+      prompt_template:
+        inline: |
+          reason_target: design_doc
+          subject: Use the complete upstream decision frame and draft design as the subject.
+          goal: Simulate whether the draft can achieve its stated goal without contradictions, unreachable states, uncovered boundaries, ownership conflicts, or false completion.
+          known_constraints: Treat upstream assumptions as assumptions, not facts. Preserve every explicit invariant and scope boundary.
+          focus_dimensions: [Internal Contradiction, Boundary / Edge Case, Coverage Hole, State / Flow Consistency, Responsibility / Ownership]
+
+    - id: audit-small-loop
+      name: "Fresh-context audit of grill + reasoning"
+      worker_type: general
+      depends_on: [frame-decision, simulate-design]
+      required: true
+      report_to_parent: true
+      output_schema:
+        type: object
+        required: [verdict, reason, evidence, loop_scope, stop_reason, next_action, prune_decisions]
+        properties:
+          verdict:
+            type: string
+            enum: [PASS, LOOP, BLOCKED]
+          reason: { type: string }
+          evidence: { type: array, items: { type: string } }
+          loop_scope: { type: array, items: { type: string } }
+          stop_reason:
+            type: string
+            enum: [goal_met, correction_required, evidence_missing, no_progress, round_cap, budget_cap]
+          next_action:
+            type: string
+            enum: [finalize, replan, stop]
+          prune_decisions:
+            type: array
+            items:
+              type: object
+              required: [node, prune_reason, replacement_coverage]
+              properties:
+                node: { type: string }
+                prune_reason: { type: string }
+                replacement_coverage: { type: string }
+      prompt_template:
+        inline: |
+          You are a fresh-context gate. Review the immediately preceding small
+          loop: the internal grill and the reasoner's simulation. Do not trust either
+          node's self-assessment.
+
+          Fail closed:
+          - PASS only when the goal, assumptions, alternatives, state/flow paths,
+            boundaries, ownership, and completion rule are materially covered.
+          - LOOP when a bounded revision can close a specific omission. Return only
+            the minimal node scope that must be recreated with new node IDs.
+          - BLOCKED when evidence or a required decision is missing, progress has
+            stalled, or a graph ceiling was reached.
+          - Every claim needs an upstream reference or repository evidence. A bare
+            assertion is not evidence.
+          - Every pruned node requires both prune_reason and replacement_coverage;
+            missing either forbids PASS.
+
+          Parent disposal contract: PASS → finalize; LOOP → pause, replan new
+          revision/reasoning/audit nodes, then resume; BLOCKED → stop with this
+          reason. Never finalize stale outputs after LOOP or BLOCKED.
+
+    - id: finalize-design
+      name: "Finalize the reviewed design"
+      worker_type: general
+      depends_on: [frame-decision, simulate-design, audit-small-loop]
+      condition: 'audit-small-loop.output.verdict == "PASS"'
+      required: true
+      report_to_parent: true
+      prompt_template:
+        inline: |
+          Produce the final development/design document from the reviewed upstream
+          artifacts. Resolve only issues supported by the reasoning and audit.
+          Preserve assumptions, rejected alternatives, invariants, acceptance
+          criteria, and remaining risks so implementation agents cannot silently
+          reinterpret the decision.
