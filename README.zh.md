@@ -223,6 +223,7 @@ bun dev serve        # headless API 服务（端口 4096）
 
 - [存盘工作流编写指南](./packages/core/src/plugin/skill/create-dag-workflow.md) —— `create-dag-workflow` skill 正文
 - [Graph Engineering 工作流目录](./.opencode/workflows/GRAPH-ENGINEERING.md) —— 参考拓扑与自适应协议
+- [`docs/harness-dag.md`](./docs/harness-dag.md) —— deep 模式准入与审查生命周期
 - [`.opencode/workflows/change-review.yaml`](./.opencode/workflows/change-review.yaml) —— 轻量变更审查图，按 `change-review` 启动
 - [`.opencode/dag-prompts`](./.opencode/dag-prompts) —— 内置节点 prompt 模板
 - [`AGENTS.md`](./AGENTS.md) —— 贡献与开发指南
