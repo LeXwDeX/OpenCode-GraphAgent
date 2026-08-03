@@ -60,13 +60,34 @@ Show the user the three lists, or report that nothing needs updating.
 - If the user declines or cannot decide, only add `NEW` templates and report
   the skipped updates.
 - Before any overwrite, back up the local file next to the original with a
-  timestamped suffix (e.g. `<name>.yaml.bak-<YYYYMMDD-HHMMSS>`).
+  timestamped suffix (e.g. `<name>.yaml.bak-<YYYYMMDD-HHMMSS>`). If the backup
+  fails (read-only directory, disk full, permissions), abort the overwrite of
+  that file and report the error — never overwrite without a backup.
+
+## Concurrency lock
+
+Another session may be updating the same directory. Take an exclusive lock on
+`<config dir>/workflows` before downloading or merging:
+
+- Create the lock with `mkdir <config dir>/workflows/.dag-update.lock` (mkdir
+  is atomic — if it fails because the directory exists, another update is in
+  progress).
+- If the lock is held, wait briefly and retry a few times; if it is still held,
+  report that an update is already running and stop.
+- Remove the lock (`rmdir <config dir>/workflows/.dag-update.lock`) after the
+  merge finishes, including on failure.
 
 ## Verify
 
-After applying, run `workflow(action: "list")` and report the resulting
-template count plus the names that changed (added / updated / skipped).
-Report the backup locations when any file was overwritten.
+After applying, confirm the update actually landed by comparing file contents,
+not just the workflow library listing:
+
+- Re-read each updated file from `<config dir>/workflows/` and compare its
+  content to the extracted archive copy — they must match.
+- Run `workflow(action: "list")` and report the resulting template count plus
+  the names that changed (added / updated / skipped). Note that a project-level
+  template with the same name shadows the global one in the listing.
+- Report the backup locations when any file was overwritten.
 
 ## Failure handling
 

@@ -356,6 +356,20 @@ function readWorkflowSpec(specPath: string | undefined, directory: string, ctx: 
     }
     const filepath = yield* resolveSpecPath(specPath, directory, ctx)
 
+    // Builtin templates are compiled into the binary (no backing file).
+    if (DagWorkflows.isBuiltinPath(filepath)) {
+      const name = filepath.slice("builtin://".length)
+      const content = DagWorkflows.builtinTemplates()[name]
+      if (content === undefined) {
+        return yield* Effect.fail(new Error(`Workflow spec not found: ${filepath}`))
+      }
+      const value = yield* Effect.try({
+        try: () => Bun.YAML.parse(content),
+        catch: (error) => workflowSpecParseError(filepath, error),
+      })
+      return { path: filepath, value }
+    }
+
     const file = Bun.file(filepath)
     if (!(yield* Effect.promise(() => file.exists()))) {
       return yield* Effect.fail(new Error(`Workflow spec not found: ${filepath}`))

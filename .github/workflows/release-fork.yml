@@ -78,8 +78,13 @@ jobs:
 
       - name: Package Templates
         run: |
+          shopt -s nullglob
+          files=(dag-config/*.yaml)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "::warning::No templates found in opencode-dag-config root; packaging empty archive"
+          fi
           mkdir -p dist
-          cp dag-config/*.yaml dist/
+          cp "${files[@]}" dist/
           tar -czf dag-templates.tar.gz -C dist .
           echo "Templates packaged: $(ls dist | wc -l) files"
 
@@ -150,6 +155,23 @@ jobs:
             sleep 5
           done
           echo "::warning::Failed to download models.dev api.json; build will fall back to @opencode-ai/models snapshot or an empty catalog"
+
+      # Embed the latest DAG reference templates into the binary so air-gapped
+      # installs ship the curated workflows (see dag/workflows.ts builtin scope
+      # and script/generate.ts DAG_TEMPLATES_DIR loading).
+      - name: Download Templates Artifact
+        if: inputs.platforms == '' || contains(inputs.platforms, matrix.name)
+        uses: actions/download-artifact@v4
+        with:
+          name: dag-templates
+          path: dag-templates-artifact
+
+      - name: Extract Templates
+        if: inputs.platforms == '' || contains(inputs.platforms, matrix.name)
+        run: |
+          mkdir -p dag-templates-src
+          tar -xzf dag-templates-artifact/dag-templates.tar.gz -C dag-templates-src
+          echo "DAG_TEMPLATES_DIR=$GITHUB_WORKSPACE/dag-templates-src" >> "$GITHUB_ENV"
 
       - name: Build CLI
         if: inputs.platforms == '' || contains(inputs.platforms, matrix.name)
