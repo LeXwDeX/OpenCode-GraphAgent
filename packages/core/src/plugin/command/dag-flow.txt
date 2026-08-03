@@ -10,7 +10,7 @@ If the content inside `<dag-flow-task>` is empty or contains only whitespace, as
 
 For a non-empty task:
 
-1. Before starting, classify the task and select the closest project reference topology:
+1. Before starting, classify the task as `brainstorm`, `review`, or `develop`, then select the closest project reference topology:
    - design documents, requirement deep-dives, architecture decisions, or design-level debugging → `.opencode/workflows/design-decision-loop.yaml`
    - end-to-end implementation with multiple modules, wiring, tests, and review → `.opencode/workflows/parallel-development-loop.yaml`
    - deep review of an already-built module, subsystem, or codebase → `.opencode/workflows/deep-review-dag-module.yaml`
