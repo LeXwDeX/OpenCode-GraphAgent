@@ -42,17 +42,17 @@ export const modelsData = await loadModelsData()
  * project/global workflow library scopes.
  */
 async function loadDagTemplatesData() {
-  const dir = process.env.DAG_TEMPLATES_DIR
-  if (!dir) {
+  const templatesDir = process.env.DAG_TEMPLATES_DIR
+  if (!templatesDir) {
     console.log("Loaded no dag templates snapshot (DAG_TEMPLATES_DIR unset)")
     return "undefined"
   }
   const templates: Record<string, string> = {}
-  for (const file of await Array.fromAsync(new Bun.Glob("*.yaml").scan({ cwd: dir }))) {
+  for (const file of await Array.fromAsync(new Bun.Glob("*.yaml").scan({ cwd: templatesDir }))) {
     const name = file.replace(/\.ya?ml$/, "")
-    templates[name] = await Bun.file(path.join(dir, file)).text()
+    templates[name] = await Bun.file(path.join(templatesDir, file)).text()
   }
-  console.log(`Loaded dag templates snapshot from ${dir}: ${Object.keys(templates).length} templates`)
+  console.log(`Loaded dag templates snapshot from ${templatesDir}: ${Object.keys(templates).length} templates`)
   return JSON.stringify(templates)
 }
 

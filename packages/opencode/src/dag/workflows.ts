@@ -49,20 +49,13 @@ export interface Entry {
 
 /** Builtin templates compiled into the binary from opencode-dag-config. */
 export function builtinTemplates(): Record<string, string> {
-  return OPENCODE_DAG_TEMPLATES ?? {}
+  // The build replaces the identifier via define; bare source/test runs have
+  // no global binding, so guard instead of throwing a ReferenceError.
+  if (typeof OPENCODE_DAG_TEMPLATES === "undefined") return {}
+  return OPENCODE_DAG_TEMPLATES
 }
 
 const BUILTIN_PREFIX = "builtin://"
-
-export interface Entry {
-  readonly name: string
-  readonly scope: Scope
-  readonly path: string
-  /** Workflow title from the spec, when the file declares one. */
-  readonly title?: string
-  /** Node count, for a one-glance sense of the graph's size. */
-  readonly nodes?: number
-}
 
 /** A name has no path separators and no YAML extension — those mean a path. */
 export function isName(value: string) {
@@ -92,7 +85,7 @@ export function resolve(name: string, projectDir: string): Effect.Effect<Entry |
     }
     const content = builtinTemplates()[name]
     if (content === undefined) return undefined
-    return { name, scope: "builtin", path: `${BUILTIN_PREFIX}${name}`, content, ...describeContent(content) }
+    return builtinEntry(name, content)
   })
 }
 
@@ -123,7 +116,7 @@ export function list(projectDir: string): Effect.Effect<Entry[]> {
     }
     for (const [name, content] of Object.entries(builtinTemplates())) {
       if (seen.has(name)) continue
-      seen.set(name, { name, scope: "builtin", path: `${BUILTIN_PREFIX}${name}`, content, ...describeContent(content) })
+      seen.set(name, await builtinEntry(name, content))
     }
     return [...seen.values()].sort((a, b) => a.name.localeCompare(b.name))
   })
@@ -132,6 +125,15 @@ export function list(projectDir: string): Effect.Effect<Entry[]> {
 /** Whether a path is the synthetic builtin marker. */
 export function isBuiltinPath(filepath: string) {
   return filepath.startsWith(BUILTIN_PREFIX)
+}
+
+/** The name encoded in a synthetic `builtin://name` path. */
+export function builtinName(filepath: string) {
+  return filepath.slice(BUILTIN_PREFIX.length)
+}
+
+async function builtinEntry(name: string, content: string): Promise<Entry> {
+  return { name, scope: "builtin", path: `${BUILTIN_PREFIX}${name}`, content, ...(await parseMeta(content)) }
 }
 
 // Resolution order, project first. The global directory applies the same
@@ -144,19 +146,19 @@ function scopes(projectDir: string) {
   ]
 }
 
-/**
- * Best-effort listing metadata. A malformed or unreadable spec still lists —
- * hiding it would make a typo look like a missing file; the start path reports
- * the real parse error.
- */
+/** Best-effort listing metadata from a file-backed spec. */
 async function describe(file: string): Promise<{ title?: string; nodes?: number }> {
   const text = await Bun.file(file).text().catch(() => undefined)
-  return text === undefined ? {} : describeContent(text)
+  return text === undefined ? {} : parseMeta(text)
 }
 
-/** Parse title/node metadata from spec content (shared with builtin entries). */
-function describeContent(text: string): { title?: string; nodes?: number } {
-  const parsed = Bun.YAML.parse(text) as unknown
+/** Parse title/node metadata from spec content (shared with builtin entries).
+ * A malformed spec still lists — hiding it would make a typo look like a
+ * missing file; the start path reports the real parse error. */
+async function parseMeta(text: string): Promise<{ title?: string; nodes?: number }> {
+  const parsed = await Promise.resolve(text)
+    .then((value) => Bun.YAML.parse(value))
+    .catch(() => undefined)
   if (!isRecord(parsed)) return {}
   const config = isRecord(parsed["config"]) ? parsed["config"] : undefined
   const title = typeof parsed["title"] === "string" ? parsed["title"] : undefined

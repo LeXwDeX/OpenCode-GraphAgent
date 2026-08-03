@@ -78,13 +78,14 @@ jobs:
 
       - name: Package Templates
         run: |
+          mkdir -p dist
           shopt -s nullglob
           files=(dag-config/*.yaml)
-          if [ ${#files[@]} -eq 0 ]; then
+          if [ ${#files[@]} -gt 0 ]; then
+            cp "${files[@]}" dist/
+          else
             echo "::warning::No templates found in opencode-dag-config root; packaging empty archive"
           fi
-          mkdir -p dist
-          cp "${files[@]}" dist/
           tar -czf dag-templates.tar.gz -C dist .
           echo "Templates packaged: $(ls dist | wc -l) files"
 
@@ -228,12 +229,6 @@ jobs:
         with:
           path: release-assets
           merge-multiple: true
-
-      - name: Download Templates Artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: dag-templates
-          path: release-assets
 
       - name: Determine Version Tag
         id: tag

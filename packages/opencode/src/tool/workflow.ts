@@ -142,7 +142,7 @@ export const WorkflowTool = Tool.define<
               if (entries.length === 0) {
                 return {
                   title: "No saved workflows",
-                  output: `The workflow library is empty. Searched ${DagWorkflows.searchPaths(session.directory).join(" and ")}. Save a spec as <name>.yaml in one of those directories to start it later by name.`,
+                  output: `The workflow library is empty. Searched ${searchedScopes(session.directory)}. Save a spec as <name>.yaml in one of those directories to start it later by name.`,
                   metadata: {},
                 }
               }
@@ -358,8 +358,7 @@ function readWorkflowSpec(specPath: string | undefined, directory: string, ctx: 
 
     // Builtin templates are compiled into the binary (no backing file).
     if (DagWorkflows.isBuiltinPath(filepath)) {
-      const name = filepath.slice("builtin://".length)
-      const content = DagWorkflows.builtinTemplates()[name]
+      const content = DagWorkflows.builtinTemplates()[DagWorkflows.builtinName(filepath)]
       if (content === undefined) {
         return yield* Effect.fail(new Error(`Workflow spec not found: ${filepath}`))
       }
@@ -391,18 +390,26 @@ function readWorkflowSpec(specPath: string | undefined, directory: string, ctx: 
   })
 }
 
+/** Directories (and the builtin fallback, when the release ships templates) a
+ * bare workflow name may resolve from — for "not found" / empty-library hints. */
+function searchedScopes(directory: string) {
+  const scopes = DagWorkflows.searchPaths(directory)
+  if (Object.keys(DagWorkflows.builtinTemplates()).length > 0) scopes.push("the release's builtin templates")
+  return scopes.join(" and ")
+}
+
 function resolveSpecPath(specPath: string, directory: string, ctx: Tool.Context) {
   return Effect.gen(function* () {
-    // A bare name addresses the workflow library. Its two scopes are curated
-    // assets the user placed under `.opencode/` or the config dir — the same
-    // trust level as dag.jsonc — so a resolved name needs no
+    // A bare name addresses the workflow library. Its project/global scopes
+    // are curated assets the user placed under `.opencode/` or the config
+    // dir — the same trust level as dag.jsonc — so a resolved name needs no
     // external-directory prompt even when the global scope lands outside the
     // session directory. Arbitrary paths below keep the prompt.
     if (DagWorkflows.isName(specPath)) {
       const entry = yield* DagWorkflows.resolve(specPath, directory)
       if (entry) return entry.path
       return yield* Effect.fail(new Error(
-        `Saved workflow not found: "${specPath}". Searched ${DagWorkflows.searchPaths(directory).join(" and ")}. Run workflow(action: "list") to see what is available, or pass a path to a .yaml spec file.`,
+        `Saved workflow not found: "${specPath}". Searched ${searchedScopes(directory)}. Run workflow(action: "list") to see what is available, or pass a path to a .yaml spec file.`,
       ))
     }
     const filepath = path.isAbsolute(specPath) ? path.normalize(specPath) : path.resolve(directory, specPath)
