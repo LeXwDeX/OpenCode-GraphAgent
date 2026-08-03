@@ -10,10 +10,13 @@ If the content inside `<dag-flow-task>` is empty or contains only whitespace, as
 
 For a non-empty task:
 
-1. Before starting, classify the task as `brainstorm`, `review`, or `develop`, then select the closest project reference topology:
-   - design documents, requirement deep-dives, architecture decisions, or design-level debugging → `.opencode/workflows/design-decision-loop.yaml`
-   - end-to-end implementation with multiple modules, wiring, tests, and review → `.opencode/workflows/parallel-development-loop.yaml`
-   - deep review of an already-built module, subsystem, or codebase → `.opencode/workflows/deep-review-dag-module.yaml`
+1. Before starting, classify the task as `brainstorm`, `review`, or `develop`, then select the closest reference topology from the workflow library. Reference templates are installed in two scopes (project overrides global, same trust as `dag.jsonc`):
+   - global: `<opencode config dir>/workflows/*.yaml` — curated by the `opencode-dag-config` repo, shared across projects
+   - project: `.opencode/workflows/*.yaml` — project-specific overrides
+   Run `workflow(action: "list")` to see every available template and their paths, then pick by name or path:
+   - design documents, requirement deep-dives, architecture decisions, or design-level debugging → saved workflow `design-decision-loop`
+   - end-to-end implementation with multiple modules, wiring, tests, and review → saved workflow `parallel-development-loop`
+   - deep review of an already-built module, subsystem, or codebase → saved workflow `deep-review-dag-module`
    - a small bounded working-tree change review → saved workflow `change-review`
    - no close match → compose the smallest fresh graph; do not force an unrelated reference
 2. Treat the selected YAML as a reviewed topology reference, not as a script to replay blindly. Start a saved workflow by name only when its embedded target and inputs already match the request. Otherwise read the reference, derive a one-off YAML, inject the complete `/dag-flow` task into its root planning/exploration prompt, retarget its lanes, and pass that file to `workflow(action=start)`.

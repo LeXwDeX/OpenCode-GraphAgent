@@ -16,10 +16,13 @@
 #                            prerelease (test build); `main` = formal release.
 #           platforms      — comma-separated subset of linux,macos,windows
 #                            to build. Leave blank to build all three.
-# Jobs    : build-cli — 3-OS matrix, bundles ripgrep + single-file binary
+# Jobs    : package-templates — package latest reference templates from the
+#                               opencode-dag-config repo into a release asset
+#           build-cli — 3-OS matrix, bundles ripgrep + single-file binary
 #           release   — optional, creates GitHub Release from build-cli artifacts
 #           register  — no-op for push triggers, just registers in Actions UI
-# Output  : Artifacts: opencode-{linux,macos,windows}.{tar.gz,zip} + SHA256SUMS
+# Output  : Artifacts: opencode-{linux,macos,windows}.{tar.gz,zip} +
+#           dag-templates.tar.gz + SHA256SUMS
 # ============================================================================
 
 name: 📦 Release · Fork Build
@@ -56,8 +59,40 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: false
 
 jobs:
+  # Package the latest reference templates from the dedicated config repo
+  # (LeXwDeX/opencode-dag-config) into a release asset. dev/main do not manage
+  # these templates anymore — the config repo is the single source of truth.
+  # Read-only: no commits, no pushes, so branch protection never blocks it.
+  package-templates:
+    name: Package Reference Templates
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Clone Config Repo
+        uses: actions/checkout@v4
+        with:
+          repository: LeXwDeX/opencode-dag-config
+          path: dag-config
+
+      - name: Package Templates
+        run: |
+          mkdir -p dist
+          cp dag-config/*.yaml dist/
+          tar -czf dag-templates.tar.gz -C dist .
+          echo "Templates packaged: $(ls dist | wc -l) files"
+
+      - name: Upload Templates Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dag-templates
+          path: dag-templates.tar.gz
+          retention-days: 7
+
   build-cli:
     name: Build CLI (${{ matrix.name }})
+    needs: package-templates
     # Skip the actual build when triggered by push (registration-only). Per-
     # matrix-entry platform filtering can't live here — `matrix` isn't in
     # scope for a job-level `if:` — so it's applied to each step below instead.
@@ -159,7 +194,7 @@ jobs:
 
   release:
     name: Create GitHub Release
-    needs: build-cli
+    needs: [build-cli, package-templates]
     if: inputs.create_release
     runs-on: ubuntu-latest
     steps:
@@ -171,6 +206,12 @@ jobs:
         with:
           path: release-assets
           merge-multiple: true
+
+      - name: Download Templates Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: dag-templates
+          path: release-assets
 
       - name: Determine Version Tag
         id: tag
