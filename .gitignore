@@ -40,8 +40,8 @@ tsconfig.tsbuildinfo
 # OpenSpec artifacts (local-only, not tracked)
 /openspec/
 
-# Local project thought and design notes (never commit)
-/docs/
+# Personal thought and design notes (never commit)
+/docs/graph-engineering-template-research.md
 
 # hooks file
 .opencode/hooks.json

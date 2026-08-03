@@ -249,6 +249,7 @@ Exact file boundaries are listed in [`NOTICE`](./NOTICE). The AGPL covers the DA
 
 - [Saved workflow authoring guide](./packages/core/src/plugin/skill/create-dag-workflow.md) — the `create-dag-workflow` skill body
 - [Graph Engineering workflow catalog](./.opencode/workflows/GRAPH-ENGINEERING.md) — reference topologies and adaptation contracts
+- [`docs/harness-dag.md`](./docs/harness-dag.md) — deep-mode admission & review lifecycle
 - [`.opencode/workflows/change-review.yaml`](./.opencode/workflows/change-review.yaml) — compact change review, startable as `change-review`
 - [`.opencode/dag-prompts`](./.opencode/dag-prompts) — built-in node prompt templates
 - [`AGENTS.md`](./AGENTS.md) — contribution & development guide
