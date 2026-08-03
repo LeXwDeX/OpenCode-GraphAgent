@@ -24,7 +24,7 @@ GraphAgent 是本项目对外的产品名；仓库以 **OpenCode-GraphAgent** �
 4. **迭代是有界的局部改图。** `PASS` 才能定稿，`LOOP` 通过 pause → replan → resume 增加新的修正与复审波次，`BLOCKED` 带证据停止；终态节点不会被伪装成环。
 5. **代码和测试说了算。** 状态变更写入事件，崩溃恢复只认持久化证据。到了代价高的边界，人可以 pause、step、cancel 或 replan。
 
-仓库已经附带三类强约束参考图：设计决策深挖、并行项目落地、已完成子系统深度 Review。`/dag-flow` 会先按需求选择最接近的中高规模样板，注入本次任务，再派生实际 DAG；可以扩展和剪枝，但不能绕过 fail-closed 门禁。入口见 [Graph Engineering 工作流目录](./.opencode/workflows/GRAPH-ENGINEERING.md)。这些 YAML 把 MIT 许可的 [graph-engineering](https://github.com/codejunkie99/graph-engineering) 项目里有价值的模式，适配到了本项目更严格的执行、恢复和控制契约上。
+仓库已经附带三类强约束参考图：设计决策深挖、并行项目落地、已完成子系统深度 Review。`/dag-flow` 会先按需求选择最接近的中高规模样板，注入本次任务，再派生实际 DAG；可以扩展和剪枝，但不能绕过 fail-closed 门禁。入口见 [Graph Engineering 工作流目录](./.opencode/workflows/GRAPH-ENGINEERING.md)。
 
 ## 为什么是 DAG
 
@@ -222,9 +222,8 @@ bun dev serve        # headless API 服务（端口 4096）
 ## 文档
 
 - [存盘工作流编写指南](./packages/core/src/plugin/skill/create-dag-workflow.md) —— `create-dag-workflow` skill 正文
-- [Graph Engineering 工作流目录](./.opencode/workflows/GRAPH-ENGINEERING.md)和[来源调研](./docs/graph-engineering-template-research.md) —— 可复用样板、证据与迁移取舍
+- [Graph Engineering 工作流目录](./.opencode/workflows/GRAPH-ENGINEERING.md) —— 参考拓扑与自适应协议
 - [`.opencode/workflows/change-review.yaml`](./.opencode/workflows/change-review.yaml) —— 轻量变更审查图，按 `change-review` 启动
-- [`docs/harness-dag.md`](./docs/harness-dag.md) —— deep 模式准入与审查生命周期
 - [`.opencode/dag-prompts`](./.opencode/dag-prompts) —— 内置节点 prompt 模板
 - [`AGENTS.md`](./AGENTS.md) —— 贡献与开发指南
 
