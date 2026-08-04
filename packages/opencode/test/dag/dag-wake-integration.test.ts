@@ -84,6 +84,15 @@ function promptText(input: SessionPrompt.PromptInput) {
     .join("\n")
 }
 
+function waitForCompletion(store: DagStore.Interface, dagID: string, message: string) {
+  return pollWithTimeout<true, Error, never>(
+    store.getWorkflow(dagID).pipe(
+      Effect.map((workflow) => workflow?.status === "completed" ? true : undefined),
+    ),
+    message,
+  )
+}
+
 function wakeLayer(input: {
   readonly childPrompts: Queue.Queue<PromptGate>
   readonly parentPrompts: Queue.Queue<ParentPromptGate>
@@ -527,6 +536,74 @@ describe("DagLoop atomic wake integration", () => {
           ),
           "extended workflow did not complete",
         )
+      }),
+    ),
+  )
+
+  integration.live("reopens a completed workflow whose checkpoint dependents were condition-skipped", () =>
+    runWakeTest(({ dag, store, childPrompts, parentPrompts }) =>
+      Effect.gen(function* () {
+        const dagID = yield* dag.create({
+          projectID: "project-1",
+          sessionID: "ses_parent",
+          title: "Skipped-dependent checkpoint continuation",
+          config: {
+            name: "skipped-dependent-checkpoint-continuation",
+            nodes: [
+              node("checkpoint"),
+              {
+                ...node("downstream", ["checkpoint"]),
+                condition: 'checkpoint.output == "GO"',
+              },
+            ],
+          },
+        })
+
+        const checkpoint = yield* takeWithin(childPrompts, "checkpoint did not start")
+        yield* Deferred.succeed(checkpoint.release, "REVISE")
+        yield* waitForCompletion(store, dagID, "checkpoint workflow did not complete")
+        expect((yield* store.getNode(dagID, "downstream"))?.status).toBe("skipped")
+        expect((yield* store.getNode(dagID, "downstream"))?.errorReason).toBe("condition_false")
+
+        const parent = yield* takeWithin(parentPrompts, "terminal checkpoint did not wake the parent")
+        const result = yield* dag.extend(dagID, [node("repair", ["checkpoint"])])
+        expect(result.add).toEqual(["repair"])
+
+        const repair = yield* takeWithin(childPrompts, "additive repair node did not start")
+        expect(repair.title).toBe("repair")
+        expect((yield* store.getWorkflow(dagID))?.status).toBe("running")
+        expect((yield* store.getNode(dagID, "checkpoint"))?.status).toBe("completed")
+        yield* Deferred.succeed(parent.release, "success")
+        yield* Deferred.succeed(repair.release, "fixed")
+        yield* waitForCompletion(store, dagID, "extended workflow did not complete")
+      }),
+    ),
+  )
+
+  integration.live("keeps a completed workflow terminal when the graph ran past the checkpoint", () =>
+    runWakeTest(({ dag, store, childPrompts }) =>
+      Effect.gen(function* () {
+        const dagID = yield* dag.create({
+          projectID: "project-1",
+          sessionID: "ses_parent",
+          title: "Post-checkpoint completion",
+          config: {
+            name: "post-checkpoint-completion",
+            nodes: [node("checkpoint"), { ...node("downstream", ["checkpoint"]), report_to_parent: false }],
+          },
+        })
+
+        const checkpoint = yield* takeWithin(childPrompts, "checkpoint did not start")
+        yield* Deferred.succeed(checkpoint.release, "CHECK")
+        const downstream = yield* takeWithin(childPrompts, "downstream did not start")
+        yield* Deferred.succeed(downstream.release, "done")
+        yield* waitForCompletion(store, dagID, "workflow did not complete")
+
+        const error = yield* dag.extend(dagID, [node("repair", ["checkpoint"])]).pipe(
+          Effect.catch((cause: Error) => Effect.succeed(cause)),
+        )
+        if (!(error instanceof TerminalViolationError)) throw new Error("extend unexpectedly succeeded past a terminal checkpoint")
+        expect(error.message).toContain("continued past the checkpoint")
       }),
     ),
   )
