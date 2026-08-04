@@ -63,6 +63,51 @@ test("legacy page key aliases compile as page keys", async () => {
   }
 })
 
+test("session interrupt binds a meta-modified escape fallback for merged double-ESC presses", async () => {
+  const captured: { strokes: Array<Array<{ name: string; meta?: boolean }>> } = { strokes: [] }
+
+  function Harness() {
+    const renderer = useRenderer()
+    const keymap = createDefaultOpenTuiKeymap(renderer)
+    const config = createResolvedKeymapConfig()
+    const offKeymap = registerOpencodeKeymap(keymap, renderer, config)
+    const offLayer = keymap.registerLayer({
+      commands: [{ name: "session.interrupt", run() {} }],
+      bindings: config.keybinds.gather("prompt.palette", ["session.interrupt"]),
+    })
+    captured.strokes =
+      keymap
+        .getCommandBindings({
+          visibility: "registered",
+          commands: ["session.interrupt"],
+        })
+        .get("session.interrupt")
+        ?.map((binding) =>
+          binding.sequence.map((part) => ({
+            name: part.stroke.name,
+            ...(part.stroke.meta ? { meta: true } : {}),
+          })),
+        ) ?? []
+    onCleanup(() => {
+      offLayer()
+      offKeymap()
+    })
+
+    return (
+      <OpencodeKeymapProvider keymap={keymap}>
+        <box />
+      </OpencodeKeymapProvider>
+    )
+  }
+
+  const app = await testRender(() => <Harness />)
+  try {
+    expect(captured.strokes).toEqual([[{ name: "escape" }], [{ name: "escape", meta: true }]])
+  } finally {
+    app.renderer.destroy()
+  }
+})
+
 test("mode-less bindings stay active when opencode mode changes", async () => {
   const counts: Record<string, Record<string, number>> = {}
 
