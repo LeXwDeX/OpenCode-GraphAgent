@@ -8,7 +8,6 @@ import { SessionStatus } from "@/session/status"
 import { Session } from "@/session/session"
 import { SessionPrompt } from "@/session/prompt"
 import { Provider } from "@/provider/provider"
-import { Database } from "@opencode-ai/core/database/database"
 import { SessionID } from "@/session/schema"
 import { testEffect, pollWithTimeout } from "../lib/effect"
 

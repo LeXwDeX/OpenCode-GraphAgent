@@ -31,5 +31,4 @@ export class Info extends Schema.Class<Info>("GoalState")({
  * filter is redundant here; this keeps the escape hatch at a single audited
  * site instead of `as any` scattered across goal.ts.
  */
-export const nni = (value: number): Schema.Schema.Type<typeof NonNegativeInt> =>
-  value as Schema.Schema.Type<typeof NonNegativeInt>
+export const nni = (value: number): Schema.Schema.Type<typeof NonNegativeInt> => value

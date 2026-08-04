@@ -91,7 +91,7 @@ export function isStaleZombie(
 ): boolean {
   return (
     state.status === "active" &&
-    Number(state.turns_used) === 0 &&
+    state.turns_used === 0 &&
     !hasAssistant &&
     now - state.created_at > GoalPrompts.FRESHNESS_THRESHOLD
   )
@@ -166,7 +166,7 @@ export const layer = Layer.effect(
       // we ARE the loop fiber tracked in the fibers map (same self-interrupt
       // hazard discipline as the done / shouldPreempt branches below).
       if (
-        Number(goalState.turns_used) === 0 &&
+        goalState.turns_used === 0 &&
         Date.now() - goalState.created_at > GoalPrompts.FRESHNESS_THRESHOLD
       ) {
         const probeMsgs = yield* sessions.messages({ sessionID, limit: 1 })
@@ -220,7 +220,7 @@ export const layer = Layer.effect(
                   maxOutputTokens: opts.maxTokens,
                   abortSignal: signal,
                 }),
-              catch: (e) => new Error(`judge LLM call failed: ${e}`),
+              catch: (e) => new Error(`judge LLM call failed: ${String(e)}`),
             }).pipe(Effect.timeout(`${opts.timeout} seconds`))
             if (!result) return ""
             return result.text
@@ -319,8 +319,8 @@ export const layer = Layer.effect(
       const continuationText = GoalPrompts.renderContinuation({
         goal: reloadedState.goal,
         subgoals: reloadedState.subgoals ?? [],
-        turnsUsed: Number(reloadedState.turns_used),
-        maxTurns: Number(reloadedState.max_turns),
+        turnsUsed: reloadedState.turns_used,
+        maxTurns: reloadedState.max_turns,
         lastJudgeReason: reloadedState.last_reason,
       })
 

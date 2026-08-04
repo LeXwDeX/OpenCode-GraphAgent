@@ -257,7 +257,7 @@ describe("Goal.set — saves active row + publishes goal.updated(active)", () =>
       const state = yield* goal.set(sessionID, "build feature X", 10)
 
       expect(state.status).toBe("active")
-      expect(Number(state.turns_used)).toBe(0)
+      expect(state.turns_used).toBe(0)
       expect(state.subgoals).toEqual([])
 
       const loaded = yield* goal.load(sessionID)

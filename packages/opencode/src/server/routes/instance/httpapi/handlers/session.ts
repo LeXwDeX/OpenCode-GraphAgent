@@ -111,8 +111,8 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       return {
         goal: state.goal,
         status: state.status,
-        turnsUsed: Number(state.turns_used),
-        maxTurns: Number(state.max_turns),
+        turnsUsed: state.turns_used,
+        maxTurns: state.max_turns,
         subgoals: state.subgoals ?? [],
         ...(state.paused_reason !== undefined ? { pausedReason: state.paused_reason } : {}),
       }

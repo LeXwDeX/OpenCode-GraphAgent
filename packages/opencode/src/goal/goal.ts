@@ -113,9 +113,9 @@ export const layer = Layer.effect(
         sessionID,
         goal: {
           goal: state.goal,
-          status: state.status as "active" | "paused" | "done",
-          turnsUsed: Number(state.turns_used),
-          maxTurns: Number(state.max_turns),
+          status: state.status,
+          turnsUsed: state.turns_used,
+          maxTurns: state.max_turns,
           subgoals: state.subgoals ?? [],
           ...(state.paused_reason !== undefined ? { pausedReason: state.paused_reason } : {}),
         },
@@ -434,7 +434,7 @@ export const layer = Layer.effect(
         }
       }
 
-      const turnsUsed = GoalState.nni(Number(state.turns_used) + 1)
+      const turnsUsed = GoalState.nni(state.turns_used + 1)
 
       if (newParseFailures >= GoalPrompts.MAX_CONSECUTIVE_PARSE_FAILURES) {
         const pauseReason =
@@ -571,7 +571,7 @@ export const layer = Layer.effect(
         // Without a warning the user sees "已恢复" then the same pause
         // text a second later, which looks like resume didn't work.
         const announceMsg =
-          Number(result.turns_used) >= Number(result.max_turns)
+          result.turns_used >= result.max_turns
             ? `⚠ 目标已恢复，但预算已耗尽（${result.turns_used}/${result.max_turns} 轮）。下一轮 judge 会立刻再次判定超预算暂停。建议 /goal clear 后重新 /goal <text>，或在 /goal set 时传更大的 maxTurns。`
             : undefined
         return {

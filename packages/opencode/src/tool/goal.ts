@@ -41,7 +41,7 @@ export const GoalTool = Tool.define<typeof Parameters, Metadata, never>(
     return {
       description: DESCRIPTION,
       parameters: Parameters,
-      execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context<Metadata>) =>
+      execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context) =>
         Effect.gen(function* () {
           // Goal state belongs to the session itself; it is not an external
           // resource boundary (no filesystem, no network, no cross-session
@@ -69,7 +69,7 @@ export const GoalTool = Tool.define<typeof Parameters, Metadata, never>(
                 metadata: { goal: null },
               }
             }
-            const remaining = Math.max(0, Number(state.max_turns) - Number(state.turns_used))
+            const remaining = Math.max(0, state.max_turns - state.turns_used)
             const subgoals = state.subgoals ?? []
             const line = [
               `Goal: ${state.goal}`,
@@ -92,9 +92,9 @@ export const GoalTool = Tool.define<typeof Parameters, Metadata, never>(
               metadata: {
                 goal: {
                   text: state.goal,
-                  status: state.status as "active" | "paused" | "done",
-                  turnsUsed: Number(state.turns_used),
-                  maxTurns: Number(state.max_turns),
+                  status: state.status,
+                  turnsUsed: state.turns_used,
+                  maxTurns: state.max_turns,
                   subgoals,
                   pausedReason: state.paused_reason,
                 },
@@ -136,13 +136,13 @@ export const GoalTool = Tool.define<typeof Parameters, Metadata, never>(
               goal: {
                 text: displayState.goal,
                 status: "done" as const,
-                turnsUsed: Number(displayState.turns_used),
-                maxTurns: Number(displayState.max_turns),
+                turnsUsed: displayState.turns_used,
+                maxTurns: displayState.max_turns,
                 subgoals: displayState.subgoals ?? [],
               },
             },
           }
         }),
-    } satisfies Tool.DefWithoutID<typeof Parameters, Metadata>
+    } satisfies Tool.DefWithoutID<typeof Parameters>
   }),
 )

@@ -98,8 +98,8 @@ export function renderContinuation(input: ContinuationInput): string {
 // Renders the dynamic system-prompt fragment for an active/paused goal.
 // Pure: injected into the system prompt by SystemPrompt.goal(sessionID).
 export function renderGoalSystemBlock(state: GoalState.Info): string {
-  const turnsUsed = Number(state.turns_used)
-  const maxTurns = Number(state.max_turns)
+  const turnsUsed = state.turns_used
+  const maxTurns = state.max_turns
   const remaining = Math.max(0, maxTurns - turnsUsed)
   const subgoals = state.subgoals ?? []
   const lines = [

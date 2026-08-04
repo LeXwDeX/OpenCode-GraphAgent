@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { Deferred, Effect, Fiber, Layer } from "effect"
+import { Deferred, Effect, Layer } from "effect"
 import { GoalLoop } from "@/goal/loop"
 import { Goal } from "@/goal/goal"
 import { GoalPrompts } from "@/goal/prompts"
