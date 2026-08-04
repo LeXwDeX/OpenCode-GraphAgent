@@ -1,0 +1,229 @@
+title: "Deep diff review (continuation): reuse 8 completed waves, re-run timed-out verify-claims"
+mode: deep
+admission:
+  brief_revision: 1
+  qa_mode: LIGHT
+  verdict: READY
+  brief:
+    goal: "Continue the failed deep diff review workflow dag_039602a9fffesslSA479Re5hEt: verify-claims timed out (environmental 'timeout' class, not a task error). Reuse all 8 completed node outputs on disk; re-run only verify-claims with a larger budget, then arbitrate and finalize."
+    scope:
+      in:
+        - "verify-claims over the 8 persisted upstream reports in .opencode/.dag-specs/review-parts-diff/ (fresh-context claim verification against actual code)"
+        - "arbitrate: PASS/LOOP/BLOCKED on verified evidence incl. verify-suite gate results"
+        - "continuation: deep-dive (LOOP) or finalize-review (PASS)"
+      out:
+        - "re-running scope-diff or any reviewer wave (outputs reused, never re-executed)"
+    constraints:
+      - "read-only: reviewers/verifiers must not modify any file"
+      - "upstream report files are read-only inputs"
+    assumptions:
+      - "the 8 persisted reports are complete and trustworthy (extracted from completed nodes of the failed workflow)"
+      - "reused_nodes: scope-diff, review-dataflow, review-runtime, review-contract, review-prompts, review-tests, review-style, verify-suite (verdict PASS)"
+      - "verify-claims timeout at 600000ms was environmental (reviewer-volume saturation); budget raised to 1800000ms"
+    acceptance_criteria:
+      - "every material claim verified with CONFIRMED/REFUTED/PARTIALLY_CONFIRMED/UNRESOLVABLE against file:line"
+      - "no unresolved CRITICAL/HIGH"
+      - "arbiter emits structured PASS/LOOP/BLOCKED verdict"
+      - "reference prune manifest audited"
+    evidence_required:
+      - "file:line citations verified against source"
+      - "persisted verify-suite gate results (all PASS) as objective evidence"
+    risks:
+      - "upstream reports may contain reviewer misreadings — verify wave must check independently"
+      - "verify-claims may time out again despite larger budget"
+    review_plan:
+      - "verify-claims reads the 8 persisted reports + checks claims against code"
+      - "arbitrate rules on verified evidence (PASS/LOOP/BLOCKED, report_to_parent)"
+      - "LOOP -> deep-dive replan proposal; PASS -> finalize-review publishes the report"
+    open_questions: []
+    blocking_questions: []
+config:
+  name: deep-review-diff-error-class-continue
+  max_concurrency: 2
+  max_node_replan_attempts: 2
+  max_total_nodes: 10
+  node_defaults:
+    required: false
+    report_to_parent: false
+    worker_config:
+      timeout_ms: 900000
+  nodes:
+    # Continuation graph: scope-diff + 6 reviewers + verify-suite COMPLETED in
+    # workflow dag_039602a9fffesslSA479Re5hEt; outputs persisted at
+    # .opencode/.dag-specs/review-parts-diff/. Only verify-claims (which timed
+    # out) re-runs, with a 30-minute budget.
+    - id: verify-claims
+      name: "Verify Disputed Claims (from persisted reports)"
+      worker_type: general
+      depends_on: []
+      required: true
+      worker_config:
+        timeout_ms: 1800000
+      output_schema:
+        type: object
+        required: [verdict, verified_claims, disputed_findings_resolution, critical_findings_status, coverage_gaps, evidence_quality, prune_audit]
+        properties:
+          verdict:
+            type: string
+            enum: [VERIFIED, GAPS, BLOCKED]
+          verified_claims: { type: array, items: { type: object } }
+          disputed_findings_resolution: { type: array, items: { type: object } }
+          critical_findings_status: { type: array, items: { type: object } }
+          coverage_gaps: { type: array, items: { type: object } }
+          evidence_quality: { type: string }
+          prune_audit: { type: array, items: { type: object } }
+      prompt_template:
+        inline: |
+          You are a CLAIM VERIFIER (fresh context). Read-only — do not modify any file.
+
+          The scope wave (1 node), review wave (6 nodes), and objective gate runner
+          (verify-suite) already COMPLETED in the prior workflow; their reports are
+          persisted. Read them ALL first:
+          - .opencode/.dag-specs/review-parts-diff/scope-diff.md (change map + REFERENCE MANIFEST with prune decisions)
+          - .opencode/.dag-specs/review-parts-diff/review-dataflow.md
+          - .opencode/.dag-specs/review-parts-diff/review-runtime.md
+          - .opencode/.dag-specs/review-parts-diff/review-contract.md
+          - .opencode/.dag-specs/review-parts-diff/review-prompts.md
+          - .opencode/.dag-specs/review-parts-diff/review-tests.md
+          - .opencode/.dag-specs/review-parts-diff/review-style.md
+          - .opencode/.dag-specs/review-parts-diff/verify-suite.md (objective gates: verdict PASS)
+
+          The review target is the uncommitted working-tree diff (`git diff HEAD`).
+          Your job:
+          1. Extract every unverified_claims item, every reviewer disagreement, and
+             ALL CRITICAL/HIGH findings from the six reviewer reports.
+          2. Verify each against the actual source at the cited file:line:
+             CONFIRMED / REFUTED / PARTIALLY_CONFIRMED / UNRESOLVABLE (cite exact line).
+          3. Every factual claim in review-prompts about runtime semantics MUST be
+             checked against code — those prompts steer parent-agent repair decisions.
+          4. Sample MEDIUM/LOW claims instead of trusting self-report.
+          5. Audit the reference manifest from scope-diff.md: each prune must carry
+             prune_reason + replacement_coverage; record results in prune_audit.
+          6. Audit scope coverage: any diff area with no evidence-bearing report is a gap.
+
+          Verdict:
+          - VERIFIED: every material scope/criterion covered, no material claim unresolved
+          - GAPS: a bounded fresh review can close named gaps
+          - BLOCKED: required evidence cannot be obtained
+
+          Submit the structured result via submit_result. coverage_gaps must name the
+          missing scope, evidence, and the smallest reviewer lane to add in a LOOP.
+
+    - id: arbitrate
+      name: "Arbiter: Final Verdict"
+      worker_type: general
+      depends_on: [verify-claims]
+      required: true
+      report_to_parent: true
+      output_schema:
+        type: object
+        required: [verdict, reason, evidence, findings, loop_scope, stop_reason, next_action, prune_decisions]
+        properties:
+          verdict:
+            type: string
+            enum: [PASS, LOOP, BLOCKED]
+          reason: { type: string }
+          evidence:
+            type: array
+            items: { type: string }
+          findings:
+            type: array
+            items:
+              type: object
+              required: [severity, title, evidence, status]
+              properties:
+                severity:
+                  type: string
+                  enum: [CRITICAL, HIGH, MEDIUM, LOW]
+                title: { type: string }
+                description: { type: string }
+                evidence: { type: string }
+                status:
+                  type: string
+                  enum: [CONFIRMED, REFUTED, PARTIALLY_CONFIRMED]
+                recommendation: { type: string }
+          loop_scope:
+            type: array
+            items: { type: string }
+          stop_reason:
+            type: string
+            enum: [goal_met, correction_required, evidence_missing, no_progress, round_cap, budget_cap]
+          next_action:
+            type: string
+            enum: [finalize, replan, stop]
+          prune_decisions:
+            type: array
+            items:
+              type: object
+              required: [node, prune_reason, replacement_coverage]
+              properties:
+                node: { type: string }
+                prune_reason: { type: string }
+                replacement_coverage: { type: string }
+      prompt_template:
+        inline: |
+          You are the ARBITER for this deep review of the uncommitted diff. You rule on
+          VERIFIED evidence only.
+
+          Evidence base:
+          - The verify-claims structured output (primary — it verified reviewer claims
+            against code in fresh context).
+          - Persisted upstream reports in .opencode/.dag-specs/review-parts-diff/
+            (read verify-suite.md for the objective gate results — verdict PASS — and
+            any reviewer report needed for context).
+
+          Your job:
+          1. For each CONFIRMED finding, assess true severity (reviewers may over/under-rate)
+          2. Discard REFUTED claims; correct PARTIALLY_CONFIRMED descriptions
+          3. Deduplicate findings sharing a root cause; rank by impact
+          4. A broken prompt-guidance factual claim is at least HIGH (it mis-steers
+             future parent-agent repair decisions); any real objective-gate failure is
+             at least HIGH (verify-suite reported PASS — treat contradictions with it
+             as disputes to resolve from evidence)
+          5. Audit prune_decisions from the scope manifest (via verify-claims prune_audit);
+             missing prune_reason/replacement_coverage forbids PASS
+          6. Verdict:
+             - PASS: no unresolved material finding; scope and evidence coverage complete
+             - LOOP: a bounded targeted review can resolve specific omissions/disputes
+             - BLOCKED: evidence insufficient, critical contradiction unresolved, or ceiling reached
+          7. LOOP names the minimal new scope in loop_scope; never rerun completed waves
+          8. State reason, evidence, stop_reason, next_action explicitly
+
+          Parent disposal contract: PASS -> finalize; LOOP -> pause/replan/resume fresh
+          targeted nodes; BLOCKED -> stop. Submit via submit_result.
+
+    - id: deep-dive
+      name: "Plan the bounded fresh review loop"
+      worker_type: general
+      depends_on: [arbitrate]
+      condition: 'arbitrate.output.verdict == "LOOP"'
+      required: true
+      report_to_parent: true
+      prompt_template:
+        inline: |
+          The arbiter required LOOP. Produce a minimal replan fragment proposal for a
+          NEW local review wave. Include only the missing or disputed scope from the
+          arbiter's loop_scope, assign NEW node IDs, preserve real artifact
+          dependencies, add a fresh verifier and a new arbiter, and stay within the
+          workflow caps. Read-only: do not fix code. Reused completed outputs live in
+          .opencode/.dag-specs/review-parts-diff/ — never propose re-running them.
+
+          Return the loop reason, new nodes, dependencies, evidence each node must
+          collect, acceptance condition, and stop reason.
+
+    - id: finalize-review
+      name: "Publish the accepted deep-review report"
+      worker_type: general
+      depends_on: [arbitrate]
+      condition: 'arbitrate.output.verdict == "PASS"'
+      required: true
+      report_to_parent: true
+      prompt_template:
+        inline: |
+          Publish the final evidence-backed review report for the uncommitted diff.
+          Include: scope coverage, confirmed findings (severity-ranked with file:line
+          evidence), discarded/refuted claims, objective gate results (verify-suite),
+          residual low-risk issues, and the final PASS reason. Source material:
+          arbiter verdict, verify-claims output, and the persisted reports in
+          .opencode/.dag-specs/review-parts-diff/. Do not introduce new findings or
+          claims that were not verified upstream.

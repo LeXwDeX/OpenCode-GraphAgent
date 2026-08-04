@@ -227,6 +227,10 @@ describe("DagLoop replan vs stale NodeFailed", () => {
             "replacement graph did not settle",
           )
           expect(state.workflow?.status).toBe("running")
+          const cancelled = yield* store.getNode(dagID, "a")
+          expect(cancelled?.status).toBe("failed")
+          expect(cancelled?.errorReason).toBe("cancelled via replan")
+          expect(cancelled?.errorClass).toBeNull()
           const replacement = yield* takeWithin(childPrompts, "replacement b did not start")
           expect(replacement.title).toBe("b")
           expect(state.replacement?.status).toBe("running")
@@ -316,6 +320,51 @@ describe("DagLoop replan vs stale NodeFailed", () => {
           // workflow-fail terminalization skipped it.
           expect((yield* store.getNode(dagID, "b"))?.status).toBe("skipped")
           expect(Option.isNone(yield* Queue.poll(childPrompts))).toBe(true)
+          const parent = yield* takeWithin(parentPrompts, "failure wake did not reach the parent")
+          yield* Deferred.succeed(parent.release, "success")
+        }),
+      ),
+    )
+  })
+
+  it("keeps dependents pending while paused; terminalizes them to skipped on resume after a required failure", async () => {
+    await Effect.runPromise(
+      runLoopTest(({ dag, store, childPrompts, parentPrompts }) =>
+        Effect.gen(function* () {
+          const dagID = yield* dag.create({
+            projectID: "project-1",
+            sessionID: "ses_parent",
+            title: "Paused required failure",
+            config: { name: "paused-required-failure", nodes: [node("a"), node("b", ["a"])] },
+          })
+          const gate = yield* takeWithin(childPrompts, "a did not start")
+          expect(gate.title).toBe("a")
+
+          // Pause first, then fail the required node. A paused workflow cannot
+          // transition to failed, so the dependent must stay pending (no
+          // skipped terminalization) until the scheduler evaluates on resume.
+          yield* dag.pause(dagID)
+          yield* Deferred.succeed(gate.release, "")
+
+          yield* pollWithTimeout(
+            store.getNode(dagID, "a").pipe(
+              Effect.map((current) => current?.status === "failed" ? current : undefined),
+            ),
+            "required node did not fail while the workflow was paused",
+          )
+          expect((yield* store.getWorkflow(dagID))?.status).toBe("paused")
+          expect((yield* store.getNode(dagID, "b"))?.status).toBe("pending")
+
+          yield* dag.resume(dagID)
+          yield* pollWithTimeout(
+            store.getWorkflow(dagID).pipe(
+              Effect.map((workflow) => workflow?.status === "failed" ? workflow : undefined),
+            ),
+            "workflow did not fail after resuming with a required failure",
+          )
+          const nodeB = yield* store.getNode(dagID, "b")
+          expect(nodeB?.status).toBe("skipped")
+          expect(nodeB?.errorReason).toBe("workflow_failed")
           const parent = yield* takeWithin(parentPrompts, "failure wake did not reach the parent")
           yield* Deferred.succeed(parent.release, "success")
         }),

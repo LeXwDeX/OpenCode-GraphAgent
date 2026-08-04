@@ -10,12 +10,13 @@ If the content inside `<dag-flow-task>` is empty or contains only whitespace, as
 
 For a non-empty task:
 
-1. Before starting, classify the task as `brainstorm`, `review`, or `develop`, then select the closest project reference topology:
-   - design documents, requirement deep-dives, architecture decisions, or design-level debugging → `.opencode/workflows/design-decision-loop.yaml`
-   - end-to-end implementation with multiple modules, wiring, tests, and review → `.opencode/workflows/parallel-development-loop.yaml`
-   - deep review of an already-built module, subsystem, or codebase → `.opencode/workflows/deep-review-dag-module.yaml`
+1. Before starting, classify the task as `brainstorm`, `review`, or `develop`, then select the closest reference topology from the workflow library. Saved workflow names resolve through three scopes (first match wins): project `.opencode/workflows/`, global `<opencode config dir>/workflows/` (curated by the `opencode-dag-config` repo), then the builtin templates embedded in release binaries.
+   Run `workflow(action: "list")` to see every template that actually resolves in this environment with its scope, then pick by NAME:
+   - design documents, requirement deep-dives, architecture decisions, or design-level debugging → saved workflow `design-decision-loop`
+   - end-to-end implementation with multiple modules, wiring, tests, and review → saved workflow `parallel-development-loop`
+   - deep review of an already-built module, subsystem, or codebase → saved workflow `deep-review-dag-module`
    - a small bounded working-tree change review → saved workflow `change-review`
-   - no close match → compose the smallest fresh graph; do not force an unrelated reference
+   - none of the above names resolves (bare dev checkout without the config repo) → compose the smallest fresh graph; do not force an unrelated reference
 2. Treat the selected YAML as a reviewed topology reference, not as a script to replay blindly. Start a saved workflow by name only when its embedded target and inputs already match the request. Otherwise read the reference, derive a one-off YAML, inject the complete `/dag-flow` task into its root planning/exploration prompt, retarget its lanes, and pass that file to `workflow(action=start)`.
 3. The derived graph may expand or prune non-protected lanes. Record the selected `reference_template`, every added node, and every prune as `{node, prune_reason, replacement_coverage}` in the first planning/exploration artifact; require the next fresh review gate to audit that manifest. Missing prune evidence is fail-closed.
 4. Preserve the selected reference's protected spine: fresh-context local review, deterministic/evidence verification where applicable, one final arbiter, and PASS-only finalization. Gates return `PASS | LOOP | BLOCKED` with reason, evidence, minimal `loop_scope`, and `stop_reason`. `LOOP` means pause → replan new local correction/review nodes → resume; never create a cycle or restart terminal nodes.
@@ -28,5 +29,15 @@ For a non-empty task:
 11. The workflow runs asynchronously and wakes this parent session when attention or a terminal result is ready. Do not poll it with `action=status`, sleep, retry, or loop merely to wait. End the current response after the brief success report.
 12. On failure, state that the workflow was not started and report the actual error. Never invent a Workflow ID or start a replacement workflow unless the user explicitly asked for automatic retries.
 13. A completed aggregate node must actually contain the requested synthesis. Never describe unresolved placeholders or an aggregate-node error message as a successful final result.
+
+## Resume-first: continue an interrupted workflow before restarting
+
+When the current task maps to a previously interrupted workflow (same task retried or resumed), the default instinct to "restart the whole graph" is usually wrong — completed node outputs are durable and reusable. First read `workflow(action=status)` on the prior workflow: every failed node carries `error_class` (runtime classes: timeout / exec_failed / verdict_fail) plus `error_reason` — except nodes cancelled via replan (failed with reason "cancelled via replan", no error_class) and rows written before the error_class migration — triage per the Node failure triage section in the workflow guidance, then recover in this order, and only fall back to a full restart when nothing reusable exists:
+
+1. **Paused recovery (crash recovery)**: if the prior workflow is `paused`, never open a new one. The failed node is terminal and immutable — add a replacement node under a NEW id, rewire its pending dependents' `depends_on` to the new id, then `control(resume)`. Downstream nodes stay pending and keep their state.
+2. **Continue from completed waves**: if the prior workflow is terminal (`failed` or `cancelled`) but has nodes that `completed` before the failure, their final outputs are still valid. Extract each completed node's output (its final text result, e.g. from the node session's persisted parts or any artifact it wrote) and compile a **continuation spec** that starts at the first unfinished wave. Inject the reused outputs as static context into the downstream node prompts (do not re-run them), add only the missing nodes, and `workflow(action=start)` it. Record `reused_nodes` in the manifest.
+3. **Full restart**: only when no completed-node output is reusable — zero completed nodes, or their outputs are empty/irrelevant to the remaining work — re-derive the full graph and start it.
+
+Fail-closed guard: before starting a continuation, verify every reused output is present and non-empty; if extraction is incomplete, fall back to the affected node's fresh run rather than silently continuing on empty input. Never discard completed work to rerun it from zero unless extraction genuinely fails.
 
 Use the orchestration guidance below to design and manage the workflow.

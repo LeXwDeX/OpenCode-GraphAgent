@@ -1,0 +1,255 @@
+title: DAG Module Deep Review
+config:
+  name: dag-module-review
+  max_concurrency: 5
+  max_node_replan_attempts: 3
+  max_total_nodes: 20
+  node_defaults:
+    required: false
+    report_to_parent: false
+    worker_config:
+      timeout_ms: 600000
+  nodes:
+    - id: explore-dag
+      name: explore-dag
+      worker_type: explore
+      depends_on: []
+      required: true
+      prompt_template:
+        inline: |
+          Map the DAG module at packages/opencode/src/dag/ in this repository.
+
+          The module has 13 source files across these clusters:
+          - Core workflow control: dag.ts (withWorkflowLock, pause, resume, step, cancel, complete, parseWorkflowConfig, normalizeModel, computeMergedConfig)
+          - Configuration: config.ts (load, tierModel, globalConfigDir)
+          - Model resolution: model.ts (resolve)
+          - Admission QA: admission.ts (transitionAdmission, fingerprintBrief, createAdmissionRecord, validateAdmission, evaluateQa, projectBriefForNode)
+          - Review lifecycle: review-lifecycle.ts (validateReviewLifecycle, validateReviewExecutionInput, reviewImplementationFingerprint, isReviewWorker)
+          - Templates: templates/resolve.ts, templates/sanitize.ts (renderTemplate, sanitizeInput, preserveEvidence)
+          - Runtime: runtime/spawn.ts (spawnNode), runtime/loop.ts, runtime/recovery.ts (settle), runtime/capture.ts (registerCaptureSlot), runtime/eval.ts (evaluateCondition, resolveInputMapping), runtime/summary-publisher.ts (schedulePublish)
+
+          Tests are in packages/opencode/test/dag/ (25 test files).
+
+          Your task:
+          1. Read each source file and produce a responsibility map: file → public API → internal dependencies → external dependencies (imports from outside src/dag/).
+          2. Identify the dependency direction between clusters. Flag any circular or upward dependencies.
+          3. List all cross-module consumers: who outside src/dag/ imports from this module?
+          4. Note any files that appear under-tested or over-tested relative to their complexity.
+
+          Output a structured inventory with file paths and line numbers for key exports.
+
+    - id: review-arch
+      name: review-arch
+      worker_type: general
+      depends_on: [explore-dag]
+      prompt_template:
+        inline: |
+          You are the PROSECUTOR in an adversarial architecture review of the DAG module at packages/opencode/src/dag/.
+
+          Your mandate: argue the structure is WRONG. Focus on:
+          - Coupling violations: clusters that should be independent but share state or call each other
+          - Hidden invariants: assumptions that are enforced by convention rather than types or runtime checks
+          - Failure modes: what happens when withWorkflowLock contention occurs, when spawn fails mid-graph, when recovery races with a live scheduler
+          - Layer violations: runtime/ depending on dag.ts control flow, or templates/ reaching into runtime state
+          - Missing abstractions: god-objects, files doing too much, logic that should be extracted
+
+          Use the exploration inventory as your starting point: {{explore-dag}}
+
+          RULES:
+          - Every finding MUST cite file:line evidence from the actual source code
+          - Read the source files directly to verify your claims
+          - List any claim you could NOT verify as unverified_claims with the reason
+          - Severity: CRITICAL (data loss/corruption), HIGH (incorrect behavior), MEDIUM (maintainability), LOW (style)
+
+          Output format:
+          ## Findings
+          [numbered list with severity, file:line, description, evidence]
+
+          ## unverified_claims
+          [claims you made but could not confirm from code, with reason]
+
+    - id: review-logic
+      name: review-logic
+      worker_type: general
+      depends_on: [explore-dag]
+      prompt_template:
+        inline: |
+          You are a CORRECTNESS reviewer for the DAG module at packages/opencode/src/dag/.
+
+          Your mandate: find logic bugs, race conditions, and edge-case failures. Focus on:
+          - State machine correctness: admission transitions (admission.ts), workflow status transitions in dag.ts
+          - Concurrency: withWorkflowLock implementation, can two operations interleave incorrectly? Does recovery.ts race with loop.ts?
+          - Condition evaluation: eval.ts edge cases (undefined references, circular conditions, type coercion)
+          - Loop termination: can the execution loop in runtime/loop.ts get stuck? Are guard counters correct?
+          - Schema validation: can invalid payloads pass validateAgainstSchema? Are error paths handled?
+          - Recovery semantics: does settle() in recovery.ts correctly handle all crash states? Can it lose node results?
+
+          Use the exploration inventory as your starting point: {{explore-dag}}
+
+          RULES:
+          - Every finding MUST cite file:line evidence from the actual source code
+          - Read the source files directly, trace execution paths
+          - List any claim you could NOT verify as unverified_claims with the reason
+          - Severity: CRITICAL (data loss/corruption), HIGH (incorrect behavior), MEDIUM (edge case), LOW (theoretical)
+
+          Output format:
+          ## Findings
+          [numbered list with severity, file:line, description, evidence]
+
+          ## unverified_claims
+          [claims you made but could not confirm from code, with reason]
+
+    - id: review-style
+      name: review-style
+      worker_type: general
+      depends_on: [explore-dag]
+      prompt_template:
+        inline: |
+          You are a CONVENTIONS reviewer for the DAG module at packages/opencode/src/dag/.
+
+          Your mandate: check adherence to the project's documented coding standards from AGENTS.md. Focus on:
+          - Import conventions: no aliases, no star imports, prefer dynamic imports for heavy modules
+          - Variable style: const over let, ternaries over reassignment, no unnecessary destructuring
+          - Control flow: early returns over else, no try/catch where avoidable
+          - Effect patterns: services bound to named variables before method calls, no nested service yields
+          - Type safety: no `any`, rely on type inference where possible
+          - Comments: should only exist for non-obvious constraints (flag unnecessary comments)
+          - Schema/Drizzle: snake_case field names (if applicable)
+          - Helper extraction: single-use helpers should be inlined; helpers should not return Effect unless effectful
+
+          Use the exploration inventory as your starting point: {{explore-dag}}
+
+          RULES:
+          - Every finding MUST cite file:line evidence from the actual source code
+          - Read the source files directly
+          - List any claim you could NOT verify as unverified_claims with the reason
+          - Severity: HIGH (violates explicit AGENTS.md rule), MEDIUM (violates spirit), LOW (inconsistency)
+
+          Output format:
+          ## Findings
+          [numbered list with severity, file:line, description, evidence]
+
+          ## unverified_claims
+          [claims you made but could not confirm from code, with reason]
+
+    - id: verify-claims
+      name: verify-claims
+      worker_type: explore
+      depends_on: [review-arch, review-logic, review-style]
+      prompt_template:
+        inline: |
+          You are the CLAIM VERIFIER. Three reviewers produced findings about the DAG module at packages/opencode/src/dag/.
+
+          Architecture prosecutor findings:
+          {{review-arch}}
+
+          Correctness reviewer findings:
+          {{review-logic}}
+
+          Conventions reviewer findings:
+          {{review-style}}
+
+          Your task:
+          1. Collect ALL items from every reviewer's unverified_claims section
+          2. Collect all CRITICAL and HIGH severity findings
+          3. For each item, read the actual source code at the cited file:line and determine: CONFIRMED (evidence supports the claim), REFUTED (evidence contradicts it), or PARTIAL (partially true, explain)
+          4. For disputed claims between reviewers (one says X, another implies not-X), resolve the conflict with evidence
+
+          Output format:
+          ## Verification Results
+          [for each claim: reviewer source, claim summary, file:line checked, verdict (CONFIRMED/REFUTED/PARTIAL), evidence]
+
+          ## Conflicts Resolved
+          [where reviewers disagreed, state who was right and why]
+
+          ## Remaining Uncertain
+          [claims that remain genuinely uncertain after your check, with reason]
+
+    - id: arbitrate
+      name: arbitrate
+      worker_type: general
+      depends_on: [verify-claims]
+      required: true
+      report_to_parent: true
+      output_schema:
+        type: object
+        required: [verdict, summary, findings, required_actions, next_action]
+        properties:
+          verdict:
+            type: string
+            enum: [ACCEPT, REVISE, REJECT, BLOCKED]
+          summary:
+            type: string
+          findings:
+            type: array
+            items:
+              type: object
+              properties:
+                severity:
+                  type: string
+                file:
+                  type: string
+                description:
+                  type: string
+                verified:
+                  type: boolean
+          required_actions:
+            type: array
+            items:
+              type: string
+          next_action:
+            type: object
+            required: [operation, targets]
+            properties:
+              operation:
+                type: string
+                enum: [continue, extend, replan, complete, stop]
+              targets:
+                type: array
+                items:
+                  type: string
+      prompt_template:
+        inline: |
+          You are the ARBITER for the DAG module review. Rule on VERIFIED evidence only.
+
+          The claim verifier's results:
+          {{verify-claims}}
+
+          Your task:
+          1. Discard any finding that was REFUTED by the verifier
+          2. For CONFIRMED and PARTIAL findings, rule finding-by-finding: is this a real issue requiring action?
+          3. Deduplicate findings that describe the same root cause
+          4. Rank by severity and impact
+          5. Emit a structured verdict:
+             - ACCEPT: no CRITICAL/HIGH issues remain after verification
+             - REVISE: CRITICAL/HIGH issues confirmed but bounded and actionable
+             - REJECT: systemic issues requiring redesign
+             - BLOCKED: cannot determine without additional information
+          6. For each confirmed finding in the output, set verified=true; for any you include from PARTIAL, set verified=false
+          7. required_actions: concrete, file-specific fixes
+          8. next_action: if ACCEPT → operation=complete; if REVISE → operation=extend with targets being the files to fix; if REJECT → operation=replan
+
+          Call submit_result with your structured verdict.
+
+    - id: deep-dive
+      name: deep-dive
+      worker_type: general
+      depends_on: [arbitrate]
+      condition: 'arbitrate.output.verdict != "ACCEPT"'
+      report_to_parent: true
+      prompt_template:
+        inline: |
+          The arbiter did not accept the DAG module review. Its verdict and findings:
+          {{arbitrate}}
+
+          Your task:
+          1. For each required_action, read the actual code at the cited location
+          2. Produce a concrete, implementable fix proposal for each action:
+             - Exact file and line range to modify
+             - What the code currently does (quote it)
+             - What it should do instead
+             - Why the fix is safe (what invariants it preserves)
+          3. If any finding is actually a false positive on closer inspection, say so and explain
+          4. Rank the fixes by priority (CRITICAL first)
+
+          Output a prioritized fix plan that a developer can execute directly.

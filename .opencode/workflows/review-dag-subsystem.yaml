@@ -1,0 +1,206 @@
+title: "DAG Subsystem Review"
+config:
+  name: dag-subsystem-review
+  max_concurrency: 5
+  max_node_replan_attempts: 3
+  node_defaults:
+    required: false
+    report_to_parent: false
+    worker_config:
+      timeout_ms: 600000
+  nodes:
+    - id: explore-structure
+      name: explore-structure
+      worker_type: explore
+      depends_on: []
+      required: true
+      prompt_template:
+        inline: |
+          Explore the DAG orchestration subsystem at packages/opencode/src/dag/.
+          Map:
+          1. All files and their responsibilities (one line each)
+          2. Internal module boundaries and dependency direction between files
+          3. Public API surface (exports consumed by other packages/modules)
+          4. External dependencies (what this subsystem imports from outside)
+          Output a structured inventory with file paths.
+
+    - id: explore-runtime
+      name: explore-runtime
+      worker_type: explore
+      depends_on: []
+      required: true
+      prompt_template:
+        inline: |
+          Explore the runtime behavior of the DAG subsystem at packages/opencode/src/dag/.
+          Map:
+          1. Entry points: how workflows are created, started, and scheduled
+          2. State machine: workflow and node lifecycle states, transitions
+          3. Concurrency model: how parallel nodes execute, locking, coordination
+          4. Error handling and recovery: crash recovery, replan, pause/resume
+          5. Integration points: how the DAG connects to sessions, tools, events
+          Output structured findings with file:line references.
+
+    - id: review-arch
+      name: review-arch
+      worker_type: review
+      depends_on: [explore-structure, explore-runtime]
+      prompt_template:
+        inline: |
+          Architecture review of the DAG subsystem at packages/opencode/src/dag/.
+          Focus:
+          - Layering violations and dependency direction
+          - Coupling between modules (circular deps, god objects)
+          - Separation of concerns (state vs execution vs persistence)
+          - Extension points and their adequacy
+          - Whether the module boundaries match the conceptual model
+
+          RULES:
+          - Cite file:line for every finding
+          - List claims you could not verify as unverified_claims
+          - Do NOT modify any file
+          Output: findings list with severity (HIGH/MEDIUM/LOW), evidence, and unverified_claims section.
+
+    - id: review-logic
+      name: review-logic
+      worker_type: review
+      depends_on: [explore-structure, explore-runtime]
+      prompt_template:
+        inline: |
+          Logic correctness review of the DAG subsystem at packages/opencode/src/dag/.
+          Focus:
+          - State machine completeness: unreachable states, missing transitions
+          - Race conditions in concurrent node scheduling
+          - Edge cases: empty graphs, single node, max concurrency boundaries
+          - Error propagation: does a node failure correctly affect dependents?
+          - Replan/recovery correctness: can state become inconsistent?
+          - Condition evaluation and skip semantics
+
+          RULES:
+          - Cite file:line for every finding
+          - List claims you could not verify as unverified_claims
+          - Do NOT modify any file
+          Output: findings list with severity (HIGH/MEDIUM/LOW), evidence, and unverified_claims section.
+
+    - id: review-conventions
+      name: review-conventions
+      worker_type: review
+      depends_on: [explore-structure, explore-runtime]
+      prompt_template:
+        inline: |
+          Code style and conventions review of the DAG subsystem at packages/opencode/src/dag/.
+          Check against the project AGENTS.md style guide:
+          - No unnecessary destructuring (prefer dot notation)
+          - No import aliases or star imports
+          - const over let, ternaries over reassignment
+          - No else statements (prefer early returns)
+          - Effect conventions: named service bindings, no nested yields
+          - Drizzle schema: snake_case fields
+          - Single-use helpers should be inlined
+          - Prefer Bun APIs
+          - No comments unless non-obvious constraints
+
+          RULES:
+          - Cite file:line for every finding
+          - List claims you could not verify as unverified_claims
+          - Do NOT modify any file
+          Output: findings list with severity (HIGH/MEDIUM/LOW), evidence, and unverified_claims section.
+
+    - id: verify-claims
+      name: verify-claims
+      worker_type: general
+      depends_on: [review-arch, review-logic, review-conventions]
+      required: true
+      prompt_template:
+        inline: |
+          You are the claim verification step. Three reviewers produced findings about
+          packages/opencode/src/dag/. Your job:
+
+          1. Collect all unverified_claims from all three reviews
+          2. Collect all HIGH severity findings
+          3. For each, open the actual source code and verify whether the claim is TRUE, FALSE, or PARTIALLY TRUE
+          4. For disputed findings (where reviewers disagree), check the code and state which is correct
+
+          RULES:
+          - Read the actual files. Do not speculate.
+          - For each claim, output: claim text, source file:line, verdict (CONFIRMED/REFUTED/PARTIAL), evidence
+          - Do NOT modify any file
+
+          Upstream reviews:
+          {{review-arch}}
+          {{review-logic}}
+          {{review-conventions}}
+
+    - id: arbitrate
+      name: arbitrate
+      worker_type: general
+      depends_on: [verify-claims]
+      required: true
+      report_to_parent: true
+      output_schema:
+        type: object
+        required: [verdict, summary, findings, required_actions, next_action]
+        properties:
+          verdict:
+            type: string
+            enum: [ACCEPT, REVISE, REJECT, BLOCKED]
+          summary:
+            type: string
+          findings:
+            type: array
+            items:
+              type: object
+              properties:
+                severity: { type: string }
+                description: { type: string }
+                evidence: { type: string }
+                verified: { type: boolean }
+          required_actions:
+            type: array
+            items: { type: string }
+          next_action:
+            type: object
+            required: [operation, targets]
+            properties:
+              operation:
+                type: string
+                enum: [continue, extend, replan, complete, stop]
+              targets:
+                type: array
+                items: { type: string }
+      prompt_template:
+        inline: |
+          You are the final arbiter for the DAG subsystem review.
+
+          Based on the verified claims, rule finding-by-finding:
+          1. Only include findings that were CONFIRMED or PARTIAL in the verification step
+          2. Deduplicate overlapping findings across reviewers
+          3. Rank by severity and impact
+          4. Emit a structured verdict:
+             - ACCEPT: no HIGH findings survived verification
+             - REVISE: HIGH findings exist but are fixable with targeted changes
+             - REJECT: fundamental design issues require rethinking
+             - BLOCKED: cannot determine without additional information
+          5. Provide required_actions (concrete fix steps) and next_action
+
+          Verified evidence:
+          {{verify-claims}}
+
+    - id: deep-dive
+      name: deep-dive
+      worker_type: general
+      depends_on: [arbitrate]
+      condition: 'arbitrate.output.verdict != "ACCEPT"'
+      report_to_parent: true
+      prompt_template:
+        inline: |
+          The arbiter did not accept the DAG subsystem review.
+          For each required_action in the arbiter's findings:
+          1. Open the relevant source files
+          2. Verify the problem exists as described
+          3. Propose a concrete, minimal fix with code-level detail
+          4. Identify any secondary effects of the proposed fix
+
+          Do NOT modify any file. Output an evidence-backed action plan.
+
+          Arbiter findings:
+          {{arbitrate}}

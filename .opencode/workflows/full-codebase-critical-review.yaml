@@ -1,0 +1,251 @@
+title: "OpenCode Full Codebase Review - Critical Bugs & Performance"
+config:
+  name: full-codebase-critical-review
+  max_concurrency: 4
+  max_node_replan_attempts: 3
+  node_defaults:
+    worker_config:
+      timeout_ms: 600000
+  nodes:
+    - id: review-concurrency
+      name: "Concurrency & Resource Leaks"
+      worker_type: general
+      depends_on: []
+      report_to_parent: false
+      prompt_template:
+        inline: |
+          你是并发与资源泄漏专家。对 opencode 代码库进行只读审查，只关注严重 bug 和性能问题。
+
+          ## 审查维度
+          - 竞态条件：并发访问共享状态无保护、TOCTOU
+          - 资源泄漏：未关闭的进程/文件句柄/定时器/EventSource/AbortController
+          - 死锁/活锁：Effect 层中的循环依赖、Fiber 泄漏
+          - 内存泄漏：无限增长的 Map/Array、未清理的订阅
+
+          ## 重点文件（来自知识图谱热点）
+          - packages/opencode/src/cli/cmd/run/stream.transport.ts (complexity 79, 43 callees)
+          - packages/opencode/src/cli/cmd/run/runtime.ts (complexity 46, 16 callees)
+          - packages/opencode/src/lsp/server.ts (unguarded_recursion in spawn)
+          - packages/opencode/src/session/ (session lifecycle)
+          - packages/core/src/process.ts (unguarded_recursion in describeCommand)
+          - packages/core/src/session/runner/ (LLM event publishing)
+          - packages/app/src/context/terminal.tsx (clearWorkspaceTerminals)
+          - packages/opencode/src/dag/ (DAG runtime, workflow execution)
+
+          ## 工具使用
+          优先使用 codebase-memory-mcp 工具（project: "opencode-dag"）：
+          - search_graph 查找函数定义
+          - get_code_snippet 读取源码
+          - trace_path 追踪调用链
+          - query_graph 查询复杂模式
+
+          ## 输出要求
+          对每个发现输出：
+          - 严重性：CRITICAL / HIGH
+          - 文件:行号
+          - 问题描述（一句话）
+          - 证据（代码片段或调用链）
+          - 潜在影响
+
+          只报告 CRITICAL 和 HIGH 级别。不要报告风格问题、命名问题或低影响问题。
+          最多报告 10 个最严重的问题。
+
+    - id: review-performance
+      name: "Performance Hotspots"
+      worker_type: general
+      depends_on: []
+      report_to_parent: false
+      prompt_template:
+        inline: |
+          你是性能优化专家。对 opencode 代码库进行只读审查，只关注严重性能问题。
+
+          ## 审查维度
+          - O(n²) 或更差的算法复杂度（循环内线性扫描）
+          - 热路径上的不必要分配（alloc_in_loop）
+          - 大数据集的同步阻塞操作
+          - 不必要的重复计算/渲染
+          - 内存膨胀（大对象未释放、缓存无上限）
+
+          ## 重点文件（来自知识图谱热点）
+          - packages/app/src/pages/session.tsx (Page complexity 194!, transitive_loop_depth 6)
+          - packages/app/src/pages/session/timeline/message-timeline.tsx (complexity 119, 7 loops)
+          - packages/core/src/github-copilot/responses/convert-to-openai-responses-input.ts (complexity 47, 19 alloc_in_loop!)
+          - packages/opencode/src/cli/cmd/run/session-data.ts (reduceSessionData complexity 63)
+          - packages/session-ui/src/components/session-turn.tsx (complexity 44, transitive_loop_depth 7)
+          - packages/app/src/context/global-sync/event-reducer.ts (complexity 56)
+          - packages/tui/src/component/prompt/autocomplete.tsx (complexity 45, 2 alloc_in_loop)
+          - packages/console/app/src/routes/zen/util/handler.ts (complexity 113, cognitive 214)
+
+          ## 工具使用
+          优先使用 codebase-memory-mcp 工具（project: "opencode-dag"）：
+          - query_graph 查询性能模式
+          - get_code_snippet 读取源码
+          - trace_path 追踪热路径
+
+          ## 输出要求
+          对每个发现输出：
+          - 严重性：CRITICAL / HIGH
+          - 文件:行号
+          - 问题描述（一句话）
+          - 证据（代码片段 + 复杂度数据）
+          - 性能影响估算
+
+          只报告 CRITICAL 和 HIGH 级别。不要报告微小的优化机会。
+          最多报告 10 个最严重的问题。
+
+    - id: review-error-handling
+      name: "Error Handling & Data Corruption"
+      worker_type: general
+      depends_on: []
+      report_to_parent: false
+      prompt_template:
+        inline: |
+          你是错误处理与数据完整性专家。对 opencode 代码库进行只读审查，只关注可能导致数据损坏或系统崩溃的严重问题。
+
+          ## 审查维度
+          - 静默吞掉错误导致状态不一致
+          - 未处理的 Promise rejection / Effect 失败
+          - 数据库/文件写入的原子性缺失
+          - 状态机非法转换
+          - 类型断言绕过安全检查（as any, as unknown）
+
+          ## 重点文件
+          - packages/opencode/src/dag/ (DAG 状态机、workflow 持久化)
+          - packages/opencode/src/session/ (session 生命周期、消息持久化)
+          - packages/opencode/src/server/ (HTTP API 错误处理)
+          - packages/core/src/session/runner/ (LLM 流式处理错误)
+          - packages/llm/src/route/executor.ts (retryStatusFailures - unguarded_recursion)
+          - packages/llm/src/protocols/shared.ts (removeNullSchemas - unguarded_recursion)
+          - packages/opencode/src/plugin/ (插件系统错误隔离)
+
+          ## 工具使用
+          优先使用 codebase-memory-mcp 工具（project: "opencode-dag"）：
+          - search_code 搜索错误处理模式
+          - get_code_snippet 读取源码
+          - trace_path 追踪错误传播路径
+
+          ## 输出要求
+          对每个发现输出：
+          - 严重性：CRITICAL / HIGH
+          - 文件:行号
+          - 问题描述（一句话）
+          - 证据（代码片段）
+          - 数据损坏/崩溃场景
+
+          只报告 CRITICAL 和 HIGH 级别。不要报告日志缺失或错误消息不清晰。
+          最多报告 10 个最严重的问题。
+
+    - id: review-critical-logic
+      name: "Critical Path Logic Bugs"
+      worker_type: general
+      depends_on: []
+      report_to_parent: false
+      prompt_template:
+        inline: |
+          你是逻辑正确性专家。对 opencode 代码库的核心路径进行只读审查，只关注可能导致功能完全失效的严重逻辑 bug。
+
+          ## 审查维度
+          - 边界条件错误（off-by-one、空集合、null/undefined）
+          - 异步时序错误（await 缺失、竞态窗口）
+          - 状态不一致（读写不同源、缓存失效）
+          - 协议违规（HTTP/SSE/WebSocket 协议假设错误）
+          - 递归终止条件缺失
+
+          ## 重点文件
+          - packages/opencode/src/dag/runtime/ (DAG 调度、节点生命周期)
+          - packages/opencode/src/session/v2/ (V2 session 核心)
+          - packages/core/src/session/runner/ (模型调用循环)
+          - packages/llm/src/route/ (LLM 路由、流式解析)
+          - packages/opencode/src/server/routes/ (API 路由)
+          - packages/cli/src/commands/handlers/serve.ts (unguarded_recursion in next)
+          - packages/opencode/src/acp/service.ts (16 callees, complexity 16)
+
+          ## 工具使用
+          优先使用 codebase-memory-mcp 工具（project: "opencode-dag"）：
+          - get_code_snippet 读取核心函数源码
+          - trace_path 追踪关键调用链
+          - query_graph 查询递归/循环模式
+
+          ## 输出要求
+          对每个发现输出：
+          - 严重性：CRITICAL / HIGH
+          - 文件:行号
+          - 问题描述（一句话）
+          - 证据（代码片段 + 触发条件）
+          - 失效场景
+
+          只报告 CRITICAL 和 HIGH 级别。不要报告代码可读性或设计偏好。
+          最多报告 10 个最严重的问题。
+
+    - id: arbitrate
+      name: "Arbiter - Synthesize & Rank"
+      worker_type: general
+      depends_on: [review-concurrency, review-performance, review-error-handling, review-critical-logic]
+      required: true
+      report_to_parent: true
+      output_schema:
+        type: object
+        required: [verdict, summary, findings, required_actions, next_action]
+        properties:
+          verdict:
+            type: string
+            enum: [ACCEPT, REVISE, REJECT, BLOCKED]
+          summary:
+            type: string
+          findings:
+            type: array
+            items:
+              type: object
+              required: [severity, file, description, evidence]
+              properties:
+                severity:
+                  type: string
+                  enum: [CRITICAL, HIGH]
+                file:
+                  type: string
+                line:
+                  type: string
+                description:
+                  type: string
+                evidence:
+                  type: string
+                impact:
+                  type: string
+                category:
+                  type: string
+          required_actions:
+            type: array
+            items:
+              type: string
+          next_action:
+            type: object
+            required: [operation, targets]
+            properties:
+              operation:
+                type: string
+                enum: [continue, extend, replan, complete, stop]
+              targets:
+                type: array
+      prompt_template:
+        inline: |
+          你是高级仲裁者。四个独立审查者分别从并发/资源泄漏、性能热点、错误处理/数据损坏、关键路径逻辑 bug 四个维度审查了 opencode 代码库。
+
+          ## 你的任务
+          1. 去重：合并指向同一根因的发现
+          2. 验证：对每个发现评估证据是否充分，标记证据不足的为"待验证"
+          3. 排序：按影响范围和触发概率排序
+          4. 裁决：
+             - ACCEPT：所有发现都有充分证据，可以输出最终报告
+             - REVISE：部分发现需要更深入的代码验证
+             - REJECT：大部分发现证据不足
+             - BLOCKED：无法完成审查
+
+          ## 输出
+          调用 submit_result 提交结构化结果：
+          - verdict: 裁决
+          - summary: 一句话总结代码库健康度
+          - findings: 去重排序后的发现列表（最多 15 个最严重的）
+          - required_actions: 建议的修复优先级
+          - next_action: 工作流下一步操作
+
+          严格只保留 CRITICAL 和 HIGH 级别的发现。每个 finding 必须有具体的文件路径和代码证据。

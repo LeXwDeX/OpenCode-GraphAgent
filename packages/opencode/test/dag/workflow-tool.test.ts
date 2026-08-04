@@ -177,6 +177,7 @@ const store = Layer.mock(DagStore.Service, {
         output: null,
         capturedOutput: null,
         errorReason: null,
+        errorClass: null,
         deadlineMs: null,
         wakeEligible: true,
         wakeReported: false,
@@ -184,6 +185,30 @@ const store = Layer.mock(DagStore.Service, {
         seq: 1,
         startedAt: 1,
         completedAt: null,
+        timeCreated: 1,
+        timeUpdated: 2,
+          }, {
+        id: "node_failed",
+        workflowId: "dag_status",
+        name: "Failed node",
+        workerType: "build",
+        status: "failed",
+        required: false,
+        dependsOn: ["node_running"],
+        modelId: null,
+        modelProviderId: null,
+        childSessionId: "ses_failed_child",
+        output: null,
+        capturedOutput: null,
+        errorReason: "node exceeded timeout of 600000ms",
+        errorClass: "timeout",
+        deadlineMs: null,
+        wakeEligible: false,
+        wakeReported: false,
+        replanAttempts: 0,
+        seq: 2,
+        startedAt: 1,
+        completedAt: 2,
         timeCreated: 1,
         timeUpdated: 2,
           }]
@@ -385,6 +410,8 @@ describe("workflow tool execution", () => {
       expect(result.output).toContain('"id": "node_running"')
       expect(result.output).toContain('"child_session_id": "ses_child"')
       expect(result.output).toContain('"mode": "standard"')
+      expect(result.output).toContain('"id": "node_failed"')
+      expect(result.output).toContain('"error_class": "timeout"')
     }),
   )
 

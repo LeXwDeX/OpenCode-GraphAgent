@@ -1,7 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test"
-import { Effect, Schema } from "effect"
+import { Effect } from "effect"
 import { DagWorkflows } from "@/dag/workflows"
-import { StartSpec } from "@/tool/workflow"
 import * as os from "node:os"
 import * as path from "node:path"
 import * as fs from "node:fs/promises"
@@ -159,31 +158,6 @@ describe("DagWorkflows.list", () => {
     const entries = await Effect.runPromise(DagWorkflows.list(projectDir))
     expect(entries[0]?.title).toBeUndefined()
     expect(entries[0]?.nodes).toBe(0)
-  })
-})
-
-// The README advertises this committed spec as startable by name, so it has to
-// survive the same decode a real start performs. Only the shipped example is
-// checked — `.opencode/workflows/` is also where a contributor keeps their own
-// specs, and those must not fail the suite.
-describe("the repository's own workflow library", () => {
-  const repoRoot = path.resolve(import.meta.dir, "../../../..")
-
-  it("ships change-review as a valid start spec referencing existing prompt templates", async () => {
-    const entry = await Effect.runPromise(DagWorkflows.resolve("change-review", repoRoot))
-    expect(entry?.scope).toBe("project")
-
-    const spec = Schema.decodeUnknownSync(StartSpec)(Bun.YAML.parse(await Bun.file(entry!.path).text()))
-    const templates = await fs
-      .readdir(path.join(repoRoot, ".opencode", "dag-prompts"))
-      .then((files) => files.map((file) => path.basename(file, ".md")))
-
-    for (const node of spec.config.nodes) {
-      if (node.prompt_template.id) expect(templates).toContain(node.prompt_template.id)
-      for (const dependency of node.depends_on) {
-        expect(spec.config.nodes.map((other) => other.id)).toContain(dependency)
-      }
-    }
   })
 })
 

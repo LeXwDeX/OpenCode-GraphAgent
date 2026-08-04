@@ -282,6 +282,7 @@ export const layer = Layer.effectDiscard(
         .set({
           status: "failed",
           error_reason: event.data.reason,
+          error_class: event.data.trigger,
           completed_at: toMillis(event.data.timestamp),
           seq: event.durable!.seq,
           time_updated: toMillis(event.data.timestamp),

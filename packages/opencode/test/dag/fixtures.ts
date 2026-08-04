@@ -15,6 +15,7 @@ export function makeNodeRow(overrides: Partial<DagStore.NodeRow> = {}): DagStore
     output: undefined,
     capturedOutput: undefined,
     errorReason: null,
+    errorClass: null,
     deadlineMs: null,
     wakeEligible: false,
     wakeReported: false,

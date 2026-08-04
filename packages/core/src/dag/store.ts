@@ -39,6 +39,7 @@ export interface NodeRow {
   output: unknown
   capturedOutput: unknown
   errorReason: string | null
+  errorClass: string | null
   deadlineMs: number | null
   wakeEligible: boolean
   wakeReported: boolean
@@ -100,6 +101,7 @@ const mapNode = (r: typeof WorkflowNodeTable.$inferSelect): NodeRow => ({
   output: r.output,
   capturedOutput: r.captured_output,
   errorReason: r.error_reason,
+  errorClass: r.error_class,
   deadlineMs: r.deadline_ms,
   wakeEligible: r.wake_eligible,
   wakeReported: r.wake_reported,

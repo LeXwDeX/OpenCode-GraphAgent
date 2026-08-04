@@ -1,0 +1,177 @@
+title: "Round 3 final audit (continuation): re-run timed-out closure review, reuse green gate results"
+mode: deep
+admission:
+  brief_revision: 1
+  qa_mode: LIGHT
+  verdict: READY
+  brief:
+    goal: "Continue the failed round-3 audit (dag_038dbcba0ffeAZRBDq2cwyIPr6): review-final timed out at 900s (environmental timeout class). Reuse the completed verify-suite result (8/8 PASS, persisted on disk); re-run only the closure review with a 30-minute budget, then arbitrate."
+    scope:
+      in:
+        - "review-final-2: closure verification of the five round-2 HIGH findings + regression scan (same mission, larger budget)"
+        - "arbitrate: final PASS/LOOP/BLOCKED on review-final-2 + persisted verify-suite gate results"
+        - "finalize-review on PASS"
+      out:
+        - "re-running the objective gate suite (verify-suite completed: 8/8 PASS)"
+    constraints:
+      - "reviewers are read-only; do not modify any file"
+      - "upstream gate result file is read-only input"
+    assumptions:
+      - "verify-suite result at .opencode/.dag-specs/review-parts-round3/verify-suite.md is complete and trustworthy (verdict PASS, 8/8 gates)"
+      - "review-final timeout was environmental (budget too small for the closure scan over ~40 files), fixed by raising timeout_ms to 1800000"
+      - "reused_nodes: verify-suite"
+    acceptance_criteria:
+      - "each round-2 HIGH finding verifiably closed with file:line evidence"
+      - "no NEW CRITICAL/HIGH on verified evidence"
+      - "arbiter emits structured PASS/LOOP/BLOCKED"
+    evidence_required:
+      - "file:line citations for closure claims"
+      - "persisted gate results as objective evidence"
+    risks:
+      - "review-final-2 could time out again despite 30-min budget"
+    review_plan:
+      - "review-final-2 (fresh context, reads working tree + gate result file)"
+      - "arbitrate (advanced tier, report_to_parent)"
+      - "PASS -> finalize-review"
+    open_questions: []
+    blocking_questions: []
+config:
+  name: deep-review-round3-continue
+  max_concurrency: 2
+  max_node_replan_attempts: 2
+  max_total_nodes: 8
+  node_defaults:
+    required: false
+    report_to_parent: false
+    worker_config:
+      timeout_ms: 900000
+  nodes:
+    - id: review-final
+      name: "Review: remediation closure + regression scan (30min)"
+      worker_type: general
+      depends_on: []
+      required: true
+      worker_config:
+        timeout_ms: 1800000
+      prompt_template:
+        inline: |
+          You are a FRESH-CONTEXT FINAL REVIEWER. Read-only — do not modify any file.
+          Work efficiently: targeted reads/greps first, full reads only where needed.
+
+          The repo's uncommitted working-tree diff contains a joint change set (DAG
+          error_class exposure, /goal restoration, two remediation waves). A prior
+          review round returned LOOP with five HIGH findings; a remediation wave claims
+          closure. Objective gates already ran: read
+          .opencode/.dag-specs/review-parts-round3/verify-suite.md (8/8 PASS).
+
+          Verify each round-2 HIGH is closed (cite fixing lines):
+          1. workflow.md "Cascade detection" section: required-failure shape must state
+             dependents are terminalized to `skipped` with error_reason
+             `workflow_failed` (pending only while paused) — cross-check against
+             dag.ts terminateNonTerminalNodes + loop.ts dag.fail wiring.
+          2. workflow.md exec_failed row (c): must NOT rely on a surfaced workflow-level
+             reason or universal primary-node attribution; must carry an
+             orchestrator_unresponsive recipe (zero attribution; use status;
+             extend/replan or change approach). Cross-check dag.ts fail(),
+             loop.ts `required node(s) failed:` producer, wake digest visibility.
+          3. dag-flow.txt: error_class sentence carries replan-cancel + pre-migration
+             exceptions.
+          4. packages/opencode/test/session/prompt.test.ts: tests exist and meaningfully
+             cover /goal set+kick, /goal status, /subgoal, Goal-absent fallthrough
+             (judge assertion strength, not just existence).
+          5. packages/opencode/src/session/system.ts: Goal.defaultLayer provided +
+             Goal.node in the LayerNode deps (goal block reachable); no import cycle
+             hazard vs the deferred SettingsHook pattern.
+
+          Regression spot-checks (brief, evidence-based):
+          - error_class pipeline intact (projector, store, tool status, wake digest,
+            httpapi NodeResponse, SDK)
+          - app-runtime provideMerge comment accurate vs loop.ts/settings.ts
+            self-provides
+          - GOAL command description includes done; dispatch handles done (goal.ts)
+
+          Known deferred follow-ups (non-blocking unless clearly material): GET
+          /session/:id/goal 200-null vs SDK Goal typing; httpapi error_class
+          field-level fixture; TUI sync reducer tests; GoalLoop e2e fixed sleeps.
+
+          MANDATORY output format:
+          1. closure: array of {round2_finding, status: CLOSED|PARTIAL|OPEN, evidence: "file:line", note}
+          2. findings: array of {severity: CRITICAL|HIGH|MEDIUM|LOW, title, description, evidence: "file:line", recommendation} (NEW issues only)
+          3. unverified_claims: array of strings
+          4. summary: 2-3 sentences
+
+    - id: arbitrate
+      name: "Arbiter: Final Verdict"
+      worker_type: general
+      depends_on: [review-final]
+      required: true
+      report_to_parent: true
+      worker_config:
+        timeout_ms: 1200000
+      output_schema:
+        type: object
+        required: [verdict, reason, evidence, findings, loop_scope, stop_reason, next_action]
+        properties:
+          verdict:
+            type: string
+            enum: [PASS, LOOP, BLOCKED]
+          reason: { type: string }
+          evidence:
+            type: array
+            items: { type: string }
+          findings:
+            type: array
+            items:
+              type: object
+              required: [severity, title, evidence, status]
+              properties:
+                severity:
+                  type: string
+                  enum: [CRITICAL, HIGH, MEDIUM, LOW]
+                title: { type: string }
+                description: { type: string }
+                evidence: { type: string }
+                status:
+                  type: string
+                  enum: [CONFIRMED, REFUTED, PARTIALLY_CONFIRMED]
+                recommendation: { type: string }
+          loop_scope:
+            type: array
+            items: { type: string }
+          stop_reason:
+            type: string
+            enum: [goal_met, correction_required, evidence_missing, no_progress, round_cap, budget_cap]
+          next_action:
+            type: string
+            enum: [finalize, replan, stop]
+      prompt_template:
+        inline: |
+          You are the ARBITER for the FINAL audit round of the joint uncommitted diff.
+          Rule on VERIFIED evidence only: review-final's closure verification +
+          the persisted gate results in
+          .opencode/.dag-specs/review-parts-round3/verify-suite.md (8/8 PASS).
+
+          This is round 3 of a bounded loop (max_node_replan_attempts: 2). Judgment:
+          - PASS: all five round-2 HIGH findings CLOSED, gates PASS, no new
+            CRITICAL/HIGH; the documented deferred follow-ups remain explicitly
+            non-blocking (list them in evidence as accepted residual items)
+          - LOOP: at most ONE more bounded wave, only for a NEW or reopened HIGH with
+            concrete loop_scope; do not loop on deferred follow-ups or cosmetics
+          - BLOCKED: evidence missing or ceiling reached; report residual findings
+
+          Deduplicate, discard REFUTED, rank by impact. State reason, evidence,
+          stop_reason, next_action explicitly. Submit via submit_result.
+
+    - id: finalize-review
+      name: "Publish the final audit report"
+      worker_type: general
+      depends_on: [arbitrate]
+      condition: 'arbitrate.output.verdict == "PASS"'
+      required: true
+      report_to_parent: true
+      prompt_template:
+        inline: |
+          Publish the final audit report for the joint uncommitted diff: closure table
+          for the round-2 HIGH findings (with fix evidence), gate results, confirmed
+          residual items with their accepted non-blocking status, and the PASS reason.
+          Do not introduce new findings.
