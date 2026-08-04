@@ -172,7 +172,11 @@ jobs:
         run: |
           mkdir -p dag-templates-src
           tar -xzf dag-templates-artifact/dag-templates.tar.gz -C dag-templates-src
-          echo "DAG_TEMPLATES_DIR=$GITHUB_WORKSPACE/dag-templates-src" >> "$GITHUB_ENV"
+          templates_dir="$GITHUB_WORKSPACE/dag-templates-src"
+          if command -v cygpath &>/dev/null; then
+            templates_dir="$(cygpath -m "$templates_dir")"
+          fi
+          echo "DAG_TEMPLATES_DIR=$templates_dir" >> "$GITHUB_ENV"
 
       - name: Build CLI
         if: inputs.platforms == '' || contains(inputs.platforms, matrix.name)

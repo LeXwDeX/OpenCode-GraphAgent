@@ -1,3 +1,4 @@
+import { existsSync } from "fs"
 import path from "path"
 import { fileURLToPath } from "url"
 
@@ -46,6 +47,15 @@ async function loadDagTemplatesData() {
   if (!templatesDir) {
     console.log("Loaded no dag templates snapshot (DAG_TEMPLATES_DIR unset)")
     return "undefined"
+  }
+  // Contextual failure: a set-but-unresolvable dir usually means the release
+  // workflow's Extract Templates step wrote an unconverted shell path
+  // (Windows Git Bash) — fail loudly with the offending value instead of a
+  // bare glob/IO error.
+  if (!existsSync(templatesDir)) {
+    throw new Error(
+      `DAG_TEMPLATES_DIR points to a missing directory: ${templatesDir} — check the release workflow's Extract Templates step path conversion`,
+    )
   }
   const templates: Record<string, string> = {}
   for (const file of await Array.fromAsync(new Bun.Glob("*.yaml").scan({ cwd: templatesDir }))) {
