@@ -1183,6 +1183,36 @@ const scenarios: Scenario[] = [
       check(stable(body) === stable(ctx.state.todos), "todos should match seeded state")
     }),
   http.protected
+    .get("/session/{sessionID}/goal", "session.goal")
+    .seeded((ctx) =>
+      Effect.gen(function* () {
+        const session = yield* ctx.session({ title: "Goal session" })
+        yield* ctx.goal(session.id, "cover session goal")
+        return { session }
+      }),
+    )
+    .at((ctx) => ({
+      path: route("/session/{sessionID}/goal", { sessionID: ctx.state.session.id }),
+      headers: ctx.headers(),
+    }))
+    .json(200, (body) => {
+      object(body)
+      check(body.goal === "cover session goal", "goal text should match seeded state")
+      check(body.status === "active", "status should be active for a freshly seeded goal")
+      check(body.turnsUsed === 0, "turnsUsed should be 0 for a freshly seeded goal")
+      check(body.maxTurns === 20, "maxTurns should be the default (20)")
+      check(Array.isArray(body.subgoals) && body.subgoals.length === 0, "subgoals should be an empty array")
+      check(!("pausedReason" in body), "pausedReason should be absent when goal is active")
+    }),
+  http.protected
+    .get("/session/{sessionID}/goal", "session.goal.absent")
+    .seeded((ctx) => ctx.session({ title: "Goalless session" }))
+    .at((ctx) => ({
+      path: route("/session/{sessionID}/goal", { sessionID: ctx.state.id }),
+      headers: ctx.headers(),
+    }))
+    .json(404, object, "status"),
+  http.protected
     .post("/session/{sessionID}/hook", "session.hook.add")
     .seeded((ctx) => ctx.session({ title: "Hook session" }))
     .at((ctx) => ({
