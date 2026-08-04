@@ -705,16 +705,18 @@ export const layer = Layer.effect(
       // executed, so the graph effectively ended at the checkpoint and the
       // naturally-completed workflow may still be reopened by additive extend.
       // Dependents that completed or failed continued the graph past the
-      // checkpoint and block the exception.
+      // checkpoint and block the exception. Row statuses are compared as
+      // plain strings (loop.ts convention) — enum casts on read-model rows
+      // trip the lint ratchet.
       const executedDependents = (nodeID: string) =>
         nodes.filter(
           (candidate) =>
             candidate.dependsOn.includes(nodeID)
-            && (candidate.status === NodeStatus.COMPLETED || candidate.status === NodeStatus.FAILED),
+            && (candidate.status === "completed" || candidate.status === "failed"),
         )
       const checkpointCandidates = nodes.filter(
         (node) =>
-          node.status === NodeStatus.COMPLETED
+          node.status === "completed"
           && node.wakeEligible
           && configuredNodes.some((candidate) => candidate.id === node.id),
       )
@@ -722,13 +724,13 @@ export const layer = Layer.effect(
       const addsNewNode = newNodes.some((node) => !nodes.some((existing) => existing.id === node.id))
       const earlyCompleted = nodes.some((node) => node.errorReason === "agent_complete")
       const reopenCompleted =
-        wf.status === WorkflowStatus.COMPLETED
+        wf.status === "completed"
         && addsNewNode
         && hasReportingLeafCheckpoint
         && !earlyCompleted
       function reopenDenial(workflowStatus: string): string | undefined {
-        if (workflowStatus === WorkflowStatus.ARCHIVED) return "archived workflows are immutable — start a new workflow instead"
-        if (workflowStatus !== WorkflowStatus.COMPLETED) return "only a naturally completed workflow can be reopened — failed and cancelled workflows are immutable; start a new workflow reusing their completed outputs as static input"
+        if (workflowStatus === "archived") return "archived workflows are immutable — start a new workflow instead"
+        if (workflowStatus !== "completed") return "only a naturally completed workflow can be reopened — failed and cancelled workflows are immutable; start a new workflow reusing their completed outputs as static input"
         if (!addsNewNode) return "the fragment adds no new node ids — an additive reopen requires at least one new node"
         if (earlyCompleted) return "the workflow was completed early via control(complete); early completion stays terminal"
         if (checkpointCandidates.length === 0) return "no wake-eligible reporting checkpoint completed the graph — only a naturally completed reporting-leaf checkpoint may be reopened"
@@ -739,9 +741,10 @@ export const layer = Layer.effect(
       // Keep the exception private to naturally completed additive extension;
       // an early control(complete) leaves an agent_complete marker and remains
       // terminal, as do public replan and non-additive terminal mutations.
-      if (isWorkflowTerminalStatus(wf.status as WorkflowStatus) && !reopenCompleted) {
-        const status = wf.status
-        return yield* Effect.fail(new TerminalViolationError(dagID, status, "extend", reopenDenial(status)))
+      const wfTerminal =
+        wf.status === "completed" || wf.status === "failed" || wf.status === "cancelled" || wf.status === "archived"
+      if (wfTerminal && !reopenCompleted) {
+        return yield* Effect.fail(new TerminalViolationError(dagID, wf.status, "extend", reopenDenial(wf.status)))
       }
       // Internal call to _replan — shares the caller's lock holding period,
       // does NOT re-acquire the per-workflow lock or go through Service.of.
