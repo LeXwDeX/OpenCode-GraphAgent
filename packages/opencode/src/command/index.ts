@@ -48,6 +48,8 @@ export function hints(template: string) {
 export const Default = {
   INIT: "init",
   REVIEW: "review",
+  GOAL: "goal",
+  SUBGOAL: "subgoal",
   DAG_FLOW: "dag-flow",
   IMPORT_HOOKS: "import-claude-hooks",
   CREATE_HOOK: "create-hook",
@@ -90,6 +92,20 @@ export const layer = Layer.effect(
         },
         subtask: true,
         hints: hints(PROMPT_REVIEW),
+      }
+      commands[Default.GOAL] = {
+        name: Default.GOAL,
+        description: "设定持久目标，自动循环执行直到完成 [status|pause|resume|done|clear|stop]",
+        source: "command",
+        template: "",
+        hints: ["$ARGUMENTS"],
+      }
+      commands[Default.SUBGOAL] = {
+        name: Default.SUBGOAL,
+        description: "管理子目标 [list|<text>|remove <n>|clear]",
+        source: "command",
+        template: "",
+        hints: ["$ARGUMENTS"],
       }
       commands[Default.DAG_FLOW] = {
         name: Default.DAG_FLOW,

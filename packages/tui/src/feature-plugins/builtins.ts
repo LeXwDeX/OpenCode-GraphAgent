@@ -4,6 +4,7 @@ import HomeTips from "./home/tips"
 import SidebarContext from "./sidebar/context"
 import SidebarFiles from "./sidebar/files"
 import SidebarFooter from "./sidebar/footer"
+import SidebarGoal from "./sidebar/goal"
 import SidebarLsp from "./sidebar/lsp"
 import SidebarMcp from "./sidebar/mcp"
 import SidebarTodo from "./sidebar/todo"
@@ -29,6 +30,7 @@ export function createBuiltinPlugins(options: { experimentalEventSystem: boolean
     SidebarMcp,
     SidebarLsp,
     SidebarTodo,
+    SidebarGoal,
     SidebarFiles,
     SidebarDag,
     SidebarDagPanel,
