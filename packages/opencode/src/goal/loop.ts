@@ -21,7 +21,7 @@ export interface Interface {
 export class Service extends Context.Service<Service, Interface>()("@opencode/GoalLoop") {}
 
 /**
- * Test-only injection point for the judge LLM call (D5). When provided in the
+ * Test-only injection point for the judge LLM call. When provided in the
  * Effect context, `afterIdle` uses `call` instead of the production
  * Provider → generateText path, so e2e tests can script judge verdicts
  * (continue→done) with no network or Provider credentials. Production never
@@ -192,7 +192,7 @@ export const layer = Layer.effect(
         .slice(-4000)
       if (!responseText) return
 
-      // Judge LLM call: prefer the test-injected callable (D5) so e2e tests
+      // Judge LLM call: prefer the test-injected callable so e2e tests
       // can script verdicts without Provider/network; otherwise build the
       // production Provider → generateText path. The verdict logic below is
       // unchanged — only the callLLM construction point moved.
@@ -304,7 +304,7 @@ export const layer = Layer.effect(
       const reloadedState = yield* goal.load(sessionID)
       if (!reloadedState || reloadedState.status !== "active") return
 
-      // Single merged continuation injection (D4.2). This replaces the former
+      // Single merged continuation injection. This replaces the former
       // two-call sequence (a `noReply` progress line + an `ignored:true`
       // continuation). The merged prompt carries goal text, subgoals, the
       // turns/budget line, and the last judge reason, plus the autonomous-mode

@@ -57,7 +57,7 @@ export const run = Effect.fn("Goal.Judge.run")(function* (
   }).pipe(
     Effect.map((text) => parseJudgeResponse(text)),
     // Transport errors (timeout, network, non-JSON transport-level failure)
-    // count toward the pause budget (D5). Previously they returned
+    // count toward the pause budget. Previously they returned
     // parseFailed: false, which reset consecutive_parse_failures and let a
     // flaky provider alternate bad-JSON and timeout indefinitely without
     // ever hitting MAX_CONSECUTIVE_PARSE_FAILURES. Returning parseFailed: true

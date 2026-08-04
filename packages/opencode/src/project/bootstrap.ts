@@ -29,6 +29,9 @@ export const layer = Layer.effect(
     // deps (Provider/SessionPrompt → HttpClient) that don't belong in bootstrap's
     // construction context. It is resolved lazily via serviceOption in `run`,
     // mirroring how SettingsHook consumers treat their optional dep.
+    // (GoalLoop.defaultLayer still appears in BootstrapLayer — bootstrap-runtime.ts —
+    // purely so bootstrap-built entry points can serviceOption it; no bootstrap
+    // caller invokes its init, and the shared memoMap dedups construction.)
     const config = yield* Config.Service
     const dagLoop = yield* DagLoop.Service
     const dagPublisher = yield* DagSummaryPublisher.Service

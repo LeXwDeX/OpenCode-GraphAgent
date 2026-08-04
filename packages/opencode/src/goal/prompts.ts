@@ -65,7 +65,7 @@ export interface ContinuationInput {
   readonly lastJudgeReason?: string
 }
 
-// Renders the single merged continuation injection (D4.2). Carries goal text,
+// Renders the single merged continuation injection. Carries goal text,
 // subgoals, turns/budget, the last judge reason (labeled), and the autonomous-mode
 // frame. This is both the user-visible per-turn progress line AND the prompt that
 // drives the next agent turn — it must reach the model (no `ignored` flag at the
@@ -95,7 +95,7 @@ export function renderContinuation(input: ContinuationInput): string {
   return lines.join("\n")
 }
 
-// Renders the dynamic system-prompt fragment for an active/paused goal (D4.1).
+// Renders the dynamic system-prompt fragment for an active/paused goal.
 // Pure: injected into the system prompt by SystemPrompt.goal(sessionID).
 export function renderGoalSystemBlock(state: GoalState.Info): string {
   const turnsUsed = Number(state.turns_used)

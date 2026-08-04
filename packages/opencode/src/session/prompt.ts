@@ -1878,19 +1878,19 @@ export const layer = Layer.effect(
             }),
           ),
         )
+        const m = yield* currentModel(input.sessionID)
+        const agentName = input.agent ?? (yield* agents.defaultAgent())
+        const userMsg: SessionV1.User = {
+          id: input.messageID ?? MessageID.ascending(),
+          role: "user",
+          sessionID: input.sessionID,
+          time: { created: Date.now() },
+          agent: agentName,
+          model: { providerID: m.providerID, modelID: m.modelID },
+        }
+        yield* sessions.updateMessage(userMsg)
         if (!dispatchResult) {
           // Dispatch failed — return error message to user instead of silent fallthrough
-          const m = yield* currentModel(input.sessionID)
-          const agentName = input.agent ?? (yield* agents.defaultAgent())
-          const userMsg: SessionV1.User = {
-            id: input.messageID ?? MessageID.ascending(),
-            role: "user",
-            sessionID: input.sessionID,
-            time: { created: Date.now() },
-            agent: agentName,
-            model: { providerID: m.providerID, modelID: m.modelID },
-          }
-          yield* sessions.updateMessage(userMsg)
           const errorPart: SessionV1.TextPart = {
             id: PartID.ascending(),
             messageID: userMsg.id,
@@ -1904,17 +1904,6 @@ export const layer = Layer.effect(
           return { info: userMsg, parts: [errorPart] }
         }
         const dispatchText = dispatchResult.announce ?? dispatchResult.text
-        const m = yield* currentModel(input.sessionID)
-        const agentName = input.agent ?? (yield* agents.defaultAgent())
-        const userMsg: SessionV1.User = {
-          id: input.messageID ?? MessageID.ascending(),
-          role: "user",
-          sessionID: input.sessionID,
-          time: { created: Date.now() },
-          agent: agentName,
-          model: { providerID: m.providerID, modelID: m.modelID },
-        }
-        yield* sessions.updateMessage(userMsg)
         const cmdText: SessionV1.TextPart = {
           id: PartID.ascending(),
           messageID: userMsg.id,
