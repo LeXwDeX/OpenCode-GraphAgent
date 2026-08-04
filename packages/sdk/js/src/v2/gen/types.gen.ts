@@ -3906,6 +3906,7 @@ export type DagNode = {
   child_session_id?: string
   output?: unknown
   error_reason?: string
+  error_class?: string
   deadline_ms?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
   replan_attempts: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
   started_at?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"

@@ -1816,6 +1816,9 @@ const scenarios: Scenario[] = [
             ],
           }),
         ),
+        Effect.flatMap((dag) =>
+          ctx.dagFailNode(dag.dagID, "b", "node exceeded timeout of 600000ms", "timeout").pipe(Effect.as(dag)),
+        ),
       ),
     )
     .at((ctx) => ({ path: route("/dag/{dagID}/nodes", { dagID: ctx.state.dagID }), headers: ctx.headers() }))
@@ -1829,6 +1832,14 @@ const scenarios: Scenario[] = [
         check(typeof n.status === "string", "node should have status")
         check(Array.isArray(n.depends_on), "node should have depends_on")
         check(typeof n.replan_attempts === "number", "node should have replan_attempts")
+        const failed = body.find((node: any) => node.id === "b")
+        object(failed)
+        check(failed.status === "failed", "seeded node b should be failed")
+        check(failed.error_class === "timeout", "failed node should expose error_class on the wire")
+        check(typeof failed.error_reason === "string", "failed node should expose error_reason")
+        const pristine = body.find((node: any) => node.id === "a")
+        object(pristine)
+        check(!("error_class" in pristine), "error_class should be absent on non-failed nodes")
       }),
     ),
 

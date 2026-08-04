@@ -191,6 +191,7 @@ function withContext<A, E>(
           llmWait: (count) => Effect.suspend(() => llm().wait(count)),
           tuiRequest: (request) => Effect.sync(() => modules.Tui.submitTuiRequest(request)),
           dag: (input) => run(createDagFixture(input.sessionID, input.title, input.nodes)),
+          dagFailNode: (dagID, nodeID, reason, errorClass) => run(failDagNodeFixture(dagID, nodeID, reason, errorClass)),
           foreignDag: (input) => run(createForeignDagFixture(input.title, input.nodes)),
         }
         yield* trace(options, scenario, `${label} seed start`)
@@ -305,6 +306,15 @@ async function bounded(label: string, work: () => Promise<unknown>, ms = CLEANUP
   if (winner === "timeout") {
     console.error(`[cleanup] ${label} exceeded ${ms}ms — forcing continuation (resource may leak)`)
   }
+}
+
+/** Fail a seeded DAG node through the Dag service so error_class lands on the wire. */
+function failDagNodeFixture(dagID: string, nodeID: string, reason: string, errorClass: "timeout" | "exec_failed" | "verdict_fail") {
+  return Effect.gen(function* () {
+    const modules = yield* Effect.promise(() => runtime())
+    const dag = yield* modules.Dag.Service
+    yield* dag.nodeFailed(dagID, nodeID, reason, errorClass).pipe(Effect.orDie)
+  })
 }
 
 /**
