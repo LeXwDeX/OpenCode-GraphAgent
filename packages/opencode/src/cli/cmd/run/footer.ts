@@ -963,13 +963,15 @@ export class RunFooter implements FooterApi {
 
   // Two-press interrupt: first press shows a hint ("esc again to interrupt"),
   // second press within 5 seconds fires onInterrupt. The timer resets the
-  // counter if the user doesn't follow through.
-  private handleInterrupt = (): boolean => {
+  // counter if the user doesn't follow through. `mergedDoublePress` covers
+  // terminals that deliver a fast ESC double-press as a single meta-modified
+  // escape event.
+  private handleInterrupt = (mergedDoublePress = false): boolean => {
     if (this.isClosed || this.state().phase !== "running") {
       return false
     }
 
-    const next = this.state().interrupt + 1
+    const next = this.state().interrupt + (mergedDoublePress ? 2 : 1)
     this.patch({ interrupt: next })
 
     if (next < 2) {
