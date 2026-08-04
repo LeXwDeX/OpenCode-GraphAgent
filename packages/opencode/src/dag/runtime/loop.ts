@@ -849,17 +849,38 @@ export const layer = Layer.effect(
               }
               if (lastUserAt > lastAsstAt) return
 
+              const failuresByWorkflow = new Map<string, string[]>()
+              for (const workflow of batch.workflows) {
+                if (workflow.status !== "failed") continue
+                const failedNodes = yield* store.getNodes(workflow.id).pipe(
+                  Effect.map((nodes) => nodes.filter((node): node is DagStore.NodeRow & { errorClass: string } => node.status === "failed" && node.errorClass !== null)),
+                  Effect.catchCause((cause) =>
+                    Effect.gen(function* () {
+                      yield* Effect.logWarning("wake digest failed to read failed nodes", { workflowId: workflow.id, cause })
+                      return [] as (DagStore.NodeRow & { errorClass: string })[]
+                    }),
+                  ),
+                )
+                if (failedNodes.length > 0) {
+                  failuresByWorkflow.set(
+                    workflow.id,
+                    failedNodes.map((node) => `- "${node.name}" (${node.errorClass}): ${node.errorReason ?? "unknown error"}`.slice(0, 300)),
+                  )
+                }
+              }
               const summaries = [
                 ...batch.nodes.map((node) => {
                   const output = typeof node.output === "string"
                     ? node.output.slice(0, 500)
                     : node.errorReason ?? (node.output == null ? "(no output)" : JSON.stringify(node.output).slice(0, 500))
-                  return `[DAG Node Result] Node "${node.name}" ${node.status}: ${output}`
+                  const failureClass = node.status === "failed" && node.errorClass ? ` (${node.errorClass})` : ""
+                  return `[DAG Node Result] Node "${node.name}" ${node.status}${failureClass}: ${output}`
                 }),
-                ...batch.workflows.map(
-                  (workflow) =>
-                    `[DAG Workflow ${workflow.status}] Workflow "${workflow.title}" has reached terminal status.`,
-                ),
+                ...batch.workflows.map((workflow) => {
+                  const failures = failuresByWorkflow.get(workflow.id)
+                  const attribution = failures ? `\nFailed nodes:\n${failures.join("\n")}` : ""
+                  return `[DAG Workflow ${workflow.status}] Workflow "${workflow.title}" has reached terminal status.${attribution}`
+                }),
               ]
               const summary = [
                 ...summaries,

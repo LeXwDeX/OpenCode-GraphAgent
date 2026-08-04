@@ -39,6 +39,9 @@ export const NodeResponse = Schema.Struct({
   child_session_id: Schema.optional(Schema.String),
   output: Schema.optional(Schema.Unknown),
   error_reason: Schema.optional(Schema.String),
+  // Failed nodes only: the dag.node.failed trigger class
+  // (timeout/exec_failed/verdict_fail/push_exhausted) for failure triage.
+  error_class: Schema.optional(Schema.String),
   // Deadline (absolute epoch millis) fixed at admission; drives the running-
   // node countdown in the TUI inspector (P2-8).
   deadline_ms: Schema.optional(Schema.Number),

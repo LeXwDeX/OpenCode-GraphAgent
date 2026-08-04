@@ -83,6 +83,7 @@ export default {
           \`child_session_id\` text,
           \`output\` text,
           \`error_reason\` text,
+          \`error_class\` text,
           \`captured_output\` text,
           \`deadline_ms\` integer,
           \`wake_eligible\` integer DEFAULT false NOT NULL,

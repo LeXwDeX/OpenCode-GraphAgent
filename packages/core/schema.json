@@ -1,9 +1,9 @@
 {
   "version": "7",
   "dialect": "sqlite",
-  "id": "a26723c8-be88-4c4e-85cf-0c1ecd3cf638",
+  "id": "937897f2-96bc-4fee-af44-bbc2accda92f",
   "prevIds": [
-    "747f1cfb-b2d5-45f6-b46b-c38e470bb2d5"
+    "a26723c8-be88-4c4e-85cf-0c1ecd3cf638"
   ],
   "ddl": [
     {
@@ -591,6 +591,16 @@
       "default": null,
       "generated": null,
       "name": "error_reason",
+      "entityType": "columns",
+      "table": "workflow_node"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "error_class",
       "entityType": "columns",
       "table": "workflow_node"
     },

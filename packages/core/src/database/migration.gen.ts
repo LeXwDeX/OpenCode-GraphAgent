@@ -47,5 +47,6 @@ export const migrations = (
     import("./migration/20260715040000_drop_retry_count"),
     import("./migration/20260717034735_fearless_cammi"),
     import("./migration/20260720013828_dag-workflow-node-identity"),
+    import("./migration/20260803073521_workflow_node_error_class"),
   ])
 ).map((module) => module.default) satisfies DatabaseMigration.Migration[]
