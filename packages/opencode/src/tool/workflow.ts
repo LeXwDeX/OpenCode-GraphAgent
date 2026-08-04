@@ -278,7 +278,10 @@ export const WorkflowTool = Tool.define<
                 Effect.mapError((error) => new Error(`Invalid workflow spec ${specFile.path}: ${String(error)}`)),
                 Effect.orDie,
               )
-              const r = yield* dag.extend(params.workflow_id, spec.nodes as NodeConfig[]).pipe(Effect.orDie)
+              const r = yield* withTerminalRecovery(
+                dag.extend(params.workflow_id, spec.nodes as NodeConfig[]),
+                "Terminal workflows are immutable except for the additive-extend reopen, which requires the workflow to have completed naturally at a wake-eligible reporting checkpoint (fragment adds new node ids; no early control(complete); no executed node beyond the checkpoint — condition-skipped dependents are fine). When the reopen does not apply, recover by starting a NEW workflow spec that reuses this workflow's completed outputs as static input.",
+              ).pipe(Effect.orDie)
               return {
                 title: `Workflow extended: ${r.add.length} nodes added`,
                 output: `<workflow id="${params.workflow_id}" action="extend">\nAdded: ${r.add.join(", ")}\n</workflow>`,
@@ -312,19 +315,13 @@ export const WorkflowTool = Tool.define<
                     Effect.mapError((error) => new Error(`Invalid workflow spec ${specFile.path}: ${String(error)}`)),
                     Effect.orDie,
                   )
-                  const r = yield* dag.replan(wfId, { nodes: spec.fragment.nodes as NodeConfig[] }).pipe(
-                    // The graph raced to terminal while the fragment was being
-                    // composed (the pause-first protocol was skipped). Surface
-                    // the recovery options instead of a bare iron-law rejection.
-                    Effect.catchIf(
-                      (err): err is TerminalViolationError => err instanceof TerminalViolationError,
-                      (err) =>
-                        Effect.die(new Error(
-                          `${err.message}. The workflow reached a terminal status before the replan arrived — terminal workflows are immutable. Recover by writing a new start spec with the updated node definitions and passing its spec_path, or extend if a reporting leaf checkpoint naturally completed the graph. Next time issue control(pause) BEFORE composing the spec file.`,
-                        )),
-                    ),
-                    Effect.orDie,
-                  )
+                  // The graph raced to terminal while the fragment was being
+                  // composed (the pause-first protocol was skipped). Surface
+                  // the recovery options instead of a bare iron-law rejection.
+                  const r = yield* withTerminalRecovery(
+                    dag.replan(wfId, { nodes: spec.fragment.nodes as NodeConfig[] }),
+                    "The workflow reached a terminal status before the replan arrived — terminal workflows are immutable. Recover by writing a new start spec with the updated node definitions and passing its spec_path, or extend if a reporting leaf checkpoint naturally completed the graph. Next time issue control(pause) BEFORE composing the spec file.",
+                  ).pipe(Effect.orDie)
                   const ignored = r.ignore.length > 0 ? `\nIgnored (terminal, immutable — add replacements under new ids to retry): ${r.ignore.join(", ")}` : ""
                   return {
                     title: `Workflow replanned: +${r.add.length} -${r.cancel.length} ↻${r.restart.length}`,
@@ -406,6 +403,17 @@ function resolveSpecPath(specPath: string, directory: string, ctx: Tool.Context)
 
 function workflowSpecParseError(filepath: string, error: unknown) {
   return new Error(`Invalid workflow YAML ${filepath}: ${error instanceof Error ? error.message : String(error)}`)
+}
+
+/** Terminal-workflow rejections surface as defects carrying recovery
+ * guidance, not bare iron-law errors. Shared by the replan and extend paths. */
+function withTerminalRecovery<A>(effect: Effect.Effect<A, Error>, guidance: string) {
+  return effect.pipe(
+    Effect.catchIf(
+      (err): err is TerminalViolationError => err instanceof TerminalViolationError,
+      (err) => Effect.die(new Error(`${err.message}. ${guidance}`)),
+    ),
+  )
 }
 
 function findNodesWithoutModel(input: {
