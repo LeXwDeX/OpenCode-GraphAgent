@@ -1,0 +1,141 @@
+title: "Closing audit: cygpath HIGH fix verification"
+mode: deep
+admission:
+  brief_revision: 1
+  qa_mode: LIGHT
+  verdict: READY
+  brief:
+    goal: "Close the final-confirmation audit loop: verify the sole HIGH (missing cygpath conversion in release-fork.yml Extract Templates) is fixed by commit 434a4cbca on feat/dag-config-repo, per the arbiter's bounded LOOP scope"
+    scope:
+      in:
+        - "release-fork.yml Extract Templates step: cygpath -m guard now mirrors the models.dev step"
+        - "packages/opencode/script/generate.ts: contextual error for set-but-missing DAG_TEMPLATES_DIR"
+        - "affected gates only: typecheck opencode, SDK regen determinism (zero diff), generate.ts error/happy paths"
+        - "fix is committed and pushed to feat/dag-config-repo (PR #171)"
+      out:
+        - "the 3 MEDIUM + 10 LOW deferred follow-ups (arbiter excluded them from the loop)"
+        - "re-running the 9/9 gate suite or re-reviewing lanes (arbiter forbade both)"
+    constraints:
+      - "read-only verification"
+    assumptions:
+      - "arbiter verdict and loop_scope from dag_035a2534affe21Pdb2mCgFs6a6 are the binding contract"
+    acceptance_criteria:
+      - "Extract Templates step contains the cygpath guard pattern identical in shape to the models.dev step"
+      - "generate.ts throws a contextual error for missing dir and loads a real dir correctly"
+      - "typecheck PASS; SDK regen produces zero diff; fix commit present on feat/dag-config-repo"
+    evidence_required:
+      - "file:line citations + executed checks"
+    risks:
+      - "none material; mechanical one-pattern mirror"
+    review_plan:
+      - "one verifier node (fix existence + gates), one arbiter (final PASS/LOOP/BLOCKED)"
+    open_questions: []
+    blocking_questions: []
+config:
+  name: closing-audit-cygpath-fix
+  max_concurrency: 2
+  max_node_replan_attempts: 1
+  max_total_nodes: 4
+  node_defaults:
+    required: false
+    report_to_parent: false
+    worker_config:
+      timeout_ms: 600000
+  nodes:
+    - id: verify-fix
+      name: "Verify: cygpath fix + affected gates"
+      worker_type: general
+      depends_on: []
+      required: true
+      output_schema:
+        type: object
+        required: [verdict, results, anomalies]
+        properties:
+          verdict:
+            type: string
+            enum: [PASS, FAIL, BLOCKED]
+          results:
+            type: array
+            items:
+              type: object
+              required: [gate, command, outcome, detail]
+              properties:
+                gate: { type: string }
+                command: { type: string }
+                outcome: { type: string, enum: [PASS, FAIL, SKIPPED] }
+                detail: { type: string }
+          anomalies: { type: array, items: { type: string } }
+      prompt_template:
+        inline: |
+          You are an OBJECTIVE VERIFIER. Read-only (no file modifications). Current
+          branch: feat/dag-config-repo. Verify the HIGH-fix closure:
+          1. Fix presence: .github/workflows/release-fork.yml "Extract Templates" step
+             contains the `command -v cygpath` guard and writes the converted
+             templates_dir to GITHUB_ENV; compare its shape against the models.dev
+             step in the same file (quote both hunks, file:line).
+          2. Fix committed: `git log --oneline -3` shows the cygpath fix commit on
+             feat/dag-config-repo; `git diff HEAD~1 HEAD --stat` covers exactly
+             release-fork.yml + script/generate.ts.
+          3. generate.ts contextual error: run
+             DAG_TEMPLATES_DIR=/nonexistent-probe bun -e "await import('./packages/opencode/script/generate.ts').then(()=>console.log('NO-THROW'),(e)=>console.log('THREW:',e.message.slice(0,120)))"
+             — expect THREW with the contextual message.
+          4. generate.ts happy path: run the same import with
+             DAG_TEMPLATES_DIR pointing at ~/.config/opencode/workflows — expect the
+             "Loaded dag templates snapshot" log with a positive template count.
+          5. typecheck: bun run typecheck (packages/opencode)
+          6. SDK regen determinism: ./packages/sdk/js/script/build.ts then
+             `git status --short packages/sdk/js/src/v2/gen` — expect zero diff.
+          Verdict PASS only if all pass. Report decisive fragments.
+
+    - id: arbitrate
+      name: "Arbiter: Closure Verdict"
+      worker_type: general
+      depends_on: [verify-fix]
+      required: true
+      report_to_parent: true
+      output_schema:
+        type: object
+        required: [verdict, reason, evidence, findings, stop_reason, next_action]
+        properties:
+          verdict:
+            type: string
+            enum: [PASS, LOOP, BLOCKED]
+          reason: { type: string }
+          evidence:
+            type: array
+            items: { type: string }
+          findings:
+            type: array
+            items:
+              type: object
+              required: [severity, title, evidence, status]
+              properties:
+                severity: { type: string, enum: [CRITICAL, HIGH, MEDIUM, LOW] }
+                title: { type: string }
+                description: { type: string }
+                evidence: { type: string }
+                status: { type: string, enum: [CONFIRMED, REFUTED, PARTIALLY_CONFIRMED] }
+                recommendation: { type: string }
+          stop_reason:
+            type: string
+            enum: [goal_met, correction_required, evidence_missing, no_progress, round_cap, budget_cap]
+          next_action:
+            type: string
+            enum: [finalize, replan, stop]
+      prompt_template:
+        inline: |
+          You are the ARBITER closing the final-confirmation audit loop for the
+          three-PR stack (#171/#169/#170). The parent loop verdict
+          (dag_035a2534affe21Pdb2mCgFs6a6) demanded exactly one bounded fix: the
+          cygpath HIGH. Judge ONLY whether verify-fix proves that closure:
+          - PASS: fix present + committed + contextual error works + gates green;
+            declare the full stack merge-ready, listing the deferred follow-ups as
+            accepted residuals (3 MEDIUM + 10 LOW from the parent arbiter: version
+            pinning, template retry, builtin third-scope docs, cascade wording,
+            goal route optional schema, dagFailNode union, hydration race, stack base
+            drift, artifact commit intent note, builtin scope tests, embed
+            determinism, template-update lock semantics, chore message wording)
+          - LOOP: only if the fix itself is wrong/incomplete (name it)
+          - BLOCKED: evidence missing
+          State reason, evidence, stop_reason, next_action explicitly. Submit via
+          submit_result.

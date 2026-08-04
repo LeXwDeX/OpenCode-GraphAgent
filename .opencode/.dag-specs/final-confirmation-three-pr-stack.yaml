@@ -1,0 +1,291 @@
+title: "Final confirmation review: three-PR stack (config-repo, error_class, goal restore)"
+mode: deep
+admission:
+  brief_revision: 1
+  qa_mode: LIGHT
+  verdict: READY
+  brief:
+    goal: "Final confirmation review closing the last two review gaps before merge: (1) the post-round-3 remediation wave (R1-R10 fixes) which was gate-verified but never agent-reviewed, and (2) the config-repo template mechanism (#171) whose original deep review was interrupted and never reached a verdict"
+    scope:
+      in:
+        - "Post-remediation delta: workflow.md paused/queued/paused wording; prompt.test.ts positive fall-through assertions; dag-replan-stale-nodefailed.test.ts paused required-failure test; handlers/session.ts goal 404 + session.goal.absent scenario; httpapi-exercise dagFailNode fixture (runner/types/index); tui sync-goal.test.tsx; e2e-loop.test.ts SUBSCRIPTION_SETTLE_MS"
+        - "Config-repo mechanism commits 676e0463e, 6ffc7a712, 98e4c0624, 2ee59d874: release-fork.yml package-templates job, dag-flow.txt library scope text, /dag-template-update command template + registration, builtin template embedding (workflows.ts + build injection)"
+        - "Stack integrity: per-branch content attribution (feat/dag-config-repo / feat/dag-error-class / feat/goal-restore), generated-file coherence per branch, committed .opencode artifacts hygiene (no secrets)"
+        - "Objective gates at feat/goal-restore HEAD (full tree): typecheck, test suites, httpapi contract, migration check, SDK regen determinism"
+      out:
+        - "Re-reviewing already-adjudicated round-1/2/3 findings (closure already PASS-adjudicated)"
+        - "opencode-dag-config remote repo content itself"
+    constraints:
+      - "reviewers are read-only; do not modify any file"
+      - "every material finding must cite file:line evidence"
+    assumptions:
+      - "current branch feat/goal-restore contains the complete stacked final state"
+      - "prior adjudications stand: round-3 PASS on the pre-remediation state; R1-R10 argumentations recorded in-session"
+    acceptance_criteria:
+      - "no NEW CRITICAL/HIGH on verified evidence across remediation delta and config-repo mechanism"
+      - "config-repo mechanism verified sound: release job, update command, library resolution tier"
+      - "all objective gates PASS at HEAD"
+      - "stack branches carry exactly their attributed bundles"
+    evidence_required:
+      - "file:line citations"
+      - "executed gate results"
+    risks:
+      - "remediation fixes introducing subtle contract drift (goal 404 vs consumers)"
+      - "release-template job failure modes never exercised"
+    review_plan:
+      - "wave 1: three parallel reviewers (post-remediation delta, config-repo mechanism, stack integrity)"
+      - "wave 2: objective gate runner"
+      - "wave 3: arbiter PASS/LOOP/BLOCKED with bounded continuation"
+    open_questions: []
+    blocking_questions: []
+config:
+  name: final-confirmation-three-pr-stack
+  max_concurrency: 6
+  max_node_replan_attempts: 2
+  max_total_nodes: 12
+  node_defaults:
+    required: false
+    report_to_parent: false
+    worker_config:
+      timeout_ms: 900000
+  nodes:
+    - id: review-post-remediation
+      name: "Review: post-round-3 remediation delta"
+      worker_type: general
+      depends_on: []
+      required: true
+      worker_config:
+        timeout_ms: 1200000
+      prompt_template:
+        inline: |
+          You are a FRESH-CONTEXT REVIEWER. Read-only — do not modify any file.
+          Target: the remediation wave applied AFTER the round-3 PASS adjudication of
+          the joint diff. These fixes were gate-verified but never agent-reviewed.
+          Current branch (feat/goal-restore) contains the final committed state.
+
+          Review each fix for correctness, regressions, and contract drift:
+          1. packages/core/src/plugin/command/workflow.md "Cascade detection":
+             required-failure shape says dependents pending/queued/PAUSED are skipped
+             with error_reason workflow_failed (untouched only while workflow paused).
+             Cross-check dag.ts terminateNonTerminalNodes (failRunning branch vs
+             NodeSkipped branch) and the PAUSED->FAILED guard.
+          2. packages/opencode/test/session/prompt.test.ts goal-absent fall-through
+             test: positive assertions (/goal orphan request persisted + exactly 1 LLM
+             input). Check they cannot pass vacuously and match the registry path
+             behavior in prompt.ts (empty template expansion).
+          3. packages/opencode/test/dag/dag-replan-stale-nodefailed.test.ts paused
+             required-failure test: scenario valid (pause before failure settlement,
+             empty-reply failing the node), assertions prove the paused nuance.
+          4. packages/opencode/src/server/routes/instance/httpapi/handlers/session.ts
+             goal handler returns notFound when goalless (was 200+null): check error
+             import, ApiNotFoundError declared on the route (groups/session.ts), and
+             EVERY consumer tolerates 404 — audit packages/tui/src/context/sync.tsx
+             hydration (.catch fallback) and any other session.goal call sites.
+          5. httpapi-exercise: session.goal.absent scenario (404 expectation),
+             dag.nodes scenario seeded failure (failDagNodeFixture in runner.ts via
+             Dag.Service.nodeFailed + run() wrapper), wire assertions
+             (error_class present on failed, absent on pristine).
+          6. packages/tui/test/cli/cmd/tui/sync-goal.test.tsx: events match schema
+             (goal.updated properties goal object; goal.cleared), reducer assertions
+             cover write/replace/clear.
+          7. packages/opencode/test/goal/e2e-loop.test.ts SUBSCRIPTION_SETTLE_MS
+             constant: comment accuracy vs loop.ts forkScoped; all three waits use it.
+
+          MANDATORY output format:
+          1. findings: array of {severity: CRITICAL|HIGH|MEDIUM|LOW, title, description, evidence: "file:line", recommendation}
+          2. unverified_claims: array of strings
+          3. summary: 2-3 sentences
+
+    - id: review-config-repo
+      name: "Review: config-repo template mechanism (#171)"
+      worker_type: general
+      depends_on: []
+      required: true
+      prompt_template:
+        inline: |
+          You are a FRESH-CONTEXT REVIEWER. Read-only — do not modify any file.
+          Target: the config-repo reference-template mechanism on branch
+          feat/dag-config-repo (commits 676e0463e, 6ffc7a712, 98e4c0624, 2ee59d874,
+          plus chore commit 494b3b463 artifacts). Its original deep review was
+          interrupted; this is the first completed review. Use `git show <commit>`
+          and read current files on this branch.
+
+          Review dimensions:
+          1. .github/workflows/release-fork.yml package-templates/sync job: clone of
+             LeXwDeX/opencode-dag-config at release time, packaging dag-templates
+             asset, write-safety (must not touch main repo contents outside the
+             asset), failure behavior (job failure vs release), pinning (branch/tag/
+             SHA?) and supply-chain trust implications.
+          2. /dag-template-update command: packages/core/src/plugin/command.ts
+             registration + packages/core/src/plugin/command/dag-template-update.txt
+             template — the update flow (first-run clone, pull --ff-only, or zip
+             download per commit message), preview classification
+             (NEW/UNCHANGED/UPDATE), backup-before-overwrite, QA decision gate,
+             directory assumptions (<config dir>/workflows), failure modes (network,
+             dirty target dir, divergence).
+          3. Library resolution: builtin scope as third tier in command/workflows.ts
+             (project overrides global overrides builtin), list/resolve coverage,
+             dag-flow.txt guidance text consistency with actual resolution order.
+          4. Build injection: how OPENCODE_DAG_TEMPLATES is injected (generate/build
+             scripts touched by 98e4c0624) — determinism, embedding correctness.
+          5. Fix commit 2ee59d874: what review findings did it address, are they
+             actually resolved?
+          6. Chore artifacts (494b3b463 .opencode/.dag-specs + workflows yamls):
+             YAML sanity scan + NO secrets/credentials/absolute-path leakage
+             (grep for tokens, keys, ~/.local/share paths that would break for others).
+
+          MANDATORY output format:
+          1. findings: array of {severity: CRITICAL|HIGH|MEDIUM|LOW, title, description, evidence: "file:line", recommendation}
+          2. unverified_claims: array of strings
+          3. summary: 2-3 sentences
+
+    - id: review-stack
+      name: "Review: three-PR stack integrity"
+      worker_type: general
+      depends_on: []
+      prompt_template:
+        inline: |
+          You are a FRESH-CONTEXT STACK-INTEGRITY REVIEWER. Read-only — do not
+          modify any file. Three stacked PR branches carry the joint change set:
+          - feat/dag-config-repo (PR #171, base dev): config-repo mechanism +
+            workflow library + review artifacts
+          - feat/dag-error-class (PR #169, base feat/dag-config-repo): error_class
+            exposure + triage guidance + its remediation
+          - feat/goal-restore (PR #170, base feat/dag-error-class): /goal restoration
+            + its remediation
+
+          Verify (git commands: git log/diff between branches):
+          1. Attribution: diff(feat/dag-config-repo -> feat/dag-error-class) contains
+             ONLY error_class-bundle files; diff(feat/dag-error-class ->
+             feat/goal-restore) contains ONLY goal-bundle files. List any file that
+             appears in the wrong layer (generated files included — migration registry,
+             schema baseline, SDK gen must be layered correctly: error_class-only
+             additions before goal additions).
+          2. Independence: feat/dag-error-class compiles conceptually without goal
+             (no dangling goal imports in its tree — grep for @/goal references in
+             files attributed to it).
+          3. Generated coherence: migration.gen.ts on feat/dag-error-class lists only
+             the error_class migration; on feat/goal-restore both; schema baseline and
+             SDK gen likewise layered.
+          4. No cross-branch leftovers: nothing from the wip snapshot committed by
+             accident (compare feat/goal-restore against expectations).
+
+          MANDATORY output format:
+          1. findings: array of {severity: CRITICAL|HIGH|MEDIUM|LOW, title, description, evidence: "file:line or git range", recommendation}
+          2. unverified_claims: array of strings
+          3. summary: 2-3 sentences
+
+    - id: verify-suite
+      name: "Verify: execute all gates at HEAD"
+      worker_type: general
+      depends_on: []
+      required: true
+      output_schema:
+        type: object
+        required: [verdict, results, anomalies]
+        properties:
+          verdict:
+            type: string
+            enum: [PASS, FAIL, BLOCKED]
+          results:
+            type: array
+            items:
+              type: object
+              required: [gate, command, outcome, detail]
+              properties:
+                gate: { type: string }
+                command: { type: string }
+                outcome: { type: string, enum: [PASS, FAIL, SKIPPED] }
+                detail: { type: string }
+          anomalies: { type: array, items: { type: string } }
+      prompt_template:
+        inline: |
+          You are an OBJECTIVE GATE RUNNER. Execute and report faithfully. Do NOT
+          modify any file. Current branch feat/goal-restore holds the full stacked
+          state. Gates (from the stated directories):
+          1. typecheck core: bun run typecheck (packages/core)
+          2. typecheck opencode: bun run typecheck (packages/opencode)
+          3. typecheck tui: bun run typecheck (packages/tui)
+          4. opencode suites: bun test test/dag test/goal test/tool/goal-tool.test.ts test/session/prompt.test.ts (packages/opencode)
+          5. core suites: bun test test/dag-core.test.ts test/dag-projector-drift.test.ts test/dag-store-summaries.test.ts test/plugin/command.test.ts (packages/core)
+          6. tui sync suites: bun test test/cli/cmd/tui/sync-goal.test.tsx test/cli/cmd/tui/sync-dag.test.tsx (packages/tui)
+          7. migration check: bun script/migration.ts --check (packages/core)
+          8. HttpAPI contract: bun run test:httpapi --fail-on-missing (packages/opencode)
+          9. SDK regen determinism: in packages/sdk/js run bun run build, then
+             `git diff -- packages/sdk/js/src/v2/gen` — PASS iff no diff at all (the
+             committed gen files must be exactly reproduced).
+          Record outcome + decisive fragment per gate. Verdict PASS only if all pass;
+          FAIL lists failing gates; BLOCKED states why.
+
+    - id: arbitrate
+      name: "Arbiter: Final Verdict"
+      worker_type: general
+      depends_on: [review-post-remediation, review-config-repo, review-stack, verify-suite]
+      required: true
+      report_to_parent: true
+      worker_config:
+        timeout_ms: 1200000
+      output_schema:
+        type: object
+        required: [verdict, reason, evidence, findings, loop_scope, stop_reason, next_action]
+        properties:
+          verdict:
+            type: string
+            enum: [PASS, LOOP, BLOCKED]
+          reason: { type: string }
+          evidence:
+            type: array
+            items: { type: string }
+          findings:
+            type: array
+            items:
+              type: object
+              required: [severity, title, evidence, status]
+              properties:
+                severity:
+                  type: string
+                  enum: [CRITICAL, HIGH, MEDIUM, LOW]
+                title: { type: string }
+                description: { type: string }
+                evidence: { type: string }
+                status:
+                  type: string
+                  enum: [CONFIRMED, REFUTED, PARTIALLY_CONFIRMED]
+                recommendation: { type: string }
+          loop_scope:
+            type: array
+            items: { type: string }
+          stop_reason:
+            type: string
+            enum: [goal_met, correction_required, evidence_missing, no_progress, round_cap, budget_cap]
+          next_action:
+            type: string
+            enum: [finalize, replan, stop]
+      prompt_template:
+        inline: |
+          You are the ARBITER for the final confirmation review of the three-PR stack.
+          Rule on VERIFIED evidence only: three reviewer outputs + gate results.
+
+          Judgment:
+          - PASS: no CRITICAL/HIGH on verified evidence; gates PASS; stack layers
+            correctly attributed; config-repo mechanism sound (release job safe,
+            update command robust, resolution tiers correct, no secrets in artifacts)
+          - LOOP: at most ONE bounded wave for concrete HIGH findings (name loop_scope)
+          - BLOCKED: evidence missing or ceiling reached; report residuals
+
+          Deduplicate, discard REFUTED, rank by impact. State reason, evidence,
+          stop_reason, next_action explicitly. Submit via submit_result.
+
+    - id: finalize-review
+      name: "Publish the final confirmation report"
+      worker_type: general
+      depends_on: [arbitrate]
+      condition: 'arbitrate.output.verdict == "PASS"'
+      required: true
+      report_to_parent: true
+      prompt_template:
+        inline: |
+          Publish the final confirmation report for the three-PR stack: per-PR
+          review coverage status, gate results, confirmed residual items (accepted
+          non-blocking), and the PASS reason declaring the stack merge-ready. Do not
+          introduce new findings.
