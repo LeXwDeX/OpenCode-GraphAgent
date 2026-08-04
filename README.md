@@ -27,7 +27,7 @@ Our graph-engineering doctrine is operational:
 4. **Iteration is a bounded local graph rewrite.** `PASS` finalizes, `LOOP` adds a new correction/review wave through pause → replan → resume, and `BLOCKED` stops with evidence. Completed nodes never form a hidden cycle.
 5. **Reality outranks self-report.** State is event-sourced, recovery follows durable evidence, tests and code settle claims, and humans retain pause/step/cancel/replan authority where mistakes are expensive.
 
-The repository ships three opinionated reference graphs: design decision deep-dive, parallel project delivery, and deep review of an existing subsystem. `/dag-flow` selects the closest shape from the request, injects the current task, and derives the actual DAG while preserving its fail-closed gates. See the [Graph Engineering workflow catalog](./.opencode/workflows/GRAPH-ENGINEERING.md). The designs adapt useful patterns from the MIT-licensed [graph-engineering](https://github.com/codejunkie99/graph-engineering) project to this runtime's stronger execution, recovery, and control contracts.
+Curated reference topologies — design decision deep-dive, parallel project delivery, deep review of an existing subsystem, compact change review — ship through the workflow library's global scope (curated by the [`opencode-dag-config`](https://github.com/LeXwDeX/opencode-dag-config) repo) and a builtin tier embedded in release binaries; the project `.opencode/workflows/` directory holds repo-specific specs. `/dag-flow` picks the closest shape by name, injects the current task, and derives the actual DAG while preserving its fail-closed gates. See the [Graph Engineering workflow catalog](./.opencode/workflows/GRAPH-ENGINEERING.md).
 
 ## Why a DAG
 
@@ -76,9 +76,13 @@ directory and it gains a **name**:
 |---|---|---|
 | Project | `.opencode/workflows/<name>.yaml` | This repo, committed with it — the whole team gets the same procedure |
 | Global | `<opencode config dir>/workflows/<name>.yaml` | Every project on the machine |
+| Builtin | Compiled into release binaries | Every release install — the last-resort tier |
 
-The filename stem is the name, and a project file shadows a global one with the
-same name. A minimal spec:
+Resolution takes the first match in that order, so a project file shadows a
+global one with the same name, and both shadow the builtin tier. The global
+scope is maintained by the [`opencode-dag-config`](https://github.com/LeXwDeX/opencode-dag-config)
+repository; the `/dag-template-update` command syncs it (preview of
+new/changed/unchanged files, backup before overwrite, QA decision gate). A minimal spec:
 
 ```yaml
 title: Dependency audit
@@ -111,7 +115,7 @@ relative to the session directory instead of the library.
 
 ### 3. Let the agent author it
 
-The built-in **`create-dag-workflow`** skill covers spec authoring: the two
+The built-in **`create-dag-workflow`** skill covers spec authoring: the library
 scopes, the file shape, the rules a saved spec must respect (no pinned models,
 `worker_type` must exist, required template variables must be supplied), and
 how to verify it. Ask to "save this as a reusable workflow" and the agent
@@ -157,6 +161,7 @@ Workflow-level knobs: `max_concurrency` (default 5), `max_node_replan_attempts` 
 - Declared transition tables for workflow and node status; every mutation goes through a guard, invalid transitions and terminal violations are typed errors (HTTP 409, not 500).
 - All changes are published as durable `dag.*` events; a projector writes the SQLite read model *inside* the publish transaction. History is event replay, not a log table. A drift test fails whenever the projector's guards and the declared transition tables are edited out of sync.
 - **Crash recovery** is lazy, per-workflow, and evidence-based: nodes left `running` are reconciled against their child session's durable state. Sessions that finished back-fill their captured output; when execution ownership was genuinely lost, the workflow pauses and the parent decides disposition (replan / resume / cancel). Recovery never adopts or restarts provider work on its own.
+- **Failure triage**: every failed node carries a failure class (`timeout` / `exec_failed` / `verdict_fail`) surfaced in `workflow(action=status)` and in the parent's wake — including a failed-nodes attribution digest when a workflow terminalizes failed — so the parent agent repairs the specific node (replan with a replacement under a new id, or a continuation workflow reusing completed outputs) instead of restarting the graph.
 
 ### Deep mode: admission & review
 
@@ -197,6 +202,19 @@ the next workflow start without a restart.
 
 ---
 
+## Autonomous goal loop (`/goal`)
+
+Graph orchestration decomposes a task across child sessions; the goal loop is
+its single-session complement: one durable goal that the agent works toward
+autonomously across turns of the current session.
+
+- **Commands**: `/goal <text>` sets a goal and starts the loop; `/goal status|pause|resume|done|clear|stop` controls it; `/subgoal <text>|list|remove <n>|clear` manages subgoals attached to the active goal.
+- **Judge loop**: after each turn an external judge evaluates progress — `done` clears the goal, `continue` injects the next continuation turn against a configurable turn budget (budget exhaustion pauses the goal; it stays resumable). The agent can self-declare completion with the `goal(action: "complete")` tool, which bypasses the judge; `goal(action: "status")` inspects state.
+- **Visibility**: while a goal is active or paused, the system prompt carries a live goal block (text, status, turns used/remaining, subgoals, last judge verdict); the TUI sidebar shows a compact goal widget; `GET /session/:sessionID/goal` exposes the state (`404` when no goal is set).
+- **Durability**: goal state is persisted per session (`goal_state`), survives restarts, and is cleared automatically when the session is deleted.
+
+---
+
 ## Other changes in this fork
 
 - **Hooks API**: Claude Code hooks protocol compatibility. 26 hook events (`PreToolUse`, `PostToolUse`, `SessionStart`, `PermissionRequest`, `WorktreeCreate`, …) × 5 execution types (`command`, `mcp`, `http`, `prompt`, `agent`), loaded from a global/project/worktree `hooks.json` chain or registered per-session over HTTP, with optional workspace-trust gating. See the [hooks reference](./packages/core/src/plugin/skill/configure-hooks.md).
@@ -204,7 +222,6 @@ the next workflow start without a restart.
 - **CJK & IME fixes**: corrections for Chinese/Japanese/Korean input in the terminal UI (IME composition flushing, full-width text handling), plus a Korean IME fix script under [`patches/`](./patches).
 - **Worktree isolation**: per-workflow `git worktree` isolation, with experimental sandbox-worktree HTTP endpoints.
 - **Configuration assistant**: a standalone Go TUI under [`config_assistant`](./config_assistant) for locating, validating, and editing opencode configuration (`cd config_assistant && go run ./cmd/ocfg`).
-- An earlier "Goal auto-loop" and the `/goal`, `/subgoal`, `/workflow` slash commands are gone; autonomous execution now goes through the `workflow` tool and its wake mechanism.
 
 All upstream capabilities (multi-provider, built-in LSP, client/server architecture, TUI/desktop/web clients) are preserved.
 
@@ -248,8 +265,7 @@ Exact file boundaries are listed in [`NOTICE`](./NOTICE). The AGPL covers the DA
 ## Docs
 
 - [Saved workflow authoring guide](./packages/core/src/plugin/skill/create-dag-workflow.md) — the `create-dag-workflow` skill body
-- [Graph Engineering workflow catalog](./.opencode/workflows/GRAPH-ENGINEERING.md) and [source research](./docs/graph-engineering-template-research.md) — reusable shapes, evidence, and migration choices
-- [`.opencode/workflows/change-review.yaml`](./.opencode/workflows/change-review.yaml) — compact change review, startable as `change-review`
+- [Graph Engineering workflow catalog](./.opencode/workflows/GRAPH-ENGINEERING.md) — reference topologies and adaptation contracts
 - [`docs/harness-dag.md`](./docs/harness-dag.md) — deep-mode admission & review lifecycle
 - [`.opencode/dag-prompts`](./.opencode/dag-prompts) — built-in node prompt templates
 - [`AGENTS.md`](./AGENTS.md) — contribution & development guide

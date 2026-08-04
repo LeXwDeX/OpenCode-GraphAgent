@@ -1,0 +1,235 @@
+title: DAG Module Deep Review
+config:
+  name: dag-module-review
+  max_concurrency: 5
+  max_node_replan_attempts: 3
+  node_defaults:
+    report_to_parent: false
+    worker_config:
+      timeout_ms: 600000
+  nodes:
+    - id: explore-dag
+      name: explore-dag
+      worker_type: explore
+      depends_on: []
+      required: true
+      prompt_template:
+        inline: |
+          Explore the DAG workflow orchestration module at packages/opencode/src/dag/ in this repository.
+
+          Use the codebase-memory-mcp tools (project name: "opencode-dag") for structural analysis:
+          - search_graph, trace_path, get_code_snippet, query_graph
+
+          Map the complete module structure:
+          1. List every file with its responsibility (admission.ts, config.ts, dag.ts, model.ts, review-lifecycle.ts, runtime/*.ts, templates/*.ts)
+          2. Identify the core data flow: workflow creation → node scheduling → execution → completion
+          3. Map cross-file dependencies and coupling points
+          4. Identify the public API surface (exported functions/classes)
+          5. Note integration points with the rest of the system (Session, EventV2, Provider, etc.)
+          6. Flag any files over 300 lines or functions with high cyclomatic complexity
+
+          Output a structured inventory: file paths, responsibilities, key exports, dependency edges, and integration boundaries.
+
+    - id: review-arch
+      name: review-arch
+      worker_type: general
+      depends_on: [explore-dag]
+      prompt_template:
+        inline: |
+          You are an architecture reviewer. Review the DAG module at packages/opencode/src/dag/ for architectural soundness.
+
+          Context from exploration:
+          {{explore-dag}}
+
+          Use codebase-memory-mcp (project: "opencode-dag") and file reads to examine the actual code.
+
+          Review dimensions:
+          - Module boundaries: are responsibilities cleanly separated? (admission vs config vs runtime vs templates)
+          - Coupling: does dag.ts (core) leak runtime concerns? Does runtime/ properly abstract execution?
+          - Layer violations: does the module respect the LayerNode/defaultLayer self-containment invariant from AGENTS.md?
+          - State management: is workflow state mutation properly guarded (withWorkflowLock)?
+          - Extension points: are templates, model resolution, and config properly pluggable?
+
+          HARD REQUIREMENTS:
+          - Every finding MUST cite file:line evidence
+          - List any claims you could NOT verify as `unverified_claims`
+          - Do NOT modify any files
+          - Rate each finding: CRITICAL / HIGH / MEDIUM / LOW
+
+    - id: review-logic
+      name: review-logic
+      worker_type: general
+      depends_on: [explore-dag]
+      prompt_template:
+        inline: |
+          You are a correctness reviewer. Review the DAG module at packages/opencode/src/dag/ for logic correctness and edge-case safety.
+
+          Context from exploration:
+          {{explore-dag}}
+
+          Use codebase-memory-mcp (project: "opencode-dag") and file reads to examine the actual code.
+
+          Review dimensions:
+          - State machine correctness: workflow lifecycle transitions (pending → running → completed/failed/cancelled/paused)
+          - Concurrency safety: lock usage in withWorkflowLock, race conditions in node scheduling
+          - Error handling: are failures properly propagated? Can a node failure leave the workflow in an inconsistent state?
+          - Recovery logic (runtime/recovery.ts): does crash recovery correctly handle mid-flight nodes?
+          - Condition evaluation (runtime/eval.ts): can conditions reference undefined outputs?
+          - Admission state machine (admission.ts): are transitions exhaustive and mutually exclusive?
+
+          HARD REQUIREMENTS:
+          - Every finding MUST cite file:line evidence
+          - List any claims you could NOT verify as `unverified_claims`
+          - Do NOT modify any files
+          - Rate each finding: CRITICAL / HIGH / MEDIUM / LOW
+
+    - id: review-style
+      name: review-style
+      worker_type: general
+      depends_on: [explore-dag]
+      prompt_template:
+        inline: |
+          You are a code style and conventions reviewer. Review the DAG module at packages/opencode/src/dag/ against the project's documented style guide in AGENTS.md.
+
+          Context from exploration:
+          {{explore-dag}}
+
+          Use codebase-memory-mcp (project: "opencode-dag") and file reads to examine the actual code.
+
+          Review dimensions:
+          - Effect usage: are services bound to named variables before method calls? No nested service yields?
+          - Import style: no aliases, no star imports, dynamic imports for heavy modules?
+          - Variable style: const over let, ternaries over reassignment, no unnecessary destructuring?
+          - Control flow: early returns over else, no try/catch where avoidable?
+          - Schema/Drizzle conventions: snake_case field names?
+          - Type safety: no `any`, proper use of Schema helpers for JSON parsing?
+          - Comment discipline: comments only for non-obvious constraints?
+
+          HARD REQUIREMENTS:
+          - Every finding MUST cite file:line evidence
+          - List any claims you could NOT verify as `unverified_claims`
+          - Do NOT modify any files
+          - Rate each finding: CRITICAL / HIGH / MEDIUM / LOW
+
+    - id: verify-claims
+      name: verify-claims
+      worker_type: general
+      depends_on: [review-arch, review-logic, review-style]
+      required: true
+      prompt_template:
+        inline: |
+          You are a claim verification agent. Three reviewers produced findings about the DAG module at packages/opencode/src/dag/.
+
+          Architecture review:
+          {{review-arch}}
+
+          Logic/correctness review:
+          {{review-logic}}
+
+          Style review:
+          {{review-style}}
+
+          Your job:
+          1. Collect ALL items listed as `unverified_claims` from all three reviews
+          2. Collect all CRITICAL and HIGH findings
+          3. For EACH item, verify it against the actual source code using file reads and codebase-memory-mcp (project: "opencode-dag")
+          4. Mark each as: CONFIRMED (evidence supports it), REFUTED (evidence contradicts it), or PARTIAL (partially true)
+          5. For CONFIRMED findings, note the exact file:line evidence
+          6. For REFUTED findings, explain why the reviewer was wrong
+
+          Output a verification report with:
+          - verified_findings: list of CONFIRMED findings with evidence
+          - refuted_findings: list of REFUTED findings with counter-evidence
+          - partial_findings: list of PARTIAL findings with nuance
+          - unresolved: items you could not determine
+
+          Do NOT modify any files.
+
+    - id: arbitrate
+      name: arbitrate
+      worker_type: general
+      depends_on: [verify-claims]
+      required: true
+      report_to_parent: true
+      output_schema:
+        type: object
+        required: [verdict, summary, findings, required_actions, next_action]
+        properties:
+          verdict:
+            type: string
+            enum: [ACCEPT, REVISE, REJECT, BLOCKED]
+          summary:
+            type: string
+          findings:
+            type: array
+            items:
+              type: object
+              properties:
+                id: { type: string }
+                severity: { type: string }
+                category: { type: string }
+                description: { type: string }
+                evidence: { type: string }
+                verified: { type: boolean }
+          required_actions:
+            type: array
+            items: { type: string }
+          next_action:
+            type: object
+            required: [operation, targets]
+            properties:
+              operation:
+                type: string
+                enum: [continue, extend, replan, complete, stop]
+              targets:
+                type: array
+                items: { type: string }
+      prompt_template:
+        inline: |
+          You are the final arbiter for a code review of the DAG module at packages/opencode/src/dag/.
+
+          Verification report:
+          {{verify-claims}}
+
+          Your job:
+          1. Rule finding-by-finding on the VERIFIED evidence only (CONFIRMED and PARTIAL items)
+          2. Discard REFUTED findings entirely
+          3. Deduplicate overlapping findings across reviewers
+          4. Resolve conflicts between reviewers using the verification evidence
+          5. Produce a final ranked list of findings by severity
+          6. Decide verdict:
+             - ACCEPT: no CRITICAL or HIGH verified findings remain
+             - REVISE: HIGH findings exist but are actionable and bounded
+             - REJECT: CRITICAL findings exist or the module has fundamental structural problems
+             - BLOCKED: cannot determine due to unresolved verification gaps
+          7. Specify required_actions for each confirmed finding
+          8. Set next_action: if ACCEPT → complete; if REVISE/REJECT → extend with targets being the problem areas
+
+          Call submit_result with your structured verdict.
+
+    - id: deep-dive
+      name: deep-dive
+      worker_type: general
+      depends_on: [arbitrate]
+      condition: 'arbitrate.output.verdict != "ACCEPT"'
+      report_to_parent: true
+      prompt_template:
+        inline: |
+          The arbiter did not accept the DAG module review. Verify each required action against the actual code and produce a corrected, evidence-backed action plan.
+
+          Arbiter verdict:
+          {{arbitrate}}
+
+          For each required_action:
+          1. Read the relevant source files in packages/opencode/src/dag/
+          2. Confirm the problem exists with exact file:line evidence
+          3. Propose a concrete fix (code-level, not abstract)
+          4. Assess fix risk and blast radius
+
+          Output a prioritized remediation plan with:
+          - Each action confirmed or dismissed
+          - Concrete code suggestions for confirmed actions
+          - Dependency order for fixes
+          - Risk assessment per fix
+
+          Do NOT modify any files.

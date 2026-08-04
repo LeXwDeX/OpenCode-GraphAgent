@@ -58,6 +58,7 @@ export type ScenarioContext = {
   message: (sessionID: SessionID, input?: { text?: string }) => Effect.Effect<MessageSeed>
   messages: (sessionID: SessionID) => Effect.Effect<SessionV1.WithParts[]>
   todos: (sessionID: SessionID, todos: TodoInfo[]) => Effect.Effect<void>
+  goal: (sessionID: SessionID, goalText: string, maxTurns?: number) => Effect.Effect<void>
   worktree: (input?: { name?: string }) => Effect.Effect<Worktree.Info>
   worktreeRemove: (directory: string) => Effect.Effect<void>
   llmText: (value: string) => Effect.Effect<void>
@@ -65,6 +66,8 @@ export type ScenarioContext = {
   tuiRequest: (request: { path: string; body: unknown }) => Effect.Effect<void>
   /** Create a DAG workflow owned by sessionID with the given node configs. Returns the dagID. */
   dag: (input: { sessionID: SessionID; title?: string; nodes: DagNodeSeed[] }) => Effect.Effect<DagWorkflowInfo>
+  /** Fail a seeded DAG node through the Dag service (projects error_class on the wire). */
+  dagFailNode: (dagID: string, nodeID: string, reason: string, errorClass: "timeout" | "exec_failed" | "verdict_fail") => Effect.Effect<void>
   /** Create a DAG workflow under a different project in the shared database. */
   foreignDag: (input: { title?: string; nodes: DagNodeSeed[] }) => Effect.Effect<DagWorkflowInfo>
 }

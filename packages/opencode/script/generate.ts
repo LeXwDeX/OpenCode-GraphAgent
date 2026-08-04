@@ -1,3 +1,4 @@
+import { existsSync } from "fs"
 import path from "path"
 import { fileURLToPath } from "url"
 
@@ -33,3 +34,36 @@ async function loadModelsData() {
 }
 
 export const modelsData = await loadModelsData()
+
+/**
+ * DAG reference templates compiled into the binary so air-gapped installs
+ * ship the curated workflows without network access. The release pipeline
+ * clones opencode-dag-config and points DAG_TEMPLATES_DIR at it; when absent
+ * (local dev), the binary has no builtin templates and falls back to the
+ * project/global workflow library scopes.
+ */
+async function loadDagTemplatesData() {
+  const templatesDir = process.env.DAG_TEMPLATES_DIR
+  if (!templatesDir) {
+    console.log("Loaded no dag templates snapshot (DAG_TEMPLATES_DIR unset)")
+    return "undefined"
+  }
+  // Contextual failure: a set-but-unresolvable dir usually means the release
+  // workflow's Extract Templates step wrote an unconverted shell path
+  // (Windows Git Bash) — fail loudly with the offending value instead of a
+  // bare glob/IO error.
+  if (!existsSync(templatesDir)) {
+    throw new Error(
+      `DAG_TEMPLATES_DIR points to a missing directory: ${templatesDir} — check the release workflow's Extract Templates step path conversion`,
+    )
+  }
+  const templates: Record<string, string> = {}
+  for (const file of await Array.fromAsync(new Bun.Glob("*.yaml").scan({ cwd: templatesDir }))) {
+    const name = file.replace(/\.ya?ml$/, "")
+    templates[name] = await Bun.file(path.join(templatesDir, file)).text()
+  }
+  console.log(`Loaded dag templates snapshot from ${templatesDir}: ${Object.keys(templates).length} templates`)
+  return JSON.stringify(templates)
+}
+
+export const dagTemplatesData = await loadDagTemplatesData()

@@ -1183,6 +1183,36 @@ const scenarios: Scenario[] = [
       check(stable(body) === stable(ctx.state.todos), "todos should match seeded state")
     }),
   http.protected
+    .get("/session/{sessionID}/goal", "session.goal")
+    .seeded((ctx) =>
+      Effect.gen(function* () {
+        const session = yield* ctx.session({ title: "Goal session" })
+        yield* ctx.goal(session.id, "cover session goal")
+        return { session }
+      }),
+    )
+    .at((ctx) => ({
+      path: route("/session/{sessionID}/goal", { sessionID: ctx.state.session.id }),
+      headers: ctx.headers(),
+    }))
+    .json(200, (body) => {
+      object(body)
+      check(body.goal === "cover session goal", "goal text should match seeded state")
+      check(body.status === "active", "status should be active for a freshly seeded goal")
+      check(body.turnsUsed === 0, "turnsUsed should be 0 for a freshly seeded goal")
+      check(body.maxTurns === 20, "maxTurns should be the default (20)")
+      check(Array.isArray(body.subgoals) && body.subgoals.length === 0, "subgoals should be an empty array")
+      check(!("pausedReason" in body), "pausedReason should be absent when goal is active")
+    }),
+  http.protected
+    .get("/session/{sessionID}/goal", "session.goal.absent")
+    .seeded((ctx) => ctx.session({ title: "Goalless session" }))
+    .at((ctx) => ({
+      path: route("/session/{sessionID}/goal", { sessionID: ctx.state.id }),
+      headers: ctx.headers(),
+    }))
+    .json(404, object, "status"),
+  http.protected
     .post("/session/{sessionID}/hook", "session.hook.add")
     .seeded((ctx) => ctx.session({ title: "Hook session" }))
     .at((ctx) => ({
@@ -1816,6 +1846,9 @@ const scenarios: Scenario[] = [
             ],
           }),
         ),
+        Effect.flatMap((dag) =>
+          ctx.dagFailNode(dag.dagID, "b", "node exceeded timeout of 600000ms", "timeout").pipe(Effect.as(dag)),
+        ),
       ),
     )
     .at((ctx) => ({ path: route("/dag/{dagID}/nodes", { dagID: ctx.state.dagID }), headers: ctx.headers() }))
@@ -1829,6 +1862,14 @@ const scenarios: Scenario[] = [
         check(typeof n.status === "string", "node should have status")
         check(Array.isArray(n.depends_on), "node should have depends_on")
         check(typeof n.replan_attempts === "number", "node should have replan_attempts")
+        const failed = body.find((node: any) => node.id === "b")
+        object(failed)
+        check(failed.status === "failed", "seeded node b should be failed")
+        check(failed.error_class === "timeout", "failed node should expose error_class on the wire")
+        check(typeof failed.error_reason === "string", "failed node should expose error_reason")
+        const pristine = body.find((node: any) => node.id === "a")
+        object(pristine)
+        check(!("error_class" in pristine), "error_class should be absent on non-failed nodes")
       }),
     ),
 

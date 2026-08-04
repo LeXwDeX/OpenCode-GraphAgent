@@ -445,6 +445,7 @@ describe("DagLoop atomic wake integration", () => {
             "workflow did not complete",
           )
           expect((yield* store.getNode(dagID, "review-security"))?.status).toBe("failed")
+          expect((yield* store.getNode(dagID, "review-security"))?.errorClass).toBe("exec_failed")
         }),
       ),
     )
@@ -692,7 +693,7 @@ describe("DagLoop atomic wake integration", () => {
 
   it("fails an aggregate node before execution when template placeholders remain unresolved", async () => {
     await Effect.runPromise(
-      runWakeTest(({ dag, store, childPrompts }) =>
+      runWakeTest(({ dag, store, childPrompts, parentPrompts }) =>
         Effect.gen(function* () {
           const dagID = yield* dag.create({
             projectID: "project-1",
@@ -722,6 +723,12 @@ describe("DagLoop atomic wake integration", () => {
           )
           const summary = yield* store.getNode(dagID, "summary")
           expect(summary?.errorReason).toContain("Unresolved template placeholders")
+          expect(summary?.errorClass).toBe("verdict_fail")
+          const parent = yield* takeWithin(parentPrompts, "workflow failure did not wake the parent")
+          const wakeText = promptText(parent.input)
+          expect(wakeText).toContain('[DAG Workflow failed] Workflow "Unresolved aggregate input" has reached terminal status.')
+          expect(wakeText).toContain('Failed nodes:\n- "summary" (verdict_fail):')
+          yield* Deferred.succeed(parent.release, "success")
           expect(yield* Queue.poll(childPrompts)).toEqual(Option.none())
         }),
       ),

@@ -16,10 +16,13 @@
 #                            prerelease (test build); `main` = formal release.
 #           platforms      — comma-separated subset of linux,macos,windows
 #                            to build. Leave blank to build all three.
-# Jobs    : build-cli — 3-OS matrix, bundles ripgrep + single-file binary
+# Jobs    : package-templates — package latest reference templates from the
+#                               opencode-dag-config repo into a release asset
+#           build-cli — 3-OS matrix, bundles ripgrep + single-file binary
 #           release   — optional, creates GitHub Release from build-cli artifacts
 #           register  — no-op for push triggers, just registers in Actions UI
-# Output  : Artifacts: opencode-{linux,macos,windows}.{tar.gz,zip} + SHA256SUMS
+# Output  : Artifacts: opencode-{linux,macos,windows}.{tar.gz,zip} +
+#           dag-templates.tar.gz + SHA256SUMS
 # ============================================================================
 
 name: 📦 Release · Fork Build
@@ -56,8 +59,46 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: false
 
 jobs:
+  # Package the latest reference templates from the dedicated config repo
+  # (LeXwDeX/opencode-dag-config) into a release asset. dev/main do not manage
+  # these templates anymore — the config repo is the single source of truth.
+  # Read-only: no commits, no pushes, so branch protection never blocks it.
+  package-templates:
+    name: Package Reference Templates
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Clone Config Repo
+        uses: actions/checkout@v4
+        with:
+          repository: LeXwDeX/opencode-dag-config
+          path: dag-config
+
+      - name: Package Templates
+        run: |
+          mkdir -p dist
+          shopt -s nullglob
+          files=(dag-config/*.yaml)
+          if [ ${#files[@]} -gt 0 ]; then
+            cp "${files[@]}" dist/
+          else
+            echo "::warning::No templates found in opencode-dag-config root; packaging empty archive"
+          fi
+          tar -czf dag-templates.tar.gz -C dist .
+          echo "Templates packaged: $(ls dist | wc -l) files"
+
+      - name: Upload Templates Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dag-templates
+          path: dag-templates.tar.gz
+          retention-days: 7
+
   build-cli:
     name: Build CLI (${{ matrix.name }})
+    needs: package-templates
     # Skip the actual build when triggered by push (registration-only). Per-
     # matrix-entry platform filtering can't live here — `matrix` isn't in
     # scope for a job-level `if:` — so it's applied to each step below instead.
@@ -116,6 +157,27 @@ jobs:
           done
           echo "::warning::Failed to download models.dev api.json; build will fall back to @opencode-ai/models snapshot or an empty catalog"
 
+      # Embed the latest DAG reference templates into the binary so air-gapped
+      # installs ship the curated workflows (see dag/workflows.ts builtin scope
+      # and script/generate.ts DAG_TEMPLATES_DIR loading).
+      - name: Download Templates Artifact
+        if: inputs.platforms == '' || contains(inputs.platforms, matrix.name)
+        uses: actions/download-artifact@v4
+        with:
+          name: dag-templates
+          path: dag-templates-artifact
+
+      - name: Extract Templates
+        if: inputs.platforms == '' || contains(inputs.platforms, matrix.name)
+        run: |
+          mkdir -p dag-templates-src
+          tar -xzf dag-templates-artifact/dag-templates.tar.gz -C dag-templates-src
+          templates_dir="$GITHUB_WORKSPACE/dag-templates-src"
+          if command -v cygpath &>/dev/null; then
+            templates_dir="$(cygpath -m "$templates_dir")"
+          fi
+          echo "DAG_TEMPLATES_DIR=$templates_dir" >> "$GITHUB_ENV"
+
       - name: Build CLI
         if: inputs.platforms == '' || contains(inputs.platforms, matrix.name)
         run: ./packages/opencode/script/build.ts --single --skip-install
@@ -159,7 +221,7 @@ jobs:
 
   release:
     name: Create GitHub Release
-    needs: build-cli
+    needs: [build-cli, package-templates]
     if: inputs.create_release
     runs-on: ubuntu-latest
     steps:

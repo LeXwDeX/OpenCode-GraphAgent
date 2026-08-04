@@ -1,0 +1,203 @@
+title: "Final confirmation (continuation): split post-remediation review, reuse 3 completed lanes"
+mode: deep
+admission:
+  brief_revision: 1
+  qa_mode: LIGHT
+  verdict: READY
+  brief:
+    goal: "Continue the failed final-confirmation workflow (dag_035b6a590ffeyPe2ofvgYNTwXR): the monolithic post-remediation reviewer timed out at 1200s for the third consecutive time — CHANGED APPROACH per Escalation: split it into two small parallel lanes instead of retrying a bigger monolith. Reuse the 3 completed lane outputs (config-repo review, stack integrity, 9/9 gate results) persisted on disk."
+    scope:
+      in:
+        - "review-remediation-docs: workflow.md cascade wording, prompt.test.ts fall-through positive assertions, dag-replan paused required-failure test, e2e-loop SUBSCRIPTION_SETTLE_MS"
+        - "review-remediation-contract: goal 404 handler + route error declaration + consumer tolerance audit (sync.tsx hydration + any session.goal callers), httpapi-exercise goal.absent scenario + dagFailNode fixture + wire assertions, sync-goal reducer tests"
+        - "arbitrate over all five lane outputs (2 new + 3 persisted)"
+      out:
+        - "re-running gates (9/9 PASS persisted), re-reviewing config-repo/stack lanes (completed)"
+    constraints:
+      - "reviewers are read-only; do not modify any file"
+      - "persisted upstream lane outputs are read-only inputs"
+    assumptions:
+      - "persisted outputs complete: .opencode/.dag-specs/review-parts-final/{review-config-repo.md, review-stack.md, verify-suite.md}"
+      - "reused_nodes: review-config-repo, review-stack, verify-suite"
+      - "timeout root cause was monolithic lane size, not budget alone; splitting is the approach change"
+    acceptance_criteria:
+      - "every R1-R10 remediation item reviewed by one of the two new lanes with file:line evidence"
+      - "no NEW CRITICAL/HIGH on verified evidence"
+      - "arbiter emits PASS/LOOP/BLOCKED"
+    evidence_required:
+      - "file:line citations"
+      - "persisted gate results (9/9 PASS)"
+    risks:
+      - "split lanes missing an item at the boundary between docs/tests and contract/wiring"
+    review_plan:
+      - "two parallel small reviewers (explicit per-item assignment, boundary covered twice where cheap)"
+      - "arbiter with persisted upstream context"
+      - "finalize on PASS"
+    open_questions: []
+    blocking_questions: []
+config:
+  name: final-confirmation-continue
+  max_concurrency: 4
+  max_node_replan_attempts: 2
+  max_total_nodes: 8
+  node_defaults:
+    required: false
+    report_to_parent: false
+    worker_config:
+      timeout_ms: 900000
+  nodes:
+    - id: review-remediation-docs
+      name: "Review: remediation docs + test assertions"
+      worker_type: general
+      depends_on: []
+      required: true
+      prompt_template:
+        inline: |
+          You are a FRESH-CONTEXT REVIEWER. Read-only — do not modify any file.
+          Branch feat/goal-restore holds the final state. Review FOUR remediation
+          items (post-round-3 fixes, gate-verified but never agent-reviewed):
+
+          1. packages/core/src/plugin/command/workflow.md "Cascade detection":
+             required-failure shape says pending/queued/paused dependents are
+             terminalized to `skipped` with error_reason workflow_failed, untouched
+             only while the workflow stays paused. Cross-check against
+             packages/opencode/src/dag/dag.ts terminateNonTerminalNodes (failRunning
+             branch fails running nodes, else-branch skips every other non-terminal)
+             and the PAUSED->FAILED guard rejection.
+          2. packages/opencode/test/session/prompt.test.ts goal-absent fall-through
+             test: positive assertions ("/goal orphan request" persisted + exactly 1
+             LLM input). Verify they cannot pass vacuously: trace the registry path
+             in prompt.ts (empty template -> text part + single prompt/loop run).
+          3. packages/opencode/test/dag/dag-replan-stale-nodefailed.test.ts paused
+             required-failure test: scenario constructs the paused window correctly
+             (pause before settlement; empty reply fails the required node), and the
+             assertions prove pending-during-pause then skipped(workflow_failed)
+             after resume.
+          4. packages/opencode/test/goal/e2e-loop.test.ts SUBSCRIPTION_SETTLE_MS:
+             constant used at all three former sleep sites; comment claims match
+             loop.ts forkScoped subscription wiring and the absence of a readiness
+             latch.
+
+          MANDATORY output format:
+          1. findings: array of {severity: CRITICAL|HIGH|MEDIUM|LOW, title, description, evidence: "file:line", recommendation}
+          2. unverified_claims: array of strings
+          3. summary: 2-3 sentences
+
+    - id: review-remediation-contract
+      name: "Review: remediation contract + fixture wiring"
+      worker_type: general
+      depends_on: []
+      required: true
+      prompt_template:
+        inline: |
+          You are a FRESH-CONTEXT REVIEWER. Read-only — do not modify any file.
+          Branch feat/goal-restore holds the final state. Review FOUR remediation
+          items (post-round-3 fixes, gate-verified but never agent-reviewed):
+
+          1. Goal endpoint 404 contract: packages/opencode/src/server/.../handlers/
+             session.ts goal handler fails with notFound(...) when goalless; verify
+             `notFound` import, ApiNotFoundError declared in the goal route's error
+             list (groups/session.ts), wire shape honesty (200 always carries Goal).
+             CONSUMER AUDIT: find every session.goal call site (SDK client usage in
+             packages/tui — sync.tsx hydration .catch fallback — and anywhere else)
+             and verify each tolerates 404.
+          2. httpapi-exercise session.goal.absent scenario: 404 expectation matches
+             handler behavior; seeded goalless session.
+          3. httpapi-exercise error_class fixture: runner.ts failDagNodeFixture
+             (Dag.Service.nodeFailed via run() wrapper — check run() provides the app
+             layer so no residual requirement leaks), types.ts dagFailNode signature,
+             index.ts dag.nodes scenario seeds a timeout failure and asserts
+             error_class present on failed node / absent on pristine node.
+          4. packages/tui/test/cli/cmd/tui/sync-goal.test.tsx: emitted events match
+             the schema definitions (goal.updated carries goal Info object;
+             goal.cleared carries sessionID only); reducer assertions cover write /
+             replace / clear transitions.
+
+          MANDATORY output format:
+          1. findings: array of {severity: CRITICAL|HIGH|MEDIUM|LOW, title, description, evidence: "file:line", recommendation}
+          2. unverified_claims: array of strings
+          3. summary: 2-3 sentences
+
+    - id: arbitrate
+      name: "Arbiter: Final Verdict"
+      worker_type: general
+      depends_on: [review-remediation-docs, review-remediation-contract]
+      required: true
+      report_to_parent: true
+      worker_config:
+        timeout_ms: 1200000
+      output_schema:
+        type: object
+        required: [verdict, reason, evidence, findings, loop_scope, stop_reason, next_action]
+        properties:
+          verdict:
+            type: string
+            enum: [PASS, LOOP, BLOCKED]
+          reason: { type: string }
+          evidence:
+            type: array
+            items: { type: string }
+          findings:
+            type: array
+            items:
+              type: object
+              required: [severity, title, evidence, status]
+              properties:
+                severity:
+                  type: string
+                  enum: [CRITICAL, HIGH, MEDIUM, LOW]
+                title: { type: string }
+                description: { type: string }
+                evidence: { type: string }
+                status:
+                  type: string
+                  enum: [CONFIRMED, REFUTED, PARTIALLY_CONFIRMED]
+                recommendation: { type: string }
+          loop_scope:
+            type: array
+            items: { type: string }
+          stop_reason:
+            type: string
+            enum: [goal_met, correction_required, evidence_missing, no_progress, round_cap, budget_cap]
+          next_action:
+            type: string
+            enum: [finalize, replan, stop]
+      prompt_template:
+        inline: |
+          You are the ARBITER for the final confirmation review of the three-PR stack
+          (#171 config-repo, #169 error_class, #170 goal restore).
+
+          Evidence base — read all five inputs:
+          - Two new reviewer outputs (upstream context): review-remediation-docs,
+            review-remediation-contract
+          - Three persisted completed lanes from the interrupted workflow:
+            .opencode/.dag-specs/review-parts-final/review-config-repo.md
+            .opencode/.dag-specs/review-parts-final/review-stack.md
+            .opencode/.dag-specs/review-parts-final/verify-suite.md (9/9 gates PASS,
+            including SDK regen zero-diff determinism)
+
+          Judgment:
+          - PASS: no CRITICAL/HIGH on verified evidence across all five lanes; gates
+            PASS; stack attribution sound; config-repo mechanism sound
+          - LOOP: at most ONE bounded wave for concrete HIGH findings (name loop_scope);
+            do NOT loop on MEDIUM/LOW or deferred follow-ups
+          - BLOCKED: evidence missing or ceiling reached; report residuals
+
+          Deduplicate, discard REFUTED, rank by impact. State reason, evidence,
+          stop_reason, next_action explicitly. Submit via submit_result.
+
+    - id: finalize-review
+      name: "Publish the final confirmation report"
+      worker_type: general
+      depends_on: [arbitrate]
+      condition: 'arbitrate.output.verdict == "PASS"'
+      required: true
+      report_to_parent: true
+      prompt_template:
+        inline: |
+          Publish the final confirmation report for the three-PR stack. Include:
+          per-PR review coverage, the five lane conclusions, gate results (9/9),
+          confirmed residual items with accepted non-blocking status, and the PASS
+          reason declaring the stack merge-ready. Write the report to
+          .opencode/.dag-specs/review-parts-final/final-confirmation-report.md and
+          submit a concise summary as your final output. Do not introduce new findings.

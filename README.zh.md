@@ -24,7 +24,7 @@ GraphAgent 是本项目对外的产品名；仓库以 **OpenCode-GraphAgent** �
 4. **迭代是有界的局部改图。** `PASS` 才能定稿，`LOOP` 通过 pause → replan → resume 增加新的修正与复审波次，`BLOCKED` 带证据停止；终态节点不会被伪装成环。
 5. **代码和测试说了算。** 状态变更写入事件，崩溃恢复只认持久化证据。到了代价高的边界，人可以 pause、step、cancel 或 replan。
 
-仓库已经附带三类强约束参考图：设计决策深挖、并行项目落地、已完成子系统深度 Review。`/dag-flow` 会先按需求选择最接近的中高规模样板，注入本次任务，再派生实际 DAG；可以扩展和剪枝，但不能绕过 fail-closed 门禁。入口见 [Graph Engineering 工作流目录](./.opencode/workflows/GRAPH-ENGINEERING.md)。这些 YAML 把 MIT 许可的 [graph-engineering](https://github.com/codejunkie99/graph-engineering) 项目里有价值的模式，适配到了本项目更严格的执行、恢复和控制契约上。
+强约束参考拓扑——设计决策深挖、并行项目落地、已完成子系统深度 Review、轻量变更审查——随工作流库分发：全局作用域由 [`opencode-dag-config`](https://github.com/LeXwDeX/opencode-dag-config) 仓库维护，正式版的二进制里还有内嵌的 builtin 层；项目的 `.opencode/workflows/` 存放本仓库专属 spec。`/dag-flow` 按名字选最接近的样板，注入本次任务，再派生实际 DAG；可以扩展和剪枝，但不能绕过 fail-closed 门禁。入口见 [Graph Engineering 工作流目录](./.opencode/workflows/GRAPH-ENGINEERING.md)。
 
 ## 为什么是 DAG
 
@@ -65,8 +65,9 @@ GraphAgent 是本项目对外的产品名；仓库以 **OpenCode-GraphAgent** �
 |---|---|---|
 | 项目级 | `.opencode/workflows/<name>.yaml` | 本仓库，随仓库提交 —— 团队拿到的是同一套流程 |
 | 全局级 | `<opencode 配置目录>/workflows/<name>.yaml` | 本机所有项目 |
+| 内嵌级 | 编译进正式版二进制 | 每个正式版安装——兜底解析层 |
 
-文件名（去掉扩展名）就是名字，同名时项目级遮蔽全局级。一个最小的 spec：
+解析按此顺序取第一个命中的名字：项目级遮蔽同名的全局级，二者都遮蔽内嵌级。全局作用域由 [`opencode-dag-config`](https://github.com/LeXwDeX/opencode-dag-config) 仓库维护，`/dag-template-update` 命令负责同步（预览新增/变更/不变清单，覆盖前备份，QA 决策门禁）。一个最小的 spec：
 
 ```yaml
 title: Dependency audit
@@ -96,7 +97,7 @@ config:
 
 ### 3. 让智能体替你写
 
-内置的 **`create-dag-workflow`** skill 覆盖 spec 编写：两个作用域、文件结构、存盘 spec 必须守的规矩（不能钉死模型、`worker_type` 必须存在、模板必需变量必须给全），以及怎么验证。说一句「把这个存成可复用的工作流」，智能体会先跟你确认阶段和门禁，把文件写进你选的作用域，再真跑一次证明它能用。
+内置的 **`create-dag-workflow`** skill 覆盖 spec 编写：工作流库作用域、文件结构、存盘 spec 必须守的规矩（不能钉死模型、`worker_type` 必须存在、模板必需变量必须给全），以及怎么验证。说一句「把这个存成可复用的工作流」，智能体会先跟你确认阶段和门禁，把文件写进你选的作用域，再真跑一次证明它能用。
 
 节点 prompt 来自 `.opencode/dag-prompts/*.md` —— 随仓库附带 12 个，通过 `prompt_template.id` 引用。往那儿加一个 `.md` 就多一个模板；全局工作流建议用 `inline` prompt，否则会依赖某个仓库本地的模板。
 
@@ -134,6 +135,7 @@ config:
 - 工作流和节点状态各有声明式转换表；所有变更先过守卫，非法转换和终态违规是类型化错误（HTTP 返回 409 而非 500）。
 - 所有变更以持久化 `dag.*` 事件发布；投影器在发布事务*内部*写入 SQLite 读模型。历史来自事件回放，没有日志表。另有一个漂移测试盯着投影器守卫和声明的转换表，改了一边没改另一边，测试会挂。
 - **崩溃恢复**是惰性的、按工作流、基于证据：残留 `running` 的节点对照其子会话的持久化状态和解。子会话已经跑完的，回填捕获输出；执行权确实丢了的，工作流转入暂停，交给父智能体决定处置（replan / resume / cancel）。恢复过程不会自行接管或重启模型调用。
+- **失败分诊**：每个失败节点都带失败分类（`timeout` / `exec_failed` / `verdict_fail`），暴露在 `workflow(action=status)` 和父智能体收到的唤醒里——工作流终态失败时还带失败节点归因摘要——父智能体据此定向修复具体节点（replan 换新 id 的替代节点，或复用已完成输出开续跑工作流），而不是整图重启。
 
 ### deep 模式：准入与审查
 
@@ -171,6 +173,17 @@ DAG 相关的东西都放在 `.opencode/` 下，在 opencode 配置目录（`OPE
 
 ---
 
+## 自主目标循环（`/goal`）
+
+图编排把任务拆给多个子会话；目标循环是它的单会话互补形态：一个持久目标，智能体在当前会话里跨回合自主推进。
+
+- **命令**：`/goal <文本>` 设定目标并启动循环；`/goal status|pause|resume|done|clear|stop` 控制；`/subgoal <文本>|list|remove <n>|clear` 管理挂在当前目标下的子目标。
+- **评审循环**：每回合结束后由外部评审判定进展——`done` 清除目标，`continue` 注入下一轮续跑提示，受可配置的回合预算约束（预算耗尽转暂停，可随时恢复）。智能体也可以用 `goal(action: "complete")` 工具自我宣告完成（绕过评审）；`goal(action: "status")` 查询状态。
+- **可见性**：目标激活或暂停期间，系统提示里带实时目标块（目标文本、状态、已用/总回合、子目标、最近一次评审判定）；TUI 侧边栏有简洁的目标组件；`GET /session/:sessionID/goal` 暴露状态（未设目标时返回 `404`）。
+- **持久化**：目标状态按会话持久化（`goal_state`），重启不丢，会话删除时自动清除。
+
+---
+
 ## 本 fork 的其他改动
 
 - **Hooks API**：兼容 Claude Code hooks 协议，26 个 hook 事件（`PreToolUse`、`PostToolUse`、`SessionStart`、`PermissionRequest`、`WorktreeCreate` 等）× 5 种执行类型（`command`、`mcp`、`http`、`prompt`、`agent`），从全局/项目/worktree 的 `hooks.json` 链加载，也可以经 HTTP 按会话注册，支持可选的工作区信任门控。详见 [hooks 参考](./packages/core/src/plugin/skill/configure-hooks.md)。
@@ -178,7 +191,6 @@ DAG 相关的东西都放在 `.opencode/` 下，在 opencode 配置目录（`OPE
 - **CJK 与 IME 修复**：终端 UI 里中日韩文输入的修正（IME 组字刷新、全角文本处理），另有 [`patches/`](./patches) 下的韩文 IME 修复脚本。
 - **Worktree 隔离**：按工作流的 `git worktree` 隔离，附实验性的 sandbox-worktree HTTP 端点。
 - **配置助手**：[`config_assistant`](./config_assistant) 下提供独立 Go TUI，用于定位、校验和编辑 opencode 配置（`cd config_assistant && go run ./cmd/ocfg`）。
-- 早期的「Goal 自动循环」和 `/goal`、`/subgoal`、`/workflow` 斜杠命令已经移除，自主执行统一走 `workflow` 工具和它的唤醒机制。
 
 上游全部能力（多 Provider、内置 LSP、客户端/服务器架构、TUI/桌面/Web 客户端）均完整保留。
 
@@ -222,8 +234,7 @@ bun dev serve        # headless API 服务（端口 4096）
 ## 文档
 
 - [存盘工作流编写指南](./packages/core/src/plugin/skill/create-dag-workflow.md) —— `create-dag-workflow` skill 正文
-- [Graph Engineering 工作流目录](./.opencode/workflows/GRAPH-ENGINEERING.md)和[来源调研](./docs/graph-engineering-template-research.md) —— 可复用样板、证据与迁移取舍
-- [`.opencode/workflows/change-review.yaml`](./.opencode/workflows/change-review.yaml) —— 轻量变更审查图，按 `change-review` 启动
+- [Graph Engineering 工作流目录](./.opencode/workflows/GRAPH-ENGINEERING.md) —— 参考拓扑与自适应协议
 - [`docs/harness-dag.md`](./docs/harness-dag.md) —— deep 模式准入与审查生命周期
 - [`.opencode/dag-prompts`](./.opencode/dag-prompts) —— 内置节点 prompt 模板
 - [`AGENTS.md`](./AGENTS.md) —— 贡献与开发指南

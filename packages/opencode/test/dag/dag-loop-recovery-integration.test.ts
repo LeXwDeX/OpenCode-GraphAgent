@@ -252,6 +252,7 @@ describe("DagLoop crash recovery integration", () => {
             trigger: "timeout",
           }))
           expect((yield* store.getNode(dagID, "n1"))?.errorReason).toBe("deadline exceeded on recovery")
+          expect((yield* store.getNode(dagID, "n1"))?.errorClass).toBe("timeout")
         }),
       ),
     )
