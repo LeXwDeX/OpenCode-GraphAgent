@@ -1,0 +1,376 @@
+title: "Deep Performance Review - opencode-dag"
+mode: deep
+admission:
+  brief_revision: 1
+  qa_mode: LIGHT
+  verdict: READY
+  brief:
+    goal: "深度性能审查 opencode-dag 项目，识别算法瓶颈、资源泄漏、I/O 阻塞、启动延迟、数据层低效"
+    scope:
+      in:
+        - "packages/core"
+        - "packages/opencode"
+        - "packages/tui"
+        - "packages/app"
+        - "packages/server"
+        - "packages/llm"
+        - "packages/sdk"
+        - "packages/client"
+        - "packages/plugin"
+        - "packages/schema"
+      out:
+        - "第三方依赖内部实现"
+        - "CI/CD 配置"
+        - "storybook mocks"
+    constraints:
+      - "只读审查，不修改任何文件"
+      - "所有发现必须引用 file:line 证据"
+      - "使用 codebase-memory-mcp 工具进行结构化分析"
+    assumptions:
+      - "工作树即审查目标"
+      - "main 分支当前 HEAD 为审查版本"
+    acceptance_criteria:
+      - "每个性能发现都有 file:line 证据支撑"
+      - "发现按严重程度排序（CRITICAL/HIGH/MEDIUM/LOW）"
+      - "提供可操作的修复建议"
+      - "区分已验证事实和未验证推测"
+    evidence_required:
+      - "代码引用（file:line）"
+      - "复杂度指标（loop_depth, linear_scan_in_loop 等）"
+      - "调用链分析"
+    risks:
+      - "遗漏跨包性能回归"
+      - "误报：静态分析无法确认运行时热点"
+    review_plan:
+      - "Wave 1: 探索性能关键表面（hotspots + architecture）"
+      - "Wave 2: 5 维度并行审查（算法/内存/IO/启动/数据层）"
+      - "Wave 3: 证据验证（检查 unverified_claims）"
+      - "Wave 4: 仲裁（去重、排序、结构化裁决）"
+      - "Wave 5: 深挖（verdict 驱动的条件节点）"
+    open_questions: []
+    blocking_questions: []
+config:
+  name: perf-deep-review
+  max_concurrency: 8
+  max_node_replan_attempts: 3
+  max_total_nodes: 30
+  node_defaults:
+    required: false
+    report_to_parent: false
+    worker_config:
+      timeout_ms: 900000
+  nodes:
+    - id: explore-hotspots
+      name: "Explore Performance Hotspots"
+      worker_type: explore
+      depends_on: []
+      required: true
+      prompt_template:
+        inline: |
+          你是性能探索专家。使用 codebase-memory-mcp 工具分析 opencode-dag 项目的性能热点。
+
+          执行以下分析：
+          1. 使用 query_graph 查找高复杂度函数：
+             - transitive_loop_depth >= 3 的函数
+             - linear_scan_in_loop >= 1 的函数
+             - alloc_in_loop >= 1 的函数
+             - recursive 标记为 true 的函数
+          2. 使用 trace_path 追踪 fan_in 最高的 top 20 函数的调用链
+          3. 识别 packages/core, packages/opencode, packages/tui, packages/server 中的热路径
+
+          输出格式：
+          - 按严重程度排序的热点列表
+          - 每个热点包含：qualified_name, file:line, 复杂度指标, 调用频率估计
+          - 标注跨包调用链中的性能瓶颈
+
+          项目名：opencode-dag
+
+    - id: explore-arch
+      name: "Explore Performance Architecture"
+      worker_type: explore
+      depends_on: []
+      required: true
+      prompt_template:
+        inline: |
+          你是架构性能分析专家。探索 opencode-dag 项目的性能相关架构设计。
+
+          分析以下方面：
+          1. 缓存策略：搜索 cache, memo, lru 相关实现，评估是否有无界缓存
+          2. 懒加载设计：搜索 dynamic import, lazy 模式，评估启动路径是否过重
+          3. 事件系统：搜索 EventBus, subscribe, emit 模式，评估是否有监听器泄漏风险
+          4. 连接管理：搜索 HttpClient, WebSocket, connection pool 模式
+          5. 序列化开销：搜索 JSON.parse, JSON.stringify, Schema.decode 在热路径中的使用
+
+          使用 codebase-memory-mcp 的 search_code 和 search_graph 工具。
+          项目名：opencode-dag
+
+          输出：每个方面的架构现状 + 潜在性能风险 + file:line 证据
+
+    - id: review-algorithmic
+      name: "Review: Algorithmic Complexity"
+      worker_type: general
+      depends_on: [explore-hotspots]
+      prompt_template:
+        inline: |
+          你是算法复杂度审查专家。基于以下热点探索结果，深入审查算法性能问题。
+
+          探索结果：
+          {{explore-hotspots}}
+
+          审查重点：
+          1. O(n²) 或更差的算法模式（嵌套循环 + 线性搜索）
+          2. 不必要的重复计算（缺少 memoization）
+          3. 递归深度风险（无尾递归优化、无深度限制）
+          4. 数据结构选择不当（应该用 Map/Set 却用 Array 查找）
+          5. 排序/过滤在热路径中的重复执行
+
+          规则：
+          - 每个发现必须引用 file:line
+          - 使用 codebase-memory-mcp 的 get_code_snippet 验证具体实现
+          - 无法验证的声明标记为 unverified_claims
+          - 按 CRITICAL/HIGH/MEDIUM/LOW 分级
+
+          项目名：opencode-dag
+
+    - id: review-memory
+      name: "Review: Memory & Resource Management"
+      worker_type: general
+      depends_on: [explore-hotspots, explore-arch]
+      prompt_template:
+        inline: |
+          你是内存与资源管理审查专家。审查 opencode-dag 的内存泄漏和资源管理问题。
+
+          架构探索结果：
+          {{explore-arch}}
+
+          审查重点：
+          1. 事件监听器未清理（subscribe 无对应 unsubscribe）
+          2. 无界缓存/集合持续增长（Map, Set, Array 无淘汰策略）
+          3. 闭包持有大对象引用（阻止 GC）
+          4. Effect 纤维泄漏（fork 后未 join/interrupt）
+          5. 文件句柄/连接未关闭
+          6. 定时器（setInterval/setTimeout）未清理
+
+          规则：
+          - 每个发现必须引用 file:line
+          - 使用 search_code 搜索 subscribe/addEventListener/setInterval 等模式
+          - 无法验证的声明标记为 unverified_claims
+          - 按 CRITICAL/HIGH/MEDIUM/LOW 分级
+
+          项目名：opencode-dag
+
+    - id: review-io
+      name: "Review: I/O & Concurrency"
+      worker_type: general
+      depends_on: [explore-arch]
+      prompt_template:
+        inline: |
+          你是 I/O 与并发审查专家。审查 opencode-dag 的异步性能和阻塞问题。
+
+          架构探索结果：
+          {{explore-arch}}
+
+          审查重点：
+          1. 同步阻塞操作在异步上下文中（readFileSync, execSync）
+          2. 串行化的并行机会（await 循环 vs Promise.all/Effect.all）
+          3. 缺少背压控制的流处理
+          4. HTTP 请求无超时/重试/连接复用
+          5. 大文件一次性读入内存（应流式处理）
+          6. 锁竞争或过度序列化
+
+          规则：
+          - 每个发现必须引用 file:line
+          - 使用 search_code 搜索 readFileSync/execSync/await.*for 等模式
+          - 无法验证的声明标记为 unverified_claims
+          - 按 CRITICAL/HIGH/MEDIUM/LOW 分级
+
+          项目名：opencode-dag
+
+    - id: review-startup
+      name: "Review: Startup & Bundle Performance"
+      worker_type: general
+      depends_on: [explore-arch]
+      prompt_template:
+        inline: |
+          你是启动与构建性能审查专家。审查 opencode-dag 的启动时间和 bundle 效率。
+
+          架构探索结果：
+          {{explore-arch}}
+
+          审查重点：
+          1. 入口点（packages/opencode/src/index.ts, packages/cli）的 import 深度
+          2. 应该动态导入但静态导入的重模块
+          3. 模块初始化副作用（顶层 await、立即执行的数据库连接）
+          4. Layer 构建顺序中的不必要串行化
+          5. TUI 渲染首屏的关键路径长度
+          6. 重复初始化（同一服务被多个路径触发）
+
+          规则：
+          - 每个发现必须引用 file:line
+          - 使用 trace_path 追踪入口点的 outbound 调用深度
+          - 无法验证的声明标记为 unverified_claims
+          - 按 CRITICAL/HIGH/MEDIUM/LOW 分级
+
+          项目名：opencode-dag
+
+    - id: review-data
+      name: "Review: Data Layer Performance"
+      worker_type: general
+      depends_on: [explore-hotspots, explore-arch]
+      prompt_template:
+        inline: |
+          你是数据层性能审查专家。审查 opencode-dag 的数据库和序列化性能。
+
+          热点探索结果：
+          {{explore-hotspots}}
+
+          架构探索结果：
+          {{explore-arch}}
+
+          审查重点：
+          1. SQLite 查询缺少索引（WHERE/JOIN 字段）
+          2. N+1 查询模式（循环中逐条查询）
+          3. 大结果集未分页（SELECT * 无 LIMIT）
+          4. 频繁序列化/反序列化（JSON.parse/stringify 在热路径）
+          5. Drizzle ORM 使用不当（缺少事务批量操作）
+          6. 事件存储的读写放大
+
+          规则：
+          - 每个发现必须引用 file:line
+          - 使用 search_code 搜索 db.select/db.insert/JSON.parse 等模式
+          - 检查 packages/core/src 和 packages/opencode/src 中的数据访问层
+          - 无法验证的声明标记为 unverified_claims
+          - 按 CRITICAL/HIGH/MEDIUM/LOW 分级
+
+          项目名：opencode-dag
+
+    - id: verify-claims
+      name: "Verify Performance Claims"
+      worker_type: verify
+      depends_on: [review-algorithmic, review-memory, review-io, review-startup, review-data]
+      required: true
+      prompt_template:
+        inline: |
+          你是性能声明验证专家。验证以下 5 个审查报告中所有标记为 unverified_claims 的声明，以及所有 CRITICAL/HIGH 级别发现。
+
+          审查报告：
+          算法复杂度：{{review-algorithmic}}
+          内存资源：{{review-memory}}
+          I/O并发：{{review-io}}
+          启动性能：{{review-startup}}
+          数据层：{{review-data}}
+
+          验证方法：
+          1. 对每个 unverified_claim，使用 codebase-memory-mcp 的 get_code_snippet 读取实际代码
+          2. 对每个 CRITICAL/HIGH 发现，确认 file:line 引用准确且问题真实存在
+          3. 检查是否有误报（代码已修复、有缓解措施、或分析错误）
+          4. 使用 query_graph 验证复杂度指标
+
+          输出：
+          - VERIFIED: 确认为真的发现列表
+          - REFUTED: 被证伪的声明列表（附原因）
+          - UNCERTAIN: 无法静态确认的声明（需要运行时 profiling）
+
+          项目名：opencode-dag
+
+    - id: arbitrate
+      name: "Performance Arbitration"
+      worker_type: general
+      depends_on: [verify-claims]
+      required: true
+      report_to_parent: true
+      output_schema:
+        type: object
+        required: [verdict, summary, findings, required_actions, next_action]
+        properties:
+          verdict:
+            type: string
+            enum: [ACCEPT, REVISE, REJECT, BLOCKED]
+          summary:
+            type: string
+          findings:
+            type: array
+            items:
+              type: object
+              required: [severity, category, description, evidence, recommendation]
+              properties:
+                severity:
+                  type: string
+                  enum: [CRITICAL, HIGH, MEDIUM, LOW]
+                category:
+                  type: string
+                description:
+                  type: string
+                evidence:
+                  type: string
+                recommendation:
+                  type: string
+          required_actions:
+            type: array
+            items:
+              type: string
+          next_action:
+            type: object
+            required: [operation, targets]
+            properties:
+              operation:
+                type: string
+                enum: [continue, extend, replan, complete, stop]
+              targets:
+                type: array
+                items:
+                  type: string
+      prompt_template:
+        inline: |
+          你是性能审查仲裁专家。基于已验证的证据，做出最终裁决。
+
+          验证结果：
+          {{verify-claims}}
+
+          仲裁规则：
+          1. 只采纳 VERIFIED 的发现作为正式 findings
+          2. REFUTED 的声明不得出现在 findings 中
+          3. UNCERTAIN 的发现降级为 MEDIUM 并标注"需要运行时验证"
+          4. 去重：相同根因的多个表现合并为一条
+          5. 按严重程度排序：CRITICAL > HIGH > MEDIUM > LOW
+          6. 每条 finding 必须有可操作的修复建议
+
+          Verdict 判定：
+          - ACCEPT: 无 CRITICAL/HIGH 发现，项目性能状况良好
+          - REVISE: 存在 HIGH 发现但无 CRITICAL，需要改进
+          - REJECT: 存在 CRITICAL 发现，需要立即修复
+          - BLOCKED: 无法完成审查（工具不可用等）
+
+          next_action:
+          - ACCEPT → operation: complete
+          - REVISE/REJECT → operation: extend, targets: 需要深挖的具体模块/文件
+
+          使用 submit_result 提交结构化裁决。
+          项目名：opencode-dag
+
+    - id: deep-dive
+      name: "Performance Deep Dive"
+      worker_type: general
+      depends_on: [arbitrate]
+      condition: 'arbitrate.output.verdict != "ACCEPT"'
+      report_to_parent: true
+      prompt_template:
+        inline: |
+          你是性能深挖专家。仲裁未通过，需要对确认的问题区域进行深入分析。
+
+          仲裁裁决：
+          {{arbitrate}}
+
+          任务：
+          1. 对每个 CRITICAL/HIGH finding，追踪完整的调用链（使用 trace_path）
+          2. 量化影响：估算受影响的用户操作路径
+          3. 提供具体的修复方案（代码级别，不是泛泛建议）
+          4. 识别修复的依赖顺序（哪些必须先修）
+          5. 评估修复风险（是否可能引入回归）
+
+          输出：
+          - 每个 CRITICAL/HIGH 问题的完整修复计划
+          - 修复优先级排序
+          - 风险评估
+
+          项目名：opencode-dag

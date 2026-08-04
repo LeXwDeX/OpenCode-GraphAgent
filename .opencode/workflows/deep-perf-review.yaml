@@ -1,0 +1,346 @@
+title: "Deep Performance Review - opencode-dag"
+mode: deep
+admission:
+  brief_revision: 1
+  qa_mode: LIGHT
+  verdict: READY
+  brief:
+    goal: "对 opencode-dag 仓库进行深度性能审查，识别热路径、启动瓶颈、I/O 低效、并发问题和内存压力"
+    scope:
+      in:
+        - "packages/opencode (core runtime, session, DAG engine, event system, storage)"
+        - "packages/tui (SolidJS rendering, reactivity)"
+        - "packages/plugin (plugin lifecycle)"
+        - "packages/schema (serialization)"
+        - "packages/sdk/js (generated client)"
+        - "packages/client (HTTP client)"
+      out:
+        - "功能正确性（非性能维度）"
+        - "代码风格/命名"
+        - "测试覆盖率（除非性能测试缺失）"
+    constraints:
+      - "只读审查，不修改任何文件"
+      - "所有发现必须附带 file:line 证据"
+      - "无法验证的声明必须标记为 unverified_claims"
+    assumptions:
+      - "当前工作树即审查目标"
+      - "Bun 为运行时"
+      - "Effect-TS 为核心框架"
+    acceptance_criteria:
+      - "每个发现都有 file:line 代码引用"
+      - "发现按严重程度排序（CRITICAL/HIGH/MEDIUM/LOW）"
+      - "包含具体优化建议"
+      - "unverified_claims 经过验证波次确认"
+    evidence_required:
+      - "代码引用（file:line）"
+      - "算法复杂度分析"
+      - "调用链/数据流路径"
+    risks:
+      - "跨模块性能回归被遗漏"
+      - "Effect-TS 特有的性能陷阱（Layer 构建、Fiber 泄漏）"
+      - "DAG 引擎在大规模工作流下的扩展性"
+    review_plan:
+      - "Wave 1: 探索性能关键表面"
+      - "Wave 2: 5 个并行维度审查（启动/热路径/IO/并发/TUI）"
+      - "Wave 3: 验证波次检查 unverified_claims"
+      - "Wave 4: 仲裁节点裁决并排序"
+    open_questions: []
+    blocking_questions: []
+config:
+  name: deep-perf-review
+  max_concurrency: 6
+  max_node_replan_attempts: 3
+  max_total_nodes: 20
+  node_defaults:
+    required: false
+    report_to_parent: false
+    worker_config:
+      timeout_ms: 900000
+  nodes:
+    - id: explore-perf
+      name: "Performance Surface Mapping"
+      worker_type: explore
+      depends_on: []
+      required: true
+      prompt_template:
+        inline: |
+          你是性能探索专家。映射 opencode-dag 仓库中所有性能关键的代码表面。
+
+          重点探索：
+          1. 启动路径：入口点 → 服务初始化 → Layer 构建链（packages/opencode/src 的 main/index/entry）
+          2. 热循环：DAG 调度循环、事件处理循环、Session drain 循环
+          3. I/O 边界：SQLite/Drizzle 查询、文件读写、HTTP 请求、MCP 通信
+          4. 内存敏感区：事件存储、会话历史、知识图谱缓存
+          5. TUI 渲染：SolidJS 响应式更新、列表渲染、事件流消费
+
+          输出格式：
+          - 每个表面：文件路径、关键函数、调用深度、潜在瓶颈假设
+          - 标记哪些区域需要深入审查
+          - 列出 packages/opencode/src 下的核心模块及其职责
+
+          使用 codebase-memory-mcp 工具（search_graph, trace_path, get_architecture）优先，grep/glob 作为补充。
+
+    - id: review-startup
+      name: "Startup & Lazy Loading Review"
+      worker_type: review
+      depends_on: [explore-perf]
+      review:
+        phase: design
+      prompt_template:
+        inline: |
+          你是启动性能审查专家。审查 opencode-dag 的启动性能和模块加载策略。
+
+          审查维度：
+          1. 入口点到首个可交互状态的完整路径（packages/opencode/src/index.ts 或 main）
+          2. Effect Layer 构建链：哪些 Layer 是 eager 的？哪些可以 lazy？
+          3. 动态 import 使用情况：是否有不必要的静态 import 拖慢启动？
+          4. 服务初始化顺序：是否有可以并行化的串行初始化？
+          5. 配置加载、插件发现、MCP 服务器启动的开销
+
+          规则：
+          - 每个发现必须引用 file:line
+          - 无法确认的声明放入 unverified_claims 部分
+          - 按 CRITICAL/HIGH/MEDIUM/LOW 分级
+          - 给出具体的优化建议
+
+          输出结构：
+          ## findings
+          ## unverified_claims
+          ## recommendations
+
+    - id: review-hotpath
+      name: "Hot Path & Algorithmic Complexity Review"
+      worker_type: review
+      depends_on: [explore-perf]
+      review:
+        phase: design
+      prompt_template:
+        inline: |
+          你是算法性能审查专家。审查 opencode-dag 中的热路径和算法复杂度问题。
+
+          审查维度：
+          1. DAG 调度器：节点就绪检测、拓扑排序、并发调度的复杂度
+          2. 事件系统：事件分发、订阅匹配、历史回放的效率
+          3. Session 管理：消息序列化/反序列化、上下文窗口管理
+          4. 搜索/索引：codebase-memory-mcp 集成、代码搜索路径
+          5. 循环内的线性扫描（find/includes/indexOf in loop）
+          6. 不必要的重复计算或缺失的缓存
+
+          使用 codebase-memory-mcp 的 query_graph 查询：
+          - transitive_loop_depth >= 3 的函数
+          - linear_scan_in_loop >= 1 的函数
+          - alloc_in_loop 的函数
+
+          规则：
+          - 每个发现必须引用 file:line
+          - 标注大 O 复杂度
+          - 无法确认的声明放入 unverified_claims
+          - 按 CRITICAL/HIGH/MEDIUM/LOW 分级
+
+          输出结构：
+          ## findings
+          ## unverified_claims
+          ## recommendations
+
+    - id: review-io
+      name: "I/O & Database Efficiency Review"
+      worker_type: review
+      depends_on: [explore-perf]
+      review:
+        phase: design
+      prompt_template:
+        inline: |
+          你是 I/O 性能审查专家。审查 opencode-dag 的数据库访问、文件 I/O 和网络通信效率。
+
+          审查维度：
+          1. SQLite/Drizzle 查询：N+1 查询、缺失索引、全表扫描、事务粒度
+          2. 文件 I/O：是否有可以批处理的小文件读写？Bun.file() 使用是否最优？
+          3. HTTP 通信：SDK client 调用是否有不必要的串行请求？连接复用？
+          4. MCP 通信：stdio/SSE 传输的效率、消息序列化开销
+          5. 事件持久化：写入频率、批量策略、WAL 模式使用
+          6. 日志系统：是否有过度日志影响性能？
+
+          规则：
+          - 每个发现必须引用 file:line
+          - 标注 I/O 模式（同步/异步/批量）
+          - 无法确认的声明放入 unverified_claims
+          - 按 CRITICAL/HIGH/MEDIUM/LOW 分级
+
+          输出结构：
+          ## findings
+          ## unverified_claims
+          ## recommendations
+
+    - id: review-concurrency
+      name: "Concurrency & Memory Review"
+      worker_type: review
+      depends_on: [explore-perf]
+      review:
+        phase: design
+      prompt_template:
+        inline: |
+          你是并发和内存性能审查专家。审查 opencode-dag 的异步模式、内存使用和 Effect-TS 特有性能问题。
+
+          审查维度：
+          1. Fiber 管理：是否有泄漏的 Fiber？未取消的后台任务？
+          2. Layer 构建：重复构建昂贵 Layer？Layer 缓存策略？
+          3. 背压：事件流消费是否有背压机制？DAG 节点产出是否有限流？
+          4. 内存：大对象生命周期、缓存淘汰策略、会话历史增长
+          5. 锁/信号量：是否有不必要的串行化？死锁风险？
+          6. GC 压力：频繁分配/释放、大数组拷贝、字符串拼接
+
+          规则：
+          - 每个发现必须引用 file:line
+          - 标注并发模式（fork/join/race/stream）
+          - 无法确认的声明放入 unverified_claims
+          - 按 CRITICAL/HIGH/MEDIUM/LOW 分级
+
+          输出结构：
+          ## findings
+          ## unverified_claims
+          ## recommendations
+
+    - id: review-tui
+      name: "TUI Rendering & Reactivity Review"
+      worker_type: review
+      depends_on: [explore-perf]
+      review:
+        phase: design
+      prompt_template:
+        inline: |
+          你是前端/TUI 渲染性能审查专家。审查 packages/tui 的 SolidJS/opentui 渲染性能。
+
+          审查维度：
+          1. 响应式更新：是否有过度细粒度的 signal 导致频繁重渲染？
+          2. 列表渲染：大列表（会话列表、DAG 节点列表）是否虚拟化？
+          3. 事件流消费：SSE 事件处理是否高效？是否有节流/防抖？
+          4. 组件结构：是否有不必要的组件重建？memo 使用是否合理？
+          5. 状态管理：store 更新是否触发不必要的依赖计算？
+          6. 键盘输入处理：是否有输入延迟？
+
+          规则：
+          - 每个发现必须引用 file:line（packages/tui/src/ 下）
+          - 无法确认的声明放入 unverified_claims
+          - 按 CRITICAL/HIGH/MEDIUM/LOW 分级
+
+          输出结构：
+          ## findings
+          ## unverified_claims
+          ## recommendations
+
+    - id: verify-claims
+      name: "Claim Verification"
+      worker_type: verify
+      depends_on: [review-startup, review-hotpath, review-io, review-concurrency, review-tui]
+      required: true
+      prompt_template:
+        inline: |
+          你是性能声明验证专家。你的任务是验证上游 5 个审查节点产出的 unverified_claims。
+
+          对每个 unverified_claim：
+          1. 定位到实际代码（file:line）
+          2. 确认或否定该声明
+          3. 如果确认，补充具体证据（代码片段、调用链、复杂度分析）
+          4. 如果否定，说明为什么该声明不成立
+
+          同时交叉检查：
+          - 不同审查者是否对同一代码段有矛盾结论？
+          - 是否有跨维度的复合性能问题（如 I/O + 并发）？
+
+          输出：
+          ## verified_claims（确认的声明 + 证据）
+          ## rejected_claims（否定的声明 + 原因）
+          ## cross_cutting_issues（跨维度问题）
+          ## conflicts（审查者间的矛盾）
+
+    - id: arbitrate
+      name: "Performance Arbitration"
+      worker_type: general
+      depends_on: [verify-claims]
+      required: true
+      report_to_parent: true
+      output_schema:
+        type: object
+        required: [verdict, summary, findings, required_actions, next_action]
+        properties:
+          verdict:
+            type: string
+            enum: [ACCEPT, REVISE, REJECT, BLOCKED]
+          summary:
+            type: string
+          findings:
+            type: array
+            items:
+              type: object
+              properties:
+                severity:
+                  type: string
+                  enum: [CRITICAL, HIGH, MEDIUM, LOW]
+                category:
+                  type: string
+                location:
+                  type: string
+                description:
+                  type: string
+                recommendation:
+                  type: string
+          required_actions:
+            type: array
+            items:
+              type: string
+          next_action:
+            type: object
+            required: [operation, targets]
+            properties:
+              operation:
+                type: string
+                enum: [continue, extend, replan, complete, stop]
+              targets:
+                type: array
+                items:
+                  type: string
+      prompt_template:
+        inline: |
+          你是性能审查仲裁者。基于验证波次的结果，对 opencode-dag 的性能状况做出最终裁决。
+
+          你的输入：
+          - 5 个维度审查者的发现（startup, hotpath, io, concurrency, tui）
+          - 验证节点的确认/否定结果
+
+          裁决规则：
+          1. 只基于已验证的证据做判断，忽略被否定的声明
+          2. 去重：多个审查者报告同一问题时合并
+          3. 排序：按实际性能影响排序（CRITICAL > HIGH > MEDIUM > LOW）
+          4. 每个 finding 必须包含：severity, category, location(file:line), description, recommendation
+          5. 解决审查者间的矛盾，给出理由
+
+          verdict 含义：
+          - ACCEPT: 无 CRITICAL/HIGH 问题，性能状况可接受
+          - REVISE: 有 HIGH 问题需要关注但不阻塞
+          - REJECT: 有 CRITICAL 问题需要立即修复
+          - BLOCKED: 无法做出判断（证据不足）
+
+          调用 submit_result 提交结构化裁决。
+
+    - id: deep-dive
+      name: "Performance Deep Dive"
+      worker_type: general
+      depends_on: [arbitrate]
+      condition: 'arbitrate.output.verdict != "ACCEPT"'
+      report_to_parent: true
+      prompt_template:
+        inline: |
+          仲裁者发现了需要关注的性能问题。对每个 required_action 进行深入分析：
+
+          1. 定位具体代码，确认问题存在
+          2. 分析根因（为什么会出现这个问题？）
+          3. 评估影响范围（哪些用户场景受影响？影响程度？）
+          4. 给出具体的修复方案（代码级别的建议）
+          5. 评估修复成本和风险
+
+          输出：按优先级排序的修复计划，每项包含：
+          - 问题描述 + file:line
+          - 根因分析
+          - 影响评估
+          - 修复方案（具体代码变更建议）
+          - 成本/风险评估
