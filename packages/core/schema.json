@@ -1,9 +1,9 @@
 {
   "version": "7",
   "dialect": "sqlite",
-  "id": "a26723c8-be88-4c4e-85cf-0c1ecd3cf638",
+  "id": "442cdbd5-86a8-41a9-86d6-5361dbac90e0",
   "prevIds": [
-    "747f1cfb-b2d5-45f6-b46b-c38e470bb2d5"
+    "a953899b-bb63-497e-8e2e-86eb5e0fdeed"
   ],
   "ddl": [
     {
@@ -48,6 +48,10 @@
     },
     {
       "name": "event",
+      "entityType": "tables"
+    },
+    {
+      "name": "goal_state",
       "entityType": "tables"
     },
     {
@@ -600,6 +604,16 @@
       "autoincrement": false,
       "default": null,
       "generated": null,
+      "name": "error_class",
+      "entityType": "columns",
+      "table": "workflow_node"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
       "name": "captured_output",
       "entityType": "columns",
       "table": "workflow_node"
@@ -983,6 +997,36 @@
       "name": "data",
       "entityType": "columns",
       "table": "event"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "session_id",
+      "entityType": "columns",
+      "table": "goal_state"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "payload",
+      "entityType": "columns",
+      "table": "goal_state"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "updated_at",
+      "entityType": "columns",
+      "table": "goal_state"
     },
     {
       "type": "text",
@@ -2302,6 +2346,15 @@
     },
     {
       "columns": [
+        "session_id"
+      ],
+      "nameExplicit": false,
+      "name": "goal_state_pk",
+      "table": "goal_state",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
         "id"
       ],
       "nameExplicit": false,
@@ -2566,6 +2619,20 @@
       "name": "event_aggregate_type_seq_idx",
       "entityType": "indexes",
       "table": "event"
+    },
+    {
+      "columns": [
+        {
+          "value": "updated_at",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "goal_state_updated_at_idx",
+      "entityType": "indexes",
+      "table": "goal_state"
     },
     {
       "columns": [

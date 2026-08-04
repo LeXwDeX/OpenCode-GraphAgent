@@ -398,6 +398,52 @@ replannable. Dispose of it in the same turn:
 Never assume a crashed workflow resumes or retries on its own — it will wait,
 paused, until you act.
 
+### Node failure triage: repair the failed node, don't restart
+
+A node-failure wake is a work order for a **targeted repair**, not a restart
+signal. Every node failed via `dag.node.failed` carries an `error_class` in
+`status` output and in the wake summary. Exception: a node cancelled via replan
+appears as `failed` with error_reason `cancelled via replan` and NO
+`error_class` — deliberate action, no triage needed. Triage on the class
+before acting:
+
+| error_class | What it means | Correct response |
+|---|---|---|
+| `timeout` | The node exceeded `timeout_ms`; the runtime cancelled its child session at the deadline. Environmental — the task is NOT wrong. | Replace and rerun ONLY that node with a larger `worker_config.timeout_ms`. Check its `child_session_id` for partial artifacts before rerunning. |
+| `exec_failed` | Runtime/session-level failure. Gate on `error_reason`: (a) unknown/wrong model, auth, rate-limit, connection, template-resolution or condition-expression errors → config/prompt errors; (b) recovery reasons ("no child session on recovery", "child session failed (recovered)") → crash ownership loss; (c) workflow-collateral reasons (`required node(s) failed: ...`, `unresolved review outcome(s): ...`, `orchestrator_unresponsive`) → the node itself was fine; it was failed because the workflow failed. | (a) Fix the config first (`dag.jsonc` tier, provider credentials, model id, template/input mapping), then replace and rerun ONLY that node. (b) Inspect the child session's artifacts, then replace and rerun. (c) Do not rerun these collateral nodes. The wake surfaces no workflow-level reason — triage from the Failed-nodes block: `required node(s) failed: <ids>` names the culprit nodes directly (repair them); `orchestrator_unresponsive` carries NO attribution (see the recipe below). |
+| `verdict_fail` | Two shapes. Ran-but-broke-contract: missing `submit_result`, schema rejection, review fingerprint mismatch. Never-ran: pre-spawn contract failures (unresolved template placeholders, review input contract). | Ran-but-broke-contract → rerun the node with the contract stated explicitly; keep the topology. Never-ran → fix the template, input_mapping, or dependency wiring first, then rerun; prompt emphasis alone does not fix broken interpolation. |
+| (cascade — see below) | Dependents of a failed node. No dedicated class. | Repair the ROOT node first, then restore the dependent subtree. |
+
+Cascade detection has two shapes:
+
+- **Required node failed** → the workflow terminalizes `failed`; still-running nodes are failed with the workflow reason and all other pending/queued/paused dependents are terminalized to `skipped` with error_reason `workflow_failed` (dependents stay untouched only while the workflow is still `paused` — terminalization happens when the scheduler evaluates). The culprit is a node in the Failed-nodes block whose `error_class` is a real failure class; collateral rows carry the workflow reason instead.
+- **Optional node failed** → dependents ran with `Dependency "X" failed: ...` / `Dependency "X" skipped: ...` interpolated into their prompt text (inspect the dependent's rendered prompt/input, not its `error_reason`). Judge per dependent whether its output is still valid with the degraded input.
+
+In both shapes, repair the root/classed node first, then re-add the failed/skipped dependents rewired onto the replacement id.
+
+`orchestrator_unresponsive` recipe (zero attribution by design — the parent
+took no mandatory action while the workflow stalled): read `status`, identify
+which nodes were `running` or stuck when the guard fired, then dispose per the
+Verdict Disposal Contract: extend/replan those nodes, or change the approach
+(see Escalation) if the stall repeats. Never repair collateral rows blindly.
+
+The value set above is what the runtime produces today; `push_exhausted`
+exists in the schema but is reserved and currently never emitted.
+
+Budget exhaustion is a separate class: `replan attempt ceiling exceeded` or
+`Total node ceiling exceeded` means the budget is spent — change the approach
+or stop, do not retry the identical plan (see Escalation).
+
+Where to apply the repair:
+
+- **Workflow still live** (running/paused/stepping): `control(pause)` → `control(replan)` adding a replacement node under a NEW id (rewire the failed node's pending dependents onto it; use `restart: true` for still-running nodes) → `control(resume)`. `extend` with the replacement node also works. Completed siblings are untouched.
+- **Workflow terminal `failed`**: terminal status is irreversible — you cannot replan it. Start a **continuation workflow** instead: reuse every completed node's output as static input (inject it into the downstream prompts; never re-run a completed node), re-add only the failed and still-pending tail, and record `reused_nodes` in the manifest.
+
+Hard rule: an environmental single-node failure (timeout, wrong model, API
+error, crash-recovery loss) never justifies restarting the workflow from zero.
+Completed node outputs are durable and reusable; a full restart wastes paid
+provider work and destroys evidence the earlier nodes already earned.
+
 ## Model Assignment Strategy
 
 Workflow definitions MUST NOT specify `node.model` or
@@ -443,12 +489,12 @@ never appear as `[object Object]`.
 
 ## Budget Declaration
 
-The engine faithfully executes declared budgets and circuit-breaks on ceiling breach. It does not adaptively adjust — declare what your task needs. Choose values based on task complexity:
+The engine faithfully executes declared budgets and circuit-breaks on ceiling breach. It does not adaptively adjust — declare what your task needs. Default values are floors for light work, not recommendations: size every timeout and ceiling to the actual task load (target size, number of upstream reports a node must consume, expected tool/test/compilation work) and never trust the defaults blindly. Choose values based on task complexity:
 
 - `max_concurrency`: default 5. For independent fan-out (e.g., generating 100 images, migrating 10 packages), declare 10–20 so nodes aren't serialized behind an artificially narrow pipe.
 - `max_node_replan_attempts`: default 5. Increase only if you expect iterative quality-driven convergence (review → revise → review cycles on a single artifact).
 - `max_total_nodes`: default 100. Increase for large-scale decompositions.
-- `worker_config.timeout_ms`: default 10 minutes. Increase for long-running nodes (compilation, large test suites).
+- `worker_config.timeout_ms`: default 10 minutes. Increase for long-running nodes (compilation, large test suites). Verifier and aggregator nodes are the most common timeout victims: a node that consumes several parallel reports and re-checks their claims against code runs sequentially and routinely needs 20–30 minutes (e.g. `timeout_ms: 1800000`) — declaring the fan-out lanes' budget for the fan-in lane is a recurring failure pattern.
 
 ## Single-Workspace Discipline
 

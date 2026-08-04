@@ -1,0 +1,246 @@
+title: Algorithm Complexity Review (opencode-dag)
+mode: standard
+config:
+  name: algo-complexity-review
+  max_concurrency: 6
+  max_node_replan_attempts: 2
+  worker_config:
+    timeout_ms: 900000
+  nodes:
+
+    # ============================================================
+    # Wave 1: 6 parallel algorithm reviewers (one per process cluster)
+    # ============================================================
+
+    - id: review-llm-pipeline
+      name: Review LLM Request Pipeline
+      worker_type: general
+      depends_on: []
+      prompt_template:
+        inline: |
+          你是算法复杂度审查专家。审查 opencode-dag 的 LLM 请求构建管道，验证知识图谱给出的静态复杂度指标是否与真实代码吻合。
+
+          ## 背景（已知热点指标，待你用真实代码验证或推翻）
+          - `convertToOpenAIResponsesInput` @ packages/core/src/github-copilot/responses/convert-to-openai-responses-input.ts:21 — cx=47, cog=261, alloc_in_loop=19, lines≈308。每次 LLM provider turn 必经。
+          - `normalizeMessages` @ packages/opencode/src/provider/transform.ts — cx=47, ail=2。调用 sanitizeSurrogates + sanitizeToolResultOutput + scrub。
+          - `prepareResponsesTools` @ packages/core/src/github-copilot/responses/openai-responses-prepare-tools.ts — ail=8。
+          - `variants` @ packages/opencode/src/provider/transform.ts — cx=57, cog=135。
+          - `convertToOpenAICompatibleChatMessages` @ packages/core/src/github-copilot/chat/convert-to-openai-compatible-chat-messages.ts — ail=6。
+
+          ## 审查重点（按优先级）
+          1. O(n²) 或更差模式：消息数 n 的循环内，每条消息是否再对消息列表/工具列表做线性扫描？嵌套 switch 是否随 n 放大？
+          2. 循环内分配（alloc_in_loop）：每个对象字面量/数组 push/JSON.stringify 的实际位置（file:line）及其是否可提到循环外。
+          3. 缺失 memoization：同一计算（如工具列表序列化、message key）是否在一次 turn 内重复执行。
+          4. 数据结构选择：是否有 Array.indexOf/includes/find 可改 Map/Set。
+          5. JSON.stringify 在热路径中的开销。
+
+          ## 工具使用
+          - 用 Read 工具读取上述文件确认实现细节（精确 file:line）。
+          - 可用 codebase-memory-mcp 的 get_code_snippet / trace_path（project="opencode-dag"）查调用关系与邻居。
+          - 调用链：packages/opencode/src/session/llm.ts → transformParams → normalizeMessages → 3 个 sanitizer；openai-responses-language-model.ts → getArgs/doGenerate/doStream → convertToOpenAIResponsesInput + prepareResponsesTools。
+
+          ## 输出要求（Markdown，提交为最终文本）
+          对每个目标输出：
+          ### 目标名 (file:line)
+          - **已验证问题**：逐条列出，每条含 [severity] 描述 + `file:line` 证据 + 实测复杂度（含 n 代表什么）+ 修复建议。
+          - **被推翻/夸大的声明**：指标与实际不符之处（如 alloc_in_loop 计数偏高/偏低，注明原因）。
+          - **unverified_claims**：你无法从静态代码确认、需运行时 profiling 的点。
+          末尾给该 cluster 一个 **总体严重度评级**（CRITICAL/HIGH/MEDIUM/LOW）与一句话结论。区分"每次 LLM 请求"是已验证（代码路径必经）还是推测。
+
+    - id: review-dag-replan
+      name: Review DAG Replan Engine
+      worker_type: general
+      depends_on: []
+      prompt_template:
+        inline: |
+          你是算法复杂度审查专家。审查 opencode-dag 的 DAG replan 引擎，验证环检测与图重建的算法复杂度。
+
+          ## 背景（待验证指标）
+          - `planReplan` @ packages/core/src/dag/core/replan.ts:79 — cx=47, cog=87, alloc_in_loop=15, loop_count=14, tld=2, lines≈168。14 个循环遍历节点集合，15 处循环内分配。
+          - 调用 `DependencyGraph.addNode/addEdge`、`DependencyGraph.hasCycle/findCycles`（声称 O(V+E) 环检测）。
+          - 调用方：packages/opencode/src/dag/dag.ts。每次 DAG replan 操作触发。
+
+          ## 审查重点
+          1. **planReplan 的 O(n²) 风险**：survivingIds 集合构建是否真的需要 3 次遍历？14 个循环是否可合并？循环内是否对节点集合做 Array.includes/线性查找（应用 Set.has）。
+          2. **环检测开销**：定位 DependencyGraph 实现（find packages/core/src/dag 下的 dependency-graph）。hasCycle + findCycles 是否重复遍历？是 DFS 还是 Tarjan？replan 中是否每次都全图重算，而非增量。
+          3. **数据结构**：邻接表 vs 邻接矩阵；Map/Set vs Array。
+          4. **alloc_in_loop=15** 的真实位置（file:line）。
+          5. 大工作流（100+ 节点）时的最坏复杂度推导。
+
+          ## 工具
+          - Read 上述文件；用 codebase-memory-mcp search_graph / get_code_snippet 找 DependencyGraph 实现（project="opencode-dag"）。
+          - trace_path(trace function_name="planReplan") 看调用方频率。
+
+          ## 输出（同上格式）
+          重点给出：planReplan 的实测时间复杂度（用 n=节点数、e=边数表达），环检测是否增量，以及 100 节点时的推算开销。区分"O(n²)"是已验证（代码确有嵌套线性查找）还是推测。
+
+    - id: review-event-persist
+      name: Review Event Persistence & Reduction
+      worker_type: general
+      depends_on: []
+      prompt_template:
+        inline: |
+          你是算法复杂度审查专家。审查 opencode-dag 的持久化事件提交管道与会话数据归约。
+
+          ## 背景（待验证指标）
+          - `commitDurableEvent` @ packages/core/src/event.ts:126 — recursive=true, cx=13, lines≈163。每个持久化事件必经。含 DB 事务(immediate)、多次 SELECT/INSERT、isDeepStrictEqual 深比较。
+          - `publish` @ packages/core/src/event.ts:340（通过 publishEvent 间接递归）。
+          - `reduceSessionData` @ packages/opencode/src/cli/cmd/run/session-data.ts — cx=63, cog=139。fan-in 高（被 createLayer/applyChildEvent/bootstrapChildEvent/session-replay.apply 等 5+ 调用方使用）。
+
+          ## 审查重点
+          1. **递归安全性**：commitDurableEvent 的递归终止条件（守卫）是什么？最坏递归深度？是否尾递归/有深度上限？会否因恶意/深层 payload 栈溢出？
+          2. **isDeepStrictEqual 开销**：定位其调用点 file:line，确认比较对象大小（payload？整条事件？），是否 O(n) 且在每个事件上执行。是否可用哈希替代。
+          3. **DB 往返**：确认每个事件的确切 SELECT/INSERT 次数（声称 2 SELECT + 2 INSERT）。是否可批量化/合并。immediate 事务模式的锁开销。
+          4. **去重检查**：SELECT EventTable 去重是否在主键/唯一索引上？
+          5. **reduceSessionData**：cog=139 的高认知复杂度来源，是否有重复归约/未 memoize 的派生计算；事件序列化是否每次重建。
+
+          ## 工具
+          - Read packages/core/src/event.ts 全文；Read session-data.ts。
+          - codebase-memory-mcp trace_path(function_name="commitDurableEvent") 与 trace_path("reduceSessionData") 看真实 fan-in（project="opencode-dag"）。
+
+          ## 输出（同上格式）
+          重点：递归深度上界（已验证 vs 推测）、每事件 DB 往返实测数、isDeepStrictEqual 比较粒度。区分"全局热路径"是已验证（所有 durable event 必经）还是推测。
+
+    - id: review-frontend-render
+      name: Review Frontend Render Hot Paths
+      worker_type: general
+      depends_on: []
+      prompt_template:
+        inline: |
+          你是算法复杂度审查专家。审查 opencode-dag 前端（React/SolidJS app 包）渲染热路径的算法与重渲染开销。
+
+          ## 背景（待验证指标）
+          - `LegacyLayout` @ packages/app/src/pages/layout.tsx — cx=222, cog=249, tld=5, lsil=1, ail=4。全项目最高圈复杂度，每次渲染。
+          - `Page` (session) @ packages/app/src/pages/session.tsx — cx=194, tld=6，含 revealMessage(unguarded_recursion=true)。
+          - `PromptInput` @ packages/app/src/components/prompt-input.tsx — cx=148, cog=208，handleKeyDown(cx=33) 每次按键。
+          - `MessageTimeline` @ packages/app/src/pages/session/timeline/message-timeline.tsx — cx=119, tld=6，长会话渲染开销。
+
+          ## 审查重点
+          1. **循环内线性扫描 (lsil)**：LegacyLayout 的 lsil=1 实际是哪段代码（file:line）？是否在 render 中对数组做 indexOf/find。MessageTimeline 是否对消息列表做 O(n²)。
+          2. **缺失 memoization**：useMemo/useCallback 缺失导致每次渲染重算；派生数据是否在 render 内现算而非 selector。
+          3. **重渲染触发面**：LegacyLayout 作为主布局，哪些 state 变化触发它重渲染；是否有 context 过度订阅。
+          4. **revealMessage 无守卫递归**：定位实现，确认终止条件与最坏深度，DOM 滚动场景会否栈溢出。
+          5. **PromptInput.handleKeyDown**：cx=33 的按键处理是否有重复计算/未 debounce。
+
+          ## 工具
+          - Read 上述 .tsx 文件确认实现。注意区分 React(useMemo/useCallback/useEffect) vs SolidJS(createMemo/Signal) —— 先看包用的是哪个框架。
+          - codebase-memory-mcp search_graph 可辅助（project="opencode-dag"）。
+
+          ## 输出（同上格式）
+          重点：每项的实测最坏复杂度（用消息数 m / 渲染次数 r 表达），lsil 的确切位置，memoization 缺口清单。区分"每次渲染/每次按键"是已验证（确认在 render/事件处理体内）还是推测。
+
+    - id: review-cli-tui
+      name: Review CLI Transport & TUI Hot Paths
+      worker_type: general
+      depends_on: []
+      prompt_template:
+        inline: |
+          你是算法复杂度审查专家。审查 opencode-dag 的 CLI 会话传输层与 TUI 输入热路径。
+
+          ## 背景（待验证指标）
+          - `createLayer` (stream.transport) @ packages/opencode/src/cli/cmd/run/stream.transport.ts — cx=79, cog=104, tld=6, ail=4。CLI 每个事件经过此路径。
+          - `Autocomplete` (TUI) @ packages/tui/src/component/prompt/autocomplete.tsx — cx=45, tld=3, ail=2，每次按键。
+          - `Session` (TUI) @ packages/tui/src/routes/session/index.tsx — cx=81, cog=100, tld=6。
+          - 关联：reduceSessionData @ session-data.ts（另一 reviewer 负责其本体，你关注 createLayer 如何调用它）。
+
+          ## 审查重点
+          1. **createLayer tld=6**：6 层传递循环深度的实际代码结构（file:line）。是嵌套 for/while 还是递归？每个会话事件是否触发全量归约而非增量。
+          2. **ail=4** 的循环内分配位置，是否可提循环外。
+          3. **事件传输开销**：每个事件是否复制/序列化整个 session state；有无增量更新机制。
+          4. **Autocomplete 每次按键**：候选集构建是否在按键处理内重算；是否线性扫描候选；有无缓存。
+          5. **Session(TUI)** tld=6 的来源，渲染开销。
+
+          ## 工具
+          - Read 上述文件；codebase-memory-mcp trace_path(function_name="createLayer", project="opencode-dag")。
+
+          ## 输出（同上格式）
+          重点：createLayer 的传递循环结构（嵌套 vs 递归）、每事件开销是否随 session 大小放大。区分 tld=6 是真实嵌套循环还是误统计（如 Effect.gen 链）。
+
+    - id: review-recursion-risks
+      name: Review Recursion & Cross-Cut Event Sync
+      worker_type: general
+      depends_on: []
+      prompt_template:
+        inline: |
+          你是算法复杂度审查专家。审查 opencode-dag 的递归函数栈安全性与前端事件同步链。
+
+          ## 背景（待验证指标）
+          - `revealMessage` @ packages/app/src/pages/session.tsx — **unguarded_recursion=true**（高风险）。
+          - `toModelOutput` @ packages/core/src/tool/edit.ts — **unguarded_recursion=true**（高风险）。
+          - `flatten` @ packages/core/src/observability/logging.ts — unguarded_recursion，日志展平。
+          - `settle`/`run` @ packages/core/src/session/run-coordinator.ts — 有守卫递归。
+          - `applyDirectoryEvent` @ packages/app/src/context/global-sync/event-reducer.ts — cx=56, cog=153, tld=4，每个目录事件。
+          - `createLLMEventPublisher` @ packages/core/src/session/runner/publish-llm-event.ts — cx=46, cog=96，每个 LLM 流事件。
+
+          ## 审查重点
+          1. **revealMessage / toModelOutput 无守卫递归**：读取实现，确认终止条件是否存在、最坏递归深度、触发场景，栈溢出可能性（给出具体 file:line）。这是本审查最高优先级。
+          2. **flatten** 递归：展平对象深度是否可控，恶意深层结构会否栈溢出。
+          3. **applyDirectoryEvent** cog=153：153 认知复杂度的具体来源；每个事件是否做全量重算；有无增量 reducer 模式缺失；是否有 O(n²) 事件应用。
+          4. **createLLMEventPublisher**：每个 LLM 流事件的开销；是否对每个 token 做重计算；事件去重/合并是否缺失。
+
+          ## 工具
+          - Read 上述文件确认实现（unguarded 递归务必读到函数体与调用点）。
+          - codebase-memory-mcp trace_path（project="opencode-dag"）。
+
+          ## 输出（同上格式）
+          重点：每个 unguarded 递归给出「终止条件是否存在 + 最坏深度 + 栈溢出风险评级」三要素，附 file:line。区分 unguarded_recursion 标记是否属实（有时是 mutual/indirect recursion 被误标，需你核实）。
+
+    # ============================================================
+    # Wave 2: Arbiter — consolidate, dedupe, rank, emit verdict
+    # ============================================================
+
+    - id: arbitrate
+      name: Arbitrate & Consolidate Findings
+      worker_type: general
+      depends_on:
+        - review-llm-pipeline
+        - review-dag-replan
+        - review-event-persist
+        - review-frontend-render
+        - review-cli-tui
+        - review-recursion-risks
+      required: true
+      report_to_parent: true
+      output_schema:
+        type: object
+        required: [verdict, severity_ranked_findings, cross_cutting_patterns, unverified_claims, top_fixes, next_action]
+        properties:
+          verdict:
+            type: string
+            enum: [ACCEPT, REVISE, REJECT, BLOCKED]
+            description: "ACCEPT=审查完成结论可信；BLOCKED=证据不足"
+          severity_ranked_findings:
+            type: array
+            description: "按 CRITICAL>HIGH>MEDIUM>LOW 排序的最终发现，每条含 target, file:line, severity, 实测复杂度, 修复建议"
+          cross_cutting_patterns:
+            type: array
+            description: "跨多个 cluster 的共性算法反模式（如多处缺 memoization、多处 Array 代替 Set）"
+          unverified_claims:
+            type: array
+            description: "需运行时 profiling 才能确认的点"
+          top_fixes:
+            type: array
+            description: "投入产出比最高的 3-5 个修复，按 ROI 排序"
+          next_action:
+            type: object
+            required: [operation, targets]
+            properties:
+              operation:
+                type: string
+                enum: [continue, extend, replan, complete, stop]
+              targets:
+                type: array
+      prompt_template:
+        inline: |
+          你是仲裁专家。6 位算法审查员已分别审查了 opencode-dag 的 6 个 cluster（LLM 管道 / DAG replan / 事件持久化 / 前端渲染 / CLI&TUI / 递归风险）。他们的发现作为你的结构化输入已附在上方。
+
+          ## 你的任务
+          1. **去重与合并**：同一问题被多个 reviewer 提及则合并，保留最强证据。
+          2. **核实冲突**：若 reviewer 间结论冲突，以 file:line 代码证据为准，必要时自行 Read 关键文件复核。
+          3. **按严重度排序**：CRITICAL > HIGH > MEDIUM > LOW。判定依据：实测最坏复杂度 × 触发频率 × 影响面（是否热路径）。每条给出「实测复杂度（含 n 的含义）」。
+          4. **提取横切反模式**：跨 cluster 的共性（如 alloc_in_loop 普遍、Set/Map 用 Array 代替普遍、缺 memoization 普遍）。
+          5. **厘清 unverified_claims**：把所有"需运行时验证"的点单列，不混入已验证发现。
+          6. **输出 top_fixes**：投入产出比最高的 3-5 个修复，按 ROI 排序（预期收益 ÷ 改动风险）。
+          7. **verdict**：若证据充分结论可信 → ACCEPT；若关键目标证据不足 → BLOCKED 并说明缺什么。
+
+          严格区分 ✅已验证（代码路径确认必经、复杂度推导自源码）vs ⚠️未验证（频率/运行时开销推测）。调用 submit_result 提交符合 output_schema 的结构化结果。

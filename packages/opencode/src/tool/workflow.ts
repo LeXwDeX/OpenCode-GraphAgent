@@ -201,6 +201,7 @@ export const WorkflowTool = Tool.define<
                       depends_on: node.dependsOn,
                       ...(node.childSessionId ? { child_session_id: node.childSessionId } : {}),
                       ...(node.errorReason ? { error_reason: node.errorReason } : {}),
+                      ...(node.errorClass ? { error_class: node.errorClass } : {}),
                     })),
                   },
                   null,

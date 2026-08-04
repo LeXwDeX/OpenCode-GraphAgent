@@ -32,4 +32,14 @@ For a non-empty task:
 12. On failure, state that the workflow was not started and report the actual error. Never invent a Workflow ID or start a replacement workflow unless the user explicitly asked for automatic retries.
 13. A completed aggregate node must actually contain the requested synthesis. Never describe unresolved placeholders or an aggregate-node error message as a successful final result.
 
+## Resume-first: continue an interrupted workflow before restarting
+
+When the current task maps to a previously interrupted workflow (same task retried or resumed), the default instinct to "restart the whole graph" is usually wrong — completed node outputs are durable and reusable. First read `workflow(action=status)` on the prior workflow: every failed node carries `error_class` (runtime classes: timeout / exec_failed / verdict_fail) plus `error_reason` — except nodes cancelled via replan (failed with reason "cancelled via replan", no error_class) and rows written before the error_class migration — triage per the Node failure triage section in the workflow guidance, then recover in this order, and only fall back to a full restart when nothing reusable exists:
+
+1. **Paused recovery (crash recovery)**: if the prior workflow is `paused`, never open a new one. The failed node is terminal and immutable — add a replacement node under a NEW id, rewire its pending dependents' `depends_on` to the new id, then `control(resume)`. Downstream nodes stay pending and keep their state.
+2. **Continue from completed waves**: if the prior workflow is terminal (`failed` or `cancelled`) but has nodes that `completed` before the failure, their final outputs are still valid. Extract each completed node's output (its final text result, e.g. from the node session's persisted parts or any artifact it wrote) and compile a **continuation spec** that starts at the first unfinished wave. Inject the reused outputs as static context into the downstream node prompts (do not re-run them), add only the missing nodes, and `workflow(action=start)` it. Record `reused_nodes` in the manifest.
+3. **Full restart**: only when no completed-node output is reusable — zero completed nodes, or their outputs are empty/irrelevant to the remaining work — re-derive the full graph and start it.
+
+Fail-closed guard: before starting a continuation, verify every reused output is present and non-empty; if extraction is incomplete, fall back to the affected node's fresh run rather than silently continuing on empty input. Never discard completed work to rerun it from zero unless extraction genuinely fails.
+
 Use the orchestration guidance below to design and manage the workflow.

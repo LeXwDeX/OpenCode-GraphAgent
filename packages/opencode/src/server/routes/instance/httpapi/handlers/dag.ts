@@ -62,6 +62,7 @@ export const dagHandlers = HttpApiBuilder.group(InstanceHttpApi, "dag", (handler
       ...(r.childSessionId !== null ? { child_session_id: r.childSessionId } : {}),
       ...(r.output !== null ? { output: r.output } : {}),
       ...(r.errorReason !== null ? { error_reason: r.errorReason } : {}),
+      ...(r.errorClass !== null ? { error_class: r.errorClass } : {}),
       ...(r.deadlineMs !== null ? { deadline_ms: r.deadlineMs } : {}),
       replan_attempts: r.replanAttempts,
       ...(r.startedAt !== null ? { started_at: r.startedAt } : {}),

@@ -47,6 +47,7 @@ import { Shell } from "@opencode-ai/core/shell"
 import { Snapshot } from "../../src/snapshot"
 import { ToolRegistry } from "@/tool/registry"
 import { Dag } from "@/dag/dag"
+import { Goal } from "@/goal/goal"
 import { Truncate } from "@/tool/truncate"
 import { SettingsHook, type HookPayload } from "@/hook/settings"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
@@ -229,7 +230,10 @@ const blockingProcessor = Layer.succeed(
   }),
 )
 
-function makePrompt(input?: { mcpInstructions?: MCP.ServerInstructions[]; processor?: "blocking" }) {
+function makePrompt(input?: { mcpInstructions?: MCP.ServerInstructions[]; processor?: "blocking"; goal?: boolean }) {
+  // goal: false exercises the Goal-absent degradation path (serviceOption None)
+  const goalLayer: Layer.Layer<Goal.Service> =
+    input?.goal === false ? (Layer.empty as unknown as Layer.Layer<Goal.Service>) : Goal.defaultLayer
   const deps = Layer.mergeAll(
     hookRecorderLayer,
     Session.defaultLayer,
@@ -290,10 +294,12 @@ function makePrompt(input?: { mcpInstructions?: MCP.ServerInstructions[]; proces
     Layer.provideMerge(registry),
     Layer.provideMerge(trunc),
     Layer.provide(Instruction.defaultLayer),
+    Layer.provideMerge(goalLayer),
     Layer.provide(
       SystemPrompt.layer.pipe(
         Layer.provide(Skill.defaultLayer),
         Layer.provide(LocationServiceMap.layer),
+        Layer.provide(goalLayer),
         Layer.provide(deps),
       ),
     ),
@@ -303,11 +309,11 @@ function makePrompt(input?: { mcpInstructions?: MCP.ServerInstructions[]; proces
   )
 }
 
-function makeHttp(input?: { mcpInstructions?: MCP.ServerInstructions[]; processor?: "blocking" }) {
+function makeHttp(input?: { mcpInstructions?: MCP.ServerInstructions[]; processor?: "blocking"; goal?: boolean }) {
   return Layer.mergeAll(TestLLMServer.layer, makePrompt(input))
 }
 
-function makeHttpNoLLMServer(input?: { mcpInstructions?: MCP.ServerInstructions[]; processor?: "blocking" }) {
+function makeHttpNoLLMServer(input?: { mcpInstructions?: MCP.ServerInstructions[]; processor?: "blocking"; goal?: boolean }) {
   return makePrompt(input)
 }
 
@@ -2274,6 +2280,104 @@ it.instance("stores the slash invocation as visible text and hides the expanded 
       "Expanded command instructions:\ninspect layout",
     )
     expect(JSON.stringify(yield* llm.inputs)).toContain("Expanded command instructions")
+  }),
+)
+
+it.instance("dispatches /goal set through the Goal service and runs one loop turn", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const { prompt, sessions, chat } = yield* boot()
+    const goalSvc = yield* Goal.Service
+    yield* llm.text("working")
+
+    const result = yield* prompt.command({
+      sessionID: chat.id,
+      command: "goal",
+      arguments: "write the docs",
+    })
+    // kick dispatch returns the loop result (assistant WithParts)
+    expect(result.info.role).toBe("assistant")
+    const texts = (yield* sessions.messages({ sessionID: chat.id }))
+      .flatMap((message) => message.parts)
+      .filter((part): part is SessionV1.TextPart => part.type === "text")
+      .map((part) => part.text)
+
+    expect(texts).toContain("/goal write the docs")
+    expect(texts.some((text) => text.includes("目标已设定"))).toBe(true)
+    const state = yield* goalSvc.load(chat.id)
+    expect(state?.goal).toBe("write the docs")
+    expect(state?.status).toBe("active")
+    expect((yield* llm.inputs).length).toBe(1)
+  }),
+)
+
+it.instance("returns /goal status without running a loop turn", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const { prompt, chat } = yield* boot()
+    const goalSvc = yield* Goal.Service
+    yield* goalSvc.set(chat.id, "status probe goal")
+
+    const result = yield* prompt.command({
+      sessionID: chat.id,
+      command: "goal",
+      arguments: "status",
+    })
+    const texts = result.parts
+      .filter((part): part is SessionV1.TextPart => part.type === "text")
+      .map((part) => part.text)
+
+    expect(texts).toContain("/goal status")
+    expect(texts.some((text) => text.includes("status probe goal"))).toBe(true)
+    expect((yield* llm.inputs).length).toBe(0)
+  }),
+)
+
+it.instance("dispatches /subgoal add through the Goal service without a loop turn", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const { prompt, chat } = yield* boot()
+    const goalSvc = yield* Goal.Service
+    yield* goalSvc.set(chat.id, "goal with subgoals")
+
+    const result = yield* prompt.command({
+      sessionID: chat.id,
+      command: "subgoal",
+      arguments: "step one",
+    })
+    const texts = result.parts
+      .filter((part): part is SessionV1.TextPart => part.type === "text")
+      .map((part) => part.text)
+
+    expect(texts).toContain("/subgoal step one")
+    const state = yield* goalSvc.load(chat.id)
+    expect(state?.subgoals).toContain("step one")
+    expect((yield* llm.inputs).length).toBe(0)
+  }),
+)
+
+const noGoal = testEffect(makeHttp({ goal: false }))
+noGoal.instance("falls through to the command registry when the Goal service is absent", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const { prompt, sessions, chat } = yield* boot()
+    yield* llm.text("noop")
+
+    yield* prompt.command({
+      sessionID: chat.id,
+      command: "goal",
+      arguments: "orphan request",
+    })
+
+    const texts = (yield* sessions.messages({ sessionID: chat.id }))
+      .flatMap((message) => message.parts)
+      .filter((part): part is SessionV1.TextPart => part.type === "text")
+      .map((part) => part.text)
+    expect(texts.some((text) => text.includes("目标已设定"))).toBe(false)
+    // Positive fall-through markers: the command registry path persists the
+    // slash text and drives exactly one LLM turn (empty template expansion).
+    expect(texts).toContain("/goal orphan request")
+    expect((yield* llm.inputs).length).toBe(1)
   }),
 )
 

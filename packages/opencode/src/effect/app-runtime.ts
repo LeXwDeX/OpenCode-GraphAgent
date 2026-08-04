@@ -54,6 +54,8 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 import { HookStartContext } from "@/hook/start-context"
 import { SettingsHook } from "@/hook/settings"
 import { HookRewakeLive } from "@/hook/rewake-live"
+import { Goal } from "@/goal/goal"
+import { GoalLoop } from "@/goal/loop"
 import { Dag } from "@/dag/dag"
 import { DagStore } from "@opencode-ai/core/dag/store"
 import { DagLoop } from "@/dag/runtime/loop"
@@ -80,6 +82,7 @@ export const AppLayer = Layer.mergeAll(
     Question.defaultLayer,
     Permission.defaultLayer,
     Todo.defaultLayer,
+    Goal.defaultLayer,
     Session.defaultLayer,
     SessionStatus.defaultLayer,
     BackgroundJob.defaultLayer,
@@ -118,10 +121,13 @@ export const AppLayer = Layer.mergeAll(
   Layer.provideMerge(Ripgrep.defaultLayer),
   Layer.provideMerge(InstanceLayer.layer),
   Layer.provideMerge(Observability.layer),
-  // SettingsHook goes in provideMerge (NOT mergeAll) because it needs
+  // GoalLoop + SettingsHook go in provideMerge (NOT mergeAll) because they need
   // services from BOTH group1 and group2. mergeAll siblings cannot see each
   // other's outputs, but provideMerge gives the layer access to the full
-  // accumulated context (group1 + group2 merged).
+  // accumulated context (group1 + group2 merged). Both self-provide part of
+  // their transitive chain (GoalLoop in loop.ts, SettingsHook via
+  // SessionHooks.defaultLayer); the remainder resolves from this ambient context.
+  Layer.provideMerge(GoalLoop.defaultLayer),
   Layer.provideMerge(DagLoop.defaultLayer),
   Layer.provideMerge(DagSummaryPublisher.defaultLayer),
   Layer.provideMerge(SettingsHook.defaultLayer),
