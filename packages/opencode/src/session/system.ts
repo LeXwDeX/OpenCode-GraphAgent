@@ -61,11 +61,10 @@ export const layer = Layer.effect(
     const mcp = yield* MCP.Service
     const locations = yield* LocationServiceMap
     // Goal.Service is resolved lazily (serviceOption) rather than declared as a
-    // hard construction dependency, mirroring src/session/prompt.ts and
-    // src/tool/goal.ts. Keeping it optional lets the system prompt degrade to a
-    // terse "no active goal" note in runtimes that omit Goal (some headless / test
-    // entry points), and avoids dragging Goal's transitive deps into every
-    // SystemPrompt consumer.
+    // hard construction dependency: SystemPrompt.layer itself stays buildable in
+    // compositions that omit Goal (bare test harnesses) and degrades to the
+    // terse "no active goal" note. Production compositions always provide Goal
+    // (defaultLayer and the LayerNode deps below), so the goal block renders.
     const goalSvc = Option.getOrUndefined(yield* Effect.serviceOption(Goal.Service))
 
     return Service.of({
