@@ -168,6 +168,45 @@ describe("session.retry.retryable", () => {
     expect(SessionRetry.retryable(error, retryProvider)).toEqual({ message: msg })
   })
 
+  test.each([
+    "Internal server error",
+    "internal error",
+    "server-error",
+    "Provider returned error",
+    "provider-returned-error",
+    "terminated",
+    "fetch failed",
+    "connection refused",
+    "connect ECONNREFUSED",
+    "request ETIMEDOUT",
+    "failed to fetch",
+    "EAI_AGAIN",
+    "response timed out",
+    "Please retry your request",
+    "try your request again",
+    "upstream returned status 524",
+  ])("retries matching API error text: %s", (message) => {
+    expect(SessionRetry.retryable(wrap(message), retryProvider)).toEqual({ message })
+  })
+
+  test("retries hyphenated service-unavailable errors", () => {
+    expect(SessionRetry.retryable(wrap("service-unavailable"), retryProvider)).toEqual({
+      message: "Provider is overloaded",
+    })
+  })
+
+  test("matches retryable API response bodies", () => {
+    const error = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
+      new SessionV1.APIError({
+        message: "Request failed",
+        isRetryable: false,
+        statusCode: 400,
+        responseBody: JSON.stringify({ error: { message: "upstream connection refused" } }),
+      }).toObject(),
+    )
+    expect(SessionRetry.retryable(error, retryProvider)).toEqual({ message: "Request failed" })
+  })
+
   test("retries transport timeout errors", () => {
     const request = MessageV2.fromError(new ProviderError.HeaderTimeoutError(10000), { providerID })
     expect(SessionV1.APIError.isInstance(request)).toBe(true)
