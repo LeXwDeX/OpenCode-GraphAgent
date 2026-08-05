@@ -700,22 +700,52 @@ export const layer = Layer.effect(
         .map((n) => cfgById.get(n.id))
         .filter((n): n is NodeConfig => n !== undefined)
       const configuredNodes = config?.nodes ?? []
-      const hasReportingLeafCheckpoint = nodes.some(
+      // Leaf qualification runs on the RUNTIME topology, not the static config:
+      // a dependent that was skipped (condition_false / orphan_cascade) never
+      // executed, so the graph effectively ended at the checkpoint and the
+      // naturally-completed workflow may still be reopened by additive extend.
+      // Dependents that completed or failed continued the graph past the
+      // checkpoint and block the exception. Row statuses are compared as
+      // plain strings (loop.ts convention) — enum casts on read-model rows
+      // trip the lint ratchet.
+      const executedDependents = (nodeID: string) =>
+        nodes.filter(
+          (candidate) =>
+            candidate.dependsOn.includes(nodeID)
+            && (candidate.status === "completed" || candidate.status === "failed"),
+        )
+      const checkpointCandidates = nodes.filter(
         (node) =>
-          node.status === NodeStatus.COMPLETED
+          node.status === "completed"
           && node.wakeEligible
-          && configuredNodes.some((candidate) => candidate.id === node.id)
-          && !configuredNodes.some((candidate) => candidate.depends_on.includes(node.id)),
+          && configuredNodes.some((candidate) => candidate.id === node.id),
       )
+      const hasReportingLeafCheckpoint = checkpointCandidates.some((node) => executedDependents(node.id).length === 0)
+      const addsNewNode = newNodes.some((node) => !nodes.some((existing) => existing.id === node.id))
+      const earlyCompleted = nodes.some((node) => node.errorReason === "agent_complete")
       const reopenCompleted =
-        wf.status === WorkflowStatus.COMPLETED
-        && newNodes.some((node) => !nodes.some((existing) => existing.id === node.id))
+        wf.status === "completed"
+        && addsNewNode
         && hasReportingLeafCheckpoint
-        && !nodes.some((node) => node.errorReason === "agent_complete")
+        && !earlyCompleted
+      function reopenDenial(workflowStatus: string): string | undefined {
+        if (workflowStatus === "archived") return "archived workflows are immutable — start a new workflow instead"
+        if (workflowStatus !== "completed") return "only a naturally completed workflow can be reopened — failed and cancelled workflows are immutable; start a new workflow reusing their completed outputs as static input"
+        if (!addsNewNode) return "the fragment adds no new node ids — an additive reopen requires at least one new node"
+        if (earlyCompleted) return "the workflow was completed early via control(complete); early completion stays terminal"
+        if (checkpointCandidates.length === 0) return "no wake-eligible reporting checkpoint completed the graph — only a naturally completed reporting-leaf checkpoint may be reopened"
+        const blockers = [...new Set(checkpointCandidates.flatMap((node) => executedDependents(node.id).map((dependent) => dependent.id)))]
+        return `reporting checkpoint(s) ${checkpointCandidates.map((node) => `"${node.id}"`).join(", ")} are followed by executed dependent(s) ${blockers.map((id) => `"${id}"`).join(", ")} — the graph continued past the checkpoint`
+      }
       // A terminal atomic wake may ask the parent to add the next bounded wave.
       // Keep the exception private to naturally completed additive extension;
       // an early control(complete) leaves an agent_complete marker and remains
       // terminal, as do public replan and non-additive terminal mutations.
+      const wfTerminal =
+        wf.status === "completed" || wf.status === "failed" || wf.status === "cancelled" || wf.status === "archived"
+      if (wfTerminal && !reopenCompleted) {
+        return yield* Effect.fail(new TerminalViolationError(dagID, wf.status, "extend", reopenDenial(wf.status)))
+      }
       // Internal call to _replan — shares the caller's lock holding period,
       // does NOT re-acquire the per-workflow lock or go through Service.of.
       return yield* _replan(lock, dagID, { nodes: [...preserved, ...newNodes] }, reopenCompleted)

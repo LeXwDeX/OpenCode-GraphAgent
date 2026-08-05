@@ -306,6 +306,10 @@ export function Prompt(props: PromptProps) {
 
   // Initialize agent/model/variant from last user message when session changes
   let syncedSessionID: string | undefined
+  let interruptTimer: Timer | undefined
+  onCleanup(() => {
+    if (interruptTimer) clearTimeout(interruptTimer)
+  })
   createEffect(() => {
     const sessionID = props.sessionID
     const msg = lastUserMessage()
@@ -391,7 +395,7 @@ export function Prompt(props: PromptProps) {
         category: "Session",
         hidden: true,
         enabled: status().type !== "idle",
-        run: () => {
+        run: (ctx: CommandContext<Renderable, KeyEvent>) => {
           if (auto()?.visible) return
           if (!input.focused) return
           // TODO: this should be its own command
@@ -401,13 +405,20 @@ export function Prompt(props: PromptProps) {
           }
           if (!props.sessionID) return
 
-          setStore("interrupt", store.interrupt + 1)
+          // Terminals can deliver a fast ESC double-press as a single
+          // meta-modified escape event; count it as the confirmed second
+          // press instead of losing it.
+          setStore("interrupt", store.interrupt + (ctx.event.meta ? 2 : 1))
 
-          setTimeout(() => {
+          if (interruptTimer) clearTimeout(interruptTimer)
+          interruptTimer = setTimeout(() => {
+            interruptTimer = undefined
             setStore("interrupt", 0)
           }, 5000)
 
           if (store.interrupt >= 2) {
+            if (interruptTimer) clearTimeout(interruptTimer)
+            interruptTimer = undefined
             void sdk.client.session.abort({
               sessionID: props.sessionID,
             })

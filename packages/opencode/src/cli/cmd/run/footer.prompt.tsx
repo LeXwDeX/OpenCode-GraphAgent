@@ -70,7 +70,7 @@ type PromptInput = {
   history?: RunPrompt[]
   onSubmit: (input: RunPrompt) => boolean | Promise<boolean>
   onCycle: () => void
-  onInterrupt: () => boolean
+  onInterrupt: (mergedDoublePress?: boolean) => boolean
   onEditorOpen: (input: { value: string }) => Promise<string | undefined>
   onInputClear: () => void
   onExitRequest?: () => boolean
@@ -1000,8 +1000,8 @@ export function createPromptState(input: PromptInput): PromptState {
         name: "session.interrupt",
         title: "Interrupt session",
         category: "Session",
-        run() {
-          if (input.onInterrupt()) return
+        run(ctx: { event: KeyEvent }) {
+          if (input.onInterrupt(ctx.event.meta)) return
           return false
         },
       },

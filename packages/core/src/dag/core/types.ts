@@ -96,11 +96,11 @@ export class InvalidTransitionError extends DagCoreError {
 }
 
 export class TerminalViolationError extends DagCoreError {
-  constructor(entityId: string, terminalStatus: string, attemptedStatus: string) {
+  constructor(entityId: string, terminalStatus: string, attemptedStatus: string, reason?: string) {
     super(
       ErrorCode.TERMINAL_VIOLATION,
-      `Cannot transition from terminal state: ${entityId} (${terminalStatus} -> ${attemptedStatus})`,
-      { entityId, terminalStatus, attemptedStatus },
+      `Cannot transition from terminal state: ${entityId} (${terminalStatus} -> ${attemptedStatus})${reason ? `: ${reason}` : ""}`,
+      { entityId, terminalStatus, attemptedStatus, reason },
     )
     this.name = "TerminalViolationError"
   }
