@@ -35,7 +35,8 @@ import { coverageResult, parseOptions, routeKey, routeKeys, selectedScenarios } 
 import { runScenario } from "./runner"
 import { disposeApps } from "./backend"
 import { runtime } from "./runtime"
-import { type Scenario } from "./types"
+import { type Options, type Scenario } from "./types"
+import { startProgressWatchdog } from "./watchdog"
 
 function cursor(input: Record<string, unknown>) {
   return Buffer.from(JSON.stringify(input)).toString("base64url")
@@ -2132,7 +2133,8 @@ const llmScenarios = new Set([
 
 const main = Effect.gen(function* () {
   yield* Effect.addFinalizer(() => Effect.promise(() => disposeApps()).pipe(Effect.andThen(cleanupExercisePaths)))
-  const options = parseOptions(Bun.argv.slice(2))
+  const parsed = parseOptions(Bun.argv.slice(2))
+  const options: Options = parsed.progress ? { ...parsed, heartbeat: startProgressWatchdog() } : parsed
   const modules = yield* Effect.promise(() => runtime())
   const effectRoutes = routeKeys(OpenApi.fromApi(modules.PublicApi))
   const selected = selectedScenarios(options, scenarios)
@@ -2158,6 +2160,7 @@ const main = Effect.gen(function* () {
           (scenario) =>
             Effect.gen(function* () {
               if (options.progress) console.log(`${color.dim}RUN ${routeKey(scenario)} ${scenario.name}${color.reset}`)
+              options.heartbeat?.(`RUN ${routeKey(scenario)} ${scenario.name}`)
               return yield* runScenario(options)(scenario)
             }),
           { concurrency: 1 },

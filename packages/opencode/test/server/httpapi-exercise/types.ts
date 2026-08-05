@@ -27,6 +27,8 @@ export type Options = {
   scenarioTimeout: Duration.Duration
   progress: boolean
   trace: boolean
+  /** Progress heartbeat for the out-of-process watchdog (CI only). */
+  heartbeat?: (label: string) => void
 }
 
 export type RequestSpec = {
