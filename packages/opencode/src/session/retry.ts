@@ -122,32 +122,19 @@ export function retryable(error: Err, provider: string) {
     return { message: error.data.message.includes("Overloaded") ? "Provider is overloaded" : error.data.message }
   }
 
-  // Check for rate limit patterns in plain text error messages
-  const msg = isRecord(error.data) ? error.data.message : undefined
-  if (typeof msg === "string") {
-    const lower = msg.toLowerCase()
-    if (
-      lower.includes("rate increased too quickly") ||
-      lower.includes("rate limit") ||
-      lower.includes("too many requests")
-    ) {
-      return { message: msg }
-    }
+  const message = isRecord(error.data) ? error.data.message : undefined
+  if (typeof message !== "string") return undefined
+  const lower = message.toLowerCase()
+  if (
+    lower.includes("rate increased too quickly") ||
+    lower.includes("rate limit") ||
+    lower.includes("rate_limit") ||
+    lower.includes("too many requests")
+  ) {
+    return { message }
   }
-
-  const json = parseJSON(msg)
-  if (!json || typeof json !== "object") return undefined
-  const code = typeof json.code === "string" ? json.code : ""
-
-  if (json.type === "error" && json.error?.type === "too_many_requests") {
-    return { message: "Too Many Requests" }
-  }
-  if (code.includes("exhausted") || code.includes("unavailable")) {
-    return { message: "Provider is overloaded" }
-  }
-  if (json.type === "error" && typeof json.error?.code === "string" && json.error.code.includes("rate_limit")) {
-    return { message: "Rate Limited" }
-  }
+  if (lower.includes("too_many_requests")) return { message: "Too Many Requests" }
+  if (lower.includes("exhausted") || lower.includes("unavailable")) return { message: "Provider is overloaded" }
   return undefined
 }
 
