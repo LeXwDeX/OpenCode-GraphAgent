@@ -100,6 +100,7 @@ describe("DagStore.getWorkflowSummaries (SQL aggregation)", () => {
           failedNodes: 1,
           skippedNodes: 1,
           queuedNodes: 1,
+          escalatedNodes: 0,
         })
         expect(summaries[1]).toEqual({
           id: "wf-empty",
@@ -111,6 +112,7 @@ describe("DagStore.getWorkflowSummaries (SQL aggregation)", () => {
           failedNodes: 0,
           skippedNodes: 0,
           queuedNodes: 0,
+          escalatedNodes: 0,
         })
       }).pipe(Effect.provide(storeLayer()), Effect.scoped),
     )

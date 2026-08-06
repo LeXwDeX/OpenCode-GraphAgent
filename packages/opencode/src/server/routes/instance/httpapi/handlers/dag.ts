@@ -116,6 +116,7 @@ export const dagHandlers = HttpApiBuilder.group(InstanceHttpApi, "dag", (handler
         failedNodes: s.failedNodes,
         skippedNodes: s.skippedNodes,
         queuedNodes: s.queuedNodes,
+        escalatedNodes: s.escalatedNodes,
       }))
     })
 

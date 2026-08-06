@@ -68,6 +68,7 @@ function summary(id: string, completedNodes: number): WorkflowSummary {
     failedNodes: 0,
     skippedNodes: 0,
     queuedNodes: 0,
+    escalatedNodes: 0,
   }
 }
 
@@ -149,6 +150,29 @@ function publishNodeEvents(
       } as never),
       { discard: true },
     )
+  })
+}
+
+function publishTimeoutEscalation(
+  bus: EventControl,
+  dagID: string,
+  nodeID: string,
+  extensions: number,
+) {
+  if (!bus.listener) return Effect.die(new Error("publisher listener is not ready"))
+  return Effect.gen(function* () {
+    const instance = yield* InstanceState.context
+    yield* bus.listener!({
+      type: DagEvent.NodeTimeoutEscalated.type,
+      data: {
+        dagID,
+        nodeID,
+        childSessionID: `ses-${nodeID}`,
+        timeoutExtensions: extensions,
+        timestamp: ts(extensions),
+      },
+      location: { directory: instance.directory },
+    } as never)
   })
 }
 
@@ -322,6 +346,35 @@ describe("DagSummaryPublisher behavior", () => {
           summaries: [summary("dag-workspace", 1)],
           workspace: "wrk-origin",
         })
+      }),
+    ).pipe(Effect.provide(runtime(state, bus)))
+  })
+
+  it.instance("a timeout escalation triggers a fresh summary recompute (F10)", () => {
+    const state = control()
+    const bus = {} satisfies EventControl
+    state.sessions.set("dag-escalated", "ses-escalated")
+    state.summaries.set("ses-escalated", [{
+      ...summary("dag-escalated", 0),
+      runningNodes: 1,
+      escalatedNodes: 1,
+    }])
+
+    return withCollector((collector) =>
+      Effect.gen(function* () {
+        yield* (yield* DagSummaryPublisher.Service).init()
+        // Escalation is a pure counter change on a running node — no status
+        // transition — so the publisher must still re-emit or the TUI would
+        // keep showing a plain RUNNING node (F10).
+        yield* publishTimeoutEscalation(bus, "dag-escalated", "dag-escalated-a", 1)
+        yield* pollWithTimeout(
+          Effect.sync(() => collector.emissions.length === 1 ? collector.emissions[0] : undefined),
+          "escalation did not trigger a summary emission",
+        )
+
+        expect(state.reads.get("ses-escalated")).toBe(1)
+        expect(collector.emissions[0].summaries[0].escalatedNodes).toBe(1)
+        expect(collector.emissions[0].summaries[0].runningNodes).toBe(1)
       }),
     ).pipe(Effect.provide(runtime(state, bus)))
   })

@@ -89,6 +89,8 @@ export default {
           \`wake_eligible\` integer DEFAULT false NOT NULL,
           \`wake_reported\` integer DEFAULT false NOT NULL,
           \`replan_attempts\` integer DEFAULT 0 NOT NULL,
+          \`timeout_extensions\` integer DEFAULT 0 NOT NULL,
+          \`escalation_pending\` integer DEFAULT false NOT NULL,
           \`seq\` integer NOT NULL,
           \`started_at\` integer,
           \`completed_at\` integer,

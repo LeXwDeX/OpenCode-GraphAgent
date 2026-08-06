@@ -68,6 +68,8 @@ export const WorkflowNodeTable = sqliteTable(
     wake_eligible: integer({ mode: "boolean" }).notNull().default(false), // D6: node has report_to_parent=true
     wake_reported: integer({ mode: "boolean" }).notNull().default(false), // D3: has this node's terminal event been injected into the parent session?
     replan_attempts: integer().notNull().default(0), // D4: per-node replan counter for circuit breaker
+    timeout_extensions: integer().notNull().default(0), // timeout escalation count (node stays running; main agent adjudicates)
+    escalation_pending: integer({ mode: "boolean" }).notNull().default(false), // set on escalate, cleared on adjudication (extend) or new attempt — "awaiting main-agent adjudication"
     seq: integer().notNull(), // latest durable event seq for this node
     started_at: integer(),
     completed_at: integer(),

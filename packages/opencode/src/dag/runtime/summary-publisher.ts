@@ -44,6 +44,10 @@ const SUMMARY_TRIGGER_EVENTS = [
   DagEvent.NodeSkipped,
   DagEvent.NodeCancelled,
   DagEvent.NodeRestarted,
+  // F10: escalation changes the visible summary (escalatedNodes rises from 0)
+  // without any status transition — without this trigger the TUI would keep
+  // showing a plain RUNNING node until some unrelated node event fires.
+  DagEvent.NodeTimeoutEscalated,
 ] as const
 
 export interface Interface {

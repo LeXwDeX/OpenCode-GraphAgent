@@ -7,8 +7,15 @@
  * Admission model (P0-2): the node is durably QUEUED at dispatch — the child
  * session and NodeStarted only materialize INSIDE the concurrency permit, so a
  * 100-node fan-out no longer creates 100 sessions and shows 100 "running"
- * rows while true concurrency is 5. The deadline is fixed at admission time:
- * queue wait counts toward the node's budget.
+ * rows while true concurrency is 5. The admission deadline is fixed when the
+ * node is admitted (deadline = admission time + timeout_ms) and is NOT
+ * adjusted by running-node extensions (F4): the replan/extend handler re-times
+ * RUNNING nodes only, so a queued node's pre-permit wait keeps its admission
+ * deadline — queue wait counts toward the node's budget, and an expired
+ * queued node fails directly via the pre-permit timeout path (no progress to
+ * protect). A queued node absent from a plain replan fragment is superseded
+ * (cancelled) by planReplan; the additive extend path re-admits it with a
+ * fresh admission deadline.
  *
  * Completion model (mirrors task.ts:210-221): a node completes when its child
  * session's prompt() resolves; it fails when prompt() fails. The completion
@@ -20,7 +27,7 @@
  * (Level 2) is a documented boundary — see eval.ts.
  */
 
-import { Effect, Semaphore, Scope, Fiber, Option, Clock, Cause } from "effect"
+import { Effect, Semaphore, Scope, Fiber, Option, Clock, Cause, Exit } from "effect"
 import { Agent } from "@/agent/agent"
 import { Session } from "@/session/session"
 import { SessionID, MessageID } from "@/session/schema"
@@ -28,7 +35,7 @@ import { deriveSubagentSessionPermission } from "@/agent/subagent-permissions"
 import { SessionPrompt } from "@/session/prompt"
 import { Dag } from "../dag"
 import { DagModel } from "../model"
-import { isTransitionRejection } from "@opencode-ai/core/dag/core/types"
+import { isTransitionRejection, isNodeTerminalStatus } from "@opencode-ai/core/dag/core/types"
 import type { DagStore } from "@opencode-ai/core/dag/store"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
@@ -50,10 +57,169 @@ export interface NodeSpawnInput {
   fallbackModel?: { modelID: string; providerID: string }
   /** dag.jsonc thinking_depth — forwarded as the prompt variant (no-op unless the model defines it). */
   variant?: string
+  /** Workflow-level timeout extension cap (defaults to DEFAULT_WORKFLOW_CONFIG.maxTimeoutExtensions). */
+  maxTimeoutExtensions?: number
 }
 
 export interface NodeSpawnResult {
   fiber: Fiber.Fiber<unknown, unknown>
+  /** Deadline watcher fiber — rebuilt by the replan handler when the deadline is extended. */
+  watcherFiber: Fiber.Fiber<unknown, unknown>
+}
+
+export interface DeadlineWatcherInput {
+  dagID: string
+  nodeID: string
+  /**
+   * The node's effective execution timeout. Doubles as the escalation
+   * interval (S1): after escalating, the watcher waits one timeout period
+   * before re-reading — an extended deadline (replan adjudication) moves the
+   * row's deadline into the future and the loop sleeps until it; an untouched
+   * deadline escalates again, driving the count toward the extension cap.
+   */
+  timeoutMs?: number
+  /** Workflow-level timeout extension cap (defaults to DEFAULT_WORKFLOW_CONFIG.maxTimeoutExtensions). */
+  maxTimeoutExtensions?: number
+}
+
+/**
+ * Deadline watcher (timeout = signal, not failure). Sleeps until the node's
+ * absolute deadline, then reads the durable row:
+ * - node no longer running → exit (cancelled/restarted/completed)
+ * - deadline extended on the row (replan with a new timeout_ms) → re-sleep
+ * - extension cap exhausted → cancel the child + nodeFailed("timeout")
+ * - otherwise → publish NodeTimeoutEscalated (node stays RUNNING)
+ * The row is the single source of truth, so a watcher that survives its
+ * execution fiber (interrupt misses) self-heals on the next wake-up.
+ *
+ * S1: the watcher self-renews — it does NOT exit after escalating. It waits
+ * one escalate interval and re-reads the row: a replan that extended the
+ * deadline (a NEW worker_config.timeout_ms — nodeExtendTimeout recomputes
+ * from now per §3.7) is picked up on the next read; a deadline the main agent
+ * never adjudicated escalates AGAIN, so the extension count climbs toward the
+ * cap and supervision stays bounded even when no replan ever arrives. F5: a
+ * queued/pending/paused node past its deadline still polls instead of
+ * exiting — the node may yet acquire the permit inside its admission window
+ * (edge-deadline permit) and start running under supervision.
+ */
+export function makeDeadlineWatcher(
+  input: DeadlineWatcherInput,
+): Effect.Effect<void, never, Dag.Service | SessionPrompt.Service> {
+  return Effect.gen(function* () {
+    const dag = yield* Dag.Service
+    const promptSvc = yield* SessionPrompt.Service
+    const escalateIntervalMs = Math.max(1_000, input.timeoutMs ?? Dag.DEFAULT_WORKFLOW_CONFIG.nodeTimeoutMs)
+    // Read the durable row. Transient store failures (SQLite lock blips,
+    // connection hiccups) must NOT end supervision — a single failed read
+    // would otherwise permanently orphan the node's timeout path — so the
+    // read retries with a short backoff (R13) and only gives up after every
+    // attempt fails. Effect.exit captures both effect failures and defects.
+    const readNode = Effect.gen(function* () {
+      for (let attemptNo = 0; attemptNo <= 3; attemptNo++) {
+        const outcome = yield* dag.store.getNode(input.dagID, input.nodeID).pipe(Effect.exit)
+        if (Exit.isSuccess(outcome)) return outcome.value
+        if (attemptNo < 3) yield* Effect.sleep(500)
+      }
+      yield* Effect.logWarning("DAG deadline watcher giving up after store read retries", { dagID: input.dagID, nodeID: input.nodeID })
+      return undefined
+    })
+    for (;;) {
+      const node = yield* readNode
+      if (!node) {
+        // Store read failed after all retries — do NOT exit (the watcher
+        // "must not end supervision"). Sleep with a longer backoff and
+        // retry the read in the next loop iteration; a transient store
+        // outage should not permanently orphan the node's timeout path.
+        yield* Effect.sleep(5_000)
+        continue
+      }
+      if (isNodeTerminalStatus(node.status as never)) return
+      const now = yield* Clock.currentTimeMillis
+      const deadline = node.deadlineMs
+      if (node.status !== "running") {
+        // Pre-running wait (F5): a queued/pending/paused node past its
+        // deadline may still acquire the permit inside its admission window —
+        // do not abandon supervision; poll until it starts, terminalizes, or
+        // the pre-permit timeout path fails it.
+        yield* Effect.sleep(sleepUntilDeadlineMs(deadline, now, 1_000))
+        continue
+      }
+      if (deadline === null || deadline > now) {
+        yield* Effect.sleep(sleepUntilDeadlineMs(deadline, now, 10))
+        continue
+      }
+      const extensions = node.timeoutExtensions
+      const maxExtensions = input.maxTimeoutExtensions ?? Dag.DEFAULT_WORKFLOW_CONFIG.maxTimeoutExtensions
+      if (extensions >= maxExtensions) {
+        yield* promptSvc.cancel(node.childSessionId as never).pipe(Effect.ignore)
+        // Enforcing the cap IS the watcher's contract (§5-5), so a transient
+        // failure here must retry rather than end supervision: returning would
+        // leave a RUNNING node past its cap with nobody left to fail it. A
+        // rejected guard means someone else already terminalized the node,
+        // which counts as done.
+        const outcome = yield* dag.nodeFailed(input.dagID, input.nodeID, `timeout extensions exhausted (${extensions}/${maxExtensions})`, "timeout").pipe(
+          Effect.catchIf(
+            isTransitionRejection,
+            () => Effect.logWarning("nodeFailed (timeout extensions exhausted) guard rejected — node already terminal"),
+          ),
+          Effect.exit,
+        )
+        if (Exit.isSuccess(outcome)) return
+        if (Cause.hasInterrupts(outcome.cause)) return yield* Effect.failCause(outcome.cause)
+        yield* Effect.logWarning("DAG deadline watcher cap enforcement failed — retrying", { dagID: input.dagID, nodeID: input.nodeID, cause: outcome.cause })
+        yield* Effect.sleep(escalateIntervalMs)
+        continue
+      }
+      // The escalate write takes the workflow lock and publishes a durable
+      // event, so it can fail with a typed Error (lock contention) or die (a
+      // publish defect). Neither may end supervision: an exited watcher stops
+      // escalating, the extension count stops climbing, `extensions >=
+      // maxExtensions` never becomes true, and the node occupies a concurrency
+      // slot unbounded. Log and fall through to the sleep — the next iteration
+      // re-reads the row and escalates again. Mirrors the read path's R13
+      // hardening above, which the write path previously lacked.
+      const escalated = yield* dag.nodeTimeoutEscalated(input.dagID, input.nodeID, node.childSessionId as never, extensions + 1).pipe(
+        Effect.catchIf(
+          isTransitionRejection,
+          () => Effect.logWarning("nodeTimeoutEscalated guard rejected — node already terminal"),
+        ),
+        Effect.exit,
+      )
+      if (Exit.isFailure(escalated)) {
+        if (Cause.hasInterrupts(escalated.cause)) return yield* Effect.failCause(escalated.cause)
+        yield* Effect.logWarning("DAG deadline watcher escalation failed — keeping supervision and retrying", { dagID: input.dagID, nodeID: input.nodeID, cause: escalated.cause })
+      }
+      // Self-renew (S1): stay alive after escalating. Wait one escalate
+      // interval, then loop — the re-read sees an extended deadline (replan
+      // adjudication via nodeExtendTimeout) and sleeps until it, or sees a
+      // still-past deadline and escalates AGAIN. Repeated escalation is what
+      // drives the count toward the cap, so a main agent that never replans
+      // cannot leave the node running unbounded.
+      yield* Effect.sleep(escalateIntervalMs)
+    }
+  }).pipe(
+    // Last-resort net for defects outside the loop's own handling. Use
+    // hasInterrupts, not interruptors: the latter collects DEFINED fiber IDs
+    // and silently ignores interrupt reasons carrying none, which would
+    // misclassify such an interrupt as an error.
+    Effect.catchCause((cause) =>
+      Cause.hasInterrupts(cause)
+        ? Effect.void
+        : Effect.logWarning("DAG deadline watcher exited with an error", { cause }),
+    ),
+  )
+}
+
+/**
+ * How long the deadline watcher sleeps before re-reading the node row. With no
+ * deadline yet, poll fast (100ms) so a late deadline write is seen quickly;
+ * with a future deadline, sleep exactly until it (min 10ms); once past the
+ * deadline, back off by overdueMs before the next read.
+ */
+function sleepUntilDeadlineMs(deadlineMs: number | null, now: number, overdueMs: number) {
+  if (deadlineMs === null) return 100
+  if (deadlineMs > now) return Math.max(deadlineMs - now, 10)
+  return overdueMs
 }
 
 export function spawnNode(
@@ -79,7 +245,7 @@ export function spawnNode(
             () => Effect.logWarning(`nodeFailed (${label}) guard rejected — node already terminal`),
           ),
         )
-        return { fiber: yield* Effect.forkIn(scope)(Effect.void) }
+        return { fiber: yield* Effect.forkIn(scope)(Effect.void), watcherFiber: yield* Effect.forkIn(scope)(Effect.void) }
       })
 
     const agent = yield* agentService.get(input.node.workerType).pipe(
@@ -145,12 +311,23 @@ export function spawnNode(
     )
     if (!admitted) {
       const fiber = yield* Effect.forkIn(scope)(Effect.void)
-      return { fiber }
+      const watcherFiber = yield* Effect.forkIn(scope)(Effect.void)
+      return { fiber, watcherFiber }
     }
 
     // Assigned inside the fiber once the child session materializes; read by
     // the ensuring/onInterrupt cleanups below.
     let childSessionID: string | undefined
+
+    // Forked first so the execution fiber's cleanup closures can capture it.
+    const watcherFiber = yield* Effect.forkIn(scope)(
+      makeDeadlineWatcher({
+        dagID: input.dagID,
+        nodeID: input.nodeID,
+        timeoutMs,
+        maxTimeoutExtensions: input.maxTimeoutExtensions,
+      }),
+    )
 
     const fiber = yield* Effect.forkIn(scope)(
       Effect.gen(function* () {
@@ -215,27 +392,18 @@ export function spawnNode(
 
           if (input.outputSchema) registerCaptureSlot(childSession.id, input.outputSchema)
 
-          // Run the actual prompt with the remaining time budget.
-          const permitTime = yield* Clock.currentTimeMillis
-          const remainingMs = Math.max(0, deadlineMs - permitTime)
-          const resultOpt = yield* promptSvc.prompt({
+          // The prompt runs WITHOUT a timeout — the deadline watcher owns the
+          // timeout path (escalate signal vs exhausted-force-cancel). A timeout
+          // never interrupts the child session mid-work; it only notifies the
+          // main agent, which adjudicates (extend / cancel / replan).
+          const result = yield* promptSvc.prompt({
             messageID: MessageID.ascending(),
             sessionID: childSession.id,
             model,
             agent: agent.name,
             ...(input.variant ? { variant: input.variant } : {}),
             parts: input.promptParts,
-          }).pipe(Effect.timeoutOption(remainingMs))
-          if (Option.isNone(resultOpt)) {
-            yield* promptSvc.cancel(childSession.id).pipe(Effect.ignore)
-            yield* dag.nodeFailed(input.dagID, input.nodeID, `node exceeded timeout of ${timeoutMs}ms`, "timeout").pipe(
-              Effect.catchIf(
-                isTransitionRejection,
-                () => Effect.logWarning("nodeFailed (timeout) guard rejected — node already terminal"),
-              ),
-            )
-            return
-          }
+          })
           if (input.outputSchema) {
             clearCaptureSlot(childSession.id)
             const updatedNode = yield* dag.store.getNode(input.dagID, input.nodeID).pipe(Effect.orDie)
@@ -253,7 +421,7 @@ export function spawnNode(
               ),
             )
           } else {
-            const rawText = resultOpt.value.parts.findLast((p) => p.type === "text")?.text ?? ""
+            const rawText = result.parts.findLast((p) => p.type === "text")?.text ?? ""
             if (rawText.trim() === "") {
               yield* dag.nodeFailed(
                 input.dagID,
@@ -280,7 +448,10 @@ export function spawnNode(
         }
       }).pipe(
         Effect.ensuring(
-          Effect.sync(() => {
+          Effect.gen(function* () {
+            // The prompt finished (or this fiber was interrupted) — the
+            // deadline watcher has no further job.
+            yield* Fiber.interrupt(watcherFiber).pipe(Effect.ignore)
             if (input.outputSchema && childSessionID) clearCaptureSlot(childSessionID)
           }),
         ),
@@ -296,7 +467,7 @@ export function spawnNode(
         ),
         Effect.catchCause((cause) =>
           Effect.gen(function* () {
-            if (Cause.interruptors(cause).size > 0) return
+            if (Cause.hasInterrupts(cause)) return
             yield* dag.nodeFailed(input.dagID, input.nodeID, Cause.pretty(cause), "exec_failed").pipe(
               Effect.catchIf(
                 isTransitionRejection,
@@ -308,6 +479,6 @@ export function spawnNode(
       ),
     )
 
-    return { fiber }
+    return { fiber, watcherFiber }
   })
 }

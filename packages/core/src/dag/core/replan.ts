@@ -186,15 +186,15 @@ export function planReplan(
   for (const n of current.nodes) {
     if (!survivingIds.has(n.id)) continue
     const frag = fragmentNodeById.get(n.id)
-    // A node takes the fragment's deps only when it is actually being replaced
-    // (pending/queued/paused) or restarted (running with restart marker). A
-    // running node present without a marker is "kept unchanged" and keeps its
-    // current deps; terminal nodes are immutable and keep their current deps.
-    if (frag && (frag.restart || (n.status !== NodeStatus.RUNNING && !isNodeTerminalStatus(n.status)))) {
-      for (const depId of frag.depends_on) tryAddEdge(n.id, depId)
-    } else {
-      for (const depId of n.depends_on) tryAddEdge(n.id, depId)
-    }
+    // P1a: the CHECK graph must equal the EXECUTION graph. A running node
+    // present without a restart marker is replaced (its definition is
+    // re-published via NodeRegistered and the projector upserts the fragment's
+    // depends_on into the durable row the runtime rebuilds from), so it takes
+    // the fragment's deps here too — otherwise a cycle only reachable through
+    // the replaced deps passes the check and crashes the runtime's
+    // rebuildGraph. Terminal nodes are immutable and keep their current deps.
+    const deps = frag && !isNodeTerminalStatus(n.status) ? frag.depends_on : n.depends_on
+    for (const depId of deps) tryAddEdge(n.id, depId)
   }
   for (const fragNode of fragment.nodes) {
     if (currentStateById.has(fragNode.id)) continue // handled above
@@ -226,7 +226,15 @@ export function planReplan(
       continue
     }
     if (n.status === NodeStatus.RUNNING) {
-      if (frag?.restart) restart.push(n.id)
+      if (frag?.restart) {
+        restart.push(n.id)
+        continue
+      }
+      // A running node present in the fragment (no restart marker) gets its
+      // definition replaced without re-executing — this is the timeout
+      // extension path: the merged config carries the new worker_config.timeout_ms,
+      // and the runtime recomputes the absolute deadline from it.
+      if (frag) replace.push(n.id)
       continue
     }
     if (n.status === NodeStatus.PENDING) {

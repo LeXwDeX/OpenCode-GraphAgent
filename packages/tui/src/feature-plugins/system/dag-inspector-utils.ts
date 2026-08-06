@@ -131,6 +131,14 @@ export function formatDagProgress(summary: {
   return `${Number(summary.completedNodes) + Number(summary.skippedNodes)}/${Number(summary.nodeCount)}`
 }
 
+/** F10: timeout-pending indicator — running nodes past their deadline awaiting
+ * main-agent adjudication, shown distinctly from normal RUNNING. */
+export function dagEscalationLabel(summary: { escalatedNodes?: number | string }): string | undefined {
+  const escalated = Number(summary.escalatedNodes ?? 0)
+  if (!Number.isFinite(escalated) || escalated <= 0) return undefined
+  return `timeout ×${escalated}`
+}
+
 /**
  * Shared status→color mapping for every DAG surface (sidebar indicator,
  * sidebar panel, inspector) so one status never renders in different colors

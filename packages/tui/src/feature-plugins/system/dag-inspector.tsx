@@ -20,6 +20,7 @@ import {
   formatDagError,
   formatDagOutputPreview,
   formatDagProgress,
+  dagEscalationLabel,
   type DagControlOperation,
   type DagNode,
 } from "./dag-inspector-utils"
@@ -492,6 +493,7 @@ function DagInspector(props: { api: TuiPluginApi }) {
                     </box>
                     <text fg={theme().textMuted} flexShrink={0}>
                       {formatDagProgress(wf)}
+                      {dagEscalationLabel(wf) ? ` ${dagEscalationLabel(wf)}` : ""}
                     </text>
                   </box>
                 )

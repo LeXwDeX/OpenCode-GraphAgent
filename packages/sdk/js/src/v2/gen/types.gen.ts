@@ -684,6 +684,7 @@ export type DagWorkflowSummary = {
   failedNodes: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
   skippedNodes: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
   queuedNodes: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  escalatedNodes: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
 }
 
 export type SessionStatus =
@@ -2977,6 +2978,7 @@ export type DagWorkflowSummary1 = {
   failedNodes: number | "NaN" | "Infinity" | "-Infinity"
   skippedNodes: number | "NaN" | "Infinity" | "-Infinity"
   queuedNodes: number | "NaN" | "Infinity" | "-Infinity"
+  escalatedNodes: number | "NaN" | "Infinity" | "-Infinity"
 }
 
 export type EventTuiPromptAppend2 = {

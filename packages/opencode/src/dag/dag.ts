@@ -46,6 +46,7 @@ export const DEFAULT_WORKFLOW_CONFIG = {
   nodeTimeoutMs: 10 * 60 * 1000,
   nodeRequired: false,
   reportToParent: false,
+  maxTimeoutExtensions: 20,
 } as const
 
 /** A node as declared in the workflow's YAML config. */
@@ -85,6 +86,7 @@ export interface WorkflowConfig {
   max_concurrency?: number
   max_node_replan_attempts?: number
   max_total_nodes?: number
+  max_timeout_extensions?: number
   node_defaults?: NodeDefaults
   nodes: NodeConfig[]
 }
@@ -113,11 +115,19 @@ export function normalizeModel(model: NodeConfig["model"]) {
   }
 }
 
+// F9: clamp the timeout floor — 0/negative timeout_ms would fire the deadline
+// watcher immediately (escalate or force-cancel on the first tick).
+const MIN_NODE_TIMEOUT_MS = 1_000
+
+function clampTimeoutMs(timeoutMs: number | undefined, fallbackMs: number) {
+  return Math.max(MIN_NODE_TIMEOUT_MS, timeoutMs ?? fallbackMs)
+}
+
 function normalizeNodeDefaults(defaults: NodeDefaults | undefined): NodeDefaults {
   return {
     required: defaults?.required ?? DEFAULT_WORKFLOW_CONFIG.nodeRequired,
     worker_config: {
-      timeout_ms: defaults?.worker_config?.timeout_ms ?? DEFAULT_WORKFLOW_CONFIG.nodeTimeoutMs,
+      timeout_ms: clampTimeoutMs(defaults?.worker_config?.timeout_ms, DEFAULT_WORKFLOW_CONFIG.nodeTimeoutMs),
     },
     report_to_parent: defaults?.report_to_parent ?? DEFAULT_WORKFLOW_CONFIG.reportToParent,
     ...(defaults?.model ? { model: normalizeModel(defaults.model) } : {}),
@@ -132,11 +142,22 @@ function normalizeNodeConfig(node: NodeConfig, defaults: NodeDefaults): NodeConf
     worker_config: {
       ...defaults.worker_config,
       ...node.worker_config,
-      timeout_ms: node.worker_config?.timeout_ms ?? defaults.worker_config?.timeout_ms ?? DEFAULT_WORKFLOW_CONFIG.nodeTimeoutMs,
+      timeout_ms: clampTimeoutMs(node.worker_config?.timeout_ms ?? defaults.worker_config?.timeout_ms, DEFAULT_WORKFLOW_CONFIG.nodeTimeoutMs),
     },
     report_to_parent: node.report_to_parent ?? defaults.report_to_parent ?? DEFAULT_WORKFLOW_CONFIG.reportToParent,
     ...(model ? { model } : {}),
   }
+}
+
+// F2: a fragment node that omits worker_config.timeout_ms must NOT be
+// silently normalized to the DEFAULT (that would rewrite a long extension
+// back to 10min — implicit budget shortening). The replace bucket (definition
+// replaced, execution kept) preserves the existing node's timeout for the
+// merged config and the deadline recompute.
+function normalizeFragmentNode(node: NodeConfig, existingTimeoutMs: number | undefined, defaults: NodeDefaults): NodeConfig {
+  const timeoutMs = node.worker_config?.timeout_ms ?? existingTimeoutMs
+  const withTimeout = timeoutMs == null ? node : { ...node, worker_config: { ...node.worker_config, timeout_ms: timeoutMs } }
+  return normalizeNodeConfig(withTimeout, defaults)
 }
 
 function normalizeWorkflowConfig(config: WorkflowConfig): WorkflowConfig {
@@ -147,6 +168,7 @@ function normalizeWorkflowConfig(config: WorkflowConfig): WorkflowConfig {
     max_concurrency: config.max_concurrency ?? DEFAULT_WORKFLOW_CONFIG.maxConcurrency,
     max_node_replan_attempts: config.max_node_replan_attempts ?? DEFAULT_WORKFLOW_CONFIG.maxNodeReplanAttempts,
     max_total_nodes: config.max_total_nodes ?? DEFAULT_WORKFLOW_CONFIG.maxTotalNodes,
+    max_timeout_extensions: config.max_timeout_extensions ?? DEFAULT_WORKFLOW_CONFIG.maxTimeoutExtensions,
     node_defaults: defaults,
     nodes: config.nodes.map((node) => normalizeNodeConfig(node, defaults)),
   }
@@ -262,6 +284,8 @@ export interface Interface {
   readonly nodeSkipped: (dagID: string, nodeID: string, reason: string) => Effect.Effect<void, Error>
   readonly nodeCancelled: (dagID: string, nodeID: string) => Effect.Effect<void, Error>
   readonly nodeRestarted: (dagID: string, nodeID: string, childSessionID: string) => Effect.Effect<void, Error>
+  readonly nodeTimeoutEscalated: (dagID: string, nodeID: string, childSessionID: string, timeoutExtensions: number) => Effect.Effect<void, Error>
+  readonly nodeExtendTimeout: (dagID: string, nodeID: string, newDeadlineMs: number) => Effect.Effect<number, Error>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Dag") {}
@@ -542,7 +566,12 @@ export const layer = Layer.effect(
       }
       const wfConfig = parseWorkflowConfig(workflow.config)
       const defaults = normalizeNodeDefaults(wfConfig?.node_defaults)
-      const normalizedFragment = { nodes: fragment.nodes.map((node) => normalizeNodeConfig(node, defaults)) }
+      const cfgById = new Map((wfConfig?.nodes ?? []).map((n) => [n.id, n]))
+      const normalizedFragment = {
+        nodes: fragment.nodes.map((node) =>
+          normalizeFragmentNode(node, cfgById.get(node.id)?.worker_config?.timeout_ms, defaults),
+        ),
+      }
       const nodes = yield* store.getNodes(dagID)
       const plan = planReplan(
         { nodes: nodes.map((n) => ({ id: n.id, status: n.status as never, depends_on: n.dependsOn })) },
@@ -640,6 +669,24 @@ export const layer = Layer.effect(
         })
       }
       for (const id of effectiveRestart) {
+        // A restart re-spawns with the fragment's definition — the new
+        // depends_on must reach the durable row BEFORE the runtime rebuilds
+        // its graph from store.getNodes (WorkflowReplanned handler), or the
+        // restarted node keeps its stale edges and is re-ready under them.
+        // Mirrors the replace bucket's NodeRegistered re-publish.
+        const node = fragmentById.get(id)
+        if (node) {
+          yield* events.publish(DagEvent.NodeRegistered, {
+            dagID: dagID as ID,
+            nodeID: id as never,
+            name: node.name,
+            workerType: node.worker_type,
+            dependsOn: node.depends_on.map((d) => d as never),
+            required: node.required,
+            model: node.model as never,
+            timestamp: yield* DateTime.now,
+          })
+        }
         yield* events.publish(DagEvent.NodeRestarted, {
           dagID: dagID as ID,
           nodeID: id as never,
@@ -689,9 +736,14 @@ export const layer = Layer.effect(
       // extend is additive: carry forward pending/queued/paused nodes (with their
       // existing config definition) so replan treats them as "replace" (preserved)
       // rather than "supersede" (cancelled). Running nodes are intentionally
-      // excluded — a running node absent from the fragment is already kept
-      // unchanged by replan, so there is nothing to carry forward. Terminal
-      // nodes are immutable and need no preservation.
+      // excluded — the merged config (computeMergedConfig: surviving = every
+      // non-cancel node) already keeps a running node's definition whether or
+      // not the fragment mentions it, so there is nothing to carry forward.
+      // Note (§3.7): the WorkflowReplanned handler re-times a running survivor
+      // only when the replan carries a NEW worker_config.timeout_ms for it
+      // (deadline = now + new timeout). Unchanged/omitted timeout keeps the
+      // current deadline and the extension count is never reset by an extend.
+      // Terminal nodes are immutable and need no preservation.
       const toPreserve = nodes.filter((n) => !newIds.has(n.id) && (n.status === NodeStatus.PENDING || n.status === NodeStatus.QUEUED || n.status === NodeStatus.PAUSED))
       if (toPreserve.length > 0 && !config) {
         return yield* Effect.fail(new Error(`Cannot extend: workflow config is unparseable — would silently cancel ${toPreserve.length} pending node(s)`))
@@ -791,6 +843,32 @@ export const layer = Layer.effect(
       yield* guardNode(dagID, nodeID, NodeStatus.PENDING)
       yield* events.publish(DagEvent.NodeRestarted, { dagID: dagID as ID, nodeID: nodeID as never, childSessionID: childSessionID as never, timestamp: yield* DateTime.now })
     })
+    // Timeout escalation publishes no status transition — the node stays
+    // RUNNING (see the NodeTimeoutEscalated projector). Only the extension
+    // count, seq, and wake flag change.
+    const nodeTimeoutEscalated = Effect.fn("Dag.nodeTimeoutEscalated")(function* (lock: WorkflowLock, dagID: string, nodeID: string, childSessionID: string, timeoutExtensions: number) {
+      yield* guardWorkflowNotTerminal(dagID, "timeout escalation")
+      yield* events.publish(DagEvent.NodeTimeoutEscalated, {
+        dagID: dagID as ID,
+        nodeID: nodeID as never,
+        childSessionID: childSessionID as never,
+        timeoutExtensions,
+        timestamp: yield* DateTime.now,
+      })
+    })
+    // Replan with a new worker_config.timeout_ms recomputes the absolute
+    // deadline and persists it on the node row (Q6: from the adjudication
+    // moment). The deadline watcher is rebuilt by the replan handler. The lock
+    // witness matters: updateNodeDeadline guards status='running', and the
+    // guard is only race-free while the caller holds the workflow lock.
+    // Returns the number of rows written — 0 when the running-guard rejects
+    // (the node terminalized between the caller's read and this write), so the
+    // caller can observe the silent no-op instead of logging a false success.
+    // The store write itself cannot fail (updateNodeDeadline orDies its SQL),
+    // so the only typed-error channel on this command is withWorkflowLock.
+    const nodeExtendTimeout = Effect.fn("Dag.nodeExtendTimeout")(function* (lock: WorkflowLock, dagID: string, nodeID: string, newDeadlineMs: number) {
+      return yield* store.updateNodeDeadline(dagID, nodeID, newDeadlineMs)
+    })
 
     return Service.of({
       create,
@@ -811,6 +889,9 @@ export const layer = Layer.effect(
       nodeSkipped: (dagID, nodeID, reason) => withWorkflowLock(dagID)((lock) => nodeSkipped(lock, dagID, nodeID, reason)),
       nodeCancelled: (dagID, nodeID) => withWorkflowLock(dagID)((lock) => nodeCancelled(lock, dagID, nodeID)),
       nodeRestarted: (dagID, nodeID, childSessionID) => withWorkflowLock(dagID)((lock) => nodeRestarted(lock, dagID, nodeID, childSessionID)),
+      nodeTimeoutEscalated: (dagID, nodeID, childSessionID, timeoutExtensions) =>
+        withWorkflowLock(dagID)((lock) => nodeTimeoutEscalated(lock, dagID, nodeID, childSessionID, timeoutExtensions)),
+      nodeExtendTimeout: (dagID, nodeID, newDeadlineMs) => withWorkflowLock(dagID)((lock) => nodeExtendTimeout(lock, dagID, nodeID, newDeadlineMs)),
     })
   }),
 )
