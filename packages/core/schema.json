@@ -1,9 +1,9 @@
 {
   "version": "7",
   "dialect": "sqlite",
-  "id": "442cdbd5-86a8-41a9-86d6-5361dbac90e0",
+  "id": "abdf5c23-7f2e-4ca3-b08b-012db47b5aa5",
   "prevIds": [
-    "a953899b-bb63-497e-8e2e-86eb5e0fdeed"
+    "442cdbd5-86a8-41a9-86d6-5361dbac90e0"
   ],
   "ddl": [
     {
@@ -655,6 +655,26 @@
       "default": "0",
       "generated": null,
       "name": "replan_attempts",
+      "entityType": "columns",
+      "table": "workflow_node"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "0",
+      "generated": null,
+      "name": "timeout_extensions",
+      "entityType": "columns",
+      "table": "workflow_node"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "false",
+      "generated": null,
+      "name": "escalation_pending",
       "entityType": "columns",
       "table": "workflow_node"
     },

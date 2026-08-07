@@ -125,9 +125,21 @@ export function reconcileWorkflow(
         if (node.deadlineMs !== null) {
           const now = yield* Clock.currentTimeMillis
           if (now >= node.deadlineMs) {
+            // S2: recovery of an escalated node preserves the timeout semantics
+            // — the extension budget was spent before the crash, the deadline
+            // was never re-extended, and the durable escalation count proves
+            // it. Failure reason records the escalation so the parent can tell
+            // "ran out of time after N extensions" from "never escalated".
             yield* settle(
               node.id,
-              dag.nodeFailed(dagID, node.id, "deadline exceeded on recovery", "timeout"),
+              dag.nodeFailed(
+                dagID,
+                node.id,
+                node.timeoutExtensions > 0
+                  ? `timeout escalated (${node.timeoutExtensions} extension(s)) node failed on recovery`
+                  : "deadline exceeded on recovery",
+                "timeout",
+              ),
             )
             reconciled++
             continue

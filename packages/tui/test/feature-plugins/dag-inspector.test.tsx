@@ -26,6 +26,7 @@ const wfSummary = (overrides: Partial<DagWorkflowSummary> = {}): DagWorkflowSumm
   failedNodes: 0,
   skippedNodes: 0,
   queuedNodes: 0,
+  escalatedNodes: 0,
   ...overrides,
 })
 

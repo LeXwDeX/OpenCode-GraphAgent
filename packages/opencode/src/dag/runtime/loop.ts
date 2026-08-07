@@ -1,6 +1,6 @@
 export * as DagLoop from "./loop"
 
-import { Cause, Effect, Layer, Context, Stream, Semaphore, Fiber, Option } from "effect"
+import { Cause, Effect, Layer, Context, Stream, Semaphore, Fiber, Option, DateTime, Clock } from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { InstanceState } from "@/effect/instance-state"
 import { EventV2Bridge } from "@/event-v2-bridge"
@@ -26,7 +26,7 @@ import { SessionStatus } from "@/session/status"
 import { renderTemplate } from "../templates/resolve"
 import { sanitizeInput } from "../templates/sanitize"
 import { DagConfig } from "../config"
-import { spawnNode } from "./spawn"
+import { spawnNode, makeDeadlineWatcher } from "./spawn"
 import { evaluateCondition, resolveInputMapping } from "./eval"
 import { reconcileWorkflow, makeSessionStatusChecker } from "./recovery"
 
@@ -43,6 +43,7 @@ interface WorkflowEntry {
   parentSessionID: string
   config: WorkflowConfig | undefined
   fibers: Map<string, Fiber.Fiber<unknown, unknown>>
+  watchers: Map<string, Fiber.Fiber<unknown, unknown>>
 }
 
 export const layer = Layer.effect(
@@ -219,8 +220,15 @@ export const layer = Layer.effect(
 
             entry.runtime.markRunning(nodeID)
             const oldFiber = entry.fibers.get(nodeID)
+            const oldWatcher = entry.watchers.get(nodeID)
             yield* abortChild(nodeID, node.childSessionId).pipe(Effect.ignore)
             if (oldFiber) yield* Fiber.interrupt(oldFiber).pipe(Effect.ignore)
+            // Interrupt the old watcher BEFORE spawning a new one — otherwise
+            // the old self-renewing watcher survives as a phantom (it is
+            // unreachable from the map after the overwrite below) and keeps
+            // escalating against the stale deadline, double-counting
+            // timeout_extensions and sending duplicate wake notifications.
+            if (oldWatcher) yield* Fiber.interrupt(oldWatcher).pipe(Effect.ignore)
             yield* spawnNode(entry.semaphore, {
               dagID,
               nodeID,
@@ -235,8 +243,14 @@ export const layer = Layer.effect(
                 : undefined,
               fallbackModel: DagConfig.tierModel(dagConfig, { required: node.required, workerType: node.workerType }),
               variant: dagConfig.thinking_depth,
+              maxTimeoutExtensions: entry.config?.max_timeout_extensions ?? Dag.DEFAULT_WORKFLOW_CONFIG.maxTimeoutExtensions,
             }).pipe(
-              Effect.tap((result) => Effect.sync(() => entry.fibers.set(nodeID, result.fiber))),
+              Effect.tap((result) =>
+                Effect.sync(() => {
+                  entry.fibers.set(nodeID, result.fiber)
+                  entry.watchers.set(nodeID, result.watcherFiber)
+                }),
+              ),
               Effect.provideService(Dag.Service, dag),
               Effect.provideService(Agent.Service, agentSvc),
               Effect.provideService(Session.Service, sessionSvc),
@@ -316,7 +330,10 @@ export const layer = Layer.effect(
           // first yield so the second caller drops out immediately.
           if (runtimes.has(dagID) || recovering.has(dagID)) return
           recovering.add(dagID)
-          try {
+          // Effect.ensuring releases the adoption slot even when a fiber
+          // interrupt cuts the adoption sequence — a finally block does not
+          // survive interruption.
+          yield* Effect.gen(function* () {
             const config = parseWorkflowConfig(wf.config)
             const recovery = yield* reconcileWorkflow(
               dagID,
@@ -372,7 +389,7 @@ export const layer = Layer.effect(
             const isStepping = wf.status === "stepping"
             if (isPaused) runtime.setPaused(true)
             if (isStepping) runtime.setStepMode(true)
-            const entry: WorkflowEntry = { runtime, semaphore, evalLock: Semaphore.makeUnsafe(1), parentSessionID: wf.sessionId, config, fibers: new Map() }
+            const entry: WorkflowEntry = { runtime, semaphore, evalLock: Semaphore.makeUnsafe(1), parentSessionID: wf.sessionId, config, fibers: new Map(), watchers: new Map() }
             runtimes.set(dagID, entry)
             // Reconciliation settles every persisted running attempt before the
             // runtime is rebuilt. Recovery never adopts or restarts provider work;
@@ -391,18 +408,70 @@ export const layer = Layer.effect(
             if (pausedForRecovery) {
               yield* tryDeliverWake(wf.sessionId).pipe(Effect.ignore, Effect.forkScoped)
             }
-          } finally {
-            recovering.delete(dagID)
-          }
+          }).pipe(Effect.ensuring(Effect.sync(() => recovering.delete(dagID))))
+        })
+
+        // Orphan-pending recovery: a pending workflow with no non-pending node
+        // is a create sequence that crashed mid-way — Dag.create publishes
+        // WorkflowCreated + NodeRegistered + WorkflowStarted in separate
+        // transactions, so a crash between them leaves a row whose start event
+        // never arrives. PENDING→RUNNING is its only legal transition
+        // (core/dag/core/types.ts), so nothing else can ever move it — without
+        // this sweep the workflow hangs in pending forever. Terminalize via the
+        // legal pending→running→failed sequence: the projector accepts
+        // WorkflowFailed only from running/stepping (core/dag/projector.ts), so
+        // a bare fail would be silently dropped. Failed (not cancelled) matches
+        // the interrupted-create semantics and persists the reason in the
+        // durable WorkflowFailed event; cancelled is reserved for explicit
+        // user/agent cancels (see the checkCompletion attribution comment).
+        const recoverOrphanPending = Effect.fn("DagLoop.recoverOrphanPending")(function* (wf: DagStore.WorkflowRow) {
+          // Same cross-instance guard as recoverWorkflow: only the owning
+          // project's instance may dispose of the orphan.
+          if (wf.projectId !== ctx.project.id) return
+          const dagID = wf.id
+          if (runtimes.has(dagID) || recovering.has(dagID)) return
+          // Reserve the adoption slot for the whole terminalization sequence:
+          // the WorkflowStarted leg is a real event on the bus, and the
+          // WorkflowStarted handler must not adopt the orphan mid-sequence
+          // (a zero-node orphan would be checkCompleted straight to
+          // "completed" instead of being failed with the recovery reason).
+          // Effect.ensuring releases the slot even when a fiber interrupt cuts
+          // the sequence — a finally block does not survive interruption.
+          recovering.add(dagID)
+          yield* Effect.gen(function* () {
+            const nodes = yield* store.getNodes(dagID)
+            // Defensive no-miss-kill criterion: any non-pending node proves the
+            // workflow was adopted and progressed — it is mid-flight, not
+            // orphaned. All-pending rows can only be interrupted creates, since
+            // create() completes its start event within the same process.
+            if (!nodes.every((node) => node.status === "pending")) return
+            yield* events.publish(DagEvent.WorkflowStarted, { dagID: dagID as never, timestamp: yield* DateTime.now })
+            // dag.fail guards running→failed, persists the reason in the durable
+            // WorkflowFailed event, and terminalizes every pending node via
+            // NodeSkipped — no node is ever scheduled.
+            yield* dag.fail(dagID, "orphan pending workflow recovered at startup")
+            yield* Effect.logWarning("DagLoop terminalized orphan pending workflow", { dagID })
+          }).pipe(Effect.ensuring(Effect.sync(() => recovering.delete(dagID))))
         })
 
         yield* events.subscribe(DagEvent.WorkflowStarted).pipe(
           Stream.runForEach((evt) =>
             Effect.gen(function* () {
               const dagID = evt.data.dagID as string
-              if (runtimes.has(dagID)) return
+              // Adoption-in-flight reservations (recoverWorkflow and the
+              // orphan-pending sweep) must suppress this handler too: the
+              // orphan sweep publishes WorkflowStarted only to legalize its
+              // pending→running→failed terminalization, and adopting the
+              // orphan mid-sequence would start scheduling on a dead workflow.
+              if (runtimes.has(dagID) || recovering.has(dagID)) return
               const wf = yield* store.getWorkflow(dagID).pipe(Effect.orDie)
               if (!wf) return
+              // Status guard: the orphan-pending sweep publishes WorkflowStarted
+              // only to legalize the pending→running leg of its terminalization
+              // sequence. By the time the event reaches this handler the row is
+              // already failed — adopting it would rebuild a runtime and start
+              // scheduling nodes on a dead workflow. Accept running rows only.
+              if (wf.status !== "running") return
               // Cross-instance guard: only the owning project's instance adopts
               // (see recoverWorkflow). First-wave spawns must not race across
               // directory contexts.
@@ -412,7 +481,7 @@ export const layer = Layer.effect(
               const maxConcurrency = Math.max(1, config?.max_concurrency ?? Dag.DEFAULT_WORKFLOW_CONFIG.maxConcurrency)
               const runtime = new WorkflowRuntime(toSchedulingNodes(nodes), maxConcurrency)
               const semaphore = Semaphore.makeUnsafe(maxConcurrency)
-              const entry: WorkflowEntry = { runtime, semaphore, evalLock: Semaphore.makeUnsafe(1), parentSessionID: wf.sessionId, config, fibers: new Map() }
+              const entry: WorkflowEntry = { runtime, semaphore, evalLock: Semaphore.makeUnsafe(1), parentSessionID: wf.sessionId, config, fibers: new Map(), watchers: new Map() }
               runtimes.set(dagID, entry)
               yield* entry.evalLock.withPermits(1)(
                 Effect.gen(function* () {
@@ -450,22 +519,33 @@ export const layer = Layer.effect(
                     const expected = def === DagEvent.NodeSkipped ? "skipped" : "completed"
                     const node = yield* store.getNode(dagID, nodeID)
                     const confirmed = node?.status === expected
-                    // Cancel-skip race: workflow-level cancel publishes NodeSkipped
-                    // for running nodes, and this handler may win the cross-stream
-                    // race against WorkflowCancelled. Deleting the fiber here
-                    // uninterrupted would orphan it from the WorkflowCancelled
-                    // sweep and the child session would keep running until its
-                    // prompt finishes or times out. Stop it now, mirroring the
-                    // NodeCancelled handler. Completed nodes keep the plain
-                    // delete — their fiber published the event and is finishing.
-                    if (confirmed && def === DagEvent.NodeSkipped) {
-                      const fiber = entry.fibers.get(nodeID)
-                      if (fiber) {
-                        yield* abortChild(nodeID, node?.childSessionId ?? null).pipe(Effect.ignore)
-                        yield* Fiber.interrupt(fiber).pipe(Effect.ignore)
+                    if (confirmed) {
+                      if (def === DagEvent.NodeSkipped) {
+                        // Cancel-skip race: workflow-level cancel publishes NodeSkipped
+                        // for running nodes, and this handler may win the cross-stream
+                        // race against WorkflowCancelled. Deleting the fiber here
+                        // uninterrupted would orphan it from the WorkflowCancelled
+                        // sweep and the child session would keep running until its
+                        // prompt finishes or times out. Stop it now, mirroring the
+                        // NodeCancelled handler. Completed nodes keep the plain
+                        // delete — their fiber published the event and is finishing.
+                        const fiber = entry.fibers.get(nodeID)
+                        if (fiber) {
+                          yield* abortChild(nodeID, node?.childSessionId ?? null).pipe(Effect.ignore)
+                          yield* Fiber.interrupt(fiber).pipe(Effect.ignore)
+                        }
                       }
+                      // N3: interrupt the watcher on BOTH terminal events. A node
+                      // re-timed via replan carries a REPLACED watcher in
+                      // entry.watchers; the spawn-time cleanup only interrupts the
+                      // original watcherFiber, so without this the replacement
+                      // lingers until its deadline wake (≤ the extended timeout)
+                      // before it re-reads a terminal row and exits.
+                      const watcher = entry.watchers.get(nodeID)
+                      if (watcher) yield* Fiber.interrupt(watcher).pipe(Effect.ignore)
+                      entry.fibers.delete(nodeID)
+                      entry.watchers.delete(nodeID)
                     }
-                    if (confirmed) entry.fibers.delete(nodeID)
                     if (!confirmed) {
                       yield* Effect.logDebug("DagLoop dropped stale node terminal event", { dagID, nodeID, expected, dbStatus: node?.status ?? "missing" })
                     }
@@ -512,6 +592,9 @@ export const layer = Layer.effect(
                     yield* Fiber.interrupt(fiber).pipe(Effect.ignore)
                     entry.fibers.delete(nodeID)
                   }
+                  const watcher = entry.watchers.get(nodeID)
+                  if (watcher) yield* Fiber.interrupt(watcher).pipe(Effect.ignore)
+                  entry.watchers.delete(nodeID)
                   entry.runtime.markUnsatisfied(nodeID)
                   yield* checkCompletion(dagID)
                 }),
@@ -546,9 +629,12 @@ export const layer = Layer.effect(
                     // would incorrectly flip a satisfied node to unsatisfied.
                     if (node?.status === "failed" && entry.runtime.isActive(nid)) {
                       const fiber = entry.fibers.get(nid)
+                      const watcher = entry.watchers.get(nid)
                       entry.fibers.delete(nid)
+                      entry.watchers.delete(nid)
                       yield* abortChild(nid, node.childSessionId ?? null).pipe(Effect.ignore)
                       if (fiber) yield* Fiber.interrupt(fiber).pipe(Effect.ignore)
+                      if (watcher) yield* Fiber.interrupt(watcher).pipe(Effect.ignore)
                       entry.runtime.markUnsatisfied(nid)
                       if (!entry.runtime.isStepMode()) yield* spawnReady(dagID)
                     }
@@ -563,6 +649,24 @@ export const layer = Layer.effect(
                 )
                 yield* tryDeliverWake(entry.parentSessionID).pipe(Effect.ignore, Effect.forkScoped)
               }).pipe(guarded("NodeFailed")),
+          ),
+          Effect.forkScoped({ startImmediately: true }),
+        )
+
+        // Timeout escalation: the node keeps RUNNING — the runtime needs no
+        // state change. The event's only job is to wake the main agent so it
+        // can adjudicate (extend via replan with a new timeout_ms, or
+        // cancel/replan). Delivery re-reads the wake snapshot, where the
+        // escalated running node now appears (timeout_extensions > 0).
+        yield* events.subscribe(DagEvent.NodeTimeoutEscalated).pipe(
+          Stream.filter((e) => runtimes.has(e.data.dagID as string)),
+          Stream.runForEach((evt) =>
+            Effect.gen(function* () {
+              const dagID = evt.data.dagID as string
+              const entry = runtimes.get(dagID)
+              if (!entry) return
+              yield* tryDeliverWake(entry.parentSessionID).pipe(Effect.ignore, Effect.forkScoped)
+            }).pipe(guarded("NodeTimeoutEscalated")),
           ),
           Effect.forkScoped({ startImmediately: true }),
         )
@@ -656,9 +760,108 @@ export const layer = Layer.effect(
               yield* entry.evalLock.withPermits(1)(
                 Effect.gen(function* () {
                   const wf = yield* store.getWorkflow(dagID).pipe(Effect.orDie)
+                  const oldConfig = entry.config
                   if (wf) entry.config = parseWorkflowConfig(wf.config)
                   const nodes = yield* store.getNodes(dagID)
                   entry.runtime.rebuildGraph(toSchedulingNodes(nodes))
+                  // Timeout extension (Q6): a running node gets a recomputed
+                  // deadline (now + new timeout) ONLY when the replan carries a
+                  // NEW worker_config.timeout_ms for it (§3.7) AND the node
+                  // actually needs re-timing (deadline elapsed or escalation
+                  // pending — see the gate below). Restarted nodes are pending
+                  // here — their new attempt spawns a fresh watcher via
+                  // spawnReady.
+                  const newConfig = entry.config
+                  for (const node of nodes) {
+                    if (node.status !== "running") continue
+                    const frag = newConfig?.nodes.find((candidate) => candidate.id === node.id)
+                    if (!frag) continue
+                    const oldTimeoutMs = oldConfig?.nodes.find((candidate) => candidate.id === node.id)?.worker_config?.timeout_ms
+                    const fragTimeoutMs = frag.worker_config?.timeout_ms
+                    // §3.7: re-time only when the replan carries a NEW
+                    // timeout_ms. The persisted config behind WorkflowReplanned
+                    // is the MERGED config — every non-cancel survivor keeps its
+                    // definition — so a node the fragment never mentioned, or
+                    // re-specified with an unchanged/omitted timeout_ms,
+                    // matches here with its OLD timeout.
+                    if (fragTimeoutMs == null || fragTimeoutMs === oldTimeoutMs) continue
+                    const now = yield* Clock.currentTimeMillis
+                    // Cap gate (A1): a changed timeout alone must not move a
+                    // healthy deadline forward. An agent replanning BEFORE each
+                    // deadline with cycling values (10m→20m→10m…) would push the
+                    // deadline away forever without a single escalation firing,
+                    // so the extension count never climbs and the ≈21× cap is
+                    // bypassed. Re-time only when the current deadline already
+                    // elapsed or an escalation awaits adjudication; a gated-off
+                    // node keeps its deadline and the self-renewing watcher
+                    // escalates it the moment it passes. A null deadline is
+                    // treated as elapsed — re-timing is what re-establishes
+                    // supervision.
+                    if (!node.escalationPending && node.deadlineMs != null && node.deadlineMs > now) continue
+                    // N1: write the new deadline FIRST. nodeExtendTimeout
+                    // acquires the workflow lock and can fail or block; if the
+                    // write never lands, the old watcher must keep supervising
+                    // the old deadline — interrupting it beforehand would leave
+                    // a RUNNING node with no watcher, no escalation, and a
+                    // defeated cap backstop (§5-5).
+                    // D1: one node's failed extend must not abort the rest of
+                    // the handler — an uncaught failure propagates to
+                    // guarded("WorkflowReplanned") and skips the stale-fiber
+                    // sweep below plus spawnReady/checkCompletion, leaving
+                    // restarted nodes pending with nobody to schedule them.
+                    // A failed write also leaves the deadline unmoved, so the
+                    // old watcher keeps supervising (N1) — this path must not
+                    // touch it. Interruption still propagates: hasInterrupts is
+                    // a structural check, whereas Cause.interruptors collects
+                    // only DEFINED fiber IDs and ignores interrupt reasons
+                    // carrying none — those would be swallowed as errors here.
+                    const written = yield* dag.nodeExtendTimeout(dagID, node.id, now + fragTimeoutMs).pipe(
+                      Effect.catchCause((cause) =>
+                        Cause.hasInterrupts(cause)
+                          ? Effect.failCause(cause)
+                          : Effect.logWarning("DagLoop replan re-time failed; keeping the old watcher and continuing the batch", { dagID, nodeID: node.id, cause }).pipe(
+                              Effect.as(-1),
+                            ),
+                      ),
+                    )
+                    if (written < 0) continue
+                    if (written === 0) {
+                      // The status='running' guard rejected the write — the node
+                      // terminalized between the getNodes read and this update.
+                      // No deadline was written; stop the old watcher and do not
+                      // install one for a row the store refused to touch.
+                      const deadWatcher = entry.watchers.get(node.id)
+                      if (deadWatcher) yield* Fiber.interrupt(deadWatcher).pipe(Effect.ignore)
+                      entry.watchers.delete(node.id)
+                      yield* Effect.logWarning("DagLoop replan re-time skipped — node no longer running", { dagID, nodeID: node.id })
+                      continue
+                    }
+                    // Write committed: install the re-armed watcher BEFORE
+                    // interrupting the old one so supervision is never absent.
+                    // F8's original race is benign in this order — the old
+                    // watcher's next read sees the future deadline and sleeps;
+                    // an escalation already in flight (lock-serialized behind
+                    // this write) only adds a counted extension toward the cap,
+                    // it never removes supervision. Its sole residue is re-setting
+                    // escalation_pending on the now-extended node, which costs one
+                    // redundant wake and permits one extra re-time via the gate
+                    // above — cosmetic; the cap accounting still holds because the
+                    // count did climb.
+                    const newWatcher = yield* makeDeadlineWatcher({
+                      dagID,
+                      nodeID: node.id,
+                      timeoutMs: fragTimeoutMs,
+                      maxTimeoutExtensions: newConfig?.max_timeout_extensions ?? Dag.DEFAULT_WORKFLOW_CONFIG.maxTimeoutExtensions,
+                    }).pipe(
+                      Effect.provideService(Dag.Service, dag),
+                      Effect.provideService(SessionPrompt.Service, promptSvc),
+                      Effect.forkScoped,
+                    )
+                    const oldWatcher = entry.watchers.get(node.id)
+                    entry.watchers.set(node.id, newWatcher)
+                    if (oldWatcher) yield* Fiber.interrupt(oldWatcher).pipe(Effect.ignore)
+                    yield* Effect.logInfo("DagLoop extended node deadline via replan", { dagID, nodeID: node.id, newDeadlineMs: now + fragTimeoutMs })
+                  }
                   // Replan resets restarted nodes to pending. Old fibers of nodes
                   // that are no longer running/queued must be interrupted here:
                   // nothing else will (there is no NodeRestarted subscriber), and
@@ -670,7 +873,10 @@ export const layer = Layer.effect(
                     if (node && (node.status === "running" || node.status === "queued")) continue
                     yield* abortChild(nodeID, node?.childSessionId ?? null).pipe(Effect.ignore)
                     yield* Fiber.interrupt(fiber).pipe(Effect.ignore)
+                    const watcher = entry.watchers.get(nodeID)
+                    if (watcher) yield* Fiber.interrupt(watcher).pipe(Effect.ignore)
                     entry.fibers.delete(nodeID)
+                    entry.watchers.delete(nodeID)
                   }
                   yield* spawnReady(dagID)
                   yield* checkCompletion(dagID)
@@ -696,8 +902,11 @@ export const layer = Layer.effect(
                         const node = yield* store.getNode(dagID, nodeID)
                         yield* abortChild(nodeID, node?.childSessionId ?? null).pipe(Effect.ignore)
                         yield* Fiber.interrupt(fiber).pipe(Effect.ignore)
+                        const watcher = entry.watchers.get(nodeID)
+                        if (watcher) yield* Fiber.interrupt(watcher).pipe(Effect.ignore)
                       }
                       entry.fibers.clear()
+                      entry.watchers.clear()
                       runtimes.delete(dagID)
                     }),
                   )
@@ -727,6 +936,21 @@ export const layer = Layer.effect(
           const terminalWorkflows = snapshot.workflows.filter(
             (workflow) => !workflow.wakeReported && isWorkflowTerminalStatus(workflow.status as never),
           )
+          // Timeout-escalated nodes must reach the main agent for
+          // adjudication — their workflow is a delivery boundary even though
+          // the runtime still reports a running node. F11: a non-eligible node
+          // that escalated then terminalized (cap-exhausted force-cancel) must
+          // deliver its verdict immediately, not wait for the next natural
+          // boundary (it may never come while other nodes keep running).
+          // The boundary is escalation_pending (a live, not-yet-adjudicated
+          // escalation) OR an escalated node that terminalized — NOT the sticky
+          // extension count alone, or an already-adjudicated running node would
+          // override the delivery boundary for the rest of the attempt.
+          const escalatedWorkflowIDs = new Set(
+            snapshot.nodes
+              .filter((node) => node.escalationPending || (node.timeoutExtensions > 0 && isNodeTerminalStatus(node.status as never)))
+              .map((node) => node.workflowId),
+          )
           const workflowIDs = [...new Set([
             ...snapshot.nodes.map((node) => node.workflowId),
             ...terminalWorkflows.map((workflow) => workflow.id),
@@ -740,6 +964,7 @@ export const layer = Layer.effect(
             if (workflow.status === "paused" || workflow.status === "stepping") return true
             if (entry?.runtime.isPaused() || entry?.runtime.isStepMode()) return true
             if (workflow.status !== "running" || !entry) return false
+            if (escalatedWorkflowIDs.has(workflow.id)) return true
             // Delivery boundary uses the runtime's own running set, NOT fiber
             // ownership: between markRunning and fibers.set the spawn path has
             // async yield points, and a wake reading that window would misjudge
@@ -870,6 +1095,14 @@ export const layer = Layer.effect(
               }
               const summaries = [
                 ...batch.nodes.map((node) => {
+                  // The timeout advisory is for a running node awaiting
+                  // adjudication (escalation_pending). A batch node is
+                  // wake_reported=false, so it cannot be an already-adjudicated
+                  // extend — escalation_pending and timeoutExtensions>0 agree
+                  // here; the flag is the intent-level signal.
+                  if (node.status === "running" && node.escalationPending) {
+                    return `[DAG Node Timeout] RUNNING node "${node.name}" exceeded its execution deadline (timeout escalation ${node.timeoutExtensions}) and is still executing. Adjudicate by replanning with a NEW worker_config.timeout_ms to extend the node — that grants more execution time, but the cumulative extension count is NOT reset (only a new attempt resets it), and the node is force-cancelled once the cap is reached — or cancel/replan the node. Queued nodes are not extended: their admission deadline was fixed at permit acquisition and is not adjusted by extensions.`
+                  }
                   const output = typeof node.output === "string"
                     ? node.output.slice(0, 500)
                     : node.errorReason ?? (node.output == null ? "(no output)" : JSON.stringify(node.output).slice(0, 500))
@@ -941,6 +1174,17 @@ export const layer = Layer.effect(
 
         // Install all live event handlers before spawning recovery watchers so
         // a child that settles immediately cannot leave the runtime stale.
+        // Orphan-pending sweep first: the WorkflowStarted it publishes for the
+        // terminalization leg is rejected by the handler's status guard above
+        // (the row is already failed once the event arrives), never adopted.
+        const pendingWfs = yield* store.listByStatus("pending").pipe(Effect.orDie)
+        for (const wf of pendingWfs) {
+          yield* recoverOrphanPending(wf).pipe(
+            Effect.catchCause((cause) =>
+              Effect.logWarning("DagLoop orphan pending recovery failed for workflow", { dagID: wf.id, cause }),
+            ),
+          )
+        }
         const runningWfs = yield* store.listByStatus("running").pipe(Effect.orDie)
         const pausedWfs = yield* store.listByStatus("paused").pipe(Effect.orDie)
         const steppingWfs = yield* store.listByStatus("stepping").pipe(Effect.orDie)

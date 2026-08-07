@@ -1,6 +1,6 @@
 export * as DagStore from "./store"
 
-import { and, asc, count, desc, eq, inArray } from "drizzle-orm"
+import { and, asc, count, desc, eq, gt, inArray, or } from "drizzle-orm"
 import { Context, Effect, Layer } from "effect"
 import { Database } from "../database/database"
 import { LayerNode } from "../effect/layer-node"
@@ -44,6 +44,8 @@ export interface NodeRow {
   wakeEligible: boolean
   wakeReported: boolean
   replanAttempts: number
+  timeoutExtensions: number
+  escalationPending: boolean
   seq: number
   startedAt: number | null
   completedAt: number | null
@@ -70,6 +72,8 @@ export interface WorkflowSummary {
   failedNodes: number
   skippedNodes: number
   queuedNodes: number
+  /** Running nodes with a not-yet-adjudicated timeout escalation (escalation_pending). */
+  escalatedNodes: number
 }
 
 const mapWorkflow = (r: typeof WorkflowTable.$inferSelect): WorkflowRow => ({
@@ -106,10 +110,31 @@ const mapNode = (r: typeof WorkflowNodeTable.$inferSelect): NodeRow => ({
   wakeEligible: r.wake_eligible,
   wakeReported: r.wake_reported,
   replanAttempts: r.replan_attempts,
+  timeoutExtensions: r.timeout_extensions,
+  escalationPending: r.escalation_pending,
   seq: r.seq,
   startedAt: r.started_at,
   completedAt: r.completed_at,
 })
+
+// F11: wake eligibility gates TERMINAL notifications (the report_to_parent
+// contract) — but a timeout-escalated node must reach the main agent
+// REGARDLESS of report_to_parent AND regardless of its current status: the
+// escalation wake is the only force behind the extension cap, and a
+// non-eligible node (default config) would otherwise never be adjudicated.
+// Escalated-then-terminalized nodes (cap-exhausted force-cancel) still need
+// delivery, and so do escalated-then-COMPLETED nodes: the main agent already
+// spent turns adjudicating this node (the extend path), so its result is the
+// receipt for those turns — withholding it behind report_to_parent would
+// silently lose adjudicated work. Single source of truth for snapshot /
+// unreported / bootstrap-sweep wake queries.
+const wakeDeliverableNodePredicate = or(
+  and(
+    eq(WorkflowNodeTable.wake_eligible, true),
+    inArray(WorkflowNodeTable.status, ["completed", "failed"]),
+  ),
+  gt(WorkflowNodeTable.timeout_extensions, 0),
+)
 
 // ============================================================================
 // Service interface
@@ -127,6 +152,7 @@ export interface Interface {
   readonly getNode: (workflowId: string, nodeId: string) => Effect.Effect<NodeRow | undefined>
   readonly getRunningNodes: (workflowId: string) => Effect.Effect<NodeRow[]>
   readonly setCapturedOutput: (childSessionID: string, payload: unknown) => Effect.Effect<void>
+  readonly updateNodeDeadline: (workflowId: string, nodeID: string, deadlineMs: number) => Effect.Effect<number>
 
   readonly markNodeWakeReported: (workflowId: string, nodeID: string) => Effect.Effect<void>
   readonly markWorkflowWakeReported: (dagID: string) => Effect.Effect<void>
@@ -212,6 +238,26 @@ export const layer = Layer.effect(
           .groupBy(WorkflowNodeTable.workflow_id, WorkflowNodeTable.status)
           .all()
           .pipe(Effect.orDie)
+        // F10: separate aggregation for running nodes with a not-yet-adjudicated
+        // timeout escalation (the status grouping above cannot see the flag).
+        // escalation_pending is set on escalate and cleared on adjudication, so
+        // this counts only nodes genuinely awaiting main-agent action.
+        const escalatedRows = yield* db
+          .select({
+            workflowId: WorkflowNodeTable.workflow_id,
+            total: count(),
+          })
+          .from(WorkflowNodeTable)
+          .innerJoin(WorkflowTable, eq(WorkflowNodeTable.workflow_id, WorkflowTable.id))
+          .where(and(
+            eq(WorkflowTable.session_id, sessionId),
+            eq(WorkflowNodeTable.status, "running"),
+            eq(WorkflowNodeTable.escalation_pending, true),
+          ))
+          .groupBy(WorkflowNodeTable.workflow_id)
+          .all()
+          .pipe(Effect.orDie)
+        const escalatedByWorkflow = new Map(escalatedRows.map((row) => [row.workflowId, row.total]))
         const counts = countRows.reduce((all, row) => {
           const current = all.get(row.workflowId) ?? { nodeCount: 0, completedNodes: 0, runningNodes: 0, failedNodes: 0, skippedNodes: 0, queuedNodes: 0 }
           current.nodeCount += row.total
@@ -228,6 +274,7 @@ export const layer = Layer.effect(
           title: wf.title,
           status: wf.status,
           ...(counts.get(wf.id) ?? { nodeCount: 0, completedNodes: 0, runningNodes: 0, failedNodes: 0, skippedNodes: 0, queuedNodes: 0 }),
+          escalatedNodes: escalatedByWorkflow.get(wf.id) ?? 0,
         }))
       }),
 
@@ -269,6 +316,30 @@ export const layer = Layer.effect(
           .where(eq(WorkflowNodeTable.child_session_id, childSessionID))
           .run()
           .pipe(Effect.orDie)
+      }),
+
+      updateNodeDeadline: Effect.fn("DagStore.updateNodeDeadline")(function* (workflowId, nodeID, deadlineMs) {
+        const updated = yield* db
+          .update(WorkflowNodeTable)
+          // Adjudication write (re-time via nodeExtendTimeout). Only update the
+          // deadline — do NOT reset timeout_extensions: the count is cumulative
+          // per attempt so an agent cannot bypass the cap by re-planning.
+          // Escalation is now adjudicated: clear escalation_pending (summary and
+          // delivery boundary stop treating the node as awaiting adjudication)
+          // and consume the escalation wake (wake_reported=true) so the stale
+          // timeout wake is not re-delivered after the deadline moved.
+          .set({ deadline_ms: deadlineMs, escalation_pending: false, wake_reported: true })
+          // Guard: never write a deadline onto a node that terminalized between
+          // the caller's read and this update.
+          .where(and(
+            eq(WorkflowNodeTable.workflow_id, workflowId),
+            eq(WorkflowNodeTable.id, nodeID),
+            eq(WorkflowNodeTable.status, "running"),
+          ))
+          .returning({ id: WorkflowNodeTable.id })
+          .all()
+          .pipe(Effect.orDie)
+        return updated.length
       }),
 
       markNodeWakeReported: Effect.fn("DagStore.markNodeWakeReported")(function* (workflowId, nodeID) {
@@ -337,9 +408,14 @@ export const layer = Layer.effect(
                 .innerJoin(WorkflowTable, eq(WorkflowNodeTable.workflow_id, WorkflowTable.id))
                 .where(and(
                   eq(WorkflowTable.session_id, sessionID),
-                  eq(WorkflowNodeTable.wake_eligible, true),
                   eq(WorkflowNodeTable.wake_reported, false),
-                  inArray(WorkflowNodeTable.status, ["completed", "failed"]),
+                  // Escalated nodes enter the snapshot unconditionally
+                  // (timeout_extensions > 0), covering the escalated-then-
+                  // terminal outcome too — the cap's terminal verdict is its
+                  // enforceable force. Adjudication consumes the wake
+                  // (wake_reported=true), so adjudicated nodes are already
+                  // filtered out above.
+                  wakeDeliverableNodePredicate,
                 ))
                 .orderBy(
                   asc(WorkflowTable.seq),
@@ -370,9 +446,10 @@ export const layer = Layer.effect(
           .innerJoin(WorkflowTable, eq(WorkflowNodeTable.workflow_id, WorkflowTable.id))
           .where(and(
             eq(WorkflowTable.session_id, sessionID),
-            eq(WorkflowNodeTable.wake_eligible, true),
             eq(WorkflowNodeTable.wake_reported, false),
-            inArray(WorkflowNodeTable.status, ["completed", "failed"]),
+            // See wakeDeliverableNodePredicate — escalated nodes are wake-
+            // eligible regardless of report_to_parent and status.
+            wakeDeliverableNodePredicate,
           ))
           .orderBy(
             asc(WorkflowTable.seq),
@@ -416,9 +493,11 @@ export const layer = Layer.effect(
           .from(WorkflowNodeTable)
           .innerJoin(WorkflowTable, eq(WorkflowNodeTable.workflow_id, WorkflowTable.id))
           .where(and(
-            eq(WorkflowNodeTable.wake_eligible, true),
             eq(WorkflowNodeTable.wake_reported, false),
-            inArray(WorkflowNodeTable.status, ["completed", "failed"]),
+            // See wakeDeliverableNodePredicate — escalated nodes count as
+            // unreported wakes so the bootstrap sweep finds a session whose
+            // only outstanding item is an escalation.
+            wakeDeliverableNodePredicate,
           ))
           .all()
           .pipe(Effect.orDie)

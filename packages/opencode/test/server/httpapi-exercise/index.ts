@@ -1812,6 +1812,7 @@ const scenarios: Scenario[] = [
         check(typeof summary.failedNodes === "number", "summary should have failedNodes")
         check(typeof summary.status === "string", "summary should have status")
         check(typeof summary.title === "string", "summary should have title")
+        check(typeof summary.escalatedNodes === "number", "summary should have escalatedNodes")
       }),
     ),
 
