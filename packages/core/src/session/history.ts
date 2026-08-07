@@ -26,6 +26,7 @@ const messageRows = Effect.fnUntraced(function* (
   sessionID: SessionSchema.ID,
   compaction: { readonly seq: number } | undefined,
   baselineSeq?: number,
+  afterSeq?: number,
 ) {
   const rows = yield* db
     .select()
@@ -44,6 +45,7 @@ const messageRows = Effect.fnUntraced(function* (
         baselineSeq === undefined
           ? undefined
           : or(ne(SessionMessageTable.type, "system"), gt(SessionMessageTable.seq, baselineSeq)),
+        afterSeq === undefined ? undefined : gt(SessionMessageTable.seq, afterSeq),
       ),
     )
     .orderBy(asc(SessionMessageTable.seq))
@@ -63,6 +65,11 @@ const decodeMessageRow = (row: typeof SessionMessageTable.$inferSelect) =>
     ),
   )
 
+const decodeEntries = (rows: typeof SessionMessageTable.$inferSelect[]) =>
+  Effect.forEach(rows, (row) =>
+    decodeMessageRow(row).pipe(Effect.map((message) => ({ seq: row.seq, message }))),
+  )
+
 export const load = Effect.fn("SessionHistory.load")(function* (db: DatabaseService, sessionID: SessionSchema.ID) {
   const [epoch, compaction] = yield* Effect.all(
     [
@@ -76,7 +83,8 @@ export const load = Effect.fn("SessionHistory.load")(function* (db: DatabaseServ
     ],
     { concurrency: "unbounded" },
   )
-  return yield* Effect.forEach(yield* messageRows(db, sessionID, compaction, epoch?.baselineSeq), decodeMessageRow)
+  const entries = yield* decodeEntries(yield* messageRows(db, sessionID, compaction, epoch?.baselineSeq))
+  return entries.map((entry) => entry.message)
 })
 
 export const loadForRunner = Effect.fn("SessionHistory.loadForRunner")(function* (
@@ -93,9 +101,39 @@ export const entriesForRunner = Effect.fn("SessionHistory.entriesForRunner")(fun
   baselineSeq: number,
 ) {
   const rows = yield* messageRows(db, sessionID, yield* latestCompaction(db, sessionID), baselineSeq)
-  return yield* Effect.forEach(rows, (row) =>
-    decodeMessageRow(row).pipe(Effect.map((message) => ({ seq: row.seq, message }))),
-  )
+  return yield* decodeEntries(rows)
+})
+
+/**
+ * Incremental read for the runner hot path: returns only entries with
+ * `seq > afterSeq` (the caller's last-read cursor), so a session of length N
+ * costs O(new messages) per turn instead of a full O(N) scan.
+ *
+ * - `entries` are subject to the same compaction and epoch-baseline filters as
+ *   `entriesForRunner`, so appending them to the caller's cached entries is
+ *   equivalent to a fresh full read.
+ * - `lastSeq` is the highest `seq` returned (unchanged when nothing new was
+ *   written) and doubles as the next `afterSeq`.
+ * - `reset` is true when a compaction has crossed the cursor since the last
+ *   read. Compaction changes the read window (`seq >= compaction.seq`), so the
+ *   caller must discard its cached entries and replace them with `entries`,
+ *   which already contain the full read in that case.
+ *
+ * Epoch-baseline changes are reported by the caller (it owns the epoch) and
+ * are not detected here.
+ */
+export const entriesAfter = Effect.fn("SessionHistory.entriesAfter")(function* (
+  db: DatabaseService,
+  sessionID: SessionSchema.ID,
+  baselineSeq: number,
+  afterSeq: number,
+) {
+  const compaction = yield* latestCompaction(db, sessionID)
+  const reset = compaction !== undefined && compaction.seq > afterSeq
+  const rows = yield* messageRows(db, sessionID, compaction, baselineSeq, reset ? undefined : afterSeq)
+  const entries = yield* decodeEntries(rows)
+  const lastSeq = entries.length === 0 ? afterSeq : entries[entries.length - 1].seq
+  return { entries, lastSeq, reset }
 })
 
 export * as SessionHistory from "./history"
