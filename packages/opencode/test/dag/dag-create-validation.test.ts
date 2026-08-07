@@ -125,3 +125,122 @@ describe("Dag.create structural validation", () => {
     )
   })
 })
+
+describe("Dag prompt_template binding validation", () => {
+  it("rejects an inline template referencing a variable with no binding source", async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        // Pre-fix, the graph was "Added" and every node died at spawn time
+        // (verdict_fail: Unresolved template placeholders) — a silent window
+        // where the wave looked running. Acceptance rejects it up front.
+        const error = yield* createExpectingError({
+          nodes: [{ ...node("repair"), prompt_template: { inline: "Work in {{path}}" } }],
+        })
+        expect(error.message).toContain('node "repair" prompt_template references unbound variable "{{path}}"')
+      }).pipe(Effect.scoped, Effect.provide(dagLayer)) as Effect.Effect<never>,
+    )
+  })
+
+  it("accepts when prompt_template.input binds the variable", async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        yield* setupFKs()
+        const dag = yield* Dag.Service
+        const dagID = yield* dag.create({
+          projectID: Project.ID.global,
+          sessionID: "ses_create",
+          title: "binding-input",
+          config: {
+            name: "binding-input",
+            nodes: [{ ...node("repair"), prompt_template: { inline: "Work in {{path}}", input: { path: "/repo" } } }],
+          },
+        }).pipe(Effect.orDie)
+        expect(dagID.startsWith("dag")).toBe(true)
+      }).pipe(Effect.scoped, Effect.provide(dagLayer)) as Effect.Effect<never>,
+    )
+  })
+
+  it("accepts when depends_on identity binding covers the variable", async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        yield* setupFKs()
+        const dag = yield* Dag.Service
+        const dagID = yield* dag.create({
+          projectID: Project.ID.global,
+          sessionID: "ses_create",
+          title: "binding-identity",
+          config: {
+            name: "binding-identity",
+            nodes: [node("explore"), { ...node("repair", ["explore"]), prompt_template: { inline: "Use {{explore}}" } }],
+          },
+        }).pipe(Effect.orDie)
+        expect(dagID.startsWith("dag")).toBe(true)
+      }).pipe(Effect.scoped, Effect.provide(dagLayer)) as Effect.Effect<never>,
+    )
+  })
+
+  it("accepts when input_mapping binds the variable", async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        yield* setupFKs()
+        const dag = yield* Dag.Service
+        const dagID = yield* dag.create({
+          projectID: Project.ID.global,
+          sessionID: "ses_create",
+          title: "binding-mapping",
+          config: {
+            name: "binding-mapping",
+            nodes: [
+              node("explore"),
+              {
+                ...node("repair", ["explore"]),
+                input_mapping: { findings: "explore.output" },
+                prompt_template: { inline: "Use {{findings}}" },
+              },
+            ],
+          },
+        }).pipe(Effect.orDie)
+        expect(dagID.startsWith("dag")).toBe(true)
+      }).pipe(Effect.scoped, Effect.provide(dagLayer)) as Effect.Effect<never>,
+    )
+  })
+
+  it("does not binding-check id templates at acceptance (spawn-time enforcement covers them)", async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        yield* setupFKs()
+        const dag = yield* Dag.Service
+        const dagID = yield* dag.create({
+          projectID: Project.ID.global,
+          sessionID: "ses_create",
+          title: "binding-id-template",
+          config: {
+            name: "binding-id-template",
+            nodes: [{ ...node("repair"), prompt_template: { id: "not-on-disk" } }],
+          },
+        }).pipe(Effect.orDie)
+        expect(dagID.startsWith("dag")).toBe(true)
+      }).pipe(Effect.scoped, Effect.provide(dagLayer)) as Effect.Effect<never>,
+    )
+  })
+
+  it("rejects an extend whose new node has an unbound inline placeholder", async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        yield* setupFKs()
+        const dag = yield* Dag.Service
+        const dagID = yield* dag.create({
+          projectID: Project.ID.global,
+          sessionID: "ses_create",
+          title: "binding-extend",
+          config: { name: "binding-extend", nodes: [node("explore")] },
+        }).pipe(Effect.orDie)
+        const error = yield* dag.extend(dagID, [
+          { ...node("repair", ["explore"]), prompt_template: { inline: "Use {{path}}" } },
+        ]).pipe(Effect.catch((e: Error) => Effect.succeed(e)))
+        expect(error).toBeInstanceOf(Error)
+        expect((error as Error).message).toContain('Replan rejected: node "repair" prompt_template references unbound variable "{{path}}"')
+      }).pipe(Effect.scoped, Effect.provide(dagLayer)) as Effect.Effect<never>,
+    )
+  })
+})

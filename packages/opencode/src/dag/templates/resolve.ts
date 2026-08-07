@@ -26,6 +26,14 @@ export interface TemplateRef {
 
 const INTERPOLATION_RE = /{{\s*([^{}]+?)\s*}}/g
 
+/** Placeholder keys appearing in a template source, deduplicated, first-seen
+ * order. Matches exactly what `interpolate` tries to resolve — the single
+ * source of truth for template syntax, shared with acceptance-time binding
+ * validation. */
+export function placeholderKeys(template: string): string[] {
+  return [...new Set([...template.matchAll(INTERPOLATION_RE)].map((match) => match[1]))]
+}
+
 /** A template id must be a single path segment (no separators, no parent refs)
  * so it cannot escape the dag-prompts directory via path traversal. */
 function isSafeTemplateId(id: string): boolean {
