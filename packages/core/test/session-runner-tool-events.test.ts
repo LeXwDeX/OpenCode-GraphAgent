@@ -26,6 +26,19 @@ const capture = () => {
         })
         return event
       }),
+    publishMany: (events) =>
+      Effect.sync(() =>
+        events.map(({ definition, data }) => {
+          const event = { id: EventV2.ID.create(), type: definition.type, data } as EventV2.Payload
+          published.push({
+            type: definition.durable
+              ? EventV2.versionedType(definition.type, definition.durable.version)
+              : definition.type,
+            data,
+          })
+          return event
+        }),
+      ),
     subscribe: () => Stream.empty,
     all: () => Stream.empty,
     durable: () => Stream.empty,
