@@ -189,16 +189,33 @@ export const layer = Layer.effect(
       schema: S,
       loginOrigin: string,
     ) {
+      // Transport-level failures (DNS/connection/timeout, non-2xx status, body
+      // read failures) always degrade to a warning — an unreachable well-known
+      // source cannot crash config loading. Auth errors (RemoteAuthError) and
+      // decode failures stay hard errors: they indicate a broken credential or
+      // a malformed remote config, not an offline environment.
       const response = yield* HttpClient.filterStatusOk(withTransientReadRetry(http))
         .execute(
           HttpClientRequest.get(url).pipe(HttpClientRequest.acceptJson, HttpClientRequest.setHeaders(headers ?? {})),
         )
         .pipe(
-          Effect.catch((error) => Effect.die(new Error(`failed to fetch remote config from ${url}: ${String(error)}`))),
+          Effect.catch((error) =>
+            Effect.logWarning("failed to fetch remote config, skipping source", {
+              url,
+              reason: String(error),
+            }).pipe(Effect.as(undefined)),
+          ),
         )
+      if (response === undefined) return undefined
       const body = yield* response.text.pipe(
-        Effect.catch((error) => Effect.die(new Error(`failed to read remote config from ${url}: ${String(error)}`))),
+        Effect.catch((error) =>
+          Effect.logWarning("failed to read remote config, skipping source", {
+            url,
+            reason: String(error),
+          }).pipe(Effect.as(undefined)),
+        ),
       )
+      if (body === undefined) return undefined
       // An auth proxy can answer with an HTML login page at HTTP 200 (passes filterStatusOk); treat it as a re-auth error, not a decode failure.
       const contentType = (response.headers["content-type"] ?? "").toLowerCase()
       if (contentType.includes("html") || /^\s*<!doctype|^\s*<html/i.test(body)) {
@@ -358,6 +375,9 @@ export const layer = Layer.effect(
             const wellknownURL = `${url}/.well-known/opencode`
             yield* Effect.logDebug("fetching remote config", { url: wellknownURL })
             const wellknown = yield* fetchRemoteJson(wellknownURL, undefined, ConfigV1.WellKnown, url)
+            // Unreachable source: the warning was logged by fetchRemoteJson; skip this source entirely
+            // without merging anything so the local config stays fully usable.
+            if (wellknown === undefined) continue
             const remote = yield* Effect.promise(() =>
               substituteWellKnownRemoteConfig({
                 value: wellknown.remote_config,
@@ -370,6 +390,7 @@ export const layer = Layer.effect(
               ? yield* Effect.gen(function* () {
                   yield* Effect.logDebug("fetching remote config", { url: remote.url })
                   const data = yield* fetchRemoteJson(remote.url, remote.headers, Schema.Json, url)
+                  if (data === undefined) return {}
                   if (isRecord(data) && isRecord(data.config)) return data.config
                   if (isRecord(data)) return data
                   return yield* Effect.die(
