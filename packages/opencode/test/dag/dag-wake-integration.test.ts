@@ -778,7 +778,7 @@ describe("DagLoop atomic wake integration", () => {
           // (verdict_fail: Unresolved template placeholders). Acceptance-time
           // binding validation now rejects it before any node can spawn — the
           // "Added, then spawn-dead" silent window is gone.
-          const error = yield* dag.create({
+          const createError = yield* dag.create({
             projectID: "project-1",
             sessionID: "ses_parent",
             title: "Unresolved aggregate input",
@@ -793,9 +793,8 @@ describe("DagLoop atomic wake integration", () => {
                 },
               ],
             },
-          }).pipe(Effect.catch((cause: Error) => Effect.succeed(cause)))
-          expect(error).toBeInstanceOf(Error)
-          expect((error as Error).message).toContain('unbound variable "{{node-a}}"')
+          }).pipe(Effect.catch((cause: Error) => Effect.succeed(cause.message)))
+          expect(createError).toContain('unbound variable "{{node-a}}"')
           expect(yield* Queue.poll(childPrompts)).toEqual(Option.none())
         }),
       ),

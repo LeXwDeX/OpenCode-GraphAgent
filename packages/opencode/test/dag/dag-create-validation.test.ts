@@ -235,11 +235,10 @@ describe("Dag prompt_template binding validation", () => {
           title: "binding-extend",
           config: { name: "binding-extend", nodes: [node("explore")] },
         }).pipe(Effect.orDie)
-        const error = yield* dag.extend(dagID, [
+        const errorMessage = yield* dag.extend(dagID, [
           { ...node("repair", ["explore"]), prompt_template: { inline: "Use {{path}}" } },
-        ]).pipe(Effect.catch((e: Error) => Effect.succeed(e)))
-        expect(error).toBeInstanceOf(Error)
-        expect((error as Error).message).toContain('Replan rejected: node "repair" prompt_template references unbound variable "{{path}}"')
+        ]).pipe(Effect.catch((e: Error) => Effect.succeed(e.message)))
+        expect(errorMessage).toContain('Replan rejected: node "repair" prompt_template references unbound variable "{{path}}"')
       }).pipe(Effect.scoped, Effect.provide(dagLayer)) as Effect.Effect<never>,
     )
   })
