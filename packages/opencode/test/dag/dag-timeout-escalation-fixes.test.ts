@@ -385,9 +385,15 @@ describe("Dag timeout escalation fixes (unit)", () => {
           Effect.forkIn(scope),
         )
         // After 4 failed reads (1 + 3 retries), the watcher does NOT exit —
-        // it sleeps 5s then retries. Verify reads > 4 after enough time for
-        // at least 2 cycles, then interrupt.
-        yield* Effect.sleep("8 seconds")
+        // it sleeps 5s then retries. Wait for the 5th read via a fence rather
+        // than a fixed sleep, so the test does not race the 5s retry boundary
+        // under CI scheduling jitter (reads becomes > 4 at ~6.5s; 12s budget
+        // sits under the 15s test timeout).
+        yield* pollWithTimeout(
+          Effect.sync(() => (reads > 4 ? true : undefined)),
+          "watcher exited instead of continuing supervision after store-read retry exhaustion (R13/F1-product)",
+          "12 seconds",
+        )
         yield* Fiber.interrupt(watcher)
         expect(reads).toBeGreaterThan(4)
       }).pipe(

@@ -366,7 +366,11 @@ export const layer = Layer.effect(
               // afterIdle fiber and emit a spurious pause. Real dispatch
               // failures (provider fault, session write error) still get the
               // recoverable pause below.
-              if (Cause.interruptors(cause).size > 0) {
+              // F1: hasInterrupts is a structural check; Cause.interruptors only
+              // collects DEFINED fiber ids and silently ignores interrupts
+              // carrying none (e.g. Cause.interrupt()), which would otherwise be
+              // misclassified as a dispatch failure and spuriously paused here.
+              if (Cause.hasInterrupts(cause)) {
                 yield* Effect.logInfo("goal continuation interrupted (likely user ESC) — not pausing; shouldPreempt handles next cycle")
                 return
               }

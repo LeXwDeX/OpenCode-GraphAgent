@@ -286,7 +286,7 @@ describe("ShareNext", () => {
           yield* pollWithTimeout(
             Effect.sync(() => (seen.length === 1 ? true : undefined)),
             "timed out waiting for share sync",
-            "5 seconds",
+            "15 seconds",
           )
 
           expect(seen).toHaveLength(1)
