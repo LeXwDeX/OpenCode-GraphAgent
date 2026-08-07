@@ -64,6 +64,17 @@ export function startProgressWatchdog(timeoutMs = 120_000, pollMs = 5_000): (lab
     stderr: "inherit",
   })
   child.unref()
+  // F6: unlink the heartbeat file on exit so repeated runs do not leak temp
+  // files in tmpdir. The child exits on its own when the parent pid dies, but
+  // the heartbeat file was never cleaned up.
+  const cleanup = () => {
+    try {
+      fs.unlinkSync(heartbeat)
+    } catch {
+      // Already gone or never created.
+    }
+  }
+  process.on("exit", cleanup)
   return (label: string) => {
     try {
       fs.writeFileSync(heartbeat, label)

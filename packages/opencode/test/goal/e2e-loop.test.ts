@@ -515,9 +515,14 @@ describe("GoalLoop — continuation interrupted → no pause, goal stays active 
     messages: () => Effect.succeed([mkAssistant()]),
   } as never)
   // Continuation dispatch fails with an INTERRUPT cause — simulates user ESC
-  // mid-dispatch. catchCause sees interruptors > 0 → branch 4 (log + return).
+  // mid-dispatch. catchCause sees hasInterrupts → branch 4 (log + return). The
+  // cause is held in `interruptCause` so each instance below covers a different
+  // fiber-id shape: a DEFINED id (Cause.interrupt(0)) and Cause.interrupt()'s
+  // undefined id — the F1 miss case that Cause.interruptors silently drops and
+  // the old interruptors().size check misclassified as a dispatch failure.
+  let interruptCause: Cause.Cause<never> = Cause.interrupt(0)
   const promptInterruptMock = Layer.succeed(SessionPrompt.Service, {
-    prompt: () => Effect.failCause(Cause.interrupt(0)),
+    prompt: () => Effect.failCause(interruptCause),
   } as never)
   const providerMock = Layer.succeed(Provider.Service, {} as never)
   const judgeMock = Layer.succeed(
@@ -542,9 +547,10 @@ describe("GoalLoop — continuation interrupted → no pause, goal stays active 
   )
   const it = testEffect(branchLayer)
 
-  it.instance("continuation 被中断 → 不暂停，goal 保持 active，后续 idle 重新驱动", () =>
+  it.instance("continuation 被中断（defined fiber id）→ 不暂停，goal 保持 active，后续 idle 重新驱动", () =>
     Effect.gen(function* () {
       reset()
+      interruptCause = Cause.interrupt(0)
       const loop = yield* GoalLoop.Service
       const goal = yield* Goal.Service
       const events = yield* EventV2Bridge.Service
@@ -583,6 +589,43 @@ describe("GoalLoop — continuation interrupted → no pause, goal stays active 
         "branch 4: loop did not re-drive on second idle",
         "5 seconds",
       )
+    }),
+  )
+
+  // F1: the same interrupt contract must hold when the cause carries NO
+  // defined fiber id (Cause.interrupt() → fiberId undefined). The old
+  // interruptors().size check dropped such reasons (causeFilterInterruptors
+  // skips undefined ids), misclassifying the interrupt as a dispatch failure
+  // and spuriously pausing. hasInterrupts is structural and catches it.
+  it.instance("continuation 被中断（undefined fiber id, F1 miss case）→ 同样不暂停，goal 保持 active", () =>
+    Effect.gen(function* () {
+      reset()
+      interruptCause = Cause.interrupt()
+      const loop = yield* GoalLoop.Service
+      const goal = yield* Goal.Service
+      const events = yield* EventV2Bridge.Service
+      const seen = yield* captureEvents(events)
+      yield* loop.init()
+      const sid = SessionID.descending()
+      yield* goal.set(sid, "ship the feature", 10)
+      yield* Effect.sleep(SUBSCRIPTION_SETTLE_MS)
+
+      // idle → judge(continue) → continuation fails with an anonymous interrupt
+      // → branch 4: log + return, NO pause (the F1 fix; old code paused here).
+      yield* events.publish(SessionStatus.Event.Status, { sessionID: sid, status: { type: "idle" } })
+      yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const g = yield* goal.load(sid)
+          return Number(g?.turns_used) >= 1 ? true : undefined
+        }),
+        "branch 4 (undefined id): turns_used never advanced",
+        "5 seconds",
+      )
+
+      const afterInterrupt = yield* goal.load(sid)
+      expect(afterInterrupt?.status).toBe("active") // NOT paused
+      expect(afterInterrupt?.paused_reason).toBeUndefined()
+      expect(seen.some((e) => e.type === GoalEvent.Updated.type && e.status === "paused")).toBe(false)
     }),
   )
 })

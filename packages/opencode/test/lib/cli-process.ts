@@ -520,12 +520,20 @@ export const cliIt = {
     body: (input: CliFixture) => Effect.Effect<A, E, Scope.Scope | HttpClient.HttpClient>,
     opts?: number | TestOptions,
   ) => it.live(name, () => withCliFixture(body), opts),
+  // NOTE: despite the `.concurrent` name, these run SERIALLY on every platform.
+  // Each test spawns a real `bun run` CLI subprocess (transpile + boot + a model
+  // turn); running N of them concurrently starves the host under CI load and
+  // surfaces as pre-timeout failures that look like hangs (concurrency-amplified
+  // contention, NOT a 120s timeout). win32 was already serial for this reason;
+  // the same applies to Linux CI. The name is kept for API stability across the
+  // 11 consumer suites — if you re-enable parallelism, gate it behind a real
+  // concurrency cap, not bare test.concurrent.
   concurrent: <A, E>(
     name: string,
     body: (input: CliFixture) => Effect.Effect<A, E, Scope.Scope | HttpClient.HttpClient>,
     opts?: number | TestOptions,
   ) =>
-    (process.platform === "win32" ? test : test.concurrent)(
+    test(
       name,
       () => Effect.runPromise(Effect.scoped(withCliFixture(body))),
       opts,
