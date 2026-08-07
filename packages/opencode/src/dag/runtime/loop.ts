@@ -843,12 +843,24 @@ export const layer = Layer.effect(
                             ),
                       ),
                     )
+                    // Negative verdict: -1 (write failure, mapped above) OR -2
+                    // (Q2 delivery-gate rejection — the node is STILL RUNNING but
+                    // its escalation wake was undelivered, raced in by the watchdog
+                    // re-escalating under the workflow lock AFTER this handler's
+                    // evalLock snapshot read at getNodes). In BOTH cases no deadline
+                    // was written and the node remains running, so the old watcher
+                    // must keep supervising the elapsed deadline and re-escalating
+                    // toward the cap (N1: a running node is never left without a
+                    // watcher). Clearing the watcher here would orphan the node and
+                    // defeat the cap backstop.
                     if (written < 0) continue
                     if (written === 0) {
-                      // The status='running' guard rejected the write — the node
-                      // terminalized between the getNodes read and this update.
-                      // No deadline was written; stop the old watcher and do not
-                      // install one for a row the store refused to touch.
+                      // 0 = TERMINAL rejection: the status='running' guard rejected
+                      // the write — the node terminalized between the getNodes read
+                      // and this command. Only THIS meaning reaches the branch now
+                      // (C1 split the Q2 case into -2 above). No deadline was
+                      // written; stop the old watcher and do not install one for a
+                      // row the command refused to touch.
                       const deadWatcher = entry.watchers.get(node.id)
                       if (deadWatcher) yield* Fiber.interrupt(deadWatcher).pipe(Effect.ignore)
                       entry.watchers.delete(node.id)

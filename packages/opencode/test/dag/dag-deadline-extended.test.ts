@@ -172,7 +172,7 @@ describe("nodeExtendTimeout command-layer guard (Q3)", () => {
 
           const written = yield* dag.nodeExtendTimeout(dagID, "a", 99_999)
           // Command sync return: 1 = success (guard 前移, 错误即状态 — the
-          // orchestrator observes 0/1 directly, not via the publish chain).
+          // orchestrator observes 1/0/-2 directly, not via the publish chain).
           expect(written).toBe(1)
 
           // The extension is a durable event now, not a direct write.
@@ -218,7 +218,7 @@ describe("nodeExtendTimeout command-layer guard (Q3)", () => {
     )
   })
 
-  it("Q2 delivery gate rejection is NOT an event: returns 0 when the escalation wake is undelivered", async () => {
+  it("Q2 delivery gate rejection is NOT an event: returns -2 (NOT 0 — the node is still running) when the escalation wake is undelivered", async () => {
     await Effect.runPromise(
       runTest(({ dag, store, db }) =>
         Effect.gen(function* () {
@@ -232,9 +232,13 @@ describe("nodeExtendTimeout command-layer guard (Q3)", () => {
           expect(undelivered?.wakeReported).toBe(false)
 
           // Defense-in-depth: the command refuses to re-time an escalation the
-          // main agent has not seen (primary gate is loop.ts:800).
+          // main agent has not seen (primary gate is loop.ts:800). C1: the
+          // rejection returns -2, NOT 0 — the node is STILL running, so the
+          // caller must keep its watcher (N1). Returning 0 here made the
+          // handler kill the watcher on a running node under the T8↔T9
+          // interleave.
           const written = yield* dag.nodeExtendTimeout(dagID, "a", 99_999)
-          expect(written).toBe(0)
+          expect(written).toBe(-2)
 
           const eventCount = yield* deadlineExtendedCount(db, dagID, "a")
           expect(eventCount).toBe(0)

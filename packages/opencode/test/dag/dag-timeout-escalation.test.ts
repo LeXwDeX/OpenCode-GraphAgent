@@ -1136,4 +1136,190 @@ describe("DagLoop timeout escalation", () => {
       ),
     )
   }, 30_000)
+
+  // C1 (final-review 裁定): nodeExtendTimeout had two `return 0` paths — a
+  // terminal rejection (node not running) and a Q2 delivery-gate rejection
+  // (node STILL running, escalationPending ∧ ¬wakeReported). The handler
+  // killed the watcher on every written===0, so under the T8↔T9 interleave
+  // (getNodes reads under evalLock, nodeExtendTimeout re-reads under
+  // workflowLock — the two locks are not synchronized) a Q2 reject orphaned
+  // a running node (N1 violation: a running node left with no watcher, cap
+  // backstop defeated). The fix splits the contract: Q2 returns -2, terminal
+  // keeps 0; the handler's existing `written < 0 → continue` then keeps the
+  // watcher for -2 (and -1 write-fail) while `written === 0` stays the
+  // terminal-cleanup path.
+  it("C1: nodeExtendTimeout distinguishes Q2 rejection (-2) from terminal rejection (0) — three-valued contract", async () => {
+    await Effect.runPromise(
+      runLoopTest(({ dag, store, childPrompts, parentPrompts }) =>
+        Effect.gen(function* () {
+          const dagID = yield* dag.create({
+            projectID: "project-1",
+            sessionID: "ses_parent",
+            title: "C1 three-valued contract",
+            config: { name: "c1-contract", nodes: [node("a", [], 300)] },
+          })
+          const gate = yield* takeWithin(childPrompts, "a did not start")
+
+          // Escalation fires; the wake is held UNDELIVERED so the node sits at
+          // the Q2 state [escalationPending ∧ ¬wakeReported ∧ running].
+          const escalated = yield* pollWithTimeout(
+            store.getNode(dagID, "a").pipe(
+              Effect.map((current) =>
+                current?.timeoutExtensions === 1 && current.escalationPending && !current.wakeReported
+                  ? current
+                  : undefined,
+              ),
+            ),
+            "escalation did not reach the Q2 state",
+          )
+          const frozenDeadline = escalated.deadlineMs
+          const farFuture = (escalated.deadlineMs ?? 0) + 99_999_999
+
+          // The command must DISTINGUISH the two rejection reasons: Q2 returns
+          // -2, NOT 0. Returning 0 made the handler kill the watcher on a
+          // still-running node. No deadline is written on either reject.
+          const q2Verdict = yield* dag.nodeExtendTimeout(dagID, "a", farFuture)
+          expect(q2Verdict).toBe(-2)
+          const afterQ2 = yield* store.getNode(dagID, "a")
+          expect(afterQ2?.status).toBe("running")
+          expect(afterQ2?.deadlineMs).toBe(frozenDeadline)
+
+          // Deliver the wake and let the child finish — the node terminalizes.
+          const wake = yield* takeWithin(parentPrompts, "escalation wake did not reach the parent")
+          yield* Deferred.succeed(wake.release, "success")
+          yield* Deferred.succeed(gate.release, "done")
+          yield* pollWithTimeout(
+            store.getNode(dagID, "a").pipe(
+              Effect.map((current) => (current?.status === "completed" ? current : undefined)),
+            ),
+            "node did not complete",
+          )
+
+          // Terminal rejection stays 0 — the node is no longer running. The
+          // handler's 0-branch (clear the stale watcher) is correct for THIS
+          // value alone now that Q2 no longer collides into it.
+          const terminalVerdict = yield* dag.nodeExtendTimeout(dagID, "a", farFuture)
+          expect(terminalVerdict).toBe(0)
+        }),
+      ),
+    )
+  })
+
+  it("C1: a Q2 rejection (-2) keeps the node supervised — the watcher re-escalates (N1)", async () => {
+    let extendCalls = 0
+    await Effect.runPromise(
+      runLoopTest(({ dag, store, childPrompts, parentPrompts }) =>
+        Effect.gen(function* () {
+          const dagID = yield* dag.create({
+            projectID: "project-1",
+            sessionID: "ses_parent",
+            title: "C1 Q2 reject keeps supervision",
+            config: { name: "c1-q2-keep", nodes: [node("a", [], 300)] },
+          })
+          yield* takeWithin(childPrompts, "a did not start")
+
+          // Escalate, then DELIVER the wake so the re-time gate PROCEEDS (the
+          // gate skips only while the wake is undelivered). This reaches
+          // nodeExtendTimeout — the mock returns -2, simulating the T8
+          // interleave (watchdog re-escalated under the workflow lock AFTER
+          // the gate's evalLock snapshot read, flipping wakeReported false).
+          yield* pollWithTimeout(
+            store.getNode(dagID, "a").pipe(
+              Effect.map((c) => (c?.timeoutExtensions === 1 ? c : undefined)),
+            ),
+            "first escalation did not fire",
+          )
+          const wake = yield* takeWithin(parentPrompts, "escalation wake did not reach the parent")
+          yield* Deferred.succeed(wake.release, "success")
+          yield* pollWithTimeout(
+            store.getNode(dagID, "a").pipe(
+              Effect.map((c) => (c?.wakeReported === true ? c : undefined)),
+            ),
+            "wake_reported was not persisted after delivery",
+          )
+
+          yield* dag.replan(dagID, { nodes: [{ ...node("a", [], 2000) }] })
+          yield* pollWithTimeout(
+            Effect.sync(() => (extendCalls > 0 ? true : undefined)),
+            "replan never attempted nodeExtendTimeout",
+          )
+
+          // N1: the -2 verdict kept the watcher alive. The mock wrote nothing,
+          // so the self-renewing watcher re-escalates the elapsed deadline —
+          // count climbs 1→2. Under the bug (Q2 returned 0) the handler killed
+          // the watcher here and the count froze, orphaning the running node.
+          const second = yield* pollWithTimeout(
+            store.getNode(dagID, "a").pipe(
+              Effect.map((c) => (c?.timeoutExtensions === 2 && c.status === "running" ? c : undefined)),
+            ),
+            "watcher was killed on the Q2 reject — node escaped supervision (N1 violation)",
+          )
+          expect(second.status).toBe("running")
+          const secondWake = yield* takeWithin(parentPrompts, "second wake did not reach the parent")
+          yield* Deferred.succeed(secondWake.release, "success")
+        }),
+        {
+          nodeExtendTimeout: () => Effect.sync(() => { extendCalls++ }).pipe(Effect.as(-2)),
+        },
+      ),
+    )
+  })
+
+  it("C1: a terminal rejection (0) clears the stale watcher — the node stops escalating", async () => {
+    let extendCalls = 0
+    await Effect.runPromise(
+      runLoopTest(({ dag, store, childPrompts, parentPrompts }) =>
+        Effect.gen(function* () {
+          const dagID = yield* dag.create({
+            projectID: "project-1",
+            sessionID: "ses_parent",
+            title: "C1 terminal reject clears watcher",
+            config: { name: "c1-terminal-clear", nodes: [node("a", [], 300)] },
+          })
+          yield* takeWithin(childPrompts, "a did not start")
+
+          // Escalate (count 0→1) and deliver the wake so the re-time gate
+          // proceeds. The mock returns 0 — simulating nodeExtendTimeout's
+          // terminal rejection. The handler must clear the stale watcher.
+          yield* pollWithTimeout(
+            store.getNode(dagID, "a").pipe(
+              Effect.map((c) => (c?.timeoutExtensions === 1 ? c : undefined)),
+            ),
+            "first escalation did not fire",
+          )
+          const wake = yield* takeWithin(parentPrompts, "escalation wake did not reach the parent")
+          yield* Deferred.succeed(wake.release, "success")
+          yield* pollWithTimeout(
+            store.getNode(dagID, "a").pipe(
+              Effect.map((c) => (c?.wakeReported === true ? c : undefined)),
+            ),
+            "wake_reported was not persisted after delivery",
+          )
+
+          yield* dag.replan(dagID, { nodes: [{ ...node("a", [], 2000) }] })
+          yield* pollWithTimeout(
+            Effect.sync(() => (extendCalls > 0 ? true : undefined)),
+            "replan never attempted nodeExtendTimeout",
+          )
+
+          // The 0-verdict cleared the watcher. The count captured after the
+          // handler ran must FREEZE: a live self-renewing watcher escalates
+          // every ~1s (escalateIntervalMs) on the elapsed deadline, so holding
+          // past two escalate intervals with no climb is positive evidence the
+          // watcher is gone. The contrast with the 0→1 climb above (and with
+          // the -2 test where the count keeps climbing) makes the absence
+          // legible. The sleep IS the assertion (non-escalation), not a sync
+          // hack — a live watcher would deterministically escalate within it.
+          const frozen = (yield* store.getNode(dagID, "a"))!.timeoutExtensions
+          yield* Effect.sleep("2 seconds")
+          const after = yield* store.getNode(dagID, "a")
+          expect(after?.status).toBe("running")
+          expect(after?.timeoutExtensions).toBe(frozen)
+        }),
+        {
+          nodeExtendTimeout: () => Effect.sync(() => { extendCalls++ }).pipe(Effect.as(0)),
+        },
+      ),
+    )
+  })
 })

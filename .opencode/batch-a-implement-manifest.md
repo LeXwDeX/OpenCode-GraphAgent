@@ -48,3 +48,10 @@ audit-module-wave（模块波本地审查，PASS|LOOP|BLOCKED）→ wire-modules
 
 ## 审查门禁义务
 arbitrate-final-review 必须审计本 manifest：每个 prune 有 prune_reason + replacement_coverage，缺任一禁止 PASS（fail-closed）。
+
+## 续作记录（Continuation）
+原图 dag_024a09546ffevmMvS3M6v0I1Av 于 audit PASS、wire-modules 提交 17f10f0ce 之后 terminal failed——两个 spawn 期配置错误：impl-q3（{{freeze-contract}} 非直接依赖，已由 impl-q3b 替换并完成）与 verify-wired-system（replan 片段遗漏 input: repo）。
+终态不可逆 → 按续作合约起新图 batch-a-continue：
+- reused_nodes：freeze-contract、impl-q1/q2/q3b/s5/flaky-stdout/flaky-ws/flaky-share/sdk、audit-module-wave（PASS）、wire-modules（提交 17f10f0ce）——全部完成且经审计，不重跑
+- 续跑尾部：verify-wired（修复 input 绑定）→ simulate-wired + 三路 review → arbitrate-final → finalize
+- 尾部节点一律从真实仓库状态（git show HEAD + 票据 + grill 文档）取证，不注入可能为空的旧输出（fail-closed）

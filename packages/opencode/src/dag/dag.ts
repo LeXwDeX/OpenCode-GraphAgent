@@ -867,14 +867,24 @@ export const layer = Layer.effect(
     // worker_config.timeout_ms recomputes the absolute deadline and records it
     // as a durable event — the direct-write path (store.updateNodeDeadline) is
     // abolished so the deadline survives replay. The guard runs HERE, in the
-    // command layer, holding the workflow lock and BEFORE publish: a rejection
-    // returns 0 synchronously (error = state — the orchestrator observes 0/1
-    // directly, NOT via the publish chain, whose projector return value is
+    // command layer, holding the workflow lock and BEFORE publish. The return
+    // is a synchronous state verdict (error = state — the orchestrator observes
+    // it directly, NOT via the publish chain, whose projector return value is
     // discarded). NodeDeadlineExtended is only appended on success, so it is the
-    // success log; the projector does a pure idempotent fold. The 0/1 contract
-    // is identical to the old row-count return, so the single caller
-    // (loop.ts:827) needs no change. The only typed-error channel beyond the
-    // explicit 0/1 is withWorkflowLock (getNode/publish orDie their work).
+    // success log; the projector does a pure idempotent fold. The contract is
+    // THREE-VALUED so the two rejection reasons stay distinguishable (C1):
+    //   1  = success (deadline written, NodeDeadlineExtended appended)
+    //   0  = TERMINAL rejection (node not running / missing — caller drops the
+    //        stale watcher; the node is done)
+    //  -2  = Q2 delivery-gate rejection (node STILL running but its escalation
+    //        wake is undelivered — caller MUST keep supervision; killing the
+    //        watcher here would orphan a running node and defeat the cap
+    //        backstop, violating N1)
+    // The single caller (loop.ts WorkflowReplanned handler) branches on this:
+    // < 0 keeps the watcher (covers -2 here and -1 write-failure mapped by the
+    // caller's catchCause), === 0 clears it. The only typed-error channel
+    // beyond this explicit 1/0/-2 is withWorkflowLock (getNode/publish orDie
+    // their work).
     const nodeExtendTimeout = Effect.fn("Dag.nodeExtendTimeout")(function* (lock: WorkflowLock, dagID: string, nodeID: string, newDeadlineMs: number) {
       const node = yield* store.getNode(dagID, nodeID).pipe(Effect.orDie)
       // running-guard: a node that terminalized between the caller's read and
@@ -883,7 +893,9 @@ export const layer = Layer.effect(
       // Q2 delivery gate (ADR-0002): never re-time an escalation the main agent
       // has not seen. Defense in depth — the primary gate is loop.ts:800, but
       // the command stays self-protecting so a future caller cannot bypass it.
-      if (node.escalationPending && !node.wakeReported) return 0
+      // Returns -2 (NOT 0): the node is still running, so the caller must keep
+      // its watcher (N1). See the three-valued contract above.
+      if (node.escalationPending && !node.wakeReported) return -2
       yield* events.publish(DagEvent.NodeDeadlineExtended, {
         dagID: dagID as ID,
         nodeID: nodeID as never,
