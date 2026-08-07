@@ -786,18 +786,37 @@ export const layer = Layer.effect(
                     // matches here with its OLD timeout.
                     if (fragTimeoutMs == null || fragTimeoutMs === oldTimeoutMs) continue
                     const now = yield* Clock.currentTimeMillis
-                    // Cap gate (A1): a changed timeout alone must not move a
-                    // healthy deadline forward. An agent replanning BEFORE each
-                    // deadline with cycling values (10m→20m→10m…) would push the
-                    // deadline away forever without a single escalation firing,
-                    // so the extension count never climbs and the ≈21× cap is
-                    // bypassed. Re-time only when the current deadline already
-                    // elapsed or an escalation awaits adjudication; a gated-off
-                    // node keeps its deadline and the self-renewing watcher
-                    // escalates it the moment it passes. A null deadline is
-                    // treated as elapsed — re-timing is what re-establishes
-                    // supervision.
-                    if (!node.escalationPending && node.deadlineMs != null && node.deadlineMs > now) continue
+                    // Cap gate (A1) + delivery gate (Q2): both are SKIP
+                    // conjuncts on the single re-time path (this handler is the
+                    // only caller of nodeExtendTimeout; the watchdog never
+                    // re-times — it only proposes escalations).
+                    //   A1: a changed timeout alone must not move a healthy
+                    //   deadline forward. An agent replanning BEFORE each
+                    //   deadline with cycling values (10m→20m→10m…) would push
+                    //   the deadline away forever without a single escalation
+                    //   firing, so the extension count never climbs and the
+                    //   ≈21× cap is bypassed. Re-time only when the current
+                    //   deadline already elapsed or an escalation awaits
+                    //   adjudication; a gated-off node keeps its deadline and
+                    //   the self-renewing watcher escalates it the moment it
+                    //   passes. A null deadline is treated as elapsed —
+                    //   re-timing is what re-establishes supervision.
+                    //   Q2: an escalated node whose wake has NOT been delivered
+                    //   (escalationPending ∧ ¬wakeReported) is skipped too.
+                    //   Adjudication must follow delivery — otherwise the
+                    //   re-time below would call nodeExtendTimeout, which clears
+                    //   escalation_pending and marks wake_reported, silently
+                    //   adjudicating an escalation the main agent never saw
+                    //   (D2). The node keeps its elapsed deadline and the
+                    //   self-renewing watcher re-escalates toward the cap; the
+                    //   wake is delivered normally. This is a SKIP conjunct, not
+                    //   a pass-through disjunct — the disjunct form is swamped
+                    //   by the deadlineElapsed case on the public path and is a
+                    //   no-op there (cons-F1).
+                    if (
+                      (!node.escalationPending && node.deadlineMs != null && node.deadlineMs > now)
+                      || (node.escalationPending && !node.wakeReported)
+                    ) continue
                     // N1: write the new deadline FIRST. nodeExtendTimeout
                     // acquires the workflow lock and can fail or block; if the
                     // write never lands, the old watcher must keep supervising

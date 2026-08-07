@@ -1002,4 +1002,138 @@ describe("DagLoop timeout escalation", () => {
       ),
     )
   })
+
+  // Q2 delivery-gated re-time (ADR-0002). re-time is a single path — this
+  // WorkflowReplanned handler is the only caller of nodeExtendTimeout, and the
+  // watchdog never re-times (it only proposes nodeTimeoutEscalated /
+  // nodeFailed). The gate at loop.ts:800 decides skip vs proceed for every
+  // re-time. Enumerated trigger paths reaching the gate with a NEW timeout_ms:
+  //   P1 ¬escalationPending ∧ deadline>now          → A1 skip (cap)          [covered by the A1 tests above]
+  //   P2 ¬escalationPending ∧ deadline≤now / null   → proceed                [A1 complement; deadline-driven re-time]
+  //   P3  escalationPending ∧ ¬wakeReported         → Q2 skip (NEW)          [public path — test below]
+  //   P4  escalationPending ∧ ¬wakeReported ∧ dl>now → Q2 skip (same conjunct; unreachable via the state machine: escalate never moves the deadline, so an escalated node always has deadline≤now)
+  //   P5  escalationPending ∧ wakeReported          → proceed                [recovery — test below + L880/L567]
+  it("blocks re-time while the escalation wake is undelivered (Q2: escalationPending ∧ ¬wakeReported ⇒ skip)", async () => {
+    await Effect.runPromise(
+      runLoopTest(({ dag, store, childPrompts, parentPrompts }) =>
+        Effect.gen(function* () {
+          const dagID = yield* dag.create({
+            projectID: "project-1",
+            sessionID: "ses_parent",
+            title: "Q2 delivery gate",
+            config: { name: "q2-delivery-gate", nodes: [node("a", [], 300)] },
+          })
+          yield* takeWithin(childPrompts, "a did not start")
+
+          // Acceptance #2: the deadline-driven INITIAL escalation (watchdog →
+          // nodeTimeoutEscalated → first wake) is NOT touched by the gate —
+          // the gate only governs the replan re-time path. It fires and its
+          // wake reaches the parent.
+          const escalated = yield* pollWithTimeout(
+            store.getNode(dagID, "a").pipe(
+              Effect.map((current) => current?.timeoutExtensions === 1 ? current : undefined),
+            ),
+            "initial escalation did not fire",
+          )
+          expect(escalated.status).toBe("running")
+          expect(escalated.escalationPending).toBe(true)
+          const baselineDeadline = escalated.deadlineMs
+          const timeoutWake = yield* takeWithin(parentPrompts, "initial escalation wake did not reach the parent")
+          expect(timeoutWake.text).toContain("[DAG Node Timeout]")
+
+          // Hold the wake UNDELIVERED: the harness blocks delivery on the
+          // release Deferred, and the loop persists wake_reported=true only
+          // AFTER successful delivery (loop.ts:1125). The node sits at the
+          // public-path state [escalationPending ∧ ¬wakeReported ∧ deadline≤now].
+          const undelivered = yield* store.getNode(dagID, "a")
+          expect(undelivered?.escalationPending).toBe(true)
+          expect(undelivered?.wakeReported).toBe(false)
+
+          // Main agent replans with a NEW timeout. Q2 must SKIP the re-time:
+          // adjudication cannot land before the escalation wake was delivered.
+          yield* dag.replan(dagID, { nodes: [{ ...node("a", [], 5000) }] })
+
+          // Positive discriminator (matches the L546 idiom): under Q2 the
+          // re-time was skipped, so the deadline stays frozen and the
+          // self-renewing watcher RE-ESCALATES there (count 1→2 with
+          // deadlineMs unchanged). Under the bug the re-time fired
+          // nodeExtendTimeout, moving the deadline to now+5000 (future), so
+          // the watcher sleeps and the count never climbs within this window.
+          // This also proves the watchdog is a pure PROPOSER: its escalation
+          // drove the count up WITHOUT moving the deadline — only a re-time
+          // (main-agent-initiated) moves it, and that path was gated.
+          const reEscalated = yield* pollWithTimeout(
+            store.getNode(dagID, "a").pipe(
+              Effect.map((current) =>
+                current?.timeoutExtensions === 2 && current?.deadlineMs === baselineDeadline
+                  ? current
+                  : undefined,
+              ),
+            ),
+            "re-time fired while the escalation wake was still undelivered — the deadline moved instead of staying frozen for re-escalation (Q2 delivery gate absent)",
+            "3 seconds",
+          )
+          expect(reEscalated.escalationPending).toBe(true)
+          expect(reEscalated.wakeReported).toBe(false)
+          expect(reEscalated.deadlineMs).toBe(baselineDeadline)
+
+          // Release the held wake so the loop marks delivery before teardown.
+          yield* Deferred.succeed(timeoutWake.release, "success")
+        }),
+      ),
+    )
+  }, 30_000)
+
+  it("admits re-time once the escalation wake is delivered (Q2 recovery: escalationPending ∧ wakeReported ⇒ proceed)", async () => {
+    await Effect.runPromise(
+      runLoopTest(({ dag, store, childPrompts, parentPrompts }) =>
+        Effect.gen(function* () {
+          // P5. A long timeout gives a wide re-escalation interval so the
+          // delivered (wakeReported=true) state is observable before the
+          // watchdog re-arms it.
+          const dagID = yield* dag.create({
+            projectID: "project-1",
+            sessionID: "ses_parent",
+            title: "Q2 recovery after delivery",
+            config: { name: "q2-recovery", nodes: [node("a", [], 5000)] },
+          })
+          yield* takeWithin(childPrompts, "a did not start")
+          const escalated = yield* pollWithTimeout(
+            store.getNode(dagID, "a").pipe(
+              Effect.map((current) => current?.timeoutExtensions === 1 ? current : undefined),
+            ),
+            "escalation did not fire",
+            "15 seconds",
+          )
+          const baselineDeadline = escalated.deadlineMs
+          const wake = yield* takeWithin(parentPrompts, "escalation wake did not reach the parent")
+          yield* Deferred.succeed(wake.release, "success")
+
+          // Delivery persisted — this is the state Q2 requires before re-time
+          // may proceed.
+          const delivered = yield* pollWithTimeout(
+            store.getNode(dagID, "a").pipe(
+              Effect.map((current) => current?.wakeReported === true ? current : undefined),
+            ),
+            "wake_reported was not persisted after delivery",
+          )
+          expect(delivered.escalationPending).toBe(true)
+
+          // Replan with a NEW timeout: Q2 no longer skips (wakeReported=true)
+          // and the re-time recovers — the deadline moves past the frozen
+          // baseline, adjudicating a wake the agent actually saw.
+          yield* dag.replan(dagID, { nodes: [{ ...node("a", [], 15000) }] })
+          const extended = yield* pollWithTimeout(
+            store.getNode(dagID, "a").pipe(
+              Effect.map((current) =>
+                current?.deadlineMs != null && current.deadlineMs > (baselineDeadline ?? 0) ? current : undefined,
+              ),
+            ),
+            "re-time did not recover after the escalation wake was delivered (Q2 over-gated)",
+          )
+          expect(extended.status).toBe("running")
+        }),
+      ),
+    )
+  }, 30_000)
 })
