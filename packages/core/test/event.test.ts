@@ -242,7 +242,7 @@ describe("EventV2", () => {
     }),
   )
 
-  it.effect("runs listeners inline after projectors", () =>
+  it.effect("runs listeners after projectors", () =>
     Effect.gen(function* () {
       const events = yield* EventV2.Service
       const received = new Array<string>()
@@ -285,32 +285,61 @@ describe("EventV2", () => {
     }),
   )
 
-  it.effect("preserves observer interruption", () =>
+  it.effect("keeps the publish path uninterrupted by an interrupting listener", () =>
     Effect.gen(function* () {
       const events = yield* EventV2.Service
       const { db } = yield* Database.Service
       yield* events.listen(() => Effect.interrupt)
 
-      const exit = yield* events.publish(SyncMessage, { id: "interrupted", text: "hello" }).pipe(Effect.exit)
+      const event = yield* events.publish(SyncMessage, { id: "interrupted", text: "hello" })
       const committed = yield* db
-        .select({ id: EventTable.id })
+        .select({ id: EventTable.id, seq: EventTable.seq })
         .from(EventTable)
         .where(eq(EventTable.aggregate_id, "interrupted"))
         .get()
         .pipe(Effect.orDie)
 
-      expect(Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause)).toBeTrue()
-      expect(committed).toBeDefined()
+      expect(event.durable?.seq).toBe(0)
+      expect(committed).toEqual({ id: event.id, seq: 0 })
     }),
   )
 
-  it.effect("keeps live-only listener defects fail-fast", () =>
+  it.effect("isolates live-only listener defects", () =>
     Effect.gen(function* () {
       const events = yield* EventV2.Service
       const defect = new Error("listener defect")
       yield* events.listen(() => Effect.die(defect))
 
-      expect(yield* events.publish(Message, { text: "hello" }).pipe(Effect.catchDefect(Effect.succeed))).toBe(defect)
+      expect(yield* events.publish(Message, { text: "hello" }).pipe(Effect.isSuccess)).toBeTrue()
+    }),
+  )
+
+  it.effect("isolates listener defects and preserves pubsub order across events", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const received = new Array<string>()
+      const fiber = yield* events.all().pipe(
+        Stream.take(2),
+        Stream.runForEach((event) => Effect.sync(() => received.push((event.data as { text: string }).text))),
+        Effect.forkScoped,
+      )
+      yield* Effect.yieldNow
+      yield* events.listen(() => Effect.die(new Error("listener defect")))
+      yield* events.listen((event) =>
+        Effect.sync(() => received.push(`L:${(event.data as { text: string }).text}`)),
+      )
+
+      yield* events.publish(Message, { text: "one" })
+      yield* events.publish(Message, { text: "two" })
+      yield* Fiber.join(fiber)
+
+      // The dying listener neither blocks the publish nor stops the other
+      // listener. Cross-event listener ordering is NOT guaranteed (each
+      // event's fan-out runs on its own fiber), so only assert what the
+      // contract guarantees: synchronous pubsub FIFO order and per-listener
+      // isolation. See the fan-out contract comment in event.ts `notify`.
+      expect(received.filter((value) => !value.startsWith("L:"))).toEqual(["one", "two"])
+      expect(received.filter((value) => value.startsWith("L:")).sort()).toEqual(["L:one", "L:two"])
     }),
   )
 

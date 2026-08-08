@@ -18,6 +18,10 @@ export const WorkflowSummary = Schema.Struct({
   // finish with a "3/9" denominator lie. queued surfaces true concurrency.
   skippedNodes: Schema.Number,
   queuedNodes: Schema.Number,
+  // F10: running nodes with a not-yet-adjudicated timeout escalation
+  // (escalation_pending) — lets the TUI distinguish normal RUNNING from
+  // timeout-pending. Already-adjudicated (extended) nodes are excluded.
+  escalatedNodes: Schema.Number,
 }).annotate({ identifier: "DagWorkflowSummary" })
 export type WorkflowSummary = typeof WorkflowSummary.Type
 

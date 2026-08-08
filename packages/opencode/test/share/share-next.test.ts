@@ -243,8 +243,11 @@ describe("ShareNext", () => {
           const session = yield* Session.Service
 
           const info = yield* session.create({ title: "first" })
+          // No readiness sleep: init() registers the Diff subscribers
+          // synchronously (core EventV2 `listen` is an Effect.sync push), so
+          // they are live before init() returns. The pollWithTimeout below
+          // covers the source-side 1s coalesce debounce.
           yield* share.init()
-          yield* Effect.sleep(50)
           const { db } = yield* Database.Service
           yield* db
             .insert(SessionShareTable)
@@ -286,7 +289,6 @@ describe("ShareNext", () => {
           yield* pollWithTimeout(
             Effect.sync(() => (seen.length === 1 ? true : undefined)),
             "timed out waiting for share sync",
-            "5 seconds",
           )
 
           expect(seen).toHaveLength(1)

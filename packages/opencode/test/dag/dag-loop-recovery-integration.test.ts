@@ -244,6 +244,19 @@ describe("DagLoop crash recovery integration", () => {
           const dagID = yield* createRunningNode(dag, database, [node()], Date.now() - 1)
 
           yield* loop.init()
+          // Listener fan-out is async-ordered relative to publish (never rely
+          // on it having run by the time init returns) — wait for the durable
+          // failure to surface before unsubscribing.
+          yield* pollWithTimeout(
+            Effect.sync(() =>
+              failures.some(
+                (f) => f.reason === "deadline exceeded on recovery" && f.trigger === "timeout",
+              )
+                ? failures
+                : undefined,
+            ),
+            "NodeFailed recovery timeout was not observed",
+          )
           yield* unsubscribe
 
           expect(cancelled).toEqual(["ses_child1"])

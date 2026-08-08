@@ -20,6 +20,8 @@ export function makeNodeRow(overrides: Partial<DagStore.NodeRow> = {}): DagStore
     wakeEligible: false,
     wakeReported: false,
     replanAttempts: 0,
+    timeoutExtensions: 0,
+    escalationPending: false,
     seq: 0,
     startedAt: null,
     completedAt: null,

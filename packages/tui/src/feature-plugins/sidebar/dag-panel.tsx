@@ -4,7 +4,7 @@ import type { DagNode, DagWorkflowSummary } from "@opencode-ai/sdk/v2"
 import type { BuiltinTuiPlugin } from "../builtins"
 import { createEffect, createMemo, createSignal, For, Show } from "solid-js"
 import { Spinner } from "../../component/spinner"
-import { computeWaves, dagNodeGlyph, dagStatusColor, formatDagProgress } from "../system/dag-inspector-utils"
+import { computeWaves, dagEscalationLabel, dagNodeGlyph, dagStatusColor, formatDagProgress } from "../system/dag-inspector-utils"
 
 const id = "internal:sidebar-dag-panel"
 
@@ -69,7 +69,8 @@ function WorkflowRow(props: {
             ({formatDagProgress(props.summary)}
             {running() > 0 ? `, ${running()} running` : ""}
             {queued() > 0 ? `, ${queued()} queued` : ""}
-            {failed() > 0 ? `, ${failed()} failed` : ""})
+            {failed() > 0 ? `, ${failed()} failed` : ""}
+            {dagEscalationLabel(props.summary) ? `, ${dagEscalationLabel(props.summary)}` : ""})
           </span>
         </text>
       </box>

@@ -54,6 +54,7 @@ export class HttpOptions extends Schema.Class<HttpOptions>("LLM.HttpOptions")({
   body: Schema.optional(JsonSchema),
   headers: Schema.optional(Schema.Record(Schema.String, Schema.String)),
   query: Schema.optional(Schema.Record(Schema.String, Schema.String)),
+  timeout: Schema.optional(Schema.DurationFromMillis),
 }) {}
 
 export namespace HttpOptions {
@@ -67,8 +68,9 @@ export const mergeHttpOptions = (...items: ReadonlyArray<HttpOptions | undefined
   const body = mergeJsonRecords(...items.map((item) => item?.body))
   const headers = mergeStringRecords(...items.map((item) => item?.headers))
   const query = mergeStringRecords(...items.map((item) => item?.query))
-  if (!body && !headers && !query) return undefined
-  return new HttpOptions({ body, headers, query })
+  const timeout = items.findLast((item) => item?.timeout !== undefined)?.timeout
+  if (!body && !headers && !query && timeout === undefined) return undefined
+  return new HttpOptions({ body, headers, query, ...(timeout === undefined ? {} : { timeout }) })
 }
 
 export class GenerationOptions extends Schema.Class<GenerationOptions>("LLM.GenerationOptions")({

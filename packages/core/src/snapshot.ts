@@ -240,6 +240,22 @@ export const noopLayer = Layer.succeed(
   }),
 )
 
+/**
+ * Hot-path snapshot dedupe: run the capture, but reuse the previous tree ID
+ * when the fresh capture returns the same content-addressed tree, so identical
+ * consecutive states never produce a new snapshot identity and callers can
+ * skip the downstream diff computation for unchanged trees.
+ */
+export const captureDeduped = (
+  state: { last: ID | undefined },
+  capture: () => Effect.Effect<ID | undefined>,
+): Effect.Effect<ID | undefined> =>
+  Effect.map(capture(), (id) => {
+    if (id === undefined || id === state.last) return state.last
+    state.last = id
+    return id
+  })
+
 function failure(operation: Error["operation"], cause: unknown) {
   if (cause instanceof Error && cause.operation === operation) return cause
   return new Error({

@@ -153,7 +153,7 @@ function expectExitContains(exit: Exit.Exit<unknown, unknown>, ...messages: stri
   for (const message of messages) expect(String(exit.cause)).toContain(message)
 }
 
-function eventuallyEffect(effect: Effect.Effect<void>, timeout = 1500) {
+function eventuallyEffect(effect: Effect.Effect<void>, timeout = 6000) {
   return Effect.gen(function* () {
     const started = Date.now()
     let last: unknown

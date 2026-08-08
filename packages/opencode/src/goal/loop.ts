@@ -184,54 +184,61 @@ export const layer = Layer.effect(
 
       const msgs = yield* sessions.messages({ sessionID, limit: 20 })
       const lastAssistant = [...msgs].reverse().find((m) => m.info.role === "assistant")
-      if (!lastAssistant) return
+      if (!lastAssistant) {
+        // No assistant message in the last 20 — the conversation may have
+        // been compacted or the initial kick failed after the stale-zombie
+        // guard window. Pause visibly instead of silently stalling.
+        const pauseMsg = "近期消息中无 assistant 回复，目标已暂停。使用 /goal resume 重试。"
+        yield* goal.pauseAndPublish(sessionID, pauseMsg).pipe(Effect.ignore)
+        yield* promptSvc.prompt({ sessionID, noReply: true, parts: [{ type: "text", text: `⏸ 目标已暂停 — ${pauseMsg}` }] }).pipe(Effect.ignore)
+        return
+      }
       const responseText = lastAssistant.parts
         .filter((p): p is Extract<(typeof lastAssistant.parts)[number], { type: "text" }> => p.type === "text")
         .map((p) => p.text)
         .join("\n")
         .slice(-4000)
-      if (!responseText) return
-
-      // Judge LLM call: prefer the test-injected callable so e2e tests
-      // can script verdicts without Provider/network; otherwise build the
-      // production Provider → generateText path. The verdict logic below is
-      // unchanged — only the callLLM construction point moved.
-      const injected = Option.getOrUndefined(yield* Effect.serviceOption(GoalLoopJudgeLLM))
-      const callLLM: JudgeCallLLM =
-        injected?.call ??
-        ((opts) =>
-          Effect.gen(function* () {
-            const defaultM = yield* provider.defaultModel()
-            // Judge is a ~200-token JSON binary classification — prefer the
-            // provider's small/fast model (config `small_model`, plugin hint,
-            // or the built-in haiku/flash/nano priority list). Fall back to
-            // the default model when no small model is resolvable, keeping
-            // the prior behavior byte-for-byte for those providers.
-            const small = yield* provider.getSmallModel(defaultM.providerID)
-            const model = small ?? (yield* provider.getModel(defaultM.providerID, defaultM.modelID))
-            const language = yield* provider.getLanguage(model)
-            const result = yield* Effect.tryPromise({
-              try: (signal) =>
-                generateText({
-                  model: language,
-                  system: opts.system,
-                  prompt: opts.user,
-                  temperature: opts.temperature,
-                  maxOutputTokens: opts.maxTokens,
-                  abortSignal: signal,
-                }),
-              catch: (e) => new Error(`judge LLM call failed: ${String(e)}`),
-            }).pipe(Effect.timeout(`${opts.timeout} seconds`))
-            if (!result) return ""
-            return result.text
-          }))
-
-      const verdict = yield* GoalJudge.run(
-        goalState.goal,
-        responseText,
-        goalState.subgoals ?? [],
-        callLLM,
-      )
+      // When the last assistant turn produced no text (pure tool calls,
+      // reasoning-only, or a submit_result with no prose), the goal should
+      // NOT silently stall — the agent is making progress via tools. Skip
+      // the judge (there is nothing to classify) and continue directly,
+      // using a synthetic "continue" verdict so the loop dispatches the
+      // next turn. Previously this was a bare `return` that left the goal
+      // permanently "active" with no continuation — the agent appeared to
+      // stop working on its own.
+      const callLLM = Option.getOrUndefined(yield* Effect.serviceOption(GoalLoopJudgeLLM))
+      const verdict = responseText
+        ? yield* GoalJudge.run(
+            goalState.goal,
+            responseText,
+            goalState.subgoals ?? [],
+            // Judge LLM call: prefer the test-injected callable so e2e tests
+            // can script verdicts without Provider/network; otherwise build the
+            // production Provider → generateText path.
+            callLLM?.call ??
+              ((opts) =>
+                Effect.gen(function* () {
+                  const defaultM = yield* provider.defaultModel()
+                  const small = yield* provider.getSmallModel(defaultM.providerID)
+                  const model = small ?? (yield* provider.getModel(defaultM.providerID, defaultM.modelID))
+                  const language = yield* provider.getLanguage(model)
+                  const result = yield* Effect.tryPromise({
+                    try: (signal) =>
+                      generateText({
+                        model: language,
+                        system: opts.system,
+                        prompt: opts.user,
+                        temperature: opts.temperature,
+                        maxOutputTokens: opts.maxTokens,
+                        abortSignal: signal,
+                      }),
+                    catch: (e) => new Error(`judge LLM call failed: ${String(e)}`),
+                  }).pipe(Effect.timeout(`${opts.timeout} seconds`))
+                  if (!result) return ""
+                  return result.text
+                })),
+          )
+        : { verdict: "continue" as const, reason: "上一轮无文本输出（纯工具调用），跳过判定直接继续", parseFailed: false }
 
       const updateResult = yield* goal.updateAfterJudge(sessionID, verdict.verdict, verdict.reason, verdict.parseFailed)
       if (!updateResult) return
@@ -283,7 +290,14 @@ export const layer = Layer.effect(
 
       const currentStatus = yield* status.get(sessionID)
       if (currentStatus.type !== "idle") {
-        return // session no longer idle, skip continuation
+        // Session is no longer idle after the judge call (5-30s latency).
+        // Previously this was a bare `return` that left the goal silently
+        // "active" with no continuation. Pause with a visible reason so the
+        // user knows the loop was interrupted by a status change.
+        const pauseMsg = `judge 期间会话状态变化（${currentStatus.type}），目标已暂停`
+        yield* goal.pauseAndPublish(sessionID, pauseMsg).pipe(Effect.ignore)
+        yield* promptSvc.prompt({ sessionID, noReply: true, parts: [{ type: "text", text: `⏸ 目标已暂停 — ${pauseMsg}` }] }).pipe(Effect.ignore)
+        return
       }
 
       // Reload messages after judge LLM call — the snapshot from before judge
@@ -339,10 +353,31 @@ export const layer = Layer.effect(
         .pipe(
           Effect.catchCause((cause) =>
             Effect.gen(function* () {
+              // F1: Only pause for non-interrupt causes. An interrupt (user
+              // pressed ESC during continuation) is safe to drop because the
+              // session ALWAYS re-emits idle afterwards, which re-drives this
+              // loop: SessionRunState.cancel (run-state.ts) and the runner's
+              // onIdle callback both call status.set(idle), and
+              // SessionStatus.set (status.ts) publishes the Status+Idle event
+              // pair unconditionally — even when the session was already idle.
+              // That fresh idle event forks a new afterIdle fiber whose
+              // shouldPreempt guard detects the user's newer message and pauses
+              // there if needed. Pausing HERE would race that replacement
+              // afterIdle fiber and emit a spurious pause. Real dispatch
+              // failures (provider fault, session write error) still get the
+              // recoverable pause below.
+              // F1: hasInterrupts is a structural check; Cause.interruptors only
+              // collects DEFINED fiber ids and silently ignores interrupts
+              // carrying none (e.g. Cause.interrupt()), which would otherwise be
+              // misclassified as a dispatch failure and spuriously paused here.
+              if (Cause.hasInterrupts(cause)) {
+                yield* Effect.logInfo("goal continuation interrupted (likely user ESC) — not pausing; shouldPreempt handles next cycle")
+                return
+              }
+              const errMsg = `continuation dispatch failed: ${Cause.pretty(cause)}`
               yield* Effect.logWarning("goal continuation dispatch failed", { error: Cause.pretty(cause) })
-              yield* goal.pauseAndPublish(sessionID, `continuation dispatch failed: ${Cause.pretty(cause)}`).pipe(
-                Effect.ignore,
-              )
+              yield* goal.pauseAndPublish(sessionID, errMsg).pipe(Effect.ignore)
+              yield* promptSvc.prompt({ sessionID, noReply: true, parts: [{ type: "text", text: `⏸ 目标已暂停 — ${errMsg}` }] }).pipe(Effect.ignore)
             }),
           ),
         )

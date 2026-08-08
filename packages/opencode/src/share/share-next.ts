@@ -6,6 +6,7 @@ import { Effect, Exit, Layer, Option, Schema, Scope, Context, Stream } from "eff
 import { FetchHttpClient, HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
 import { Account } from "@/account/account"
 import { EventV2Bridge } from "@/event-v2-bridge"
+import { InstanceRef } from "@/effect/instance-ref"
 import { InstanceState } from "@/effect/instance-state"
 import { Provider } from "@/provider/provider"
 
@@ -169,7 +170,14 @@ export const layer = Layer.effect(
         ) =>
           events.listen((event) => {
             if (event.type !== def.type || event.location?.directory !== _ctx.directory) return Effect.void
+            // Event listener fan-out (FiberSet.makeRuntime in core event.ts) runs
+            // callbacks on a forked fiber whose captured runtime does not carry the
+            // per-instance context. Share sync reads the per-directory InstanceState
+            // (which needs InstanceRef to key its ScopedCache), so restore the
+            // instance context captured by this per-directory closure. Without it the
+            // subscriber dies with "InstanceRef not provided" on every event.
             return fn(event.data as EventV2.Data<D>).pipe(
+              Effect.provideService(InstanceRef, _ctx),
               Effect.catchCause((cause) =>
                 Effect.logError("share subscriber failed", { type: def.type, cause: cause }),
               ),
@@ -187,6 +195,12 @@ export const layer = Layer.effect(
             const info = data.info
             yield* sync(info.sessionID, [{ type: "message", data: structuredClone(info) as SDK.Message }])
             if (info.role !== "user") return
+            // Resolve + sync model metadata only when a share exists for this
+            // session. Without a share the getModel call is wasted and fails for
+            // unknown models, surfacing as a subscriber error that pollutes the
+            // non-interactive subprocess stdout.
+            const share = yield* getCached(info.sessionID)
+            if (!share) return
             const model = yield* provider.getModel(info.model.providerID, info.model.modelID)
             yield* sync(info.sessionID, [{ type: "model", data: [model] }])
           }),

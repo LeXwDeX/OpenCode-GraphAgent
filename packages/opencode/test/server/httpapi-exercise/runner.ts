@@ -211,6 +211,7 @@ function withContext<A, E>(
 
 function trace(options: Options, scenario: ActiveScenario, phase: string) {
   return Effect.sync(() => {
+    options.heartbeat?.(`${scenario.name}: ${phase}`)
     if (!options.trace) return
     console.log(`[trace] ${scenario.name}: ${phase}`)
   })

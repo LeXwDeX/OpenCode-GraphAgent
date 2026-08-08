@@ -24,7 +24,7 @@ describe("public event manifest", () => {
       SessionV1.Event.Error,
     ])
     expect(EventManifest.Latest.size).toBe(92)
-    expect(EventManifest.Durable.size).toBe(53)
+    expect(EventManifest.Durable.size).toBe(55)
   })
 
   test("uses canonical definitions for current public events", () => {

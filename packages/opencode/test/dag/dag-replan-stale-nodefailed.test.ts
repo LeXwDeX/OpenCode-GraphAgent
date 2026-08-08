@@ -300,7 +300,14 @@ describe("DagLoop replan vs stale NodeFailed", () => {
             projectID: "project-1",
             sessionID: "ses_parent",
             title: "Genuine failure",
-            config: { name: "genuine-failure", nodes: [node("a", [], 300), node("b", ["a"])] },
+            config: {
+              name: "genuine-failure",
+              // Extension cap 0: the first deadline exhausts the cap and the
+              // watcher force-cancels + fails the node (timeout = signal until
+              // the cap runs out — this test exercises the cap-exhausted path).
+              max_timeout_extensions: 0,
+              nodes: [node("a", [], 300), node("b", ["a"])],
+            },
           })
           const gate = yield* takeWithin(childPrompts, "a did not start")
           expect(gate.title).toBe("a")
@@ -366,6 +373,60 @@ describe("DagLoop replan vs stale NodeFailed", () => {
           expect(nodeB?.status).toBe("skipped")
           expect(nodeB?.errorReason).toBe("workflow_failed")
           const parent = yield* takeWithin(parentPrompts, "failure wake did not reach the parent")
+          yield* Deferred.succeed(parent.release, "success")
+        }),
+      ),
+    )
+  })
+
+  it("rebuilds the graph from a restarted node's new depends_on (restart + rewired deps)", async () => {
+    await Effect.runPromise(
+      runLoopTest(({ dag, store, childPrompts, parentPrompts }) =>
+        Effect.gen(function* () {
+          const dagID = yield* dag.create({
+            projectID: "project-1",
+            sessionID: "ses_parent",
+            title: "Restart rewire",
+            config: { name: "restart-rewire", nodes: [node("a"), node("b", ["a"])] },
+          })
+          const gateA = yield* takeWithin(childPrompts, "a did not start")
+          expect(gateA.title).toBe("a")
+          yield* Deferred.succeed(gateA.release, "done")
+          const gateB = yield* takeWithin(childPrompts, "b did not start")
+          expect(gateB.title).toBe("b")
+
+          // Restart b mid-flight, rewiring its dependency from a → c (new node).
+          const plan = yield* dag.replan(dagID, {
+            nodes: [
+              { ...node("b", ["c"]), restart: true },
+              node("c"),
+            ],
+          })
+          expect(plan.restart).toEqual(["b"])
+          expect(plan.add).toEqual(["c"])
+
+          // New graph: c is b's only dependency. If the stale b→a edge
+          // survived the rebuild, b (a already completed) would be re-ready
+          // immediately and its prompt would arrive before c's — the take
+          // below would then fail with the wrong title.
+          const gateC = yield* takeWithin(childPrompts, "c did not start first under the rewired graph")
+          expect(gateC.title).toBe("c")
+          const bRow = yield* store.getNode(dagID, "b")
+          expect(bRow?.status).toBe("pending")
+          expect(bRow?.dependsOn).toEqual(["c"])
+          yield* Deferred.succeed(gateC.release, "done")
+
+          const gateB2 = yield* takeWithin(childPrompts, "b was not rescheduled after its new dependency completed")
+          expect(gateB2.title).toBe("b")
+          yield* Deferred.succeed(gateB2.release, "done")
+
+          yield* pollWithTimeout(
+            store.getWorkflow(dagID).pipe(
+              Effect.map((workflow) => workflow?.status === "completed" ? workflow : undefined),
+            ),
+            "workflow did not complete under the rewired graph",
+          )
+          const parent = yield* takeWithin(parentPrompts, "terminal wake did not reach the parent")
           yield* Deferred.succeed(parent.release, "success")
         }),
       ),

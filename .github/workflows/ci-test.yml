@@ -143,6 +143,11 @@ jobs:
         # default 6h. The full gate baseline is ~6m in CI, so 15m is generous;
         # test:httpapi:ci adds --progress/--trace to effect mode so the log
         # names the exact scenario and phase if it ever hangs again.
+        # 2026-08-05: a native-level freeze survived every in-process guard
+        # (timers die with the event loop) and burned the full 15m silently.
+        # --progress now also arms an out-of-process watchdog that SIGKILLs
+        # the runner after 120s without progress, naming the last scenario/
+        # phase — the step timeout stays as the final backstop.
         timeout-minutes: 15
         run: bun run test:httpapi:ci
 

@@ -730,32 +730,49 @@ export const layer: Layer.Layer<
       const msgs = yield* messages({ sessionID: input.sessionID })
       const idMap = new Map<string, MessageID>()
 
-      for (const msg of msgs) {
-        if (input.messageID && msg.info.id >= input.messageID) break
-        const newID = MessageID.ascending()
-        idMap.set(msg.info.id, newID)
+      // Every updateMessage/updatePart publishes a durable event, and each
+      // publish opens its own db transaction — a large session forks in
+      // thousands of commits. The effect-drizzle adapter turns nested
+      // `db.transaction` calls into savepoints on the outer transaction's
+      // connection (reads inside the transaction see the uncommitted writes,
+      // so seq allocation stays consecutive), so wrapping the copy loop in a
+      // single transaction converges the fork to one commit while keeping the
+      // per-event publish semantics (projector order, wake order) unchanged.
+      yield* db
+        .transaction(
+          () =>
+            Effect.gen(function* () {
+              for (const msg of msgs) {
+                if (input.messageID && msg.info.id >= input.messageID) break
+                const newID = MessageID.ascending()
+                idMap.set(msg.info.id, newID)
 
-        const parentID = msg.info.role === "assistant" && msg.info.parentID ? idMap.get(msg.info.parentID) : undefined
-        const cloned = yield* updateMessage({
-          ...msg.info,
-          sessionID: session.id,
-          id: newID,
-          ...(parentID && { parentID }),
-        })
+                const parentID =
+                  msg.info.role === "assistant" && msg.info.parentID ? idMap.get(msg.info.parentID) : undefined
+                const cloned = yield* updateMessage({
+                  ...msg.info,
+                  sessionID: session.id,
+                  id: newID,
+                  ...(parentID && { parentID }),
+                })
 
-        for (const part of msg.parts) {
-          const p: SessionV1.Part = {
-            ...part,
-            id: PartID.ascending(),
-            messageID: cloned.id,
-            sessionID: session.id,
-          }
-          if (p.type === "compaction" && p.tail_start_id) {
-            p.tail_start_id = idMap.get(p.tail_start_id)
-          }
-          yield* updatePart(p)
-        }
-      }
+                for (const part of msg.parts) {
+                  const p: SessionV1.Part = {
+                    ...part,
+                    id: PartID.ascending(),
+                    messageID: cloned.id,
+                    sessionID: session.id,
+                  }
+                  if (p.type === "compaction" && p.tail_start_id) {
+                    p.tail_start_id = idMap.get(p.tail_start_id)
+                  }
+                  yield* updatePart(p)
+                }
+              }
+            }),
+          { behavior: "immediate" },
+        )
+        .pipe(Effect.orDie)
       return session
     })
 
