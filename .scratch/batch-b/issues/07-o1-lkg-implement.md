@@ -5,13 +5,22 @@
 **Evidence:** `.scratch/batch-b/evidence.md#o1--remote-config-last-known-good`
 **Branch:** `feat/config-lkg`
 **Blocked by:** 无（06 已关闭；OpenSpec `remote-config-lkg` 为 apply-ready）
-**Status:** ready-for-agent
+**Status:** closed
 
 - [x] 06 的 OpenSpec requirements/scenarios 已写入下方“规格入口”；实施以 tracked 镜像为稳定入口，以 local-only change 为 OpenSpec 原件
-- [ ] 在线成功后产生可复用 LKG，随后 transport/body 失败按规格回退
-- [ ] auth/HTML login/decode 失败仍保持硬失败
-- [ ] 损坏缓存不崩溃、不覆盖错误类别，且日志不含凭据
-- [ ] 在 `packages/opencode` 运行目标测试与 `bun typecheck`
+- [x] 在线成功后产生可复用 LKG，随后 transport/body 失败按规格回退
+- [x] auth/HTML login/decode 失败仍保持硬失败
+- [x] 损坏缓存不崩溃、不覆盖错误类别，且日志不含凭据
+- [x] 在 `packages/opencode` 运行目标测试与 `bun typecheck`
+
+## 实施证据
+
+- **基线/分支：** `af0be65b0831c352cad28e6a32ac1c3c883fc5d8` → `feat/config-lkg`
+- **公开 seam：** `Config.Service.get()` 的 well-known/remote-config 加载结果；持久化细节通过 `RemoteLkg.digest/read/write` 窄接口验证
+- **RED：** 在线→transport 新实例期望 `lkg/transport-model`、实际 `undefined`；持久化测试因 `@/config/remote-lkg` 不存在失败；401/403 预实现错误地返回成功
+- **GREEN：** `bun test test/config/remote-lkg.test.ts test/config/wellknown-offline.test.ts` 连续 3 次 `24 pass / 0 fail`；`bun typecheck` 绿色
+- **OpenSpec：** `remote-config-lkg` 为 `14/14`、`all_done`；`openspec validate --changes` 为 `1 passed, 0 failed`，strict change validate 为 valid；tracked 镜像 4/4 artifacts 与当前 local-only 原件逐字节一致
+- **范围：** 4 个指定代码/测试文件；无 fixture、依赖、lockfile、core、HTTP/SDK 改动
 
 ## 规格入口
 

@@ -5,8 +5,8 @@
 **Method:** `/diagnosing-bugs`
 **Evidence:** `.scratch/batch-b/evidence.md#s7--recovery-invented-推断`
 **Branch:** `test/recovery-diagnosis`
-**Blocked by:** 07（批次串行）
-**Status:** blocked
+**Blocked by:** 无（07 已关闭）
+**Status:** ready-for-agent
 
 - [ ] 第一项产出是一条确定性、快速、可由 agent 重复运行且能红灯的命令；在此之前不写理论/修复
 - [ ] 症状必须包含“durable transcript 语义完成”与“reconcile 实际写 failed”，不能只单测 helper 返回 active
