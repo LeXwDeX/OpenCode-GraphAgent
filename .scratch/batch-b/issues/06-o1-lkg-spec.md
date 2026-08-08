@@ -5,7 +5,7 @@
 **Evidence:** `.scratch/batch-b/evidence.md#o1--remote-config-last-known-good`
 **Branch:** `docs/config-lkg-spec`
 **Blocked by:** 05（批次串行）
-**Status:** blocked
+**Status:** ready-for-agent
 
 - [ ] 定义缓存内容与写入时机：只缓存已验证结构，明确环境替换前后边界
 - [ ] 定义稳定 cache key、原子写、文件权限；key/内容不得泄露 header/token
