@@ -14,9 +14,15 @@
 
 **Blocked by:** None（独立设计决策）
 
-**Status:** backlog（需先设计裁决，非 ready-for-agent）
+**Status:** closed（方案 A 已实施 — PR #189，commit 67d1ca2b1）
 
-- [ ] 设计裁决 A/B（含消费方影响面清单）
-- [ ] 按裁决实施 + 测试
-- [ ] 转移表 v2 与 CONTEXT.md 状态机词汇同步
-- [ ] typecheck + dag 套件绿
+## 裁决与实施记录（batch-a-residuals DAG，终审 PASS）
+- 裁决：方案 A（对齐实现）——消费方核验确认仅 TUI 存在 phantom dead branch 读节点级 cancelled，投影写 status=failed 故永不触发，无真实依赖
+- T5 改写 to=failed(cancelled)；状态空间删除节点级 cancelled 目标态（保留工作流级）；CONTEXT.md 同步；projector 投影注释固化契约
+- 新增 core 测试断言 NodeCancelled 重放 → status=failed + error_reason 承载取消语义
+- 对抗审查：检察官/辩护人/证据矩阵三路 + 第四方 claim 核验，终审 PASS
+
+- [x] 设计裁决 A/B（含消费方影响面清单）
+- [x] 按裁决实施 + 测试
+- [x] 转移表 v2 与 CONTEXT.md 状态机词汇同步
+- [x] typecheck + dag 套件绿
