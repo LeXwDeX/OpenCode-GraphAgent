@@ -32,6 +32,7 @@ import {
 import { unresolvedReviewOutcomes, validateReviewLifecycle } from "./review-lifecycle"
 import { conditionReference } from "./runtime/eval"
 import { unsupportedSchemaKeywords } from "./runtime/capture"
+import { placeholderKeys } from "./templates/resolve"
 
 // Re-export domain types
 export const ID = DagEvent.DagID
@@ -239,6 +240,32 @@ function conditionReferenceErrors(nodes: readonly NodeConfig[]): string[] {
   })
 }
 
+/**
+ * An inline prompt_template may only reference variables that have a binding
+ * source: static prompt_template.input keys, input_mapping target names, or —
+ * when input_mapping is omitted — the direct depends_on ids that feed the
+ * spawn-time input. Anything else is guaranteed to die at spawn (verdict_fail:
+ * Unresolved template placeholders), so rejecting at acceptance removes the
+ * "Added, then spawn-dead" silent window. `id` templates are read lazily from
+ * disk and cannot be binding-checked here; spawn-time enforcement still
+ * covers them.
+ */
+function templateBindingErrors(nodes: readonly NodeConfig[]): string[] {
+  return nodes.flatMap((node) => {
+    const template = node.prompt_template.inline
+    if (template === undefined) return []
+    const bound = new Set([
+      ...Object.keys(node.prompt_template.input ?? {}),
+      ...Object.keys(node.input_mapping ?? Object.fromEntries(node.depends_on.map((dep) => [dep, dep]))),
+    ])
+    return placeholderKeys(template)
+      .filter((key) => !bound.has(key))
+      .map((key) =>
+        `node "${node.id}" prompt_template references unbound variable "{{${key}}}" (bind it via prompt_template.input, input_mapping, or depends_on)`,
+      )
+  })
+}
+
 // The runtime validator enforces a JSON Schema subset; anything outside it is
 // inert. Warn (not reject) at create/replan so authors learn their constraint
 // won't fire before a payload silently sails past it.
@@ -369,6 +396,10 @@ export const layer = Layer.effect(
       const conditionErrors = conditionReferenceErrors(config.nodes)
       if (conditionErrors.length > 0) {
         return yield* Effect.fail(new Error(`Invalid workflow config: ${conditionErrors.join("; ")}`))
+      }
+      const bindingErrors = templateBindingErrors(config.nodes)
+      if (bindingErrors.length > 0) {
+        return yield* Effect.fail(new Error(`Invalid workflow config: ${bindingErrors.join("; ")}`))
       }
       yield* warnUnsupportedSchemaKeywords(config.nodes)
       // Enforce the total node ceiling at creation, not only on replan — the
@@ -584,15 +615,18 @@ export const layer = Layer.effect(
       // ignored by the plan and keep their immutable definitions; cancelled
       // nodes never evaluate a condition again.
       const nodeStatusById = new Map(nodes.map((n) => [n.id, n.status]))
-      const conditionErrors = conditionReferenceErrors(
-        normalizedFragment.nodes.filter((n) => {
-          if (n.cancel) return false
-          const status = nodeStatusById.get(n.id)
-          return status === undefined || !isNodeTerminalStatus(status as NodeStatus)
-        }),
-      )
+      const rerunNodes = normalizedFragment.nodes.filter((n) => {
+        if (n.cancel) return false
+        const status = nodeStatusById.get(n.id)
+        return status === undefined || !isNodeTerminalStatus(status as NodeStatus)
+      })
+      const conditionErrors = conditionReferenceErrors(rerunNodes)
       if (conditionErrors.length > 0) {
         return yield* Effect.fail(new Error(`Replan rejected: ${conditionErrors.join("; ")}`))
+      }
+      const bindingErrors = templateBindingErrors(rerunNodes)
+      if (bindingErrors.length > 0) {
+        return yield* Effect.fail(new Error(`Replan rejected: ${bindingErrors.join("; ")}`))
       }
       yield* warnUnsupportedSchemaKeywords(normalizedFragment.nodes)
 

@@ -444,6 +444,24 @@ error, crash-recovery loss) never justifies restarting the workflow from zero.
 Completed node outputs are durable and reusable; a full restart wastes paid
 provider work and destroys evidence the earlier nodes already earned.
 
+### Graph-action acceptance is not execution
+
+`start`, `extend`, and `control(replan)` responses confirm that a graph was
+**accepted**, not that its nodes **execute**. Acceptance-time validation does
+not resolve template placeholders or map upstream outputs — spawn-time
+contract failures (`verdict_fail`: unresolved placeholders, broken
+input_mapping, condition-expression errors) kill freshly added nodes seconds
+after a successful "Added" response, leaving a silent window where the wave
+is believed to be running. Two disciplines close the gap:
+
+- After any successful graph-carrying call, make ONE `status` read before
+  reporting nodes as running: every newly added node must have left
+  `pending` (a `child_session_id` or `running` status). An acceptance
+  receipt alone is never evidence of execution.
+- After any rejected graph-carrying call (SchemaError, validation error),
+  fix the spec AND re-issue the call in the same turn — a fixed file is not
+  a fixed operation, and the re-issue needs the same `status` verification.
+
 ## Model Assignment Strategy
 
 Workflow definitions MUST NOT specify `node.model` or

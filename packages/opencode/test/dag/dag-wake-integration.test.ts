@@ -1,4 +1,6 @@
 import { describe, expect, it } from "bun:test"
+import * as fs from "node:fs/promises"
+import * as path from "node:path"
 import { Deferred, Effect, Fiber, Layer, Option, Queue } from "effect"
 import type { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Database } from "@opencode-ai/core/database/database"
@@ -768,11 +770,15 @@ describe("DagLoop atomic wake integration", () => {
     ),
   )
 
-  it("fails an aggregate node before execution when template placeholders remain unresolved", async () => {
+  it("rejects an unbound inline placeholder at acceptance instead of spawning a doomed node", async () => {
     await Effect.runPromise(
-      runWakeTest(({ dag, store, childPrompts, parentPrompts }) =>
+      runWakeTest(({ dag, childPrompts }) =>
         Effect.gen(function* () {
-          const dagID = yield* dag.create({
+          // Pre-fix this graph was created and the summary node died at spawn
+          // (verdict_fail: Unresolved template placeholders). Acceptance-time
+          // binding validation now rejects it before any node can spawn — the
+          // "Added, then spawn-dead" silent window is gone.
+          const createError = yield* dag.create({
             projectID: "project-1",
             sessionID: "ses_parent",
             title: "Unresolved aggregate input",
@@ -787,29 +793,68 @@ describe("DagLoop atomic wake integration", () => {
                 },
               ],
             },
-          })
-
-          const root = yield* takeWithin(childPrompts, "root node did not start")
-          yield* Deferred.succeed(root.release, "A")
-
-          yield* pollWithTimeout(
-            store.getNode(dagID, "summary").pipe(
-              Effect.map((item) => item?.status === "failed" ? item : undefined),
-            ),
-            "summary node did not fail",
-          )
-          const summary = yield* store.getNode(dagID, "summary")
-          expect(summary?.errorReason).toContain("Unresolved template placeholders")
-          expect(summary?.errorClass).toBe("verdict_fail")
-          const parent = yield* takeWithin(parentPrompts, "workflow failure did not wake the parent")
-          const wakeText = promptText(parent.input)
-          expect(wakeText).toContain('[DAG Workflow failed] Workflow "Unresolved aggregate input" has reached terminal status.')
-          expect(wakeText).toContain('Failed nodes:\n- "summary" (verdict_fail):')
-          yield* Deferred.succeed(parent.release, "success")
+          }).pipe(Effect.catch((cause: Error) => Effect.succeed(cause.message)))
+          expect(createError).toContain('unbound variable "{{node-a}}"')
           expect(yield* Queue.poll(childPrompts)).toEqual(Option.none())
         }),
       ),
     )
+  })
+
+  it("fails an id-template node at spawn and wakes the parent when placeholders remain unresolved", async () => {
+    // Acceptance-time binding validation only covers inline templates; id
+    // templates are read lazily from disk, so the spawn-time guard (and its
+    // failure wake) stays live for them. Exercise that path with a real
+    // template file carrying an unbound placeholder.
+    const templateDir = path.join(process.cwd(), ".opencode", "dag-prompts")
+    const templateFile = path.join(templateDir, "wake-unbound-fixture.md")
+    await fs.mkdir(templateDir, { recursive: true })
+    await fs.writeFile(templateFile, "汇总结果：{{never-bound}}")
+    try {
+      await Effect.runPromise(
+        runWakeTest(({ dag, store, childPrompts, parentPrompts }) =>
+          Effect.gen(function* () {
+            const dagID = yield* dag.create({
+              projectID: "project-1",
+              sessionID: "ses_parent",
+              title: "Unresolved aggregate input",
+              config: {
+                name: "unresolved-aggregate-input",
+                nodes: [
+                  node("node-a"),
+                  {
+                    ...node("summary", ["node-a"]),
+                    input_mapping: {},
+                    prompt_template: { id: "wake-unbound-fixture" },
+                  },
+                ],
+              },
+            })
+
+            const root = yield* takeWithin(childPrompts, "root node did not start")
+            yield* Deferred.succeed(root.release, "A")
+
+            yield* pollWithTimeout(
+              store.getNode(dagID, "summary").pipe(
+                Effect.map((item) => item?.status === "failed" ? item : undefined),
+              ),
+              "summary node did not fail",
+            )
+            const summary = yield* store.getNode(dagID, "summary")
+            expect(summary?.errorReason).toContain("Unresolved template placeholders")
+            expect(summary?.errorClass).toBe("verdict_fail")
+            const parent = yield* takeWithin(parentPrompts, "workflow failure did not wake the parent")
+            const wakeText = promptText(parent.input)
+            expect(wakeText).toContain('[DAG Workflow failed] Workflow "Unresolved aggregate input" has reached terminal status.')
+            expect(wakeText).toContain('Failed nodes:\n- "summary" (verdict_fail):')
+            yield* Deferred.succeed(parent.release, "success")
+            expect(yield* Queue.poll(childPrompts)).toEqual(Option.none())
+          }),
+        ),
+      )
+    } finally {
+      await fs.rm(templateFile, { force: true })
+    }
   })
 
   it("does not block a second workflow's downstream scheduling on a parent wake", async () => {
