@@ -52,17 +52,31 @@ like "review X" never does.
 
 ## Execution Mode Selection
 
-Choose the smallest execution mode that can safely complete the request:
+The parent conversation owns user interaction, requirement and admission
+decisions, the macro plan, workflow controls, checkpoint interpretation, and
+the final user-facing synthesis. Once work is classified for delegation, the
+parent MUST NOT perform executable leaf work itself.
 
-1. Use direct execution when one agent can finish the task in its current context without dependent phases.
-2. Use a single `task` subagent when one configured specialist is sufficient and no graph-level coordination is needed.
-3. Use a `workflow` DAG when the task has staged dependencies, independently parallelizable work, a quality gate, unknown-size discovery, or an explicit multi-role or multi-model requirement.
+Choose the smallest child execution mode that can safely complete the request:
+
+1. Use direct execution only for conversation, trivial state inspection,
+   workflow control, final synthesis, or an explicit user opt-out.
+2. Use one `task` subagent for one independent non-trivial leaf assignment when
+   no graph-level coordination is needed. The parent launches it once, consumes
+   its result, and does not duplicate the leaf work.
+3. Use one live `workflow` DAG when one user objective contains staged
+   dependencies, two or more related workstreams, a quality gate, unknown-size
+   discovery, adaptive repair, or an explicit multi-role or multi-model
+   requirement.
 
 "Smallest" is measured against the Depth Ladder: a mode or graph that cannot
 deliver the ladder's hard minimum for the target size is not safe, merely
 small.
 
-Outside an explicit `/dag-flow` request, select a DAG only when the request contains both a scenario signal and a structural signal. Scenario signals include multi-role review, brainstorming, swarm or cluster work, multi-model analysis, and end-to-end development. Structural signals include independent viewpoints, multiple work packages, staged gates, unknown-size discovery, and requested iteration. A lone keyword such as "review" is not sufficient.
+Related flows for one user objective belong to one live DAG. Represent them as
+nodes and dependency edges; use `extend` or `control(replan)` when discovery or
+a verdict adds work. Start another DAG only after a terminal boundary prevents
+live adaptation, and carry the prior outputs into the continuation explicitly.
 
 Explicit user constraints override profile defaults:
 
@@ -133,8 +147,8 @@ continue QA, reduce scope, use `standard`, or explicitly waive. A `WAIVED`
 start is informed only when both `waiver_reason` and `acknowledged_risks` are
 non-empty; preserve them for audit.
 
-Do not supply `protocol_version`, `state`, or `fingerprint` in the YAML
-admission input. Those are durable audit fields owned by the workflow boundary:
+Do not supply `protocol_version`, `state`, or `fingerprint` in the admission
+input. Those are durable audit fields owned by the workflow boundary:
 it sets protocol version 1, initializes state from the verdict, normalizes the
 Brief for fingerprint computation, and computes the lowercase hexadecimal
 SHA-256 hash. A successful deep start alone transitions the durable record to
