@@ -178,7 +178,13 @@ export function makeDeadlineWatcher(
       // slot unbounded. Log and fall through to the sleep — the next iteration
       // re-reads the row and escalates again. Mirrors the read path's R13
       // hardening above, which the write path previously lacked.
-      const escalated = yield* dag.nodeTimeoutEscalated(input.dagID, input.nodeID, node.childSessionId as never, extensions + 1).pipe(
+      // The deadline this watcher OBSERVED may be stale — it was read WITHOUT
+      // the workflow lock (readNode above). nodeTimeoutEscalated re-reads the
+      // node under the lock and suppresses the escalation when the deadline has
+      // moved past this observed value (ticket B — spurious T8 suppression),
+      // so a budget unit is only charged when the node is genuinely still
+      // overdue. Pass node.deadlineMs, the value this snapshot read.
+      const escalated = yield* dag.nodeTimeoutEscalated(input.dagID, input.nodeID, node.childSessionId as never, extensions + 1, node.deadlineMs).pipe(
         Effect.catchIf(
           isTransitionRejection,
           () => Effect.logWarning("nodeTimeoutEscalated guard rejected — node already terminal"),
