@@ -65,7 +65,8 @@ const unreachable = HttpClient.make((request) => transportFailure(request, "conn
 // Well-known endpoint answers, but the remote_config URL is unreachable.
 const remoteConfigUnreachable = (seen: { wellKnown?: string; remote?: string }) =>
   HttpClient.make((request) => {
-    if (request.url.includes(".well-known/opencode")) {
+    const parsedUrl = new URL(request.url)
+    if (parsedUrl.pathname.includes("/.well-known/opencode")) {
       seen.wellKnown = request.url
       return Effect.succeed(
         json(request, {
@@ -74,7 +75,7 @@ const remoteConfigUnreachable = (seen: { wellKnown?: string; remote?: string }) 
         }),
       )
     }
-    if (request.url.includes("config.example.com")) {
+    if (parsedUrl.hostname === "config.example.com") {
       seen.remote = request.url
       return transportFailure(request, "connect timeout")
     }
@@ -84,11 +85,12 @@ const remoteConfigUnreachable = (seen: { wellKnown?: string; remote?: string }) 
 // Both hops succeed: remote config must merge exactly as before.
 const remoteOk = (seen: { wellKnown?: string; remote?: string }) =>
   HttpClient.make((request) => {
-    if (request.url.includes(".well-known/opencode")) {
+    const parsedUrl = new URL(request.url)
+    if (parsedUrl.pathname.includes("/.well-known/opencode")) {
       seen.wellKnown = request.url
       return Effect.succeed(json(request, { remote_config: { url: "https://config.example.com/opencode.json" } }))
     }
-    if (request.url.includes("config.example.com")) {
+    if (parsedUrl.hostname === "config.example.com") {
       seen.remote = request.url
       return Effect.succeed(
         json(request, {
