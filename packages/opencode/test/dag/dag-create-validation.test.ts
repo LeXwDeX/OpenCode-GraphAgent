@@ -137,7 +137,7 @@ describe("Dag prompt_template binding validation", () => {
           nodes: [{ ...node("repair"), prompt_template: { inline: "Work in {{path}}" } }],
         })
         expect(error.message).toContain('node "repair" prompt_template references unbound variable "{{path}}"')
-      }).pipe(Effect.scoped, Effect.provide(dagLayer)) as Effect.Effect<never>,
+      }).pipe(Effect.scoped, Effect.provide(dagLayer)),
     )
   })
 
@@ -156,7 +156,7 @@ describe("Dag prompt_template binding validation", () => {
           },
         }).pipe(Effect.orDie)
         expect(dagID.startsWith("dag")).toBe(true)
-      }).pipe(Effect.scoped, Effect.provide(dagLayer)) as Effect.Effect<never>,
+      }).pipe(Effect.scoped, Effect.provide(dagLayer)),
     )
   })
 
@@ -175,7 +175,7 @@ describe("Dag prompt_template binding validation", () => {
           },
         }).pipe(Effect.orDie)
         expect(dagID.startsWith("dag")).toBe(true)
-      }).pipe(Effect.scoped, Effect.provide(dagLayer)) as Effect.Effect<never>,
+      }).pipe(Effect.scoped, Effect.provide(dagLayer)),
     )
   })
 
@@ -201,7 +201,7 @@ describe("Dag prompt_template binding validation", () => {
           },
         }).pipe(Effect.orDie)
         expect(dagID.startsWith("dag")).toBe(true)
-      }).pipe(Effect.scoped, Effect.provide(dagLayer)) as Effect.Effect<never>,
+      }).pipe(Effect.scoped, Effect.provide(dagLayer)),
     )
   })
 
@@ -220,7 +220,7 @@ describe("Dag prompt_template binding validation", () => {
           },
         }).pipe(Effect.orDie)
         expect(dagID.startsWith("dag")).toBe(true)
-      }).pipe(Effect.scoped, Effect.provide(dagLayer)) as Effect.Effect<never>,
+      }).pipe(Effect.scoped, Effect.provide(dagLayer)),
     )
   })
 
@@ -239,7 +239,7 @@ describe("Dag prompt_template binding validation", () => {
           { ...node("repair", ["explore"]), prompt_template: { inline: "Use {{path}}" } },
         ]).pipe(Effect.catch((e: Error) => Effect.succeed(e.message)))
         expect(errorMessage).toContain('Replan rejected: node "repair" prompt_template references unbound variable "{{path}}"')
-      }).pipe(Effect.scoped, Effect.provide(dagLayer)) as Effect.Effect<never>,
+      }).pipe(Effect.scoped, Effect.provide(dagLayer)),
     )
   })
 })
