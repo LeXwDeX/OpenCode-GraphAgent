@@ -32,6 +32,12 @@ export const NodeStatusProjection = {
   completed: { to: "completed", from: ["running"] },
   failed: { to: "failed", from: ["running", "pending", "queued"] },
   skipped: { to: "skipped", from: ["pending", "queued", "running", "paused"] },
+  // NodeCancelled has NO independent terminal status — the NodeStatus enum has
+  // no CANCELLED and getValidNextNodeStatuses never returns it. A cancelled
+  // node lands on `failed` with the cancellation carried by `error_reason`
+  // ("cancelled via replan"), never on a phantom node-level "cancelled" status.
+  // Workflow-level cancelled (WorkflowStatusProjection.cancelled below) is a
+  // legitimate, separate terminal — this entry is node-scoped only.
   cancelled: { to: "failed", from: ["pending", "queued", "running", "paused"] },
   restarted: { to: "pending", from: ["running"] },
 } as const
@@ -342,6 +348,12 @@ export const layer = Layer.effectDiscard(
         .pipe(Effect.orDie),
     )
 
+    // NodeCancelled carries no independent terminal status: it projects to
+    // status="failed" with the cancellation marker in error_reason and clears
+    // the adjudication flag (cancel is itself an adjudication). A node row can
+    // therefore never hold status="cancelled"; see NodeStatusProjection.cancelled
+    // above and the canonical proof in
+    // packages/opencode/test/dag/dag-escalation-clear-flag.test.ts:130-148.
     yield* events.project(DagEvent.NodeCancelled, (event) =>
       db
         .update(WorkflowNodeTable)
