@@ -4,8 +4,8 @@
 
 **Evidence:** `.scratch/batch-b/evidence.md#f3--固定订阅-settle-sleep`
 **Branch:** `test/goal-readiness`
-**Blocked by:** 03（批次串行；代码写集独立）
-**Status:** blocked
+**Blocked by:** None（03 已完成；代码写集独立）
+**Status:** ready-for-agent
 
 - [ ] 先证明每个 sleep 等待的具体事件/状态，不用另一个超时数值替换 200ms
 - [ ] 8 个固定 settle sleeps 全部删除或由同一确定性同步机制取代
