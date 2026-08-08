@@ -31,6 +31,7 @@ import { ConfigManaged } from "./managed"
 import { ConfigParse } from "./parse"
 import { ConfigPaths } from "./paths"
 import { ConfigPlugin } from "./plugin"
+import { RemoteLkg } from "./remote-lkg"
 import { ConfigVariable } from "./variable"
 import { Npm } from "@opencode-ai/core/npm"
 import { withTransientReadRetry } from "@/util/effect-http-client"
@@ -183,47 +184,89 @@ export const layer = Layer.effect(
 
     const readConfigFile = (filepath: string) => fs.readFileStringSafe(filepath).pipe(Effect.orDie)
 
-    const fetchRemoteJson = Effect.fnUntraced(function* <S extends Schema.Top>(
+    const readRemoteLkg = Effect.fnUntraced(function* <S extends Schema.Decoder<unknown, never>>(
+      url: string,
+      schema: S,
+      role: RemoteLkg.Role,
+    ) {
+      const cached = yield* RemoteLkg.read({ url, role })
+      if (cached.status !== "available") return undefined
+      const parsed = Schema.decodeUnknownOption(Schema.UnknownFromJsonString)(cached.body)
+      if (Option.isNone(parsed)) {
+        yield* Effect.logWarning("remote config LKG unavailable", {
+          digest: cached.digest,
+          role,
+          reason: "invalid-json",
+        })
+        return undefined
+      }
+      const data = Schema.decodeUnknownOption(schema)(parsed.value)
+      if (Option.isNone(data)) {
+        yield* Effect.logWarning("remote config LKG unavailable", {
+          digest: cached.digest,
+          role,
+          reason: "schema-decode",
+        })
+        return undefined
+      }
+      yield* Effect.logInfo("using remote config LKG", {
+        digest: cached.digest,
+        role,
+        ageSeconds: cached.ageSeconds,
+      })
+      return { data: data.value, source: "lkg" as const }
+    })
+
+    const fallbackRemoteJson = Effect.fnUntraced(function* <S extends Schema.Decoder<unknown, never>>(
+      url: string,
+      schema: S,
+      role: RemoteLkg.Role,
+      reason: "transport" | "http-status" | "body-read" | "json-syntax",
+      status?: number,
+    ) {
+      yield* Effect.logWarning(
+        reason === "body-read" || reason === "json-syntax"
+          ? "failed to read remote config, skipping source"
+          : "failed to fetch remote config, skipping source",
+        { digest: RemoteLkg.digest(url), role, reason, status },
+      )
+      return yield* readRemoteLkg(url, schema, role)
+    })
+
+    const fetchRemoteJson = Effect.fnUntraced(function* <S extends Schema.Decoder<unknown, never>>(
       url: string,
       headers: Record<string, string> | undefined,
       schema: S,
       loginOrigin: string,
+      role: RemoteLkg.Role,
     ) {
-      // Transport-level failures (DNS/connection/timeout, non-2xx status, body
-      // read failures) always degrade to a warning — an unreachable well-known
-      // source cannot crash config loading. Auth errors (RemoteAuthError) and
-      // decode failures stay hard errors: they indicate a broken credential or
-      // a malformed remote config, not an offline environment.
-      const response = yield* HttpClient.filterStatusOk(withTransientReadRetry(http))
+      const response = yield* withTransientReadRetry(http)
         .execute(
           HttpClientRequest.get(url).pipe(HttpClientRequest.acceptJson, HttpClientRequest.setHeaders(headers ?? {})),
         )
-        .pipe(
-          Effect.catch((error) =>
-            Effect.logWarning("failed to fetch remote config, skipping source", {
-              url,
-              reason: String(error),
-            }).pipe(Effect.as(undefined)),
-          ),
-        )
-      if (response === undefined) return undefined
-      const body = yield* response.text.pipe(
-        Effect.catch((error) =>
-          Effect.logWarning("failed to read remote config, skipping source", {
-            url,
-            reason: String(error),
-          }).pipe(Effect.as(undefined)),
-        ),
-      )
-      if (body === undefined) return undefined
+        .pipe(Effect.catch(() => Effect.succeed(undefined)))
+      if (response === undefined) return yield* fallbackRemoteJson(url, schema, role, "transport")
+      if (response.status === 401 || response.status === 403) {
+        return yield* Effect.die(new RemoteAuthError({ url: loginOrigin, remote: url }))
+      }
+      if (response.status < 200 || response.status >= 300) {
+        return yield* fallbackRemoteJson(url, schema, role, "http-status", response.status)
+      }
+      const body = yield* response.text.pipe(Effect.catch(() => Effect.succeed(undefined)))
+      if (body === undefined) return yield* fallbackRemoteJson(url, schema, role, "body-read")
       // An auth proxy can answer with an HTML login page at HTTP 200 (passes filterStatusOk); treat it as a re-auth error, not a decode failure.
       const contentType = (response.headers["content-type"] ?? "").toLowerCase()
       if (contentType.includes("html") || /^\s*<!doctype|^\s*<html/i.test(body)) {
         return yield* Effect.die(new RemoteAuthError({ url: loginOrigin, remote: url }))
       }
-      return yield* Schema.decodeEffect(Schema.fromJsonString(schema))(body).pipe(
-        Effect.catch((error) => Effect.die(new Error(`failed to decode remote config from ${url}: ${String(error)}`))),
+      const parsed = Schema.decodeUnknownOption(Schema.UnknownFromJsonString)(body)
+      if (Option.isNone(parsed)) return yield* fallbackRemoteJson(url, schema, role, "json-syntax")
+      const data = yield* Schema.decodeUnknownEffect(schema)(parsed.value).pipe(
+        Effect.catch(() =>
+          Effect.die(new Error(`failed to decode remote config (${RemoteLkg.digest(url)}): schema-decode`)),
+        ),
       )
+      return { data, source: "online" as const, body }
     })
 
     const loadConfig = Effect.fnUntraced(function* (
@@ -373,32 +416,58 @@ export const layer = Layer.effect(
             const url = key.replace(/\/+$/, "")
             authEnv[value.key] = value.token
             const wellknownURL = `${url}/.well-known/opencode`
-            yield* Effect.logDebug("fetching remote config", { url: wellknownURL })
-            const wellknown = yield* fetchRemoteJson(wellknownURL, undefined, ConfigV1.WellKnown, url)
+            yield* Effect.logDebug("fetching remote config", {
+              digest: RemoteLkg.digest(wellknownURL),
+              role: "well-known",
+            })
+            const wellknown = yield* fetchRemoteJson(wellknownURL, undefined, ConfigV1.WellKnown, url, "well-known")
             // Unreachable source: the warning was logged by fetchRemoteJson; skip this source entirely
             // without merging anything so the local config stays fully usable.
             if (wellknown === undefined) continue
             const remote = yield* Effect.promise(() =>
               substituteWellKnownRemoteConfig({
-                value: wellknown.remote_config,
+                value: wellknown.data.remote_config,
                 dir: url,
                 source: wellknownURL,
                 env: authEnv,
               }),
             )
-            const fetchedConfig = remote
+            const fetched = remote
               ? yield* Effect.gen(function* () {
-                  yield* Effect.logDebug("fetching remote config", { url: remote.url })
-                  const data = yield* fetchRemoteJson(remote.url, remote.headers, Schema.Json, url)
-                  if (data === undefined) return {}
-                  if (isRecord(data) && isRecord(data.config)) return data.config
-                  if (isRecord(data)) return data
+                  yield* Effect.logDebug("fetching remote config", {
+                    digest: RemoteLkg.digest(remote.url),
+                    role: "remote-config",
+                  })
+                  const hit = yield* fetchRemoteJson(remote.url, remote.headers, Schema.Json, url, "remote-config")
+                  if (hit === undefined) return { config: {} }
+                  const data = hit.data
+                  if (isRecord(data) && isRecord(data.config)) {
+                    return {
+                      config: data.config,
+                      cache:
+                        hit.source === "online"
+                          ? { url: remote.url, role: "remote-config" as const, body: hit.body }
+                          : undefined,
+                    }
+                  }
+                  if (isRecord(data)) {
+                    return {
+                      config: data,
+                      cache:
+                        hit.source === "online"
+                          ? { url: remote.url, role: "remote-config" as const, body: hit.body }
+                          : undefined,
+                    }
+                  }
                   return yield* Effect.die(
-                    new Error(`failed to decode remote config from ${remote.url}: expected object`),
+                    new Error(`failed to decode remote config (${RemoteLkg.digest(remote.url)}): expected object`),
                   )
                 })
-              : {}
-            const remoteConfig = mergeConfig(isRecord(wellknown.config) ? wellknown.config : {}, fetchedConfig)
+              : { config: {} }
+            const remoteConfig = mergeConfig(
+              isRecord(wellknown.data.config) ? wellknown.data.config : {},
+              fetched.config,
+            )
             if (!remoteConfig.$schema) remoteConfig.$schema = "https://opencode.ai/config.json"
             const source = wellknownURL
             const next = yield* loadConfig(
@@ -409,8 +478,15 @@ export const layer = Layer.effect(
               },
               authEnv,
             )
+            if (wellknown.source === "online") {
+              yield* RemoteLkg.write({ url: wellknownURL, role: "well-known", body: wellknown.body })
+            }
+            if (fetched.cache) yield* RemoteLkg.write(fetched.cache)
             yield* merge(source, next, "global")
-            yield* Effect.logDebug("loaded remote config from well-known", { url })
+            yield* Effect.logDebug("loaded remote config from well-known", {
+              digest: RemoteLkg.digest(wellknownURL),
+              role: "well-known",
+            })
           }
         }
 

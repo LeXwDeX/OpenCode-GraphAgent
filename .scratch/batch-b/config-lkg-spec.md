@@ -243,27 +243,27 @@ URL 用 WHATWG `URL` 规范化：清除不会随 HTTP 请求发送的 fragment�
 <!-- BEGIN artifact: tasks.md -->
 ## 1. 红灯：锁定外部行为
 
-- [ ] 1.1 在 `packages/opencode/test/config/wellknown-offline.test.ts` 增加两跳在线成功写入、换实例后第一跳/第二跳 transport 与非认证 body 失败使用 LKG 的场景，并先运行目标文件确认新断言因 LKG 尚未实现而失败；对应[在线成功后写入并可离线复用](specs/remote-config-lkg/spec.md#scenario-在线成功后写入并可离线复用)与[允许降级回退](specs/remote-config-lkg/spec.md#scenario-transport-或非认证不可用状态回退)。
-- [ ] 1.2 在同一集成测试预置可用 LKG，再覆盖 401、403、HTML login、合法 JSON 的 well-known schema 错误、第二跳非对象和最终 `ConfigV1.Info` decode 错误；逐项断言硬失败、未使用/未覆盖 LKG，对应[401/403](specs/remote-config-lkg/spec.md#scenario-401-或-403-不回退)、[HTML](specs/remote-config-lkg/spec.md#scenario-html-登录页不回退)与[schema decode](specs/remote-config-lkg/spec.md#scenario-schema-decode-错误不回退)。
-- [ ] 1.3 在同一集成测试加入缺失、空、损坏和超旧缓存；断言第一跳保持 warn + skip、本地配置可用，第二跳保持内嵌 config 合并，超旧记录仍使用且只给安全年龄诊断；不得改写现有降级分支的结果。
-- [ ] 1.4 新建 `packages/opencode/test/config/remote-lkg.test.ts`，用隔离 cache 根和真实文件系统锁定 URL 规范化摘要、原始 Environment 占位符、同目录 rename、完整 envelope、POSIX `0600`、并发完整性，并用最窄 rename 故障注入锁定失败更新后旧 LKG 仍可读。
-- [ ] 1.5 在两份目标测试放置独特的 header/token/Environment/正文标记，断言文件名、key 和所有 remote-config/cache 日志不含标记，envelope 不含请求认证元数据；确认新增安全断言先红。
+- [x] 1.1 在 `packages/opencode/test/config/wellknown-offline.test.ts` 增加两跳在线成功写入、换实例后第一跳/第二跳 transport 与非认证 body 失败使用 LKG 的场景，并先运行目标文件确认新断言因 LKG 尚未实现而失败；对应[在线成功后写入并可离线复用](specs/remote-config-lkg/spec.md#scenario-在线成功后写入并可离线复用)与[允许降级回退](specs/remote-config-lkg/spec.md#scenario-transport-或非认证不可用状态回退)。
+- [x] 1.2 在同一集成测试预置可用 LKG，再覆盖 401、403、HTML login、合法 JSON 的 well-known schema 错误、第二跳非对象和最终 `ConfigV1.Info` decode 错误；逐项断言硬失败、未使用/未覆盖 LKG，对应[401/403](specs/remote-config-lkg/spec.md#scenario-401-或-403-不回退)、[HTML](specs/remote-config-lkg/spec.md#scenario-html-登录页不回退)与[schema decode](specs/remote-config-lkg/spec.md#scenario-schema-decode-错误不回退)。
+- [x] 1.3 在同一集成测试加入缺失、空、损坏和超旧缓存；断言第一跳保持 warn + skip、本地配置可用，第二跳保持内嵌 config 合并，超旧记录仍使用且只给安全年龄诊断；不得改写现有降级分支的结果。
+- [x] 1.4 新建 `packages/opencode/test/config/remote-lkg.test.ts`，用隔离 cache 根和真实文件系统锁定 URL 规范化摘要、原始 Environment 占位符、同目录 rename、完整 envelope、POSIX `0600`、并发完整性，并用最窄 rename 故障注入锁定失败更新后旧 LKG 仍可读。
+- [x] 1.5 在两份目标测试放置独特的 header/token/Environment/正文标记，断言文件名、key 和所有 remote-config/cache 日志不含标记，envelope 不含请求认证元数据；确认新增安全断言先红。
 
 ## 2. 绿灯：实现私有原子 LKG 模块
 
-- [ ] 2.1 新建 `packages/opencode/src/config/remote-lkg.ts` 并按 `src/config` 自导出规范提供窄接口：WHATWG URL 去 fragment、SHA-256 文件名、version 1 envelope decode，以及从 `Global.Path.cache/remote-config-lkg/` 读取原始 body；损坏、空和不支持版本返回可分类的不可用结果，不抛出正文。
-- [ ] 2.2 在该模块实现 best-effort 写入：目标同目录唯一临时文件以 `0600` 写完整 envelope，关闭后原子 rename，最终模式 `0600`；失败时安全告警、best-effort 清理临时文件且不触碰旧目标。
-- [ ] 2.3 保持 `writtenAt` 为合法 RFC 3339 诊断字段；读取不检查 TTL/mtime，不增加配置项、清理器、后台刷新或 TTL 扩展接口。
+- [x] 2.1 新建 `packages/opencode/src/config/remote-lkg.ts` 并按 `src/config` 自导出规范提供窄接口：WHATWG URL 去 fragment、SHA-256 文件名、version 1 envelope decode，以及从 `Global.Path.cache/remote-config-lkg/` 读取原始 body；损坏、空和不支持版本返回可分类的不可用结果，不抛出正文。
+- [x] 2.2 在该模块实现 best-effort 写入：目标同目录唯一临时文件以 `0600` 写完整 envelope，关闭后原子 rename，最终模式 `0600`；失败时安全告警、best-effort 清理临时文件且不触碰旧目标。
+- [x] 2.3 保持 `writtenAt` 为合法 RFC 3339 诊断字段；读取不检查 TTL/mtime，不增加配置项、清理器、后台刷新或 TTL 扩展接口。
 
 ## 3. 绿灯：接入当前 remote config 流程
 
-- [ ] 3.1 仅在 `packages/opencode/src/config/config.ts` 调整 `fetchRemoteJson` 附近：把 JSON 语法解析与 schema decode 分开，并将结果分类为在线成功、允许降级失败和硬失败；401/403 与 HTML/login/auth 继续使用硬认证错误，合法 JSON 的 schema/object/final-config 错误继续硬失败。
-- [ ] 3.2 well-known 与第二跳在线响应只暂存 Environment 替换前 body；完整来源通过 `loadConfig` 最终 schema 验证后才调用 LKG 写入。仅允许降级失败读取并重验 LKG；无可用 LKG 时分别复用现有“第一跳 skip 来源”和“第二跳空 fetched config”分支。
-- [ ] 3.3 把触及的 remote-config/cache 诊断限定为摘要、端点角色、失败分类和非敏感年龄；不得序列化原始 URL、底层可能回显请求的错误对象、headers、token、Environment 值或 body。
+- [x] 3.1 仅在 `packages/opencode/src/config/config.ts` 调整 `fetchRemoteJson` 附近：把 JSON 语法解析与 schema decode 分开，并将结果分类为在线成功、允许降级失败和硬失败；401/403 与 HTML/login/auth 继续使用硬认证错误，合法 JSON 的 schema/object/final-config 错误继续硬失败。
+- [x] 3.2 well-known 与第二跳在线响应只暂存 Environment 替换前 body；完整来源通过 `loadConfig` 最终 schema 验证后才调用 LKG 写入。仅允许降级失败读取并重验 LKG；无可用 LKG 时分别复用现有“第一跳 skip 来源”和“第二跳空 fetched config”分支。
+- [x] 3.3 把触及的 remote-config/cache 诊断限定为摘要、端点角色、失败分类和非敏感年龄；不得序列化原始 URL、底层可能回显请求的错误对象、headers、token、Environment 值或 body。
 
 ## 4. 验收与范围门禁
 
-- [ ] 4.1 从 `packages/opencode` 运行 `bun test test/config/remote-lkg.test.ts test/config/wellknown-offline.test.ts`，确认在线→离线、旧 LKG、auth/decode、损坏/空缓存、永不过期、key/log 安全及原子/权限场景全绿。
-- [ ] 4.2 从 `packages/opencode` 运行 `bun typecheck`；不得用 `bun run build` 代替类型门禁。
-- [ ] 4.3 检查实现 diff 只涉及 `packages/opencode/src/config/config.ts`、`packages/opencode/src/config/remote-lkg.ts` 和上述两份 config 测试；如确需测试 fixture 的最小改动须在提交说明中列出，`packages/core`、HTTP routes、SDK 生成物、依赖与既有 warn + skip 语义保持零改动。
+- [x] 4.1 从 `packages/opencode` 运行 `bun test test/config/remote-lkg.test.ts test/config/wellknown-offline.test.ts`，确认在线→离线、旧 LKG、auth/decode、损坏/空缓存、永不过期、key/log 安全及原子/权限场景全绿。
+- [x] 4.2 从 `packages/opencode` 运行 `bun typecheck`；不得用 `bun run build` 代替类型门禁。
+- [x] 4.3 检查实现 diff 只涉及 `packages/opencode/src/config/config.ts`、`packages/opencode/src/config/remote-lkg.ts` 和上述两份 config 测试；如确需测试 fixture 的最小改动须在提交说明中列出，`packages/core`、HTTP routes、SDK 生成物、依赖与既有 warn + skip 语义保持零改动。
 <!-- END artifact: tasks.md -->
