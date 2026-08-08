@@ -108,7 +108,8 @@ const loginPage = (seen: { wellKnown?: string; remote?: string }) =>
       seen.wellKnown = request.url
       return Effect.succeed(json(request, { remote_config: { url: "https://config.example.com/opencode.json" } }))
     }
-    if (request.url.includes("config.example.com")) {
+    const requestHost = new URL(request.url).hostname
+    if (requestHost === "config.example.com") {
       seen.remote = request.url
       return Effect.succeed(
         HttpClientResponse.fromWeb(
