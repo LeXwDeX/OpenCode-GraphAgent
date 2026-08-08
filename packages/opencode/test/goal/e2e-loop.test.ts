@@ -36,11 +36,9 @@ const captureEvents = (events: EventV2Bridge.Service["Service"]) =>
 // Scripted assistant response — afterIdle extracts its text as the judge input.
 const assistantText = "I have made progress on the feature."
 // GoalLoop.init forks the idle-event subscription (loop.ts Effect.forkScoped).
-// No observable latch exists for stream-subscription registration, so the only
-// sync point before publishing the first idle event is this bounded fork-window
-// wait. Kept intentionally: replacing it needs a subscribe-ready signal in
-// EventV2Bridge (production change, out of scope for test hygiene).
-const SUBSCRIPTION_SETTLE_MS = 200
+// Each scenario yields one scheduler turn before its first idle publish so that
+// fiber can acquire the PubSub subscription. No business event exists yet, so
+// outcome completion remains separately observed through public state/events.
 const mkAssistant = () =>
   ({
     info: { role: "assistant", time: { created: Date.now() } },
@@ -141,9 +139,9 @@ describe("GoalLoop end-to-end — continue → done lifecycle (P2b)", () => {
       yield* loop.init()
       const sid = SessionID.descending()
       yield* goal.set(sid, "ship the feature", 10)
-      // Let the idle subscription finish wiring (InstanceState is built on the
-      // first init) before publishing, so the first idle event is not missed.
-      yield* Effect.sleep(SUBSCRIPTION_SETTLE_MS)
+      // Give the forkScoped idle subscriber one scheduler turn to acquire its
+      // PubSub subscription. Business completion is observed below.
+      yield* Effect.yieldNow
 
       // ── Turn 1: idle → judge(continue) → continuation prompt ──
       yield* events.publish(SessionStatus.Event.Status, { sessionID: sid, status: { type: "idle" } })
@@ -231,8 +229,7 @@ describe("GoalLoop — continuation dispatch failure → recoverable pause (D1)"
       yield* loop.init()
       const sid = SessionID.descending()
       yield* goal.set(sid, "ship the feature", 10)
-      // Let the idle subscription wire (InstanceState builds on first init).
-      yield* Effect.sleep(SUBSCRIPTION_SETTLE_MS)
+      yield* Effect.yieldNow
 
       // idle → judge(continue) → continuation prompt fails → catchCause → pause
       yield* events.publish(SessionStatus.Event.Status, { sessionID: sid, status: { type: "idle" } })
@@ -267,7 +264,7 @@ describe("GoalLoop — continuation dispatch failure → recoverable pause (D1)"
       yield* loop.init()
       const sid = SessionID.descending()
       yield* goal.set(sid, "ship the feature", 10)
-      yield* Effect.sleep(SUBSCRIPTION_SETTLE_MS)
+      yield* Effect.yieldNow
       yield* events.publish(SessionStatus.Event.Status, { sessionID: sid, status: { type: "idle" } })
       yield* pollWithTimeout(
         Effect.gen(function* () {
@@ -332,7 +329,7 @@ describe("GoalLoop — no assistant in window → visible pause (branch 1)", () 
       yield* loop.init()
       const sid = SessionID.descending()
       yield* goal.set(sid, "ship the feature", 10)
-      yield* Effect.sleep(SUBSCRIPTION_SETTLE_MS)
+      yield* Effect.yieldNow
 
       yield* events.publish(SessionStatus.Event.Status, { sessionID: sid, status: { type: "idle" } })
       yield* pollWithTimeout(
@@ -400,7 +397,7 @@ describe("GoalLoop — empty assistant text → synthetic continue, no stall (br
       yield* loop.init()
       const sid = SessionID.descending()
       yield* goal.set(sid, "ship the feature", 10)
-      yield* Effect.sleep(SUBSCRIPTION_SETTLE_MS)
+      yield* Effect.yieldNow
 
       yield* events.publish(SessionStatus.Event.Status, { sessionID: sid, status: { type: "idle" } })
       // The synthetic continue dispatches a continuation prompt (non-noReply).
@@ -477,7 +474,7 @@ describe("GoalLoop — status changed during judge → visible pause (branch 3)"
       // busy. The raw idle-event publish below drives afterIdle WITHOUT
       // touching the status map, so the busy entry persists.
       yield* status.set(sid, { type: "busy" })
-      yield* Effect.sleep(SUBSCRIPTION_SETTLE_MS)
+      yield* Effect.yieldNow
 
       yield* events.publish(SessionStatus.Event.Status, { sessionID: sid, status: { type: "idle" } })
       yield* pollWithTimeout(
@@ -558,7 +555,7 @@ describe("GoalLoop — continuation interrupted → no pause, goal stays active 
       yield* loop.init()
       const sid = SessionID.descending()
       yield* goal.set(sid, "ship the feature", 10)
-      yield* Effect.sleep(SUBSCRIPTION_SETTLE_MS)
+      yield* Effect.yieldNow
 
       // Turn 1: idle → judge(continue) → continuation fails with interrupt →
       // branch 4: log + return, NO pause.
@@ -608,7 +605,7 @@ describe("GoalLoop — continuation interrupted → no pause, goal stays active 
       yield* loop.init()
       const sid = SessionID.descending()
       yield* goal.set(sid, "ship the feature", 10)
-      yield* Effect.sleep(SUBSCRIPTION_SETTLE_MS)
+      yield* Effect.yieldNow
 
       // idle → judge(continue) → continuation fails with an anonymous interrupt
       // → branch 4: log + return, NO pause (the F1 fix; old code paused here).
