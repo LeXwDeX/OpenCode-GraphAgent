@@ -318,7 +318,7 @@ export interface Interface {
   readonly nodeSkipped: (dagID: string, nodeID: string, reason: string) => Effect.Effect<void, Error>
   readonly nodeCancelled: (dagID: string, nodeID: string) => Effect.Effect<void, Error>
   readonly nodeRestarted: (dagID: string, nodeID: string, childSessionID: string) => Effect.Effect<void, Error>
-  readonly nodeTimeoutEscalated: (dagID: string, nodeID: string, childSessionID: string, timeoutExtensions: number) => Effect.Effect<void, Error>
+  readonly nodeTimeoutEscalated: (dagID: string, nodeID: string, childSessionID: string, timeoutExtensions: number, staleDeadlineMs?: number | null) => Effect.Effect<void, Error>
   readonly nodeExtendTimeout: (dagID: string, nodeID: string, newDeadlineMs: number) => Effect.Effect<number, Error>
 }
 
@@ -887,8 +887,28 @@ export const layer = Layer.effect(
     // Timeout escalation publishes no status transition — the node stays
     // RUNNING (see the NodeTimeoutEscalated projector). Only the extension
     // count, seq, and wake flag change.
-    const nodeTimeoutEscalated = Effect.fn("Dag.nodeTimeoutEscalated")(function* (lock: WorkflowLock, dagID: string, nodeID: string, childSessionID: string, timeoutExtensions: number) {
+    //
+    // Ticket B (method-A — stale-read suppression): the deadline watcher reads
+    // the durable row WITHOUT the workflow lock (spawn.ts readNode). Between
+    // that stale snapshot and this command acquiring the lock, a replan's
+    // nodeExtendTimeout may have moved the deadline into the future. Escalating
+    // then would charge a max_timeout_extensions budget unit for a node that is
+    // no longer overdue — a spurious T8 (the cosmetic residue self-documented
+    // at loop.ts:870-880). The caller passes the deadline it OBSERVED
+    // (node.deadlineMs); this command re-reads the node FRESH under the workflow
+    // lock and, when the deadline has moved strictly past the observed value,
+    // suppresses the escalation (no publish, no budget increment). Budget only
+    // counts a real extension (a deadline that actually moved), not a stale-read
+    // cosmetic recount. Suppression returns void, exactly like a publish, so the
+    // watcher's self-renewal loop (S1) keeps supervising — a running node is
+    // never orphaned (N1). When staleDeadlineMs is omitted (existing callers,
+    // test setups) the guard is inert: back-compat is unconditional publish.
+    const nodeTimeoutEscalated = Effect.fn("Dag.nodeTimeoutEscalated")(function* (lock: WorkflowLock, dagID: string, nodeID: string, childSessionID: string, timeoutExtensions: number, staleDeadlineMs?: number | null) {
       yield* guardWorkflowNotTerminal(dagID, "timeout escalation")
+      if (staleDeadlineMs != null) {
+        const node = yield* store.getNode(dagID, nodeID).pipe(Effect.orDie)
+        if (node && node.status === "running" && node.deadlineMs != null && node.deadlineMs > staleDeadlineMs) return
+      }
       yield* events.publish(DagEvent.NodeTimeoutEscalated, {
         dagID: dagID as ID,
         nodeID: nodeID as never,
@@ -959,8 +979,8 @@ export const layer = Layer.effect(
       nodeSkipped: (dagID, nodeID, reason) => withWorkflowLock(dagID)((lock) => nodeSkipped(lock, dagID, nodeID, reason)),
       nodeCancelled: (dagID, nodeID) => withWorkflowLock(dagID)((lock) => nodeCancelled(lock, dagID, nodeID)),
       nodeRestarted: (dagID, nodeID, childSessionID) => withWorkflowLock(dagID)((lock) => nodeRestarted(lock, dagID, nodeID, childSessionID)),
-      nodeTimeoutEscalated: (dagID, nodeID, childSessionID, timeoutExtensions) =>
-        withWorkflowLock(dagID)((lock) => nodeTimeoutEscalated(lock, dagID, nodeID, childSessionID, timeoutExtensions)),
+      nodeTimeoutEscalated: (dagID, nodeID, childSessionID, timeoutExtensions, staleDeadlineMs) =>
+        withWorkflowLock(dagID)((lock) => nodeTimeoutEscalated(lock, dagID, nodeID, childSessionID, timeoutExtensions, staleDeadlineMs)),
       nodeExtendTimeout: (dagID, nodeID, newDeadlineMs) => withWorkflowLock(dagID)((lock) => nodeExtendTimeout(lock, dagID, nodeID, newDeadlineMs)),
     })
   }),

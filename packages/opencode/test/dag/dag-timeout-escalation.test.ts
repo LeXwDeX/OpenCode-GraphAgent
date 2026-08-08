@@ -5,15 +5,19 @@ import { Database } from "@opencode-ai/core/database/database"
 import { DagProjector } from "@opencode-ai/core/dag/projector"
 import { DagStore } from "@opencode-ai/core/dag/store"
 import { EventV2 } from "@opencode-ai/core/event"
+import { Project } from "@opencode-ai/core/project"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
+import { AbsolutePath } from "@opencode-ai/core/schema"
 import { SessionTable } from "@opencode-ai/core/session/sql"
+import { Model } from "@opencode-ai/schema/model"
+import { Provider } from "@opencode-ai/schema/provider"
 import { Agent } from "@/agent/agent"
 import { Dag, type NodeConfig } from "@/dag/dag"
 import { DagLoop } from "@/dag/runtime/loop"
 import { InstanceRef } from "@/effect/instance-ref"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { SessionPrompt } from "@/session/prompt"
-import { MessageID } from "@/session/schema"
+import { MessageID, PartID, SessionID } from "@/session/schema"
 import { Session } from "@/session/session"
 import { SessionStatus } from "@/session/status"
 import { pollWithTimeout } from "../lib/effect"
@@ -39,23 +43,24 @@ function takeWithin<A>(queue: Queue.Queue<A>, message: string) {
 }
 
 function reply(sessionID: string, text: string): SessionV1.WithParts {
+  const id = MessageID.ascending()
   return {
     info: {
-      id: MessageID.ascending(),
+      id,
       role: "assistant",
       parentID: MessageID.ascending(),
-      sessionID: sessionID as never,
+      sessionID: SessionID.make(sessionID),
       mode: "build",
       agent: "build",
       cost: 0,
       path: { cwd: process.cwd(), root: process.cwd() },
       tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
-      modelID: "test-model" as never,
-      providerID: "test" as never,
+      modelID: Model.ID.make("test-model"),
+      providerID: Provider.ID.make("test"),
       time: { created: Date.now() },
       finish: "stop",
     },
-    parts: text ? [{ type: "text", text }] as never : [],
+    parts: text ? [{ id: PartID.ascending(), sessionID: SessionID.make(sessionID), messageID: id, type: "text", text }] : [],
   }
 }
 
@@ -113,13 +118,31 @@ function loopLayer(input: {
   const created: string[] = []
   let cancelCount = 0
   const session = Layer.mock(Session.Service, {
-    get: () => Effect.succeed({ id: "ses_parent", permission: [], agent: "build" } as never),
+    get: () => Effect.succeed({
+      id: SessionID.make("ses_parent"),
+      slug: "parent",
+      projectID: Project.ID.make("project-1"),
+      directory: process.cwd(),
+      title: "Parent",
+      version: "test",
+      time: { created: 0, updated: 0 },
+      permission: [],
+      agent: "build",
+    }),
     create: (value) =>
       Effect.sync(() => {
         const id = `ses_child_${created.length + 1}`
         created.push(id)
         childTitles.set(id, (value?.title ?? id).replace(" (DAG node)", ""))
-        return { id } as never
+        return {
+          id: SessionID.make(id),
+          slug: "child",
+          projectID: Project.ID.make("project-1"),
+          directory: process.cwd(),
+          title: value?.title ?? id,
+          version: "test",
+          time: { created: 0, updated: 0 },
+        }
       }),
     messages: () => Effect.succeed([]),
   })
@@ -153,7 +176,7 @@ function loopLayer(input: {
       options: {},
       description: "",
       prompt: "",
-      model: { providerID: "test" as never, modelID: "test-model" as never },
+      model: { providerID: Provider.ID.make("test"), modelID: Model.ID.make("test-model") },
       tools: {},
       hooks: {},
     }),
@@ -190,15 +213,15 @@ function runLoopTest<A>(
       const store = yield* DagStore.Service
       const database = yield* Database.Service
       yield* database.db.insert(ProjectTable).values({
-        id: "project-1" as never,
-        worktree: process.cwd() as never,
+        id: Project.ID.make("project-1"),
+        worktree: AbsolutePath.make(process.cwd()),
         sandboxes: [],
       }).run().pipe(Effect.orDie)
       yield* database.db.insert(SessionTable).values({
-        id: "ses_parent" as never,
-        project_id: "project-1" as never,
+        id: SessionID.make("ses_parent"),
+        project_id: Project.ID.make("project-1"),
         slug: "parent",
-        directory: process.cwd() as never,
+        directory: AbsolutePath.make(process.cwd()),
         title: "Parent",
         version: "test",
       }).run().pipe(Effect.orDie)
@@ -215,8 +238,13 @@ function runLoopTest<A>(
       Effect.provideService(InstanceRef, {
         directory: process.cwd(),
         worktree: process.cwd(),
-        project: { id: "project-1" },
-      } as never),
+        project: {
+          id: Project.ID.make("project-1"),
+          worktree: process.cwd(),
+          time: { created: 0, updated: 0 },
+          sandboxes: [],
+        },
+      }),
       Effect.scoped,
     )
   })

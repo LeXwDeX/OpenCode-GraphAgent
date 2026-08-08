@@ -4,8 +4,11 @@ import { Database } from "@opencode-ai/core/database/database"
 import { DagProjector } from "@opencode-ai/core/dag/projector"
 import { DagStore } from "@opencode-ai/core/dag/store"
 import { EventV2 } from "@opencode-ai/core/event"
+import { Project } from "@opencode-ai/core/project"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
+import { AbsolutePath } from "@opencode-ai/core/schema"
 import { SessionTable } from "@opencode-ai/core/session/sql"
+import { Session } from "@opencode-ai/schema/session"
 import { Dag, type NodeConfig } from "@/dag/dag"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { InstanceRef } from "@/effect/instance-ref"
@@ -39,15 +42,15 @@ function runTest<A>(
     return yield* Effect.gen(function* () {
       const database = yield* Database.Service
       yield* database.db.insert(ProjectTable).values({
-        id: "project-1" as never,
-        worktree: process.cwd() as never,
+        id: Project.ID.make("project-1"),
+        worktree: AbsolutePath.make(process.cwd()),
         sandboxes: [],
       }).run().pipe(Effect.orDie)
       yield* database.db.insert(SessionTable).values({
-        id: "ses_parent" as never,
-        project_id: "project-1" as never,
+        id: Session.ID.make("ses_parent"),
+        project_id: Project.ID.make("project-1"),
         slug: "parent",
-        directory: process.cwd() as never,
+        directory: AbsolutePath.make(process.cwd()),
         title: "Parent",
         version: "test",
       }).run().pipe(Effect.orDie)
@@ -59,8 +62,13 @@ function runTest<A>(
       Effect.provideService(InstanceRef, {
         directory: process.cwd(),
         worktree: process.cwd(),
-        project: { id: "project-1" },
-      } as never),
+        project: {
+          id: Project.ID.make("project-1"),
+          worktree: process.cwd(),
+          time: { created: 0, updated: 0 },
+          sandboxes: [],
+        },
+      }),
       Effect.scoped,
     )
   })

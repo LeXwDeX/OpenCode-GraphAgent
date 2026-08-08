@@ -7,6 +7,7 @@ import { EventTable, EventSequenceTable } from "@opencode-ai/core/event/sql"
 import { DagProjector } from "@opencode-ai/core/dag/projector"
 import { DagStore } from "@opencode-ai/core/dag/store"
 import { DagEvent } from "@opencode-ai/schema/dag-event"
+import { Session } from "@opencode-ai/schema/session"
 import { Project } from "@opencode-ai/core/project"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
 import { SessionTable } from "@opencode-ai/core/session/sql"
@@ -50,15 +51,15 @@ function runTest<A>(
     return yield* Effect.gen(function* () {
       const database = yield* Database.Service
       yield* database.db.insert(ProjectTable).values({
-        id: "project-1" as never,
-        worktree: process.cwd() as never,
+        id: Project.ID.make("project-1"),
+        worktree: AbsolutePath.make(process.cwd()),
         sandboxes: [],
       }).run().pipe(Effect.orDie)
       yield* database.db.insert(SessionTable).values({
-        id: "ses_parent" as never,
-        project_id: "project-1" as never,
+        id: Session.ID.make("ses_parent"),
+        project_id: Project.ID.make("project-1"),
         slug: "parent",
-        directory: process.cwd() as never,
+        directory: AbsolutePath.make(process.cwd()),
         title: "Parent",
         version: "test",
       }).run().pipe(Effect.orDie)
@@ -70,8 +71,13 @@ function runTest<A>(
       Effect.provideService(InstanceRef, {
         directory: process.cwd(),
         worktree: process.cwd(),
-        project: { id: "project-1" },
-      } as never),
+        project: {
+          id: Project.ID.make("project-1"),
+          worktree: process.cwd(),
+          time: { created: 0, updated: 0 },
+          sandboxes: [],
+        },
+      }),
       Effect.scoped,
     )
   })
@@ -118,7 +124,7 @@ function setupFKs() {
   return Effect.gen(function* () {
     const { db } = yield* Database.Service
     yield* db.insert(ProjectTable).values({ id: Project.ID.global, worktree: AbsolutePath.make("/project"), sandboxes: [] }).run().pipe(Effect.orDie)
-    yield* db.insert(SessionTable).values({ id: "ses_replay" as never, project_id: Project.ID.global, slug: "replay", directory: "/project", title: "replay", version: "test" }).run().pipe(Effect.orDie)
+    yield* db.insert(SessionTable).values({ id: Session.ID.make("ses_replay"), project_id: Project.ID.global, slug: "replay", directory: "/project", title: "replay", version: "test" }).run().pipe(Effect.orDie)
   })
 }
 
@@ -261,15 +267,15 @@ describe("NodeDeadlineExtended projector fold + replay (Q3)", () => {
         yield* setupFKs()
         const events = yield* EventV2.Service
         const store = yield* DagStore.Service
-        const dagID = "dag_replay_extend" as never
+        const dagID = DagEvent.DagID.descending("dag_replay_extend")
 
-        yield* events.publish(DagEvent.WorkflowCreated, { dagID, projectID: Project.ID.global as never, sessionID: "ses_replay" as never, title: "extend-replay", config: "{}", status: "pending", timestamp: ts(0) })
-        yield* events.publish(DagEvent.NodeRegistered, { dagID, nodeID: "a" as never, name: "A", workerType: "build", dependsOn: [], required: true, timestamp: ts(1) })
+        yield* events.publish(DagEvent.WorkflowCreated, { dagID, projectID: Project.ID.global, sessionID: Session.ID.make("ses_replay"), title: "extend-replay", config: "{}", status: "pending", timestamp: ts(0) })
+        yield* events.publish(DagEvent.NodeRegistered, { dagID, nodeID: DagEvent.NodeID.make("a"), name: "A", workerType: "build", dependsOn: [], required: true, timestamp: ts(1) })
         yield* events.publish(DagEvent.WorkflowStarted, { dagID, timestamp: ts(2) })
-        yield* events.publish(DagEvent.NodeStarted, { dagID, nodeID: "a" as never, childSessionID: "ses_child" as never, deadlineMs: 5_000, wakeEligible: true, timestamp: ts(3) })
+        yield* events.publish(DagEvent.NodeStarted, { dagID, nodeID: DagEvent.NodeID.make("a"), childSessionID: Session.ID.make("ses_child"), deadlineMs: 5_000, wakeEligible: true, timestamp: ts(3) })
         // Escalate, then adjudicate by extending the deadline.
-        yield* events.publish(DagEvent.NodeTimeoutEscalated, { dagID, nodeID: "a" as never, childSessionID: "ses_child" as never, timeoutExtensions: 1, timestamp: ts(4) })
-        yield* events.publish(DagEvent.NodeDeadlineExtended, { dagID, nodeID: "a" as never, deadlineMs: 99_999, timeoutExtensions: 1, timestamp: ts(5) })
+        yield* events.publish(DagEvent.NodeTimeoutEscalated, { dagID, nodeID: DagEvent.NodeID.make("a"), childSessionID: Session.ID.make("ses_child"), timeoutExtensions: 1, timestamp: ts(4) })
+        yield* events.publish(DagEvent.NodeDeadlineExtended, { dagID, nodeID: DagEvent.NodeID.make("a"), deadlineMs: 99_999, timeoutExtensions: 1, timestamp: ts(5) })
 
         const before = yield* store.getNode(dagID, "a")
         expect(before?.deadlineMs).toBe(99_999)
@@ -288,7 +294,7 @@ describe("NodeDeadlineExtended projector fold + replay (Q3)", () => {
         expect(replayed?.escalationPending).toBe(false)
         expect(replayed?.wakeReported).toBe(true)
         expect(replayed?.timeoutExtensions).toBe(1)
-      }).pipe(Effect.provide(projectorLayer)) as Effect.Effect<never>,
+      }).pipe(Effect.provide(projectorLayer)),
     )
   })
 
@@ -298,17 +304,17 @@ describe("NodeDeadlineExtended projector fold + replay (Q3)", () => {
         yield* setupFKs()
         const events = yield* EventV2.Service
         const store = yield* DagStore.Service
-        const dagID = "dag_replay_stale_extend" as never
+        const dagID = DagEvent.DagID.descending("dag_replay_stale_extend")
 
-        yield* events.publish(DagEvent.WorkflowCreated, { dagID, projectID: Project.ID.global as never, sessionID: "ses_replay" as never, title: "stale-extend", config: "{}", status: "pending", timestamp: ts(0) })
-        yield* events.publish(DagEvent.NodeRegistered, { dagID, nodeID: "a" as never, name: "A", workerType: "build", dependsOn: [], required: true, timestamp: ts(1) })
+        yield* events.publish(DagEvent.WorkflowCreated, { dagID, projectID: Project.ID.global, sessionID: Session.ID.make("ses_replay"), title: "stale-extend", config: "{}", status: "pending", timestamp: ts(0) })
+        yield* events.publish(DagEvent.NodeRegistered, { dagID, nodeID: DagEvent.NodeID.make("a"), name: "A", workerType: "build", dependsOn: [], required: true, timestamp: ts(1) })
         yield* events.publish(DagEvent.WorkflowStarted, { dagID, timestamp: ts(2) })
-        yield* events.publish(DagEvent.NodeStarted, { dagID, nodeID: "a" as never, childSessionID: "ses_child" as never, deadlineMs: 5_000, wakeEligible: true, timestamp: ts(3) })
-        yield* events.publish(DagEvent.NodeDeadlineExtended, { dagID, nodeID: "a" as never, deadlineMs: 50_000, timeoutExtensions: 1, timestamp: ts(4) })
+        yield* events.publish(DagEvent.NodeStarted, { dagID, nodeID: DagEvent.NodeID.make("a"), childSessionID: Session.ID.make("ses_child"), deadlineMs: 5_000, wakeEligible: true, timestamp: ts(3) })
+        yield* events.publish(DagEvent.NodeDeadlineExtended, { dagID, nodeID: DagEvent.NodeID.make("a"), deadlineMs: 50_000, timeoutExtensions: 1, timestamp: ts(4) })
         // Node completes AFTER the extension was logged...
-        yield* events.publish(DagEvent.NodeCompleted, { dagID, nodeID: "a" as never, output: "done", durationMs: 0, timestamp: ts(5) })
+        yield* events.publish(DagEvent.NodeCompleted, { dagID, nodeID: DagEvent.NodeID.make("a"), output: "done", durationMs: 0, timestamp: ts(5) })
         // ...then a stale/late extension races in (crash-recovery replay order).
-        yield* events.publish(DagEvent.NodeDeadlineExtended, { dagID, nodeID: "a" as never, deadlineMs: 99_999, timeoutExtensions: 1, timestamp: ts(6) })
+        yield* events.publish(DagEvent.NodeDeadlineExtended, { dagID, nodeID: DagEvent.NodeID.make("a"), deadlineMs: 99_999, timeoutExtensions: 1, timestamp: ts(6) })
 
         const row = yield* store.getNode(dagID, "a")
         // The projector's status='running' WHERE guard means the stale fold is a
@@ -317,7 +323,7 @@ describe("NodeDeadlineExtended projector fold + replay (Q3)", () => {
         expect(row?.status).toBe("completed")
         expect(row?.deadlineMs).toBe(50_000)
         expect(row?.output).toBe("done")
-      }).pipe(Effect.provide(projectorLayer)) as Effect.Effect<never>,
+      }).pipe(Effect.provide(projectorLayer)),
     )
   })
 })
