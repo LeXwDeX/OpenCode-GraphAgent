@@ -133,9 +133,8 @@ against the code, with fix waves through the audit loop).
 
 ## Choosing and Combining
 
-Playbooks compose: Large Engineering embeds Deep Review at its gate; Deep
-Speculation can front-load any of them. Selection still obeys Execution Mode
-Selection and the Depth Ladder — a playbook is justified only when the task
-shows both a scenario and a structural signal, its wave count meets the
+Playbooks compose inside one live DAG: Large Engineering embeds Deep Review at
+its gate; Deep Speculation can front-load any of them. Selection still obeys
+Execution Mode Selection and the Depth Ladder — its wave count meets the
 ladder's minimum for the target size, and explicit user constraints always
 override the playbook shape.
