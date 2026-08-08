@@ -4,8 +4,8 @@
 
 **Evidence:** `.scratch/batch-b/evidence.md#f4--dagstore-双重断言`
 **Branch:** `test/dag-store-fixtures`
-**Blocked by:** 04（批次串行；代码写集独立）
-**Status:** blocked
+**Blocked by:** None（04 已完成；代码写集独立）
+**Status:** ready-for-agent
 
 - [ ] 两处双重断言都消失，不能只修原评审记录的第一处
 - [ ] fixture 缺少/签名漂移的方法能在 typecheck 时暴露
