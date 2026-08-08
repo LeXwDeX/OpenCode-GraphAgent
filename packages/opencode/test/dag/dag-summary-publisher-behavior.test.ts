@@ -1,5 +1,5 @@
 import { describe, expect } from "bun:test"
-import { DateTime, Effect, Layer } from "effect"
+import { DateTime, Deferred, Effect, Layer } from "effect"
 import { DagStore, type WorkflowRow, type WorkflowSummary } from "@opencode-ai/core/dag/store"
 import { DagEvent } from "@opencode-ai/schema/dag-event"
 import { EventV2Bridge } from "@/event-v2-bridge"
@@ -18,6 +18,11 @@ interface SummaryEmission {
 
 interface StoreControl {
   failures: number
+  failuresAfterGate: number
+  readGate?: {
+    started: Deferred.Deferred<void>
+    release: Deferred.Deferred<void>
+  }
   reads: Map<string, number>
   lookups: Map<string, number>
   projects: Map<string, string>
@@ -29,15 +34,16 @@ interface EventControl {
   listener?: (event: never) => Effect.Effect<void>
 }
 
-function control() {
+function control(): StoreControl {
   return {
     failures: 0,
+    failuresAfterGate: 0,
     reads: new Map<string, number>(),
     lookups: new Map<string, number>(),
     projects: new Map<string, string>(),
     sessions: new Map<string, string>(),
     summaries: new Map<string, WorkflowSummary[]>(),
-  } satisfies StoreControl
+  }
 }
 
 function workflow(id: string, sessionId: string, projectId: string): WorkflowRow {
@@ -81,13 +87,24 @@ function runtime(state: StoreControl, bus: EventControl) {
         return sid ? workflow(dagID, sid, state.projects.get(dagID) ?? "global") : undefined
       }),
     getWorkflowSummaries: (sessionID) =>
-      Effect.sync(() => {
+      Effect.gen(function* () {
         state.reads.set(sessionID, (state.reads.get(sessionID) ?? 0) + 1)
         if (state.failures > 0) {
           state.failures -= 1
           throw new Error("simulated summary read failure")
         }
-        return state.summaries.get(sessionID) ?? []
+        const summaries = state.summaries.get(sessionID) ?? []
+        const gate = state.readGate
+        state.readGate = undefined
+        if (gate) {
+          yield* Deferred.succeed(gate.started, undefined)
+          yield* Deferred.await(gate.release)
+        }
+        if (state.failuresAfterGate > 0) {
+          state.failuresAfterGate -= 1
+          throw new Error("simulated summary read failure after gate")
+        }
+        return summaries
       }),
   })
   const events = Layer.mock(EventV2Bridge.Service, {
@@ -227,6 +244,117 @@ describe("DagSummaryPublisher behavior", () => {
         expect(state.lookups.get("dag-burst")).toBe(1)
         expect(collector.emissions).toEqual([
           { sessionID: "ses-burst", summaries: [summary("dag-burst", 5)] },
+        ])
+      }),
+    ).pipe(Effect.provide(runtime(state, bus)))
+  })
+
+  it.instance("an event arriving during an in-flight read schedules a fresh recompute", () => {
+    const state = control()
+    const bus = {} satisfies EventControl
+    state.sessions.set("dag-inflight", "ses-inflight")
+    state.summaries.set("ses-inflight", [summary("dag-inflight", 1)])
+
+    return withCollector((collector) =>
+      Effect.gen(function* () {
+        const started = yield* Deferred.make<void>()
+        const release = yield* Deferred.make<void>()
+        state.readGate = { started, release }
+
+        yield* (yield* DagSummaryPublisher.Service).init()
+        yield* publishNodeEvents(bus, "dag-inflight", 1)
+        yield* Deferred.await(started).pipe(Effect.timeout("1 second"))
+
+        state.summaries.set("ses-inflight", [summary("dag-inflight", 2)])
+        yield* publishNodeEvents(bus, "dag-inflight", 1)
+        yield* Effect.sleep("20 millis")
+        yield* Deferred.succeed(release, undefined)
+
+        yield* pollWithTimeout(
+          Effect.sync(() => (collector.emissions.at(-1)?.summaries[0]?.completedNodes === 2 ? true : undefined)),
+          () =>
+            `event coalesced during an in-flight read was lost (lookups=${state.lookups.get("dag-inflight") ?? 0}, reads=${state.reads.get("ses-inflight") ?? 0}, emissions=${collector.emissions.length})`,
+          "500 millis",
+        )
+
+        expect(state.reads.get("ses-inflight")).toBe(2)
+        expect(collector.emissions.at(-1)?.summaries).toEqual([summary("dag-inflight", 2)])
+      }),
+    ).pipe(Effect.provide(runtime(state, bus)))
+  })
+
+  it.instance("another DAG event arriving during a shared session read schedules a fresh recompute", () => {
+    const state = control()
+    const bus = {} satisfies EventControl
+    state.sessions.set("dag-session-a", "ses-shared")
+    state.sessions.set("dag-session-b", "ses-shared")
+    state.summaries.set("ses-shared", [summary("dag-session-a", 1)])
+
+    return withCollector((collector) =>
+      Effect.gen(function* () {
+        const started = yield* Deferred.make<void>()
+        const release = yield* Deferred.make<void>()
+        state.readGate = { started, release }
+
+        yield* (yield* DagSummaryPublisher.Service).init()
+        yield* publishNodeEvents(bus, "dag-session-a", 1)
+        yield* Deferred.await(started).pipe(Effect.timeout("1 second"))
+
+        state.summaries.set("ses-shared", [summary("dag-session-a", 2)])
+        yield* publishNodeEvents(bus, "dag-session-b", 1)
+        yield* Effect.sleep("80 millis")
+        yield* Deferred.succeed(release, undefined)
+
+        yield* pollWithTimeout(
+          Effect.sync(() => (collector.emissions.at(-1)?.summaries[0]?.completedNodes === 2 ? true : undefined)),
+          () =>
+            `shared session event was lost (reads=${state.reads.get("ses-shared") ?? 0}, emissions=${collector.emissions.length})`,
+          "500 millis",
+        )
+
+        expect(state.reads.get("ses-shared")).toBe(2)
+        expect(state.lookups).toEqual(
+          new Map([
+            ["dag-session-a", 1],
+            ["dag-session-b", 1],
+          ]),
+        )
+      }),
+    ).pipe(Effect.provide(runtime(state, bus)))
+  })
+
+  it.instance("an event arriving during a failed in-flight read schedules a fresh recompute", () => {
+    const state = control()
+    const bus = {} satisfies EventControl
+    state.failuresAfterGate = 1
+    state.sessions.set("dag-failed-inflight", "ses-failed-inflight")
+    state.summaries.set("ses-failed-inflight", [summary("dag-failed-inflight", 1)])
+
+    return withCollector((collector) =>
+      Effect.gen(function* () {
+        const started = yield* Deferred.make<void>()
+        const release = yield* Deferred.make<void>()
+        state.readGate = { started, release }
+
+        yield* (yield* DagSummaryPublisher.Service).init()
+        yield* publishNodeEvents(bus, "dag-failed-inflight", 1)
+        yield* Deferred.await(started).pipe(Effect.timeout("1 second"))
+
+        state.summaries.set("ses-failed-inflight", [summary("dag-failed-inflight", 2)])
+        yield* publishNodeEvents(bus, "dag-failed-inflight", 1)
+        yield* Effect.sleep("20 millis")
+        yield* Deferred.succeed(release, undefined)
+
+        yield* pollWithTimeout(
+          Effect.sync(() => (collector.emissions.at(-1)?.summaries[0]?.completedNodes === 2 ? true : undefined)),
+          () =>
+            `event coalesced during a failed in-flight read was lost (reads=${state.reads.get("ses-failed-inflight") ?? 0}, emissions=${collector.emissions.length})`,
+          "500 millis",
+        )
+
+        expect(state.reads.get("ses-failed-inflight")).toBe(2)
+        expect(collector.emissions).toEqual([
+          { sessionID: "ses-failed-inflight", summaries: [summary("dag-failed-inflight", 2)] },
         ])
       }),
     ).pipe(Effect.provide(runtime(state, bus)))

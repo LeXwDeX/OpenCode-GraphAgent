@@ -1,6 +1,6 @@
 export * as DagSummaryPublisher from "./summary-publisher"
 
-import { Effect, Layer, Scope, Context } from "effect"
+import { Cause, Effect, Exit, Layer, Scope, Context } from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { InstanceState } from "@/effect/instance-state"
 import { EventV2Bridge } from "@/event-v2-bridge"
@@ -75,13 +75,46 @@ export const layer = Layer.effect(
         // removed entirely, correctness is unchanged — only more DagStore
         // reads would occur. This satisfies the "stateless derived view"
         // contract: no cached summary is ever served from this map.
-        const pending = new Set<string>()
+        const pending = new Map<string, boolean>()
         // Second coalescing tier keyed by workspace/dagID: node events don't
         // carry a sessionID, and resolving it eagerly meant one getWorkflow
         // query PER EVENT before the debounce window could absorb the burst
         // (P1-4). Resolve the sessionID once after the window, then hand off
         // to the workspace/session debounce.
-        const pendingByDag = new Set<string>()
+        const pendingByDag = new Map<string, boolean>()
+
+        const coalesceLatest = <E, R>(
+          active: Map<string, boolean>,
+          key: string,
+          body: () => Effect.Effect<void, E, R>,
+        ) =>
+          Effect.gen(function* () {
+            if (active.has(key)) {
+              active.set(key, true)
+              return
+            }
+            active.set(key, false)
+            yield* Effect.gen(function* () {
+              for (;;) {
+                yield* Effect.sleep("50 millis")
+                // Events during the debounce window are absorbed by the read
+                // that follows; only events racing the read require a rerun.
+                active.set(key, false)
+                const outcome = yield* body().pipe(Effect.exit)
+                const repeat = yield* Effect.sync(() => {
+                  if (active.get(key)) return true
+                  active.delete(key)
+                  return false
+                })
+                if (Exit.isFailure(outcome) && Cause.hasInterrupts(outcome.cause)) {
+                  return yield* Effect.failCause(outcome.cause)
+                }
+                if (repeat) continue
+                if (Exit.isFailure(outcome)) return yield* Effect.failCause(outcome.cause)
+                return
+              }
+            }).pipe(Effect.ensuring(Effect.sync(() => active.delete(key))))
+          })
 
         const publishForSession = (sessionID: string, workspace: string | undefined) =>
           Effect.gen(function* () {
@@ -98,36 +131,19 @@ export const layer = Layer.effect(
           })
 
         const schedulePublish = (sessionID: string, workspace: string | undefined) =>
-          Effect.gen(function* () {
-            const key = `${workspace ?? ""}\0${sessionID}`
-            // Coalesce: if a recompute is already scheduled for this route,
-            // let it absorb this trigger rather than queueing a second read.
-            // The coalesced early return MUST NOT touch `pending` — only the
-            // owning fiber clears its own slot, otherwise a coalesced caller
-            // would delete the owner's entry and reopen the window.
-            if (pending.has(key)) return
-            pending.add(key)
-            yield* Effect.gen(function* () {
-              yield* Effect.sleep("50 millis")
-              yield* publishForSession(sessionID, workspace)
-            }).pipe(Effect.ensuring(Effect.sync(() => pending.delete(key))))
-          })
+          coalesceLatest(pending, `${workspace ?? ""}\0${sessionID}`, () => publishForSession(sessionID, workspace))
 
         const schedulePublishByDag = (dagID: string, workspace: string | undefined) =>
-          Effect.gen(function* () {
-            const key = `${workspace ?? ""}\0${dagID}`
-            if (pendingByDag.has(key)) return
-            pendingByDag.add(key)
-            yield* Effect.gen(function* () {
-              yield* Effect.sleep("50 millis")
+          coalesceLatest(pendingByDag, `${workspace ?? ""}\0${dagID}`, () =>
+            Effect.gen(function* () {
               const wf = yield* store.getWorkflow(dagID)
               if (wf?.projectId !== ctx.project.id) return
               // Hand off to the session-level debounce (not publishForSession
               // directly) so a concurrent session-keyed window absorbs this
               // trigger instead of producing a duplicate read.
               yield* schedulePublish(wf.sessionId, workspace)
-            }).pipe(Effect.ensuring(Effect.sync(() => pendingByDag.delete(key))))
-          })
+            }),
+          )
 
         const unsubscribe = yield* events.listen((evt) => {
           if (!SUMMARY_TRIGGER_EVENTS.some((def) => def.type === evt.type)) return Effect.void
