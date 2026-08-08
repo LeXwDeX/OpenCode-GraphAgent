@@ -6,8 +6,10 @@
 
 **Blocked by:** None — can start immediately
 
-**Status:** ready-for-agent
+**Status:** closed（PR #186，merge commit `4ddeaf2fc`）
 
-- [ ] 先复现并确认根因（计时 vs 其他），根因记录入票
-- [ ] 修复后本地重复跑（≥5 次）+ 模拟负载下稳定绿
-- [ ] 无新增固定 sleep 反模式
+**Completion evidence:** flaky 稳定化与验证随 PR #186 合入 `dev`，并随 PR #188 通过 main 全量门禁。
+
+- [x] 先复现并确认根因（计时 vs 其他），根因记录入票
+- [x] 修复后本地重复跑（≥5 次）+ 模拟负载下稳定绿
+- [x] 无新增固定 sleep 反模式

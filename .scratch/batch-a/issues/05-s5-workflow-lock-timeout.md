@@ -6,10 +6,12 @@
 
 **Blocked by:** None — can start immediately
 
-**Status:** ready-for-agent
+**Status:** closed（PR #186，merge commit `4ddeaf2fc`）
 
-- [ ] 唯一改动点在 withWorkflowLock 包装层（一行 + 常量）
-- [ ] 30s 超限产生 TimeoutException，编排器按既有 error_class 分诊规则处置
-- [ ] 无新错误类、无 per-caller 分支的断言
-- [ ] watchdog 自续行为在锁超时后仍正确的测试
-- [ ] dag 测试套件 + typecheck 绿
+**Completion evidence:** 批次 A 实现与测试随 PR #186 合入 `dev`，并随 PR #188 通过 main 全量门禁。
+
+- [x] 唯一改动点在 withWorkflowLock 包装层（一行 + 常量）
+- [x] 30s 超限产生 TimeoutException，编排器按既有 error_class 分诊规则处置
+- [x] 无新错误类、无 per-caller 分支的断言
+- [x] watchdog 自续行为在锁超时后仍正确的测试
+- [x] dag 测试套件 + typecheck 绿

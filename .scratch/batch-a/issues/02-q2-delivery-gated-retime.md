@@ -6,10 +6,12 @@
 
 **Blocked by:** None — can start immediately
 
-**Status:** ready-for-agent
+**Status:** closed（PR #186，merge commit `4ddeaf2fc`）
 
-- [ ] skip 合取项落在 re-time 唯一发起点，全 re-time 触发路径逐条覆盖（测试枚举，不只抄规格）
-- [ ] 初始升级（deadline ⟹ 首次 wake）不受门控影响
-- [ ] 裁决写入后 re-time 能力恢复的测试
-- [ ] watchdog 无状态写（仅提案）的断言保持
-- [ ] dag 测试套件 + typecheck 绿
+**Completion evidence:** 批次 A 实现与测试随 PR #186 合入 `dev`，并随 PR #188 通过 main 全量门禁。
+
+- [x] skip 合取项落在 re-time 唯一发起点，全 re-time 触发路径逐条覆盖（测试枚举，不只抄规格）
+- [x] 初始升级（deadline ⟹ 首次 wake）不受门控影响
+- [x] 裁决写入后 re-time 能力恢复的测试
+- [x] watchdog 无状态写（仅提案）的断言保持
+- [x] dag 测试套件 + typecheck 绿
