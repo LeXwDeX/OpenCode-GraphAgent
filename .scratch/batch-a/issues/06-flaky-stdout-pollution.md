@@ -6,9 +6,11 @@
 
 **Blocked by:** None — can start immediately
 
-**Status:** ready-for-agent
+**Status:** closed（PR #186，merge commit `4ddeaf2fc`）
 
-- [ ] 污染源定位经可复现测试验证（修复前红、修复后绿）
-- [ ] run-process 9 项断言不削弱、不删除，本地重复跑（≥5 次）稳定绿
-- [ ] ShareNext 的 stdout 污染分量同步修复（计时问题归 07 票）
-- [ ] opencode 包测试套全绿（除豁免清单剩余项）
+**Completion evidence:** flaky 根因修复与验证随 PR #186 合入 `dev`，并随 PR #188 通过 main 全量门禁。
+
+- [x] 污染源定位经可复现测试验证（修复前红、修复后绿）
+- [x] run-process 9 项断言不削弱、不删除，本地重复跑（≥5 次）稳定绿
+- [x] ShareNext 的 stdout 污染分量同步修复（计时问题归 07 票）
+- [x] opencode 包测试套全绿（除豁免清单剩余项）

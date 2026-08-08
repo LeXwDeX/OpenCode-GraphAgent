@@ -4,10 +4,12 @@
 
 **Blocked by:** 03 — Q3：NodeDeadlineExtended durable 事件 + guard 前移命令层
 
-**Status:** ready-for-agent
+**Status:** closed（PR #186，merge commit `4ddeaf2fc`）
 
-- [ ] SDK 再生脚本执行，生成物提交
-- [ ] 事件联合类型包含 NodeDeadlineExtended，消费方编译绿
-- [ ] `check:generated`（SDK + client）零 diff
-- [ ] 涉及响应/事件形状的 httpapi-exercise 场景已更新（如有）
-- [ ] 全量单元测试（含 httpapi 契约）绿
+**Completion evidence:** 批次 A 生成物与消费者更新随 PR #186 合入 `dev`，并随 PR #188 通过 main 全量门禁。
+
+- [x] SDK 再生脚本执行，生成物提交
+- [x] 事件联合类型包含 NodeDeadlineExtended，消费方编译绿
+- [x] `check:generated`（SDK + client）零 diff
+- [x] 涉及响应/事件形状的 httpapi-exercise 场景已更新（如有）
+- [x] 全量单元测试（含 httpapi 契约）绿

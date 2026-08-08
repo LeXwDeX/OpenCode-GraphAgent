@@ -4,9 +4,11 @@
 
 **Blocked by:** 01、02、03、04、05、06、07、08 全部合入 dev
 
-**Status:** ready-for-agent
+**Status:** closed（PR #188，merge commit `e837dcbfa`）
 
-- [ ] dev 最新 push 的 CI 四项检查全绿（Typecheck、Unit、E2E linux、E2E windows）
-- [ ] 豁免清单清零或逐项重新裁决留档
-- [ ] PR 描述附批次 A 交付清单（Q1/Q2/Q3/S5 + flaky 根因修复）与两轮深审 PASS 证据链接
-- [ ] 合并后 main 可手动 release-fork
+**Completion evidence:** dev→main 晋级 PR #188 的 Typecheck、Unit Tests (linux)、E2E Tests (linux/windows) 全部通过并合入。
+
+- [x] dev 最新 push 的 CI 四项检查全绿（Typecheck、Unit、E2E linux、E2E windows）
+- [x] 豁免清单清零或逐项重新裁决留档
+- [x] PR 描述附批次 A 交付清单（Q1/Q2/Q3/S5 + flaky 根因修复）与两轮深审 PASS 证据链接
+- [x] 合并后 main 可手动 release-fork

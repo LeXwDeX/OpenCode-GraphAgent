@@ -1,20 +1,28 @@
 import { describe, expect, test } from "bun:test"
-import { Cause, Duration, Effect, Exit, Fiber, Option, Stream } from "effect"
+import { Cause, Deferred, Duration, Effect, Exit, Fiber, Option, Stream } from "effect"
+import { FetchHttpClient } from "effect/unstable/http"
 import * as TestClock from "effect/testing/TestClock"
 import { LLM, LLMError, LLMEvent } from "../src"
 import * as OpenAIChat from "../src/protocols/openai-chat"
 import { HttpOptions, Model, mergeHttpOptions } from "../src/schema"
 import { LLMClient } from "../src/route"
 import { testEffect } from "./lib/effect"
-import { dynamicResponse, fixedResponse } from "./lib/http"
+import { dynamicResponse, fixedResponse, runtimeLayer } from "./lib/http"
 import { deltaChunk } from "./lib/openai-chunks"
-import { sseEvents } from "./lib/sse"
+import { sseEvents, sseRaw } from "./lib/sse"
 
 const model = Model.make({ id: "fake-model", provider: "fake", route: OpenAIChat.route })
 
-const request = (timeout?: number) =>
+const request = (timeout?: number, baseURL?: string) =>
   LLM.request({
-    model,
+    model:
+      baseURL === undefined
+        ? model
+        : Model.make({
+            id: "fake-model",
+            provider: "fake",
+            route: OpenAIChat.route.with({ endpoint: { baseURL } }),
+          }),
     prompt: "Say hello.",
     http: timeout === undefined ? undefined : { timeout: Duration.millis(timeout) },
   })
@@ -24,6 +32,23 @@ const hangingHeaders = dynamicResponse(() => Effect.never)
 const hangingBody = dynamicResponse((input) =>
   Effect.sync(() =>
     input.respond(new ReadableStream({ start() {} }), { headers: { "content-type": "text/event-stream" } }),
+  ),
+)
+
+const stalledAfterFirstFrame = dynamicResponse((input) =>
+  Effect.sync(() =>
+    input.respond(
+      new ReadableStream({
+        start(controller) {
+          controller.enqueue(
+            new TextEncoder().encode(
+              sseRaw(`data: ${JSON.stringify(deltaChunk({ role: "assistant", content: "Hello" }))}`),
+            ),
+          )
+        },
+      }),
+      { headers: { "content-type": "text/event-stream" } },
+    ),
   ),
 )
 
@@ -37,7 +62,59 @@ const expectTimeoutExit = (exit: Exit.Exit<readonly LLMEvent[], LLMError>) => {
   expect(error.reason).toMatchObject({ _tag: "Transport", kind: "Timeout" })
 }
 
+const waitForFence = <A>(name: string, promise: Promise<A>) =>
+  Effect.promise(() => promise).pipe(
+    Effect.timeout(Duration.seconds(2)),
+    Effect.mapError(() => new Error(`${name} was not observed within 2000ms`)),
+  )
+
+const timeoutProvider = () => {
+  const requestReceived = Promise.withResolvers<void>()
+  const responseCanceled = Promise.withResolvers<void>()
+  const encoder = new TextEncoder()
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch() {
+      requestReceived.resolve()
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(encoder.encode(": connected\n\n"))
+          },
+          cancel() {
+            responseCanceled.resolve()
+          },
+        }),
+        { headers: { "content-type": "text/event-stream" } },
+      )
+    },
+  })
+  return { server, requestReceived: requestReceived.promise, responseCanceled: responseCanceled.promise }
+}
+
+const networkRuntime = runtimeLayer(FetchHttpClient.layer)
+
 describe("http transport timeout", () => {
+  testEffect(networkRuntime).live(
+    "cancels the provider response stream when a real HTTP request times out",
+    () =>
+      Effect.gen(function* () {
+        const provider = yield* Effect.acquireRelease(
+          Effect.sync(timeoutProvider),
+          (fixture) => Effect.promise(() => fixture.server.stop(true)),
+        )
+        const fiber = yield* LLMClient.stream(request(200, provider.server.url.origin)).pipe(
+          Stream.runCollect,
+          Effect.forkScoped,
+        )
+
+        yield* waitForFence("provider request", provider.requestReceived)
+        expectTimeoutExit(yield* Fiber.join(fiber).pipe(Effect.exit))
+        yield* waitForFence("provider response cancellation", provider.responseCanceled)
+      }),
+  )
+
   testEffect(hangingHeaders).effect(
     "ends the stream with a Timeout error when the provider never sends response headers",
     () =>
@@ -55,6 +132,31 @@ describe("http transport timeout", () => {
         const fiber = yield* LLMClient.stream(request(1000)).pipe(Stream.runCollect, Effect.forkChild)
         yield* TestClock.adjust(2000)
         expectTimeoutExit(yield* Fiber.join(fiber).pipe(Effect.exit))
+      }),
+  )
+
+  testEffect(stalledAfterFirstFrame).effect(
+    "delivers the first frame before timing out the next inter-frame gap",
+    () =>
+      Effect.gen(function* () {
+        const firstFrameDelivered = yield* Deferred.make<void>()
+        const fiber = yield* LLMClient.stream(request(1000)).pipe(
+          Stream.tap((event) =>
+            LLMEvent.is.textDelta(event) && event.text === "Hello"
+              ? Deferred.succeed(firstFrameDelivered, undefined)
+              : Effect.void,
+          ),
+          Stream.runCollect,
+          Effect.forkChild,
+        )
+
+        yield* Deferred.await(firstFrameDelivered)
+        yield* TestClock.adjust(2000)
+        yield* Effect.yieldNow
+
+        const exit = fiber.pollUnsafe()
+        if (exit === undefined) throw new Error("expected the stalled stream to time out")
+        expectTimeoutExit(exit)
       }),
   )
 

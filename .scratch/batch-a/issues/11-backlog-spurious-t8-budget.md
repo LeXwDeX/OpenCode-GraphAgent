@@ -14,9 +14,14 @@
 
 **Blocked by:** None（独立设计决策）
 
-**Status:** backlog（需先裁决 A/B/C，非 ready-for-agent）
+**Status:** closed（方案 A 已实施 — PR #189，commit b35630486）
 
-- [ ] 裁决修复方向（A/B/C，含锁交互与预算语义影响面）
-- [ ] 按裁决实施 + 测试（含陈旧读复现场景）
-- [ ] 若 C：ADR + 转移表语义注记落地
-- [ ] typecheck + dag 套件绿
+## 裁决与实施记录（batch-a-residuals DAG，终审 PASS）
+- 裁决：方案 A（锁内新鲜读）——watchdog 以 staleDeadlineMs 守卫判定：陈旧读触发的延长被新鲜读否决时不发布 NodeDeadlineExtended、不递增 timeoutExtensions
+- 真红→绿：test/dag/dag-retime-stale-read.test.ts，case1（陈旧读抑制）vs case2（真实超时延长）对照
+- 不变式保持：-2/0/1 三值契约、N1 监督不变式（running 节点总有 watcher）
+- 对抗审查两项开放担忧裁决：U1（Effect.timeout 败者中断产生孤立节点）经 Effect v4 源码分析 REFUTED（TimeoutError=Cause.Fail，raceAllFirst 败者中断不经 hasInterrupts 匹配）；N1（抑制守卫 >staleDeadlineMs 缺 >now）经三方一致论证为有界自愈（下一 tick 必发布，延迟 ≤1 escalateIntervalMs，预算不丢）
+
+- [x] 裁决修复方向（A/B/C，含锁交互与预算语义影响面）
+- [x] 按裁决实施 + 测试（含陈旧读复现场景）
+- [x] typecheck + dag 套件绿

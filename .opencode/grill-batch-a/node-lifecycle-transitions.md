@@ -8,7 +8,9 @@
 
 ## 状态空间
 
-**主状态**（workflow_node.status）：`pending` / `queued` / `running` / 终态 `completed` / `failed` / `cancelled` / `skipped`
+**主状态**（workflow_node.status）：`pending` / `queued` / `running` / 终态 `completed` / `failed` / `skipped`
+
+> **节点级无独立 `cancelled` 终态**（method-A 对齐实现）：`NodeCancelled` 事件投影为 `status=failed` + `error_reason='cancelled via replan'`，取消语义经 error_reason 承载，行永不持有 `status='cancelled'`（`NodeStatus` 枚举无 CANCELLED，`getValidNextNodeStatuses` 对任何 from 均不返回 cancelled）。工作流级 `cancelled`（`WorkflowStatusProjection.cancelled`）是合法独立终态，与节点级无关。见 T5。
 
 **running 扩展维度**（子状态）：
 | 维度 | 语义 | 契约来源 |
@@ -26,7 +28,7 @@
 | T2 | queued | nodeStarted | runtime spawn | running | **清 escalation_pending + 重置 timeout_extensions=0**（新 attempt） | 子会话启动 | [现状] |
 | T3 | running | nodeCompleted | 子会话结果 | completed | **清 escalation_pending**（终态无裁决对象） | 结果交付（终态交付臂） | [目标] ADR-0001 |
 | T4 | running/queued | nodeFailed（reason + trigger） | 子会话失败 / watchdog cap / recovery | failed | **清 escalation_pending**；trigger 入 error 语义 | `[DAG Node Result]`/wake 承载 reason+trigger（错误即状态→处置依据） | [目标] ADR-0001 |
-| T5 | pending/queued/running | nodeCancelled | replan cancel / workflow cancel | cancelled | **清 escalation_pending**（cancel 即裁决） | 取消交付 | [目标] ADR-0001 |
+| T5 | pending/queued/running | nodeCancelled | replan cancel / workflow cancel | failed(cancelled) | **status=failed + error_reason='cancelled via replan' + 清 escalation_pending**（cancel 即裁决；节点级无独立 cancelled 终态，取消语义经 error_reason 承载） | 取消交付 | [目标] ADR-0001 |
 | T6 | pending/queued | nodeSkipped | 依赖失败级联 | skipped | — | 跳过级联 | [现状] |
 | T7 | failed | nodeRestarted | replan restart | running | 清旗 + 重置计数（新 attempt） | 重试 | [现状] |
 | T8 | running | nodeTimeoutEscalated | **watchdog（提议者）** | running | timeout_extensions+1、escalation_pending=true、wake re-arm（wake_reported=false） | `[DAG Node Timeout]` wake（extend 或 cancel 的裁决请求） | [现状] |

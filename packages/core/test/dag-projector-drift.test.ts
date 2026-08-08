@@ -67,3 +67,14 @@ describe("projector from-guards vs declared transition tables", () => {
 // third encoding of the same machine with zero production callers — a
 // capability reservoir kept for the event-semantics mapping. It is exercised
 // by dag-core.test.ts only and intentionally not welded here.
+//
+// Note (ticket A, method-A): NodeStatusProjection.cancelled.to === "failed"
+// is intentional, not a missing target. NodeCancelled has no independent
+// terminal status — the NodeStatus enum has no CANCELLED and
+// getValidNextNodeStatuses never returns cancelled, so a node row can never
+// hold status="cancelled". The drift test passes for cancelled because
+// "failed" is a legal target from every cancelled.from state; a phantom
+// node-level "cancelled" target is what this alignment rules out. The
+// cancellation marker rides on error_reason ("cancelled via replan"), locked
+// by dag-node-cancelled-projection.test.ts and the opencode canonical proof
+// at packages/opencode/test/dag/dag-escalation-clear-flag.test.ts:130-148.
