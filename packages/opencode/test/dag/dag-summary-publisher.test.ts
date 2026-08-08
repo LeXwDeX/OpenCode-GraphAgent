@@ -54,11 +54,11 @@ describe("DagSummaryPublisher contract (stateless derived view)", () => {
       path.resolve("src/dag/runtime/summary-publisher.ts"),
       "utf-8",
     )
-    // No module-level mutable Map/Set. The `pending` Set lives inside
+    // No module-level mutable Map/Set. The `pending` Map lives inside
     // the InstanceState closure, not at module level.
     expect(src).not.toMatch(/^const\s+\w+\s*=\s*new\s+(Map|Set)\b/m)
     expect(src).not.toMatch(/^let\s+\w+\s*=\s*new\s+(Map|Set)\b/m)
-    // The pending Set is declared inside the InstanceState.make closure.
-    expect(src).toMatch(/const pending = new Set<string>/)
+    // The pending Map is declared inside the InstanceState.make closure.
+    expect(src).toMatch(/const pending = new Map<string, boolean>/)
   })
 })
