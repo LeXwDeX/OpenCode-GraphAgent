@@ -5,8 +5,8 @@
 **Spec:** `.scratch/batch-b/abort-path-contracts.md` 的 Requirement 3
 **Evidence:** `.scratch/batch-b/evidence.md#transport-mid-stream-stall`
 **Branch:** `test/midstream-timeout`
-**Blocked by:** 02（共同修改 `packages/llm/test/transport-timeout.test.ts`）
-**Status:** blocked
+**Blocked by:** None（02 已完成）
+**Status:** ready-for-agent
 
 - [ ] 用 fence 证明 timeout 前合法首帧已经交付给消费者
 - [ ] 用 TestClock 越过下一帧间隔，随后得到现有 Transport/Timeout
