@@ -318,27 +318,35 @@ describe("Dag timeout escalation fixes (unit)", () => {
   it("retries transient store read failures instead of exiting supervision (R13)", async () => {
     let reads = 0
     let escalations = 0
-    const dagLayer = Layer.mock(Dag.Service, {
-      store: {
-        getNode: () =>
-          Effect.sync(() => {
-            reads++
-            // 3 transient failures (e.g. SQLite lock blips) — the watcher
-            // must survive them and keep supervising.
-            if (reads <= 3) throw new Error("database locked")
-            return makeNodeRow({
-              id: "a",
-              workflowId: "dag-r13",
-              name: "a",
-              status: "running",
-              deadlineMs: 1,
-              timeoutExtensions: 0,
-              childSessionId: "ses_child_1",
-            })
-          }),
-      } as unknown as DagStore.Interface,
-      nodeTimeoutEscalated: () => Effect.sync(() => { escalations++ }),
+    const storeLayer = Layer.mock(DagStore.Service)({
+      getNode: () =>
+        Effect.sync(() => {
+          reads++
+          // 3 transient failures (e.g. SQLite lock blips) — the watcher
+          // must survive them and keep supervising.
+          if (reads <= 3) throw new Error("database locked")
+          return makeNodeRow({
+            id: "a",
+            workflowId: "dag-r13",
+            name: "a",
+            status: "running",
+            deadlineMs: 1,
+            timeoutExtensions: 0,
+            childSessionId: "ses_child_1",
+          })
+        }),
     })
+    const dagLayer = Layer.unwrap(
+      Effect.map(DagStore.Service, (store) =>
+        Layer.mock(Dag.Service)({
+          store,
+          nodeTimeoutEscalated: () =>
+            Effect.sync(() => {
+              escalations++
+            }),
+        }),
+      ),
+    ).pipe(Layer.provide(storeLayer))
     const promptLayer = Layer.mock(SessionPrompt.Service, {
       cancel: () => Effect.void,
     })
@@ -366,15 +374,16 @@ describe("Dag timeout escalation fixes (unit)", () => {
 
   it("continues supervision after store read retries fail (R13/F1-product)", async () => {
     let reads = 0
-    const dagLayer = Layer.mock(Dag.Service, {
-      store: {
-        getNode: () =>
-          Effect.sync(() => {
-            reads++
-            throw new Error("database locked")
-          }),
-      } as unknown as DagStore.Interface,
+    const storeLayer = Layer.mock(DagStore.Service)({
+      getNode: () =>
+        Effect.sync(() => {
+          reads++
+          throw new Error("database locked")
+        }),
     })
+    const dagLayer = Layer.unwrap(
+      Effect.map(DagStore.Service, (store) => Layer.mock(Dag.Service)({ store })),
+    ).pipe(Layer.provide(storeLayer))
     const promptLayer = Layer.mock(SessionPrompt.Service, {
       cancel: () => Effect.void,
     })
