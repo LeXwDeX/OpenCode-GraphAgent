@@ -266,6 +266,10 @@ export const layer = Layer.effectDiscard(
           status: "completed",
           output: event.data.output,
           completed_at: toMillis(event.data.timestamp),
+          // Q1: a terminal node is no longer awaiting adjudication — clear the
+          // escalation flag. Its result is delivered via the wake_reported
+          // re-arm below (orthogonal to the adjudication flag).
+          escalation_pending: false,
           // F2b: re-arm wake delivery on every status migration. A node whose
           // escalated wake was already reported (wake_reported=true) must
           // re-enter the snapshot on completion/failure — otherwise its result
@@ -296,6 +300,9 @@ export const layer = Layer.effectDiscard(
           error_reason: event.data.reason,
           error_class: event.data.trigger,
           completed_at: toMillis(event.data.timestamp),
+          // Q1: a terminal node is no longer awaiting adjudication — clear the
+          // escalation flag.
+          escalation_pending: false,
           // F2b: same re-arm as NodeCompleted — a failure after a reported
           // escalation (or a crash-recovery failure of an escalated node)
           // must still reach the main agent.
@@ -321,6 +328,8 @@ export const layer = Layer.effectDiscard(
         .set({
           status: "skipped",
           error_reason: event.data.reason,
+          // Q1: a skipped node is terminal — clear the adjudication flag.
+          escalation_pending: false,
           seq: event.durable!.seq,
           time_updated: toMillis(event.data.timestamp),
         })
@@ -336,7 +345,7 @@ export const layer = Layer.effectDiscard(
     yield* events.project(DagEvent.NodeCancelled, (event) =>
       db
         .update(WorkflowNodeTable)
-        .set({ status: "failed", error_reason: "cancelled via replan", seq: event.durable!.seq, time_updated: toMillis(event.data.timestamp) })
+        .set({ status: "failed", error_reason: "cancelled via replan", escalation_pending: false, seq: event.durable!.seq, time_updated: toMillis(event.data.timestamp) })
         .where(and(
           eq(WorkflowNodeTable.workflow_id, event.data.dagID),
           eq(WorkflowNodeTable.id, event.data.nodeID),
@@ -386,7 +395,7 @@ export const layer = Layer.effectDiscard(
           timeout_extensions: event.data.timeoutExtensions,
           // The escalation is not yet adjudicated — summary and the wake
           // delivery boundary treat the node as awaiting main-agent action
-          // until an extend (updateNodeDeadline) or a new attempt clears it.
+          // until an extend (NodeDeadlineExtended) or a new attempt clears it.
           escalation_pending: true,
           wake_reported: false,
           seq: event.durable!.seq,
@@ -395,6 +404,37 @@ export const layer = Layer.effectDiscard(
         // F2a: escalate only live running nodes — a stale escalate racing a
         // terminal event must not resurrect the wake flag or inflate the
         // counter on an already-completed/failed node (ghost wake).
+        .where(and(
+          eq(WorkflowNodeTable.workflow_id, event.data.dagID),
+          eq(WorkflowNodeTable.id, event.data.nodeID),
+          inArray(WorkflowNodeTable.status, ["running"]),
+        ))
+        .run()
+        .pipe(Effect.orDie),
+    )
+
+    // Deadline extension (ADR-0003): a pure idempotent fold. The command
+    // (nodeExtendTimeout) runs the guard — status='running' + Q2 delivery gate
+    // — in the command layer BEFORE publish, so this event is only appended on a
+    // successful extension (event = success log). The projector does NOT judge
+    // the guard, does NOT publish events, and ignores the row count — single
+    // write authority, deterministic replay. The status='running' WHERE clause
+    // is only a replay-safety guard: a stale extension racing a terminal event
+    // (crash recovery) matches 0 rows and is a benign skip.
+    yield* events.project(DagEvent.NodeDeadlineExtended, (event) =>
+      db
+        .update(WorkflowNodeTable)
+        .set({
+          deadline_ms: event.data.deadlineMs,
+          // ADR-0001: adjudication is complete — clear the pending flag.
+          escalation_pending: false,
+          // Consume the escalation wake so the moved deadline is not re-serviced
+          // by a stale timeout wake. Harmless no-op once the Q2 gate is in
+          // effect (delivery already happened before the re-time was admitted).
+          wake_reported: true,
+          seq: event.durable!.seq,
+          time_updated: toMillis(event.data.timestamp),
+        })
         .where(and(
           eq(WorkflowNodeTable.workflow_id, event.data.dagID),
           eq(WorkflowNodeTable.id, event.data.nodeID),

@@ -50,6 +50,13 @@ export const DEFAULT_WORKFLOW_CONFIG = {
   maxTimeoutExtensions: 20,
 } as const
 
+// Cap on workflow-lock acquisition + critical section (ADR-0004). The critical
+// section is a synchronous DB write, so exceeding this means the workflow is
+// already broken — interrupt loudly via Effect's builtin TimeoutException. The
+// critical section must never await async work; that is the only way this bound
+// can fire.
+export const WORKFLOW_LOCK_TIMEOUT = "30 seconds" as const
+
 /** A node as declared in the workflow's YAML config. */
 export interface NodeConfig {
   id: string
@@ -336,7 +343,7 @@ export const layer = Layer.effect(
     const workflowLocks = KeyedMutex.makeUnsafe<string>()
     const lockWitness = {} as WorkflowLock
     const withWorkflowLock = (dagID: string) => <A, E, R>(body: (lock: WorkflowLock) => Effect.Effect<A, E, R>) =>
-      workflowLocks.withLock(dagID)(Effect.suspend(() => body(lockWitness)))
+      workflowLocks.withLock(dagID)(Effect.suspend(() => body(lockWitness))).pipe(Effect.timeout(WORKFLOW_LOCK_TIMEOUT))
 
     const guardWorkflow = Effect.fn("Dag.guardWorkflow")(function* (dagID: string, target: WorkflowStatus) {
       const wf = yield* store.getWorkflow(dagID).pipe(Effect.orDie)
@@ -890,18 +897,47 @@ export const layer = Layer.effect(
         timestamp: yield* DateTime.now,
       })
     })
-    // Replan with a new worker_config.timeout_ms recomputes the absolute
-    // deadline and persists it on the node row (Q6: from the adjudication
-    // moment). The deadline watcher is rebuilt by the replan handler. The lock
-    // witness matters: updateNodeDeadline guards status='running', and the
-    // guard is only race-free while the caller holds the workflow lock.
-    // Returns the number of rows written — 0 when the running-guard rejects
-    // (the node terminalized between the caller's read and this write), so the
-    // caller can observe the silent no-op instead of logging a false success.
-    // The store write itself cannot fail (updateNodeDeadline orDies its SQL),
-    // so the only typed-error channel on this command is withWorkflowLock.
+    // Adjudication of a timeout escalation (ADR-0003). Replan with a new
+    // worker_config.timeout_ms recomputes the absolute deadline and records it
+    // as a durable event — the direct-write path (store.updateNodeDeadline) is
+    // abolished so the deadline survives replay. The guard runs HERE, in the
+    // command layer, holding the workflow lock and BEFORE publish. The return
+    // is a synchronous state verdict (error = state — the orchestrator observes
+    // it directly, NOT via the publish chain, whose projector return value is
+    // discarded). NodeDeadlineExtended is only appended on success, so it is the
+    // success log; the projector does a pure idempotent fold. The contract is
+    // THREE-VALUED so the two rejection reasons stay distinguishable (C1):
+    //   1  = success (deadline written, NodeDeadlineExtended appended)
+    //   0  = TERMINAL rejection (node not running / missing — caller drops the
+    //        stale watcher; the node is done)
+    //  -2  = Q2 delivery-gate rejection (node STILL running but its escalation
+    //        wake is undelivered — caller MUST keep supervision; killing the
+    //        watcher here would orphan a running node and defeat the cap
+    //        backstop, violating N1)
+    // The single caller (loop.ts WorkflowReplanned handler) branches on this:
+    // < 0 keeps the watcher (covers -2 here and -1 write-failure mapped by the
+    // caller's catchCause), === 0 clears it. The only typed-error channel
+    // beyond this explicit 1/0/-2 is withWorkflowLock (getNode/publish orDie
+    // their work).
     const nodeExtendTimeout = Effect.fn("Dag.nodeExtendTimeout")(function* (lock: WorkflowLock, dagID: string, nodeID: string, newDeadlineMs: number) {
-      return yield* store.updateNodeDeadline(dagID, nodeID, newDeadlineMs)
+      const node = yield* store.getNode(dagID, nodeID).pipe(Effect.orDie)
+      // running-guard: a node that terminalized between the caller's read and
+      // this command is rejected (race-free — we hold the workflow lock).
+      if (!node || node.status !== "running") return 0
+      // Q2 delivery gate (ADR-0002): never re-time an escalation the main agent
+      // has not seen. Defense in depth — the primary gate is loop.ts:800, but
+      // the command stays self-protecting so a future caller cannot bypass it.
+      // Returns -2 (NOT 0): the node is still running, so the caller must keep
+      // its watcher (N1). See the three-valued contract above.
+      if (node.escalationPending && !node.wakeReported) return -2
+      yield* events.publish(DagEvent.NodeDeadlineExtended, {
+        dagID: dagID as ID,
+        nodeID: nodeID as never,
+        deadlineMs: newDeadlineMs,
+        timeoutExtensions: node.timeoutExtensions,
+        timestamp: yield* DateTime.now,
+      })
+      return 1
     })
 
     return Service.of({

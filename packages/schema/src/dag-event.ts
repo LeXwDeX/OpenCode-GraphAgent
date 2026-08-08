@@ -302,6 +302,26 @@ export const NodeTimeoutEscalated = Event.define({
 })
 export type NodeTimeoutEscalated = typeof NodeTimeoutEscalated.Type
 
+// Adjudication of a timeout escalation: the main agent replanned with a new
+// timeout_ms and nodeExtendTimeout persisted the recomputed absolute deadline
+// (now + new timeout) as a durable event (ADR-0003). The old direct-write path
+// (store.updateNodeDeadline) is abolished — the deadline now survives replay.
+// The guard (status='running' + Q2 delivery gate) runs in the COMMAND layer
+// before publish; this event is only appended on a successful extension, so it
+// is the success log. The projector does a pure idempotent fold (single write
+// authority, no event publish, no return-value contract).
+export const NodeDeadlineExtended = Event.define({
+  type: "dag.node.deadline_extended",
+  ...options,
+  schema: {
+    ...Base,
+    nodeID: NodeID,
+    deadlineMs: Schema.Number, // absolute deadline (ms) recomputed at adjudication
+    timeoutExtensions: Schema.Number, // extension count at adjudication moment (audit)
+  },
+})
+export type NodeDeadlineExtended = typeof NodeDeadlineExtended.Type
+
 // ============================================================================
 // Inventories + tagged unions
 // ============================================================================
@@ -326,6 +346,7 @@ export const DurableDefinitions = Event.inventory(
   NodeCancelled,
   NodeRestarted,
   NodeTimeoutEscalated,
+  NodeDeadlineExtended,
 )
 
 export const Definitions = DurableDefinitions

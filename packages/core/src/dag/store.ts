@@ -152,7 +152,6 @@ export interface Interface {
   readonly getNode: (workflowId: string, nodeId: string) => Effect.Effect<NodeRow | undefined>
   readonly getRunningNodes: (workflowId: string) => Effect.Effect<NodeRow[]>
   readonly setCapturedOutput: (childSessionID: string, payload: unknown) => Effect.Effect<void>
-  readonly updateNodeDeadline: (workflowId: string, nodeID: string, deadlineMs: number) => Effect.Effect<number>
 
   readonly markNodeWakeReported: (workflowId: string, nodeID: string) => Effect.Effect<void>
   readonly markWorkflowWakeReported: (dagID: string) => Effect.Effect<void>
@@ -316,30 +315,6 @@ export const layer = Layer.effect(
           .where(eq(WorkflowNodeTable.child_session_id, childSessionID))
           .run()
           .pipe(Effect.orDie)
-      }),
-
-      updateNodeDeadline: Effect.fn("DagStore.updateNodeDeadline")(function* (workflowId, nodeID, deadlineMs) {
-        const updated = yield* db
-          .update(WorkflowNodeTable)
-          // Adjudication write (re-time via nodeExtendTimeout). Only update the
-          // deadline — do NOT reset timeout_extensions: the count is cumulative
-          // per attempt so an agent cannot bypass the cap by re-planning.
-          // Escalation is now adjudicated: clear escalation_pending (summary and
-          // delivery boundary stop treating the node as awaiting adjudication)
-          // and consume the escalation wake (wake_reported=true) so the stale
-          // timeout wake is not re-delivered after the deadline moved.
-          .set({ deadline_ms: deadlineMs, escalation_pending: false, wake_reported: true })
-          // Guard: never write a deadline onto a node that terminalized between
-          // the caller's read and this update.
-          .where(and(
-            eq(WorkflowNodeTable.workflow_id, workflowId),
-            eq(WorkflowNodeTable.id, nodeID),
-            eq(WorkflowNodeTable.status, "running"),
-          ))
-          .returning({ id: WorkflowNodeTable.id })
-          .all()
-          .pipe(Effect.orDie)
-        return updated.length
       }),
 
       markNodeWakeReported: Effect.fn("DagStore.markNodeWakeReported")(function* (workflowId, nodeID) {

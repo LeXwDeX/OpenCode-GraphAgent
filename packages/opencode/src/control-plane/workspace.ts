@@ -28,7 +28,6 @@ import { SessionID } from "@/session/schema"
 import { NotFoundError } from "@/storage/storage"
 import { errorData } from "@/util/error"
 import { waitEvent } from "./util"
-import { WorkspaceRef } from "@/effect/instance-ref"
 import { Vcs } from "@/project/vcs"
 import { InstanceStore } from "@/project/instance-store"
 import { InstanceBootstrap } from "@/project/bootstrap"
@@ -347,8 +346,8 @@ export const layer = Layer.effect(
       yield* Effect.forEach(
         history,
         (event) =>
-          events
-            .replay(
+          Effect.gen(function* () {
+            yield* events.replay(
               {
                 id: EventV2.ID.make(event.id),
                 aggregateID: event.aggregate_id,
@@ -358,7 +357,26 @@ export const layer = Layer.effect(
               },
               { publish: true, ownerID: space.id },
             )
-            .pipe(Effect.provideService(WorkspaceRef, space.id)),
+            // The bridge's listener fan-out captures its runtime at layer build,
+            // so WorkspaceRef does not reach it; replayed events would otherwise
+            // forward with workspace=undefined. Emit directly with this workspace
+            // id, mirroring the live-SSE path. `type` is versioned (`<type>.<v>`).
+            try {
+              GlobalBus.emit("event", {
+                workspace: space.id,
+                payload: {
+                  id: event.id,
+                  type: event.type.replace(/\.\d+$/, ""),
+                  properties: event.data,
+                },
+              })
+            } catch (error) {
+              yield* Effect.logWarning("failed to forward replayed history event", {
+                workspaceID: space.id,
+                error: errorData(error),
+              })
+            }
+          }),
         { discard: true },
       )
     })
