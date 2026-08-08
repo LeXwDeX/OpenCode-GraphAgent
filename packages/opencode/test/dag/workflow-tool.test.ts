@@ -317,6 +317,18 @@ function writeWorkflowSpec(name: string, value: unknown) {
   )
 }
 
+function toolContext() {
+  return {
+    sessionID: SessionID.make("ses_workflow_parent"),
+    messageID: MessageID.ascending(),
+    agent: "build",
+    abort: new AbortController().signal,
+    messages: [],
+    metadata: () => Effect.void,
+    ask: () => Effect.void,
+  } satisfies Tool.Context
+}
+
 describe("workflow tool schema (negative tests)", () => {
   it("action field accepts start/extend/control/status/list", () => {
     const decode = Schema.decodeUnknownSync(Parameters)
@@ -326,6 +338,18 @@ describe("workflow tool schema (negative tests)", () => {
     expect(() => decode({ action: "status", workflow_id: "wf-1" })).not.toThrow()
     // list browses the saved-spec library and needs no workflow_id.
     expect(() => decode({ action: "list" })).not.toThrow()
+  })
+
+  it("retains an inline structured spec", () => {
+    const decode = Schema.decodeUnknownSync(Parameters)
+    const spec = {
+      config: {
+        name: "inline-schema",
+        nodes: [],
+      },
+    }
+
+    expect(decode({ action: "start", spec })).toEqual({ action: "start", spec })
   })
 
   it("action field rejects unknown actions", () => {
@@ -357,7 +381,7 @@ describe("workflow tool schema (negative tests)", () => {
     expect(() => decode({ action: "control", workflow_id: "wf-1", operation: "start" })).toThrow()
   })
 
-  it("keeps workflow graph and admission internals out of tool-call parameters", () => {
+  it("keeps workflow graph and admission fields inside spec", () => {
     const decode = Schema.decodeUnknownSync(Parameters)
     expect(decode({
       action: "start",
@@ -416,6 +440,125 @@ describe("workflow tool execution", () => {
       expect(result.output).toContain('"mode": "standard"')
       expect(result.output).toContain('"id": "node_failed"')
       expect(result.output).toContain('"error_class": "timeout"')
+    }),
+  )
+
+  runtime.effect("starts from an inline structured spec without a file", () =>
+    Effect.gen(function* () {
+      published.length = 0
+      const info = yield* WorkflowTool
+      const workflow = yield* info.init()
+      const result = yield* workflow.execute(
+        Schema.decodeUnknownSync(Parameters)({
+          action: "start",
+          spec: {
+            config: {
+              name: "inline-start",
+              nodes: [],
+            },
+          },
+        }),
+        toolContext(),
+      )
+
+      expect(result.title).toBe("Workflow started: inline-start")
+      expect(result.metadata.workflowId).toBeDefined()
+      expect(published.some((event) => event.type === DagEvent.WorkflowCreated.type)).toBe(true)
+    }),
+  )
+
+  runtime.effect("extends from an inline structured spec without a file", () =>
+    Effect.gen(function* () {
+      published.length = 0
+      const info = yield* WorkflowTool
+      const workflow = yield* info.init()
+      const result = yield* workflow.execute(
+        Schema.decodeUnknownSync(Parameters)({
+          action: "extend",
+          workflow_id: "dag_defaults",
+          spec: {
+            nodes: [{
+              id: "inline-added",
+              name: "Inline added",
+              worker_type: "general",
+              depends_on: [],
+              prompt_template: { inline: "work" },
+            }],
+          },
+        }),
+        toolContext(),
+      )
+
+      expect(result.title).toBe("Workflow extended: 1 nodes added")
+      expect(published.find((event) => event.type === DagEvent.NodeRegistered.type)?.data).toEqual(
+        expect.objectContaining({ nodeID: "inline-added" }),
+      )
+    }),
+  )
+
+  runtime.effect("replans from an inline structured spec without a file", () =>
+    Effect.gen(function* () {
+      published.length = 0
+      const info = yield* WorkflowTool
+      const workflow = yield* info.init()
+      const result = yield* workflow.execute(
+        Schema.decodeUnknownSync(Parameters)({
+          action: "control",
+          workflow_id: "dag_defaults",
+          operation: "replan",
+          spec: {
+            fragment: {
+              name: "inline-replan",
+              nodes: [{
+                id: "inline-replanned",
+                name: "Inline replanned",
+                worker_type: "general",
+                depends_on: [],
+                prompt_template: { inline: "work" },
+              }],
+            },
+          },
+        }),
+        toolContext(),
+      )
+
+      expect(result.title).toContain("Workflow replanned: +1")
+      expect(published.find((event) => event.type === DagEvent.NodeRegistered.type)?.data).toEqual(
+        expect.objectContaining({ nodeID: "inline-replanned" }),
+      )
+    }),
+  )
+
+  runtime.effect("rejects ambiguous or missing spec sources before side effects", () =>
+    Effect.gen(function* () {
+      const info = yield* WorkflowTool
+      const workflow = yield* info.init()
+      const cases = [
+        {
+          params: {
+            action: "start",
+            spec: { config: { name: "ambiguous", nodes: [] } },
+            spec_path: "saved-workflow",
+          },
+          message: "accepts exactly one source",
+        },
+        {
+          params: { action: "start" },
+          message: "requires exactly one of 'spec' or 'spec_path'",
+        },
+      ]
+
+      for (const item of cases) {
+        published.length = 0
+        const exit = yield* workflow.execute(
+          Schema.decodeUnknownSync(Parameters)(item.params),
+          toolContext(),
+        ).pipe(Effect.exit)
+
+        expect(Exit.isFailure(exit)).toBe(true)
+        if (Exit.isFailure(exit)) expect(Cause.pretty(exit.cause)).toContain(item.message)
+        expect(published).toHaveLength(0)
+      }
     }),
   )
 
@@ -1213,4 +1356,3 @@ describe("workflow tool saved workflows", () => {
     ),
   )
 })
-

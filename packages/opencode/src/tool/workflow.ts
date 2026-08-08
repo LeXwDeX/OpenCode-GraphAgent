@@ -20,7 +20,7 @@ const id = "workflow"
 const MAX_WORKFLOW_SPEC_BYTES = 1_000_000
 
 // ============================================================================
-// File schemas stay rich; tool-call parameters below stay shallow.
+// Action schemas remain the single validation authority for file and inline input.
 // ============================================================================
 
 const NodeSchema = Schema.Struct({
@@ -105,6 +105,7 @@ const decodeReplanSpec = Schema.decodeUnknownEffect(ReplanSpec)
 
 export const Parameters = Schema.Struct({
   action: Schema.Literals(["start", "extend", "control", "status", "list"]).annotate({ description: "start: create workflow; extend: add nodes; control: pause/resume/cancel/replan/step/complete; status: inspect durable workflow and node state; list: show saved workflow specs in the library (not running workflows)" }),
+  spec: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)).annotate({ description: "(start/extend/control replan) Inline structured spec for a one-off graph. Use this or spec_path, never both" }),
   spec_path: Schema.optional(Schema.String).annotate({ description: '(start/extend/control replan) A saved workflow name from the library (e.g. "code-review"), or a path to a YAML workflow spec. Relative paths resolve from the session directory' }),
   session_id: Schema.optional(Schema.String).annotate({ description: "(start) Parent session ID" }),
   project_id: Schema.optional(Schema.String).annotate({ description: "(start) Optional Project ID; must match the parent session project" }),
@@ -216,7 +217,7 @@ export const WorkflowTool = Tool.define<
               if (params.project_id && params.project_id !== session.projectID) {
                 return yield* Effect.die(new Error("project_id must match the parent session project"))
               }
-              const specFile = yield* readWorkflowSpec(params.spec_path, session.directory, ctx).pipe(Effect.orDie)
+              const specFile = yield* readWorkflowSpec(params.spec, params.spec_path, session.directory, ctx).pipe(Effect.orDie)
               const spec = yield* decodeStartSpec(specFile.value).pipe(
                 Effect.mapError((error) => new Error(`Invalid workflow spec ${specFile.path}: ${String(error)}`)),
                 Effect.orDie,
@@ -274,7 +275,7 @@ export const WorkflowTool = Tool.define<
             case "extend": {
               if (!params.workflow_id) return yield* Effect.die(new Error("extend requires 'workflow_id'"))
               const session = yield* sessions.get(SessionID.make(ctx.sessionID)).pipe(Effect.orDie)
-              const specFile = yield* readWorkflowSpec(params.spec_path, session.directory, ctx).pipe(Effect.orDie)
+              const specFile = yield* readWorkflowSpec(params.spec, params.spec_path, session.directory, ctx).pipe(Effect.orDie)
               const spec = yield* decodeExtendSpec(specFile.value).pipe(
                 Effect.mapError((error) => new Error(`Invalid workflow spec ${specFile.path}: ${String(error)}`)),
                 Effect.orDie,
@@ -292,7 +293,7 @@ export const WorkflowTool = Tool.define<
             case "control": {
               if (!params.workflow_id || !params.operation) {
                 return yield* Effect.die(new Error(
-                  `control requires 'workflow_id' and 'operation' (got workflow_id=${params.workflow_id ?? "<missing>"}, operation=${params.operation ?? "<missing>"}). Example: { action: "control", workflow_id: "dag_...", operation: "pause" }. On a cancel/replan intent, issue pause FIRST — it needs no spec file and freezes scheduling instantly while you compose the replan.`,
+                  `control requires 'workflow_id' and 'operation' (got workflow_id=${params.workflow_id ?? "<missing>"}, operation=${params.operation ?? "<missing>"}). Example: { action: "control", workflow_id: "dag_...", operation: "pause" }. On a cancel/replan intent, issue pause FIRST — it needs no spec and freezes scheduling instantly while you compose the replan.`,
                 ))
               }
               const wfId = params.workflow_id
@@ -311,7 +312,7 @@ export const WorkflowTool = Tool.define<
                   return { title: "Workflow completed (early)", output: `<workflow id="${wfId}" state="completed"/>`, metadata: { workflowId: wfId } as Metadata }
                 case "replan": {
                   const session = yield* sessions.get(SessionID.make(ctx.sessionID)).pipe(Effect.orDie)
-                  const specFile = yield* readWorkflowSpec(params.spec_path, session.directory, ctx).pipe(Effect.orDie)
+                  const specFile = yield* readWorkflowSpec(params.spec, params.spec_path, session.directory, ctx).pipe(Effect.orDie)
                   const spec = yield* decodeReplanSpec(specFile.value).pipe(
                     Effect.mapError((error) => new Error(`Invalid workflow spec ${specFile.path}: ${String(error)}`)),
                     Effect.orDie,
@@ -321,7 +322,7 @@ export const WorkflowTool = Tool.define<
                   // the recovery options instead of a bare iron-law rejection.
                   const r = yield* withTerminalRecovery(
                     dag.replan(wfId, { nodes: spec.fragment.nodes as NodeConfig[] }),
-                    "The workflow reached a terminal status before the replan arrived — terminal workflows are immutable. Recover by writing a new start spec with the updated node definitions and passing its spec_path, or extend if a reporting leaf checkpoint naturally completed the graph. Next time issue control(pause) BEFORE composing the spec file.",
+                    "The workflow reached a terminal status before the replan arrived — terminal workflows are immutable. Recover by starting a new workflow with the updated node definitions, or extend if a reporting leaf checkpoint naturally completed the graph. Next time issue control(pause) BEFORE composing the spec.",
                   ).pipe(Effect.orDie)
                   const ignored = r.ignore.length > 0 ? `\nIgnored (terminal, immutable — add replacements under new ids to retry): ${r.ignore.join(", ")}` : ""
                   return {
@@ -345,11 +346,22 @@ export const WorkflowTool = Tool.define<
   }),
 )
 
-function readWorkflowSpec(specPath: string | undefined, directory: string, ctx: Tool.Context) {
+function readWorkflowSpec(
+  spec: Record<string, unknown> | undefined,
+  specPath: string | undefined,
+  directory: string,
+  ctx: Tool.Context,
+) {
   return Effect.gen(function* () {
+    if (spec && specPath) {
+      return yield* Effect.fail(new Error(
+        "Workflow configuration accepts exactly one source: remove either 'spec' or 'spec_path'.",
+      ))
+    }
+    if (spec) return { path: "<inline>", value: spec }
     if (!specPath) {
       return yield* Effect.fail(new Error(
-        `Workflow configuration requires 'spec_path'. Pass a saved workflow name (workflow(action: "list") shows them) or write the YAML spec to a file and retry with its path.`,
+        `Workflow configuration requires exactly one of 'spec' or 'spec_path'. Pass an inline structured spec for a one-off graph, or a saved workflow name/path through 'spec_path'.`,
       ))
     }
     const filepath = yield* resolveSpecPath(specPath, directory, ctx)

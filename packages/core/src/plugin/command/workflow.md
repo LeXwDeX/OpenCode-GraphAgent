@@ -11,20 +11,20 @@ Compile every graph under the Tiered Orchestration Doctrine and Depth Ladder in 
 
 ## When to start a workflow
 
-A task is an implicit workflow candidate only when it has both a scenario
-signal—such as multi-role review, brainstorming, swarm/cluster work,
-multi-model analysis, or end-to-end development—and one of these structural
+Use one live workflow when a user objective has any of these structural
 signals:
 
 - **Staged**: clear phase boundaries where later phases depend on earlier outputs (explore → plan → implement → verify).
-- **Parallelizable**: ≥3 independent sub-units can execute concurrently (same fix across 5 packages).
+- **Parallelizable**: ≥2 related sub-units can execute concurrently (same fix across 5 packages).
 - **Quality gate**: intermediate output must pass review before downstream work begins (architecture review before implementation).
 - **Adaptive scope**: discovery may reveal an unknown number of work packages or require a bounded repair wave.
 
-A lone keyword such as "review" is not enough. An explicit `/dag-flow` request
-does not require this implicit-trigger test. If a task fits in one context
-window and has no inter-step dependencies, use the `task` tool instead. For
-trivial work, use direct tools.
+Use one `task` subagent for one independent non-trivial leaf assignment. Keep
+related staged, parallel, gated, or adaptive flows under one workflow ID; use
+`extend` or `control(replan)` instead of starting disconnected DAGs. An explicit
+`/dag-flow` request always selects a workflow. Direct tools in the parent are
+reserved for conversation, trivial state inspection, workflow control, and
+final synthesis.
 
 ## Standard and deep workflow entry
 
@@ -34,14 +34,14 @@ as independent workstreams, cross-domain uncertainty, high blast radius,
 conflicting constraints, evidence gathering, or multiple verification
 perspectives.
 
-Before any graph-carrying action (`start`, `extend`, or `control(replan)`),
-write its configuration to a `.yaml` or `.yml` file, then pass only
-`spec_path` beside the shallow action fields. Never inline graph nodes,
-admission, or replan fragments in the tool call. Keep the file after a
-validation failure, edit only the reported problem, and retry the same path.
+For a one-off graph, pass `spec` inline on `start`, `extend`, or
+`control(replan)`. This is the default: do not create a transient YAML file.
+Use `spec_path` only for a saved workflow name, a reusable workflow file, or an
+explicitly requested file-backed spec. Exactly one of `spec` and `spec_path` is
+valid. After a validation failure, correct the same source and retry the call.
 
 Before a deep start, qualify the request interactively in the parent session.
-The start YAML places `mode: deep`, a versioned `READY` or informed `WAIVED`
+The start spec places `mode: deep`, a versioned `READY` or informed `WAIVED`
 admission input, and `config` at the same level. The admission input contains
 `brief_revision`, `qa_mode`, `verdict`, `brief`, and waiver audit fields when
 applicable; the workflow boundary owns `protocol_version`, `state`, and
@@ -93,22 +93,21 @@ code review workflow") and the saved target/inputs already match: starting it
 is one call, and its graph has already been reviewed. `/dag-flow` may also read
 a saved workflow as a topology reference, then derive a one-off spec that
 injects the current task, retargets module lanes, and records additions/prunes.
-Compose a fresh spec file when the task is one-off or no reference fits — a
-path-shaped `spec_path` keeps the original session-relative behavior. To turn a
-working one-off spec into a saved workflow, move the file into one of the two
-directories under a descriptive name.
+Compose a fresh inline `spec` when the task is one-off or no reference fits.
+To turn a working one-off spec into a saved workflow, persist it as YAML in one
+of the two workflow-library directories under a descriptive name.
 
 ## Orchestration Lifecycle
 
-Heavy tasks follow a meta-workflow: multiple workflows chained together, each producing a decision that shapes the next. The lifecycle is the two accuracy axes applied in sequence — breadth to cover the surface, depth to earn the verdict:
+Heavy tasks follow one adaptive workflow whose decisions shape later waves. The lifecycle is the two accuracy axes applied in sequence — breadth to cover the surface, depth to earn the verdict:
 
 1. **Explore + brainstorm** — exploration nodes fan out over the codebase while independent generators propose approaches; a required synthesizer converges them into a design plus architecture inventory.
-2. **Design review gate** — an advanced-tier gate node (`report_to_parent: true`, normalized verdict `output_schema`) rules on the design. `required: true` fails the workflow only when the gate node fails to execute or satisfy its output contract; a successful `REVISE` or `REJECT` is a business verdict, not an execution failure. Route the static ACCEPT path through a downstream `condition`, and dispose of a reported non-ACCEPT verdict per the Verdict Disposal Contract. Dependencies cannot cross workflow boundaries — a gate in a separate workflow receives the prior result as static input.
+2. **Design review gate** — an advanced-tier gate node (`report_to_parent: true`, normalized verdict `output_schema`) rules on the design. `required: true` fails the workflow only when the gate node fails to execute or satisfy its output contract; a successful `REVISE` or `REJECT` is a business verdict, not an execution failure. Route the static ACCEPT path through a downstream `condition`, and dispose of a reported non-ACCEPT verdict per the Verdict Disposal Contract.
 3. **Parallel execution** — the accepted design decomposes into module-level worker nodes with disjoint write sets, fanning into a required assembler.
 4. **Verify + diff review + audit** — production assurance follows `implementation → verification(PASS) → diff review → final gate/audit` with fingerprint echo; `REJECT` routes through corrected implementation and verification before a new diff review. Progress tracking is updated to reflect what shipped.
-5. **Expansion decision** — iterate (bounded `control(replan)` of affected nodes), extend (additional parallel nodes), separate phase (a new workflow once the previous is terminal), or complete (`control(complete)`).
+5. **Expansion decision** — iterate (bounded `control(replan)` of affected nodes), extend (additional parallel nodes in the same workflow), or complete (`control(complete)`). Start a continuation workflow only after the original is terminal and cannot be adapted.
 
-Not every task needs all five phases: a well-specified task may enter at phase 3, a clear design with uncertain scope at phase 2. The lifecycle is a decision tree, not a pipeline. Concrete graph YAML for each shape is under Collaboration Patterns below.
+Not every task needs all five phases: a well-specified task may enter at phase 3, a clear design with uncertain scope at phase 2. The lifecycle is a decision tree, not a pipeline. Concrete graph shapes are under Collaboration Patterns below.
 
 ## Node inputs and model selection
 
@@ -150,9 +149,9 @@ the workflow uncreated so the user can configure a model and retry.
 ## Collaboration Patterns
 
 Four structural patterns cover the common cases. Real workflows often combine
-them. Every YAML block below is workflow spec file content. Save the selected
-shape to a `.yaml` file, then call the tool with
-`{ action: "start", spec_path: "<that-file>.yaml" }`.
+them. Every block below shows the object shape for inline `spec`; pass the
+selected shape with `{ action: "start", spec: { ... } }`. Persist it as YAML
+and use `spec_path` only when the workflow itself should be saved.
 
 ### 1. Staged Pipeline with Gate
 
@@ -459,8 +458,9 @@ is believed to be running. Two disciplines close the gap:
   `pending` (a `child_session_id` or `running` status). An acceptance
   receipt alone is never evidence of execution.
 - After any rejected graph-carrying call (SchemaError, validation error),
-  fix the spec AND re-issue the call in the same turn — a fixed file is not
-  a fixed operation, and the re-issue needs the same `status` verification.
+  fix the spec source AND re-issue the call in the same turn — corrected input
+  is not a corrected operation, and the re-issue needs the same `status`
+  verification.
 
 ## Model Assignment Strategy
 
@@ -537,10 +537,11 @@ All nodes share the same workspace. Write conflicts are an orchestration concern
 
 ### Actions
 
-**start** — Create a workflow from a YAML spec with `config` and optional
-`title`, `mode`, and admission input at the file root. Write the file first,
-then call `{ action: "start", spec_path: ".opencode/workflows/name.yaml" }`, or
-pass a saved workflow name (`{ action: "start", spec_path: "code-review" }`).
+**start** — Create a workflow from `config` and optional `title`, `mode`, and
+admission input. For a one-off graph call
+`{ action: "start", spec: { config: { ... } } }`. Use `spec_path` for a saved
+workflow name (`{ action: "start", spec_path: "code-review" }`) or an explicit
+YAML path.
 Returns the workflow ID. Nodes declare `depends_on` (node IDs); layers and
 execution order are computed automatically.
 
@@ -552,9 +553,8 @@ not running workflows; use `status` for a workflow's live state.
 new nodes are immediately eligible for scheduling if their dependencies are
 met. It also accepts a genuinely additive wave after a reporting leaf
 checkpoint naturally completed the current graph; an early
-`control(complete)` workflow remains terminal. Put the new nodes under a
-file-root `nodes` array, then call
-`{ action: "extend", workflow_id: "dag_...", spec_path: "extend.yaml" }`.
+`control(complete)` workflow remains terminal. Put the new nodes under `spec.nodes`,
+then call `{ action: "extend", workflow_id: "dag_...", spec: { nodes: [...] } }`.
 
 **status** — Read the durable state of one workflow and all of its nodes. Pass `workflow_id`. Use it when the user explicitly asks for current state or once before a decision that requires fresh state, such as replan/control. Do not poll a running workflow merely to wait: node reports and terminal outcomes wake the parent session automatically.
 
@@ -562,7 +562,7 @@ file-root `nodes` array, then call
 - `pause` — let running nodes finish, don't spawn new ones (pause does NOT stop nodes that are already running). On a cancel/replan intent, always pause FIRST: it needs no fragment and freezes scheduling while you compose the replan, so the graph cannot terminalize under you.
 - `resume` — resume scheduling
 - `cancel` — cancel the entire workflow
-- `replan` — write a YAML file with a file-root `fragment` object containing the graph fields and node definitions, then pass its `spec_path`; running nodes can be `restart: true` or `cancel: true`; pending nodes absent from the fragment are cancelled. Valid while paused — the pause → compose file → replan → resume sequence is the safe path.
+- `replan` — pass `spec: { fragment: { ... } }` with the graph fields and node definitions; running nodes can be `restart: true` or `cancel: true`; pending nodes absent from the fragment are cancelled. Valid while paused — the pause → compose spec → replan → resume sequence is the safe path. Use `spec_path` only for a saved or explicitly file-backed fragment.
 - `complete` — early-complete: remaining pending nodes are skipped (non-violation)
 - `step` — advance exactly one ready node (the first by node ID lexicographic order), then wait. Use for controlled debugging or staged verification of a critical path. Unlike `pause`, which freezes all scheduling, `step` advances one node and re-waits. A second `step` while the stepped node is still running is rejected. Use `resume` to return to full-speed scheduling. Nodes are selected in lexicographic ID order for determinism.
 
@@ -588,4 +588,4 @@ file-root `nodes` array, then call
 
 - No `node_complete` action — completion is automatic
 - No `history` action — inspect a known workflow with `status`; browsing running workflows remains TUI-only (`list` shows saved specs, not running workflows)
-- No runtime-side magical topology selection — `/dag-flow` selects and adapts saved reference graphs in the parent agent; the workflow runtime executes only the resulting YAML
+- No runtime-side magical topology selection — `/dag-flow` selects and adapts saved reference graphs in the parent agent; the workflow runtime executes the resulting validated spec

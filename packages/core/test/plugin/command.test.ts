@@ -55,16 +55,36 @@ describe("CommandPlugin.Plugin", () => {
     }),
   )
 
-  it.effect("documents the smallest execution mode and conservative implicit DAG trigger", () =>
+  it.effect("documents the smallest child execution mode", () =>
     Effect.sync(() => {
       expect(CommandPlugin.WorkflowContent).toContain("## Execution Mode Selection")
-      expect(CommandPlugin.WorkflowContent).toContain("direct execution")
-      expect(CommandPlugin.WorkflowContent).toContain("single `task` subagent")
-      expect(CommandPlugin.WorkflowContent).toContain("both a scenario signal and a structural signal")
-      expect(CommandPlugin.WorkflowFactsContent).toContain("both a scenario")
+      expect(CommandPlugin.WorkflowContent).toContain("Use direct execution only")
+      expect(CommandPlugin.WorkflowContent).toContain("one `task` subagent")
+      expect(CommandPlugin.WorkflowContent).toContain("Related flows for one user objective")
       expect(CommandPlugin.WorkflowFactsContent).not.toContain("when ANY")
       expect(CommandPlugin.WorkflowFactsContent).not.toContain("- **Multi-model**:")
       expect(CommandPlugin.DagFlowContent).toContain("workflow` tool with `action=start")
+    }),
+  )
+
+  it.effect("keeps the parent at macro level and consolidates related work", () =>
+    Effect.sync(() => {
+      expect(CommandPlugin.OrchestrationPolicyContent).toContain("The parent conversation owns")
+      expect(CommandPlugin.OrchestrationPolicyContent).toContain("MUST NOT perform executable leaf work")
+      expect(CommandPlugin.OrchestrationPolicyContent).toContain("one `task` subagent")
+      expect(CommandPlugin.OrchestrationPolicyContent).toContain("one live `workflow` DAG")
+      expect(CommandPlugin.OrchestrationPolicyContent).toContain("one user objective")
+      expect(CommandPlugin.DagFlowContent).toContain("one consolidated graph")
+    }),
+  )
+
+  it.effect("uses inline specs for one-off graphs without removing saved workflows", () =>
+    Effect.sync(() => {
+      expect(CommandPlugin.WorkflowFactsContent).toContain("For a one-off graph, pass `spec` inline")
+      expect(CommandPlugin.WorkflowFactsContent).toContain("Use `spec_path` only")
+      expect(CommandPlugin.WorkflowFactsContent).not.toContain("Never inline graph nodes")
+      expect(CommandPlugin.WorkflowFactsContent).not.toContain("Before any graph-carrying action")
+      expect(CommandPlugin.DagFlowContent).toContain("inline `spec`")
     }),
   )
 
@@ -281,12 +301,12 @@ describe("CommandPlugin.Plugin", () => {
       expect(CommandPlugin.OrchestrationPolicyContent).toContain("invalidate the prior fingerprint")
       expect(CommandPlugin.OrchestrationPolicyContent).toContain("SHA-256 hash")
       expect(CommandPlugin.WorkflowFactsContent).toContain(
-        "The start YAML places `mode: deep`, a versioned `READY` or informed `WAIVED`",
+        "The start spec places `mode: deep`, a versioned `READY` or informed `WAIVED`",
       )
       expect(CommandPlugin.WorkflowFactsContent).toContain(
         "the workflow boundary owns `protocol_version`, `state`, and\n`fingerprint`",
       )
-      expect(CommandPlugin.WorkflowFactsContent).toContain("pass only\n`spec_path` beside the shallow action fields")
+      expect(CommandPlugin.WorkflowFactsContent).toContain("For a one-off graph, pass `spec` inline")
       expect(CommandPlugin.WorkflowFactsContent).not.toContain("`config.mode`")
     }),
   )
