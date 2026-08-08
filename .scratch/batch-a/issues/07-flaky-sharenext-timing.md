@@ -6,8 +6,10 @@
 
 **Blocked by:** 06 — Flaky：stdout 污染族根治（同一测试文件，写集串行）
 
-**Status:** ready-for-agent
+**Status:** closed（PR #186，merge commit `4ddeaf2fc`）
 
-- [ ] 修复走信号等待惯用法；若改预算须附 CI 计时证据
-- [ ] 本地重复跑（≥5 次）+ 模拟负载下稳定绿
-- [ ] 无新增 Effect.sleep 等待 forked fiber 的反模式
+**Completion evidence:** flaky 稳定化与验证随 PR #186 合入 `dev`，并随 PR #188 通过 main 全量门禁。
+
+- [x] 修复走信号等待惯用法；若改预算须附 CI 计时证据
+- [x] 本地重复跑（≥5 次）+ 模拟负载下稳定绿
+- [x] 无新增 Effect.sleep 等待 forked fiber 的反模式

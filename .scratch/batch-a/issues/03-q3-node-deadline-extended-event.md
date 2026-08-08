@@ -6,11 +6,13 @@
 
 **Blocked by:** 01 — Q1：escalation_pending 裁决旗生命周期闭环（projector 折叠侧写集串行）
 
-**Status:** ready-for-agent
+**Status:** closed（PR #186，merge commit `4ddeaf2fc`）
 
-- [ ] Schema 定义 NodeDeadlineExtended + 入 EventManifest.Definitions
-- [ ] 命令层执行 guard：拒绝时命令失败并携带 typed 错误，编排器可区分拒绝与成功
-- [ ] 直写 deadline 旧路径废除（无遗留调用方）
-- [ ] projector 纯折叠：无事件发布、无返回值契约依赖
-- [ ] 恢复/replay 一致性测试（事件日志重放 ⟺ 活跃态）
-- [ ] dag 测试套件 + typecheck 绿
+**Completion evidence:** 批次 A 实现与测试随 PR #186 合入 `dev`，并随 PR #188 通过 main 全量门禁。
+
+- [x] Schema 定义 NodeDeadlineExtended + 入 EventManifest.Definitions
+- [x] 命令层执行 guard：拒绝时命令失败并携带 typed 错误，编排器可区分拒绝与成功
+- [x] 直写 deadline 旧路径废除（无遗留调用方）
+- [x] projector 纯折叠：无事件发布、无返回值契约依赖
+- [x] 恢复/replay 一致性测试（事件日志重放 ⟺ 活跃态）
+- [x] dag 测试套件 + typecheck 绿
