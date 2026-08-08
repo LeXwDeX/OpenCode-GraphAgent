@@ -2,15 +2,17 @@ import { describe, expect } from "bun:test"
 import { Database as BunDatabase, type SQLQueryBindings } from "bun:sqlite"
 import { Database } from "@opencode-ai/core/database/database"
 import { EventV2 } from "@opencode-ai/core/event"
+import { EventTable } from "@opencode-ai/core/event/sql"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
-import { Context, Effect, Fiber, Layer, Scope, Semaphore, Stream } from "effect"
+import { Context, Effect, Exit, Fiber, Layer, Scope, Semaphore, Stream } from "effect"
 import * as Client from "effect/unstable/sql/SqlClient"
 import type { Connection } from "effect/unstable/sql/SqlConnection"
 import { SqlError, classifySqliteError } from "effect/unstable/sql/SqlError"
 import * as Statement from "effect/unstable/sql/Statement"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
+import { eq, sql } from "drizzle-orm"
 import { Session as SessionNs } from "@/session/session"
 import { MessageID, PartID } from "../../src/session/schema"
 import { testInstanceStoreLayer } from "../fixture/fixture"
@@ -24,9 +26,11 @@ interface SqlCounter {
   begins: number
   commits: number
   savepoints: number
+  releases: number
+  savepointRollbacks: number
 }
 
-const counter: SqlCounter = { begins: 0, commits: 0, savepoints: 0 }
+const counter: SqlCounter = { begins: 0, commits: 0, savepoints: 0, releases: 0, savepointRollbacks: 0 }
 
 // The Database layer's sqlite client is a closed graph (its native provider
 // cannot be overridden from outside), so this test builds its own SqlClient
@@ -51,6 +55,8 @@ const countingClientLayer = Layer.effect(
             if (/^\s*begin\b/i.test(sql)) counter.begins++
             else if (/^\s*commit\b/i.test(sql)) counter.commits++
             else if (/^\s*savepoint\b/i.test(sql)) counter.savepoints++
+            else if (/^\s*release\b/i.test(sql)) counter.releases++
+            else if (/^\s*rollback to\b/i.test(sql)) counter.savepointRollbacks++
             return target.query(sql)
           }
         }
@@ -65,7 +71,9 @@ const countingClientLayer = Layer.effect(
         // @ts-ignore bun-types missing safeIntegers method
         statement.safeIntegers(Context.get(fiber.context, Client.SafeIntegers))
         try {
-          return Effect.succeed((statement.all(...(params as SQLQueryBindings[])) ?? []) as Array<Record<string, unknown>>)
+          return Effect.succeed(
+            (statement.all(...(params as SQLQueryBindings[])) ?? []) as Array<Record<string, unknown>>,
+          )
         } catch (cause) {
           return Effect.fail(
             new SqlError({
@@ -125,15 +133,14 @@ const countingClientLayer = Layer.effect(
   }),
 )
 
-const dbLayer = Database.layer.pipe(
-  Layer.provide(countingClientLayer.pipe(Layer.provide(Reactivity.layer))),
-)
+const dbLayer = Database.layer.pipe(Layer.provide(countingClientLayer.pipe(Layer.provide(Reactivity.layer))))
 const eventV2Layer = EventV2.layer.pipe(Layer.provide(dbLayer))
 const eventV2BridgeLayer = EventV2Bridge.layer.pipe(Layer.provide(eventV2Layer))
 const projectorLayer = SessionProjector.layer.pipe(Layer.provide(eventV2Layer), Layer.provide(dbLayer))
 
 const it = testEffect(
   Layer.mergeAll(
+    dbLayer,
     SessionNs.layer.pipe(
       Layer.provide(Storage.defaultLayer),
       Layer.provide(dbLayer),
@@ -250,6 +257,8 @@ describe("Session.fork", () => {
       counter.begins = 0
       counter.commits = 0
       counter.savepoints = 0
+      counter.releases = 0
+      counter.savepointRollbacks = 0
 
       const fork = yield* Effect.acquireRelease(session.fork({ sessionID: original.id }), (info) =>
         session.remove(info.id).pipe(Effect.ignore),
@@ -266,6 +275,67 @@ describe("Session.fork", () => {
       const target = yield* session.messages({ sessionID: fork.id })
       expect(target.length).toBe(messageCount)
       for (const msg of target) expect(msg.parts.length).toBe(2)
+    }),
+  )
+
+  it.instance("fork rolls back copied durable events and projections when a nested publication fails", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const session = yield* SessionNs.Service
+      const original = yield* Effect.acquireRelease(session.create({ title: "fork-source" }), (info) =>
+        session.remove(info.id).pipe(Effect.ignore),
+      )
+
+      const firstMessageID = MessageID.ascending()
+      const failingMessageID = MessageID.ascending()
+      yield* session.updateMessage(userInfo(original.id, firstMessageID))
+      yield* session.updatePart(textPart(original.id, firstMessageID, "copied before failure"))
+      yield* session.updateMessage(userInfo(original.id, failingMessageID))
+      yield* session.updatePart(textPart(original.id, failingMessageID, "force fork copy failure"))
+      const sourceBefore = yield* session.messages({ sessionID: original.id })
+
+      yield* database.db
+        .run(
+          sql`
+          CREATE TRIGGER reject_fork_copy
+          BEFORE INSERT ON event
+          WHEN NEW.type = 'message.part.updated.1'
+            AND json_extract(NEW.data, '$.part.text') = 'force fork copy failure'
+          BEGIN
+            SELECT RAISE(ABORT, 'forced fork copy failure');
+          END
+        `,
+        )
+        .pipe(Effect.orDie)
+
+      counter.begins = 0
+      counter.commits = 0
+      counter.savepoints = 0
+      counter.releases = 0
+      counter.savepointRollbacks = 0
+
+      const forkExit = yield* Effect.exit(session.fork({ sessionID: original.id }))
+
+      expect(Exit.isFailure(forkExit)).toBe(true)
+
+      const forkedSessions = (yield* session.list()).filter((info) => info.id !== original.id)
+      expect(forkedSessions).toHaveLength(1)
+      const forked = forkedSessions[0]
+      if (!forked) return
+      yield* Effect.addFinalizer(() => session.remove(forked.id).pipe(Effect.ignore))
+
+      expect(yield* session.messages({ sessionID: forked.id })).toEqual([])
+      expect(yield* session.messages({ sessionID: original.id })).toEqual(sourceBefore)
+
+      const durableEvents = yield* database.db
+        .select({ type: EventTable.type })
+        .from(EventTable)
+        .where(eq(EventTable.aggregate_id, forked.id))
+      expect(durableEvents).toEqual([{ type: "session.created.1" }])
+
+      expect(counter.savepoints).toBe(4)
+      expect(counter.releases).toBe(4)
+      expect(counter.savepointRollbacks).toBe(1)
     }),
   )
 })
