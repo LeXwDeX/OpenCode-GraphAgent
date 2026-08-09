@@ -131,6 +131,17 @@ export const WorkflowTool = Tool.define<
     const agents = yield* Agent.Service
     const question = yield* Question.Service
 
+    const requireOwnedWorkflow = Effect.fn("WorkflowTool.requireOwnedWorkflow")(function* (
+      workflowID: string,
+      sessionID: string,
+    ) {
+      const workflow = yield* dag.store.getWorkflow(workflowID).pipe(Effect.orDie)
+      if (!workflow || workflow.sessionId !== sessionID) {
+        return yield* Effect.die(new Error(`Workflow not found: ${workflowID}`))
+      }
+      return workflow
+    })
+
     return {
       description: CommandPlugin.WorkflowContent,
       parameters: Parameters,
@@ -164,8 +175,7 @@ export const WorkflowTool = Tool.define<
             }
             case "status": {
               if (!params.workflow_id) return yield* Effect.die(new Error("status requires 'workflow_id'"))
-              const workflow = yield* dag.store.getWorkflow(params.workflow_id).pipe(Effect.orDie)
-              if (!workflow) return yield* Effect.die(new Error(`Workflow not found: ${params.workflow_id}`))
+              const workflow = yield* requireOwnedWorkflow(params.workflow_id, ctx.sessionID)
               const nodes = yield* dag.store.getNodes(params.workflow_id).pipe(Effect.orDie)
               const config = Dag.parseWorkflowConfig(workflow.config)
               return {
@@ -274,6 +284,7 @@ export const WorkflowTool = Tool.define<
             }
             case "extend": {
               if (!params.workflow_id) return yield* Effect.die(new Error("extend requires 'workflow_id'"))
+              yield* requireOwnedWorkflow(params.workflow_id, ctx.sessionID)
               const session = yield* sessions.get(SessionID.make(ctx.sessionID)).pipe(Effect.orDie)
               const specFile = yield* readWorkflowSpec(params.spec, params.spec_path, session.directory, ctx).pipe(Effect.orDie)
               const spec = yield* decodeExtendSpec(specFile.value).pipe(
@@ -297,6 +308,7 @@ export const WorkflowTool = Tool.define<
                 ))
               }
               const wfId = params.workflow_id
+              yield* requireOwnedWorkflow(wfId, ctx.sessionID)
               switch (params.operation) {
                 case "pause":
                   yield* dag.pause(wfId).pipe(Effect.orDie)
