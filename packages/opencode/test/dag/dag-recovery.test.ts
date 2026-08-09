@@ -171,6 +171,24 @@ describe("reconcileWorkflow", () => {
     expect(result).toEqual({ reconciled: 0, ownershipLost: 0 })
   })
 
+  it("aborts recovery when a stale restart-orphan session cannot be cancelled", async () => {
+    const events: TrackedEvent[] = []
+    const nodes = [makeNodeRow({ id: "n1", status: "queued", childSessionId: "ses_stale" })]
+    const dagLayer = makeDagLayer(nodes, events)
+    const checkStatus = () => Effect.succeed("active" as const)
+    const cancelSession = () => Effect.fail(new Error("cancel unavailable"))
+
+    const exit = await Effect.runPromise(
+      reconcileWorkflow("wf-1", checkStatus, cancelSession).pipe(
+        Effect.provide(dagLayer),
+        Effect.exit,
+      ),
+    )
+
+    expect(Exit.isFailure(exit)).toBe(true)
+    expect(events).toEqual([])
+  })
+
   it("cancels and fails a zero-message child classified as unknown exactly once", async () => {
     const events: TrackedEvent[] = []
     const cancelled: string[] = []
