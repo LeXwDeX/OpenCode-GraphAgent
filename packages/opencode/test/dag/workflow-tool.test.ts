@@ -486,6 +486,45 @@ describe("workflow tool execution", () => {
     }),
   )
 
+  runtime.effect("rejects reads and mutations from a session that does not own the workflow", () =>
+    Effect.gen(function* () {
+      published.length = 0
+      const info = yield* WorkflowTool
+      const workflow = yield* info.init()
+      const foreignContext = {
+        ...toolContext(),
+        sessionID: SessionID.make("ses_foreign"),
+      } satisfies Tool.Context
+
+      const statusExit = yield* Effect.exit(workflow.execute(
+        { action: "status", workflow_id: "dag_status" },
+        foreignContext,
+      ))
+      const extendExit = yield* Effect.exit(workflow.execute(
+        { action: "extend", workflow_id: "dag_defaults", spec: { nodes: [] } },
+        foreignContext,
+      ))
+      const controlExit = yield* Effect.exit(workflow.execute(
+        { action: "control", workflow_id: "dag_status", operation: "pause" },
+        foreignContext,
+      ))
+
+      expect({
+        statusSucceeded: Exit.isSuccess(statusExit),
+        statusLeakedChildSession: Exit.isSuccess(statusExit) && statusExit.value.output.includes("ses_child"),
+        extendSucceeded: Exit.isSuccess(extendExit),
+        controlSucceeded: Exit.isSuccess(controlExit),
+        publishedPause: published.some((event) => event.type === DagEvent.WorkflowPaused.type),
+      }).toEqual({
+        statusSucceeded: false,
+        statusLeakedChildSession: false,
+        extendSucceeded: false,
+        controlSucceeded: false,
+        publishedPause: false,
+      })
+    }),
+  )
+
   runtime.effect("dispatches every public control operation to its durable workflow event", () =>
     Effect.gen(function* () {
       const info = yield* WorkflowTool
@@ -1279,6 +1318,32 @@ config:
             metadata: () => Effect.void,
             ask: () => Effect.void,
           } satisfies Tool.Context,
+        )
+        .pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      expect(published).toHaveLength(0)
+    }),
+  )
+
+  runtime.effect("start rejects a parent session other than the calling session", () =>
+    Effect.gen(function* () {
+      published.length = 0
+      const info = yield* WorkflowTool
+      const workflow = yield* info.init()
+      const exit = yield* workflow
+        .execute(
+          {
+            action: "start",
+            session_id: "ses_other_parent",
+            spec: {
+              config: {
+                name: "foreign-parent",
+                nodes: [],
+              },
+            },
+          },
+          toolContext(),
         )
         .pipe(Effect.exit)
 
