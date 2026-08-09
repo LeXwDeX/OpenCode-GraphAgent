@@ -5,15 +5,16 @@
 #           LeXwDeX/opencode fork. Stripped-down version of upstream
 #           publish.yml — removes repo guard, Blacksmith runners, code
 #           signing, npm publish, and Tauri desktop.
-# Trigger : Manual workflow_dispatch (PRIMARY) — pick branch + version
+# Trigger : Manual workflow_dispatch (PRIMARY) — pick main or dev
 #           Push to main/dev ONLY registers the workflow in the Actions UI
 #           (the build job is gated on `github.event_name == 'workflow_dispatch'`)
-# Inputs  : version        — release version string (e.g. "1.14.30-fork.2")
-#                            Leave blank for auto timestamped version.
-#           create_release — when true, create a GitHub Release with the
+# Version : Independent GraphAgent SemVer derived only from graphagent-v* tags.
+#           dev builds the next stable version as X.Y.Z-dev.N; main publishes
+#           X.Y.Z and marks it Latest. OpenCode package versions are ignored.
+# Inputs  : create_release — when true, create a GitHub Release with the
 #                            built binaries + SHA256SUMS attached. Builds
-#                            from any branch other than `main` are marked
-#                            prerelease (test build); `main` = formal release.
+#                            from `dev` are marked prerelease (test build);
+#                            `main` builds are formal and become Latest.
 #           platforms      — comma-separated subset of linux,macos,windows
 #                            to build. Leave blank to build all three.
 # Jobs    : package-templates — package latest reference templates from the
@@ -31,15 +32,11 @@ on:
   # Manual trigger — the primary way to build releases
   workflow_dispatch:
     inputs:
-      version:
-        description: "Release version (e.g. 1.14.30-fork.2). Leave blank for auto."
-        required: false
-        type: string
       create_release:
         description: "Create a GitHub Release with the built binaries"
         required: false
         type: boolean
-        default: false
+        default: true
       platforms:
         description: "Platforms to build, comma-separated (linux,macos,windows). Leave blank for all."
         required: false
@@ -58,7 +55,36 @@ permissions:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: false
 
+concurrency:
+  group: release-fork
+  cancel-in-progress: false
+
 jobs:
+  version:
+    name: Resolve GraphAgent Version
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    outputs:
+      channel: ${{ steps.release-version.outputs.channel }}
+      version: ${{ steps.release-version.outputs.version }}
+      tag: ${{ steps.release-version.outputs.tag }}
+      prerelease: ${{ steps.release-version.outputs.prerelease }}
+      latest: ${{ steps.release-version.outputs.latest }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Bun
+        uses: ./.github/actions/setup-bun
+        with:
+          save-cache: false
+
+      - name: Resolve Version
+        id: release-version
+        run: bun run ./packages/opencode/script/release-version.ts
+
   # Package the latest reference templates from the dedicated config repo
   # (LeXwDeX/opencode-dag-config) into a release asset. dev/main do not manage
   # these templates anymore — the config repo is the single source of truth.
@@ -98,7 +124,7 @@ jobs:
 
   build-cli:
     name: Build CLI (${{ matrix.name }})
-    needs: package-templates
+    needs: [version, package-templates]
     # Skip the actual build when triggered by push (registration-only). Per-
     # matrix-entry platform filtering can't live here — `matrix` isn't in
     # scope for a job-level `if:` — so it's applied to each step below instead.
@@ -182,8 +208,8 @@ jobs:
         if: inputs.platforms == '' || contains(inputs.platforms, matrix.name)
         run: ./packages/opencode/script/build.ts --single --skip-install
         env:
-          OPENCODE_CHANNEL: latest
-          OPENCODE_VERSION: ${{ inputs.version || '' }}
+          OPENCODE_CHANNEL: ${{ needs.version.outputs.channel == 'main' && 'latest' || 'dev' }}
+          OPENCODE_VERSION: ${{ needs.version.outputs.version }}
 
       # Bundle ripgrep into each dist/opencode-*/bin so air-gapped users do not
       # hit the runtime download in packages/core/src/ripgrep/binary.ts.
@@ -221,7 +247,7 @@ jobs:
 
   release:
     name: Create GitHub Release
-    needs: [build-cli, package-templates]
+    needs: [version, build-cli, package-templates]
     if: inputs.create_release
     runs-on: ubuntu-latest
     steps:
@@ -234,16 +260,6 @@ jobs:
           path: release-assets
           merge-multiple: true
 
-      - name: Determine Version Tag
-        id: tag
-        run: |
-          VER="${{ inputs.version }}"
-          if [ -z "$VER" ]; then
-            VER="0.0.0-$(date +%Y%m%d%H%M)"
-          fi
-          echo "version=$VER" >> "$GITHUB_OUTPUT"
-          echo "tag=v$VER" >> "$GITHUB_OUTPUT"
-
       - name: Generate SHA256SUMS
         working-directory: release-assets
         run: |
@@ -254,17 +270,18 @@ jobs:
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-        # Releases built from any branch other than `main` (e.g. `dev`) are
-        # test builds and get marked --prerelease; only `main` produces a
-        # formal release.
+        # dev releases are prereleases and can never become Latest. main
+        # releases are formal and are explicitly promoted to Latest.
         run: |
           EXTRA_FLAGS=()
-          if [ "${{ github.ref_name }}" != "main" ]; then
-            EXTRA_FLAGS+=(--prerelease)
+          if [ "${{ needs.version.outputs.channel }}" = "main" ]; then
+            EXTRA_FLAGS+=(--latest)
+          else
+            EXTRA_FLAGS+=(--prerelease --latest=false)
           fi
-          gh release create "${{ steps.tag.outputs.tag }}" \
-            --title "opencode ${{ steps.tag.outputs.version }}" \
-            --notes "Fork release from branch ${{ github.ref_name }}" \
+          gh release create "${{ needs.version.outputs.tag }}" \
+            --title "OpenCode GraphAgent v${{ needs.version.outputs.version }}" \
+            --notes "GraphAgent release from branch ${{ github.ref_name }}" \
             --target "${{ github.sha }}" \
             "${EXTRA_FLAGS[@]}" \
             release-assets/*
