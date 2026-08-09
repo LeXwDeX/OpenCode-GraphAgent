@@ -7,13 +7,14 @@ import * as Project from "./project"
 import * as Vcs from "./vcs"
 import { InstanceState } from "@/effect/instance-state"
 import { ShareNext } from "@/share/share-next"
-import { Effect, Layer } from "effect"
+import { Effect, Layer, Scope } from "effect"
 import { Config } from "@/config/config"
 import { GoalLoop } from "@/goal/loop"
 import { DagLoop } from "@/dag/runtime/loop"
 import { DagSummaryPublisher } from "@/dag/runtime/summary-publisher"
 import { SettingsHook } from "@/hook/settings"
 import { Service } from "./bootstrap-service"
+import { Memory } from "@/memory/memory"
 
 export { Service } from "./bootstrap-service"
 export type { Interface } from "./bootstrap-service"
@@ -42,6 +43,7 @@ export const layer = Layer.effect(
     const shareNext = yield* ShareNext.Service
     const snapshot = yield* Snapshot.Service
     const vcs = yield* Vcs.Service
+    const scope = yield* Scope.Scope
 
     const run = Effect.gen(function* () {
       const ctx = yield* InstanceState.context
@@ -50,8 +52,9 @@ export const layer = Layer.effect(
       yield* config.get()
       // Plugin can mutate config so it has to be initialized before anything else.
       yield* plugin.init()
-      // Each service self-manages its own slow work via Effect.forkScoped against
-      // its per-instance state scope. We just await materialization here.
+      // These services own any internal background work; bootstrap awaits their
+      // lightweight initialization. MEMORY stays synchronous internally, so
+      // bootstrap explicitly schedules it below on the instance scope.
       const initTargets: { init: () => Effect.Effect<void, unknown> }[] = [
         lsp,
         shareNext,
@@ -65,6 +68,13 @@ export const layer = Layer.effect(
         (s) => s.init().pipe(Effect.catchCause((cause) => Effect.logWarning("init failed", { cause }))),
         { concurrency: "unbounded", discard: true },
       ).pipe(Effect.withSpan("InstanceBootstrap.init"))
+      const memory = yield* Effect.serviceOption(Memory.Service)
+      if (memory._tag === "Some") {
+        yield* memory.value.init().pipe(
+          Effect.catchCause((cause) => Effect.logWarning("memory init failed", { cause })),
+          Effect.forkIn(scope),
+        )
+      }
       // GoalLoop is provided by AppLayer (provideMerge). Activate its idle-event
       // subscription only when available; skipped in test/standalone contexts.
       const goalLoop = yield* Effect.serviceOption(GoalLoop.Service)
@@ -119,6 +129,7 @@ export const node = LayerNode.make(layer, [
   ShareNext.node,
   Snapshot.node,
   Vcs.node,
+  Memory.node,
 ])
 
 export * as InstanceBootstrap from "./bootstrap"

@@ -27,6 +27,7 @@ import { ModelV2 } from "@opencode-ai/core/model"
 import { buildPrompt } from "@opencode-ai/core/session/compaction"
 import { SessionCompactionEvent } from "@opencode-ai/schema/session-compaction-event"
 import { SettingsHook, type TriggerResult } from "@/hook/settings"
+import { Memory } from "@/memory/memory"
 
 export const Event = SessionCompactionEvent
 
@@ -306,6 +307,16 @@ export const layer = Layer.effect(
       const userMessage = parent.info
       const compactionPart = parent.parts.find((part): part is SessionV1.CompactionPart => part.type === "compaction")
 
+      const memory = Option.getOrUndefined(yield* Effect.serviceOption(Memory.Service))
+      const sessionInfo = memory ? yield* session.get(input.sessionID).pipe(Effect.orDie) : undefined
+      const memoryContext =
+        memory && !sessionInfo?.parentID
+          ? yield* memory.checkpoint({
+              sessionID: input.sessionID,
+              messages: input.messages,
+            })
+          : []
+
       // PreCompact hook. processCompaction has no custom-instruction channel, so
       // custom_instructions defaults to "" (CC behavior) in the envelope builder.
       if (settingsHook) {
@@ -362,7 +373,7 @@ export const layer = Layer.effect(
       const compacting = yield* plugin.trigger(
         "experimental.session.compacting",
         { sessionID: input.sessionID },
-        { context: [], prompt: undefined },
+        { context: memoryContext, prompt: undefined },
       )
       const nextPrompt = compacting.prompt ?? buildPrompt({ previousSummary, context: compacting.context })
       const msgs = structuredClone(selected.head)
@@ -634,6 +645,7 @@ export const node = LayerNode.make(layer, [
   Provider.node,
   EventV2Bridge.node,
   RuntimeFlags.node,
+  Memory.node,
   SettingsHook.node,
 ])
 

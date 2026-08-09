@@ -66,6 +66,7 @@ import { dispatchTrust } from "@/hook/workspace-trust"
 import { HookStartContext } from "@/hook/start-context"
 import { Goal } from "@/goal/goal"
 import { KeyedMutex } from "@opencode-ai/core/effect/keyed-mutex"
+import { Memory } from "@/memory/memory"
 
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -1713,18 +1714,20 @@ export const layer = Layer.effect(
 
             yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
 
-            const [skills, env, instructions, mcpInstructions, goalDocs, hooksDocs, modelMsgs] = yield* Effect.all(
-              [
-                sys.skills(agent),
-                sys.environment(model),
-                instruction.system().pipe(Effect.orDie),
-                sys.mcp(agent, session.permission),
-                sys.goal(sessionID),
-                sys.hooks(),
-                MessageV2.toModelMessagesEffect(msgs, model),
-              ],
-              { concurrency: "unbounded" },
-            )
+            const [skills, env, instructions, mcpInstructions, goalDocs, hooksDocs, memoryDocs, modelMsgs] =
+              yield* Effect.all(
+                [
+                  sys.skills(agent),
+                  sys.environment(model),
+                  instruction.system().pipe(Effect.orDie),
+                  sys.mcp(agent, session.permission),
+                  sys.goal(sessionID),
+                  sys.hooks(),
+                  sys.memory({ sessionID, messages: msgs, main: !session.parentID }),
+                  MessageV2.toModelMessagesEffect(msgs, model),
+                ],
+                { concurrency: "unbounded" },
+              )
             const system = [
               ...env,
               ...instructions,
@@ -1732,6 +1735,7 @@ export const layer = Layer.effect(
               ...(skills ? [skills] : []),
               ...goalDocs,
               ...hooksDocs,
+              ...memoryDocs,
             ]
             const format = lastUser.format ?? { type: "text" as const }
             if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
@@ -1830,6 +1834,46 @@ export const layer = Layer.effect(
         command: input.command,
         agent: input.agent,
       })
+      if (input.command === "memory") {
+        const memory = Option.getOrUndefined(yield* Effect.serviceOption(Memory.Service))
+        const argument = input.arguments.trim()
+        const result = memory
+          ? argument === "on"
+            ? yield* memory.setEnabled(true)
+            : argument === "off"
+              ? yield* memory.setEnabled(false)
+              : "Memory remains off"
+          : "Memory remains off"
+        const model = yield* currentModel(input.sessionID)
+        const agentName = input.agent ?? (yield* agents.defaultAgent())
+        const userMsg: SessionV1.User = {
+          id: input.messageID ?? MessageID.ascending(),
+          role: "user",
+          sessionID: input.sessionID,
+          time: { created: Date.now() },
+          agent: agentName,
+          model: { providerID: model.providerID, modelID: model.modelID },
+        }
+        yield* sessions.updateMessage(userMsg)
+        const commandPart: SessionV1.TextPart = {
+          id: PartID.ascending(),
+          messageID: userMsg.id,
+          sessionID: input.sessionID,
+          type: "text",
+          text: `/memory ${input.arguments}`.trim(),
+        }
+        yield* sessions.updatePart(commandPart)
+        const responsePart: SessionV1.TextPart = {
+          id: PartID.ascending(),
+          messageID: userMsg.id,
+          sessionID: input.sessionID,
+          type: "text",
+          text: result,
+        }
+        yield* sessions.updatePart(responsePart)
+        yield* sessions.touch(input.sessionID)
+        return { info: userMsg, parts: [commandPart, responsePart] }
+      }
       // /trust command dispatch — early return BEFORE command registry lookup.
       // Trust writes are security-sensitive and MUST NOT be delegated to the
       // LLM-driven command template path; mirror /goal's early-return dispatch
@@ -2247,6 +2291,7 @@ export const node = LayerNode.make(layer, [
   EventV2Bridge.node,
   RuntimeFlags.node,
   Database.node,
+  Memory.node,
   HookStartContext.node, SettingsHook.node, Goal.node,
 ])
 
