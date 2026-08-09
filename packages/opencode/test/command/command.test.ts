@@ -43,6 +43,19 @@ const overridden = testEffect(
 )
 
 describe("legacy command registry", () => {
+  it.instance("lists MEMORY as a controller command", () =>
+    Effect.gen(function* () {
+      const commands = yield* Command.Service
+
+      expect(yield* commands.get("memory")).toMatchObject({
+        name: "memory",
+        source: "command",
+        template: "",
+        hints: ["$ARGUMENTS"],
+      })
+    }),
+  )
+
   it.instance("registers the canonical dag-flow command without a built-in workflow fallback", () =>
     Effect.gen(function* () {
       const commands = yield* Command.Service

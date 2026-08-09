@@ -50,6 +50,7 @@ export const Default = {
   REVIEW: "review",
   GOAL: "goal",
   SUBGOAL: "subgoal",
+  MEMORY: "memory",
   DAG_FLOW: "dag-flow",
   IMPORT_HOOKS: "import-claude-hooks",
   CREATE_HOOK: "create-hook",
@@ -103,6 +104,13 @@ export const layer = Layer.effect(
       commands[Default.SUBGOAL] = {
         name: Default.SUBGOAL,
         description: "管理子目标 [list|<text>|remove <n>|clear]",
+        source: "command",
+        template: "",
+        hints: ["$ARGUMENTS"],
+      }
+      commands[Default.MEMORY] = {
+        name: Default.MEMORY,
+        description: "启用或关闭项目 MEMORY [on|off]",
         source: "command",
         template: "",
         hints: ["$ARGUMENTS"],

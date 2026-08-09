@@ -60,6 +60,7 @@ import { Dag } from "@/dag/dag"
 import { DagStore } from "@opencode-ai/core/dag/store"
 import { DagLoop } from "@/dag/runtime/loop"
 import { DagSummaryPublisher } from "@/dag/runtime/summary-publisher"
+import { Memory } from "@/memory/memory"
 
 export const AppLayer = Layer.mergeAll(
   Layer.mergeAll(
@@ -83,6 +84,7 @@ export const AppLayer = Layer.mergeAll(
     Permission.defaultLayer,
     Todo.defaultLayer,
     Goal.defaultLayer,
+    Memory.defaultLayer,
     Session.defaultLayer,
     SessionStatus.defaultLayer,
     BackgroundJob.defaultLayer,
