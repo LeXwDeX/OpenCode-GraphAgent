@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
-import { FileSystem, Integration, Permission, Project, Reference, Session, Workspace } from "../src"
+import { Event, FileSystem, Integration, Permission, Project, Reference, Session, Workspace } from "../src"
+import { DagEvent } from "../src/dag-event"
 import { EventManifest } from "../src/event-manifest"
 import { IdeEvent } from "../src/ide-event"
 import { SessionEvent } from "../src/session-event"
@@ -49,5 +50,14 @@ describe("public event manifest", () => {
     ])
     expect(EventManifest.Durable.has("session.next.step.ended.1")).toBe(false)
     expect(EventManifest.Durable.get("session.next.step.ended.2")).toBe(SessionEvent.Step.Ended)
+  })
+
+  test("registers every DAG durable event under its versioned public key", () => {
+    DagEvent.DurableDefinitions.forEach((definition) => {
+      if (!definition.durable) throw new Error(`${definition.type} is missing durable metadata`)
+      expect(EventManifest.Durable.get(Event.versionedType(definition.type, definition.durable.version))).toBe(
+        definition,
+      )
+    })
   })
 })

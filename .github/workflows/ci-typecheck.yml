@@ -1,14 +1,13 @@
 # ============================================================================
 # 🔍 CI · Typecheck
 # ----------------------------------------------------------------------------
-# Purpose : TypeScript type checking across all packages (bun typecheck)
-#           plus oxlint warning ratchet (bun run lint, --max-warnings gate)
+# Purpose : TypeScript type checking across all packages (bun typecheck),
+#           oxlint warning ratchet, and the DAG core behavior/coverage gate
 # Trigger : Push to `main`/`dev`, PRs targeting `main`/`dev`, manual dispatch
 # Jobs    : typecheck — single Linux runner, `bun run lint` + `bun typecheck`
-# Gate    : Required status check on BOTH `dev` and `main` rulesets — it is
-#           the fast gate for feat/fix → dev PRs (full test suite only gates
-#           dev → main, see ci-test.yml). Lint lives inside this job so it
-#           blocks merges without editing the rulesets' required checks.
+# Gate    : Required status check on BOTH `dev` and `main` rulesets. The DAG
+#           core gate protects state-machine and persistence changes before
+#           they merge to dev; the full suite still gates dev → main.
 # Notes   : No push trigger on feat/* or fix/* (frequent changes); PRs cover
 #           them.
 # ============================================================================
@@ -42,3 +41,8 @@ jobs:
 
       - name: Run typecheck
         run: bun typecheck
+
+      - name: Run DAG core behavior and coverage gate
+        working-directory: packages/opencode
+        run: bun run test:dag-core
+        timeout-minutes: 10
