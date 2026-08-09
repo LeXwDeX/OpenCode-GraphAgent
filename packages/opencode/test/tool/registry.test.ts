@@ -23,6 +23,7 @@ import { ModelV2 } from "@opencode-ai/core/model"
 const configLayer = TestConfig.layer({
   directories: () => InstanceState.directory.pipe(Effect.map((dir) => [path.join(dir, ".opencode")])),
 })
+const trigger: Plugin.Interface["trigger"] = (_name, _input, output) => Effect.succeed(output)
 
 // Fake Plugin.Service that returns a single plugin whose `tool` map contains
 // one definition with `args: undefined`. Used to exercise the plugin entry
@@ -31,8 +32,7 @@ const brokenPluginLayer = Layer.succeed(
   Plugin.Service,
   Plugin.Service.of({
     init: () => Effect.void,
-    trigger: ((_name: unknown, _input: unknown, output: unknown) =>
-      Effect.succeed(output)) as Plugin.Interface["trigger"],
+    trigger,
     list: () =>
       Effect.succeed([
         {
@@ -66,6 +66,14 @@ afterEach(async () => {
 })
 
 describe("tool.registry", () => {
+  it.instance("registers memory_search as a built-in tool", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+
+      expect(yield* registry.ids()).toContain("memory_search")
+    }),
+  )
+
   it.instance("does not expose task_status", () =>
     Effect.gen(function* () {
       const registry = yield* ToolRegistry.Service

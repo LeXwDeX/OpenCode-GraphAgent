@@ -1,13 +1,14 @@
 import { describe, expect, test } from "bun:test"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
-import { Duration, Effect, Layer } from "effect"
+import { Deferred, Duration, Effect, Fiber, Layer } from "effect"
 import fs from "node:fs/promises"
 import path from "node:path"
 import { Git } from "@/git"
 import { MemoryConfig } from "@/memory/config"
 import { Memory } from "@/memory/memory"
 import { MemoryModel } from "@/memory/model"
+import { MemoryPrompts } from "@/memory/prompts"
 import { MemorySchema } from "@/memory/schema"
 import { MemoryStore } from "@/memory/store"
 import { Project } from "@/project/project"
@@ -15,8 +16,12 @@ import { MessageID, PartID, SessionID } from "@/session/schema"
 import { Token } from "@/util/token"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
+import { LocationServiceMap } from "@opencode-ai/core/location-layer"
+import { MCP } from "@/mcp"
+import { Skill } from "@/skill"
+import { SystemPrompt } from "@/session/system"
 import { tmpdirScoped } from "../fixture/fixture"
-import { testEffect } from "../lib/effect"
+import { pollWithTimeout, testEffect } from "../lib/effect"
 import { ProviderTest } from "../fake/provider"
 
 const config = {
@@ -122,6 +127,107 @@ const unavailableModelIt = testEffect(
     ),
   ),
 )
+
+function recallFixture() {
+  const model = ProviderTest.model({
+    providerID: ProviderV2.ID.make("test"),
+    id: ModelV2.ID.make("memory-small"),
+  })
+  const provider = ProviderTest.fake({ model })
+  const state: {
+    queries: string[]
+    reads: number
+    topics: MemorySchema.Topic[]
+    failQueries: Set<string>
+    maintenance: number
+    config: MemorySchema.Config
+    projectInitialized: number
+    matcher?: (query: string) => Effect.Effect<unknown>
+  } = {
+    queries: [],
+    reads: 0,
+    topics: [topic()],
+    failQueries: new Set<string>(),
+    maintenance: 0,
+    config,
+    projectInitialized: 1,
+  }
+  const layer = Memory.layer.pipe(
+    Layer.provide(
+      Layer.mergeAll(
+        provider.layer,
+        Layer.mock(Project.Service, {
+          get: (id) =>
+            Effect.succeed({
+              id,
+              worktree: "/unused",
+              vcs: "git" as const,
+              time: { created: 0, updated: 0, initialized: state.projectInitialized },
+              sandboxes: [],
+            }),
+        }),
+        Layer.mock(MemoryConfig.Service, {
+          load: (directory) => Effect.succeed({ config: state.config, path: directory, level: "project" as const }),
+        }),
+        Layer.mock(MemoryModel.Service, {
+          generate: (input) =>
+            Effect.gen(function* () {
+              if (input.system === MemoryPrompts.MATCH_SYSTEM) {
+                const request: unknown = JSON.parse(input.prompt)
+                const query =
+                  request !== null &&
+                  typeof request === "object" &&
+                  "user_text" in request &&
+                  typeof request.user_text === "string"
+                    ? request.user_text
+                    : ""
+                state.queries.push(query)
+                if (state.failQueries.has(query)) throw new Error("matcher failed")
+                if (state.matcher) return yield* state.matcher(query)
+                return { topic_ids: query.includes("架构") ? [state.topics[0]?.id] : [] }
+              }
+              state.maintenance++
+              return { actions: [{ type: "no_change" }] }
+            }),
+        }),
+        Layer.mock(MemoryStore.Service, {
+          readTopics: () =>
+            Effect.sync(() => {
+              state.reads++
+              return state.topics
+            }),
+          writeTopics: () => Effect.void,
+          ensureGitExclude: () => Effect.void,
+        }),
+      ),
+    ),
+  )
+  const systemLayer = SystemPrompt.layer.pipe(
+    Layer.provide(LocationServiceMap.layer),
+    Layer.provide(Layer.mock(MCP.Service, { instructions: () => Effect.succeed([]) })),
+    Layer.provide(
+      Layer.mock(Skill.Service, {
+        available: () => Effect.succeed([]),
+      }),
+    ),
+    Layer.provideMerge(layer),
+  )
+  return {
+    state,
+    reset: () => {
+      state.queries.length = 0
+      state.reads = 0
+      state.topics = [topic()]
+      state.failQueries.clear()
+      state.maintenance = 0
+      state.config = config
+      state.projectInitialized = 1
+      state.matcher = undefined
+    },
+    it: testEffect(layer),
+    systemIt: testEffect(systemLayer),
+  }
+}
 
 describe("memory config and YAML store", () => {
   memoryIt.instance(
@@ -251,6 +357,14 @@ describe("memory config and YAML store", () => {
           metadata: { ...firstTopic.metadata, item_count: 2 },
         }),
       ).toBeUndefined()
+
+      yield* Effect.promise(() =>
+        fs.writeFile(
+          path.join(MemoryStore.topicsDir(first), "invalid-topic.yaml"),
+          "schema_version: 1\nid: invalid-topic\n",
+        ),
+      )
+      expect(yield* store.readTopics(first)).toEqual([firstTopic])
     }),
   )
 })
@@ -436,7 +550,26 @@ describe("memory controller policy", () => {
     expect(rendered[0]).toContain("first-topic")
     expect(rendered[0]).not.toContain("second-topic")
     expect(rendered[0]).toContain("Current user input and higher-priority instructions always win")
+    expect(
+      [
+        "created_at",
+        "updated_at",
+        "last_matched_at",
+        "match_count",
+        "revision",
+        "item_count",
+        "confirmed_at",
+        "schema_version",
+      ].filter((hidden) => rendered[0]?.includes(hidden)),
+    ).toEqual([])
     expect(Token.estimate(rendered[0])).toBeLessThanOrEqual(200)
+
+    expect(
+      Memory.renderTopics([second, first], {
+        ...config,
+        injection: { max_topics: 2, max_tokens: 200 },
+      }),
+    ).toEqual([])
   })
 })
 
@@ -561,6 +694,457 @@ describe("memory cadence evidence", () => {
   })
 })
 
+describe("memory turn-scoped retrieval", () => {
+  const recall = recallFixture()
+
+  recall.systemIt.instance(
+    "publishes first-turn and explicit-query views through SystemPrompt only for their real user turn",
+    () =>
+      Effect.gen(function* () {
+        recall.reset()
+        const memory = yield* Memory.Service
+        const prompt = yield* SystemPrompt.Service
+        const sessionID = SessionID.make("ses_memory_system_context")
+        const firstID = MessageID.ascending()
+        const first = user(firstID, sessionID, "继续之前确认的架构边界")
+
+        expect((yield* prompt.memory({ sessionID, messages: [first], main: true })).join("\n")).toContain(
+          "architecture-boundaries",
+        )
+
+        const second = user(MessageID.ascending(), sessionID, "处理一个没有自动记忆的新问题")
+        const secondTurn = [
+          first,
+          {
+            info: assistant(firstID, sessionID, ProviderV2.ID.make("test"), ModelV2.ID.make("test-model"), "end_turn"),
+            parts: [],
+          },
+          second,
+        ]
+        expect(yield* prompt.memory({ sessionID, messages: secondTurn, main: true })).toEqual([])
+
+        yield* memory.search({ sessionID, messages: secondTurn, query: "架构边界" })
+        expect((yield* prompt.memory({ sessionID, messages: secondTurn, main: true })).join("\n")).toContain(
+          "architecture-boundaries",
+        )
+
+        const thirdTurn = [...secondTurn, user(MessageID.ascending(), sessionID, "开始下一轮")]
+        expect(yield* prompt.memory({ sessionID, messages: thirdTurn, main: true })).toEqual([])
+      }),
+    { git: true },
+  )
+
+  recall.systemIt.instance(
+    "does not treat the first real user message after compaction as the session first turn",
+    () =>
+      Effect.gen(function* () {
+        recall.reset()
+        const memory = yield* Memory.Service
+        const prompt = yield* SystemPrompt.Service
+        const sessionID = SessionID.make("ses_memory_compacted_history")
+        const markerID = MessageID.ascending()
+        const current = user(MessageID.ascending(), sessionID, "继续压缩后的架构问题")
+        const messages: SessionV1.WithParts[] = [
+          {
+            info: {
+              ...user(markerID, sessionID, "").info,
+              id: markerID,
+            },
+            parts: [
+              {
+                id: PartID.ascending(),
+                messageID: markerID,
+                sessionID,
+                type: "compaction",
+                auto: true,
+              },
+            ],
+          },
+          current,
+        ]
+
+        expect(yield* prompt.memory({ sessionID, messages, main: true })).toEqual([])
+        expect(recall.state.queries).toEqual([])
+
+        expect(yield* memory.search({ sessionID, messages, query: "架构边界" })).toEqual({
+          status: "attached",
+          count: 1,
+          reused: false,
+        })
+        expect((yield* prompt.memory({ sessionID, messages, main: true })).join("\n")).toContain(
+          "architecture-boundaries",
+        )
+        expect(recall.state.queries).toEqual(["架构边界"])
+      }),
+    { git: true },
+  )
+
+  recall.systemIt.instance(
+    "keeps child, disabled, and ineligible sessions isolated from Topic reads and matching",
+    () =>
+      Effect.gen(function* () {
+        recall.reset()
+        const memory = yield* Memory.Service
+        const prompt = yield* SystemPrompt.Service
+        const sessionID = SessionID.make("ses_memory_isolation")
+        const messages = [user(MessageID.ascending(), sessionID, "继续之前确认的架构边界")]
+
+        expect(yield* prompt.memory({ sessionID, messages, main: false })).toEqual([])
+        expect(recall.state.reads).toBe(0)
+        expect(recall.state.queries).toEqual([])
+
+        recall.state.config = { ...config, enabled: false }
+        yield* memory.prepare({ sessionID, messages })
+        expect(yield* memory.search({ sessionID, messages, query: "架构边界" })).toEqual({
+          status: "unavailable",
+        })
+        expect(recall.state.reads).toBe(0)
+        expect(recall.state.queries).toEqual([])
+
+        recall.state.config = config
+        recall.state.projectInitialized = 0
+        yield* memory.prepare({ sessionID, messages })
+        expect(yield* memory.search({ sessionID, messages, query: "架构边界" })).toEqual({
+          status: "unavailable",
+        })
+        expect(recall.state.reads).toBe(0)
+        expect(recall.state.queries).toEqual([])
+      }),
+    { git: true },
+  )
+
+  recall.it.instance(
+    "waits for the first real user message and matches it once across provider steps",
+    () =>
+      Effect.gen(function* () {
+        recall.reset()
+        const memory = yield* Memory.Service
+        const sessionID = SessionID.make("ses_memory_first_turn")
+        const messageID = MessageID.ascending()
+
+        yield* memory.prepare({ sessionID, messages: [] })
+        expect(recall.state.queries).toEqual([])
+        expect(yield* memory.context(sessionID)).toEqual([])
+
+        const messages = [user(messageID, sessionID, "继续之前确认的架构边界")]
+        yield* memory.prepare({ sessionID, messages })
+        yield* memory.prepare({ sessionID, messages })
+
+        expect(recall.state.queries).toEqual(["继续之前确认的架构边界"])
+        expect((yield* memory.context(sessionID)).join("\n")).toContain("architecture-boundaries")
+      }),
+    { git: true },
+  )
+
+  recall.it.instance(
+    "emits no MEMORY block when the first-turn matcher finds no material topic",
+    () =>
+      Effect.gen(function* () {
+        recall.reset()
+        const memory = yield* Memory.Service
+        const sessionID = SessionID.make("ses_memory_empty_first_turn")
+        const messages = [user(MessageID.ascending(), sessionID, "解释今天的新问题")]
+
+        yield* memory.prepare({ sessionID, messages })
+        yield* memory.prepare({ sessionID, messages })
+
+        expect(recall.state.queries).toEqual(["解释今天的新问题"])
+        expect(yield* memory.context(sessionID)).toEqual([])
+      }),
+    { git: true },
+  )
+
+  recall.it.instance(
+    "keeps context through synthetic activity and expires it on the next real user turn",
+    () =>
+      Effect.gen(function* () {
+        recall.reset()
+        const memory = yield* Memory.Service
+        const sessionID = SessionID.make("ses_memory_turn_expiry")
+        const firstID = MessageID.ascending()
+        const first = user(firstID, sessionID, "继续之前确认的架构边界")
+
+        yield* memory.prepare({ sessionID, messages: [first] })
+        expect((yield* memory.context(sessionID)).join("\n")).toContain("architecture-boundaries")
+
+        const synthetic = user(MessageID.ascending(), sessionID, "synthetic continuation", true)
+        const command = user(MessageID.ascending(), sessionID, "/memory on")
+        yield* memory.prepare({ sessionID, messages: [first, synthetic, command] })
+        expect((yield* memory.context(sessionID)).join("\n")).toContain("architecture-boundaries")
+
+        const second = user(MessageID.ascending(), sessionID, "继续讨论架构边界")
+        yield* memory.prepare({ sessionID, messages: [first, synthetic, command, second] })
+
+        expect(recall.state.queries).toEqual(["继续之前确认的架构边界"])
+        expect(yield* memory.context(sessionID)).toEqual([])
+      }),
+    { git: true },
+  )
+
+  recall.it.instance(
+    "attaches one normalized explicit query and reuses an identical query in the same turn",
+    () =>
+      Effect.gen(function* () {
+        recall.reset()
+        const memory = yield* Memory.Service
+        const sessionID = SessionID.make("ses_memory_explicit_query")
+        const firstID = MessageID.ascending()
+        const secondID = MessageID.ascending()
+        const messages = [
+          user(firstID, sessionID, "先处理当前问题"),
+          {
+            info: assistant(firstID, sessionID, ProviderV2.ID.make("test"), ModelV2.ID.make("test-model"), "end_turn"),
+            parts: [],
+          },
+          user(secondID, sessionID, "现在需要历史背景"),
+        ]
+
+        const attached = yield* memory.search({ sessionID, messages, query: "  架构   边界  " })
+        const reused = yield* memory.search({ sessionID, messages, query: "架构 边界" })
+
+        expect(attached).toEqual({ status: "attached", count: 1, reused: false })
+        expect(reused).toEqual({ status: "attached", count: 1, reused: true })
+        expect(recall.state.queries).toEqual(["架构 边界"])
+        expect((yield* memory.context(sessionID)).join("\n")).toContain("architecture-boundaries")
+      }),
+    { git: true },
+  )
+
+  recall.it.instance(
+    "coalesces concurrent identical queries without consuming another query slot",
+    () =>
+      Effect.gen(function* () {
+        recall.reset()
+        const started = yield* Deferred.make<void>()
+        const repeatedStarted = yield* Deferred.make<void>()
+        recall.state.matcher = () =>
+          Effect.gen(function* () {
+            yield* Deferred.succeed(started, undefined)
+            yield* Deferred.await(repeatedStarted)
+            return { topic_ids: [recall.state.topics[0]?.id ?? ""] }
+          })
+        const memory = yield* Memory.Service
+        const sessionID = SessionID.make("ses_memory_concurrent_query")
+        const messages = [
+          user(MessageID.ascending(), sessionID, "先处理当前问题"),
+          user(MessageID.ascending(), sessionID, "召回相关历史"),
+        ]
+
+        const first = yield* memory.search({ sessionID, messages, query: "并发架构查询" }).pipe(Effect.forkChild)
+        yield* Deferred.await(started)
+        const repeated = yield* Effect.gen(function* () {
+          yield* Deferred.succeed(repeatedStarted, undefined)
+          return yield* memory.search({ sessionID, messages, query: " 并发架构查询 " })
+        }).pipe(Effect.forkChild)
+
+        expect(yield* Fiber.join(first)).toEqual({ status: "attached", count: 1, reused: false })
+        expect(yield* Fiber.join(repeated)).toEqual({ status: "attached", count: 1, reused: true })
+        expect(recall.state.queries).toEqual(["并发架构查询"])
+        expect(yield* memory.search({ sessionID, messages, query: "没有相关记录" })).toEqual({
+          status: "attached",
+          count: 1,
+          reused: false,
+        })
+      }),
+    { git: true },
+  )
+
+  recall.it.instance(
+    "replaces successful selections, reuses cached queries, and caps distinct queries at two",
+    () =>
+      Effect.gen(function* () {
+        recall.reset()
+        const memory = yield* Memory.Service
+        const sessionID = SessionID.make("ses_memory_query_limit")
+        const firstID = MessageID.ascending()
+        const messages = [
+          user(firstID, sessionID, "先处理当前问题"),
+          {
+            info: assistant(firstID, sessionID, ProviderV2.ID.make("test"), ModelV2.ID.make("test-model"), "end_turn"),
+            parts: [],
+          },
+          user(MessageID.ascending(), sessionID, "现在需要历史背景"),
+        ]
+
+        expect(yield* memory.search({ sessionID, messages, query: "架构边界" })).toEqual({
+          status: "attached",
+          count: 1,
+          reused: false,
+        })
+        expect(yield* memory.search({ sessionID, messages, query: "没有相关记录" })).toEqual({
+          status: "empty",
+          reused: false,
+        })
+        expect(yield* memory.context(sessionID)).toEqual([])
+
+        expect(yield* memory.search({ sessionID, messages, query: " 架构边界 " })).toEqual({
+          status: "attached",
+          count: 1,
+          reused: true,
+        })
+        expect(yield* memory.search({ sessionID, messages, query: "第三个不同查询" })).toEqual({ status: "limit" })
+        expect(recall.state.queries).toEqual(["架构边界", "没有相关记录"])
+        expect((yield* memory.context(sessionID)).join("\n")).toContain("architecture-boundaries")
+      }),
+    { git: true },
+  )
+
+  recall.it.instance(
+    "acknowledges only complete topic views that fit the injection budget",
+    () =>
+      Effect.gen(function* () {
+        recall.reset()
+        const large = topic("oversized-topic")
+        recall.state.topics = [
+          topic(),
+          {
+            ...large,
+            items: [{ ...large.items[0], content: "长期偏好".repeat(180) }],
+          },
+        ]
+        recall.state.config = { ...config, injection: { max_topics: 2, max_tokens: 200 } }
+        recall.state.matcher = () => Effect.succeed({ topic_ids: recall.state.topics.map((item) => item.id) })
+        const memory = yield* Memory.Service
+        const sessionID = SessionID.make("ses_memory_bounded_count")
+        const messages = [
+          user(MessageID.ascending(), sessionID, "先处理当前问题"),
+          user(MessageID.ascending(), sessionID, "召回相关历史"),
+        ]
+
+        expect(yield* memory.search({ sessionID, messages, query: "架构边界" })).toEqual({
+          status: "attached",
+          count: 1,
+          reused: false,
+        })
+        const rendered = (yield* memory.context(sessionID)).join("\n")
+        expect(rendered).toContain("architecture-boundaries")
+        expect(rendered).not.toContain("oversized-topic")
+      }),
+    { git: true },
+  )
+
+  recall.it.instance(
+    "keeps the last successful selection when a replacement query fails",
+    () =>
+      Effect.gen(function* () {
+        recall.reset()
+        const memory = yield* Memory.Service
+        const sessionID = SessionID.make("ses_memory_failed_replacement")
+        const firstID = MessageID.ascending()
+        const messages = [
+          user(firstID, sessionID, "先处理当前问题"),
+          {
+            info: assistant(firstID, sessionID, ProviderV2.ID.make("test"), ModelV2.ID.make("test-model"), "end_turn"),
+            parts: [],
+          },
+          user(MessageID.ascending(), sessionID, "现在需要历史背景"),
+        ]
+
+        yield* memory.search({ sessionID, messages, query: "架构边界" })
+        recall.state.failQueries.add("失败替换")
+        expect(yield* memory.search({ sessionID, messages, query: "失败替换" })).toEqual({ status: "failed" })
+        expect((yield* memory.context(sessionID)).join("\n")).toContain("architecture-boundaries")
+      }),
+    { git: true },
+  )
+
+  recall.it.instance(
+    "fails open without partial attachment when the matcher returns malformed output",
+    () =>
+      Effect.gen(function* () {
+        recall.reset()
+        recall.state.matcher = () => Effect.succeed({ topic_ids: "architecture-boundaries" })
+        const memory = yield* Memory.Service
+        const sessionID = SessionID.make("ses_memory_malformed_match")
+        const messages = [
+          user(MessageID.ascending(), sessionID, "先处理当前问题"),
+          user(MessageID.ascending(), sessionID, "召回相关历史"),
+        ]
+
+        expect(yield* memory.search({ sessionID, messages, query: "架构边界" })).toEqual({ status: "failed" })
+        expect(yield* memory.context(sessionID)).toEqual([])
+      }),
+    { git: true },
+  )
+
+  recall.it.instance(
+    "runs due maintenance without refreshing retrieval context for a later turn",
+    () =>
+      Effect.gen(function* () {
+        recall.reset()
+        recall.state.config = { ...config, turn_interval: 1 }
+        const memory = yield* Memory.Service
+        const sessionID = SessionID.make("ses_memory_maintenance_cadence")
+        const firstID = MessageID.ascending()
+        const first = user(firstID, sessionID, "继续之前确认的架构边界")
+
+        yield* memory.prepare({ sessionID, messages: [first] })
+        const messages = [
+          first,
+          {
+            info: assistant(firstID, sessionID, ProviderV2.ID.make("test"), ModelV2.ID.make("test-model"), "end_turn"),
+            parts: [],
+          },
+          user(MessageID.ascending(), sessionID, "再次讨论架构边界"),
+        ]
+        yield* memory.prepare({ sessionID, messages })
+
+        expect(recall.state.maintenance).toBe(1)
+        expect(recall.state.queries).not.toContain("再次讨论架构边界")
+        expect(yield* memory.context(sessionID)).toEqual([])
+      }),
+    { git: true },
+  )
+
+  recall.it.instance(
+    "discards a query that completes after a new real user turn starts",
+    () =>
+      Effect.gen(function* () {
+        recall.reset()
+        const memory = yield* Memory.Service
+        const sessionID = SessionID.make("ses_memory_stale_query")
+        const firstID = MessageID.ascending()
+        const secondID = MessageID.ascending()
+        const current = [
+          user(firstID, sessionID, "先处理当前问题"),
+          {
+            info: assistant(firstID, sessionID, ProviderV2.ID.make("test"), ModelV2.ID.make("test-model"), "end_turn"),
+            parts: [],
+          },
+          user(secondID, sessionID, "现在需要历史背景"),
+        ]
+        yield* memory.search({ sessionID, messages: current, query: "架构边界" })
+
+        const started = yield* Deferred.make<void>()
+        const release = yield* Deferred.make<void>()
+        recall.state.matcher = (query) =>
+          query === "慢查询"
+            ? Effect.gen(function* () {
+                yield* Deferred.succeed(started, undefined)
+                yield* Deferred.await(release)
+                return { topic_ids: [recall.state.topics[0]?.id ?? ""] }
+              })
+            : Effect.succeed({ topic_ids: [] })
+        const pending = yield* memory.search({ sessionID, messages: current, query: "慢查询" }).pipe(Effect.forkChild)
+        yield* Deferred.await(started)
+
+        const next = [...current, user(MessageID.ascending(), sessionID, "新的用户问题")]
+        const advanced = yield* memory.prepare({ sessionID, messages: next }).pipe(Effect.forkChild)
+        yield* pollWithTimeout(
+          memory.context(sessionID).pipe(Effect.map((value) => (value.length === 0 ? true : undefined))),
+          "new user turn did not expire the preceding memory context",
+          "250 millis",
+        )
+        yield* Deferred.succeed(release, undefined)
+
+        expect(yield* Fiber.join(pending)).toEqual({ status: "stale" })
+        yield* Fiber.join(advanced)
+        expect(yield* memory.context(sessionID)).toEqual([])
+      }),
+    { git: true },
+  )
+})
+
 describe("memory Git exclusions", () => {
   it.live("installs exact local exclusions idempotently without touching .gitignore", () =>
     Effect.gen(function* () {
@@ -655,5 +1239,30 @@ function assistant(
     modelID,
     time: { created: 1 },
     finish,
+  }
+}
+
+function user(id: MessageID, sessionID: SessionID, text: string, synthetic = false): SessionV1.WithParts {
+  const providerID = ProviderV2.ID.make("test")
+  const modelID = ModelV2.ID.make("test-model")
+  return {
+    info: {
+      id,
+      role: "user",
+      sessionID,
+      time: { created: 1 },
+      agent: "build",
+      model: { providerID, modelID },
+    },
+    parts: [
+      {
+        id: PartID.ascending(),
+        messageID: id,
+        sessionID,
+        type: "text",
+        text,
+        ...(synthetic ? { synthetic: true } : {}),
+      },
+    ],
   }
 }
