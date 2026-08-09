@@ -12,7 +12,7 @@ import { MessageID, SessionID } from "@/session/schema"
 import { SessionProcessor } from "@/session/processor"
 import { Session } from "@/session/session"
 import { SessionTools } from "@/session/tools"
-import { MemorySearchTool } from "@/tool/memory-search"
+import { MemorySearch } from "@/tool/memory-search"
 import { Tool } from "@/tool/tool"
 import { ToolRegistry } from "@/tool/registry"
 import type { TaskPromptOps } from "@/tool/task"
@@ -52,7 +52,7 @@ describe("tool.memory_search", () => {
   it.instance("trims one natural-language query and persists only an attachment acknowledgement", () =>
     Effect.gen(function* () {
       const calls: string[] = []
-      const info = yield* MemorySearchTool
+      const info = yield* MemorySearch.MemorySearchTool
       const tool = yield* info.init()
       const sessionID = SessionID.make("ses_memory_search_tool")
       const result = yield* tool.execute({ query: "  architecture   context  " }, context(sessionID)).pipe(
@@ -112,7 +112,7 @@ describe("tool.memory_search", () => {
 
   it.instance("rejects an empty query before retrieval", () =>
     Effect.gen(function* () {
-      const info = yield* MemorySearchTool
+      const info = yield* MemorySearch.MemorySearchTool
       const tool = yield* info.init()
       const exit = yield* tool
         .execute({ query: "   " }, context(SessionID.make("ses_memory_empty_query")))
@@ -125,7 +125,7 @@ describe("tool.memory_search", () => {
   it.instance("blocks retrieval at execution time when invoked for a child session", () =>
     Effect.gen(function* () {
       const state = { calls: 0 }
-      const info = yield* MemorySearchTool
+      const info = yield* MemorySearch.MemorySearchTool
       const tool = yield* info.init()
       const parentID = SessionID.make("ses_memory_parent_guard")
       const childID = SessionID.make("ses_memory_child_guard")

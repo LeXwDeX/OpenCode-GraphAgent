@@ -8,7 +8,7 @@ import { Permission } from "@/permission"
 import { Tool } from "@/tool/tool"
 import { ToolJsonSchema } from "@/tool/json-schema"
 import { ToolRegistry } from "@/tool/registry"
-import { MemorySearchTool } from "@/tool/memory-search"
+import { MemorySearch } from "@/tool/memory-search"
 import { Truncate } from "@/tool/truncate"
 
 import { Plugin } from "@/plugin"
@@ -101,12 +101,12 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
     agent: input.agent,
   })) {
     if (
-      item.id === MemorySearchTool.id &&
+      item.id === MemorySearch.MemorySearchTool.id &&
       (input.session.parentID ||
         Permission.disabled(
-          [MemorySearchTool.id],
+          [MemorySearch.MemorySearchTool.id],
           Permission.merge(input.agent.permission, input.session.permission ?? []),
-        ).has(MemorySearchTool.id))
+        ).has(MemorySearch.MemorySearchTool.id))
     )
       continue
     const schema = ProviderTransform.schema(input.model, ToolJsonSchema.fromTool(item))

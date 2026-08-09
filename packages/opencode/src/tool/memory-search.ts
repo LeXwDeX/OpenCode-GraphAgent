@@ -1,5 +1,5 @@
 import { Effect, Option, Schema } from "effect"
-import { Memory, type SearchResult } from "@/memory/memory"
+import { Memory } from "@/memory/memory"
 import { Session } from "@/session/session"
 import { Tool } from "./tool"
 
@@ -10,7 +10,7 @@ export const Parameters = Schema.Struct({
 })
 
 type Metadata = {
-  status: SearchResult["status"]
+  status: Memory.SearchResult["status"]
   count?: number
   reused?: boolean
 }
@@ -42,7 +42,7 @@ export const MemorySearchTool = Tool.define<typeof Parameters, Metadata, never>(
   } satisfies Tool.DefWithoutID<typeof Parameters, Metadata>),
 )
 
-function response(result: SearchResult): Tool.ExecuteResult<Metadata> {
+function response(result: Memory.SearchResult): Tool.ExecuteResult<Metadata> {
   if (result.status === "attached") {
     return {
       title: "memory attached",
@@ -88,3 +88,5 @@ function unavailable(): Tool.ExecuteResult<Metadata> {
     metadata: { status: "unavailable" },
   }
 }
+
+export * as MemorySearch from "./memory-search"

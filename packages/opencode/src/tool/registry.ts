@@ -13,7 +13,7 @@ import { TaskTool } from "./task"
 import { Database } from "@opencode-ai/core/database/database"
 import { TodoWriteTool } from "./todo"
 import { GoalTool } from "./goal"
-import { MemorySearchTool } from "./memory-search"
+import { MemorySearch } from "./memory-search"
 import { SettingsHook } from "@/hook/settings"
 import { WebFetchTool } from "./webfetch"
 import { WriteTool } from "./write"
@@ -107,7 +107,7 @@ export const layer = Layer.effect(
     const question = yield* QuestionTool
     const todo = yield* TodoWriteTool
     const goaltool = yield* GoalTool
-    const memorySearch = yield* MemorySearchTool
+    const memorySearch = yield* MemorySearch.MemorySearchTool
     const lsptool = yield* LspTool
     const plan = yield* PlanExitTool
     const webfetch = yield* WebFetchTool
