@@ -201,6 +201,23 @@ export function withCliFixture<A, E>(
 
     const configJson = JSON.stringify(testProviderConfig(llm.url))
     const env = isolatedEnv(home, configJson)
+    const memoryConfigDir = path.join(home, ".config/opencode")
+    yield* fs.makeDirectory(memoryConfigDir, { recursive: true })
+    // CLI tests own the provider response queue, while dedicated MEMORY tests
+    // cover first-run model selection. Seed a valid global config so unrelated
+    // background initialization cannot consume a CLI test's prompt response.
+    yield* fs.writeFileString(
+      path.join(memoryConfigDir, "memory.jsonc"),
+      JSON.stringify({
+        schema_version: 1,
+        enabled: true,
+        model: testModelID,
+        topic_limit: 10,
+        topic_limit_floor: 10,
+        turn_interval: 5,
+        injection: { max_topics: 3, max_tokens: 1_200 },
+      }),
+    )
 
     const spawn = Effect.fn("opencode.spawn")(function* (args: string[], opts?: SpawnOpts) {
       const start = Date.now()
@@ -532,10 +549,5 @@ export const cliIt = {
     name: string,
     body: (input: CliFixture) => Effect.Effect<A, E, Scope.Scope | HttpClient.HttpClient>,
     opts?: number | TestOptions,
-  ) =>
-    test(
-      name,
-      () => Effect.runPromise(Effect.scoped(withCliFixture(body))),
-      opts,
-    ),
+  ) => test(name, () => Effect.runPromise(Effect.scoped(withCliFixture(body))), opts),
 }
