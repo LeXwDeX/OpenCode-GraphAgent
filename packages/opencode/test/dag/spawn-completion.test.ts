@@ -316,4 +316,42 @@ describe("spawnNode terminalization during spawn window", () => {
     expect(events.filter((e) => e.type === "nodeCompleted")).toEqual([])
     expect(cancelCalled).toBe(true)
   })
+
+  it("cancels the child session when nodeStarted fails after session creation", async () => {
+    const events: TrackedEvent[] = []
+    let cancelCalled = false
+    let promptCalled = false
+    const dagLayer = Layer.mock(Dag.Service, {
+      store: {} as DagStore.Interface,
+      nodeQueued: () => Effect.void,
+      nodeStarted: () => Effect.fail(new Error("nodeStarted write failed")),
+      nodeCompleted: Effect.fn("stub.nodeCompleted")((dagID: string, nodeID: string) =>
+        Effect.sync(() => events.push({ type: "nodeCompleted", dagID, nodeID })),
+      ),
+      nodeFailed: Effect.fn("stub.nodeFailed")((dagID: string, nodeID: string, reason: string) =>
+        Effect.sync(() => events.push({ type: "nodeFailed", dagID, nodeID, reason })),
+      ),
+    })
+    const promptLayer = Layer.mock(SessionPrompt.Service, {
+      prompt: () =>
+        Effect.sync(() => {
+          promptCalled = true
+          return reply("unexpected")
+        }),
+      cancel: () => Effect.sync(() => { cancelCalled = true }),
+    })
+
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const result = yield* spawnNode(Semaphore.makeUnsafe(1), makeSpawnInput())
+          yield* Fiber.await(result.fiber)
+        }),
+      ).pipe(Effect.provide(Layer.mergeAll(dagLayer, agentLayer, sessionLayer, promptLayer))) as Effect.Effect<never>,
+    )
+
+    expect(promptCalled).toBe(false)
+    expect(findEvent(events, "nodeFailed")?.reason).toContain("nodeStarted write failed")
+    expect(cancelCalled).toBe(true)
+  })
 })
