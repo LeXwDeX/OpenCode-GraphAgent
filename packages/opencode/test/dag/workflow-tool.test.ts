@@ -1325,6 +1325,32 @@ config:
       expect(published).toHaveLength(0)
     }),
   )
+
+  runtime.effect("start rejects a parent session other than the calling session", () =>
+    Effect.gen(function* () {
+      published.length = 0
+      const info = yield* WorkflowTool
+      const workflow = yield* info.init()
+      const exit = yield* workflow
+        .execute(
+          {
+            action: "start",
+            session_id: "ses_other_parent",
+            spec: {
+              config: {
+                name: "foreign-parent",
+                nodes: [],
+              },
+            },
+          },
+          toolContext(),
+        )
+        .pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      expect(published).toHaveLength(0)
+    }),
+  )
 })
 
 describe("workflow tool saved workflows", () => {
