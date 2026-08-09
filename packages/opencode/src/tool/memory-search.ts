@@ -1,7 +1,7 @@
 import { Effect, Option, Schema } from "effect"
 import { Memory, type SearchResult } from "@/memory/memory"
 import { Session } from "@/session/session"
-import * as Tool from "./tool"
+import { Tool } from "./tool"
 
 export const Parameters = Schema.Struct({
   query: Schema.String.annotate({

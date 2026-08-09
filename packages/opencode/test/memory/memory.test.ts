@@ -550,18 +550,18 @@ describe("memory controller policy", () => {
     expect(rendered[0]).toContain("first-topic")
     expect(rendered[0]).not.toContain("second-topic")
     expect(rendered[0]).toContain("Current user input and higher-priority instructions always win")
-    for (const hidden of [
-      "created_at",
-      "updated_at",
-      "last_matched_at",
-      "match_count",
-      "revision",
-      "item_count",
-      "confirmed_at",
-      "schema_version",
-    ]) {
-      expect(rendered[0]).not.toContain(hidden)
-    }
+    expect(
+      [
+        "created_at",
+        "updated_at",
+        "last_matched_at",
+        "match_count",
+        "revision",
+        "item_count",
+        "confirmed_at",
+        "schema_version",
+      ].filter((hidden) => rendered[0]?.includes(hidden)),
+    ).toEqual([])
     expect(Token.estimate(rendered[0])).toBeLessThanOrEqual(200)
 
     expect(
@@ -735,6 +735,51 @@ describe("memory turn-scoped retrieval", () => {
   )
 
   recall.systemIt.instance(
+    "does not treat the first real user message after compaction as the session first turn",
+    () =>
+      Effect.gen(function* () {
+        recall.reset()
+        const memory = yield* Memory.Service
+        const prompt = yield* SystemPrompt.Service
+        const sessionID = SessionID.make("ses_memory_compacted_history")
+        const markerID = MessageID.ascending()
+        const current = user(MessageID.ascending(), sessionID, "继续压缩后的架构问题")
+        const messages: SessionV1.WithParts[] = [
+          {
+            info: {
+              ...user(markerID, sessionID, "").info,
+              id: markerID,
+            },
+            parts: [
+              {
+                id: PartID.ascending(),
+                messageID: markerID,
+                sessionID,
+                type: "compaction",
+                auto: true,
+              },
+            ],
+          },
+          current,
+        ]
+
+        expect(yield* prompt.memory({ sessionID, messages, main: true })).toEqual([])
+        expect(recall.state.queries).toEqual([])
+
+        expect(yield* memory.search({ sessionID, messages, query: "架构边界" })).toEqual({
+          status: "attached",
+          count: 1,
+          reused: false,
+        })
+        expect((yield* prompt.memory({ sessionID, messages, main: true })).join("\n")).toContain(
+          "architecture-boundaries",
+        )
+        expect(recall.state.queries).toEqual(["架构边界"])
+      }),
+    { git: true },
+  )
+
+  recall.systemIt.instance(
     "keeps child, disabled, and ineligible sessions isolated from Topic reads and matching",
     () =>
       Effect.gen(function* () {
@@ -871,11 +916,11 @@ describe("memory turn-scoped retrieval", () => {
       Effect.gen(function* () {
         recall.reset()
         const started = yield* Deferred.make<void>()
-        const release = yield* Deferred.make<void>()
+        const repeatedStarted = yield* Deferred.make<void>()
         recall.state.matcher = () =>
           Effect.gen(function* () {
             yield* Deferred.succeed(started, undefined)
-            yield* Deferred.await(release)
+            yield* Deferred.await(repeatedStarted)
             return { topic_ids: [recall.state.topics[0]?.id ?? ""] }
           })
         const memory = yield* Memory.Service
@@ -887,9 +932,10 @@ describe("memory turn-scoped retrieval", () => {
 
         const first = yield* memory.search({ sessionID, messages, query: "并发架构查询" }).pipe(Effect.forkChild)
         yield* Deferred.await(started)
-        const repeated = yield* memory.search({ sessionID, messages, query: " 并发架构查询 " }).pipe(Effect.forkChild)
-        yield* Effect.sleep("10 millis")
-        yield* Deferred.succeed(release, undefined)
+        const repeated = yield* Effect.gen(function* () {
+          yield* Deferred.succeed(repeatedStarted, undefined)
+          return yield* memory.search({ sessionID, messages, query: " 并发架构查询 " })
+        }).pipe(Effect.forkChild)
 
         expect(yield* Fiber.join(first)).toEqual({ status: "attached", count: 1, reused: false })
         expect(yield* Fiber.join(repeated)).toEqual({ status: "attached", count: 1, reused: true })

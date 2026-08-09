@@ -21,13 +21,17 @@ const EVIDENCE_CHARS = 8_000
 const PREPARE_TIMEOUT = Duration.seconds(5)
 const CHECKPOINT_TIMEOUT = Duration.seconds(8)
 
-type SessionCache = {
+type TurnCache = {
   readonly completedTurns: number
   readonly messageID: MessageID
-  firstTurnAttempted: boolean
   queryCount: number
   readonly queries: Map<string, { readonly count: number; readonly rendered: string[] }>
   rendered: string[]
+}
+
+type SessionCache = {
+  firstTurnAttempted: boolean
+  turn: TurnCache
 }
 
 export type SearchResult =
@@ -301,23 +305,11 @@ export const layer: Layer.Layer<
       const data = yield* InstanceState.get(state)
       const previous = data.sessions.get(input.sessionID)
       const turns = completedTurns(input.messages)
-      const changed = previous?.messageID !== user.info.id
-      const firstTurn = input.messages.find(isRealUser)?.info.id === user.info.id
-      const due =
-        turns > 0 && turns % current.loaded.config.turn_interval === 0 && (!previous || previous.completedTurns < turns)
-      if (changed) {
-        data.sessions.set(input.sessionID, {
-          completedTurns: previous?.completedTurns ?? 0,
-          messageID: user.info.id,
-          firstTurnAttempted: !firstTurn,
-          queryCount: 0,
-          queries: new Map(),
-          rendered: [],
-        })
-      }
-      const turn = data.sessions.get(input.sessionID)
-      const shouldMatch = firstTurn && turn?.firstTurnAttempted === false
-      if (shouldMatch && turn) turn.firstTurnAttempted = true
+      const session = beginUserTurn(previous, input.messages, user.info.id)
+      if (session !== previous) data.sessions.set(input.sessionID, session)
+      const due = turns > 0 && turns % current.loaded.config.turn_interval === 0 && session.turn.completedTurns < turns
+      const shouldMatch = !session.firstTurnAttempted && isSessionFirstRealUser(input.messages, user.info.id)
+      session.firstTurnAttempted = true
       if (!due && !shouldMatch) return
 
       yield* locks.withLock(current.ctx.worktree)(
@@ -347,10 +339,10 @@ export const layer: Layer.Layer<
                 text: user.text,
                 worktree: current.ctx.worktree,
               })).rendered
-            : (data.sessions.get(input.sessionID)?.rendered ?? [])
+            : (data.sessions.get(input.sessionID)?.turn.rendered ?? [])
           const entry = data.sessions.get(input.sessionID)
-          if (entry?.messageID !== user.info.id) return
-          data.sessions.set(input.sessionID, { ...entry, completedTurns: turns, rendered })
+          if (entry?.turn.messageID !== user.info.id) return
+          entry.turn = { ...entry.turn, completedTurns: turns, rendered }
         }),
       )
     })
@@ -369,7 +361,7 @@ export const layer: Layer.Layer<
         return []
       }
       if (!(yield* InstanceState.has(state))) return []
-      return (yield* InstanceState.get(state)).sessions.get(sessionID)?.rendered ?? []
+      return (yield* InstanceState.get(state)).sessions.get(sessionID)?.turn.rendered ?? []
     })
 
     const context: Interface["context"] = Effect.fn("Memory.context")((sessionID) =>
@@ -400,18 +392,10 @@ export const layer: Layer.Layer<
 
       const data = yield* InstanceState.get(state)
       const previous = data.sessions.get(input.sessionID)
-      if (previous?.messageID !== user.info.id) {
-        data.sessions.set(input.sessionID, {
-          completedTurns: completedTurns(input.messages),
-          messageID: user.info.id,
-          firstTurnAttempted: input.messages.find(isRealUser)?.info.id !== user.info.id,
-          queryCount: 0,
-          queries: new Map(),
-          rendered: [],
-        })
-      }
-      const turn = data.sessions.get(input.sessionID)
-      if (!turn) return { status: "unavailable" as const }
+      const session = beginUserTurn(previous, input.messages, user.info.id)
+      if (session !== previous) data.sessions.set(input.sessionID, session)
+      session.firstTurnAttempted = true
+      const turn = session.turn
       const key = query.toLocaleLowerCase()
       const cached = turn.queries.get(key)
       if (cached) {
@@ -424,7 +408,7 @@ export const layer: Layer.Layer<
 
       return yield* locks.withLock(current.ctx.worktree)(
         Effect.gen(function* () {
-          const activeTurn = data.sessions.get(input.sessionID)
+          const activeTurn = data.sessions.get(input.sessionID)?.turn
           if (activeTurn?.messageID !== origin) return { status: "stale" as const }
           const repeated = activeTurn.queries.get(key)
           if (repeated) {
@@ -443,7 +427,7 @@ export const layer: Layer.Layer<
             text: query,
             worktree: current.ctx.worktree,
           })
-          const latest = data.sessions.get(input.sessionID)
+          const latest = data.sessions.get(input.sessionID)?.turn
           if (latest?.messageID !== origin) return { status: "stale" as const }
           latest.queries.set(key, selected)
           latest.rendered = selected.rendered
@@ -631,6 +615,36 @@ export function cleanText(value: string) {
 
 function normalizeQuery(value: string) {
   return value.trim().replace(/\s+/g, " ")
+}
+
+function beginUserTurn(
+  previous: SessionCache | undefined,
+  messages: SessionV1.WithParts[],
+  messageID: MessageID,
+): SessionCache {
+  if (previous?.turn.messageID === messageID) return previous
+  return {
+    firstTurnAttempted: previous?.firstTurnAttempted ?? !isSessionFirstRealUser(messages, messageID),
+    turn: {
+      completedTurns: previous?.turn.completedTurns ?? 0,
+      messageID,
+      queryCount: 0,
+      queries: new Map(),
+      rendered: [],
+    },
+  }
+}
+
+function isSessionFirstRealUser(messages: SessionV1.WithParts[], messageID: MessageID) {
+  if (
+    messages.some(
+      (message) =>
+        message.parts.some((part) => part.type === "compaction") ||
+        (message.info.role === "assistant" && message.info.summary === true),
+    )
+  )
+    return false
+  return messages.find(isRealUser)?.info.id === messageID
 }
 
 function maintenanceEvidence(messages: SessionV1.WithParts[]) {

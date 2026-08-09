@@ -124,7 +124,7 @@ describe("tool.memory_search", () => {
 
   it.instance("blocks retrieval at execution time when invoked for a child session", () =>
     Effect.gen(function* () {
-      let calls = 0
+      const state = { calls: 0 }
       const info = yield* MemorySearchTool
       const tool = yield* info.init()
       const parentID = SessionID.make("ses_memory_parent_guard")
@@ -135,7 +135,7 @@ describe("tool.memory_search", () => {
             Layer.mock(Memory.Service, {
               search: () =>
                 Effect.sync(() => {
-                  calls++
+                  state.calls++
                   return { status: "attached" as const, count: 1, reused: false }
                 }),
             }),
@@ -146,7 +146,7 @@ describe("tool.memory_search", () => {
         ),
       )
 
-      expect(calls).toBe(0)
+      expect(state.calls).toBe(0)
       expect(result.output).toBe("Memory search is unavailable for this session")
     }),
   )
