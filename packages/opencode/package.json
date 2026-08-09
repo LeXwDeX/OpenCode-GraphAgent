@@ -8,6 +8,7 @@
   "scripts": {
     "typecheck": "tsgo --noEmit",
     "test": "bun test --timeout 30000 --only-failures",
+    "test:dag-core": "bun run script/dag-core-coverage.ts",
     "test:httpapi": "bun run script/httpapi-exercise.ts --mode coverage --fail-on-missing --fail-on-skip && bun run script/httpapi-exercise.ts --mode auth --fail-on-missing --fail-on-skip && bun run script/httpapi-exercise.ts --mode effect --fail-on-missing --fail-on-skip",
     "test:httpapi:ci": "bun run script/httpapi-exercise.ts --mode coverage --fail-on-missing --fail-on-skip && bun run script/httpapi-exercise.ts --mode auth --fail-on-missing --fail-on-skip && bun run script/httpapi-exercise.ts --mode effect --fail-on-missing --fail-on-skip --progress --trace",
     "bench:test": "bun run script/bench-test-suite.ts",
@@ -149,6 +150,7 @@
     "web-tree-sitter": "0.25.10",
     "ws": "8.21.0",
     "xdg-basedir": "5.1.0",
+    "yaml": "2.9.0",
     "yargs": "18.0.0",
     "zod": "catalog:"
   },

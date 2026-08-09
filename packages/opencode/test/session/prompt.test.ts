@@ -60,6 +60,7 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { LocationServiceMap } from "@opencode-ai/core/location-layer"
+import { Memory } from "@/memory/memory"
 
 const summary = Layer.succeed(
   SessionSummary.Service,
@@ -230,12 +231,27 @@ const blockingProcessor = Layer.succeed(
   }),
 )
 
-function makePrompt(input?: { mcpInstructions?: MCP.ServerInstructions[]; processor?: "blocking"; goal?: boolean }) {
+type PromptLayerOptions = {
+  mcpInstructions?: MCP.ServerInstructions[]
+  processor?: "blocking"
+  goal?: boolean
+  memoryContext?: string[]
+}
+
+function makePrompt(input?: PromptLayerOptions) {
   // goal: false exercises the Goal-absent degradation path (serviceOption None)
   const goalLayer: Layer.Layer<Goal.Service> =
     input?.goal === false ? (Layer.empty as unknown as Layer.Layer<Goal.Service>) : Goal.defaultLayer
+  const memoryLayer = Layer.mock(Memory.Service, {
+    init: () => Effect.void,
+    prepare: () => Effect.void,
+    context: () => Effect.succeed(input?.memoryContext ?? []),
+    checkpoint: () => Effect.succeed(input?.memoryContext ?? []),
+    setEnabled: (enabled) => Effect.succeed(enabled ? ("Memory on" as const) : ("Memory off" as const)),
+  })
   const deps = Layer.mergeAll(
     hookRecorderLayer,
+    memoryLayer,
     Session.defaultLayer,
     Snapshot.defaultLayer,
     LLM.defaultLayer,
@@ -309,11 +325,11 @@ function makePrompt(input?: { mcpInstructions?: MCP.ServerInstructions[]; proces
   )
 }
 
-function makeHttp(input?: { mcpInstructions?: MCP.ServerInstructions[]; processor?: "blocking"; goal?: boolean }) {
+function makeHttp(input?: PromptLayerOptions) {
   return Layer.mergeAll(TestLLMServer.layer, makePrompt(input))
 }
 
-function makeHttpNoLLMServer(input?: { mcpInstructions?: MCP.ServerInstructions[]; processor?: "blocking"; goal?: boolean }) {
+function makeHttpNoLLMServer(input?: PromptLayerOptions) {
   return makePrompt(input)
 }
 
@@ -331,6 +347,7 @@ const withMcpInstructions = testEffect(
     ],
   }),
 )
+const withMemoryContext = testEffect(makeHttp({ memoryContext: ["<project_memory_data>project-memory-probe</project_memory_data>"] }))
 const unix = process.platform !== "win32" ? it.instance : it.instance.skip
 const unixNoLLMServer = process.platform !== "win32" ? noLLMServer.instance : noLLMServer.instance.skip
 
@@ -2280,6 +2297,69 @@ it.instance("stores the slash invocation as visible text and hides the expanded 
       "Expanded command instructions:\ninspect layout",
     )
     expect(JSON.stringify(yield* llm.inputs)).toContain("Expanded command instructions")
+  }),
+)
+
+noLLMServer.instance("dispatches /memory on and off without running a model turn", () =>
+  Effect.gen(function* () {
+    const { prompt, sessions, chat } = yield* boot()
+
+    const off = yield* prompt.command({ sessionID: chat.id, command: "memory", arguments: "off" })
+    const on = yield* prompt.command({ sessionID: chat.id, command: "memory", arguments: "on" })
+    const unsupported = yield* prompt.command({ sessionID: chat.id, command: "memory", arguments: "topic 20" })
+
+    expect(off.parts.filter((part) => part.type === "text").map((part) => part.text)).toEqual([
+      "/memory off",
+      "Memory off",
+    ])
+    expect(on.parts.filter((part) => part.type === "text").map((part) => part.text)).toEqual([
+      "/memory on",
+      "Memory on",
+    ])
+    expect(unsupported.parts.filter((part) => part.type === "text").map((part) => part.text)).toEqual([
+      "/memory topic 20",
+      "Memory remains off",
+    ])
+    expect((yield* sessions.messages({ sessionID: chat.id })).every((message) => message.info.role === "user")).toBe(true)
+  }),
+  { config: cfg },
+)
+
+withMemoryContext.instance("injects MEMORY data into the main model system context", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const { prompt, chat } = yield* boot()
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "use the project preference" }],
+    })
+    yield* llm.text("done")
+
+    yield* prompt.loop({ sessionID: chat.id })
+
+    expect(JSON.stringify((yield* llm.hits)[0]?.body)).toContain("project-memory-probe")
+  }),
+)
+
+withMemoryContext.instance("does not inject MEMORY data into child agent sessions", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const { prompt, sessions } = yield* boot()
+    const parent = yield* sessions.create({ title: "Parent" })
+    const child = yield* sessions.create({ title: "Child", parentID: parent.id })
+    yield* prompt.prompt({
+      sessionID: child.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "inspect the delegated task" }],
+    })
+    yield* llm.text("done")
+
+    yield* prompt.loop({ sessionID: child.id })
+
+    expect(JSON.stringify((yield* llm.hits)[0]?.body)).not.toContain("project-memory-probe")
   }),
 )
 

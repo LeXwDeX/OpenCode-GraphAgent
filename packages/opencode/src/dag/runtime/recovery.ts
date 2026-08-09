@@ -65,7 +65,7 @@ export function reconcileWorkflow(
       // never revisit it if the workflow is about to become terminal.
       if (node.status === "pending" || node.status === "queued") {
         if (node.childSessionId && cancelSession) {
-          yield* cancelSession(node.childSessionId).pipe(Effect.catch(() => Effect.void))
+          yield* cancelSession(node.childSessionId)
         }
         continue
       }

@@ -23,9 +23,11 @@ import { LocationServiceMap } from "@opencode-ai/core/location-layer"
 import { Reference } from "@opencode-ai/core/reference"
 import { MCP } from "@/mcp"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
+import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Goal } from "@/goal/goal"
 import { GoalPrompts } from "@/goal/prompts"
 import { SettingsHook } from "@/hook/settings"
+import { Memory } from "@/memory/memory"
 import type { SessionID } from "@/session/schema"
 
 export function provider(model: Provider.Model) {
@@ -50,6 +52,11 @@ export interface Interface {
   readonly mcp: (agent: Agent.Info, permission?: PermissionV1.Ruleset) => Effect.Effect<string | undefined>
   readonly goal: (sessionID: SessionID) => Effect.Effect<string[]>
   readonly hooks: () => Effect.Effect<string[]>
+  readonly memory: (input: {
+    sessionID: SessionID
+    messages: SessionV1.WithParts[]
+    main: boolean
+  }) => Effect.Effect<string[]>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SystemPrompt") {}
@@ -170,6 +177,14 @@ export const layer = Layer.effect(
         if (hooks.length > MAX) lines.push(`… and ${hooks.length - MAX} more (see hooks.json)`)
         return [lines.join("\n")]
       }),
+
+      memory: Effect.fn("SystemPrompt.memory")(function* (input) {
+        if (!input.main) return []
+        const memory = Option.getOrUndefined(yield* Effect.serviceOption(Memory.Service))
+        if (!memory) return []
+        yield* memory.prepare({ sessionID: input.sessionID, messages: input.messages })
+        return yield* memory.context(input.sessionID)
+      }),
     })
   }),
 )
@@ -183,6 +198,6 @@ export const defaultLayer = layer.pipe(
 
 const locationServiceMapNode = LayerNode.make(LocationServiceMap.layer, [])
 
-export const node = LayerNode.make(layer, [Skill.node, MCP.node, Goal.node, locationServiceMapNode])
+export const node = LayerNode.make(layer, [Skill.node, MCP.node, Goal.node, Memory.node, locationServiceMapNode])
 
 export * as SystemPrompt from "./system"

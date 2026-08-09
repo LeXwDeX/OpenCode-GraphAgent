@@ -34,6 +34,8 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 import { LLMEvent, Usage } from "@opencode-ai/llm"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
+import { Memory } from "@/memory/memory"
+import { SettingsHook } from "@/hook/settings"
 
 const summary = Layer.succeed(
   SessionSummary.Service,
@@ -261,6 +263,8 @@ type CompactionProcessOptions = {
   plugin?: Layer.Layer<Plugin.Service>
   provider?: ReturnType<typeof ProviderTest.fake>
   config?: Layer.Layer<Config.Service>
+  memory?: Layer.Layer<Memory.Service>
+  settingsHook?: Layer.Layer<SettingsHook.Service>
 }
 
 function withCompaction(options?: CompactionProcessOptions) {
@@ -278,7 +282,11 @@ function compactionProcessLayer(options?: CompactionProcessOptions) {
         Layer.provide(status),
       )
     : layer(options?.result ?? "continue")
-  return Layer.mergeAll(SessionCompaction.layer.pipe(Layer.provide(processor)), processor, events, status).pipe(
+  const compaction = SessionCompaction.layer.pipe(
+    Layer.provide(processor),
+    Layer.provideMerge(Layer.mergeAll(options?.memory ?? Layer.empty, options?.settingsHook ?? Layer.empty)),
+  )
+  return Layer.mergeAll(compaction, processor, events, status).pipe(
     Layer.provide(SessionNs.defaultLayer),
     Layer.provide((options?.provider ?? wide()).layer),
     Layer.provide(Snapshot.defaultLayer),
@@ -843,6 +851,102 @@ describe("session.compaction.process", () => {
         }
       }
     }),
+  )
+
+  itCompaction.instance(
+    "runs MEMORY checkpoint before PreCompact and plugin hooks",
+    () => {
+      const order: string[] = []
+      let pluginContext: string[] = []
+      const stub = llm()
+      stub.push(reply("summary"))
+      const memory = Layer.mock(Memory.Service, {
+        checkpoint: () =>
+          Effect.sync(() => {
+            order.push("memory")
+            return ["memory-context"]
+          }),
+      })
+      const settingsHook = Layer.mock(SettingsHook.Service, {
+        trigger: (payload) =>
+          Effect.sync(() => {
+            if (payload.event === "PreCompact") order.push("precompact")
+            return { additionalContexts: [], systemMessages: [] }
+          }),
+        list: () => Effect.succeed([]),
+      })
+      const orderedPlugin = Layer.mock(Plugin.Service)({
+        trigger: (name, _input, output) =>
+          Effect.sync(() => {
+            if (
+              name === "experimental.session.compacting" &&
+              typeof output === "object" &&
+              output !== null &&
+              "context" in output &&
+              Array.isArray(output.context) &&
+              output.context.every((value) => typeof value === "string")
+            ) {
+              order.push("plugin")
+              pluginContext = [...output.context]
+            }
+            return output
+          }),
+        list: () => Effect.succeed([]),
+        init: () => Effect.void,
+      })
+
+      return Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const session = yield* ssn.create({})
+        const msg = yield* createUserMessage(session.id, "hello")
+        const msgs = yield* ssn.messages({ sessionID: session.id })
+
+        yield* SessionCompaction.use.process({
+          parentID: msg.id,
+          messages: msgs,
+          sessionID: session.id,
+          auto: false,
+        })
+
+        expect(order.slice(0, 3)).toEqual(["memory", "precompact", "plugin"])
+        expect(pluginContext).toEqual(["memory-context"])
+      }).pipe(withCompaction({ llm: stub.layer, plugin: orderedPlugin, memory, settingsHook }))
+    },
+    { git: true },
+  )
+
+  itCompaction.instance(
+    "skips the MEMORY checkpoint for child agent sessions",
+    () => {
+      let checkpoints = 0
+      const stub = llm()
+      stub.push(reply("summary"))
+      const memory = Layer.mock(Memory.Service, {
+        checkpoint: () =>
+          Effect.sync(() => {
+            checkpoints++
+            return []
+          }),
+      })
+
+      return Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const parent = yield* ssn.create({})
+        const child = yield* ssn.create({ parentID: parent.id })
+        const msg = yield* createUserMessage(child.id, "hello")
+        const msgs = yield* ssn.messages({ sessionID: child.id })
+
+        yield* SessionCompaction.use.process({
+          parentID: msg.id,
+          messages: msgs,
+          sessionID: child.id,
+          auto: false,
+        })
+
+        expect(checkpoints).toBe(0)
+      }).pipe(withCompaction({ llm: stub.layer, memory }))
+    },
+    { git: true },
   )
 
   it.instance(

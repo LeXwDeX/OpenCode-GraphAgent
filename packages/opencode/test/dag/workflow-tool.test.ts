@@ -105,6 +105,21 @@ const store = Layer.mock(DagStore.Service, {
             timeCreated: 1,
             timeUpdated: 2,
           }
+        : id === "dag_paused" || id === "dag_step"
+          ? {
+              id,
+              projectId: projectID,
+              sessionId: "ses_workflow_parent",
+              title: "Control workflow",
+              status: id === "dag_paused" ? "paused" : "running",
+              config: "{}",
+              seq: 1,
+              wakeReported: false,
+              startedAt: 1,
+              completedAt: null,
+              timeCreated: 1,
+              timeUpdated: 2,
+            }
         : id === "dag_deep_status"
           ? {
               id,
@@ -216,6 +231,34 @@ const store = Layer.mock(DagStore.Service, {
         timeCreated: 1,
         timeUpdated: 2,
           }]
+        : id === "dag_step"
+          ? [{
+              id: "node_ready",
+              workflowId: "dag_step",
+              name: "Ready node",
+              workerType: "build",
+              status: "pending",
+              required: true,
+              dependsOn: [],
+              modelId: null,
+              modelProviderId: null,
+              childSessionId: null,
+              output: null,
+              capturedOutput: null,
+              errorReason: null,
+              errorClass: null,
+              deadlineMs: null,
+              wakeEligible: false,
+              wakeReported: false,
+              replanAttempts: 0,
+              seq: 1,
+              timeoutExtensions: 0,
+              escalationPending: false,
+              startedAt: null,
+              completedAt: null,
+              timeCreated: 1,
+              timeUpdated: 1,
+            }]
         : [],
     ),
 })
@@ -440,6 +483,81 @@ describe("workflow tool execution", () => {
       expect(result.output).toContain('"mode": "standard"')
       expect(result.output).toContain('"id": "node_failed"')
       expect(result.output).toContain('"error_class": "timeout"')
+    }),
+  )
+
+  runtime.effect("rejects reads and mutations from a session that does not own the workflow", () =>
+    Effect.gen(function* () {
+      published.length = 0
+      const info = yield* WorkflowTool
+      const workflow = yield* info.init()
+      const foreignContext = {
+        ...toolContext(),
+        sessionID: SessionID.make("ses_foreign"),
+      } satisfies Tool.Context
+
+      const statusExit = yield* Effect.exit(workflow.execute(
+        { action: "status", workflow_id: "dag_status" },
+        foreignContext,
+      ))
+      const extendExit = yield* Effect.exit(workflow.execute(
+        { action: "extend", workflow_id: "dag_defaults", spec: { nodes: [] } },
+        foreignContext,
+      ))
+      const controlExit = yield* Effect.exit(workflow.execute(
+        { action: "control", workflow_id: "dag_status", operation: "pause" },
+        foreignContext,
+      ))
+
+      expect({
+        statusSucceeded: Exit.isSuccess(statusExit),
+        statusLeakedChildSession: Exit.isSuccess(statusExit) && statusExit.value.output.includes("ses_child"),
+        extendSucceeded: Exit.isSuccess(extendExit),
+        controlSucceeded: Exit.isSuccess(controlExit),
+        publishedPause: published.some((event) => event.type === DagEvent.WorkflowPaused.type),
+      }).toEqual({
+        statusSucceeded: false,
+        statusLeakedChildSession: false,
+        extendSucceeded: false,
+        controlSucceeded: false,
+        publishedPause: false,
+      })
+    }),
+  )
+
+  runtime.effect("dispatches every public control operation to its durable workflow event", () =>
+    Effect.gen(function* () {
+      const info = yield* WorkflowTool
+      const workflow = yield* info.init()
+      const controls = [
+        { workflowID: "dag_status", operation: "pause" },
+        { workflowID: "dag_paused", operation: "resume" },
+        { workflowID: "dag_status", operation: "cancel" },
+        { workflowID: "dag_status", operation: "complete" },
+        { workflowID: "dag_step", operation: "step" },
+      ] as const
+      const routed = yield* Effect.forEach(controls, (control) =>
+        Effect.gen(function* () {
+          published.length = 0
+          yield* workflow.execute(
+            {
+              action: "control",
+              workflow_id: control.workflowID,
+              operation: control.operation,
+            },
+            toolContext(),
+          )
+          return published.find((event) => event.type.startsWith("dag.workflow."))?.type ?? "missing"
+        }),
+      )
+
+      expect(routed).toEqual([
+        DagEvent.WorkflowPaused.type,
+        DagEvent.WorkflowResumed.type,
+        DagEvent.WorkflowCancelled.type,
+        DagEvent.WorkflowCompleted.type,
+        DagEvent.WorkflowStepped.type,
+      ])
     }),
   )
 
@@ -1200,6 +1318,32 @@ config:
             metadata: () => Effect.void,
             ask: () => Effect.void,
           } satisfies Tool.Context,
+        )
+        .pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      expect(published).toHaveLength(0)
+    }),
+  )
+
+  runtime.effect("start rejects a parent session other than the calling session", () =>
+    Effect.gen(function* () {
+      published.length = 0
+      const info = yield* WorkflowTool
+      const workflow = yield* info.init()
+      const exit = yield* workflow
+        .execute(
+          {
+            action: "start",
+            session_id: "ses_other_parent",
+            spec: {
+              config: {
+                name: "foreign-parent",
+                nodes: [],
+              },
+            },
+          },
+          toolContext(),
         )
         .pipe(Effect.exit)
 
