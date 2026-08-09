@@ -393,6 +393,7 @@ export function spawnNode(
                   return true
                 }),
             ),
+            Effect.onError(() => promptSvc.cancel(childSession.id).pipe(Effect.ignore)),
           )
           if (terminalized) return
 
