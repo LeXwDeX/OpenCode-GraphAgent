@@ -50,6 +50,13 @@ const CREATE_DAG_WORKFLOW_SKILL_NAME = "create-dag-workflow"
 const CREATE_DAG_WORKFLOW_SKILL_DESCRIPTION = SkillPlugin.CreateDagWorkflowDescription
 const CREATE_DAG_WORKFLOW_SKILL_BODY = SkillPlugin.CreateDagWorkflowContent
 
+// Built-in routing skill. Its compact catalog description makes project-level
+// orchestration proactive; the full decision and block-composition playbook is
+// loaded only when the model invokes the skill.
+const ORCHESTRATION_ROUTER_SKILL_NAME = "orchestration-router"
+const ORCHESTRATION_ROUTER_SKILL_DESCRIPTION = SkillPlugin.OrchestrationRouterDescription
+const ORCHESTRATION_ROUTER_SKILL_BODY = SkillPlugin.OrchestrationRouterContent
+
 export const Info = Schema.Struct({
   name: Schema.String,
   description: Schema.optional(Schema.String),
@@ -308,6 +315,12 @@ export const layer = Layer.effect(
           description: CREATE_DAG_WORKFLOW_SKILL_DESCRIPTION,
           location: "<built-in>",
           content: CREATE_DAG_WORKFLOW_SKILL_BODY,
+        }
+        s.skills[ORCHESTRATION_ROUTER_SKILL_NAME] = {
+          name: ORCHESTRATION_ROUTER_SKILL_NAME,
+          description: ORCHESTRATION_ROUTER_SKILL_DESCRIPTION,
+          location: "<built-in>",
+          content: ORCHESTRATION_ROUTER_SKILL_BODY,
         }
         yield* loadSkills(s, yield* InstanceState.get(discovered), events)
         return s

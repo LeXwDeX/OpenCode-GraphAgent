@@ -99,7 +99,8 @@ graph. You MUST NOT create an admission child node, QA workflow, separate
 persona, or privileged command. `GRILL-ME` selects `GRILL`; equivalent explicit
 requests for adversarial qualification do the same.
 
-Cover these six dimensions, asking only material unresolved questions:
+Cover these six dimensions, resolving repository-discoverable facts before
+asking the user:
 
 1. goal;
 2. scope;
@@ -108,15 +109,23 @@ Cover these six dimensions, asking only material unresolved questions:
 5. evidence and review;
 6. risks and failure modes.
 
-Use one adaptive policy with bounded modes:
+Use one parent-owned recommendation and confirmation interaction. Fill every
+material open decision with a recommended answer based on available evidence,
+show alternatives only when they change the result, then ask the user for one
+combined confirmation. Do not drip questions across several turns. A user
+correction creates a revised brief and one replacement confirmation; unchanged
+facts are not asked again.
 
-- `LIGHT`: at most 1 question round for a nearly complete brief.
-- `STANDARD`: at most 3 question rounds and the default for deep admission.
-- `GRILL`: at most 5 question rounds, probing contradictions, hidden
-  assumptions, evidence quality, failure modes, and falsifiers.
+The modes control challenge depth, not the number of user question rounds:
 
-Stop early as soon as the brief is ready. Exhausting a budget with unresolved
-blockers yields `NOT_READY`; it never silently yields `READY`.
+- `LIGHT`: validate a nearly complete brief and expose only blockers.
+- `STANDARD`: test scope, acceptance evidence, dependencies, and material
+  delivery risks.
+- `GRILL`: additionally probe contradictions, hidden assumptions, evidence
+  quality, failure modes, and falsifiers, while still recommending an answer
+  for every surfaced choice.
+
+Unresolved blockers yield `NOT_READY`; they never silently yield `READY`.
 
 Maintain a versioned Requirement Brief with this structure:
 
@@ -138,7 +147,8 @@ Maintain a versioned Requirement Brief with this structure:
 }
 ```
 
-Before start, show a concise brief summary and verdict:
+Before start, proactively show the recommended answers, a concise brief
+summary, and verdict:
 `READY | NOT_READY | WAIVED`, plus QA mode, brief revision, and remaining
 blockers. `READY` requires a non-empty goal, scope boundaries,
 acceptance criteria, evidence obligations, review plan, and no blocking

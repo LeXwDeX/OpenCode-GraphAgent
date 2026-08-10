@@ -373,7 +373,7 @@ function toolContext() {
 }
 
 describe("workflow tool schema (negative tests)", () => {
-  it("action field accepts start/extend/control/status/list", () => {
+  it("action field accepts start/extend/control/status/list/guide", () => {
     const decode = Schema.decodeUnknownSync(Parameters)
     expect(() => decode({ action: "start", spec_path: ".opencode/workflows/test.yaml" })).not.toThrow()
     expect(() => decode({ action: "extend", workflow_id: "wf-1", spec_path: ".opencode/workflows/extend.yaml" })).not.toThrow()
@@ -381,6 +381,7 @@ describe("workflow tool schema (negative tests)", () => {
     expect(() => decode({ action: "status", workflow_id: "wf-1" })).not.toThrow()
     // list browses the saved-spec library and needs no workflow_id.
     expect(() => decode({ action: "list" })).not.toThrow()
+    expect(() => decode({ action: "guide", topic: "blocks" })).not.toThrow()
   })
 
   it("retains an inline structured spec", () => {
@@ -449,11 +450,26 @@ describe("workflow tool execution", () => {
       const info = yield* WorkflowTool
       const workflow = yield* info.init()
 
-      for (const action of ["start", "extend", "status", "control"]) {
+      for (const action of ["guide", "start", "extend", "status", "control"]) {
         expect(workflow.description).toContain(`**${action}**`)
       }
       expect(workflow.description).toContain("Do not poll")
       expect(workflow.description).not.toContain("$ARGUMENTS")
+    }),
+  )
+
+  runtime.effect("loads detailed workflow guidance by topic instead of in the always-on description", () =>
+    Effect.gen(function* () {
+      const info = yield* WorkflowTool
+      const workflow = yield* info.init()
+      const index = yield* workflow.execute({ action: "guide" }, toolContext())
+      const blocks = yield* workflow.execute({ action: "guide", topic: "blocks" }, toolContext())
+
+      expect(workflow.description.length).toBeLessThan(5_000)
+      expect(index.output).toContain("blocks: compose")
+      expect(index.output).not.toContain("# Composable Workflow Blocks")
+      expect(blocks.output).toContain("# Composable Workflow Blocks")
+      expect(blocks.output).toContain("kind: coding")
     }),
   )
 
@@ -585,6 +601,45 @@ describe("workflow tool execution", () => {
     }),
   )
 
+  runtime.effect("starts from composable blocks and persists only compiled nodes", () =>
+    Effect.gen(function* () {
+      published.length = 0
+      const info = yield* WorkflowTool
+      const workflow = yield* info.init()
+      const result = yield* workflow.execute(
+        Schema.decodeUnknownSync(Parameters)({
+          action: "start",
+          spec: {
+            config: {
+              name: "block-start",
+              objective: "Implement and review session recovery",
+              blocks: [
+                { id: "build", kind: "coding", skills: ["tdd"] },
+                { id: "review", kind: "review", depends_on: ["build"] },
+              ],
+            },
+          },
+        }),
+        toolContext(),
+      )
+
+      expect(result.title).toBe("Workflow started: block-start")
+      expect(result.output).toContain("4 nodes registered")
+      const created = published.find((event) => event.type === DagEvent.WorkflowCreated.type)?.data as {
+        config?: string
+      }
+      const config = JSON.parse(created.config ?? "{}")
+      expect(config).not.toHaveProperty("blocks")
+      expect(config).not.toHaveProperty("objective")
+      expect(config.nodes.map((node: { id: string }) => node.id)).toEqual([
+        "build",
+        "review--standards",
+        "review--intent",
+        "review",
+      ])
+    }),
+  )
+
   runtime.effect("extends from an inline structured spec without a file", () =>
     Effect.gen(function* () {
       published.length = 0
@@ -610,6 +665,30 @@ describe("workflow tool execution", () => {
       expect(result.title).toBe("Workflow extended: 1 nodes added")
       expect(published.find((event) => event.type === DagEvent.NodeRegistered.type)?.data).toEqual(
         expect.objectContaining({ nodeID: "inline-added" }),
+      )
+    }),
+  )
+
+  runtime.effect("extends with blocks that depend on an existing durable node", () =>
+    Effect.gen(function* () {
+      published.length = 0
+      const info = yield* WorkflowTool
+      const workflow = yield* info.init()
+      const result = yield* workflow.execute(
+        Schema.decodeUnknownSync(Parameters)({
+          action: "extend",
+          workflow_id: "dag_status",
+          spec: {
+            objective: "Repair from the current diagnostic evidence",
+            blocks: [{ id: "repair", kind: "coding", depends_on: ["node_running"] }],
+          },
+        }),
+        toolContext(),
+      )
+
+      expect(result.title).toBe("Workflow extended: 1 nodes added")
+      expect(published.find((event) => event.type === DagEvent.NodeRegistered.type)?.data).toEqual(
+        expect.objectContaining({ nodeID: "repair", dependsOn: ["node_running"] }),
       )
     }),
   )
@@ -1464,6 +1543,10 @@ describe("workflow tool saved workflows", () => {
             Bun.write(path.join(globalDir, "workflows", "shared.yaml"), savedSpec("global-shared")),
             Bun.write(path.join(globalDir, "workflows", "global-only.yaml"), savedSpec("global-only")),
             Bun.write(
+              path.join(globalDir, "workflows", "block-flow.yaml"),
+              "title: block flow title\nconfig:\n  name: block-flow\n  objective: Review a bounded change\n  blocks:\n    - id: decision\n      kind: review\n",
+            ),
+            Bun.write(
               path.join(workflowSpecDirectory, ".opencode", "workflows", "shared.yaml"),
               savedSpec("project-shared"),
             ),
@@ -1476,6 +1559,7 @@ describe("workflow tool saved workflows", () => {
 
         expect(result.output).toContain("shared [project] — project-shared title")
         expect(result.output).toContain("global-only [global] — global-only title")
+        expect(result.output).toContain("block-flow [global] — block flow title (1 blocks)")
         expect(result.output).not.toContain("global-shared")
       }),
     ),
