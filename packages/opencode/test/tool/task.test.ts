@@ -133,6 +133,49 @@ function reply(input: SessionPrompt.PromptInput, text: string): SessionV1.WithPa
 }
 
 describe("tool.task", () => {
+  it.instance("rejects direct task execution from a child before permission or session creation", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const child = yield* sessions.create({ title: "DAG child", parentID: chat.id })
+      const state = { asks: 0, prompts: 0 }
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const exit = yield* def
+        .execute(
+          {
+            description: "escape orchestration",
+            prompt: "start an unmanaged grandchild",
+            subagent_type: "general",
+          },
+          {
+            sessionID: child.id,
+            messageID: assistant.id,
+            agent: "plan",
+            abort: new AbortController().signal,
+            extra: {
+              promptOps: stubOps({
+                onPrompt: () => {
+                  state.prompts += 1
+                },
+              }),
+            },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () =>
+              Effect.sync(() => {
+                state.asks += 1
+              }),
+          },
+        )
+        .pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      expect(state).toEqual({ asks: 0, prompts: 0 })
+      expect((yield* sessions.list()).filter((info) => info.parentID === child.id)).toHaveLength(0)
+    }),
+  )
+
   it.instance(
     "description sorts subagents by name and is stable across calls",
     () =>
@@ -218,7 +261,8 @@ describe("tool.task", () => {
         const build = yield* agent.get("build")
         const registry = yield* ToolRegistry.Service
         const description =
-          (yield* registry.tools({ ...ref, agent: build })).find((tool) => tool.id === WorkflowTool.id)?.description ?? ""
+          (yield* registry.tools({ ...ref, agent: build })).find((tool) => tool.id === WorkflowTool.id)?.description ??
+          ""
         const taskDescription =
           (yield* registry.tools({ ...ref, agent: build })).find((tool) => tool.id === TaskTool.id)?.description ?? ""
 
@@ -267,7 +311,8 @@ describe("tool.task", () => {
         const build = yield* agent.get("build")
         const registry = yield* ToolRegistry.Service
         const description =
-          (yield* registry.tools({ ...ref, agent: build })).find((tool) => tool.id === WorkflowTool.id)?.description ?? ""
+          (yield* registry.tools({ ...ref, agent: build })).find((tool) => tool.id === WorkflowTool.id)?.description ??
+          ""
 
         expect(description).toContain("- alpha: Alpha agent [model: configured]")
         expect(description).not.toContain("SECRET SYSTEM PROMPT")

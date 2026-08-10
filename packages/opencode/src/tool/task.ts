@@ -1,4 +1,4 @@
-import * as Tool from "./tool"
+import { Tool } from "./tool"
 import DESCRIPTION from "./task.txt"
 import { ToolJsonSchema } from "./json-schema"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
@@ -100,6 +100,12 @@ export const TaskTool = Tool.define(
       params: Schema.Schema.Type<typeof Parameters>,
       ctx: Tool.Context,
     ) {
+      const parent = yield* sessions.get(ctx.sessionID)
+      if (parent.parentID) {
+        return yield* Effect.fail(
+          new Error("Task delegation is available only to the main conversation, not child agents"),
+        )
+      }
       const cfg = yield* config.get()
       const runInBackground = params.background === true
       if (runInBackground && !flags.experimentalBackgroundSubagents) {
@@ -128,7 +134,6 @@ export const TaskTool = Tool.define(
       const session = params.task_id
         ? yield* sessions.get(SessionID.make(params.task_id)).pipe(Effect.catchCause(() => Effect.succeed(undefined)))
         : undefined
-      const parent = yield* sessions.get(ctx.sessionID)
       const childPermission = deriveSubagentSessionPermission({
         parentSessionPermission: parent.permission ?? [],
         subagent: next,
@@ -396,9 +401,7 @@ export const TaskTool = Tool.define(
                 },
                 { sessionID: ctx.sessionID, transcriptPath: "" },
               )
-              .pipe(
-                Effect.catch(() => Effect.succeed({ additionalContexts: [], systemMessages: [] } as TriggerResult)),
-              )
+              .pipe(Effect.catch(() => Effect.succeed({ additionalContexts: [], systemMessages: [] } as TriggerResult)))
             // Land any hook systemMessages so they're never silently dropped.
             yield* SettingsHook.landSystemMessages(stopResult, { sessionID: ctx.sessionID })
             if (!stopResult.blocked) {

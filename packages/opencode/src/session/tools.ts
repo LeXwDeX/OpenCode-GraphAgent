@@ -12,7 +12,7 @@ import { MemorySearch } from "@/tool/memory-search"
 import { Truncate } from "@/tool/truncate"
 
 import { Plugin } from "@/plugin"
-import type { TaskPromptOps } from "@/tool/task"
+import { TaskTool, type TaskPromptOps } from "@/tool/task"
 import { SettingsHook, type TriggerResult } from "@/hook/settings"
 import { applyPreHookDecision, classifyPermissionAsk } from "@/hook/pre-hook-decision"
 import { type Tool as AITool, tool, jsonSchema, type ToolExecutionOptions, asSchema } from "ai"
@@ -43,7 +43,7 @@ const SUPPORTED_MCP_RESOURCE_ATTACHMENT_MIMES = new Set([
 ])
 // Tools that modify files on disk — trigger FileChanged hook after execution
 const FILE_CHANGING_TOOLS = new Set(["edit", "write", "apply_patch", "multiedit", "patch"])
-const ROOT_ONLY_TOOLS = new Set([MemorySearch.MemorySearchTool.id, "workflow"])
+const ROOT_ONLY_TOOLS = new Set([MemorySearch.MemorySearchTool.id, TaskTool.id, "workflow"])
 
 export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
   agent: Agent.Info
@@ -121,133 +121,170 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
           SessionContext.run(context(args, options).sessionID, () =>
             Effect.gen(function* () {
               const ctx = context(args, options)
-            yield* plugin.trigger(
-              "tool.execute.before",
-              { tool: item.id, sessionID: ctx.sessionID, callID: ctx.callID },
-              { args },
-            )
-            // SettingsHook PreToolUse
-            let preContexts: string[] = []
-            if (settingsHook) {
-              const preResult = yield* settingsHook
-                .trigger(
-                  { event: "PreToolUse", toolName: item.id, toolInput: toRecord(args), toolUseID: ctx.callID },
-                  { sessionID: ctx.sessionID, transcriptPath: "" },
-                )
-                .pipe(Effect.catch(() => Effect.succeed<TriggerResult>({ additionalContexts: [], systemMessages: [] })))
-              yield* SettingsHook.landSystemMessages(preResult, { sessionID: ctx.sessionID })
-              const decision = applyPreHookDecision(toRecord(args), preResult)
-              if (decision.deniedReason) {
-                return { output: `[Tool denied by hook] ${decision.deniedReason}`, attachments: [], metadata: { hookDenied: true } } as any
+              yield* plugin.trigger(
+                "tool.execute.before",
+                { tool: item.id, sessionID: ctx.sessionID, callID: ctx.callID },
+                { args },
+              )
+              // SettingsHook PreToolUse
+              let preContexts: string[] = []
+              if (settingsHook) {
+                const preResult = yield* settingsHook
+                  .trigger(
+                    { event: "PreToolUse", toolName: item.id, toolInput: toRecord(args), toolUseID: ctx.callID },
+                    { sessionID: ctx.sessionID, transcriptPath: "" },
+                  )
+                  .pipe(
+                    Effect.catch(() => Effect.succeed<TriggerResult>({ additionalContexts: [], systemMessages: [] })),
+                  )
+                yield* SettingsHook.landSystemMessages(preResult, { sessionID: ctx.sessionID })
+                const decision = applyPreHookDecision(toRecord(args), preResult)
+                if (decision.deniedReason) {
+                  return {
+                    output: `[Tool denied by hook] ${decision.deniedReason}`,
+                    attachments: [],
+                    metadata: { hookDenied: true },
+                  } as any
+                }
+                if (decision.stopReason) {
+                  return {
+                    output: `[Hook stopped] ${decision.stopReason}`,
+                    attachments: [],
+                    metadata: { hookStopped: true },
+                  } as any
+                }
+                // permissionDecision:"ask" — invoke the confirmation dialog. We call
+                // permission.ask directly (NOT the orDie-piped ctx.ask) and classify the
+                // outcome: typed rejections become a denied result, while interrupts
+                // (session abort mid-dialog) and defects propagate instead of being
+                // masked as a denial.
+                if (preResult.permissionDecision === "ask") {
+                  const askReason = preResult.permissionDecisionReason
+                  const verdict = yield* permission
+                    .ask({
+                      permission: item.id,
+                      sessionID: ctx.sessionID,
+                      patterns: [item.id],
+                      always: [],
+                      metadata: { hookAsk: true, ...(askReason ? { reason: askReason } : {}) },
+                      tool: { messageID: input.processor.message.id, callID: options.toolCallId },
+                      ruleset: [],
+                    })
+                    .pipe(Effect.exit)
+                  const outcome = classifyPermissionAsk(verdict)
+                  if (outcome !== "approved" && outcome !== "denied")
+                    return yield* Effect.failCause(outcome.propagate as never)
+                  if (outcome === "denied") {
+                    const reason = askReason ?? "Denied by user in hook confirmation"
+                    return {
+                      output: `[Tool denied by hook] ${reason}`,
+                      attachments: [],
+                      metadata: { hookDenied: true },
+                    } as any
+                  }
+                }
+                preContexts = preResult.additionalContexts ?? []
+                // effectiveArgs reflects any PreToolUse updatedInput rewrite (shallow merge).
+                args = decision.effectiveArgs
               }
-              if (decision.stopReason) {
-                return { output: `[Hook stopped] ${decision.stopReason}`, attachments: [], metadata: { hookStopped: true } } as any
+              const result = yield* Effect.suspend(() => {
+                const cleanup = setActiveElicitationSession(ctx.sessionID)
+                return item.execute(args, ctx).pipe(Effect.ensuring(Effect.sync(cleanup)))
+              })
+              const output = {
+                ...result,
+                attachments: result.attachments?.map((attachment) => ({
+                  ...attachment,
+                  id: PartID.ascending(),
+                  sessionID: ctx.sessionID,
+                  messageID: input.processor.message.id,
+                })),
               }
-              // permissionDecision:"ask" — invoke the confirmation dialog. We call
-              // permission.ask directly (NOT the orDie-piped ctx.ask) and classify the
-              // outcome: typed rejections become a denied result, while interrupts
-              // (session abort mid-dialog) and defects propagate instead of being
-              // masked as a denial.
-              if (preResult.permissionDecision === "ask") {
-                const askReason = preResult.permissionDecisionReason
-                const verdict = yield* permission
-                  .ask({
-                    permission: item.id,
-                    sessionID: ctx.sessionID,
-                    patterns: [item.id],
-                    always: [],
-                    metadata: { hookAsk: true, ...(askReason ? { reason: askReason } : {}) },
-                    tool: { messageID: input.processor.message.id, callID: options.toolCallId },
-                    ruleset: [],
-                  })
-                  .pipe(Effect.exit)
-                const outcome = classifyPermissionAsk(verdict)
-                if (outcome !== "approved" && outcome !== "denied") return yield* Effect.failCause(outcome.propagate as never)
-                if (outcome === "denied") {
-                  const reason = askReason ?? "Denied by user in hook confirmation"
-                  return { output: `[Tool denied by hook] ${reason}`, attachments: [], metadata: { hookDenied: true } } as any
+              // PreToolUse additionalContexts: prepend so the model sees any hook-injected
+              // gate/reminder before the tool result (mirrors PostToolUse surfacing below).
+              if (preContexts.length) {
+                output.output = `${preContexts.join("\n\n")}\n\n${output.output ?? ""}`
+              }
+              yield* plugin.trigger(
+                "tool.execute.after",
+                { tool: item.id, sessionID: ctx.sessionID, callID: ctx.callID, args },
+                output,
+              )
+              // SettingsHook PostToolUse
+              if (settingsHook) {
+                const postResult = yield* settingsHook
+                  .trigger(
+                    {
+                      event: "PostToolUse",
+                      toolName: item.id,
+                      toolInput: toRecord(args),
+                      toolResponse: output.output,
+                      toolUseID: ctx.callID,
+                    } as any,
+                    { sessionID: ctx.sessionID, transcriptPath: "" },
+                  )
+                  .pipe(Effect.catch(() => Effect.succeed({ additionalContexts: [] as string[] } as any)))
+                yield* SettingsHook.landSystemMessages(postResult as TriggerResult, { sessionID: ctx.sessionID })
+                // Inject additionalContext into tool output so model sees it
+                if ((postResult as any).additionalContexts?.length) {
+                  output.output += "\n\n" + (postResult as any).additionalContexts.join("\n")
+                }
+                // PostToolUse preventContinuation: tool already executed, so annotate
+                // the output rather than skipping. Soft signal, mirrors CC semantics.
+                if ((postResult as any).preventContinuation) {
+                  const stopReason = (postResult as any).stopReason ?? "Hook requested stop"
+                  output.output += `\n\n[Hook stopped] ${stopReason}`
                 }
               }
-              preContexts = preResult.additionalContexts ?? []
-              // effectiveArgs reflects any PreToolUse updatedInput rewrite (shallow merge).
-              args = decision.effectiveArgs
-            }
-            const result = yield* Effect.suspend(() => {
-              const cleanup = setActiveElicitationSession(ctx.sessionID)
-              return item.execute(args, ctx).pipe(Effect.ensuring(Effect.sync(cleanup)))
-            })
-            const output = {
-              ...result,
-              attachments: result.attachments?.map((attachment) => ({
-                ...attachment,
-                id: PartID.ascending(),
-                sessionID: ctx.sessionID,
-                messageID: input.processor.message.id,
-              })),
-            }
-            // PreToolUse additionalContexts: prepend so the model sees any hook-injected
-            // gate/reminder before the tool result (mirrors PostToolUse surfacing below).
-            if (preContexts.length) {
-              output.output = `${preContexts.join("\n\n")}\n\n${output.output ?? ""}`
-            }
-            yield* plugin.trigger(
-              "tool.execute.after",
-              { tool: item.id, sessionID: ctx.sessionID, callID: ctx.callID, args },
-              output,
-            )
-            // SettingsHook PostToolUse
-            if (settingsHook) {
-              const postResult = yield* settingsHook
-                .trigger(
-                  { event: "PostToolUse", toolName: item.id, toolInput: toRecord(args), toolResponse: output.output, toolUseID: ctx.callID } as any,
-                  { sessionID: ctx.sessionID, transcriptPath: "" },
-                )
-                .pipe(Effect.catch(() => Effect.succeed({ additionalContexts: [] as string[] } as any)))
-              yield* SettingsHook.landSystemMessages(postResult as TriggerResult, { sessionID: ctx.sessionID })
-              // Inject additionalContext into tool output so model sees it
-              if ((postResult as any).additionalContexts?.length) {
-                output.output += "\n\n" + (postResult as any).additionalContexts.join("\n")
-              }
-              // PostToolUse preventContinuation: tool already executed, so annotate
-              // the output rather than skipping. Soft signal, mirrors CC semantics.
-              if ((postResult as any).preventContinuation) {
-                const stopReason = (postResult as any).stopReason ?? "Hook requested stop"
-                output.output += `\n\n[Hook stopped] ${stopReason}`
-              }
-            }
-            // SettingsHook FileChanged for file-modifying tools
-            if (settingsHook && FILE_CHANGING_TOOLS.has(item.id)) {
-              const fileResult = yield* settingsHook
-                .trigger(
-                  { event: "FileChanged", path: (toRecord(args))["file_path"] ?? (toRecord(args))["path"], changeType: item.id } as any,
-                  { sessionID: ctx.sessionID, transcriptPath: "" },
-                )
-                .pipe(Effect.catch(() => Effect.succeed({ additionalContexts: [], systemMessages: [] } as TriggerResult)))
-              yield* SettingsHook.landSystemMessages(fileResult, { sessionID: ctx.sessionID })
-            }
-            if (options.abortSignal?.aborted) {
-              yield* input.processor.completeToolCall(options.toolCallId, output)
-            }
-            return output
-          }).pipe(
-            Effect.catch((error: unknown) =>
-              Effect.gen(function* () {
-              // SettingsHook PostToolUseFailure
-              if (settingsHook) {
-                const failResult = yield* settingsHook
+              // SettingsHook FileChanged for file-modifying tools
+              if (settingsHook && FILE_CHANGING_TOOLS.has(item.id)) {
+                const fileResult = yield* settingsHook
                   .trigger(
-                    { event: "PostToolUseFailure", toolName: item.id, toolInput: toRecord(args), error: String(error), toolUseID: options.toolCallId } as any,
-                    { sessionID: input.session.id, transcriptPath: "" },
+                    {
+                      event: "FileChanged",
+                      path: toRecord(args)["file_path"] ?? toRecord(args)["path"],
+                      changeType: item.id,
+                    } as any,
+                    { sessionID: ctx.sessionID, transcriptPath: "" },
                   )
-                  .pipe(Effect.catch(() => Effect.succeed({ additionalContexts: [], systemMessages: [] } as TriggerResult)))
-                yield* SettingsHook.landSystemMessages(failResult, { sessionID: input.session.id })
+                  .pipe(
+                    Effect.catch(() => Effect.succeed({ additionalContexts: [], systemMessages: [] } as TriggerResult)),
+                  )
+                yield* SettingsHook.landSystemMessages(fileResult, { sessionID: ctx.sessionID })
               }
-                return yield* Effect.fail(error)
-              }),
+              if (options.abortSignal?.aborted) {
+                yield* input.processor.completeToolCall(options.toolCallId, output)
+              }
+              return output
+            }).pipe(
+              Effect.catch((error: unknown) =>
+                Effect.gen(function* () {
+                  // SettingsHook PostToolUseFailure
+                  if (settingsHook) {
+                    const failResult = yield* settingsHook
+                      .trigger(
+                        {
+                          event: "PostToolUseFailure",
+                          toolName: item.id,
+                          toolInput: toRecord(args),
+                          error: String(error),
+                          toolUseID: options.toolCallId,
+                        } as any,
+                        { sessionID: input.session.id, transcriptPath: "" },
+                      )
+                      .pipe(
+                        Effect.catch(() =>
+                          Effect.succeed({ additionalContexts: [], systemMessages: [] } as TriggerResult),
+                        ),
+                      )
+                    yield* SettingsHook.landSystemMessages(failResult, { sessionID: input.session.id })
+                  }
+                  return yield* Effect.fail(error)
+                }),
+              ),
             ),
           ),
-        ),
-      )
+        )
       },
     })
   }
@@ -528,12 +565,12 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
                 { event: "PreToolUse", toolName: key, toolInput: toRecord(args), toolUseID: opts.toolCallId },
                 { sessionID: ctx.sessionID, transcriptPath: "" },
               )
-                .pipe(Effect.catch(() => Effect.succeed<TriggerResult>({ additionalContexts: [], systemMessages: [] })))
-              yield* SettingsHook.landSystemMessages(preResult, { sessionID: ctx.sessionID })
-              const decision = applyPreHookDecision(toRecord(args), preResult)
-              if (decision.deniedReason) {
-                return { content: [{ type: "text", text: `[Tool denied by hook] ${decision.deniedReason}` }] } as any
-              }
+              .pipe(Effect.catch(() => Effect.succeed<TriggerResult>({ additionalContexts: [], systemMessages: [] })))
+            yield* SettingsHook.landSystemMessages(preResult, { sessionID: ctx.sessionID })
+            const decision = applyPreHookDecision(toRecord(args), preResult)
+            if (decision.deniedReason) {
+              return { content: [{ type: "text", text: `[Tool denied by hook] ${decision.deniedReason}` }] } as any
+            }
             if (decision.stopReason) {
               return { content: [{ type: "text", text: `[Hook stopped] ${decision.stopReason}` }] } as any
             }
@@ -553,7 +590,8 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
                 })
                 .pipe(Effect.exit)
               const outcome = classifyPermissionAsk(verdict)
-              if (outcome !== "approved" && outcome !== "denied") return yield* Effect.failCause(outcome.propagate as never)
+              if (outcome !== "approved" && outcome !== "denied")
+                return yield* Effect.failCause(outcome.propagate as never)
               if (outcome === "denied") {
                 const reason = askReason ?? "Denied by user in hook confirmation"
                 return { content: [{ type: "text", text: `[Tool denied by hook] ${reason}` }] } as any
@@ -650,7 +688,13 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
           if (settingsHook) {
             const postResult = yield* settingsHook
               .trigger(
-                { event: "PostToolUse", toolName: key, toolInput: toRecord(args), toolResponse: output.output, toolUseID: opts.toolCallId } as any,
+                {
+                  event: "PostToolUse",
+                  toolName: key,
+                  toolInput: toRecord(args),
+                  toolResponse: output.output,
+                  toolUseID: opts.toolCallId,
+                } as any,
                 { sessionID: ctx.sessionID, transcriptPath: "" },
               )
               .pipe(Effect.catch(() => Effect.succeed({ additionalContexts: [] as string[] } as any)))
@@ -675,7 +719,13 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
               if (settingsHook) {
                 yield* settingsHook
                   .trigger(
-                    { event: "PostToolUseFailure", toolName: key, toolInput: toRecord(args), error: String(error), toolUseID: opts.toolCallId } as any,
+                    {
+                      event: "PostToolUseFailure",
+                      toolName: key,
+                      toolInput: toRecord(args),
+                      error: String(error),
+                      toolUseID: opts.toolCallId,
+                    } as any,
                     { sessionID: input.session.id, transcriptPath: "" },
                   )
                   .pipe(Effect.catch(() => Effect.succeed(undefined as any)))

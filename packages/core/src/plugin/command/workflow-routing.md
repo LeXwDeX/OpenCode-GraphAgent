@@ -44,6 +44,8 @@ Load details only when needed:
 - **extend** adds nodes or blocks to the same objective.
 - **status** reads durable state when the user asks or before a control
   decision; it is not a waiting mechanism.
+- **result** reads one node's complete durable output in bounded pages when a
+  wake preview reports `truncated=true`.
 - **control** pauses, resumes, cancels, replans, steps, or completes a workflow.
 - **list** shows saved workflow specs and their resolution scope.
 - **read** returns one saved spec so the parent can retarget it before start.

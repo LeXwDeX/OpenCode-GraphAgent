@@ -35,5 +35,7 @@ failure, state that it did not start and report the real error; do not invent a
 replacement run.
 
 A final synthesis block must contain the requested result rather than a plan or
-placeholder. The parent verifies that artifact, disposes of any non-ACCEPT
-review verdict, and gives the user one final report.
+placeholder. If its wake message says `truncated=true`, the parent reads every
+page with `workflow(action="result")` before verification. The parent verifies
+that complete artifact, disposes of any non-ACCEPT review verdict, and gives the
+user one final report.

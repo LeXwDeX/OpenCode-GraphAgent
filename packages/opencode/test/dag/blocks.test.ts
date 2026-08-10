@@ -68,30 +68,86 @@ describe("workflow blocks", () => {
       objective: "Review the implementation",
       blocks: [
         { id: "implementation", kind: "coding" },
-        { id: "decision", kind: "review", depends_on: ["implementation"] },
+        { id: "verification", kind: "verify", depends_on: ["implementation"] },
+        { id: "decision", kind: "review", depends_on: ["verification"] },
         { id: "report", kind: "synthesize", depends_on: ["decision"] },
       ],
     })
 
     expect(nodes.map((node) => node.id)).toEqual([
       "implementation",
+      "verification",
       "decision--standards",
       "decision--intent",
       "decision",
       "report",
     ])
     expect(nodes.find((node) => node.id === "decision")).toMatchObject({
-      depends_on: ["decision--standards", "decision--intent"],
+      depends_on: ["decision--standards", "decision--intent", "verification"],
       required: true,
       report_to_parent: true,
+      condition: 'verification.output.verdict == "PASS"',
+      review: {
+        phase: "diff",
+        implementation_node_id: "implementation",
+        verification_node_id: "verification",
+      },
+      input_mapping: {
+        implementation_changed_files: "implementation.output.changed_files",
+        implementation_fingerprint: "implementation.output.fingerprint",
+        verification: "verification.output",
+        standards_review: "decision--standards.output",
+        intent_review: "decision--intent.output",
+      },
       output_schema: {
         type: "object",
         properties: {
-          verdict: { enum: ["ACCEPT", "REVISE", "REJECT", "BLOCKED"] },
+          verdict: { enum: ["ACCEPT", "REJECT"] },
+          implementation_fingerprint: { type: "string" },
         },
       },
     })
+    expect(nodes.find((node) => node.id === "implementation")?.output_schema).toEqual(
+      expect.objectContaining({ required: expect.arrayContaining(["changed_files", "fingerprint"]) }),
+    )
+    expect(nodes.find((node) => node.id === "verification")?.output_schema).toEqual(
+      expect.objectContaining({
+        required: expect.arrayContaining(["verdict"]),
+        properties: expect.objectContaining({ verdict: { type: "string", enum: ["PASS", "FAIL"] } }),
+      }),
+    )
     expect(nodes.find((node) => node.id === "report")?.condition).toBe('decision.output.verdict == "ACCEPT"')
+  })
+
+  it("rejects an implementation review without one verification gate", () => {
+    expect(() =>
+      DagBlocks.compileWorkflowBlocks({
+        objective: "Review current implementation",
+        blocks: [
+          { id: "implementation", kind: "coding" },
+          { id: "decision", kind: "review", depends_on: ["implementation"] },
+        ],
+      }),
+    ).toThrow("requires exactly one verification ancestor")
+  })
+
+  it("serializes unordered workspace writers while leaving read-only lanes parallel", () => {
+    const nodes = DagBlocks.compileWorkflowBlocks({
+      objective: "Build two packages from independent evidence",
+      blocks: [
+        { id: "map-a", kind: "explore" },
+        { id: "map-b", kind: "explore" },
+        { id: "package-a", kind: "coding", depends_on: ["map-a"] },
+        { id: "experiment", kind: "prototype", depends_on: ["map-b"] },
+        { id: "package-b", kind: "coding", depends_on: ["map-b"] },
+      ],
+    })
+
+    expect(nodes.find((node) => node.id === "map-a")?.depends_on).toEqual([])
+    expect(nodes.find((node) => node.id === "map-b")?.depends_on).toEqual([])
+    expect(nodes.find((node) => node.id === "package-a")?.depends_on).toEqual(["map-a"])
+    expect(nodes.find((node) => node.id === "experiment")?.depends_on).toEqual(["map-b", "package-a"])
+    expect(nodes.find((node) => node.id === "package-b")?.depends_on).toEqual(["map-b", "experiment"])
   })
 
   it("routes volume blocks to the standard tier and decision blocks to the advanced tier", () => {
@@ -130,6 +186,19 @@ describe("workflow blocks", () => {
       "decision--intent": "standard",
       decision: "advanced",
       report: "advanced",
+    })
+    expect(Object.fromEntries(nodes.map((node) => [node.id, node.required]))).toEqual({
+      map: false,
+      plan: true,
+      experiment: false,
+      "diagnose--evidence": false,
+      diagnose: true,
+      build: false,
+      verify: true,
+      "decision--standards": false,
+      "decision--intent": false,
+      decision: true,
+      report: true,
     })
   })
 

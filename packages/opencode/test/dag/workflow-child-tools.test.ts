@@ -25,6 +25,12 @@ const workflowDefinition: Tool.Def<typeof Parameters> = {
   parameters: Parameters,
   execute: () => Effect.succeed({ title: "workflow", output: "started", metadata: {} }),
 }
+const taskDefinition: Tool.Def<typeof Parameters> = {
+  id: "task",
+  description: "task",
+  parameters: Parameters,
+  execute: () => Effect.succeed({ title: "task", output: "started", metadata: {} }),
+}
 const trigger: Plugin.Interface["trigger"] = (_name, _input, output) => Effect.succeed(output)
 const it = testEffect(
   Layer.mergeAll(
@@ -37,21 +43,22 @@ const it = testEffect(
     }),
     Layer.mock(Permission.Service, { ask: () => Effect.void }),
     Layer.mock(MCP.Service, { clients: () => Effect.succeed({}), tools: () => Effect.succeed({}) }),
-    Layer.mock(ToolRegistry.Service, { tools: () => Effect.succeed([workflowDefinition]) }),
+    Layer.mock(ToolRegistry.Service, { tools: () => Effect.succeed([workflowDefinition, taskDefinition]) }),
   ),
 )
 
 describe("workflow child boundary", () => {
-  it.instance("exposes workflow to the main conversation but not to child agents", () =>
+  it.instance("exposes orchestration tools to the main conversation but not to child agents", () =>
     Effect.gen(function* () {
       const agents = yield* Agent.Service
       const build = yield* agents.get("build")
       const parentID = SessionID.make("ses_workflow_tool_parent")
+      const parentTools = yield* resolvedToolIDs(build, session(parentID))
+      const childTools = yield* resolvedToolIDs(build, session(SessionID.make("ses_workflow_tool_child"), parentID))
 
-      expect(yield* resolvedToolIDs(build, session(parentID))).toContain("workflow")
-      expect(yield* resolvedToolIDs(build, session(SessionID.make("ses_workflow_tool_child"), parentID))).not.toContain(
-        "workflow",
-      )
+      expect(parentTools).toEqual(expect.arrayContaining(["workflow", "task"]))
+      expect(childTools).not.toContain("workflow")
+      expect(childTools).not.toContain("task")
     }),
   )
 })
