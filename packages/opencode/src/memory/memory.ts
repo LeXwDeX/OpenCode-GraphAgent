@@ -5,7 +5,6 @@ import { KeyedMutex } from "@opencode-ai/core/effect/keyed-mutex"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Context, Duration, Effect, Layer, Option, Ref, Schema, Semaphore } from "effect"
 import { stringify } from "yaml"
-import { Agent } from "@/agent/agent"
 import { Config } from "@/config/config"
 import { Provider } from "@/provider/provider"
 import { Project } from "@/project/project"
@@ -63,17 +62,10 @@ export class ControllerError extends Schema.TaggedErrorClass<ControllerError>()(
 export const layer: Layer.Layer<
   Service,
   never,
-  | Agent.Service
-  | Config.Service
-  | Provider.Service
-  | Project.Service
-  | MemoryConfig.Service
-  | MemoryModel.Service
-  | MemoryStore.Service
+  Config.Service | Provider.Service | Project.Service | MemoryConfig.Service | MemoryModel.Service | MemoryStore.Service
 > = Layer.effect(
   Service,
   Effect.gen(function* () {
-    const agent = yield* Agent.Service
     const config = yield* Config.Service
     const provider = yield* Provider.Service
     const project = yield* Project.Service
@@ -85,37 +77,24 @@ export const layer: Layer.Layer<
     const locks = KeyedMutex.makeUnsafe<string>()
     const state = yield* InstanceState.make(() => Effect.succeed({ sessions: new Map<SessionID, SessionCache>() }))
 
-    const models = Effect.fn("Memory.models")(function* () {
+    const availableModels = Effect.fn("Memory.availableModels")(function* () {
       const providers = yield* provider.list()
-      return Object.values(providers)
-        .flatMap((info) =>
+      return new Set(
+        Object.values(providers).flatMap((info) =>
           Object.values(info.models)
             .filter((model) => model.capabilities.input.text && model.capabilities.output.text)
-            .map((model) => ({
-              id: `${model.providerID}/${model.id}`,
-              name: model.name,
-              input_cost: model.cost.input,
-              output_cost: model.cost.output,
-              context_limit: model.limit.context,
-              output_limit: model.limit.output,
-            })),
-        )
-        .sort((a, b) => a.input_cost + a.output_cost - (b.input_cost + b.output_cost) || a.id.localeCompare(b.id))
+            .map((model) => `${model.providerID}/${model.id}`),
+        ),
+      )
     })
 
     const selectBootstrapModel = Effect.fn("Memory.selectBootstrapModel")(function* (
-      candidates: Effect.Success<ReturnType<typeof models>>,
+      available: Effect.Success<ReturnType<typeof availableModels>>,
       conversationModel?: string,
     ) {
-      if (candidates.length === 0)
-        return yield* new ControllerError({ message: "No configured text models for MEMORY" })
-      const available = new Set(candidates.map((candidate) => candidate.id))
-      const smallModel = (yield* config.get()).small_model
-      if (smallModel && available.has(smallModel)) return smallModel
-      const compaction = yield* agent.get("compaction")
-      const compactionModel = compaction.model
-        ? `${compaction.model.providerID}/${compaction.model.modelID}`
-        : undefined
+      const settings = yield* config.get()
+      if (settings.small_model && available.has(settings.small_model)) return settings.small_model
+      const compactionModel = settings.agent?.compaction?.model
       if (compactionModel && available.has(compactionModel)) return compactionModel
       const defaultModel = yield* provider.defaultModel().pipe(Effect.option)
       const fallback = Option.isSome(defaultModel)
@@ -127,11 +106,11 @@ export const layer: Layer.Layer<
     })
 
     const selectConfiguration = Effect.fn("Memory.selectConfiguration")(function* (
-      candidates: Effect.Success<ReturnType<typeof models>>,
+      available: Effect.Success<ReturnType<typeof availableModels>>,
       current?: MemorySchema.Config,
       conversationModel?: string,
     ) {
-      const selected = yield* selectBootstrapModel(candidates, conversationModel)
+      const selected = yield* selectBootstrapModel(available, conversationModel)
       if (current) return MemorySchema.updateConfig(current, { model: selected })
       return {
         schema_version: MemorySchema.SCHEMA_VERSION,
@@ -151,19 +130,19 @@ export const layer: Layer.Layer<
       config: MemorySchema.Config,
       conversationModel?: string,
     ) {
-      const candidates = yield* models()
-      if (candidates.some((candidate) => candidate.id === config.model)) return config
+      const available = yield* availableModels()
+      if (available.has(config.model)) return config
       yield* Effect.logWarning("configured MEMORY model is unavailable — selecting a replacement", {
         model: config.model,
       })
-      return yield* selectConfiguration(candidates, config, conversationModel)
+      return yield* selectConfiguration(available, config, conversationModel)
     })
 
     const initializeGlobal = Effect.fn("Memory.initializeGlobal")(function* (conversationModel?: string) {
       const existing = yield* configStore.loadGlobal()
       const config = existing
         ? yield* ensureConfiguredModel(existing.config, conversationModel)
-        : yield* selectConfiguration(yield* models(), undefined, conversationModel)
+        : yield* selectConfiguration(yield* availableModels(), undefined, conversationModel)
       if (existing?.config.model === config.model) return
       const created = yield* configStore.writeGlobal(config, existing?.path)
       if (created) yield* Effect.logInfo("global MEMORY config initialized", { model: config.model })
@@ -325,12 +304,16 @@ export const layer: Layer.Layer<
     }) {
       const user = latestRealUser(input.messages)
       if (!user) return
+      const currentUser = currentRealUser(input.messages)
       const configured = yield* configuration()
       if (!configured) {
         yield* clearSession(input.sessionID)
         return
       }
-      if (!configured.loaded) yield* initUnsafe(`${user.info.model.providerID}/${user.info.model.modelID}`)
+      if (currentUser)
+        yield* initUnsafe(`${currentUser.info.model.providerID}/${currentUser.info.model.modelID}`).pipe(
+          Effect.catchCause((cause) => Effect.logWarning("global MEMORY init failed", { cause })),
+        )
       const current = yield* active()
       if (!current) {
         yield* clearSession(input.sessionID)
@@ -541,7 +524,7 @@ export const layer: Layer.Layer<
       const value = initial.loaded
         ? initial
         : yield* Effect.gen(function* () {
-            yield* initializeGlobal()
+            yield* initUnsafe()
             return (yield* configuration()) ?? initial
           })
       if (!value.loaded) return "Memory remains off" as const
@@ -581,7 +564,6 @@ export const layer: Layer.Layer<
 
 export const defaultLayer: Layer.Layer<Service> = Layer.suspend(() =>
   layer.pipe(
-    Layer.provide(Agent.defaultLayer),
     Layer.provide(Config.defaultLayer),
     Layer.provide(Provider.defaultLayer),
     Layer.provide(Project.defaultLayer),
@@ -592,7 +574,6 @@ export const defaultLayer: Layer.Layer<Service> = Layer.suspend(() =>
 )
 
 export const node = LayerNode.make(layer, [
-  Agent.node,
   Config.node,
   Provider.node,
   Project.node,
@@ -698,6 +679,16 @@ function maintenanceEvidence(messages: SessionV1.WithParts[]) {
 function latestRealUser(messages: SessionV1.WithParts[]) {
   const user = messages.findLast(isRealUser)
   if (!user) return undefined
+  return userInput(user)
+}
+
+function currentRealUser(messages: SessionV1.WithParts[]) {
+  const user = messages.findLast((message) => message.info.role === "user")
+  if (!user || !isRealUser(user)) return undefined
+  return userInput(user)
+}
+
+function userInput(user: SessionV1.WithParts & { info: SessionV1.User }) {
   return {
     info: user.info,
     text: cleanText(
