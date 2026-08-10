@@ -168,12 +168,6 @@ export class MatchResponse extends Schema.Class<MatchResponse>("MemoryMatchRespo
   topic_ids: Schema.Array(StableID).check(Schema.isMaxLength(MAX_INJECTION_TOPICS)),
 }) {}
 
-export class InitResponse extends Schema.Class<InitResponse>("MemoryInitResponse")({
-  model: Config.fields.model,
-  topic_limit: Config.fields.topic_limit,
-  turn_interval: Config.fields.turn_interval,
-}) {}
-
 export function topicIndex(topic: Topic): TopicIndex {
   return {
     id: topic.id,
