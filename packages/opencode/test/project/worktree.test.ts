@@ -1,18 +1,131 @@
 import { afterEach, describe, expect } from "bun:test"
+import { Database } from "@opencode-ai/core/database/database"
 import path from "path"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
-import { Cause, Deferred, Effect, Exit, Fiber, Layer } from "effect"
+import { AppProcess } from "@opencode-ai/core/process"
+import { NodePath } from "@effect/platform-node"
+import { Cause, Context, Deferred, Effect, Exit, Fiber, Layer, Ref } from "effect"
 import { GlobalBus, type GlobalEvent } from "../../src/bus/global"
 import { Git } from "../../src/git"
+import { SettingsHook } from "../../src/hook/settings"
+import { InstanceLayer } from "../../src/project/instance-layer"
+import { Project } from "../../src/project/project"
 import { Worktree } from "../../src/worktree"
 import { disposeAllInstances, provideInstance, TestInstance } from "../fixture/fixture"
-import { testEffect } from "../lib/effect"
+import { pollWithTimeout, testEffect } from "../lib/effect"
 
 const it = testEffect(
   Layer.mergeAll(Worktree.defaultLayer, FSUtil.defaultLayer, CrossSpawnSpawner.defaultLayer, Git.defaultLayer),
 )
 const wintest = process.platform !== "win32" ? it.instance : it.instance.skip
+
+class RemoveHookProbe extends Context.Service<
+  RemoveHookProbe,
+  {
+    readonly entered: Effect.Effect<void>
+    readonly overlap: Effect.Effect<void>
+    readonly release: Effect.Effect<boolean>
+    readonly run: Effect.Effect<void>
+  }
+>()("@test/WorktreeRemoveHookProbe") {}
+
+const removeHookProbeLayer = Layer.effect(
+  RemoveHookProbe,
+  Effect.gen(function* () {
+    const entered = yield* Deferred.make<void>()
+    const overlap = yield* Deferred.make<void>()
+    const release = yield* Deferred.make<void>()
+    const state = yield* Ref.make({ active: 0, calls: 0 })
+    return RemoveHookProbe.of({
+      entered: Deferred.await(entered),
+      overlap: Deferred.await(overlap),
+      release: Deferred.succeed(release, undefined),
+      run: Effect.acquireUseRelease(
+        Ref.modify(state, (current) => {
+          const next = { active: current.active + 1, calls: current.calls + 1 }
+          return [next, next]
+        }),
+        (current) =>
+          Effect.gen(function* () {
+            if (current.active > 1) yield* Deferred.succeed(overlap, undefined)
+            if (current.calls !== 1) return
+            yield* Deferred.succeed(entered, undefined)
+            yield* Deferred.await(release)
+          }),
+        () => Ref.update(state, (current) => ({ ...current, active: current.active - 1 })),
+      ),
+    })
+  }),
+)
+
+const hookResult = { additionalContexts: [], systemMessages: [] }
+const worktreeRemoveHookLayer = Layer.effect(
+  SettingsHook.Service,
+  Effect.gen(function* () {
+    const probe = yield* RemoveHookProbe
+    return SettingsHook.Service.of({
+      trigger: (payload) =>
+        payload.event === "WorktreeRemove" ? probe.run.pipe(Effect.as(hookResult)) : Effect.succeed(hookResult),
+      list: () => Effect.succeed([]),
+    })
+  }),
+).pipe(Layer.provideMerge(removeHookProbeLayer))
+
+const concurrentIt = testEffect(
+  Layer.mergeAll(
+    Worktree.defaultLayer.pipe(Layer.provideMerge(worktreeRemoveHookLayer)),
+    FSUtil.defaultLayer,
+    CrossSpawnSpawner.defaultLayer,
+    Git.defaultLayer,
+  ),
+)
+
+class CreateHookProbe extends Context.Service<
+  CreateHookProbe,
+  {
+    readonly entered: Effect.Effect<void>
+    readonly release: Effect.Effect<boolean>
+    readonly run: Effect.Effect<void>
+  }
+>()("@test/WorktreeCreateHookProbe") {}
+
+const createHookProbeLayer = Layer.effect(
+  CreateHookProbe,
+  Effect.gen(function* () {
+    const entered = yield* Deferred.make<void>()
+    const release = yield* Deferred.make<void>()
+    return CreateHookProbe.of({
+      entered: Deferred.await(entered),
+      release: Deferred.succeed(release, undefined),
+      run: Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release))),
+    })
+  }),
+)
+
+const projectCreateHookLayer = Layer.effect(
+  Project.Service,
+  Effect.gen(function* () {
+    const project = yield* Project.Service
+    const probe = yield* CreateHookProbe
+    return Project.Service.of({
+      ...project,
+      addSandbox: (id, directory) => probe.run.pipe(Effect.andThen(project.addSandbox(id, directory))),
+    })
+  }),
+).pipe(Layer.provideMerge(Project.defaultLayer), Layer.provideMerge(createHookProbeLayer))
+
+const createIt = testEffect(
+  Worktree.layer.pipe(
+    Layer.provide(Git.defaultLayer),
+    Layer.provide(AppProcess.defaultLayer),
+    Layer.provideMerge(projectCreateHookLayer),
+    Layer.provide(Database.defaultLayer),
+    Layer.provide(FSUtil.defaultLayer),
+    Layer.provide(NodePath.layer),
+    Layer.provide(InstanceLayer.layer),
+  ),
+)
 
 function normalize(input: string) {
   return input.replace(/\\/g, "/").toLowerCase()
@@ -35,6 +148,36 @@ const waitReady = Effect.fn("WorktreeTest.waitReady")(function* () {
     }),
   )
 })
+
+function makeStartCommandProbe(directory: string, name: string) {
+  const pidFile = path.join(directory, `${name}.pid`)
+  return {
+    command: `printf '%s:ready\n' "$$" > ${JSON.stringify(pidFile)}; trap 'exit 0' TERM INT; while :; do sleep 1; done`,
+    started: pollWithTimeout(
+      Effect.promise(async () => {
+        const file = Bun.file(pidFile)
+        if (!(await file.exists())) return undefined
+        const match = (await file.text()).match(/^([1-9]\d*):ready\n?$/)
+        return match ? Number(match[1]) : undefined
+      }),
+      `timed out waiting for ${name}`,
+    ),
+    stopped: (pid: number) =>
+      pollWithTimeout(
+        Effect.sync(() => {
+          try {
+            process.kill(pid, 0)
+            return undefined
+          } catch (error) {
+            if (error instanceof Error && "code" in error && error.code === "ESRCH") return true
+            throw error
+          }
+        }),
+        `${name} was left running`,
+        "2 seconds",
+      ),
+  }
+}
 
 const removeCreatedWorktree = (directory: string) =>
   Effect.gen(function* () {
@@ -207,6 +350,27 @@ describe("Worktree", () => {
       { git: true },
     )
 
+    wintest(
+      "remove interrupts an in-flight start command",
+      () =>
+        Effect.gen(function* () {
+          const test = yield* TestInstance
+          const probe = makeStartCommandProbe(test.directory, "worktree-remove-start-command")
+
+          yield* withCreatedWorktree({ name: "remove-during-start", startCommand: probe.command }, ({ info }) =>
+            Effect.gen(function* () {
+              const svc = yield* Worktree.Service
+              const pid = yield* probe.started
+
+              expect(yield* svc.remove({ directory: info.directory })).toBe(true)
+              yield* probe.stopped(pid)
+            }),
+          )
+        }),
+      { git: true },
+      { timeout: 20_000 },
+    )
+
     it.instance(
       "lists the active linked worktree but not the project checkout",
       () =>
@@ -233,6 +397,75 @@ describe("Worktree", () => {
           }),
         ),
       { git: true },
+    )
+
+    wintest(
+      "reset coordinates with asynchronous bootstrap",
+      () =>
+        Effect.gen(function* () {
+          const test = yield* TestInstance
+          const svc = yield* Worktree.Service
+          const probe = makeStartCommandProbe(test.directory, "worktree-reset-start-command")
+          yield* Effect.acquireUseRelease(
+            svc.create({ name: "reset-during-bootstrap", startCommand: probe.command }),
+            (info) =>
+              Effect.gen(function* () {
+                const pid = yield* probe.started
+                expect(yield* svc.reset({ directory: info.directory })).toBe(true)
+                yield* probe.stopped(pid)
+              }),
+            (info) => svc.remove({ directory: info.directory }).pipe(Effect.ignore),
+          )
+        }),
+      { git: true },
+    )
+
+    createIt.instance(
+      "serializes create setup with removal for the same worktree",
+      () =>
+        Effect.gen(function* () {
+          const probe = yield* CreateHookProbe
+          const svc = yield* Worktree.Service
+          const info = yield* svc.makeWorktreeInfo({ name: "serialized-create" })
+          yield* Effect.addFinalizer(() =>
+            probe.release.pipe(Effect.andThen(svc.remove({ directory: info.directory }).pipe(Effect.ignore))),
+          )
+
+          const creating = yield* svc.createFromInfo(info).pipe(Effect.forkScoped)
+          yield* probe.entered.pipe(Effect.timeout("2 seconds"))
+          const removing = yield* svc.remove({ directory: info.directory }).pipe(Effect.forkScoped)
+          const earlyRemoval = yield* Fiber.join(removing).pipe(Effect.timeoutOption("250 millis"))
+
+          yield* probe.release
+          yield* Fiber.join(creating)
+          expect(earlyRemoval._tag).toBe("None")
+          expect(yield* Fiber.join(removing)).toBe(true)
+        }),
+      { git: true },
+      { timeout: 20_000 },
+    )
+
+    concurrentIt.instance(
+      "serializes destructive operations for the same worktree",
+      () =>
+        Effect.gen(function* () {
+          const probe = yield* RemoveHookProbe
+          const svc = yield* Worktree.Service
+          const ready = yield* waitReady().pipe(Effect.forkScoped)
+          const info = yield* svc.create({ name: "serialized-remove" })
+          yield* Fiber.join(ready)
+
+          const first = yield* svc.remove({ directory: info.directory }).pipe(Effect.forkScoped)
+          yield* probe.entered.pipe(Effect.timeout("2 seconds"))
+          const second = yield* svc.remove({ directory: info.directory }).pipe(Effect.forkScoped)
+
+          expect((yield* probe.overlap.pipe(Effect.timeoutOption("250 millis")))._tag).toBe("None")
+          yield* probe.release
+          expect(yield* Fiber.join(first)).toBe(true)
+          expect(yield* Fiber.join(second)).toBe(true)
+        }),
+      { git: true },
+      { timeout: 20_000 },
     )
   })
 

@@ -1,5 +1,6 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { path } from "@opencode-ai/core/effect/layer-node-platform"
+import { KeyedMutex } from "@opencode-ai/core/effect/keyed-mutex"
 import { Global } from "@opencode-ai/core/global"
 import { InstanceLayer } from "@/project/instance-layer"
 import { InstanceStore } from "@/project/instance-store"
@@ -12,7 +13,7 @@ import { Slug } from "@opencode-ai/core/util/slug"
 import { errorMessage } from "../util/error"
 import { GlobalBus } from "@/bus/global"
 import { Git } from "@/git"
-import { Effect, Layer, Path, Schema, Scope, Context } from "effect"
+import { Context, Effect, FiberMap, Layer, Path, Schema } from "effect"
 import { ChildProcess } from "effect/unstable/process"
 import { NodePath } from "@effect/platform-node"
 import { FSUtil } from "@opencode-ai/core/fs-util"
@@ -146,7 +147,8 @@ export const layer: Layer.Layer<
 > = Layer.effect(
   Service,
   Effect.gen(function* () {
-    const scope = yield* Scope.Scope
+    const bootFibers = yield* FiberMap.make<string, void, never>()
+    const lifecycle = KeyedMutex.makeUnsafe<string>()
     const fs = yield* FSUtil.Service
     const pathSvc = yield* Path.Path
     const appProcess = yield* AppProcess.Service
@@ -287,9 +289,7 @@ export const layer: Layer.Layer<
             { event: "CwdChanged", oldCwd: ctx.directory, newCwd: info.directory },
             { sessionID: "", transcriptPath: "" },
           )
-          .pipe(
-            Effect.catch(() => Effect.succeed({ additionalContexts: [], systemMessages: [] })),
-          )
+          .pipe(Effect.catch(() => Effect.succeed({ additionalContexts: [], systemMessages: [] })))
         yield* SettingsHook.landSystemMessages(cwdResult, { sessionID: "" })
       }
 
@@ -297,10 +297,18 @@ export const layer: Layer.Layer<
     })
 
     const createFromInfo = Effect.fn("Worktree.createFromInfo")(function* (info: Info, startCommand?: string) {
-      yield* setup(info)
-      yield* boot(info, startCommand).pipe(
-        Effect.catchCause((cause) => Effect.logError("worktree bootstrap failed", { cause })),
-        Effect.forkIn(scope),
+      const directory = yield* canonical(info.directory)
+      yield* lifecycle.withLock(directory)(
+        Effect.gen(function* () {
+          yield* setup(info)
+          yield* FiberMap.run(
+            bootFibers,
+            directory,
+            boot(info, startCommand).pipe(
+              Effect.catchCause((cause) => Effect.logError("worktree bootstrap failed", { cause })),
+            ),
+          )
+        }),
       )
     })
 
@@ -321,7 +329,14 @@ export const layer: Layer.Layer<
 
     const canonical = Effect.fnUntraced(function* (input: string) {
       const abs = pathSvc.resolve(input)
-      const real = yield* fs.realPath(abs).pipe(Effect.catch(() => Effect.succeed(abs)))
+      const real = yield* fs.realPath(abs).pipe(
+        Effect.catch(() =>
+          fs.realPath(pathSvc.dirname(abs)).pipe(
+            Effect.map((parent) => pathSvc.join(parent, pathSvc.basename(abs))),
+            Effect.catch(() => Effect.succeed(abs)),
+          ),
+        ),
+      )
       const normalized = pathSvc.normalize(real)
       return process.platform === "win32" ? normalized.toLowerCase() : normalized
     })
@@ -412,13 +427,13 @@ export const layer: Layer.Layer<
       })
     }
 
-    const remove = Effect.fn("Worktree.remove")(function* (input: RemoveInput) {
+    const removeLocked = Effect.fnUntraced(function* (input: RemoveInput, directory: string) {
       const ctx = yield* InstanceState.context
       if (ctx.project.vcs !== "git") {
         return yield* new NotGitError({ message: "Worktrees are only supported for git projects" })
       }
 
-      const directory = yield* canonical(input.directory)
+      yield* FiberMap.remove(bootFibers, directory)
 
       if (settingsHook) {
         const wrResult = yield* settingsHook
@@ -483,6 +498,11 @@ export const layer: Layer.Layer<
       }
 
       return true
+    })
+
+    const remove = Effect.fn("Worktree.remove")(function* (input: RemoveInput) {
+      const directory = yield* canonical(input.directory)
+      return yield* lifecycle.withLock(directory)(removeLocked(input, directory))
     })
 
     const gitExpect = Effect.fnUntraced(function* (
@@ -559,17 +579,17 @@ export const layer: Layer.Layer<
       return yield* git(["clean", "-ffdx"], { cwd: root })
     })
 
-    const reset = Effect.fn("Worktree.reset")(function* (input: ResetInput) {
+    const resetLocked = Effect.fnUntraced(function* (input: ResetInput, directory: string) {
       const ctx = yield* InstanceState.context
       if (ctx.project.vcs !== "git") {
         return yield* new NotGitError({ message: "Worktrees are only supported for git projects" })
       }
 
-      const directory = yield* canonical(input.directory)
       const primary = yield* canonical(ctx.worktree)
       if (directory === primary) {
         return yield* new ResetFailedError({ message: "Cannot reset the primary workspace" })
       }
+      yield* FiberMap.remove(bootFibers, directory)
 
       const list = yield* git(["worktree", "list", "--porcelain"], { cwd: ctx.worktree })
       if (list.code !== 0) {
@@ -639,12 +659,20 @@ export const layer: Layer.Layer<
         return yield* new ResetFailedError({ message: `Worktree reset left local changes:\n${status.text.trim()}` })
       }
 
-      yield* runStartScripts(worktreePath, { projectID: ctx.project.id }).pipe(
-        Effect.catchCause((cause) => Effect.logError("worktree start task failed", { cause })),
-        Effect.forkIn(scope),
+      yield* FiberMap.run(
+        bootFibers,
+        directory,
+        runStartScripts(worktreePath, { projectID: ctx.project.id }).pipe(
+          Effect.catchCause((cause) => Effect.logError("worktree start task failed", { cause })),
+        ),
       )
 
       return true
+    })
+
+    const reset = Effect.fn("Worktree.reset")(function* (input: ResetInput) {
+      const directory = yield* canonical(input.directory)
+      return yield* lifecycle.withLock(directory)(resetLocked(input, directory))
     })
 
     return Service.of({ makeWorktreeInfo, createFromInfo, create, list, remove, reset })
