@@ -63,6 +63,8 @@ describe("CommandPlugin.Plugin", () => {
       expect(CommandPlugin.WorkflowContent).toContain("Use direct execution for")
       expect(CommandPlugin.WorkflowContent).toContain("one `task` subagent")
       expect(CommandPlugin.WorkflowContent).toContain("Related work for one objective")
+      expect(CommandPlugin.WorkflowFactsContent).toContain("project-level source or test changes")
+      expect(CommandPlugin.WorkflowFactsContent).toMatch(/even when only\s+one project file/)
       expect(CommandPlugin.WorkflowFactsContent).not.toContain("when ANY")
       expect(CommandPlugin.WorkflowFactsContent).not.toContain("- **Multi-model**:")
       expect(CommandPlugin.DagFlowContent).toContain('workflow(action="start")')
@@ -90,6 +92,7 @@ describe("CommandPlugin.Plugin", () => {
       expect(CommandPlugin.OrchestrationPolicyContent).toContain("MUST NOT perform executable leaf work")
       expect(CommandPlugin.OrchestrationPolicyContent).toContain("one `task` subagent")
       expect(CommandPlugin.OrchestrationPolicyContent).toContain("one live `workflow` DAG")
+      expect(CommandPlugin.OrchestrationPolicyContent).toContain("outside a project-level source or test change")
       expect(CommandPlugin.OrchestrationPolicyContent).toContain("one user objective")
       expect(CommandPlugin.DagFlowContent).toMatch(/one consolidated\s+graph/)
     }),
@@ -99,6 +102,9 @@ describe("CommandPlugin.Plugin", () => {
     Effect.sync(() => {
       expect(CommandPlugin.WorkflowFactsContent).toContain("For a one-off graph, pass `spec` inline")
       expect(CommandPlugin.WorkflowFactsContent).toContain("Use `spec_path` only")
+      expect(CommandPlugin.WorkflowContent).toContain("**read**")
+      expect(CommandPlugin.WorkflowFactsContent).toContain('{ action: "read", spec_path: "code-review" }')
+      expect(CommandPlugin.WorkflowFactsContent).toContain("retarget its objective and block instructions")
       expect(CommandPlugin.WorkflowFactsContent).not.toContain("Never inline graph nodes")
       expect(CommandPlugin.WorkflowFactsContent).not.toContain("Before any graph-carrying action")
       expect(CommandPlugin.DagFlowContent).toContain("inline `spec`")

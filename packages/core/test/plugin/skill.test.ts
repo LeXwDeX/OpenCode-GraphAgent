@@ -75,6 +75,8 @@ describe("SkillPlugin.Plugin", () => {
       const router = (yield* skill.list()).find((item) => item.name === "orchestration-router")
       expect(router?.description).toContain("even one project file")
       expect(router?.description).toContain("isolated utility scripts")
+      expect(router?.content).toContain('workflow(action="read"')
+      expect(router?.content).toContain("retarget the objective")
     }),
   )
 

@@ -302,6 +302,8 @@ const runtime = testEffect(
           slug: "workflow-test",
           projectID,
           directory: workflowSpecDirectory,
+          parentID:
+            id === SessionID.make("ses_workflow_child") ? SessionID.make("ses_workflow_parent") : undefined,
           title: "Workflow test",
           version: "test",
           time: { created: 0, updated: 0 },
@@ -373,7 +375,7 @@ function toolContext() {
 }
 
 describe("workflow tool schema (negative tests)", () => {
-  it("action field accepts start/extend/control/status/list/guide", () => {
+  it("action field accepts start/extend/control/status/list/read/guide", () => {
     const decode = Schema.decodeUnknownSync(Parameters)
     expect(() => decode({ action: "start", spec_path: ".opencode/workflows/test.yaml" })).not.toThrow()
     expect(() => decode({ action: "extend", workflow_id: "wf-1", spec_path: ".opencode/workflows/extend.yaml" })).not.toThrow()
@@ -381,6 +383,7 @@ describe("workflow tool schema (negative tests)", () => {
     expect(() => decode({ action: "status", workflow_id: "wf-1" })).not.toThrow()
     // list browses the saved-spec library and needs no workflow_id.
     expect(() => decode({ action: "list" })).not.toThrow()
+    expect(() => decode({ action: "read", spec_path: "project-change-route" })).not.toThrow()
     expect(() => decode({ action: "guide", topic: "blocks" })).not.toThrow()
   })
 
@@ -445,12 +448,28 @@ describe("workflow tool schema (negative tests)", () => {
 })
 
 describe("workflow tool execution", () => {
+  runtime.effect("rejects workflow orchestration from a child session even if invoked directly", () =>
+    Effect.gen(function* () {
+      published.length = 0
+      const info = yield* WorkflowTool
+      const workflow = yield* info.init()
+      const exit = yield* workflow.execute(
+        { action: "list" },
+        { ...toolContext(), sessionID: SessionID.make("ses_workflow_child") },
+      ).pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) expect(Cause.pretty(exit.cause)).toContain("main conversation")
+      expect(published).toHaveLength(0)
+    }),
+  )
+
   runtime.effect("description retains the workflow action reference after guidance migration", () =>
     Effect.gen(function* () {
       const info = yield* WorkflowTool
       const workflow = yield* info.init()
 
-      for (const action of ["guide", "start", "extend", "status", "control"]) {
+      for (const action of ["guide", "start", "extend", "status", "control", "list", "read"]) {
         expect(workflow.description).toContain(`**${action}**`)
       }
       expect(workflow.description).toContain("Do not poll")
@@ -1468,6 +1487,48 @@ describe("workflow tool saved workflows", () => {
           asked.push(input)
         }),
     }) satisfies Tool.Context
+
+  runtime.effect("read returns a saved route for parent retargeting without starting it", () =>
+    withGlobalConfigDir(() =>
+      Effect.gen(function* () {
+        published.length = 0
+        yield* Effect.promise(() =>
+          Bun.write(
+            path.join(workflowSpecDirectory, ".opencode", "workflows", "saved-readable.yaml"),
+            [
+              "title: Saved readable route",
+              "config:",
+              "  name: saved-readable",
+              "  objective: Replace this generic objective",
+              "  blocks:",
+              "    - id: map",
+              "      kind: explore",
+              "",
+            ].join("\n"),
+          ),
+        )
+        const info = yield* WorkflowTool
+        const workflow = yield* info.init()
+        const asked: unknown[] = []
+
+        const result = yield* workflow.execute(
+          { action: "read", spec_path: "saved-readable" },
+          contextWith(asked),
+        )
+
+        expect(result.title).toBe("Workflow spec: saved-readable")
+        expect(JSON.parse(result.output)).toMatchObject({
+          title: "Saved readable route",
+          config: {
+            objective: "Replace this generic objective",
+            blocks: [{ id: "map", kind: "explore" }],
+          },
+        })
+        expect(asked).toHaveLength(0)
+        expect(published).toHaveLength(0)
+      }),
+    ),
+  )
 
   runtime.effect("start resolves a bare name against the project workflow library", () =>
     withGlobalConfigDir(() =>

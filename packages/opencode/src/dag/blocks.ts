@@ -1,3 +1,4 @@
+import { Schema } from "effect"
 import type { NodeConfig } from "./dag"
 
 export const WORKFLOW_BLOCK_KINDS = [
@@ -13,16 +14,32 @@ export const WORKFLOW_BLOCK_KINDS = [
 
 export type WorkflowBlockKind = (typeof WORKFLOW_BLOCK_KINDS)[number]
 
-export interface WorkflowBlock {
-  id: string
-  kind: WorkflowBlockKind
-  depends_on?: string[]
-  instruction?: string
-  skills?: string[]
-  worker_type?: string
-  required?: boolean
-  report_to_parent?: boolean
-}
+export const WorkflowBlock = Schema.Struct({
+  id: Schema.String.annotate({ description: "Unique block identifier; dependencies target block IDs" }),
+  kind: Schema.Literals(WORKFLOW_BLOCK_KINDS).annotate({
+    description: "Composable workflow block; debug and review expand into evidence-gathering subgraphs",
+  }),
+  depends_on: Schema.optional(Schema.Array(Schema.String)).annotate({
+    description: "Block IDs this block waits for. Defaults to []",
+  }),
+  instruction: Schema.optional(Schema.String).annotate({
+    description: "Task-specific instruction added to the block's built-in execution contract",
+  }),
+  skills: Schema.optional(Schema.Array(Schema.String)).annotate({
+    description: "Relevant skills the child should load lazily before working",
+  }),
+  worker_type: Schema.optional(Schema.String).annotate({
+    description: "Optional configured agent override; defaults from the block kind",
+  }),
+  required: Schema.optional(Schema.Boolean).annotate({
+    description:
+      "Whether failure is terminal. Decision and verification blocks default to true; volume blocks to false",
+  }),
+  report_to_parent: Schema.optional(Schema.Boolean).annotate({
+    description: "Override wake behavior. Review decisions and synthesis report by default",
+  }),
+})
+export type WorkflowBlock = typeof WorkflowBlock.Type
 
 export interface WorkflowBlockGraph {
   objective: string
@@ -112,7 +129,7 @@ export function compileWorkflowBlocks(
 
 function compileBlock(objective: string, block: WorkflowBlock, blocks: WorkflowBlock[]): NodeConfig[] {
   const dependencies = block.depends_on ?? []
-  const required = block.required ?? true
+  const required = block.required ?? (block.kind === "plan" || block.kind === "verify" || block.kind === "synthesize")
   const reviewDependency = dependencies.find(
     (dependency) => blocks.find((candidate) => candidate.id === dependency)?.kind === "review",
   )
@@ -131,7 +148,7 @@ function compileBlock(objective: string, block: WorkflowBlock, blocks: WorkflowB
         skills: block.skills,
         contract:
           "Reproduce or characterize the failure read-only where possible. Capture exact symptoms, commands, logs, boundaries, and the smallest falsifiable observations. Do not patch the code.",
-        required,
+        required: block.required ?? false,
         reportToParent: false,
         condition,
       }),
@@ -144,7 +161,7 @@ function compileBlock(objective: string, block: WorkflowBlock, blocks: WorkflowB
         instruction: block.instruction,
         skills: block.skills,
         contract: BLOCK_CONTRACTS.debug,
-        required,
+        required: block.required ?? true,
         reportToParent: block.report_to_parent ?? false,
       }),
     ]
@@ -163,7 +180,7 @@ function compileBlock(objective: string, block: WorkflowBlock, blocks: WorkflowB
         instruction: block.instruction,
         skills: block.skills,
         contract: `${BLOCK_CONTRACTS.review} Focus on documented repository standards, architecture constraints, correctness, and verification evidence.`,
-        required,
+        required: block.required ?? false,
         reportToParent: false,
         condition,
       }),
@@ -176,7 +193,7 @@ function compileBlock(objective: string, block: WorkflowBlock, blocks: WorkflowB
         instruction: block.instruction,
         skills: block.skills,
         contract: `${BLOCK_CONTRACTS.review} Focus on the confirmed goal, scope, acceptance criteria, and user-visible behavior.`,
-        required,
+        required: block.required ?? false,
         reportToParent: false,
         condition,
       }),
@@ -193,7 +210,7 @@ function compileBlock(objective: string, block: WorkflowBlock, blocks: WorkflowB
           "Reject unsupported claims, deduplicate overlaps, and submit one structured result with verdict ACCEPT, REVISE, REJECT, or BLOCKED.",
           "Use ACCEPT only when no material required action remains.",
         ].join(" "),
-        required,
+        required: block.required ?? true,
         reportToParent: block.report_to_parent ?? true,
         outputSchema: VERDICT_SCHEMA,
       }),
@@ -221,10 +238,10 @@ function node(input: {
   id: string
   name: string
   workerType: string
-  dependencies: string[]
+  dependencies: readonly string[]
   objective: string
   instruction?: string
-  skills?: string[]
+  skills?: readonly string[]
   contract: string
   required: boolean
   reportToParent: boolean
@@ -239,7 +256,7 @@ function node(input: {
     id: input.id,
     name: input.name,
     worker_type: input.workerType,
-    depends_on: input.dependencies,
+    depends_on: [...input.dependencies],
     required: input.required,
     report_to_parent: input.reportToParent,
     prompt_template: {
@@ -292,3 +309,5 @@ function assertAcyclic(blocks: WorkflowBlock[]) {
     }
   }
 }
+
+export * as DagBlocks from "./blocks"

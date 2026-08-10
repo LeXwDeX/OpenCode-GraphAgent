@@ -1,9 +1,10 @@
 import { describe, expect, it } from "bun:test"
-import { compileWorkflowBlocks } from "@/dag/blocks"
+import { DagBlocks } from "@/dag/blocks"
+import { DagConfig } from "@/dag/config"
 
 describe("workflow blocks", () => {
   it("compiles a staged route and carries objective, instructions, skills, and dependencies", () => {
-    const nodes = compileWorkflowBlocks({
+    const nodes = DagBlocks.compileWorkflowBlocks({
       objective: "Add durable session recovery",
       blocks: [
         {
@@ -36,11 +37,15 @@ describe("workflow blocks", () => {
     })
     expect(nodes[1]?.prompt_template.inline).toContain("load these relevant skills")
     expect(nodes[1]?.prompt_template.inline).toContain("tdd")
-    expect(nodes.every((node) => node.required)).toBe(true)
+    expect(nodes.map((node) => ({ id: node.id, required: node.required }))).toEqual([
+      { id: "map", required: false },
+      { id: "build", required: false },
+      { id: "verify", required: true },
+    ])
   })
 
   it("expands debug into evidence and diagnosis nodes", () => {
-    const nodes = compileWorkflowBlocks({
+    const nodes = DagBlocks.compileWorkflowBlocks({
       objective: "Find the source of a timeout",
       blocks: [{ id: "root-cause", kind: "debug", report_to_parent: true }],
     })
@@ -59,7 +64,7 @@ describe("workflow blocks", () => {
   })
 
   it("expands review into two independent lanes and a reporting verdict gate", () => {
-    const nodes = compileWorkflowBlocks({
+    const nodes = DagBlocks.compileWorkflowBlocks({
       objective: "Review the implementation",
       blocks: [
         { id: "implementation", kind: "coding" },
@@ -89,16 +94,55 @@ describe("workflow blocks", () => {
     expect(nodes.find((node) => node.id === "report")?.condition).toBe('decision.output.verdict == "ACCEPT"')
   })
 
+  it("routes volume blocks to the standard tier and decision blocks to the advanced tier", () => {
+    const nodes = DagBlocks.compileWorkflowBlocks({
+      objective: "Deliver a reviewed project change",
+      blocks: [
+        { id: "map", kind: "explore" },
+        { id: "plan", kind: "plan", depends_on: ["map"] },
+        { id: "experiment", kind: "prototype", depends_on: ["map"] },
+        { id: "diagnose", kind: "debug", depends_on: ["map"] },
+        { id: "build", kind: "coding", depends_on: ["plan", "diagnose"] },
+        { id: "verify", kind: "verify", depends_on: ["build", "experiment"] },
+        { id: "decision", kind: "review", depends_on: ["verify"] },
+        { id: "report", kind: "synthesize", depends_on: ["decision"] },
+      ],
+    })
+    const models = Object.fromEntries(
+      nodes.map((node) => [
+        node.id,
+        DagConfig.tierModel(
+          { model: { advanced: "test/advanced", standard: "test/standard" } },
+          { required: node.required ?? false, workerType: node.worker_type },
+        )?.modelID,
+      ]),
+    )
+
+    expect(models).toEqual({
+      map: "standard",
+      plan: "advanced",
+      experiment: "standard",
+      "diagnose--evidence": "standard",
+      diagnose: "advanced",
+      build: "standard",
+      verify: "advanced",
+      "decision--standards": "standard",
+      "decision--intent": "standard",
+      decision: "advanced",
+      report: "advanced",
+    })
+  })
+
   it("rejects ambiguous dependencies and expansion collisions", () => {
     expect(() =>
-      compileWorkflowBlocks({
+      DagBlocks.compileWorkflowBlocks({
         objective: "Invalid graph",
         blocks: [{ id: "build", kind: "coding", depends_on: ["missing"] }],
       }),
     ).toThrow('Block "build" depends on unknown block "missing"')
 
     expect(() =>
-      compileWorkflowBlocks({
+      DagBlocks.compileWorkflowBlocks({
         objective: "Colliding graph",
         blocks: [
           { id: "check", kind: "review" },
@@ -108,7 +152,7 @@ describe("workflow blocks", () => {
     ).toThrow("Block expansion creates duplicate node ids: check--intent")
 
     expect(() =>
-      compileWorkflowBlocks({
+      DagBlocks.compileWorkflowBlocks({
         objective: "Cyclic graph",
         blocks: [
           { id: "a", kind: "plan", depends_on: ["b"] },
@@ -118,7 +162,7 @@ describe("workflow blocks", () => {
     ).toThrow("dependency cycle")
 
     expect(() =>
-      compileWorkflowBlocks({
+      DagBlocks.compileWorkflowBlocks({
         objective: "Unsafe ID",
         blocks: [{ id: "review.output", kind: "review" }],
       }),
@@ -126,7 +170,7 @@ describe("workflow blocks", () => {
   })
 
   it("allows an extension block to depend on an existing durable node", () => {
-    const nodes = compileWorkflowBlocks(
+    const nodes = DagBlocks.compileWorkflowBlocks(
       {
         objective: "Continue from durable evidence",
         blocks: [{ id: "repair", kind: "coding", depends_on: ["existing-evidence"] }],
@@ -138,11 +182,11 @@ describe("workflow blocks", () => {
   })
 
   it("requires one objective and one review dependency per continuation", () => {
-    expect(() => compileWorkflowBlocks({ objective: " ", blocks: [{ id: "x", kind: "coding" }] })).toThrow(
+    expect(() => DagBlocks.compileWorkflowBlocks({ objective: " ", blocks: [{ id: "x", kind: "coding" }] })).toThrow(
       "non-empty objective",
     )
     expect(() =>
-      compileWorkflowBlocks({
+      DagBlocks.compileWorkflowBlocks({
         objective: "Ambiguous gates",
         blocks: [
           { id: "review-a", kind: "review" },

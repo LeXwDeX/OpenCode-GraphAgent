@@ -69,6 +69,12 @@ not already in context. Select only justified blocks:
 - runnable uncertainty: prototype detour → update the plan;
 - review-only: scope exploration → independent review and arbitration.
 
+When a reusable route matches the topology, call
+`workflow(action="read", spec_path="<route>")`, retarget the objective and
+block instructions to the confirmed request, prune unjustified blocks, and
+start the edited result as an inline spec. Start the saved `spec_path` directly
+only when its target already matches exactly.
+
 Use a skill name on a block only when it appears in the available skill
 catalog. Test-first implementation and standards/spec review belong in their
 respective coding and review blocks, not in the always-on router prompt.

@@ -11,20 +11,22 @@ Compile every graph under the Tiered Orchestration Doctrine and Depth Ladder in 
 
 ## When to start a workflow
 
-Use one live workflow when a user objective has any of these structural
-signals:
+Use one live workflow for project-level source or test changes, even when only
+one project file is expected, and when a user objective has any of these
+structural signals:
 
 - **Staged**: clear phase boundaries where later phases depend on earlier outputs (explore → plan → implement → verify).
 - **Parallelizable**: ≥2 related sub-units can execute concurrently (same fix across 5 packages).
 - **Quality gate**: intermediate output must pass review before downstream work begins (architecture review before implementation).
 - **Adaptive scope**: discovery may reveal an unknown number of work packages or require a bounded repair wave.
 
-Use one `task` subagent for one independent non-trivial leaf assignment. Keep
-related staged, parallel, gated, or adaptive flows under one workflow ID; use
-`extend` or `control(replan)` instead of starting disconnected DAGs. An explicit
-`/dag-flow` request always selects a workflow. Direct tools in the parent are
-reserved for conversation, trivial state inspection, workflow control, and
-final synthesis.
+Use one `task` subagent for one independent non-trivial leaf assignment outside
+a project-level source or test change. Keep related staged, parallel, gated, or
+adaptive flows under one workflow ID; use `extend` or `control(replan)` instead
+of starting disconnected DAGs. An explicit `/dag-flow` request always selects
+a workflow. Explicit “single agent”, “do not use DAG”, and direct-execution
+requests opt out. Direct tools in the parent are reserved for conversation,
+trivial state inspection, workflow control, and final synthesis.
 
 ## Standard and deep workflow entry
 
@@ -90,9 +92,9 @@ resolves nowhere fails with the directories that were searched.
 
 Prefer a saved workflow when the user names a recurring procedure ("run the
 code review workflow") and the saved target/inputs already match: starting it
-is one call, and its graph has already been reviewed. `/dag-flow` may also read
-a saved workflow as a topology reference, then derive a one-off spec that
-injects the current task, retargets module lanes, and records additions/prunes.
+is one call, and its graph has already been reviewed. When only its topology
+matches, call `{ action: "read", spec_path: "code-review" }`, retarget its objective and block instructions to the current task, prune or add lanes, then
+start that edited value as an inline spec. `read` never starts a workflow.
 Compose a fresh inline `spec` when the task is one-off or no reference fits.
 To turn a working one-off spec into a saved workflow, persist it as YAML in one
 of the two workflow-library directories under a descriptive name.
@@ -548,6 +550,10 @@ execution order are computed automatically.
 **list** — Show the saved workflow specs in the library (project and global
 scope) with their names, titles, and node counts. This lists reusable specs,
 not running workflows; use `status` for a workflow's live state.
+
+**read** — Return one saved workflow as structured JSON without starting it.
+Pass `spec_path`, then retarget generic objectives and block instructions in
+the parent before using the edited result as an inline `start` spec.
 
 **extend** — Add nodes to a running workflow. Existing nodes are unaffected;
 new nodes are immediately eligible for scheduling if their dependencies are

@@ -61,13 +61,15 @@ Choose the smallest child execution mode that can safely complete the request:
 
 1. Use direct execution only for conversation, trivial state inspection,
    workflow control, final synthesis, or an explicit user opt-out.
-2. Use one `task` subagent for one independent non-trivial leaf assignment when
-   no graph-level coordination is needed. The parent launches it once, consumes
-   its result, and does not duplicate the leaf work.
-3. Use one live `workflow` DAG when one user objective contains staged
-   dependencies, two or more related workstreams, a quality gate, unknown-size
-   discovery, adaptive repair, or an explicit multi-role or multi-model
-   requirement.
+2. Use one `task` subagent for one independent non-trivial leaf assignment
+   outside a project-level source or test change when no graph-level
+   coordination is needed. The parent launches it once, consumes its result,
+   and does not duplicate the leaf work.
+3. Use one live `workflow` DAG for project-level source or test changes, even
+   when only one project file is expected, and whenever one user objective
+   contains staged dependencies, two or more related workstreams, a quality
+   gate, unknown-size discovery, adaptive repair, or an explicit multi-role or
+   multi-model requirement.
 
 "Smallest" is measured against the Depth Ladder: a mode or graph that cannot
 deliver the ladder's hard minimum for the target size is not safe, merely

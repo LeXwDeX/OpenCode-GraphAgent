@@ -5,7 +5,7 @@ import { Dag } from "@/dag/dag"
 import { DagConfig } from "@/dag/config"
 import { DagWorkflows } from "@/dag/workflows"
 import { DagModel } from "@/dag/model"
-import { compileWorkflowBlocks, WORKFLOW_BLOCK_KINDS, type WorkflowBlock } from "@/dag/blocks"
+import { DagBlocks } from "@/dag/blocks"
 import { Agent } from "@/agent/agent"
 import { Question } from "@/question"
 import { Session } from "@/session/session"
@@ -77,31 +77,6 @@ const NodeSchema = Schema.Struct({
   }),
 })
 
-const BlockSchema = Schema.Struct({
-  id: Schema.String.annotate({ description: "Unique block identifier; dependencies target block IDs" }),
-  kind: Schema.Literals(WORKFLOW_BLOCK_KINDS).annotate({
-    description: "Composable workflow block; debug and review expand into evidence-gathering subgraphs",
-  }),
-  depends_on: Schema.optional(Schema.Array(Schema.String)).annotate({
-    description: "Block IDs this block waits for. Defaults to []",
-  }),
-  instruction: Schema.optional(Schema.String).annotate({
-    description: "Task-specific instruction added to the block's built-in execution contract",
-  }),
-  skills: Schema.optional(Schema.Array(Schema.String)).annotate({
-    description: "Relevant skills the child should load lazily before working",
-  }),
-  worker_type: Schema.optional(Schema.String).annotate({
-    description: "Optional configured agent override; defaults from the block kind",
-  }),
-  required: Schema.optional(Schema.Boolean).annotate({
-    description: "Whether execution failure is terminal. Defaults to true for compiled blocks",
-  }),
-  report_to_parent: Schema.optional(Schema.Boolean).annotate({
-    description: "Override wake behavior. Review decisions and synthesis report by default",
-  }),
-})
-
 const WorkflowGraphSchema = Schema.Struct({
   name: Schema.String.annotate({ description: "Workflow name" }),
   node_defaults: Schema.optional(
@@ -127,7 +102,7 @@ const WorkflowGraphSchema = Schema.Struct({
   objective: Schema.optional(Schema.String).annotate({
     description: "Required when using blocks; injected into every generated child prompt",
   }),
-  blocks: Schema.optional(Schema.Array(BlockSchema)).annotate({
+  blocks: Schema.optional(Schema.Array(DagBlocks.WorkflowBlock)).annotate({
     description: "High-level graph compiled into nodes. Use blocks or nodes, never both",
   }),
   nodes: Schema.optional(Schema.Array(NodeSchema)).annotate({
@@ -145,7 +120,7 @@ export const StartSpec = Schema.Struct({
 
 const ExtendSpec = Schema.Struct({
   objective: Schema.optional(Schema.String),
-  blocks: Schema.optional(Schema.Array(BlockSchema)),
+  blocks: Schema.optional(Schema.Array(DagBlocks.WorkflowBlock)),
   nodes: Schema.optional(Schema.Array(NodeSchema)),
 })
 
@@ -158,9 +133,9 @@ const decodeExtendSpec = Schema.decodeUnknownEffect(ExtendSpec)
 const decodeReplanSpec = Schema.decodeUnknownEffect(ReplanSpec)
 
 export const Parameters = Schema.Struct({
-  action: Schema.Literals(["start", "extend", "control", "status", "list", "guide"]).annotate({
+  action: Schema.Literals(["start", "extend", "control", "status", "list", "read", "guide"]).annotate({
     description:
-      "start: create workflow; extend: add nodes or blocks; control: pause/resume/cancel/replan/step/complete; status: inspect durable state; list: show saved specs; guide: load detailed guidance only when needed",
+      "start: create workflow; extend: add nodes or blocks; control: pause/resume/cancel/replan/step/complete; status: inspect durable state; list: show saved specs; read: inspect one saved spec before retargeting it; guide: load detailed guidance only when needed",
   }),
   topic: Schema.optional(Schema.Literals(["blocks", "interface", "policy", "patterns"])).annotate({
     description:
@@ -172,7 +147,7 @@ export const Parameters = Schema.Struct({
   }),
   spec_path: Schema.optional(Schema.String).annotate({
     description:
-      '(start/extend/control replan) A saved workflow name from the library (e.g. "code-review"), or a path to a YAML workflow spec. Relative paths resolve from the session directory',
+      '(start/extend/control replan/read) A saved workflow name from the library (e.g. "code-review"), or a path to a YAML workflow spec. Relative paths resolve from the session directory',
   }),
   session_id: Schema.optional(Schema.String).annotate({
     description: "(start) Parent session ID; when provided, it must match the calling session",
@@ -220,6 +195,12 @@ export const WorkflowTool = Tool.define<
       parameters: Parameters,
       execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context<Metadata>) =>
         Effect.gen(function* () {
+          const callingSession = yield* sessions.get(SessionID.make(ctx.sessionID)).pipe(Effect.orDie)
+          if (callingSession.parentID) {
+            return yield* Effect.die(
+              new Error("Workflow orchestration is available only to the main conversation, not child agents"),
+            )
+          }
           switch (params.action) {
             case "guide": {
               if (!params.topic) {
@@ -273,6 +254,22 @@ export const WorkflowTool = Tool.define<
                     ].join(""),
                   )
                   .join("\n"),
+                metadata: {},
+              }
+            }
+            case "read": {
+              if (!params.spec_path || params.spec) {
+                return yield* Effect.die(
+                  new Error("read requires exactly one 'spec_path' and does not accept inline 'spec'"),
+                )
+              }
+              const session = yield* sessions.get(SessionID.make(ctx.sessionID)).pipe(Effect.orDie)
+              const specFile = yield* readWorkflowSpec(undefined, params.spec_path, session.directory, ctx).pipe(
+                Effect.orDie,
+              )
+              return {
+                title: `Workflow spec: ${params.spec_path}`,
+                output: JSON.stringify(specFile.value, null, 2),
                 metadata: {},
               }
             }
@@ -340,7 +337,7 @@ export const WorkflowTool = Tool.define<
                 Effect.mapError((error) => new Error(`Invalid workflow spec ${specFile.path}: ${String(error)}`)),
                 Effect.orDie,
               )
-              const config = yield* compileGraph(spec.config, specFile.path).pipe(Effect.orDie)
+              const config = compileGraph(spec.config, specFile.path)
               const missingModels = yield* findNodesWithoutModel({
                 nodes: config.nodes,
                 defaults: config.node_defaults,
@@ -411,7 +408,7 @@ export const WorkflowTool = Tool.define<
               const knownDependencies = (yield* dag.store.getNodes(params.workflow_id).pipe(Effect.orDie)).map(
                 (node) => node.id,
               )
-              const nodes = yield* compileNodeSource(spec, specFile.path, knownDependencies).pipe(Effect.orDie)
+              const nodes = compileNodeSource(spec, specFile.path, knownDependencies)
               const r = yield* withTerminalRecovery(
                 dag.extend(params.workflow_id, nodes),
                 "Terminal workflows are immutable except for the additive-extend reopen, which requires the workflow to have completed naturally at a wake-eligible reporting checkpoint (fragment adds new node ids; no early control(complete); no executed node beyond the checkpoint — condition-skipped dependents are fine). When the reopen does not apply, recover by starting a NEW workflow spec that reuses this workflow's completed outputs as static input.",
@@ -471,9 +468,7 @@ export const WorkflowTool = Tool.define<
                     Effect.orDie,
                   )
                   const knownDependencies = (yield* dag.store.getNodes(wfId).pipe(Effect.orDie)).map((node) => node.id)
-                  const fragment = yield* compileGraph(spec.fragment, specFile.path, knownDependencies).pipe(
-                    Effect.orDie,
-                  )
+                  const fragment = compileGraph(spec.fragment, specFile.path, knownDependencies)
                   // The graph raced to terminal while the fragment was being
                   // composed (the pause-first protocol was skipped). Surface
                   // the recovery options instead of a bare iron-law rejection.
@@ -518,37 +513,27 @@ type WorkflowGraphInput = Schema.Schema.Type<typeof WorkflowGraphSchema>
 type NodeSource = Pick<WorkflowGraphInput, "objective" | "blocks" | "nodes">
 
 function compileGraph(graph: WorkflowGraphInput, source: string, knownDependencies?: string[]) {
-  return Effect.gen(function* () {
-    const nodes = yield* compileNodeSource(graph, source, knownDependencies)
-    const { objective: _objective, blocks: _blocks, nodes: _nodes, ...config } = graph
-    return {
-      ...config,
-      nodes,
-    } as WorkflowConfig
-  })
+  const nodes = compileNodeSource(graph, source, knownDependencies)
+  const { objective: _objective, blocks: _blocks, nodes: _nodes, ...config } = graph
+  return {
+    ...config,
+    nodes,
+  } as WorkflowConfig
 }
 
 function compileNodeSource(source: NodeSource, path: string, knownDependencies?: string[]) {
-  return Effect.try({
-    try: () => {
-      const hasNodes = source.nodes !== undefined
-      const hasBlocks = source.blocks !== undefined
-      if (hasNodes === hasBlocks) {
-        throw new Error("use exactly one of nodes or blocks")
-      }
-      if (source.nodes) return source.nodes as NodeConfig[]
-      if (!source.objective) throw new Error("blocks require objective")
-      return compileWorkflowBlocks(
-        {
-          objective: source.objective,
-          blocks: source.blocks as WorkflowBlock[],
-        },
-        { known_dependencies: knownDependencies },
-      )
+  const hasNodes = source.nodes !== undefined
+  const hasBlocks = source.blocks !== undefined
+  if (hasNodes === hasBlocks) throw new Error(`Invalid workflow graph ${path}: use exactly one of nodes or blocks`)
+  if (source.nodes) return source.nodes as NodeConfig[]
+  if (!source.objective) throw new Error(`Invalid workflow graph ${path}: blocks require objective`)
+  return DagBlocks.compileWorkflowBlocks(
+    {
+      objective: source.objective,
+      blocks: source.blocks as DagBlocks.WorkflowBlock[],
     },
-    catch: (error) =>
-      new Error(`Invalid workflow graph ${path}: ${error instanceof Error ? error.message : String(error)}`),
-  })
+    { known_dependencies: knownDependencies },
+  )
 }
 
 function readWorkflowSpec(

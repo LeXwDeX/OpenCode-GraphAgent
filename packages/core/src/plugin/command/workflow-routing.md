@@ -46,10 +46,15 @@ Load details only when needed:
   decision; it is not a waiting mechanism.
 - **control** pauses, resumes, cancels, replans, steps, or completes a workflow.
 - **list** shows saved workflow specs and their resolution scope.
+- **read** returns one saved spec so the parent can retarget it before start.
 
 Prefer high-level `blocks` for a fresh one-off flow. Use low-level `nodes` when
 the task needs custom bindings, conditions, output schemas, or review metadata.
 Never provide both. Reusable saved YAML remains valid and may use either form.
+When a saved route is generic, call **read**, replace its objective and
+block-specific instructions with the confirmed request, then pass the result
+as an inline **start** spec. Start by `spec_path` only when the saved target
+already matches exactly.
 
 The workflow runs asynchronously and wakes the parent at actionable reporting
 nodes or terminal state. Do not poll, sleep, or loop merely to wait. Never
