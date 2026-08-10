@@ -1,14 +1,5 @@
 export * as MemoryPrompts from "./prompts"
 
-export const INIT_SYSTEM = `You initialize a lightweight project-memory controller.
-
-Return only the requested structured object.
-- model must exactly match one candidate id from the input.
-- Select a low-cost, low-latency text model that can reliably return structured data.
-- topic_limit is chosen once in the range 10..100. This lightweight system normally needs the low end.
-- turn_interval is chosen once in the range 1..20. Balance freshness against background cost.
-- Do not invent a provider, model, field, or fallback.`
-
 export const MATCH_SYSTEM = `Select project-memory topics relevant to the supplied user text.
 
 Return only topic ids present in the metadata input, ranked most relevant first.

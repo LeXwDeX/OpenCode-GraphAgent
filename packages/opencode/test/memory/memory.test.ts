@@ -4,6 +4,8 @@ import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Deferred, Duration, Effect, Fiber, Layer } from "effect"
 import fs from "node:fs/promises"
 import path from "node:path"
+import { Agent } from "@/agent/agent"
+import { Config } from "@/config/config"
 import { Git } from "@/git"
 import { MemoryConfig } from "@/memory/config"
 import { Memory } from "@/memory/memory"
@@ -12,6 +14,7 @@ import { MemoryPrompts } from "@/memory/prompts"
 import { MemorySchema } from "@/memory/schema"
 import { MemoryStore } from "@/memory/store"
 import { Project } from "@/project/project"
+import { Provider } from "@/provider/provider"
 import { MessageID, PartID, SessionID } from "@/session/schema"
 import { Token } from "@/util/token"
 import { ProviderV2 } from "@opencode-ai/core/provider"
@@ -82,6 +85,20 @@ const unavailableModelIt = testEffect(
   Memory.layer.pipe(
     Layer.provide(
       Layer.mergeAll(
+        Layer.mock(Agent.Service, {
+          get: () =>
+            Effect.succeed({
+              name: "compaction",
+              mode: "primary" as const,
+              native: true,
+              hidden: true,
+              permission: [],
+              options: {},
+            }),
+        }),
+        Layer.mock(Config.Service, {
+          get: () => Effect.succeed({}),
+        }),
         replacementProvider.layer,
         Layer.mock(Project.Service, {
           get: (id) =>
@@ -128,6 +145,137 @@ const unavailableModelIt = testEffect(
   ),
 )
 
+function bootstrapFixture() {
+  const providerID = ProviderV2.ID.make("test")
+  const models = {
+    small: ProviderTest.model({ providerID, id: ModelV2.ID.make("small") }),
+    compaction: ProviderTest.model({ providerID, id: ModelV2.ID.make("compaction") }),
+    default: ProviderTest.model({ providerID, id: ModelV2.ID.make("default") }),
+    conversation: ProviderTest.model({ providerID, id: ModelV2.ID.make("conversation") }),
+  }
+  const state: {
+    available: Set<string>
+    smallModel?: string
+    compactionModel?: string
+    defaultModel?: string
+    global?: MemorySchema.Config
+    written?: MemorySchema.Config
+    modelCalls: number
+    defaultModelHook?: Effect.Effect<void>
+  } = {
+    available: new Set(Object.values(models).map((model) => `${model.providerID}/${model.id}`)),
+    smallModel: "test/small",
+    compactionModel: "test/compaction",
+    defaultModel: "test/default",
+    modelCalls: 0,
+  }
+  const layer = Memory.layer.pipe(
+    Layer.provide(
+      Layer.mergeAll(
+        Layer.mock(Config.Service, {
+          get: () => Effect.succeed({ small_model: state.smallModel }),
+        }),
+        Layer.mock(Agent.Service, {
+          get: () =>
+            Effect.succeed({
+              name: "compaction",
+              mode: "primary" as const,
+              native: true,
+              hidden: true,
+              permission: [],
+              options: {},
+              model: state.compactionModel ? Provider.parseModel(state.compactionModel) : undefined,
+            }),
+        }),
+        Layer.mock(Provider.Service, {
+          list: () =>
+            Effect.succeed({
+              [providerID]: ProviderTest.info({
+                id: providerID,
+                models: Object.fromEntries(
+                  Object.values(models)
+                    .filter((model) => state.available.has(`${model.providerID}/${model.id}`))
+                    .map((model) => [model.id, model]),
+                ),
+              }),
+            }),
+          getModel: (candidateProviderID, candidateModelID) => {
+            const model = Object.values(models).find(
+              (item) => item.providerID === candidateProviderID && item.id === candidateModelID,
+            )
+            if (model && state.available.has(`${model.providerID}/${model.id}`)) return Effect.succeed(model)
+            return Effect.die(new Error(`Unknown test model: ${candidateProviderID}/${candidateModelID}`))
+          },
+          defaultModel: () =>
+            Effect.gen(function* () {
+              if (state.defaultModelHook) yield* state.defaultModelHook
+              if (state.defaultModel) return Provider.parseModel(state.defaultModel)
+              return yield* new Provider.NoProvidersError()
+            }),
+        }),
+        Layer.mock(Project.Service, {
+          get: (id) =>
+            Effect.succeed({
+              id,
+              worktree: "/unused",
+              vcs: "git" as const,
+              time: { created: 0, updated: 0, initialized: 1 },
+              sandboxes: [],
+            }),
+        }),
+        Layer.mock(MemoryConfig.Service, {
+          load: () =>
+            Effect.succeed(
+              state.global
+                ? { config: state.global, path: "/global/memory.jsonc", level: "global" as const }
+                : undefined,
+            ),
+          loadGlobal: () =>
+            Effect.succeed(
+              state.global
+                ? { config: state.global, path: "/global/memory.jsonc", level: "global" as const }
+                : undefined,
+            ),
+          writeGlobal: (next) =>
+            Effect.sync(() => {
+              state.written = next
+              state.global = next
+              return true
+            }),
+          writeProject: () => Effect.void,
+        }),
+        Layer.mock(MemoryModel.Service, {
+          generate: () =>
+            Effect.sync(() => {
+              state.modelCalls++
+              throw new Error("bootstrap must not call a model")
+            }),
+        }),
+        Layer.mock(MemoryStore.Service, {
+          readTopics: () => Effect.succeed([]),
+          ensureGitExclude: () => Effect.void,
+          writeTopics: () => Effect.void,
+        }),
+      ),
+    ),
+  )
+  return {
+    state,
+    models,
+    reset: () => {
+      state.available = new Set(Object.values(models).map((model) => `${model.providerID}/${model.id}`))
+      state.smallModel = "test/small"
+      state.compactionModel = "test/compaction"
+      state.defaultModel = "test/default"
+      state.global = undefined
+      state.written = undefined
+      state.modelCalls = 0
+      state.defaultModelHook = undefined
+    },
+    it: testEffect(layer),
+  }
+}
+
 function recallFixture() {
   const model = ProviderTest.model({
     providerID: ProviderV2.ID.make("test"),
@@ -155,6 +303,20 @@ function recallFixture() {
   const layer = Memory.layer.pipe(
     Layer.provide(
       Layer.mergeAll(
+        Layer.mock(Agent.Service, {
+          get: () =>
+            Effect.succeed({
+              name: "compaction",
+              mode: "primary" as const,
+              native: true,
+              hidden: true,
+              permission: [],
+              options: {},
+            }),
+        }),
+        Layer.mock(Config.Service, {
+          get: () => Effect.succeed({}),
+        }),
         provider.layer,
         Layer.mock(Project.Service, {
           get: (id) =>
@@ -1201,6 +1363,223 @@ describe("memory hidden model", () => {
   )
 })
 
+describe("memory bootstrap", () => {
+  const bootstrap = bootstrapFixture()
+
+  bootstrap.it.instance(
+    "creates global configuration from small_model without an initializer model call",
+    () =>
+      Effect.gen(function* () {
+        bootstrap.reset()
+        const memory = yield* Memory.Service
+
+        yield* memory.init()
+
+        expect(bootstrap.state.written).toEqual({
+          schema_version: 1,
+          enabled: true,
+          model: "test/small",
+          topic_limit: 10,
+          topic_limit_floor: 10,
+          turn_interval: 5,
+          injection: { max_topics: 3, max_tokens: 1_200 },
+        })
+        expect(bootstrap.state.modelCalls).toBe(0)
+      }),
+    { git: true },
+  )
+
+  bootstrap.it.instance(
+    "falls through an unavailable small_model to the compaction agent model",
+    () =>
+      Effect.gen(function* () {
+        bootstrap.reset()
+        bootstrap.state.smallModel = "test/removed"
+        const memory = yield* Memory.Service
+
+        yield* memory.init()
+
+        expect(bootstrap.state.written?.model).toBe("test/compaction")
+        expect(bootstrap.state.modelCalls).toBe(0)
+      }),
+    { git: true },
+  )
+
+  bootstrap.it.instance(
+    "falls through unavailable configured models to the system default model",
+    () =>
+      Effect.gen(function* () {
+        bootstrap.reset()
+        bootstrap.state.smallModel = undefined
+        bootstrap.state.compactionModel = "test/removed"
+        const memory = yield* Memory.Service
+
+        yield* memory.init()
+
+        expect(bootstrap.state.written?.model).toBe("test/default")
+        expect(bootstrap.state.modelCalls).toBe(0)
+      }),
+    { git: true },
+  )
+
+  bootstrap.it.instance(
+    "preserves an existing configuration whose model remains available",
+    () =>
+      Effect.gen(function* () {
+        bootstrap.reset()
+        bootstrap.state.global = {
+          ...config,
+          model: "test/conversation",
+          topic_limit: 42,
+          topic_limit_floor: 42,
+          turn_interval: 9,
+        }
+        const memory = yield* Memory.Service
+
+        yield* memory.init()
+
+        expect(bootstrap.state.written).toBeUndefined()
+        expect(bootstrap.state.global).toMatchObject({
+          model: "test/conversation",
+          topic_limit: 42,
+          topic_limit_floor: 42,
+          turn_interval: 9,
+        })
+        expect(bootstrap.state.modelCalls).toBe(0)
+      }),
+    { git: true },
+  )
+
+  bootstrap.it.instance(
+    "repairs a stale global model with the ordered resolver and preserves its settings",
+    () =>
+      Effect.gen(function* () {
+        bootstrap.reset()
+        bootstrap.state.smallModel = undefined
+        bootstrap.state.global = {
+          ...config,
+          model: "removed/model",
+          topic_limit: 37,
+          topic_limit_floor: 37,
+          turn_interval: 7,
+        }
+        const memory = yield* Memory.Service
+
+        yield* memory.init()
+
+        expect(bootstrap.state.written).toMatchObject({
+          model: "test/compaction",
+          topic_limit: 37,
+          topic_limit_floor: 37,
+          turn_interval: 7,
+        })
+        expect(bootstrap.state.modelCalls).toBe(0)
+      }),
+    { git: true },
+  )
+
+  bootstrap.it.instance(
+    "defers without startup sources and creates configuration from the first real conversation model",
+    () =>
+      Effect.gen(function* () {
+        bootstrap.reset()
+        bootstrap.state.available = new Set(["test/conversation"])
+        bootstrap.state.smallModel = undefined
+        bootstrap.state.compactionModel = undefined
+        bootstrap.state.defaultModel = undefined
+        const memory = yield* Memory.Service
+        const sessionID = SessionID.make("ses_memory_lazy_bootstrap")
+
+        yield* memory.init()
+        expect(bootstrap.state.written).toBeUndefined()
+
+        yield* memory.prepare({
+          sessionID,
+          messages: [user(MessageID.ascending(), sessionID, "记住这次对话", false, ModelV2.ID.make("conversation"))],
+        })
+
+        expect(bootstrap.state.written).toMatchObject({
+          model: "test/conversation",
+          topic_limit: 10,
+          topic_limit_floor: 10,
+          turn_interval: 5,
+        })
+        expect(bootstrap.state.modelCalls).toBe(0)
+      }),
+    { git: true },
+  )
+
+  bootstrap.it.instance(
+    "does not initialize from synthetic or command messages",
+    () =>
+      Effect.gen(function* () {
+        bootstrap.reset()
+        bootstrap.state.available = new Set(["test/conversation"])
+        bootstrap.state.smallModel = undefined
+        bootstrap.state.compactionModel = undefined
+        bootstrap.state.defaultModel = undefined
+        const memory = yield* Memory.Service
+        const sessionID = SessionID.make("ses_memory_ineligible_bootstrap")
+
+        yield* memory.prepare({
+          sessionID,
+          messages: [
+            user(MessageID.ascending(), sessionID, "synthetic continuation", true, ModelV2.ID.make("conversation")),
+          ],
+        })
+        yield* memory.prepare({
+          sessionID,
+          messages: [
+            user(MessageID.ascending(), sessionID, "/goal write the docs", false, ModelV2.ID.make("conversation")),
+          ],
+        })
+
+        expect(bootstrap.state.written).toBeUndefined()
+        expect(bootstrap.state.modelCalls).toBe(0)
+      }),
+    { git: true },
+  )
+
+  bootstrap.it.instance(
+    "serializes a first-turn fallback behind an overlapping startup attempt",
+    () =>
+      Effect.gen(function* () {
+        bootstrap.reset()
+        bootstrap.state.available = new Set(["test/conversation"])
+        bootstrap.state.smallModel = undefined
+        bootstrap.state.compactionModel = undefined
+        bootstrap.state.defaultModel = undefined
+        const started = yield* Deferred.make<void>()
+        const release = yield* Deferred.make<void>()
+        bootstrap.state.defaultModelHook = Effect.gen(function* () {
+          yield* Deferred.succeed(started, undefined)
+          yield* Deferred.await(release)
+        })
+        const memory = yield* Memory.Service
+        const sessionID = SessionID.make("ses_memory_overlapping_bootstrap")
+
+        const startup = yield* memory.init().pipe(Effect.forkChild)
+        yield* Deferred.await(started)
+        const preparation = yield* memory
+          .prepare({
+            sessionID,
+            messages: [
+              user(MessageID.ascending(), sessionID, "并发启动后的首轮", false, ModelV2.ID.make("conversation")),
+            ],
+          })
+          .pipe(Effect.forkChild)
+        yield* Effect.yieldNow
+        yield* Deferred.succeed(release, undefined)
+        yield* Fiber.join(startup)
+        yield* Fiber.join(preparation)
+
+        expect(bootstrap.state.written?.model).toBe("test/conversation")
+        expect(bootstrap.state.modelCalls).toBe(0)
+      }),
+    { git: true },
+  )
+})
+
 describe("memory enablement", () => {
   unavailableModelIt.instance(
     "reselects an available model for startup and the only enable command",
@@ -1242,9 +1621,14 @@ function assistant(
   }
 }
 
-function user(id: MessageID, sessionID: SessionID, text: string, synthetic = false): SessionV1.WithParts {
+function user(
+  id: MessageID,
+  sessionID: SessionID,
+  text: string,
+  synthetic = false,
+  modelID = ModelV2.ID.make("test-model"),
+): SessionV1.WithParts {
   const providerID = ProviderV2.ID.make("test")
-  const modelID = ModelV2.ID.make("test-model")
   return {
     info: {
       id,
