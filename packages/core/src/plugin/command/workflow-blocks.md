@@ -53,19 +53,26 @@ or existing durable node IDs during **extend** and replan.
 - `explore`: read-only repository mapping and evidence collection.
 - `plan`: implementation-ready decomposition, seams, checks, and risks.
 - `prototype`: the smallest throwaway experiment that resolves a runnable
-  uncertainty; it does not silently become production code.
+  uncertainty; it does not silently become production code. It still publishes
+  its changed-file list and fingerprint so later verification or review cannot
+  bind to stale experiment evidence.
 - `debug`: expands to reproduce/evidence followed by root-cause diagnosis.
 - `coding`: bounded production implementation plus focused tests and checks.
 - `verify`: deterministic acceptance checks with explicit PASS/FAIL evidence.
-- `review`: expands to independent standards and intent reviews, then one
-  structured arbiter returning `ACCEPT | REVISE | REJECT | BLOCKED`.
+- `review`: design/content inputs expand to independent standards and intent
+  reviews plus a general arbiter. An implementation input must follow a
+  `coding → verify(PASS) → review` route; the compiler binds the implementation
+  fingerprint through both reviews into an `ACCEPT | REJECT` decision.
 - `synthesize`: resolves dependency outputs into the parent-facing result.
 
-Every compiled block is required by default. `review` and `synthesize` report
-to the parent by default; other blocks stay quiet. A block immediately after a
-review gate is conditioned on `ACCEPT`. Because the condition language handles
-one verdict reference, fan multiple review lanes into one review block before
-continuing.
+Judgment and acceptance gates (`plan`, debug diagnosis, `verify`, review
+decision, and `synthesize`) are required by default. Volume lanes (`explore`,
+`prototype`, `coding`, debug evidence, and independent review lanes) are
+optional by default; an explicit `required` value on a block overrides its
+default. `review` and `synthesize` report to the parent by default; other blocks
+stay quiet. A block immediately after a review gate is conditioned on its
+accepted verdict. Because the condition language handles one verdict reference,
+fan multiple review lanes into one review block before continuing.
 
 ## Composition routes
 
@@ -73,8 +80,8 @@ Choose only blocks justified by current evidence:
 
 - Product or architecture decision: parallel `explore` lanes → `plan` options
   → `review` or `synthesize`.
-- Project feature: optional `explore` → `plan` → parallel `coding` packages →
-  `verify` → `review`.
+- Project feature: optional parallel `explore` or proposal lanes → `plan` →
+  ordered `coding`/assembly → `verify` → `review`.
 - Hard bug: `debug` → `coding` → `verify` → `review`.
 - Runnable design uncertainty: `prototype` → `plan`; keep the prototype
   disposable unless the confirmed scope explicitly promotes it.
@@ -82,9 +89,11 @@ Choose only blocks justified by current evidence:
   separate verification block first when test evidence is required.
 
 Do not add a phase merely because it exists. Skip exploration when repository
-facts are already known, skip a prototype when ordinary inspection resolves
-the question, and keep independent work parallel. Use `synthesize` only when
-multiple outputs need reconciliation.
+facts are already known and skip a prototype when ordinary inspection resolves
+the question. All block workers share one workspace: the compiler serializes
+otherwise-unordered `coding` and `prototype` writers, while read-only discovery
+and proposal lanes remain parallel. Use `synthesize` only when multiple outputs
+need reconciliation.
 
 ## Parent decision checkpoint
 

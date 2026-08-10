@@ -1,6 +1,6 @@
-import * as Tool from "./tool"
+import { Tool } from "./tool"
 import { CommandPlugin } from "@opencode-ai/core/plugin/command"
-import { Effect, Schema } from "effect"
+import { Effect, Option, Schema } from "effect"
 import { Dag } from "@/dag/dag"
 import { DagConfig } from "@/dag/config"
 import { DagWorkflows } from "@/dag/workflows"
@@ -19,6 +19,20 @@ import path from "node:path"
 
 const id = "workflow"
 const MAX_WORKFLOW_SPEC_BYTES = 1_000_000
+const DEFAULT_RESULT_PAGE_CHARS = 8_000
+const MAX_RESULT_PAGE_CHARS = 12_000
+
+class ResultCursor extends Schema.Class<ResultCursor>("WorkflowResultCursor")({
+  version: Schema.Literal(1),
+  workflow_id: Dag.ID,
+  node_id: Dag.NodeID,
+  offset: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+}) {}
+
+const ResultCursorJSON = Schema.fromJsonString(ResultCursor)
+const ResultCursorToken = Schema.String.pipe(Schema.brand("WorkflowResultCursorToken"))
+type ResultCursorToken = typeof ResultCursorToken.Type
+const decodeResultCursor = Schema.decodeUnknownOption(ResultCursorJSON)
 
 // ============================================================================
 // Action schemas remain the single validation authority for file and inline input.
@@ -133,9 +147,9 @@ const decodeExtendSpec = Schema.decodeUnknownEffect(ExtendSpec)
 const decodeReplanSpec = Schema.decodeUnknownEffect(ReplanSpec)
 
 export const Parameters = Schema.Struct({
-  action: Schema.Literals(["start", "extend", "control", "status", "list", "read", "guide"]).annotate({
+  action: Schema.Literals(["start", "extend", "control", "status", "result", "list", "read", "guide"]).annotate({
     description:
-      "start: create workflow; extend: add nodes or blocks; control: pause/resume/cancel/replan/step/complete; status: inspect durable state; list: show saved specs; read: inspect one saved spec before retargeting it; guide: load detailed guidance only when needed",
+      "start: create workflow; extend: add nodes or blocks; control: pause/resume/cancel/replan/step/complete; status: inspect durable state; result: read one durable node output in bounded pages; list: show saved specs; read: inspect one saved spec before retargeting it; guide: load detailed guidance only when needed",
   }),
   topic: Schema.optional(Schema.Literals(["blocks", "interface", "policy", "patterns"])).annotate({
     description:
@@ -155,7 +169,16 @@ export const Parameters = Schema.Struct({
   project_id: Schema.optional(Schema.String).annotate({
     description: "(start) Optional Project ID; must match the parent session project",
   }),
-  workflow_id: Schema.optional(Schema.String).annotate({ description: "(extend/control/status) Target workflow ID" }),
+  workflow_id: Schema.optional(Dag.ID).annotate({
+    description: "(extend/control/status/result) Target workflow ID",
+  }),
+  node_id: Schema.optional(Dag.NodeID).annotate({ description: "(result) Target durable node ID" }),
+  cursor: Schema.optional(ResultCursorToken).annotate({
+    description: "(result) Opaque continuation cursor returned by the previous page",
+  }),
+  limit: Schema.optional(Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: MAX_RESULT_PAGE_CHARS }))).annotate({
+    description: `(result) Maximum page characters; defaults to ${DEFAULT_RESULT_PAGE_CHARS}, max ${MAX_RESULT_PAGE_CHARS}`,
+  }),
   operation: Schema.optional(Schema.Literals(["pause", "resume", "cancel", "replan", "step", "complete"])).annotate({
     description: "(control) Operation to perform",
   }),
@@ -165,7 +188,16 @@ export const Parameters = Schema.Struct({
 // Tool definition
 // ============================================================================
 
-type Metadata = { workflowId?: string; added?: string[]; cancel?: string[]; restart?: string[]; replace?: string[] }
+type Metadata = {
+  workflowId?: Dag.ID
+  nodeId?: Dag.NodeID
+  truncated?: boolean
+  nextCursor?: ResultCursorToken
+  added?: string[]
+  cancel?: string[]
+  restart?: string[]
+  replace?: string[]
+}
 
 export const WorkflowTool = Tool.define<
   typeof Parameters,
@@ -180,7 +212,7 @@ export const WorkflowTool = Tool.define<
     const question = yield* Question.Service
 
     const requireOwnedWorkflow = Effect.fn("WorkflowTool.requireOwnedWorkflow")(function* (
-      workflowID: string,
+      workflowID: Dag.ID,
       sessionID: string,
     ) {
       const workflow = yield* dag.store.getWorkflow(workflowID).pipe(Effect.orDie)
@@ -201,6 +233,17 @@ export const WorkflowTool = Tool.define<
               new Error("Workflow orchestration is available only to the main conversation, not child agents"),
             )
           }
+          yield* ctx.ask({
+            permission: id,
+            patterns: [params.action],
+            always: ["*"],
+            metadata: {
+              action: params.action,
+              ...(params.workflow_id ? { workflow_id: params.workflow_id } : {}),
+              ...(params.node_id ? { node_id: params.node_id } : {}),
+              ...(params.operation ? { operation: params.operation } : {}),
+            },
+          })
           switch (params.action) {
             case "guide": {
               if (!params.topic) {
@@ -319,6 +362,80 @@ export const WorkflowTool = Tool.define<
                   2,
                 ),
                 metadata: { workflowId: workflow.id } as Metadata,
+              }
+            }
+            case "result": {
+              if (!params.workflow_id || !params.node_id) {
+                return yield* Effect.die(new Error("result requires 'workflow_id' and 'node_id'"))
+              }
+              yield* requireOwnedWorkflow(params.workflow_id, ctx.sessionID)
+              const node = yield* dag.store.getNode(params.workflow_id, params.node_id).pipe(Effect.orDie)
+              if (!node) {
+                return yield* Effect.die(new Error(`Workflow node not found: ${params.workflow_id}/${params.node_id}`))
+              }
+              const cursor = params.cursor
+                ? decodeResultCursor(Buffer.from(params.cursor, "base64url").toString())
+                : Option.some(
+                    new ResultCursor({
+                      version: 1 as const,
+                      workflow_id: params.workflow_id,
+                      node_id: params.node_id,
+                      offset: 0,
+                    }),
+                  )
+              if (
+                Option.isNone(cursor) ||
+                cursor.value.workflow_id !== params.workflow_id ||
+                cursor.value.node_id !== params.node_id
+              ) {
+                return yield* Effect.die(new Error("Invalid or mismatched workflow result cursor"))
+              }
+              const durableResult = node.output ?? node.errorReason
+              const content =
+                typeof durableResult === "string"
+                  ? durableResult
+                  : durableResult == null
+                    ? ""
+                    : JSON.stringify(durableResult, null, 2)
+              if (cursor.value.offset > content.length) {
+                return yield* Effect.die(new Error("Workflow result cursor is beyond the current output"))
+              }
+              const pageEnd = resultPageEnd(content, cursor.value.offset, params.limit ?? DEFAULT_RESULT_PAGE_CHARS)
+              const truncated = pageEnd < content.length
+              const nextCursor = truncated
+                ? ResultCursorToken.make(
+                    Buffer.from(
+                      JSON.stringify(
+                        new ResultCursor({
+                          version: 1,
+                          workflow_id: params.workflow_id,
+                          node_id: params.node_id,
+                          offset: pageEnd,
+                        }),
+                      ),
+                    ).toString("base64url"),
+                  )
+                : null
+              return {
+                title: `Workflow result: ${node.name}`,
+                output: JSON.stringify(
+                  {
+                    workflow_id: params.workflow_id,
+                    node_id: params.node_id,
+                    status: node.status,
+                    content: content.slice(cursor.value.offset, pageEnd),
+                    truncated,
+                    next_cursor: nextCursor,
+                  },
+                  null,
+                  2,
+                ),
+                metadata: {
+                  workflowId: params.workflow_id,
+                  nodeId: params.node_id,
+                  truncated,
+                  ...(nextCursor ? { nextCursor } : {}),
+                } as Metadata,
               }
             }
             case "start": {
@@ -508,6 +625,18 @@ export const WorkflowTool = Tool.define<
     } satisfies Tool.DefWithoutID<typeof Parameters, Metadata>
   }),
 )
+
+function resultPageEnd(content: string, offset: number, limit: number) {
+  const end = Math.min(content.length, offset + limit)
+  if (end >= content.length) return end
+  const splitsSurrogatePair =
+    content.charCodeAt(end - 1) >= 0xd800 &&
+    content.charCodeAt(end - 1) <= 0xdbff &&
+    content.charCodeAt(end) >= 0xdc00 &&
+    content.charCodeAt(end) <= 0xdfff
+  if (!splitsSurrogatePair) return end
+  return end - offset === 1 ? end + 1 : end - 1
+}
 
 type WorkflowGraphInput = Schema.Schema.Type<typeof WorkflowGraphSchema>
 type NodeSource = Pick<WorkflowGraphInput, "objective" | "blocks" | "nodes">

@@ -564,7 +564,15 @@ then call `{ action: "extend", workflow_id: "dag_...", spec: { nodes: [...] } }`
 
 **status** — Read the durable state of one workflow and all of its nodes. Pass `workflow_id`. Use it when the user explicitly asks for current state or once before a decision that requires fresh state, such as replan/control. Do not poll a running workflow merely to wait: node reports and terminal outcomes wake the parent session automatically.
 
+**result** — Read one node's complete durable output in bounded pages. Pass
+`workflow_id` and `node_id`; when the response is truncated, pass its
+`next_cursor` unchanged until no cursor remains. Wake messages contain only a
+bounded preview plus the exact workflow/node reference, so use `result` before
+verifying or synthesizing any output marked `truncated=true`. Never infer the
+omitted content from its preview.
+
 **control** — Control a running workflow:
+
 - `pause` — let running nodes finish, don't spawn new ones (pause does NOT stop nodes that are already running). On a cancel/replan intent, always pause FIRST: it needs no fragment and freezes scheduling while you compose the replan, so the graph cannot terminalize under you.
 - `resume` — resume scheduling
 - `cancel` — cancel the entire workflow

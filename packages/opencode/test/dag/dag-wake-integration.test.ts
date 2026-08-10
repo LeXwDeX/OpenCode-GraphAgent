@@ -500,6 +500,60 @@ describe("DagLoop atomic wake integration", () => {
     )
   })
 
+  it("keeps long wake output bounded and identifies the durable result target", async () => {
+    await Effect.runPromise(
+      runWakeTest(({ dag, childPrompts, parentPrompts }) =>
+        Effect.gen(function* () {
+          const dagID = yield* dag.create({
+            projectID: "project-1",
+            sessionID: "ses_parent",
+            title: "Long result retrieval",
+            config: { name: "long-result-retrieval", nodes: [node("long-report")] },
+          })
+
+          const report = yield* takeWithin(childPrompts, "long-report did not start")
+          yield* Deferred.succeed(report.release, `${"a".repeat(1_500)}WAKE_SENTINEL`)
+          const parent = yield* takeWithin(parentPrompts, "long report did not wake the parent")
+          const wake = promptText(parent.input)
+
+          expect(wake).toContain(`workflow_id="${dagID}"`)
+          expect(wake).toContain('node_id="long-report"')
+          expect(wake).toContain("truncated=true")
+          expect(wake).toContain("workflow result")
+          expect(wake).not.toContain("WAKE_SENTINEL")
+          expect(wake.length).toBeLessThan(1_500)
+          yield* Deferred.succeed(parent.release, "success")
+        }),
+      ),
+    )
+  })
+
+  it("marks a short wake preview as complete", async () => {
+    await Effect.runPromise(
+      runWakeTest(({ dag, childPrompts, parentPrompts }) =>
+        Effect.gen(function* () {
+          const dagID = yield* dag.create({
+            projectID: "project-1",
+            sessionID: "ses_parent",
+            title: "Short result retrieval",
+            config: { name: "short-result-retrieval", nodes: [node("short-report")] },
+          })
+
+          const report = yield* takeWithin(childPrompts, "short-report did not start")
+          yield* Deferred.succeed(report.release, "complete short output")
+          const parent = yield* takeWithin(parentPrompts, "short report did not wake the parent")
+          const wake = promptText(parent.input)
+
+          expect(wake).toContain(`workflow_id="${dagID}"`)
+          expect(wake).toContain('node_id="short-report"')
+          expect(wake).toContain("truncated=false")
+          expect(wake).toContain("complete short output")
+          yield* Deferred.succeed(parent.release, "success")
+        }),
+      ),
+    )
+  })
+
   integration.live("runs an additive wave after a terminal checkpoint wake", () =>
     runWakeTest(({ dag, store, childPrompts, parentPrompts }) =>
       Effect.gen(function* () {
@@ -1175,17 +1229,18 @@ describe("DagLoop atomic wake integration", () => {
     )
   })
 
-  it("fails a recovered deep workflow when verification skips every diff review", async () => {
+  it.each(["deep", "standard"] as const)("fails a recovered %s workflow when verification skips every diff review", async (mode) => {
     await Effect.runPromise(
       runWakeTest(
         ({ store, parentPrompts }) =>
           Effect.gen(function* () {
             const workflow = yield* pollWithTimeout(
               store.getWorkflow("dag_recovered_review_rejection").pipe(
-                Effect.map((row) => row?.status === "failed" ? row : undefined),
+                Effect.map((row) => row && ["completed", "failed"].includes(row.status) ? row : undefined),
               ),
-              "recovered workflow without an accepted review did not fail",
+              "recovered workflow without an accepted review did not settle",
             )
+            expect(workflow.status).toBe("failed")
             expect((yield* store.getNode(workflow.id, "review-diff"))?.status).toBe("skipped")
             expect((yield* store.getNode(workflow.id, "final-audit"))?.status).toBe("skipped")
 
@@ -1256,7 +1311,7 @@ describe("DagLoop atomic wake integration", () => {
                 status: "running",
                 config: JSON.stringify({
                   name: "dag_recovered_review_rejection",
-                  mode: "deep",
+                  mode,
                   nodes,
                 }),
                 seq: 10,
