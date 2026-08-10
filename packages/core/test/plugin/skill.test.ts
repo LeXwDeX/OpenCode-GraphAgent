@@ -54,8 +54,29 @@ describe("SkillPlugin.Plugin", () => {
         expect.objectContaining({
           name: "create-dag-workflow",
           description: expect.stringContaining("reusable DAG workflow"),
+          content: expect.stringContaining("Never declare both `blocks` and `nodes`"),
         }),
       )
+    }),
+  )
+
+  it.effect("registers the proactive orchestration router as a lazy built-in skill", () =>
+    Effect.gen(function* () {
+      const skill = yield* SkillV2.Service
+      yield* SkillPlugin.Plugin.effect(host({ skill: { ...skill, reload: skill.reload } }))
+
+      expect(yield* skill.list()).toContainEqual(
+        expect.objectContaining({
+          name: "orchestration-router",
+          description: expect.stringContaining("without waiting for /dag-flow"),
+          content: expect.stringContaining("one combined confirmation"),
+        }),
+      )
+      const router = (yield* skill.list()).find((item) => item.name === "orchestration-router")
+      expect(router?.description).toContain("even one project file")
+      expect(router?.description).toContain("isolated utility scripts")
+      expect(router?.content).toContain('workflow(action="read"')
+      expect(router?.content).toContain("retarget the objective")
     }),
   )
 

@@ -61,13 +61,15 @@ Choose the smallest child execution mode that can safely complete the request:
 
 1. Use direct execution only for conversation, trivial state inspection,
    workflow control, final synthesis, or an explicit user opt-out.
-2. Use one `task` subagent for one independent non-trivial leaf assignment when
-   no graph-level coordination is needed. The parent launches it once, consumes
-   its result, and does not duplicate the leaf work.
-3. Use one live `workflow` DAG when one user objective contains staged
-   dependencies, two or more related workstreams, a quality gate, unknown-size
-   discovery, adaptive repair, or an explicit multi-role or multi-model
-   requirement.
+2. Use one `task` subagent for one independent non-trivial leaf assignment
+   outside a project-level source or test change when no graph-level
+   coordination is needed. The parent launches it once, consumes its result,
+   and does not duplicate the leaf work.
+3. Use one live `workflow` DAG for project-level source or test changes, even
+   when only one project file is expected, and whenever one user objective
+   contains staged dependencies, two or more related workstreams, a quality
+   gate, unknown-size discovery, adaptive repair, or an explicit multi-role or
+   multi-model requirement.
 
 "Smallest" is measured against the Depth Ladder: a mode or graph that cannot
 deliver the ladder's hard minimum for the target size is not safe, merely
@@ -99,7 +101,8 @@ graph. You MUST NOT create an admission child node, QA workflow, separate
 persona, or privileged command. `GRILL-ME` selects `GRILL`; equivalent explicit
 requests for adversarial qualification do the same.
 
-Cover these six dimensions, asking only material unresolved questions:
+Cover these six dimensions, resolving repository-discoverable facts before
+asking the user:
 
 1. goal;
 2. scope;
@@ -108,15 +111,23 @@ Cover these six dimensions, asking only material unresolved questions:
 5. evidence and review;
 6. risks and failure modes.
 
-Use one adaptive policy with bounded modes:
+Use one parent-owned recommendation and confirmation interaction. Fill every
+material open decision with a recommended answer based on available evidence,
+show alternatives only when they change the result, then ask the user for one
+combined confirmation. Do not drip questions across several turns. A user
+correction creates a revised brief and one replacement confirmation; unchanged
+facts are not asked again.
 
-- `LIGHT`: at most 1 question round for a nearly complete brief.
-- `STANDARD`: at most 3 question rounds and the default for deep admission.
-- `GRILL`: at most 5 question rounds, probing contradictions, hidden
-  assumptions, evidence quality, failure modes, and falsifiers.
+The modes control challenge depth, not the number of user question rounds:
 
-Stop early as soon as the brief is ready. Exhausting a budget with unresolved
-blockers yields `NOT_READY`; it never silently yields `READY`.
+- `LIGHT`: validate a nearly complete brief and expose only blockers.
+- `STANDARD`: test scope, acceptance evidence, dependencies, and material
+  delivery risks.
+- `GRILL`: additionally probe contradictions, hidden assumptions, evidence
+  quality, failure modes, and falsifiers, while still recommending an answer
+  for every surfaced choice.
+
+Unresolved blockers yield `NOT_READY`; they never silently yield `READY`.
 
 Maintain a versioned Requirement Brief with this structure:
 
@@ -138,7 +149,8 @@ Maintain a versioned Requirement Brief with this structure:
 }
 ```
 
-Before start, show a concise brief summary and verdict:
+Before start, proactively show the recommended answers, a concise brief
+summary, and verdict:
 `READY | NOT_READY | WAIVED`, plus QA mode, brief revision, and remaining
 blockers. `READY` requires a non-empty goal, scope boundaries,
 acceptance criteria, evidence obligations, review plan, and no blocking
