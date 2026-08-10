@@ -45,6 +45,8 @@ export interface Entry {
   readonly title?: string
   /** Node count, for a one-glance sense of the graph's size. */
   readonly nodes?: number
+  /** Block count when the saved spec uses the high-level interface. */
+  readonly blocks?: number
 }
 
 /** Builtin templates compiled into the binary from opencode-dag-config. */
@@ -147,15 +149,17 @@ function scopes(projectDir: string) {
 }
 
 /** Best-effort listing metadata from a file-backed spec. */
-async function describe(file: string): Promise<{ title?: string; nodes?: number }> {
-  const text = await Bun.file(file).text().catch(() => undefined)
+async function describe(file: string): Promise<{ title?: string; nodes?: number; blocks?: number }> {
+  const text = await Bun.file(file)
+    .text()
+    .catch(() => undefined)
   return text === undefined ? {} : parseMeta(text)
 }
 
 /** Parse title/node metadata from spec content (shared with builtin entries).
  * A malformed spec still lists — hiding it would make a typo look like a
  * missing file; the start path reports the real parse error. */
-async function parseMeta(text: string): Promise<{ title?: string; nodes?: number }> {
+async function parseMeta(text: string): Promise<{ title?: string; nodes?: number; blocks?: number }> {
   const parsed = await Promise.resolve(text)
     .then((value) => Bun.YAML.parse(value))
     .catch(() => undefined)
@@ -163,5 +167,10 @@ async function parseMeta(text: string): Promise<{ title?: string; nodes?: number
   const config = isRecord(parsed["config"]) ? parsed["config"] : undefined
   const title = typeof parsed["title"] === "string" ? parsed["title"] : undefined
   const nodes = config && Array.isArray(config["nodes"]) ? config["nodes"].length : undefined
-  return { ...(title ? { title } : {}), ...(nodes === undefined ? {} : { nodes }) }
+  const blocks = config && Array.isArray(config["blocks"]) ? config["blocks"].length : undefined
+  return {
+    ...(title ? { title } : {}),
+    ...(nodes === undefined ? {} : { nodes }),
+    ...(blocks === undefined ? {} : { blocks }),
+  }
 }

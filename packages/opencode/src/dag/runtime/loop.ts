@@ -1134,11 +1134,17 @@ export const layer = Layer.effect(
                   if (node.status === "running" && node.escalationPending) {
                     return `[DAG Node Timeout] RUNNING node "${node.name}" exceeded its execution deadline (timeout escalation ${node.timeoutExtensions}) and is still executing. Adjudicate by replanning with a NEW worker_config.timeout_ms to extend the node — that grants more execution time, but the cumulative extension count is NOT reset (only a new attempt resets it), and the node is force-cancelled once the cap is reached — or cancel/replan the node. Queued nodes are not extended: their admission deadline was fixed at permit acquisition and is not adjusted by extensions.`
                   }
-                  const output = typeof node.output === "string"
-                    ? node.output.slice(0, 500)
-                    : node.errorReason ?? (node.output == null ? "(no output)" : JSON.stringify(node.output).slice(0, 500))
+                  const durableResult =
+                    typeof node.output === "string"
+                      ? node.output
+                      : (node.errorReason ?? (node.output == null ? "(no output)" : JSON.stringify(node.output)))
+                  const truncated = durableResult.length > 500
+                  const output = durableResult.slice(0, 500)
                   const failureClass = node.status === "failed" && node.errorClass ? ` (${node.errorClass})` : ""
-                  return `[DAG Node Result] Node "${node.name}" ${node.status}${failureClass}: ${output}`
+                  const retrieval = truncated
+                    ? `\nComplete output: call workflow result with workflow_id="${node.workflowId}" and node_id="${node.id}".`
+                    : ""
+                  return `[DAG Node Result] Node "${node.name}" ${node.status}${failureClass}: ${output}\n[DAG Result Reference] workflow_id="${node.workflowId}" node_id="${node.id}" truncated=${truncated}${retrieval}`
                 }),
                 ...batch.workflows.map((workflow) => {
                   const failures = failuresByWorkflow.get(workflow.id)

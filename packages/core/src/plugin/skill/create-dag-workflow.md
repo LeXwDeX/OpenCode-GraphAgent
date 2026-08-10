@@ -8,9 +8,9 @@
 
 A saved workflow is a YAML spec that lives on disk under a name, so a recurring
 multi-agent procedure can be started with one call instead of being redesigned
-every time. This skill covers authoring one. The `workflow` tool's own
-documentation covers graph semantics — read it for node fields, collaboration
-patterns, and replanning.
+every time. This skill covers authoring one. Load
+`workflow(action: "guide", topic: "blocks")` for the high-level interface or
+`topic: "interface"` for low-level node fields and replanning.
 
 ## Where the file goes
 
@@ -35,9 +35,9 @@ gets reused, so a wrong assumption gets repeated:
 
 1. **The trigger.** What does the user say to run this? That phrasing should be recognizable in the workflow's `title`.
 2. **The phases.** Which steps genuinely depend on an earlier step's output, and which are independent? Only real data dependencies become `depends_on` edges; everything else runs in parallel.
-3. **The gate.** Is there a point where downstream work must not start until quality is confirmed? That becomes a node with `output_schema` returning a verdict plus a `condition` on its dependents.
-4. **The inputs.** Does the graph need per-run values (a target module, a diff range)? A saved spec is static, so express them as static `prompt_template.input` defaults and state in the node prompt that the parent may narrow the target — or keep the node prompt broad enough to work unchanged.
-5. **The finish.** What does a successful run produce, and which node reports it? Give that node `report_to_parent: true`.
+3. **The gate.** Is there a point where downstream work must not start until quality is confirmed? Prefer a `review` block; use low-level nodes for custom verdict branches.
+4. **The inputs.** Does the graph need per-run values? Put the stable purpose in `objective` and retargetable details in block `instruction`; use low-level template inputs only when bindings are necessary.
+5. **The finish.** What does success produce? End with `review` when its verdict is the result, or `synthesize` when several accepted artifacts need a parent-facing report.
 
 ## File shape
 
@@ -47,51 +47,26 @@ config:
   name: code-review
   max_concurrency: 5
   node_defaults:
-    required: false
-    report_to_parent: false
     worker_config:
       timeout_ms: 600000
-  nodes:
-    - id: explore
-      name: explore
-      worker_type: explore
-      depends_on: []
-      required: true
-      prompt_template:
-        id: code-explore
-        input:
-          target: "the packages changed in the working tree"
-
-    - id: review-logic
-      name: review-logic
-      worker_type: general
-      depends_on: [explore]
-      prompt_template: { id: review-logic }
-
-    - id: review-arch
-      name: review-arch
-      worker_type: general
-      depends_on: [explore]
-      prompt_template: { id: review-arch }
-
-    - id: arbitrate
-      name: arbitrate
-      worker_type: general
-      depends_on: [review-logic, review-arch]
-      required: true
-      report_to_parent: true
-      output_schema:
-        type: object
-        required: [verdict, summary, findings]
-        properties:
-          verdict:
-            type: string
-            enum: [ACCEPT, REVISE, REJECT, BLOCKED]
-          summary: { type: string }
-          findings: { type: array }
-      prompt_template:
-        inline: "Two reviewers produced findings. Submit one deduplicated verdict with evidence-backed findings."
+  objective: Review the working-tree change against repository standards and confirmed intent.
+  blocks:
+    - id: survey
+      kind: explore
+      instruction: Inspect the complete diff, affected modules, and repository instructions.
+    - id: checks
+      kind: verify
+      depends_on: [survey]
+      instruction: Run the documented gates from the affected package directories.
+    - id: decision
+      kind: review
+      depends_on: [survey, checks]
 ```
+
+Use blocks for the common explore/plan/prototype/debug/coding/verify/review/
+synthesize routes. Drop to `nodes` only for custom bindings, multiple verdict
+branches, specialized output schemas, restart/cancel fragments, or deep diff
+review metadata. Never declare both `blocks` and `nodes` in one graph.
 
 `title` and `config` sit at the file root. A deep workflow adds `mode: deep`
 and an `admission` block at the same level — but admission answers are
@@ -111,7 +86,7 @@ admission Q&A and write a one-off deep spec when depth is needed.
 
 A spec is only proven by a real start. After writing the file:
 
-1. `workflow(action: "list")` — confirm the name resolves and the reported node count matches the file. A file missing from the listing is in the wrong directory or has the wrong extension (`.yaml`/`.yml` only).
+1. `workflow(action: "list")` — confirm the name resolves and the reported block/node count matches the file. A file missing from the listing is in the wrong directory or has the wrong extension (`.yaml`/`.yml` only).
 2. `workflow(action: "start", spec_path: "<name>")` on a small, real target. Schema and graph validation happen here: an invalid spec fails the start with the offending field, and no workflow is created.
 3. Read the wake report when it arrives. A graph that "succeeded" while its fan-in node produced an empty synthesis is not working — check that the reporting node's output actually contains the comparison or decision the procedure exists to produce.
 

@@ -97,23 +97,23 @@ describe("legacy command registry", () => {
       const expanded = SessionPrompt.expandCommandTemplate(CommandPlugin.DagFlowContent, "Run two parallel workers")
 
       expect(expanded).toContain("Do not poll")
-      expect(expanded).toContain("End the current response")
+      expect(expanded).toContain("and end the response")
     }),
   )
 
-  it.effect("requires profile-aware compilation without dropping task constraints", () =>
+  it.effect("requires router-driven compilation without dropping task constraints", () =>
     Effect.sync(() => {
       const expanded = SessionPrompt.expandCommandTemplate(
         CommandPlugin.DagFlowContent,
         "Use @security-reviewer to review this project. Do not modify files.",
       )
 
-      expect(expanded).toContain("classify the task as `brainstorm`, `review`, or `develop`")
-      expect(expanded).toContain("preserve every user constraint")
-      expect(expanded).toContain("eligible configured worker types")
-      expect(expanded).toContain("Do not invent a missing role or model")
-      expect(expanded).toContain("actual error")
-      expect(expanded).toContain("must actually contain the requested synthesis")
+      expect(expanded).toContain("orchestration-router")
+      expect(expanded).toMatch(/Preserve\s+the task, user constraints/)
+      expect(expanded).toContain("worker types or model IDs")
+      expect(expanded).toContain("configured capability or model")
+      expect(expanded).toContain("real error")
+      expect(expanded).toContain("final synthesis block must contain the requested result")
     }),
   )
 
@@ -123,7 +123,7 @@ describe("legacy command registry", () => {
 
       expect(expanded).toContain("<dag-flow-task>\n   \n</dag-flow-task>")
       expect(expanded).toContain("empty or contains only whitespace")
-      expect(expanded).toContain("Do not call the `workflow` tool")
+      expect(expanded).toContain("do not start a workflow")
     }),
   )
 })

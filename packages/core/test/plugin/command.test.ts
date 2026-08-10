@@ -49,21 +49,40 @@ describe("CommandPlugin.Plugin", () => {
         template: CommandPlugin.DagFlowContent,
       })
       expect(CommandPlugin.DagFlowContent).toContain("$ARGUMENTS")
-      expect(CommandPlugin.DagFlowContent).toContain("workflow` tool with `action=start")
+      expect(CommandPlugin.DagFlowContent).toContain('workflow(action="start")')
       expect(CommandPlugin.DagFlowContent).toContain("exact Workflow ID")
       expect(CommandPlugin.DagFlowContent).toContain("run `/dag`")
+      expect(CommandPlugin.DagFlowContent).toContain("orchestration-router")
+      expect(CommandPlugin.DagFlowContent).toContain("one combined confirmation")
     }),
   )
 
   it.effect("documents the smallest child execution mode", () =>
     Effect.sync(() => {
       expect(CommandPlugin.WorkflowContent).toContain("## Execution Mode Selection")
-      expect(CommandPlugin.WorkflowContent).toContain("Use direct execution only")
+      expect(CommandPlugin.WorkflowContent).toContain("Use direct execution for")
       expect(CommandPlugin.WorkflowContent).toContain("one `task` subagent")
-      expect(CommandPlugin.WorkflowContent).toContain("Related flows for one user objective")
+      expect(CommandPlugin.WorkflowContent).toContain("Related work for one objective")
+      expect(CommandPlugin.WorkflowFactsContent).toContain("project-level source or test changes")
+      expect(CommandPlugin.WorkflowFactsContent).toMatch(/even when only\s+one project file/)
       expect(CommandPlugin.WorkflowFactsContent).not.toContain("when ANY")
       expect(CommandPlugin.WorkflowFactsContent).not.toContain("- **Multi-model**:")
-      expect(CommandPlugin.DagFlowContent).toContain("workflow` tool with `action=start")
+      expect(CommandPlugin.DagFlowContent).toContain('workflow(action="start")')
+    }),
+  )
+
+  it.effect("keeps always-on guidance small and loads detailed topics progressively", () =>
+    Effect.sync(() => {
+      expect(CommandPlugin.WorkflowContent.length).toBeLessThan(5_000)
+      expect(CommandPlugin.WorkflowContent).toContain("project-level source or test changes")
+      expect(CommandPlugin.WorkflowContent).toContain("only one project file")
+      expect(CommandPlugin.WorkflowContent).toContain("isolated utility scripts")
+      expect(CommandPlugin.WorkflowContent).toContain("orchestration-router")
+      expect(CommandPlugin.WorkflowContent).toContain("**guide**")
+      expect(CommandPlugin.WorkflowContent).not.toContain("# Orchestration Domains")
+      expect(CommandPlugin.WorkflowBlocksContent).toContain("# Composable Workflow Blocks")
+      expect(CommandPlugin.WorkflowBlocksContent).toContain("combined confirmation")
+      expect(CommandPlugin.WorkflowFactsContent.length).toBeGreaterThan(CommandPlugin.WorkflowContent.length)
     }),
   )
 
@@ -73,8 +92,9 @@ describe("CommandPlugin.Plugin", () => {
       expect(CommandPlugin.OrchestrationPolicyContent).toContain("MUST NOT perform executable leaf work")
       expect(CommandPlugin.OrchestrationPolicyContent).toContain("one `task` subagent")
       expect(CommandPlugin.OrchestrationPolicyContent).toContain("one live `workflow` DAG")
+      expect(CommandPlugin.OrchestrationPolicyContent).toContain("outside a project-level source or test change")
       expect(CommandPlugin.OrchestrationPolicyContent).toContain("one user objective")
-      expect(CommandPlugin.DagFlowContent).toContain("one consolidated graph")
+      expect(CommandPlugin.DagFlowContent).toMatch(/one consolidated\s+graph/)
     }),
   )
 
@@ -82,6 +102,9 @@ describe("CommandPlugin.Plugin", () => {
     Effect.sync(() => {
       expect(CommandPlugin.WorkflowFactsContent).toContain("For a one-off graph, pass `spec` inline")
       expect(CommandPlugin.WorkflowFactsContent).toContain("Use `spec_path` only")
+      expect(CommandPlugin.WorkflowContent).toContain("**read**")
+      expect(CommandPlugin.WorkflowFactsContent).toContain('{ action: "read", spec_path: "code-review" }')
+      expect(CommandPlugin.WorkflowFactsContent).toContain("retarget its objective and block instructions")
       expect(CommandPlugin.WorkflowFactsContent).not.toContain("Never inline graph nodes")
       expect(CommandPlugin.WorkflowFactsContent).not.toContain("Before any graph-carrying action")
       expect(CommandPlugin.DagFlowContent).toContain("inline `spec`")
@@ -151,7 +174,9 @@ describe("CommandPlugin.Plugin", () => {
       expect(CommandPlugin.OrchestrationPolicyContent).toContain("unverified_claims")
       expect(CommandPlugin.OrchestrationPolicyContent).toContain("claim-verification wave")
       expect(CommandPlugin.OrchestrationPolicyContent).toContain("MUST NOT be a silent end of the graph")
-      expect(CommandPlugin.OrchestrationDomainsContent).toContain("**Verification wave (mandatory for module scope and larger)**")
+      expect(CommandPlugin.OrchestrationDomainsContent).toContain(
+        "**Verification wave (mandatory for module scope and larger)**",
+      )
       expect(CommandPlugin.OrchestrationDomainsContent).toContain("never the end of the task")
     }),
   )
@@ -201,14 +226,16 @@ describe("CommandPlugin.Plugin", () => {
       expect(CommandPlugin.OrchestrationPolicyContent).toContain("## Replan Protocol (pause-first)")
       expect(CommandPlugin.OrchestrationPolicyContent).toContain("IMMEDIATELY issue `control(pause)`")
       expect(CommandPlugin.OrchestrationPolicyContent).toContain("replan is valid while paused")
-      expect(CommandPlugin.OrchestrationPolicyContent).toContain("Pause does not interrupt nodes that are already running")
+      expect(CommandPlugin.OrchestrationPolicyContent).toContain(
+        "Pause does not interrupt nodes that are already running",
+      )
       expect(CommandPlugin.WorkflowFactsContent).toContain("always pause FIRST")
     }),
   )
 
   it.effect("defines productized orchestration domain playbooks", () =>
     Effect.sync(() => {
-      expect(CommandPlugin.WorkflowContent).toContain("# Orchestration Domains")
+      expect(CommandPlugin.WorkflowContent).not.toContain("# Orchestration Domains")
       expect(CommandPlugin.OrchestrationDomainsContent).toContain("## The Simulated Audit Loop")
       expect(CommandPlugin.OrchestrationDomainsContent).toContain("NOT a cyclic edge and NOT a harness loop")
       expect(CommandPlugin.OrchestrationDomainsContent).toContain("NEW ids (terminal nodes are")
@@ -255,10 +282,7 @@ describe("CommandPlugin.Plugin", () => {
       ]
 
       for (const fixture of fixtures) {
-        expect(
-          CommandPlugin.OrchestrationPolicyContent,
-          fixture.name,
-        ).toContain(fixture.expected)
+        expect(CommandPlugin.OrchestrationPolicyContent, fixture.name).toContain(fixture.expected)
       }
     }),
   )
@@ -289,12 +313,15 @@ describe("CommandPlugin.Plugin", () => {
       expect(CommandPlugin.OrchestrationPolicyContent).toContain('"out": []')
       expect(CommandPlugin.OrchestrationPolicyContent).not.toContain("in_scope")
       expect(CommandPlugin.OrchestrationPolicyContent).not.toContain("out_of_scope")
-      expect(CommandPlugin.OrchestrationPolicyContent).toContain("`LIGHT`: at most 1 question round")
-      expect(CommandPlugin.OrchestrationPolicyContent).toContain("`STANDARD`: at most 3 question rounds")
-      expect(CommandPlugin.OrchestrationPolicyContent).toContain("`GRILL`: at most 5 question rounds")
-      expect(CommandPlugin.OrchestrationPolicyContent).toContain("Stop early as soon as the brief is ready")
+      expect(CommandPlugin.OrchestrationPolicyContent).toContain("combined confirmation")
+      expect(CommandPlugin.OrchestrationPolicyContent).toContain("The modes control challenge depth")
+      expect(CommandPlugin.OrchestrationPolicyContent).toContain("`LIGHT`: validate a nearly complete brief")
+      expect(CommandPlugin.OrchestrationPolicyContent).toContain("`GRILL`: additionally probe contradictions")
+      expect(CommandPlugin.OrchestrationPolicyContent).toContain("recommending an answer")
       expect(CommandPlugin.OrchestrationPolicyContent).toContain("READY | NOT_READY | WAIVED")
-      expect(CommandPlugin.OrchestrationPolicyContent).toContain("continue QA, reduce scope, use `standard`, or explicitly waive")
+      expect(CommandPlugin.OrchestrationPolicyContent).toContain(
+        "continue QA, reduce scope, use `standard`, or explicitly waive",
+      )
       expect(CommandPlugin.OrchestrationPolicyContent).toContain("waiver_reason")
       expect(CommandPlugin.OrchestrationPolicyContent).toContain("acknowledged_risks")
       expect(CommandPlugin.OrchestrationPolicyContent).toContain("Material changes")
@@ -320,12 +347,8 @@ describe("CommandPlugin.Plugin", () => {
       expect(CommandPlugin.OrchestrationPolicyContent).toContain(
         "REJECT → corrected implementation → verification(PASS) → new diff review",
       )
-      expect(CommandPlugin.OrchestrationPolicyContent).toContain(
-        "Synthetic stress-test graphs",
-      )
-      expect(CommandPlugin.OrchestrationPolicyContent).toContain(
-        "MUST NOT claim implementation-diff assurance",
-      )
+      expect(CommandPlugin.OrchestrationPolicyContent).toContain("Synthetic stress-test graphs")
+      expect(CommandPlugin.OrchestrationPolicyContent).toContain("MUST NOT claim implementation-diff assurance")
     }),
   )
 
@@ -346,7 +369,7 @@ describe("CommandPlugin.Plugin", () => {
       }
       expect(CommandPlugin.WorkflowFactsContent).toContain("input_mapping:")
       expect(CommandPlugin.WorkflowFactsContent).toContain("findings: explore")
-      expect(CommandPlugin.WorkflowFactsContent).toContain('condition: \'gate.output.verdict == "ACCEPT"\'')
+      expect(CommandPlugin.WorkflowFactsContent).toContain("condition: 'gate.output.verdict == \"ACCEPT\"'")
       expect(CommandPlugin.WorkflowFactsContent).not.toContain('input: { findings: "from explore" }')
       expect(CommandPlugin.WorkflowFactsContent).not.toContain("Gate failure cancels the workflow automatically")
       expect(CommandPlugin.WorkflowFactsContent).toContain("Static `prompt_template.input`")
@@ -358,11 +381,10 @@ describe("CommandPlugin.Plugin", () => {
         /`dag\.jsonc` tier, then the\s+configured agent model, then the parent-session model/,
       )
       expect(CommandPlugin.WorkflowFactsContent).toContain("Propose-then-assemble")
-      const reviewExample = CommandPlugin.WorkflowFactsContent
-        .slice(
-          CommandPlugin.WorkflowFactsContent.indexOf("### 3. Adversarial Review"),
-          CommandPlugin.WorkflowFactsContent.indexOf("### 4. Diverge-Converge"),
-        )
+      const reviewExample = CommandPlugin.WorkflowFactsContent.slice(
+        CommandPlugin.WorkflowFactsContent.indexOf("### 3. Adversarial Review"),
+        CommandPlugin.WorkflowFactsContent.indexOf("### 4. Diverge-Converge"),
+      )
       expect(reviewExample).toContain("report_to_parent: true")
       expect(reviewExample).toContain("output_schema:")
       expect(reviewExample).toContain("required: [verdict, summary, findings, required_actions, next_action]")
@@ -372,7 +394,7 @@ describe("CommandPlugin.Plugin", () => {
       // continuation node keeps non-ACCEPT verdicts from dead-ending the graph.
       expect(reviewExample).toContain("condition: 'arbitrate.output.verdict != \"ACCEPT\"'")
       expect(CommandPlugin.WorkflowFactsContent).toContain("an early\n`control(complete)` workflow remains terminal")
-      expect(CommandPlugin.DagFlowContent).toContain("must actually contain the requested synthesis")
+      expect(CommandPlugin.DagFlowContent).toContain("must contain the requested result")
     }),
   )
 })

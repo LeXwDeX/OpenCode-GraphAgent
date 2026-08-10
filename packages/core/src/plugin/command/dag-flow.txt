@@ -1,43 +1,41 @@
 # Start a DAG Workflow
 
-The user invoked `/dag-flow` to start a new orchestration task.
-
 <dag-flow-task>
 $ARGUMENTS
 </dag-flow-task>
 
-If the content inside `<dag-flow-task>` is empty or contains only whitespace, ask the user what task should be orchestrated. Do not call the `workflow` tool until the user provides a task.
+If the task is empty or contains only whitespace, ask for it and do not start a workflow. Otherwise load
+the `orchestration-router` skill and route the request through one consolidated
+graph. `/dag-flow` explicitly selects DAG execution, but it does not waive a
+material user decision.
 
-For a non-empty task:
+When the route requires a decision checkpoint or GRILL qualification, inspect
+discoverable facts first, proactively write recommended answers, surface the
+compact brief in the main conversation, and ask for one combined confirmation.
+Do not call `workflow(action="start")` until that confirmation arrives. Do not
+put the checkpoint in a child node. If the request is already bounded and
+confirmed, start without manufacturing another question.
 
-1. Before starting, classify the task as `brainstorm`, `review`, or `develop`, then select the closest reference topology from the workflow library. Saved workflow names resolve through three scopes (first match wins): project `.opencode/workflows/`, global `<opencode config dir>/workflows/` (curated by the `opencode-dag-config` repo), then the builtin templates embedded in release binaries.
-   Run `workflow(action: "list")` to see every template that actually resolves in this environment with its scope, then pick by NAME:
-   - design documents, requirement deep-dives, architecture decisions, or design-level debugging → saved workflow `design-decision-loop`
-   - end-to-end implementation with multiple modules, wiring, tests, and review → saved workflow `parallel-development-loop`
-   - deep review of an already-built module, subsystem, or codebase → saved workflow `deep-review-dag-module`
-   - a small bounded working-tree change review → saved workflow `change-review`
-   - none of the above names resolves (bare dev checkout without the config repo) → compose the smallest fresh graph; do not force an unrelated reference
-2. Treat the selected saved spec as a reviewed topology reference, not as a script to replay blindly. Start a saved workflow by name only when its embedded target and inputs already match the request. Otherwise read the reference, derive one inline `spec`, inject the complete `/dag-flow` task into its root planning/exploration prompt, retarget its lanes, and pass it directly to `workflow(action=start)`. Do not create a transient YAML file.
-3. The derived graph may expand or prune non-protected lanes. Record the selected `reference_template`, every added node, and every prune as `{node, prune_reason, replacement_coverage}` in the first planning/exploration artifact; require the next fresh review gate to audit that manifest. Missing prune evidence is fail-closed.
-4. Preserve the selected reference's protected spine: fresh-context local review, deterministic/evidence verification where applicable, one final arbiter, and PASS-only finalization. Gates return `PASS | LOOP | BLOCKED` with reason, evidence, minimal `loop_scope`, and `stop_reason`. `LOOP` means pause → replan new local correction/review nodes → resume; never create a cycle or restart terminal nodes.
-5. During compilation, preserve every user constraint in the graph, including named `@agent` roles, exact model selections, read-only or "Do not modify files" scope, required checks, forbidden actions, and requested deliverables.
-6. Resolve capability slots against the eligible configured worker types shown in the `workflow` tool description. Do not invent a missing role or model; if a required capability cannot be resolved, do not start and report the gap.
-7. Scale one consolidated graph to the task's blast radius. Related flows for this user objective become nodes and edges under the same workflow ID. A small, well-bounded target gets the smallest useful dependency graph. A large or system-level target (an entire module, subsystem, or codebase) is never satisfied by a single wave of parallel opinions: stage exploration, independent analysis, evidence verification, and synthesis as separate dependent waves. Keep independent viewpoints or work packages parallel and use real fan-in nodes for synthesis, arbitration, integration, and final reporting.
-8. For a large-target review or audit, require every reviewer to cite file:line evidence and to mark claims it could not verify. Insert a verification wave between the reviewers and the arbiter that checks disputed, unverified, and uncovered scope against the actual code, so the arbiter rules on verified findings only.
-9. Call the `workflow` tool with `action=start` and inline `spec` in this response. Use `spec_path` only when the selected saved workflow already matches or persistence was explicitly requested. Merely printing a plan, graph, JSON, or YAML does not mean a workflow was started.
-10. Do not claim the workflow is running unless the tool call succeeds. On success, report the exact Workflow ID and initial state returned by the tool, then tell the user to run `/dag` for live inspection.
-11. The workflow runs asynchronously and wakes this parent session when attention or a terminal result is ready. Do not poll it with `action=status`, sleep, retry, or loop merely to wait. End the current response after the brief success report.
-12. On failure, state that the workflow was not started and report the actual error. Never invent a Workflow ID or start a replacement workflow unless the user explicitly asked for automatic retries.
-13. A completed aggregate node must actually contain the requested synthesis. Never describe unresolved placeholders or an aggregate-node error message as a successful final result.
+Prefer composable blocks for a fresh flow. Load
+`workflow(action="guide", topic="blocks")` only if the block contract is not
+already in context. Use inline `spec` for one-off work; use `spec_path` only
+when a saved workflow already matches or persistence was requested. Preserve
+the task, user constraints, named roles, read-only limits, acceptance checks,
+and confirmed decisions in the objective and block instructions.
 
-## Resume-first: continue an interrupted workflow before restarting
+Call the workflow tool with `action=start` in the first response after the
+route is ready. Printing a plan, JSON, or YAML does not start it. Never invent
+worker types or model IDs. If a configured capability or model is unavailable,
+report the actual gap and leave the workflow uncreated.
 
-When the current task maps to a previously interrupted workflow (same task retried or resumed), the default instinct to "restart the whole graph" is usually wrong — completed node outputs are durable and reusable. First read `workflow(action=status)` on the prior workflow: every failed node carries `error_class` (runtime classes: timeout / exec_failed / verdict_fail) plus `error_reason` — except nodes cancelled via replan (failed with reason "cancelled via replan", no error_class) and rows written before the error_class migration — triage per the Node failure triage section in the workflow guidance, then recover in this order, and only fall back to a full restart when nothing reusable exists:
+On success, report the exact Workflow ID and initial state, tell the user they
+can run `/dag` for live inspection, and end the response. The workflow wakes
+the parent when attention is needed. Do not poll, sleep, or loop to wait. On
+failure, state that it did not start and report the real error; do not invent a
+replacement run.
 
-1. **Paused recovery (crash recovery)**: if the prior workflow is `paused`, never open a new one. The failed node is terminal and immutable — add a replacement node under a NEW id, rewire its pending dependents' `depends_on` to the new id, then `control(resume)`. Downstream nodes stay pending and keep their state.
-2. **Continue from completed waves**: if the prior workflow is terminal (`failed` or `cancelled`) but has nodes that `completed` before the failure, their final outputs are still valid. Extract each completed node's output (its final text result, e.g. from the node session's persisted parts or any artifact it wrote) and compile a **continuation spec** that starts at the first unfinished wave. Inject the reused outputs as static context into the downstream node prompts (do not re-run them), add only the missing nodes, and `workflow(action=start)` it. Record `reused_nodes` in the manifest.
-3. **Full restart**: only when no completed-node output is reusable — zero completed nodes, or their outputs are empty/irrelevant to the remaining work — re-derive the full graph and start it.
-
-Fail-closed guard: before starting a continuation, verify every reused output is present and non-empty; if extraction is incomplete, fall back to the affected node's fresh run rather than silently continuing on empty input. Never discard completed work to rerun it from zero unless extraction genuinely fails.
-
-Use the orchestration guidance below to design and manage the workflow.
+A final synthesis block must contain the requested result rather than a plan or
+placeholder. If its wake message says `truncated=true`, the parent reads every
+page with `workflow(action="result")` before verification. The parent verifies
+that complete artifact, disposes of any non-ACCEPT review verdict, and gives the
+user one final report.

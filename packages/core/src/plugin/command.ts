@@ -9,6 +9,8 @@ import PROMPT_INITIALIZE from "./command/initialize.txt"
 import PROMPT_REVIEW from "./command/review.txt"
 import DAG_FLOW_PROMPT from "./command/dag-flow.txt"
 import DAG_TEMPLATE_UPDATE_PROMPT from "./command/dag-template-update.txt"
+import workflowRouting from "./command/workflow-routing.md" with { type: "text" }
+import workflowBlocks from "./command/workflow-blocks.md" with { type: "text" }
 import workflowContent from "./command/workflow.md" with { type: "text" }
 import orchestrationPolicy from "./command/orchestration-policy.md" with { type: "text" }
 import orchestrationDomains from "./command/orchestration-domains.md" with { type: "text" }
@@ -16,10 +18,11 @@ import orchestrationDomains from "./command/orchestration-domains.md" with { typ
 export const DagFlowDescription = "Start a dependency-graph multi-agent workflow for the supplied task"
 export const DagTemplateUpdateDescription = "Update the global DAG reference templates from opencode-dag-config"
 export const WorkflowFactsContent = workflowContent
+export const WorkflowBlocksContent = workflowBlocks
 export const OrchestrationPolicyContent = orchestrationPolicy
 export const OrchestrationDomainsContent = orchestrationDomains
-export const WorkflowContent = `${WorkflowFactsContent}\n\n${OrchestrationPolicyContent}\n\n${OrchestrationDomainsContent}`
-export const DagFlowContent = `${DAG_FLOW_PROMPT}\n\n${WorkflowContent}`
+export const WorkflowContent = workflowRouting
+export const DagFlowContent = DAG_FLOW_PROMPT
 
 export const Plugin = define({
   id: "command",

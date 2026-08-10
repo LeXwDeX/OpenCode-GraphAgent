@@ -12,7 +12,7 @@ import { MemorySearch } from "@/tool/memory-search"
 import { Truncate } from "@/tool/truncate"
 
 import { Plugin } from "@/plugin"
-import type { TaskPromptOps } from "@/tool/task"
+import { TaskTool, type TaskPromptOps } from "@/tool/task"
 import { SettingsHook, type TriggerResult } from "@/hook/settings"
 import { applyPreHookDecision, classifyPermissionAsk } from "@/hook/pre-hook-decision"
 import { type Tool as AITool, tool, jsonSchema, type ToolExecutionOptions, asSchema } from "ai"
@@ -43,6 +43,7 @@ const SUPPORTED_MCP_RESOURCE_ATTACHMENT_MIMES = new Set([
 ])
 // Tools that modify files on disk — trigger FileChanged hook after execution
 const FILE_CHANGING_TOOLS = new Set(["edit", "write", "apply_patch", "multiedit", "patch"])
+const ROOT_ONLY_TOOLS = new Set([MemorySearch.MemorySearchTool.id, TaskTool.id, "workflow"])
 
 export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
   agent: Agent.Info
@@ -100,13 +101,13 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
     providerID: input.model.providerID,
     agent: input.agent,
   })) {
+    if (input.session.parentID && ROOT_ONLY_TOOLS.has(item.id)) continue
     if (
       item.id === MemorySearch.MemorySearchTool.id &&
-      (input.session.parentID ||
-        Permission.disabled(
-          [MemorySearch.MemorySearchTool.id],
-          Permission.merge(input.agent.permission, input.session.permission ?? []),
-        ).has(MemorySearch.MemorySearchTool.id))
+      Permission.disabled(
+        [MemorySearch.MemorySearchTool.id],
+        Permission.merge(input.agent.permission, input.session.permission ?? []),
+      ).has(MemorySearch.MemorySearchTool.id)
     )
       continue
     const schema = ProviderTransform.schema(input.model, ToolJsonSchema.fromTool(item))
