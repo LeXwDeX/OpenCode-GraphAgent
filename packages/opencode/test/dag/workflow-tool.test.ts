@@ -48,14 +48,16 @@ const admissionBrief = {
   blocking_questions: [],
 }
 
-function admissionFor(verdict: "READY" | "NOT_READY" | "WAIVED", state: State = verdict) {
-  const brief =
-    verdict === "READY"
-      ? admissionBrief
-      : {
-          ...admissionBrief,
-          blocking_questions: ["Confirm the production rollout target"],
-        }
+function admissionFor(
+  verdict: "READY" | "NOT_READY" | "WAIVED",
+  state: State = verdict,
+) {
+  const brief = verdict === "READY"
+    ? admissionBrief
+    : {
+        ...admissionBrief,
+        blocking_questions: ["Confirm the production rollout target"],
+      }
   return {
     protocol_version: 1,
     brief_revision: 1,
@@ -307,7 +309,10 @@ const events = Layer.mock(EventV2Bridge.Service, {
       return { id: "event_test", type: definition.type, data } as never
     }),
 })
-const dag = Dag.layer.pipe(Layer.provide(store), Layer.provide(events))
+const dag = Dag.layer.pipe(
+  Layer.provide(store),
+  Layer.provide(events),
+)
 const runtime = testEffect(
   Layer.mergeAll(
     Layer.mock(Agent.Service, {
@@ -337,7 +342,8 @@ const runtime = testEffect(
           slug: "workflow-test",
           projectID,
           directory: workflowSpecDirectory,
-          parentID: id === SessionID.make("ses_workflow_child") ? SessionID.make("ses_workflow_parent") : undefined,
+          parentID:
+            id === SessionID.make("ses_workflow_child") ? SessionID.make("ses_workflow_parent") : undefined,
           title: "Workflow test",
           version: "test",
           time: { created: 0, updated: 0 },
@@ -391,7 +397,9 @@ const missingModelRuntime = testEffect(
 
 function writeWorkflowSpec(name: string, value: unknown) {
   const filepath = path.join(workflowSpecDirectory, `${name}.yaml`)
-  return Effect.promise(() => Bun.write(filepath, JSON.stringify(value, null, 2))).pipe(Effect.as(filepath))
+  return Effect.promise(() => Bun.write(filepath, JSON.stringify(value, null, 2))).pipe(
+    Effect.as(filepath),
+  )
 }
 
 function toolContext() {
@@ -497,9 +505,10 @@ describe("workflow tool execution", () => {
       published.length = 0
       const info = yield* WorkflowTool
       const workflow = yield* info.init()
-      const exit = yield* workflow
-        .execute({ action: "list" }, { ...toolContext(), sessionID: SessionID.make("ses_workflow_child") })
-        .pipe(Effect.exit)
+      const exit = yield* workflow.execute(
+        { action: "list" },
+        { ...toolContext(), sessionID: SessionID.make("ses_workflow_child") },
+      ).pipe(Effect.exit)
 
       expect(Exit.isFailure(exit)).toBe(true)
       if (Exit.isFailure(exit)) expect(Cause.pretty(exit.cause)).toContain("main conversation")
@@ -843,15 +852,13 @@ describe("workflow tool execution", () => {
           action: "extend",
           workflow_id: "dag_defaults",
           spec: {
-            nodes: [
-              {
-                id: "inline-added",
-                name: "Inline added",
-                worker_type: "general",
-                depends_on: [],
-                prompt_template: { inline: "work" },
-              },
-            ],
+            nodes: [{
+              id: "inline-added",
+              name: "Inline added",
+              worker_type: "general",
+              depends_on: [],
+              prompt_template: { inline: "work" },
+            }],
           },
         }),
         toolContext(),
@@ -901,15 +908,13 @@ describe("workflow tool execution", () => {
           spec: {
             fragment: {
               name: "inline-replan",
-              nodes: [
-                {
-                  id: "inline-replanned",
-                  name: "Inline replanned",
-                  worker_type: "general",
-                  depends_on: [],
-                  prompt_template: { inline: "work" },
-                },
-              ],
+              nodes: [{
+                id: "inline-replanned",
+                name: "Inline replanned",
+                worker_type: "general",
+                depends_on: [],
+                prompt_template: { inline: "work" },
+              }],
             },
           },
         }),
@@ -944,9 +949,10 @@ describe("workflow tool execution", () => {
 
       for (const item of cases) {
         published.length = 0
-        const exit = yield* workflow
-          .execute(Schema.decodeUnknownSync(Parameters)(item.params), toolContext())
-          .pipe(Effect.exit)
+        const exit = yield* workflow.execute(
+          Schema.decodeUnknownSync(Parameters)(item.params),
+          toolContext(),
+        ).pipe(Effect.exit)
 
         expect(Exit.isFailure(exit)).toBe(true)
         if (Exit.isFailure(exit)) expect(Cause.pretty(exit.cause)).toContain(item.message)
@@ -976,20 +982,18 @@ describe("workflow tool execution", () => {
       )
 
       const output = JSON.parse(result.output)
-      expect(output).toEqual(
-        expect.objectContaining({
-          mode: "deep",
-          admission: {
-            verdict: "WAIVED",
-            state: "CONSUMED",
-            qa_mode: "STANDARD",
-            brief_revision: 1,
-            fingerprint: admissionFor("WAIVED").fingerprint,
-            waiver_reason: "Preview release only",
-            acknowledged_risks: ["Production rollout is unresolved"],
-          },
-        }),
-      )
+      expect(output).toEqual(expect.objectContaining({
+        mode: "deep",
+        admission: {
+          verdict: "WAIVED",
+          state: "CONSUMED",
+          qa_mode: "STANDARD",
+          brief_revision: 1,
+          fingerprint: admissionFor("WAIVED").fingerprint,
+          waiver_reason: "Preview release only",
+          acknowledged_risks: ["Production rollout is unresolved"],
+        },
+      }))
       expect(output.admission).not.toHaveProperty("qa_transcript")
     }),
   )
@@ -1025,15 +1029,13 @@ config:
         metadata: () => Effect.void,
         ask: () => Effect.void,
       } satisfies Tool.Context
-      const invalid = yield* workflow
-        .execute(
-          {
-            action: "start",
-            spec_path: "deep.yaml",
-          },
-          context,
-        )
-        .pipe(Effect.exit)
+      const invalid = yield* workflow.execute(
+        {
+          action: "start",
+          spec_path: "deep.yaml",
+        },
+        context,
+      ).pipe(Effect.exit)
 
       expect(Exit.isFailure(invalid)).toBe(true)
       if (Exit.isFailure(invalid)) {
@@ -1085,17 +1087,15 @@ config:
       const created = published.find((event) => event.type === DagEvent.WorkflowCreated.type)?.data as {
         config?: string
       }
-      expect(JSON.parse(created.config ?? "{}")).toEqual(
-        expect.objectContaining({
-          mode: "deep",
-          admission: expect.objectContaining({
-            protocol_version: 1,
-            verdict: "READY",
-            state: "CONSUMED",
-            fingerprint: fingerprintBrief(admissionBrief),
-          }),
+      expect(JSON.parse(created.config ?? "{}")).toEqual(expect.objectContaining({
+        mode: "deep",
+        admission: expect.objectContaining({
+          protocol_version: 1,
+          verdict: "READY",
+          state: "CONSUMED",
+          fingerprint: fingerprintBrief(admissionBrief),
         }),
-      )
+      }))
     }),
   )
 
@@ -1106,23 +1106,21 @@ config:
       yield* Effect.promise(() => Bun.write(specPath, "config:\n  nodes: [\n"))
       const info = yield* WorkflowTool
       const workflow = yield* info.init()
-      const exit = yield* workflow
-        .execute(
-          {
-            action: "start",
-            spec_path: specPath,
-          },
-          {
-            sessionID: SessionID.make("ses_workflow_parent"),
-            messageID: MessageID.ascending(),
-            agent: "build",
-            abort: new AbortController().signal,
-            messages: [],
-            metadata: () => Effect.void,
-            ask: () => Effect.void,
-          } satisfies Tool.Context,
-        )
-        .pipe(Effect.exit)
+      const exit = yield* workflow.execute(
+        {
+          action: "start",
+          spec_path: specPath,
+        },
+        {
+          sessionID: SessionID.make("ses_workflow_parent"),
+          messageID: MessageID.ascending(),
+          agent: "build",
+          abort: new AbortController().signal,
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        } satisfies Tool.Context,
+      ).pipe(Effect.exit)
 
       expect(Exit.isFailure(exit)).toBe(true)
       if (Exit.isFailure(exit)) {
@@ -1184,7 +1182,10 @@ config:
       )
       yield* Effect.promise(() => fs.mkdir(path.join(missingModelDirectory, ".opencode"), { recursive: true }))
       yield* Effect.promise(() =>
-        Bun.write(path.join(missingModelDirectory, ".opencode", "dag.jsonc"), '{ "model": {} }\n'),
+        Bun.write(
+          path.join(missingModelDirectory, ".opencode", "dag.jsonc"),
+          '{ "model": {} }\n',
+        )
       )
       yield* Effect.promise(() =>
         Bun.write(
@@ -1192,18 +1193,16 @@ config:
           JSON.stringify({
             config: {
               name: "missing-model",
-              nodes: [
-                {
-                  id: "worker",
-                  name: "Worker",
-                  worker_type: "build",
-                  depends_on: [],
-                  prompt_template: { inline: "work" },
-                },
-              ],
+              nodes: [{
+                id: "worker",
+                name: "Worker",
+                worker_type: "build",
+                depends_on: [],
+                prompt_template: { inline: "work" },
+              }],
             },
           }),
-        ),
+        )
       )
 
       const info = yield* WorkflowTool
@@ -1264,14 +1263,12 @@ config:
       const created = published.find((event) => event.type === DagEvent.WorkflowCreated.type)?.data as {
         config?: string
       }
-      expect(JSON.parse(created.config ?? "{}").admission).toEqual(
-        expect.objectContaining({
-          verdict: "WAIVED",
-          state: "CONSUMED",
-          waiver_reason: "Preview release only",
-          acknowledged_risks: ["Production rollout is unresolved"],
-        }),
-      )
+      expect(JSON.parse(created.config ?? "{}").admission).toEqual(expect.objectContaining({
+        verdict: "WAIVED",
+        state: "CONSUMED",
+        waiver_reason: "Preview release only",
+        acknowledged_risks: ["Production rollout is unresolved"],
+      }))
     }),
   )
 
@@ -1321,23 +1318,21 @@ config:
       for (const item of cases) {
         published.length = 0
         const specPath = yield* writeWorkflowSpec(`blocked-${item.name}`, item.value)
-        const exit = yield* workflow
-          .execute(
-            {
-              action: "start",
-              spec_path: specPath,
-            },
-            {
-              sessionID: SessionID.make("ses_workflow_parent"),
-              messageID: MessageID.ascending(),
-              agent: "build",
-              abort: new AbortController().signal,
-              messages: [],
-              metadata: () => Effect.void,
-              ask: () => Effect.void,
-            } satisfies Tool.Context,
-          )
-          .pipe(Effect.exit)
+        const exit = yield* workflow.execute(
+          {
+            action: "start",
+            spec_path: specPath,
+          },
+          {
+            sessionID: SessionID.make("ses_workflow_parent"),
+            messageID: MessageID.ascending(),
+            agent: "build",
+            abort: new AbortController().signal,
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          } satisfies Tool.Context,
+        ).pipe(Effect.exit)
 
         expect(Exit.isFailure(exit)).toBe(true)
         expect(published).toHaveLength(0)
@@ -1659,7 +1654,8 @@ describe("workflow tool saved workflows", () => {
         }),
     )
 
-  const savedSpec = (name: string) => `title: ${name} title\nconfig:\n  name: ${name}\n  nodes: []\n`
+  const savedSpec = (name: string) =>
+    `title: ${name} title\nconfig:\n  name: ${name}\n  nodes: []\n`
 
   const contextWith = (asked: unknown[]) =>
     ({
@@ -1698,7 +1694,10 @@ describe("workflow tool saved workflows", () => {
         const workflow = yield* info.init()
         const asked: unknown[] = []
 
-        const result = yield* workflow.execute({ action: "read", spec_path: "saved-readable" }, contextWith(asked))
+        const result = yield* workflow.execute(
+          { action: "read", spec_path: "saved-readable" },
+          contextWith(asked),
+        )
 
         expect(result.title).toBe("Workflow spec: saved-readable")
         expect(JSON.parse(result.output)).toMatchObject({
