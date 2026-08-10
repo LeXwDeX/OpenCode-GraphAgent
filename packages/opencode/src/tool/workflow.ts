@@ -22,15 +22,17 @@ const MAX_WORKFLOW_SPEC_BYTES = 1_000_000
 const DEFAULT_RESULT_PAGE_CHARS = 8_000
 const MAX_RESULT_PAGE_CHARS = 12_000
 
-const ResultCursor = Schema.fromJsonString(
-  Schema.Struct({
-    version: Schema.Literal(1),
-    workflow_id: Schema.String,
-    node_id: Schema.String,
-    offset: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
-  }),
-)
-const decodeResultCursor = Schema.decodeUnknownOption(ResultCursor)
+class ResultCursor extends Schema.Class<ResultCursor>("WorkflowResultCursor")({
+  version: Schema.Literal(1),
+  workflow_id: Dag.ID,
+  node_id: Dag.NodeID,
+  offset: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+}) {}
+
+const ResultCursorJSON = Schema.fromJsonString(ResultCursor)
+const ResultCursorToken = Schema.String.pipe(Schema.brand("WorkflowResultCursorToken"))
+type ResultCursorToken = typeof ResultCursorToken.Type
+const decodeResultCursor = Schema.decodeUnknownOption(ResultCursorJSON)
 
 // ============================================================================
 // Action schemas remain the single validation authority for file and inline input.
@@ -167,11 +169,11 @@ export const Parameters = Schema.Struct({
   project_id: Schema.optional(Schema.String).annotate({
     description: "(start) Optional Project ID; must match the parent session project",
   }),
-  workflow_id: Schema.optional(Schema.String).annotate({
+  workflow_id: Schema.optional(Dag.ID).annotate({
     description: "(extend/control/status/result) Target workflow ID",
   }),
-  node_id: Schema.optional(Schema.String).annotate({ description: "(result) Target durable node ID" }),
-  cursor: Schema.optional(Schema.String).annotate({
+  node_id: Schema.optional(Dag.NodeID).annotate({ description: "(result) Target durable node ID" }),
+  cursor: Schema.optional(ResultCursorToken).annotate({
     description: "(result) Opaque continuation cursor returned by the previous page",
   }),
   limit: Schema.optional(Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: MAX_RESULT_PAGE_CHARS }))).annotate({
@@ -187,10 +189,10 @@ export const Parameters = Schema.Struct({
 // ============================================================================
 
 type Metadata = {
-  workflowId?: string
-  nodeId?: string
+  workflowId?: Dag.ID
+  nodeId?: Dag.NodeID
   truncated?: boolean
-  nextCursor?: string
+  nextCursor?: ResultCursorToken
   added?: string[]
   cancel?: string[]
   restart?: string[]
@@ -210,7 +212,7 @@ export const WorkflowTool = Tool.define<
     const question = yield* Question.Service
 
     const requireOwnedWorkflow = Effect.fn("WorkflowTool.requireOwnedWorkflow")(function* (
-      workflowID: string,
+      workflowID: Dag.ID,
       sessionID: string,
     ) {
       const workflow = yield* dag.store.getWorkflow(workflowID).pipe(Effect.orDie)
@@ -373,12 +375,14 @@ export const WorkflowTool = Tool.define<
               }
               const cursor = params.cursor
                 ? decodeResultCursor(Buffer.from(params.cursor, "base64url").toString())
-                : Option.some({
-                    version: 1 as const,
-                    workflow_id: params.workflow_id,
-                    node_id: params.node_id,
-                    offset: 0,
-                  })
+                : Option.some(
+                    new ResultCursor({
+                      version: 1 as const,
+                      workflow_id: params.workflow_id,
+                      node_id: params.node_id,
+                      offset: 0,
+                    }),
+                  )
               if (
                 Option.isNone(cursor) ||
                 cursor.value.workflow_id !== params.workflow_id ||
@@ -399,14 +403,18 @@ export const WorkflowTool = Tool.define<
               const pageEnd = resultPageEnd(content, cursor.value.offset, params.limit ?? DEFAULT_RESULT_PAGE_CHARS)
               const truncated = pageEnd < content.length
               const nextCursor = truncated
-                ? Buffer.from(
-                    JSON.stringify({
-                      version: 1,
-                      workflow_id: params.workflow_id,
-                      node_id: params.node_id,
-                      offset: pageEnd,
-                    }),
-                  ).toString("base64url")
+                ? ResultCursorToken.make(
+                    Buffer.from(
+                      JSON.stringify(
+                        new ResultCursor({
+                          version: 1,
+                          workflow_id: params.workflow_id,
+                          node_id: params.node_id,
+                          offset: pageEnd,
+                        }),
+                      ),
+                    ).toString("base64url"),
+                  )
                 : null
               return {
                 title: `Workflow result: ${node.name}`,

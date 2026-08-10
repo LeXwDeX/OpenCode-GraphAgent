@@ -411,11 +411,11 @@ describe("workflow tool schema (negative tests)", () => {
     const decode = Schema.decodeUnknownSync(Parameters)
     expect(() => decode({ action: "start", spec_path: ".opencode/workflows/test.yaml" })).not.toThrow()
     expect(() =>
-      decode({ action: "extend", workflow_id: "wf-1", spec_path: ".opencode/workflows/extend.yaml" }),
+      decode({ action: "extend", workflow_id: "dag_wf_1", spec_path: ".opencode/workflows/extend.yaml" }),
     ).not.toThrow()
-    expect(() => decode({ action: "control", workflow_id: "wf-1", operation: "pause" })).not.toThrow()
-    expect(() => decode({ action: "status", workflow_id: "wf-1" })).not.toThrow()
-    expect(() => decode({ action: "result", workflow_id: "wf-1", node_id: "node-1", limit: 600 })).not.toThrow()
+    expect(() => decode({ action: "control", workflow_id: "dag_wf_1", operation: "pause" })).not.toThrow()
+    expect(() => decode({ action: "status", workflow_id: "dag_wf_1" })).not.toThrow()
+    expect(() => decode({ action: "result", workflow_id: "dag_wf_1", node_id: "node-1", limit: 600 })).not.toThrow()
     // list browses the saved-spec library and needs no workflow_id.
     expect(() => decode({ action: "list" })).not.toThrow()
     expect(() => decode({ action: "read", spec_path: "project-change-route" })).not.toThrow()
@@ -439,6 +439,14 @@ describe("workflow tool schema (negative tests)", () => {
     expect(() => decode({ action: "delete" })).toThrow()
   })
 
+  it("workflow IDs use the durable DAG identity schema", () => {
+    const decode = Schema.decodeUnknownSync(Parameters)
+    expect(() => decode({ action: "status", workflow_id: "workflow-1" })).toThrow()
+    expect(decode({ action: "status", workflow_id: "dag_workflow_1" })).toMatchObject({
+      workflow_id: "dag_workflow_1",
+    })
+  })
+
   it("no node_complete action exists", () => {
     const decode = Schema.decodeUnknownSync(Parameters)
     expect(() => decode({ action: "node_complete" })).toThrow()
@@ -453,14 +461,14 @@ describe("workflow tool schema (negative tests)", () => {
   it("control operation accepts pause/resume/cancel/replan/step/complete", () => {
     const decode = Schema.decodeUnknownSync(Parameters)
     for (const op of ["pause", "resume", "cancel", "replan", "step", "complete"]) {
-      expect(() => decode({ action: "control", workflow_id: "wf-1", operation: op })).not.toThrow()
+      expect(() => decode({ action: "control", workflow_id: "dag_wf_1", operation: op })).not.toThrow()
     }
   })
 
   it("control operation rejects unknown operations", () => {
     const decode = Schema.decodeUnknownSync(Parameters)
-    expect(() => decode({ action: "control", workflow_id: "wf-1", operation: "delete" })).toThrow()
-    expect(() => decode({ action: "control", workflow_id: "wf-1", operation: "start" })).toThrow()
+    expect(() => decode({ action: "control", workflow_id: "dag_wf_1", operation: "delete" })).toThrow()
+    expect(() => decode({ action: "control", workflow_id: "dag_wf_1", operation: "start" })).toThrow()
   })
 
   it("keeps workflow graph and admission fields inside spec", () => {
@@ -534,7 +542,7 @@ describe("workflow tool execution", () => {
       const result = yield* workflow.execute(
         {
           action: "status",
-          workflow_id: "dag_status",
+          workflow_id: Dag.ID.make("dag_status"),
         },
         {
           sessionID: SessionID.make("ses_workflow_parent"),
@@ -640,7 +648,7 @@ describe("workflow tool execution", () => {
       const workflow = yield* info.init()
       const exit = yield* workflow
         .execute(
-          { action: "control", workflow_id: "dag_status", operation: "pause" },
+          { action: "control", workflow_id: Dag.ID.make("dag_status"), operation: "pause" },
           {
             ...toolContext(),
             ask: (request) => {
@@ -679,7 +687,7 @@ describe("workflow tool execution", () => {
       } satisfies Tool.Context
 
       const statusExit = yield* Effect.exit(
-        workflow.execute({ action: "status", workflow_id: "dag_status" }, foreignContext),
+        workflow.execute({ action: "status", workflow_id: Dag.ID.make("dag_status") }, foreignContext),
       )
       const resultExit = yield* Effect.exit(
         workflow.execute(
@@ -692,10 +700,16 @@ describe("workflow tool execution", () => {
         ),
       )
       const extendExit = yield* Effect.exit(
-        workflow.execute({ action: "extend", workflow_id: "dag_defaults", spec: { nodes: [] } }, foreignContext),
+        workflow.execute(
+          { action: "extend", workflow_id: Dag.ID.make("dag_defaults"), spec: { nodes: [] } },
+          foreignContext,
+        ),
       )
       const controlExit = yield* Effect.exit(
-        workflow.execute({ action: "control", workflow_id: "dag_status", operation: "pause" }, foreignContext),
+        workflow.execute(
+          { action: "control", workflow_id: Dag.ID.make("dag_status"), operation: "pause" },
+          foreignContext,
+        ),
       )
 
       expect({
@@ -723,11 +737,11 @@ describe("workflow tool execution", () => {
       const info = yield* WorkflowTool
       const workflow = yield* info.init()
       const controls = [
-        { workflowID: "dag_status", operation: "pause" },
-        { workflowID: "dag_paused", operation: "resume" },
-        { workflowID: "dag_status", operation: "cancel" },
-        { workflowID: "dag_status", operation: "complete" },
-        { workflowID: "dag_step", operation: "step" },
+        { workflowID: Dag.ID.make("dag_status"), operation: "pause" },
+        { workflowID: Dag.ID.make("dag_paused"), operation: "resume" },
+        { workflowID: Dag.ID.make("dag_status"), operation: "cancel" },
+        { workflowID: Dag.ID.make("dag_status"), operation: "complete" },
+        { workflowID: Dag.ID.make("dag_step"), operation: "step" },
       ] as const
       const routed = yield* Effect.forEach(controls, (control) =>
         Effect.gen(function* () {
@@ -948,7 +962,7 @@ describe("workflow tool execution", () => {
       const result = yield* workflow.execute(
         {
           action: "status",
-          workflow_id: "dag_deep_status",
+          workflow_id: Dag.ID.make("dag_deep_status"),
         },
         {
           sessionID: SessionID.make("ses_workflow_parent"),
@@ -1472,7 +1486,7 @@ config:
       yield* workflow.execute(
         {
           action: "extend",
-          workflow_id: "dag_defaults",
+          workflow_id: Dag.ID.make("dag_defaults"),
           spec_path: specPath,
         },
         {
@@ -1531,7 +1545,7 @@ config:
       yield* workflow.execute(
         {
           action: "control",
-          workflow_id: "dag_defaults",
+          workflow_id: Dag.ID.make("dag_defaults"),
           operation: "replan",
           spec_path: specPath,
         },

@@ -53,7 +53,9 @@ or existing durable node IDs during **extend** and replan.
 - `explore`: read-only repository mapping and evidence collection.
 - `plan`: implementation-ready decomposition, seams, checks, and risks.
 - `prototype`: the smallest throwaway experiment that resolves a runnable
-  uncertainty; it does not silently become production code.
+  uncertainty; it does not silently become production code. It still publishes
+  its changed-file list and fingerprint so later verification or review cannot
+  bind to stale experiment evidence.
 - `debug`: expands to reproduce/evidence followed by root-cause diagnosis.
 - `coding`: bounded production implementation plus focused tests and checks.
 - `verify`: deterministic acceptance checks with explicit PASS/FAIL evidence.

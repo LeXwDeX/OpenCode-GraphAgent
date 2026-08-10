@@ -131,6 +131,29 @@ describe("workflow blocks", () => {
     ).toThrow("requires exactly one verification ancestor")
   })
 
+  it("publishes evidence when a prototype is the latest verified writer", () => {
+    const nodes = DagBlocks.compileWorkflowBlocks({
+      objective: "Validate a prototype before deciding whether to promote it",
+      blocks: [
+        { id: "implementation", kind: "coding" },
+        { id: "experiment", kind: "prototype", depends_on: ["implementation"] },
+        { id: "verification", kind: "verify", depends_on: ["experiment"] },
+        { id: "decision", kind: "review", depends_on: ["verification"] },
+      ],
+    })
+
+    expect(nodes.find((node) => node.id === "experiment")?.output_schema).toEqual(
+      expect.objectContaining({ required: expect.arrayContaining(["changed_files", "fingerprint"]) }),
+    )
+    expect(nodes.find((node) => node.id === "decision")).toMatchObject({
+      review: { implementation_node_id: "experiment", verification_node_id: "verification" },
+      input_mapping: {
+        implementation_changed_files: "experiment.output.changed_files",
+        implementation_fingerprint: "experiment.output.fingerprint",
+      },
+    })
+  })
+
   it("serializes unordered workspace writers while leaving read-only lanes parallel", () => {
     const nodes = DagBlocks.compileWorkflowBlocks({
       objective: "Build two packages from independent evidence",

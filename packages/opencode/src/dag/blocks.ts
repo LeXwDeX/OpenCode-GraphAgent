@@ -102,7 +102,7 @@ const BLOCK_CONTRACTS: Record<WorkflowBlockKind, string> = {
     "Inspect the target read-only. Map relevant modules, constraints, existing conventions, and evidence with file references. Do not implement.",
   plan: "Produce an implementation-ready plan from repository evidence and dependency outputs. Name seams, work packages, acceptance checks, and unresolved risks. Do not implement.",
   prototype:
-    "Build only the smallest throwaway experiment needed to answer the stated uncertainty. Separate observations from production recommendations and do not integrate it unless explicitly instructed.",
+    "Build only the smallest throwaway experiment needed to answer the stated uncertainty. Separate observations from production recommendations and do not integrate it unless explicitly instructed. Submit its changed-file list and a stable fingerprint so downstream verification and review can bind to the exact experiment.",
   debug:
     "Diagnose the smallest falsifiable root-cause hypothesis from reproduced evidence. Distinguish cause from symptom and identify the narrowest safe repair plus a regression check.",
   coding:
@@ -263,8 +263,11 @@ function compileBlock(objective: string, block: WorkflowBlock, blocks: WorkflowB
       required,
       reportToParent: block.report_to_parent ?? block.kind === "synthesize",
       condition,
-      outputSchema:
-        block.kind === "coding" ? IMPLEMENTATION_SCHEMA : block.kind === "verify" ? VERIFICATION_SCHEMA : undefined,
+      outputSchema: WRITER_KINDS.has(block.kind)
+        ? IMPLEMENTATION_SCHEMA
+        : block.kind === "verify"
+          ? VERIFICATION_SCHEMA
+          : undefined,
     }),
   ]
 }
@@ -367,8 +370,14 @@ function serializeWorkspaceWriters(blocks: WorkflowBlock[]) {
     const previous = previousWriter.get(block.id)
     if (!previous || dependsTransitively(blocks, block.id, previous)) return block
     return new WorkflowBlock({
-      ...block,
+      id: block.id,
+      kind: block.kind,
       depends_on: [...(block.depends_on ?? []), previous],
+      instruction: block.instruction,
+      skills: block.skills,
+      worker_type: block.worker_type,
+      required: block.required,
+      report_to_parent: block.report_to_parent,
     })
   })
   topologicalBlocks(serialized)
