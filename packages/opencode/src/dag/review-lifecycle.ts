@@ -150,7 +150,6 @@ export function unresolvedReviewOutcomes(
   config: WorkflowConfig,
   nodes: ReadonlyArray<{ id: string; status: string; output: unknown }>,
 ) {
-  if ((config.mode ?? "standard") !== "deep") return []
   const rows = new Map(nodes.map((node) => [node.id, node]))
   const reviews = config.nodes.filter((node) => node.review?.phase === "diff")
   return reviews.flatMap((review) => {
