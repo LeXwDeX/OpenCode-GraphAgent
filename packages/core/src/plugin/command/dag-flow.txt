@@ -4,7 +4,7 @@
 $ARGUMENTS
 </dag-flow-task>
 
-If the task is empty, ask for it and do not start a workflow. Otherwise load
+If the task is empty or contains only whitespace, ask for it and do not start a workflow. Otherwise load
 the `orchestration-router` skill and route the request through one consolidated
 graph. `/dag-flow` explicitly selects DAG execution, but it does not waive a
 material user decision.
