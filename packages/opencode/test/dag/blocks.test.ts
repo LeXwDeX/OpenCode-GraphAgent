@@ -3,7 +3,7 @@ import { DagBlocks } from "@/dag/blocks"
 import { DagConfig } from "@/dag/config"
 
 describe("workflow blocks", () => {
-  it("compiles a staged route and carries objective, instructions, skills, and dependencies", () => {
+  it("compiles a staged route and carries objective, instructions, and dependencies", () => {
     const nodes = DagBlocks.compileWorkflowBlocks({
       objective: "Add durable session recovery",
       blocks: [
@@ -16,7 +16,6 @@ describe("workflow blocks", () => {
           id: "build",
           kind: "coding",
           depends_on: ["map"],
-          skills: ["tdd"],
         },
         {
           id: "verify",
@@ -35,13 +34,55 @@ describe("workflow blocks", () => {
       objective: "Add durable session recovery",
       instruction: "Locate persistence ownership",
     })
-    expect(nodes[1]?.prompt_template.inline).toContain("load these relevant skills")
-    expect(nodes[1]?.prompt_template.inline).toContain("tdd")
+    expect(nodes[1]?.prompt_template.inline).toContain("failing check")
+    expect(nodes[1]?.prompt_template.inline).not.toContain("Skill")
     expect(nodes.map((node) => ({ id: node.id, required: node.required }))).toEqual([
       { id: "map", required: false },
       { id: "build", required: false },
       { id: "verify", required: true },
     ])
+  })
+
+  it("composes configured design delivery capabilities without new lifecycle kinds", () => {
+    const nodes = DagBlocks.compileWorkflowBlocks({
+      objective: "Design, implement, and review project-owned memory",
+      blocks: [
+        {
+          id: "codebase-design",
+          kind: "plan",
+          instruction: "Define the project identity seam and migration boundary.",
+        },
+        { id: "coding", kind: "coding", depends_on: ["codebase-design"] },
+        { id: "verify", kind: "verify", depends_on: ["coding"] },
+        { id: "global-review", kind: "review", depends_on: ["verify"] },
+      ],
+    })
+
+    expect(nodes.map((node) => node.id)).toEqual([
+      "codebase-design",
+      "coding",
+      "verify",
+      "global-review--standards",
+      "global-review--intent",
+      "global-review",
+    ])
+    expect(nodes[0]?.prompt_template.input).toMatchObject({
+      instruction: "Define the project identity seam and migration boundary.",
+    })
+  })
+
+  it("keeps a pruned design delivery route valid when evidence is already supplied", () => {
+    const nodes = DagBlocks.compileWorkflowBlocks({
+      objective: "Implement the confirmed design from supplied file-level evidence",
+      blocks: [
+        { id: "coding", kind: "coding" },
+        { id: "verify", kind: "verify", depends_on: ["coding"] },
+        { id: "global-review", kind: "review", depends_on: ["verify"] },
+      ],
+    })
+
+    expect(nodes.some((node) => node.worker_type === "explore")).toBe(false)
+    expect(nodes.find((node) => node.id === "global-review")?.required).toBe(true)
   })
 
   it("expands debug into evidence and diagnosis nodes", () => {

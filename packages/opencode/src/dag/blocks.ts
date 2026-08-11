@@ -25,9 +25,6 @@ export class WorkflowBlock extends Schema.Class<WorkflowBlock>("WorkflowBlock")(
   instruction: Schema.optional(Schema.String).annotate({
     description: "Task-specific instruction added to the block's built-in execution contract",
   }),
-  skills: Schema.optional(Schema.Array(Schema.String)).annotate({
-    description: "Relevant skills the child should load lazily before working",
-  }),
   worker_type: Schema.optional(Schema.String).annotate({
     description: "Optional configured agent override; defaults from the block kind",
   }),
@@ -99,20 +96,20 @@ const WRITER_KINDS = new Set<WorkflowBlockKind>(["coding", "prototype"])
 
 const BLOCK_CONTRACTS: Record<WorkflowBlockKind, string> = {
   explore:
-    "Inspect the target read-only. Map relevant modules, constraints, existing conventions, and evidence with file references. Do not implement.",
-  plan: "Produce an implementation-ready plan from repository evidence and dependency outputs. Name seams, work packages, acceptance checks, and unresolved risks. Do not implement.",
+    "Inspect the target read-only and prefer primary repository or runtime evidence. Separate confirmed facts, inferences, and unknowns; map ownership, constraints, conventions, and file references. Return an evidence map that downstream blocks can cite. Do not implement or hide unresolved uncertainty.",
+  plan: "Produce a decision- or implementation-ready plan from repository evidence and dependency outputs. State the selected boundary, ordered options or work packages, dependencies, acceptance checks, falsifiers, and unresolved risks. Stop rather than inventing a user-owned product decision. Do not implement.",
   prototype:
-    "Build only the smallest throwaway experiment needed to answer the stated uncertainty. Separate observations from production recommendations and do not integrate it unless explicitly instructed. Submit its changed-file list and a stable fingerprint so downstream verification and review can bind to the exact experiment.",
+    "Answer one falsifiable uncertainty with the smallest disposable experiment. State the hypothesis and success signal first, separate observations from inference, and do not integrate prototype code unless explicitly promoted by confirmed scope. Submit its changed-file list and a stable fingerprint so downstream verification and review bind to the exact experiment.",
   debug:
-    "Diagnose the smallest falsifiable root-cause hypothesis from reproduced evidence. Distinguish cause from symptom and identify the narrowest safe repair plus a regression check.",
+    "Minimize the reproduced failure, rank falsifiable hypotheses, instrument the discriminating boundary, and identify the smallest causal explanation. Distinguish cause from symptom and correlated damage. Return the narrowest safe repair boundary and a regression check that would fail without that repair; stop if evidence does not establish a cause.",
   coding:
-    "Implement the bounded production change. Follow repository instructions, preserve unrelated work, add or update focused tests, and run relevant checks. Submit the aggregate changed-file list and a stable fingerprint of the actual implementation state so downstream verification and review can detect stale evidence.",
+    "Implement only the bounded production change and preserve unrelated work. When an observable automated seam exists, establish a failing check, make the smallest change that passes it, then refactor without breaking the check; otherwise record the evidence-backed reason before implementation. Run focused checks and stop on ownership or interface drift. Submit the aggregate changed-file list and a stable fingerprint of the actual implementation state.",
   verify:
-    "Verify the supplied work against acceptance criteria using deterministic checks where available. Submit commands and evidence with an explicit PASS or FAIL verdict. Do not hide failures.",
+    "Verify the supplied work against every acceptance criterion using deterministic checks where available. Bind evidence to the supplied implementation fingerprint and submit exact commands, results, and an explicit PASS or FAIL verdict. Missing evidence or any failed required check is FAIL; do not repair or hide failures in this block.",
   review:
-    "Review independently against repository standards and the confirmed intent. Cite concrete evidence, separate blockers from suggestions, and identify claims that still need verification.",
+    "Review independently against repository standards and the confirmed intent. Bind findings to the supplied implementation fingerprint, cite concrete evidence, separate required actions from suggestions, and reject stale, duplicated, or unsupported claims. Do not implement fixes inside the review lane.",
   synthesize:
-    "Combine dependency outputs into one decision-ready result. Resolve conflicts using evidence, preserve material uncertainty, and state the outcome, rationale, residual risks, and next action.",
+    "Combine dependency outputs into one decision-ready result. Resolve conflicts by evidence strength, preserve material uncertainty, and state the outcome, rationale, acceptance evidence, residual risks, and next action. Do not invent consensus or new facts absent from dependency evidence.",
 }
 
 export function compileWorkflowBlocks(
@@ -150,7 +147,6 @@ function compileBlock(objective: string, block: WorkflowBlock, blocks: WorkflowB
         dependencies,
         objective,
         instruction: block.instruction,
-        skills: block.skills,
         contract:
           "Reproduce or characterize the failure read-only where possible. Capture exact symptoms, commands, logs, boundaries, and the smallest falsifiable observations. Do not patch the code.",
         required: false,
@@ -164,7 +160,6 @@ function compileBlock(objective: string, block: WorkflowBlock, blocks: WorkflowB
         dependencies: [evidenceID],
         objective,
         instruction: block.instruction,
-        skills: block.skills,
         contract: BLOCK_CONTRACTS.debug,
         required: block.required ?? true,
         reportToParent: block.report_to_parent ?? false,
@@ -192,7 +187,6 @@ function compileBlock(objective: string, block: WorkflowBlock, blocks: WorkflowB
         dependencies,
         objective,
         instruction: block.instruction,
-        skills: block.skills,
         contract: `${BLOCK_CONTRACTS.review} Focus on documented repository standards, architecture constraints, correctness, and verification evidence.`,
         required: false,
         reportToParent: false,
@@ -206,7 +200,6 @@ function compileBlock(objective: string, block: WorkflowBlock, blocks: WorkflowB
         dependencies,
         objective,
         instruction: block.instruction,
-        skills: block.skills,
         contract: `${BLOCK_CONTRACTS.review} Focus on the confirmed goal, scope, acceptance criteria, and user-visible behavior.`,
         required: false,
         reportToParent: false,
@@ -220,7 +213,6 @@ function compileBlock(objective: string, block: WorkflowBlock, blocks: WorkflowB
         dependencies: [standardsID, intentID, ...(route ? [route.verification.id] : [])],
         objective,
         instruction: block.instruction,
-        skills: block.skills,
         contract: [
           "Arbitrate the two independent reviews finding by finding.",
           route
@@ -258,7 +250,6 @@ function compileBlock(objective: string, block: WorkflowBlock, blocks: WorkflowB
       dependencies,
       objective,
       instruction: block.instruction,
-      skills: block.skills,
       contract: BLOCK_CONTRACTS[block.kind],
       required,
       reportToParent: block.report_to_parent ?? block.kind === "synthesize",
@@ -279,7 +270,6 @@ function node(input: {
   dependencies: readonly string[]
   objective: string
   instruction?: string
-  skills?: readonly string[]
   contract: string
   required: boolean
   reportToParent: boolean
@@ -288,9 +278,6 @@ function node(input: {
   review?: NodeConfig["review"]
   outputSchema?: Record<string, unknown>
 }): NodeConfig {
-  const skillInstruction = input.skills?.length
-    ? `Before working, load these relevant skills with the skill tool when available: ${input.skills.join(", ")}. If one is unavailable, state that limitation and continue from repository evidence.`
-    : ""
   const instruction = input.instruction?.trim() ? "Block-specific instruction:\n{{instruction}}" : ""
   return {
     id: input.id,
@@ -303,7 +290,6 @@ function node(input: {
       inline: [
         "Workflow objective:\n{{objective}}",
         instruction,
-        skillInstruction,
         input.contract,
         "Use dependency outputs as evidence and return a concise artifact that downstream blocks can consume. Do not ask the user questions from this child session.",
       ]
@@ -374,7 +360,6 @@ function serializeWorkspaceWriters(blocks: WorkflowBlock[]) {
       kind: block.kind,
       depends_on: [...(block.depends_on ?? []), previous],
       instruction: block.instruction,
-      skills: block.skills,
       worker_type: block.worker_type,
       required: block.required,
       report_to_parent: block.report_to_parent,

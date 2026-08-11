@@ -1,63 +1,78 @@
-# Workflow Orchestration
+# Orchestration Router
 
-In the user-facing parent session, use this tool proactively when one user
-objective needs staged, parallel, quality-gated, or adaptive execution. A slash
-command is not required. A DAG child session executes its assigned block and
-must not recursively route that assignment into another workflow.
+The user-facing parent owns workflow qualification and block composition. A
+slash command or external Skill is not required. A DAG child executes its
+assigned block directly and never creates a nested workflow.
 
-## Execution Mode Selection
+Do not discover, load, or apply an external Skill to select the workflow route
+or compose its blocks. Installed routing Skills do not override this product
+contract and must not change the selected graph or generated block prompts.
 
-- Use direct execution for conversation, a small read-only lookup, or one or
-  two isolated utility scripts outside a project-level change.
-- Use one `task` subagent for one independent non-trivial leaf assignment.
-- Use one `workflow` DAG for project-level source or test changes (even when
-  only one project file is expected), work that crosses module boundaries,
-  product/architecture planning that needs repository exploration, or any
-  staged/parallel/gated/adaptive objective.
+## Execution mode
 
-Related work for one objective belongs in one live workflow. The parent
-conversation owns user decisions, scope, checkpoints, workflow control, and
-the final synthesis. Child nodes own executable leaf work. Explicit requests
-for “single agent”, “do not use DAG”, or direct work disable proactive DAG
-selection. Read-only scope changes what nodes may do; it does not by itself
-disable a useful exploration or review DAG.
+- Direct execution: conversation, a small read-only lookup, or one or two
+  isolated utility scripts outside a project-level change.
+- One `task` child: one independent non-trivial leaf assignment.
+- One `workflow` DAG: project-level source or test changes, even one project
+  file; cross-module work; repository-backed product or architecture work; or
+  staged, parallel, quality-gated, or adaptive execution.
 
-For a project-level route, load the `orchestration-router` skill before
-constructing the graph. It selects the smallest useful sequence of composable
-blocks and defines the one-confirmation decision checkpoint. Do not place user
-questioning inside a child node.
+An explicit request for one agent, direct work, or no DAG selects direct work.
+Related work for one objective stays under one workflow ID; extend or replan
+that workflow when evidence adds work.
+
+## Qualify before composing
+
+Inspect repository instructions, code, tests, history, and runtime evidence
+before asking. Classify what remains as confirmed facts, safe inferences,
+runnable uncertainties, user-owned decisions, and executable work.
+
+When a user-owned choice materially changes behavior, scope, acceptance, or an
+irreversible boundary, present one **Decision Checkpoint** before executable
+blocks start. Its **Workflow Brief** contains the recommended answer and why,
+scope, acceptance evidence, assumptions, risks, and only materially different
+alternatives. Ask for one combined confirmation. A request that already
+contains an equivalent confirmed brief needs no checkpoint. Child nodes never
+ask the user to make product or scope decisions.
+
+## Compose the smallest justified graph
+
+Use `workflow(action="guide", topic="blocks")` when block fields are not in
+context. Choose blocks from evidence, not from a fixed all-phases pipeline:
+
+- feature: optional evidence → plan/design → coding packages → verify → review;
+- bug without a proven cause: debug → coding → verify → review;
+- runnable uncertainty: prototype → update the plan;
+- product or architecture decision: evidence lanes → plan options → review or
+  synthesize;
+- existing implementation review: scope evidence → verify when required →
+  review.
+
+Omit exploration when facts are already sufficient, omit prototype when
+inspection resolves the question, and add synthesize only when outputs need
+reconciliation. High-level block contracts are self-contained; block
+instructions specialize the task and never name external Skills.
+
+When a saved route matches the topology, read it, retarget its objective and
+block instructions, and prune or add justified blocks before starting the
+edited inline spec. Start `spec_path` directly only when its target already
+matches exactly. Use low-level nodes only for bindings, conditions, output
+schemas, or lifecycle metadata blocks cannot express.
+
+Validate the composed or edited spec before start. Fix every diagnostic and
+validate again; validation creates no workflow. A successful start returns the
+exact workflow ID. The parent owns the brief, graph, user interaction,
+checkpoints, controls, and final report; children own bounded executable work.
+End after start and let the workflow wake the parent. Do not poll merely to
+wait, and never claim an unstarted graph is running.
 
 ## Progressive guidance
 
-Load details only when needed:
+- `guide` without `topic`: compact index.
+- `guide(topic="blocks")`: block shape and composition semantics.
+- `guide(topic="interface")`: low-level node and tool fields.
+- `guide(topic="policy")`: gates, recovery, and bounded repair.
+- `guide(topic="patterns")`: larger domain playbooks.
 
-- **guide** without `topic`: compact topic index.
-- **guide** `topic=blocks`: composable block schema and examples.
-- **guide** `topic=interface`: low-level node fields and tool semantics.
-- **guide** `topic=policy`: admission, gates, recovery, and bounded repair.
-- **guide** `topic=patterns`: larger domain playbooks.
-
-## Actions
-
-- **start** creates one workflow from exactly one inline `spec` or saved
-  `spec_path`.
-- **extend** adds nodes or blocks to the same objective.
-- **status** reads durable state when the user asks or before a control
-  decision; it is not a waiting mechanism.
-- **result** reads one node's complete durable output in bounded pages when a
-  wake preview reports `truncated=true`.
-- **control** pauses, resumes, cancels, replans, steps, or completes a workflow.
-- **list** shows saved workflow specs and their resolution scope.
-- **read** returns one saved spec so the parent can retarget it before start.
-
-Prefer high-level `blocks` for a fresh one-off flow. Use low-level `nodes` when
-the task needs custom bindings, conditions, output schemas, or review metadata.
-Never provide both. Reusable saved YAML remains valid and may use either form.
-When a saved route is generic, call **read**, replace its objective and
-block-specific instructions with the confirmed request, then pass the result
-as an inline **start** spec. Start by `spec_path` only when the saved target
-already matches exactly.
-
-The workflow runs asynchronously and wakes the parent at actionable reporting
-nodes or terminal state. Do not poll, sleep, or loop merely to wait. Never
-claim a workflow started unless **start** returned its exact workflow ID.
+The tool parameter schema owns required fields and exclusivity; author calls
+from that schema rather than reconstructed prose.

@@ -24,6 +24,7 @@ import { Parameters as Task } from "../../src/tool/task"
 import { Parameters as Todo } from "../../src/tool/todo"
 import { Parameters as WebFetch } from "../../src/tool/webfetch"
 import { Parameters as WebSearch } from "../../src/tool/websearch"
+import { WorkflowParameters } from "../../src/tool/workflow"
 import { Parameters as Write } from "../../src/tool/write"
 
 const parse = <S extends Schema.Decoder<unknown>>(schema: S, input: unknown): S["Type"] =>
@@ -51,7 +52,22 @@ describe("tool parameters", () => {
     test("todo", () => expect(toJsonSchema(Todo)).toMatchSnapshot())
     test("webfetch", () => expect(toJsonSchema(WebFetch)).toMatchSnapshot())
     test("websearch", () => expect(toJsonSchema(WebSearch)).toMatchSnapshot())
+    test("workflow", () => expect(toJsonSchema(WorkflowParameters)).toMatchSnapshot())
     test("write", () => expect(toJsonSchema(Write)).toMatchSnapshot())
+
+    // Regression fixture from change repair-workflow-authoring-validation:
+    // the pre-change flat Parameters left the inline spec opaque after
+    // provider transformation and exposed runtime-derived identity fields.
+    // The capture lives in fixtures/ so the red evidence survives the fix.
+    test("workflow pre-change evidence recorded the opaque inline spec", async () => {
+      const evidence = await Bun.file(new URL("./fixtures/workflow-parameters-pre-change.json", import.meta.url)).json()
+      expect(evidence.field_count).toBe(11)
+      expect(evidence.session_id_exposed).toBe(true)
+      expect(evidence.project_id_exposed).toBe(true)
+      expect(evidence.transformed.openai.spec_properties).toEqual({})
+      expect(evidence.transformed.azure.spec_properties).toEqual({})
+      expect(evidence.transformed.gemini.spec_property_keys).toEqual([])
+    })
 
     test("inlines named child schemas for provider compatibility", () => {
       const schema = toJsonSchema(Question)

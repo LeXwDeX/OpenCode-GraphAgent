@@ -1,0 +1,126 @@
+{
+  "captured_from": "packages/opencode/src/tool/workflow.ts (discriminated-union Parameters)",
+  "schema_bytes": 29254,
+  "branch_count": 14,
+  "session_id_exposed": false,
+  "project_id_exposed": false,
+  "transformed": {
+    "openai": {
+      "bytes": 29306,
+      "branch_count": 14,
+      "start_inline_spec_config_present": true,
+      "blocks_branch_fields": [
+        "name",
+        "objective",
+        "blocks",
+        "node_defaults",
+        "max_concurrency",
+        "max_node_replan_attempts",
+        "max_total_nodes"
+      ],
+      "block_item_fields": [
+        "id",
+        "kind",
+        "depends_on",
+        "instruction",
+        "worker_type",
+        "required",
+        "report_to_parent"
+      ],
+      "node_item_fields": [
+        "id",
+        "name",
+        "worker_type",
+        "depends_on",
+        "required",
+        "prompt_template",
+        "worker_config",
+        "input_mapping",
+        "report_to_parent",
+        "condition",
+        "restart",
+        "cancel",
+        "output_schema",
+        "review"
+      ]
+    },
+    "azure": {
+      "bytes": 29306,
+      "branch_count": 14,
+      "start_inline_spec_config_present": true,
+      "blocks_branch_fields": [
+        "name",
+        "objective",
+        "blocks",
+        "node_defaults",
+        "max_concurrency",
+        "max_node_replan_attempts",
+        "max_total_nodes"
+      ],
+      "block_item_fields": [
+        "id",
+        "kind",
+        "depends_on",
+        "instruction",
+        "worker_type",
+        "required",
+        "report_to_parent"
+      ],
+      "node_item_fields": [
+        "id",
+        "name",
+        "worker_type",
+        "depends_on",
+        "required",
+        "prompt_template",
+        "worker_config",
+        "input_mapping",
+        "report_to_parent",
+        "condition",
+        "restart",
+        "cancel",
+        "output_schema",
+        "review"
+      ]
+    },
+    "gemini": {
+      "bytes": 29254,
+      "branch_count": 14,
+      "start_inline_spec_config_present": true,
+      "blocks_branch_fields": [
+        "name",
+        "objective",
+        "blocks",
+        "node_defaults",
+        "max_concurrency",
+        "max_node_replan_attempts",
+        "max_total_nodes"
+      ],
+      "block_item_fields": [
+        "id",
+        "kind",
+        "depends_on",
+        "instruction",
+        "worker_type",
+        "required",
+        "report_to_parent"
+      ],
+      "node_item_fields": [
+        "id",
+        "name",
+        "worker_type",
+        "depends_on",
+        "required",
+        "prompt_template",
+        "worker_config",
+        "input_mapping",
+        "report_to_parent",
+        "condition",
+        "restart",
+        "cancel",
+        "output_schema",
+        "review"
+      ]
+    }
+  }
+}

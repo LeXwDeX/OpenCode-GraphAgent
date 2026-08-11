@@ -1,0 +1,211 @@
+import { describe, expect } from "bun:test"
+import { Effect } from "effect"
+import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
+import { WorkflowAuthoring } from "../../src/dag/authoring"
+import { DagValidation } from "../../src/dag/validation"
+import { testEffect } from "../lib/effect"
+
+const it = testEffect(CrossSpawnSpawner.defaultLayer)
+
+const node = {
+  id: "work",
+  name: "work",
+  worker_type: "general",
+  depends_on: [],
+  prompt_template: { inline: "Do the work" },
+}
+
+const start = {
+  config: {
+    name: "one-node",
+    nodes: [node],
+  },
+}
+
+describe("WorkflowAuthoring source-to-graph seam", () => {
+  it.effect("prepares start, extend, and replan through one action-aware interface", () =>
+    Effect.gen(function* () {
+      const authoring = WorkflowAuthoring.make()
+      const inputs = [
+        { action: "start" as const, value: start },
+        { action: "extend" as const, value: { nodes: [{ ...node, id: "extend" }] } },
+        {
+          action: "replan" as const,
+          value: { fragment: { name: "replacement", nodes: [{ ...node, id: "replacement" }] } },
+        },
+      ]
+
+      for (const input of inputs) {
+        const result = yield* authoring.prepare({
+          action: input.action,
+          source: { kind: "inline", value: input.value },
+          profile: "portable",
+        })
+        expect(result.valid).toBe(true)
+        expect(result.prepared?.action).toBe(input.action)
+        expect(result.prepared?.nodes).toHaveLength(1)
+        if (input.action === "start") {
+          expect(result.prepared).toMatchObject({
+            action: "start",
+            title: "one-node",
+            config: { name: "one-node", mode: "standard", nodes: [{ id: "work" }] },
+          })
+        }
+      }
+    }),
+  )
+
+  it.effect("treats inline values strictly but adapts legacy model hints only at the YAML boundary", () =>
+    Effect.gen(function* () {
+      const authoring = WorkflowAuthoring.make()
+      const inline = yield* authoring.prepare({
+        action: "start",
+        source: {
+          kind: "inline",
+          value: {
+            config: {
+              name: "inline-model",
+              node_defaults: { model: { providerID: "openai", modelID: "gpt-4.1" } },
+              nodes: [{ ...node, model: { providerID: "openai", modelID: "gpt-4.1" } }],
+            },
+          },
+        },
+        profile: "portable",
+      })
+      expect(inline.valid).toBe(false)
+      expect(inline.errors.map((error) => error.code)).toContain(DagValidation.DIAGNOSTIC_CODES.schemaInvalid)
+
+      const yaml = yield* authoring.prepare({
+        action: "start",
+        source: {
+          kind: "yaml",
+          source: "legacy.yaml",
+          content: [
+            "config:",
+            "  name: legacy-model",
+            "  node_defaults:",
+            "    model: { providerID: openai, modelID: gpt-4.1 }",
+            "  nodes:",
+            "    - id: work",
+            "      name: work",
+            "      worker_type: general",
+            "      depends_on: []",
+            "      model: { providerID: openai, modelID: gpt-4.1 }",
+            "      prompt_template: { inline: Do the work }",
+          ].join("\n"),
+        },
+        profile: "portable",
+      })
+      expect(yaml.valid).toBe(true)
+      expect(yaml.prepared?.nodes[0]?.model).toEqual({ providerID: "openai", modelID: "gpt-4.1" })
+      expect(yaml.prepared?.action === "start" ? yaml.prepared.config.node_defaults?.model : undefined).toEqual({
+        providerID: "openai",
+        modelID: "gpt-4.1",
+      })
+
+      const replan = yield* authoring.prepare({
+        action: "replan",
+        source: {
+          kind: "yaml",
+          source: "legacy-replan.yaml",
+          content: [
+            "fragment:",
+            "  name: legacy-replan",
+            "  node_defaults:",
+            "    model: { providerID: openai, modelID: gpt-4.1 }",
+            "  nodes:",
+            "    - id: work",
+            "      name: work",
+            "      worker_type: general",
+            "      depends_on: []",
+            "      prompt_template: { inline: Do the work }",
+          ].join("\n"),
+        },
+        profile: "portable",
+      })
+      expect(replan.prepared?.nodes[0]?.model).toEqual({ providerID: "openai", modelID: "gpt-4.1" })
+    }),
+  )
+
+  it.effect("reports malformed YAML as stable diagnostics instead of throwing", () =>
+    Effect.gen(function* () {
+      const result = yield* WorkflowAuthoring.make().prepare({
+        action: "start",
+        source: { kind: "yaml", source: "broken.yaml", content: "config: [unclosed" },
+        profile: "portable",
+      })
+      expect(result).toMatchObject({
+        source: "broken.yaml",
+        profile: "portable",
+        valid: false,
+        errors: [{ code: DagValidation.DIAGNOSTIC_CODES.schemaInvalid, path: "$" }],
+        warnings: [],
+      })
+      expect(result.prepared).toBeUndefined()
+    }),
+  )
+
+  it.effect("keeps portable caching but refreshes live environment catalogs", () =>
+    Effect.gen(function* () {
+      let loads = 0
+      const authoring = WorkflowAuthoring.make({
+        loadEnvironment: () => {
+          loads += 1
+          return Effect.succeed({
+            worker_types: new Set(loads === 1 ? ["general"] : []),
+          })
+        },
+      })
+      const input = {
+        action: "start" as const,
+        source: { kind: "inline" as const, value: start },
+      }
+      const portable = yield* authoring.prepare({ ...input, profile: "portable" })
+      expect(portable.valid).toBe(true)
+      expect(loads).toBe(0)
+
+      const first = yield* authoring.prepare({ ...input, profile: "environment" })
+      const second = yield* authoring.prepare({ ...input, profile: "environment" })
+      expect(first.valid).toBe(true)
+      expect(second.valid).toBe(false)
+      expect(second.prepared).toBeUndefined()
+      expect(loads).toBe(2)
+    }),
+  )
+
+  it.effect("fails closed when environment validation has no catalog loader", () =>
+    Effect.gen(function* () {
+      const result = yield* WorkflowAuthoring.make().prepare({
+        action: "start",
+        source: { kind: "inline", value: start },
+        profile: "environment",
+      })
+
+      expect(result.valid).toBe(false)
+      expect(result.errors).toContainEqual(
+        expect.objectContaining({
+          code: DagValidation.DIAGNOSTIC_CODES.environmentUnavailable,
+          path: "$environment",
+        }),
+      )
+      expect(result.prepared).toBeUndefined()
+    }),
+  )
+
+  it.effect("keeps source identity distinct when equal content is cached", () =>
+    Effect.gen(function* () {
+      const authoring = WorkflowAuthoring.make()
+      const content = Bun.YAML.stringify(start)
+      const first = yield* authoring.prepare({
+        action: "start",
+        source: { kind: "yaml", source: "first.yaml", content },
+      })
+      const second = yield* authoring.prepare({
+        action: "start",
+        source: { kind: "yaml", source: "second.yaml", content },
+      })
+      expect(first.source).toBe("first.yaml")
+      expect(second.source).toBe("second.yaml")
+    }),
+  )
+})
