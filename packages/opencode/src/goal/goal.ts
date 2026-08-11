@@ -1,19 +1,26 @@
 export * as Goal from "./goal"
 
 import { Effect, Layer, Context, Schema, Fiber } from "effect"
-import { eq } from "drizzle-orm"
+import { desc, eq } from "drizzle-orm"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Database } from "@opencode-ai/core/database/database"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { GoalState } from "./state"
-import { GoalStateTable } from "@opencode-ai/core/goal/sql"
+import { GoalOutcomeTable, GoalStateTable } from "@opencode-ai/core/goal/sql"
 import { GoalEvent } from "./events"
 import { GoalPrompts } from "./prompts"
 import { SessionID } from "@/session/schema"
 import { SessionStatus } from "@/session/status"
+import { SessionAutomationLease } from "@/session/automation-lease"
+
+export type RemoveSubgoalResult =
+  | { tag: "ok"; removed: string; state: GoalState.Info }
+  | { tag: "noState" }
+  | { tag: "outOfBounds"; size: number }
 
 export interface Interface {
   readonly load: (sessionID: SessionID) => Effect.Effect<GoalState.Info | undefined>
+  readonly lastOutcome: (sessionID: SessionID) => Effect.Effect<GoalState.Info | undefined>
   readonly set: (sessionID: SessionID, goal: string, maxTurns?: number) => Effect.Effect<GoalState.Info>
   readonly pause: (sessionID: SessionID, reason: string) => Effect.Effect<GoalState.Info | undefined>
   readonly resume: (sessionID: SessionID) => Effect.Effect<GoalState.Info | undefined>
@@ -24,11 +31,7 @@ export interface Interface {
     sessionID: SessionID,
     /** 1-based index of the subgoal to remove (1 = first subgoal). */
     index: number,
-  ) => Effect.Effect<
-    | { tag: "ok"; removed: string; state: GoalState.Info }
-    | { tag: "noState" }
-    | { tag: "outOfBounds"; size: number }
-  >
+  ) => Effect.Effect<RemoveSubgoalResult>
   readonly clearSubgoals: (sessionID: SessionID) => Effect.Effect<GoalState.Info | undefined>
   readonly statusLine: (sessionID: SessionID) => Effect.Effect<string | undefined>
   readonly dispatch: (sessionID: SessionID, args: string) => Effect.Effect<{
@@ -42,9 +45,10 @@ export interface Interface {
   }>
   readonly updateAfterJudge: (
     sessionID: SessionID,
-    verdict: "done" | "continue",
+    verdict: GoalState.Verdict,
     reason: string,
     parseFailed: boolean,
+    expected?: { readonly goalID: string; readonly revision: number },
   ) => Effect.Effect<
     | {
         state: GoalState.Info
@@ -99,12 +103,13 @@ export interface Interface {
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Goal") {}
 
-export const layer = Layer.effect(
+const serviceLayer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const events = yield* EventV2Bridge.Service
     const { db } = yield* Database.Service
     const sessionStatus = yield* SessionStatus.Service
+    const automation = yield* SessionAutomationLease.Service
 
     // Unified event publisher — every state change publishes goal.updated
     // with the full snapshot, identical to Todo's todo.updated pattern.
@@ -154,49 +159,6 @@ export const layer = Layer.effect(
       }
     })
 
-    // Terminal cleanup for "done" transitions. Loads current state (if any),
-    // constructs a transient snapshot with status="done" + the given reason,
-    // emits goal.updated(done), deletes the row, then emits goal.cleared.
-    //
-    // Does NOT touch the fiber map. This is the key safety property:
-    //   - markDone (user-initiated from slash command or goal.complete
-    //     tool) calls clearFiber FIRST, then deleteAndPublishDone — the
-    //     loop fiber is already stopped when this runs.
-    //   - loop.ts done branch calls deleteAndPublishDone DIRECTLY from
-    //     inside the loop fiber — so it must not self-interrupt.
-    //
-    // Without this separation, calling goal.clear() from within afterIdle
-    // would interrupt ourselves before goal.cleared was published (the
-    // event bus would miss the terminal event, and TUI/SSE consumers
-    // polling state would never see the transition).
-    //
-    // The whole terminal sequence (load → publish(done) → delete →
-    // publish(cleared)) runs inside Effect.uninterruptible. This is
-    // defense-in-depth (F1): even if a future caller arranges for the loop
-    // fiber to be interrupted mid-call, the terminal event contract still
-    // completes atomically — goal.cleared cannot be skipped by an interrupt
-    // landing between publish(done) and publish(cleared). The operations are
-    // short synchronous DB + event publishes, so there is no deadlock risk.
-    const deleteAndPublishDone = Effect.fnUntraced(function* (sessionID: SessionID, reason: string) {
-      return yield* Effect.uninterruptible(
-        Effect.gen(function* () {
-          const state = yield* loadState(sessionID)
-          if (state) {
-            const doneState = new GoalState.Info({
-              ...state,
-              status: "done",
-              last_verdict: "done",
-              last_reason: reason,
-            })
-            yield* publishGoal(sessionID, doneState)
-          }
-          yield* deleteState(sessionID)
-          yield* events.publish(GoalEvent.Cleared, { sessionID })
-          return state
-        }),
-      )
-    })
-
     function loadState(sessionID: SessionID) {
       return db
         .select()
@@ -212,34 +174,135 @@ export const layer = Layer.effect(
         )
     }
 
-    function saveState(sessionID: SessionID, state: GoalState.Info) {
-      const payload = JSON.stringify(Schema.encodeSync(GoalState.Info)(state))
-      return db
-        .insert(GoalStateTable)
-        .values({ session_id: sessionID, payload, updated_at: Date.now() })
-        .onConflictDoUpdate({
-          target: GoalStateTable.session_id,
-          set: { payload, updated_at: Date.now() },
-        })
-        .run()
-        .pipe(Effect.orDie)
-    }
+    type Transition<A> =
+      | { readonly tag: "noop"; readonly value: A }
+      | { readonly tag: "save"; readonly state: GoalState.Info; readonly value: A }
+      | {
+          readonly tag: "delete"
+          readonly terminal?: GoalState.Info
+          readonly value: A
+        }
 
-    function deleteState(sessionID: SessionID) {
-      return db
-        .delete(GoalStateTable)
-        .where(eq(GoalStateTable.session_id, sessionID))
-        .run()
-        .pipe(Effect.orDie)
-    }
+    // The only durable Goal mutation seam. The immediate transaction makes the
+    // read + decision + write/delete one serializable state transition, so a
+    // stale loop result cannot overwrite a concurrent pause or resurrect a row
+    // deleted by clear. Events are emitted after commit but inside the same
+    // uninterruptible region; durable state always leads presentation state.
+    const transition = <A>(
+      sessionID: SessionID,
+      decide: (state: GoalState.Info | undefined) => Transition<A>,
+    ) =>
+      Effect.uninterruptible(
+        Effect.gen(function* () {
+          const result = yield* db
+            .transaction(
+              (tx) =>
+                Effect.gen(function* () {
+                  const row = yield* tx
+                    .select()
+                    .from(GoalStateTable)
+                    .where(eq(GoalStateTable.session_id, sessionID))
+                    .get()
+                  const current = row
+                    ? Schema.decodeUnknownSync(GoalState.Info)(JSON.parse(row.payload))
+                    : undefined
+                  const next = decide(current)
+                  if (next.tag === "save") {
+                    const payload = JSON.stringify(Schema.encodeSync(GoalState.Info)(next.state))
+                    if (row) {
+                      yield* tx
+                        .update(GoalStateTable)
+                        .set({ payload, updated_at: Math.max(Date.now(), row.updated_at + 1) })
+                        .where(eq(GoalStateTable.session_id, sessionID))
+                        .run()
+                    } else {
+                      yield* tx
+                        .insert(GoalStateTable)
+                        .values({ session_id: sessionID, payload, updated_at: Date.now() })
+                        .run()
+                    }
+                  }
+                  if (next.tag === "delete" && row) {
+                    if (next.terminal) {
+                      const payload = JSON.stringify(Schema.encodeSync(GoalState.Info)(next.terminal))
+                      const goalID =
+                        next.terminal.goal_id && next.terminal.goal_id !== "legacy"
+                          ? next.terminal.goal_id
+                          : `${sessionID}:legacy:${next.terminal.created_at}`
+                      yield* tx
+                        .insert(GoalOutcomeTable)
+                        .values({
+                          goal_id: goalID,
+                          session_id: sessionID,
+                          payload,
+                          completed_at: Date.now(),
+                        })
+                        .onConflictDoUpdate({
+                          target: GoalOutcomeTable.goal_id,
+                          set: { payload, completed_at: Date.now() },
+                        })
+                        .run()
+                    }
+                    yield* tx
+                      .delete(GoalStateTable)
+                      .where(eq(GoalStateTable.session_id, sessionID))
+                      .run()
+                  }
+                  return next
+                }),
+              { behavior: "immediate" },
+            )
+            .pipe(Effect.orDie)
+          if (result.tag === "save") yield* publishGoal(sessionID, result.state)
+          if (result.tag === "delete") {
+            if (result.terminal) yield* publishGoal(sessionID, result.terminal)
+            yield* events.publish(GoalEvent.Cleared, { sessionID })
+          }
+          return result.value
+        }),
+      )
+
+    const matchesExpected = (
+      state: GoalState.Info,
+      expected?: { readonly goalID: string; readonly revision: number },
+    ) =>
+      !expected ||
+      ((state.goal_id ?? "legacy") === expected.goalID && (state.revision ?? 0) === expected.revision)
+
+    const deleteAndPublishDone = Effect.fnUntraced(function* (sessionID: SessionID, reason: string) {
+      return yield* transition<GoalState.Info | undefined>(sessionID, (state) => {
+        if (!state) return { tag: "noop", value: undefined }
+        const doneState = GoalState.advance(state, {
+          status: "done",
+          last_verdict: "done",
+          last_reason: reason,
+        })
+        return { tag: "delete", terminal: doneState, value: state }
+      })
+    })
 
     const load = Effect.fn("Goal.load")(function* (sessionID: SessionID) {
       return yield* loadState(sessionID)
     })
 
+    const lastOutcome = Effect.fn("Goal.lastOutcome")(function* (sessionID: SessionID) {
+      const row = yield* db
+        .select()
+        .from(GoalOutcomeTable)
+        .where(eq(GoalOutcomeTable.session_id, sessionID))
+        .orderBy(desc(GoalOutcomeTable.completed_at))
+        .limit(1)
+        .get()
+        .pipe(Effect.orDie)
+      if (!row) return undefined
+      return Schema.decodeUnknownSync(GoalState.Info)(JSON.parse(row.payload))
+    })
+
     const set = Effect.fn("Goal.set")(function* (sessionID: SessionID, goal: string, maxTurns?: number) {
       const now = Date.now()
       const state = new GoalState.Info({
+        goal_id: Bun.randomUUIDv7(),
+        revision: GoalState.nni(0),
         goal,
         status: "active",
         turns_used: GoalState.nni(0),
@@ -249,23 +312,24 @@ export const layer = Layer.effect(
         consecutive_parse_failures: GoalState.nni(0),
         subgoals: [],
       })
-      yield* saveState(sessionID, state)
-      yield* publishGoal(sessionID, state)
-      return state
+      const result = yield* transition(sessionID, () => ({ tag: "save", state, value: state }))
+      yield* automation.register(sessionID, { kind: "goal", id: result.goal_id ?? "legacy" })
+      return result
     })
 
     const pause = Effect.fn("Goal.pause")(function* (sessionID: SessionID, reason: string) {
-      const state = yield* loadState(sessionID)
-      if (!state || state.status !== "active") return undefined
-      const updated = new GoalState.Info({
-        ...state,
-        status: "paused",
-        paused_reason: reason,
-        last_turn_at: Date.now(),
+      const updated = yield* transition(sessionID, (state) => {
+        if (!state || state.status !== "active") return { tag: "noop", value: undefined }
+        const next = GoalState.advance(state, {
+          status: "paused",
+          paused_reason: reason,
+          last_turn_at: Date.now(),
+        })
+        return { tag: "save", state: next, value: next }
       })
-      yield* saveState(sessionID, updated)
+      if (!updated) return undefined
+      yield* automation.unregister(sessionID, { kind: "goal", id: updated.goal_id ?? "legacy" })
       yield* clearFiber(sessionID)
-      yield* publishGoal(sessionID, updated)
       return updated
     })
 
@@ -279,47 +343,38 @@ export const layer = Layer.effect(
     // and publishing goal.updated(paused) can never leave a paused DB row
     // with no corresponding event on the bus.
     const pauseAndPublish = Effect.fnUntraced(function* (sessionID: SessionID, reason: string) {
-      return yield* Effect.uninterruptible(
-        Effect.gen(function* () {
-          const state = yield* loadState(sessionID)
-          if (!state || state.status !== "active") return undefined
-          const updated = new GoalState.Info({
-            ...state,
-            status: "paused",
-            paused_reason: reason,
-            last_turn_at: Date.now(),
-          })
-          yield* saveState(sessionID, updated)
-          yield* publishGoal(sessionID, updated)
-          return updated
-        }),
-      )
+      return yield* transition(sessionID, (state) => {
+        if (!state || state.status !== "active") return { tag: "noop", value: undefined }
+        const updated = GoalState.advance(state, {
+          status: "paused",
+          paused_reason: reason,
+          last_turn_at: Date.now(),
+        })
+        return { tag: "save", state: updated, value: updated }
+      })
     })
 
     const resume = Effect.fn("Goal.resume")(function* (sessionID: SessionID) {
-      const state = yield* loadState(sessionID)
-      if (!state || state.status !== "paused") return undefined
-      // Preserve turns_used so the original max_turns budget is respected.
-      // Resetting to 0 would silently grant another full budget, defeating
-      // `max_turns` as a runaway guard — a paused goal that exhausted its
-      // budget would immediately re-exhaust the new budget on resume.
-      // Users wanting a fresh budget should /goal clear and /goal <text>.
-      const updated = new GoalState.Info({
-        ...state,
-        status: "active",
-        consecutive_parse_failures: GoalState.nni(0),
-        paused_reason: undefined,
-        last_turn_at: Date.now(),
+      const updated = yield* transition(sessionID, (state) => {
+        if (!state || state.status !== "paused") return { tag: "noop", value: undefined }
+        const updated = GoalState.advance(state, {
+          status: "active",
+          consecutive_parse_failures: GoalState.nni(0),
+          paused_reason: undefined,
+          last_turn_at: Date.now(),
+        })
+        return { tag: "save", state: updated, value: updated }
       })
-      yield* saveState(sessionID, updated)
-      yield* publishGoal(sessionID, updated)
+      if (updated)
+        yield* automation.register(sessionID, { kind: "goal", id: updated.goal_id ?? "legacy" })
       return updated
     })
 
     const clear = Effect.fn("Goal.clear")(function* (sessionID: SessionID) {
-      yield* deleteState(sessionID)
+      const cleared = yield* transition(sessionID, (state) => ({ tag: "delete", value: state }))
+      if (cleared)
+        yield* automation.unregister(sessionID, { kind: "goal", id: cleared.goal_id ?? "legacy" })
       yield* clearFiber(sessionID)
-      yield* events.publish(GoalEvent.Cleared, { sessionID })
     })
 
     const markDone = Effect.fn("Goal.markDone")(function* (sessionID: SessionID, reason: string) {
@@ -331,50 +386,48 @@ export const layer = Layer.effect(
       // row (preserving whatever turns_used a prior continue dispatch set) and
       // re-renders the done snapshot from it.
       yield* clearFiber(sessionID)
-      return yield* deleteAndPublishDone(sessionID, reason)
+      const completed = yield* deleteAndPublishDone(sessionID, reason)
+      if (completed)
+        yield* automation.unregister(sessionID, { kind: "goal", id: completed.goal_id ?? "legacy" })
+      return completed
     })
 
     const addSubgoal = Effect.fn("Goal.addSubgoal")(function* (sessionID: SessionID, subgoal: string) {
-      const state = yield* loadState(sessionID)
-      if (!state) return undefined
-      const updated = new GoalState.Info({
-        ...state,
-        subgoals: [...(state.subgoals ?? []), subgoal],
-        last_turn_at: Date.now(),
+      return yield* transition(sessionID, (state) => {
+        if (!state) return { tag: "noop", value: undefined }
+        const updated = GoalState.advance(state, {
+          subgoals: [...(state.subgoals ?? []), subgoal],
+          last_turn_at: Date.now(),
+        })
+        return { tag: "save", state: updated, value: updated }
       })
-      yield* saveState(sessionID, updated)
-      yield* publishGoal(sessionID, updated)
-      return updated
     })
 
     const removeSubgoal = Effect.fn("Goal.removeSubgoal")(function* (sessionID: SessionID, index: number) {
-      const state = yield* loadState(sessionID)
-      if (!state) return { tag: "noState" as const }
-      const subgoals = state.subgoals ?? []
-      const idx = index - 1
-      if (idx < 0 || idx >= subgoals.length) return { tag: "outOfBounds" as const, size: subgoals.length }
-      const removed = subgoals[idx]
-      const updated = new GoalState.Info({
-        ...state,
-        subgoals: subgoals.filter((_, i) => i !== idx),
-        last_turn_at: Date.now(),
+      return yield* transition<RemoveSubgoalResult>(sessionID, (state) => {
+        if (!state) return { tag: "noop", value: { tag: "noState" as const } }
+        const subgoals = state.subgoals ?? []
+        const idx = index - 1
+        if (idx < 0 || idx >= subgoals.length)
+          return { tag: "noop", value: { tag: "outOfBounds" as const, size: subgoals.length } }
+        const removed = subgoals[idx]
+        const updated = GoalState.advance(state, {
+          subgoals: subgoals.filter((_, i) => i !== idx),
+          last_turn_at: Date.now(),
+        })
+        return { tag: "save", state: updated, value: { tag: "ok" as const, removed, state: updated } }
       })
-      yield* saveState(sessionID, updated)
-      yield* publishGoal(sessionID, updated)
-      return { tag: "ok" as const, removed, state: updated }
     })
 
     const clearSubgoals = Effect.fn("Goal.clearSubgoals")(function* (sessionID: SessionID) {
-      const state = yield* loadState(sessionID)
-      if (!state) return undefined
-      const updated = new GoalState.Info({
-        ...state,
-        subgoals: [],
-        last_turn_at: Date.now(),
+      return yield* transition(sessionID, (state) => {
+        if (!state) return { tag: "noop", value: undefined }
+        const updated = GoalState.advance(state, {
+          subgoals: [],
+          last_turn_at: Date.now(),
+        })
+        return { tag: "save", state: updated, value: updated }
       })
-      yield* saveState(sessionID, updated)
-      yield* publishGoal(sessionID, updated)
-      return updated
     })
 
     const statusLine = Effect.fn("Goal.statusLine")(function* (sessionID: SessionID) {
@@ -395,53 +448,65 @@ export const layer = Layer.effect(
 
     const updateAfterJudge = Effect.fn("Goal.updateAfterJudge")(function* (
       sessionID: SessionID,
-      verdict: "done" | "continue",
+      verdict: GoalState.Verdict,
       reason: string,
       parseFailed: boolean,
+      expected?: { readonly goalID: string; readonly revision: number },
     ) {
-      const state = yield* loadState(sessionID)
-      if (!state || state.status !== "active") return undefined
+      return yield* transition(sessionID, (state) => {
+        if (!state || state.status !== "active" || !matchesExpected(state, expected))
+          return { tag: "noop", value: undefined }
 
-      const now = Date.now()
-      const newParseFailures = parseFailed ? state.consecutive_parse_failures + 1 : 0
-
-      if (verdict === "done") {
-        const updated = new GoalState.Info({
-          ...state,
-          status: "done",
-          // State transitions are budget-neutral — a `done` verdict drives no
-          // continuation dispatch, so it must NOT consume budget. turns_used
-          // reflects only continuation dispatches (see spec:
-          // turn-budget-counts-continuation-dispatches-only).
-          turns_used: state.turns_used,
-          last_turn_at: now,
-          last_verdict: "done",
-          last_reason: reason,
-          consecutive_parse_failures: GoalState.nni(newParseFailures),
-        })
-        yield* saveState(sessionID, updated)
-        // Do NOT publish goal.updated here. deleteAndPublishDone is the SOLE
-        // owner of the terminal event sequence (goal.updated(done) → delete →
-        // goal.cleared); publishing here would double-fire goal.updated(done)
-        // on every judge-declared completion (see spec:
-        // terminal-event-contract-publishes-exactly-once). We still saveState
-        // so deleteAndPublishDone can load the done row and re-render the
-        // snapshot. loop.ts invokes deleteAndPublishDone after this returns.
-        return {
-          state: updated,
-          shouldContinue: false,
-          message: `✓ 目标已达成：${reason}`,
+        const now = Date.now()
+        const newParseFailures = parseFailed ? state.consecutive_parse_failures + 1 : 0
+        if (verdict === "done") {
+          const updated = GoalState.advance(state, {
+            status: "done",
+            last_turn_at: now,
+            last_verdict: "done",
+            last_reason: reason,
+            consecutive_parse_failures: GoalState.nni(newParseFailures),
+          })
+          return {
+            tag: "delete",
+            terminal: updated,
+            value: {
+              state: updated,
+              shouldContinue: false,
+              message: `✓ 目标已达成：${reason}`,
+            },
+          }
         }
-      }
 
-      const turnsUsed = GoalState.nni(state.turns_used + 1)
+        if (verdict === "blocked") {
+          const updated = GoalState.advance(state, {
+            status: "paused",
+            last_turn_at: now,
+            last_verdict: "blocked",
+            last_reason: reason,
+            paused_reason: reason,
+            consecutive_parse_failures: GoalState.nni(newParseFailures),
+          })
+          return {
+            tag: "save",
+            state: updated,
+            value: {
+              state: updated,
+              shouldContinue: false,
+              message: `⏸ 目标已阻塞 — ${reason}`,
+            },
+          }
+        }
 
-      if (newParseFailures >= GoalPrompts.MAX_CONSECUTIVE_PARSE_FAILURES) {
+        const turnsUsed = GoalState.nni(state.turns_used + 1)
         const pauseReason =
-          "judge 模型未返回有效 JSON 判定。请检查模型配置或换用更可靠的模型，然后 /goal resume。"
-        const updated = new GoalState.Info({
-          ...state,
-          status: "paused",
+          newParseFailures >= GoalPrompts.MAX_CONSECUTIVE_PARSE_FAILURES
+            ? "judge 模型未返回有效 JSON 判定。请检查模型配置或换用更可靠的模型，然后 /goal resume。"
+            : turnsUsed >= state.max_turns
+              ? `已用 ${turnsUsed}/${state.max_turns} 轮。使用 /goal resume 继续，或 /goal clear 停止。`
+              : undefined
+        const updated = GoalState.advance(state, {
+          status: pauseReason ? "paused" : "active",
           turns_used: turnsUsed,
           last_turn_at: now,
           last_verdict: "continue",
@@ -449,63 +514,18 @@ export const layer = Layer.effect(
           paused_reason: pauseReason,
           consecutive_parse_failures: GoalState.nni(newParseFailures),
         })
-        // Do NOT call clearFiber here. updateAfterJudge is inlined into
-        // GoalLoop.afterIdle (loop.ts:122), so the fiber running this code
-        // IS the one registered in the fibers map — clearFiber would
-        // self-interrupt before publishGoal reaches the event bus, leaving
-        // the pause invisible to SSE/TUI and aborting the rest of afterIdle.
-        // The fiber naturally terminates when afterIdle returns; no explicit
-        // interrupt is needed (same rationale as pauseAndPublish /
-        // deleteAndPublishDone).
-        yield* saveState(sessionID, updated)
-        yield* publishGoal(sessionID, updated)
         return {
+          tag: "save",
           state: updated,
-          shouldContinue: false,
-          message: `⏸ 目标已暂停 — ${pauseReason}`,
+          value: {
+            state: updated,
+            shouldContinue: !pauseReason,
+            message: pauseReason
+              ? `⏸ 目标已暂停 — ${pauseReason}`
+              : `↻ 继续推进目标（${updated.turns_used}/${updated.max_turns}）：${reason}`,
+          },
         }
-      }
-
-      if (turnsUsed >= state.max_turns) {
-        const pauseReason = `已用 ${turnsUsed}/${state.max_turns} 轮。使用 /goal resume 继续，或 /goal clear 停止。`
-        const updated = new GoalState.Info({
-          ...state,
-          status: "paused",
-          turns_used: turnsUsed,
-          last_turn_at: now,
-          last_verdict: "continue",
-          last_reason: reason,
-          paused_reason: pauseReason,
-          consecutive_parse_failures: GoalState.nni(newParseFailures),
-        })
-        // Same self-interrupt hazard as the parse-failure branch above: we
-        // are running inside the afterIdle loop fiber, so clearFiber would
-        // interrupt ourselves before publishGoal(paused) fires.
-        yield* saveState(sessionID, updated)
-        yield* publishGoal(sessionID, updated)
-        return {
-          state: updated,
-          shouldContinue: false,
-          message: `⏸ 目标已暂停 — ${pauseReason}`,
-        }
-      }
-
-      const updated = new GoalState.Info({
-        ...state,
-        status: "active",
-        turns_used: turnsUsed,
-        last_turn_at: now,
-        last_verdict: "continue",
-        last_reason: reason,
-        consecutive_parse_failures: GoalState.nni(newParseFailures),
       })
-      yield* saveState(sessionID, updated)
-      yield* publishGoal(sessionID, updated)
-      return {
-        state: updated,
-        shouldContinue: true,
-        message: `↻ 继续推进目标（${updated.turns_used}/${updated.max_turns}）：${reason}`,
-      }
     })
 
     const dispatch = Effect.fn("Goal.dispatch")(function* (sessionID: SessionID, args: string) {
@@ -678,6 +698,7 @@ export const layer = Layer.effect(
 
     return Service.of({
       load,
+      lastOutcome,
       set,
       pause,
       resume,
@@ -699,10 +720,16 @@ export const layer = Layer.effect(
   }),
 )
 
+export const layer = serviceLayer.pipe(Layer.provide(SessionAutomationLease.defaultLayer))
+
 export const defaultLayer = layer.pipe(
   Layer.provide(SessionStatus.defaultLayer),
   Layer.provide(EventV2Bridge.defaultLayer),
   Layer.provide(Database.defaultLayer),
 )
 
-export const node = LayerNode.make(layer, [EventV2Bridge.node, Database.node, SessionStatus.node])
+export const node = LayerNode.make(layer, [
+  EventV2Bridge.node,
+  Database.node,
+  SessionStatus.node,
+])

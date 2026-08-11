@@ -23,6 +23,7 @@ import { Session } from "@/session/session"
 import { SessionPrompt } from "@/session/prompt"
 import { SessionID } from "@/session/schema"
 import { SessionStatus } from "@/session/status"
+import { SessionAutomationLease } from "@/session/automation-lease"
 import { renderTemplate } from "../templates/resolve"
 import { sanitizeInput } from "../templates/sanitize"
 import { DagConfig } from "../config"
@@ -46,7 +47,7 @@ interface WorkflowEntry {
   watchers: Map<string, Fiber.Fiber<unknown, unknown>>
 }
 
-export const layer = Layer.effect(
+const serviceLayer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const events = yield* EventV2Bridge.Service
@@ -56,6 +57,7 @@ export const layer = Layer.effect(
     const sessionSvc = yield* Session.Service
     const promptSvc = yield* SessionPrompt.Service
     const statusSvc = yield* SessionStatus.Service
+    const automation = yield* SessionAutomationLease.Service
 
     const state = yield* InstanceState.make(
       Effect.fn("DagLoop.state")(function* (ctx) {
@@ -391,6 +393,7 @@ export const layer = Layer.effect(
             if (isStepping) runtime.setStepMode(true)
             const entry: WorkflowEntry = { runtime, semaphore, evalLock: Semaphore.makeUnsafe(1), parentSessionID: wf.sessionId, config, fibers: new Map(), watchers: new Map() }
             runtimes.set(dagID, entry)
+            yield* automation.register(SessionID.make(wf.sessionId), { kind: "dag", id: dagID })
             // Reconciliation settles every persisted running attempt before the
             // runtime is rebuilt. Recovery never adopts or restarts provider work;
             // a new execution attempt must come from explicit workflow control.
@@ -483,6 +486,7 @@ export const layer = Layer.effect(
               const semaphore = Semaphore.makeUnsafe(maxConcurrency)
               const entry: WorkflowEntry = { runtime, semaphore, evalLock: Semaphore.makeUnsafe(1), parentSessionID: wf.sessionId, config, fibers: new Map(), watchers: new Map() }
               runtimes.set(dagID, entry)
+              yield* automation.register(SessionID.make(wf.sessionId), { kind: "dag", id: dagID })
               yield* entry.evalLock.withPermits(1)(
                 Effect.gen(function* () {
                   yield* spawnReady(dagID)
@@ -1159,6 +1163,18 @@ export const layer = Layer.effect(
                   : []),
               ].join("\n\n")
 
+              const wakeWorkflowIDs = new Set([
+                ...batch.nodes.map((node) => node.workflowId),
+                ...batch.workflows.map((workflow) => workflow.id),
+              ])
+              for (const workflowID of wakeWorkflowIDs) {
+                yield* automation.register(SessionID.make(sessionID), { kind: "dag", id: workflowID })
+              }
+              const wakeLease = Option.getOrUndefined(
+                yield* automation.claim(SessionID.make(sessionID), { kind: "dag" }),
+              )
+              if (!wakeLease) return
+
               // Persist wake_reported AFTER successful delivery only.
               // A failure stays durable for a later idle event or restart scan;
               // it must not spin synchronously on the same row.
@@ -1166,27 +1182,46 @@ export const layer = Layer.effect(
               // receives the node result and can act) but NOT rendered as a user
               // message in the TUI chat — DAG data surfaces via the sidebar panel
               // and Inspector, keeping the chat conversation clean.
-              const didDeliver = yield* promptSvc.promptIfIdle({
-                sessionID: SessionID.make(sessionID),
-                parts: [{ type: "text", text: summary, synthetic: true }],
-              }).pipe(
-                Effect.flatMap(Option.match({
-                  onNone: () => Effect.succeed(false),
-                  onSome: () =>
-                    store.markWakeBatchReported(batch).pipe(
-                      Effect.tap(() =>
-                        Effect.sync(() => {
-                          plan.unresponsiveDagIDs.forEach((workflowID) =>
-                            deliveredUnresponsiveDagIDs.add(workflowID),
-                          )
-                        }),
-                      ),
-                      Effect.as(true),
+              const didDeliver = Option.getOrElse(
+                yield* automation.use(
+                  wakeLease,
+                  promptSvc.promptIfIdle({
+                    sessionID: SessionID.make(sessionID),
+                    parts: [{ type: "text", text: summary, synthetic: true }],
+                  }).pipe(
+                    Effect.flatMap(Option.match({
+                      onNone: () => Effect.succeed(false),
+                      onSome: () =>
+                        store.markWakeBatchReported(batch).pipe(
+                          Effect.tap(() =>
+                            Effect.forEach(
+                              batch.workflows.filter((workflow) =>
+                                isWorkflowTerminalStatus(workflow.status as never),
+                              ),
+                              (workflow) =>
+                                automation.unregister(SessionID.make(sessionID), {
+                                  kind: "dag",
+                                  id: workflow.id,
+                                }),
+                              { discard: true },
+                            ),
+                          ),
+                          Effect.tap(() =>
+                            Effect.sync(() => {
+                              plan.unresponsiveDagIDs.forEach((workflowID) =>
+                                deliveredUnresponsiveDagIDs.add(workflowID),
+                              )
+                            }),
+                          ),
+                          Effect.as(true),
+                        ),
+                    })),
+                    Effect.catchCause(() =>
+                      Effect.logWarning("DAG wake delivery failed", { sessionID }).pipe(Effect.as(false)),
                     ),
-                })),
-                Effect.catchCause(() =>
-                  Effect.logWarning("DAG wake delivery failed", { sessionID }).pipe(Effect.as(false)),
+                  ),
                 ),
+                () => false,
               )
               if (!didDeliver) return
             }
@@ -1260,6 +1295,12 @@ export const layer = Layer.effect(
             ),
           )
           if (!snapshot.workflows.some((wf) => wf.projectId === ctx.project.id)) continue
+          yield* Effect.forEach(
+            snapshot.workflows,
+            (workflow) =>
+              automation.register(SessionID.make(sessionID), { kind: "dag", id: workflow.id }),
+            { discard: true },
+          )
           yield* tryDeliverWake(sessionID).pipe(Effect.forkScoped)
         }
 
@@ -1274,6 +1315,8 @@ export const layer = Layer.effect(
     return Service.of({ init })
   }),
 )
+
+export const layer = serviceLayer.pipe(Layer.provide(SessionAutomationLease.defaultLayer))
 
 export const defaultLayer = layer.pipe(
   Layer.provide(EventV2Bridge.defaultLayer),

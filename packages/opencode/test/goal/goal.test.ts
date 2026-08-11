@@ -117,7 +117,7 @@ describe("Goal.updateAfterJudge — continue branch", () => {
   )
 })
 
-describe("Goal.updateAfterJudge — done branch (turn budget)", () => {
+describe("Goal.updateAfterJudge — atomic done transition", () => {
   // §2.2 — done is a STATE TRANSITION, not a continuation dispatch, so it must
   // NOT consume budget. Pre-fix this fails (code does +1); post-§3 it passes.
   it.live("done verdict does not increment turns_used (state transitions are budget-neutral)", () =>
@@ -128,20 +128,20 @@ describe("Goal.updateAfterJudge — done branch (turn budget)", () => {
       const before = yield* goal.load(sessionID)
       const n = Number(before?.turns_used)
 
-      yield* goal.updateAfterJudge(sessionID, "done", "delivered", false)
+      const result = yield* goal.updateAfterJudge(sessionID, "done", "delivered", false)
 
-      const after = yield* goal.load(sessionID)
-      expect(after?.status).toBe("done")
-      expect(Number(after?.turns_used)).toBe(n)
+      expect(result?.state.status).toBe("done")
+      expect(Number(result?.state.turns_used)).toBe(n)
+      expect(yield* goal.load(sessionID)).toBeUndefined()
+      const outcome = yield* goal.lastOutcome(sessionID)
+      expect(outcome?.status).toBe("done")
+      expect(outcome?.last_reason).toBe("delivered")
     }),
   )
 })
 
 describe("Goal.updateAfterJudge — done branch (terminal event contract)", () => {
-  // §2.3 — updateAfterJudge's done branch must NOT publish goal.updated; only
-  // deleteAndPublishDone owns the terminal sequence. Pre-fix this fails (code
-  // publishes); post-§4 it passes.
-  it.live("done verdict does not publish goal.updated (single-owner: deleteAndPublishDone)", () =>
+  it.live("done verdict atomically removes the row and publishes the terminal sequence", () =>
     Effect.gen(function* () {
       const goal = yield* Goal.Service
       const events = yield* EventV2Bridge.Service
@@ -152,27 +152,6 @@ describe("Goal.updateAfterJudge — done branch (terminal event contract)", () =
       seen.length = 0
 
       yield* goal.updateAfterJudge(sessionID, "done", "delivered", false)
-
-      const updates = seen.filter((e) => e.type === GoalEvent.Updated.type)
-      expect(updates.length).toBe(0)
-    }),
-  )
-
-  // §4.3 — full judge-done flow: updateAfterJudge persists the done row WITHOUT
-  // publishing, then deleteAndPublishDone publishes the terminal sequence
-  // exactly once: goal.updated(done) → goal.cleared, no duplicate updated.
-  it.live("full judge-done flow publishes goal.updated(done) -> goal.cleared exactly once", () =>
-    Effect.gen(function* () {
-      const goal = yield* Goal.Service
-      const events = yield* EventV2Bridge.Service
-      const seen = yield* captureEvents(events)
-      const sessionID = SessionID.descending()
-
-      yield* goal.set(sessionID, "ship feature X", 10)
-      seen.length = 0
-
-      yield* goal.updateAfterJudge(sessionID, "done", "delivered", false)
-      yield* goal.deleteAndPublishDone(sessionID, "delivered")
 
       const types = seen.map((e) => e.type)
       expect(types).toEqual([GoalEvent.Updated.type, GoalEvent.Cleared.type])
@@ -183,6 +162,113 @@ describe("Goal.updateAfterJudge — done branch (terminal event contract)", () =
       // row is gone after the terminal sequence
       const loaded = yield* goal.load(sessionID)
       expect(loaded).toBeUndefined()
+    }),
+  )
+})
+
+describe("Goal.updateAfterJudge — blocked branch", () => {
+  it.live("blocked pauses the goal and never emits a successful done state", () =>
+    Effect.gen(function* () {
+      const goal = yield* Goal.Service
+      const events = yield* EventV2Bridge.Service
+      const seen = yield* captureEvents(events)
+      const sessionID = SessionID.descending()
+
+      yield* goal.set(sessionID, "deploy production", 10)
+      seen.length = 0
+
+      const result = yield* goal.updateAfterJudge(
+        sessionID,
+        "blocked",
+        "missing production credentials",
+        false,
+      )
+
+      expect(result?.state.status).toBe("paused")
+      expect(result?.state.last_verdict).toBe("blocked")
+      expect(result?.message).toContain("已阻塞")
+      expect(seen.some((event) => event.status === "done")).toBe(false)
+    }),
+  )
+})
+
+describe("Goal transition authority — stale loop decisions", () => {
+  it.live("concurrent pause and judge update always settle paused", () =>
+    Effect.gen(function* () {
+      const goal = yield* Goal.Service
+      const sessionID = SessionID.descending()
+      yield* goal.set(sessionID, "ship feature X", 10)
+
+      yield* Effect.all(
+        [
+          goal.pause(sessionID, "user-paused"),
+          goal.updateAfterJudge(sessionID, "continue", "racing judge result", false),
+        ],
+        { concurrency: 2 },
+      )
+
+      expect((yield* goal.load(sessionID))?.status).toBe("paused")
+    }),
+  )
+
+  it.live("concurrent clear and judge update never leave a resurrected row", () =>
+    Effect.gen(function* () {
+      const goal = yield* Goal.Service
+      const sessionID = SessionID.descending()
+      yield* goal.set(sessionID, "ship feature X", 10)
+
+      yield* Effect.all(
+        [
+          goal.clear(sessionID),
+          goal.updateAfterJudge(sessionID, "continue", "racing judge result", false),
+        ],
+        { concurrency: 2 },
+      )
+
+      expect(yield* goal.load(sessionID)).toBeUndefined()
+    }),
+  )
+
+  it.live("a judge result read before pause cannot reactivate the paused goal", () =>
+    Effect.gen(function* () {
+      const goal = yield* Goal.Service
+      const sessionID = SessionID.descending()
+      const before = yield* goal.set(sessionID, "ship feature X", 10)
+
+      yield* goal.pause(sessionID, "user-paused")
+      const stale = yield* goal.updateAfterJudge(
+        sessionID,
+        "continue",
+        "stale judge result",
+        false,
+        { goalID: before.goal_id ?? "legacy", revision: before.revision ?? 0 },
+      )
+
+      expect(stale).toBeUndefined()
+      expect((yield* goal.load(sessionID))?.status).toBe("paused")
+    }),
+  )
+
+  it.live("a judge result from a cleared goal cannot mutate its replacement", () =>
+    Effect.gen(function* () {
+      const goal = yield* Goal.Service
+      const sessionID = SessionID.descending()
+      const before = yield* goal.set(sessionID, "old goal", 10)
+
+      yield* goal.clear(sessionID)
+      const replacement = yield* goal.set(sessionID, "new goal", 10)
+      const stale = yield* goal.updateAfterJudge(
+        sessionID,
+        "continue",
+        "old result",
+        false,
+        { goalID: before.goal_id ?? "legacy", revision: before.revision ?? 0 },
+      )
+
+      expect(stale).toBeUndefined()
+      const current = yield* goal.load(sessionID)
+      expect(current?.goal_id).toBe(replacement.goal_id)
+      expect(current?.turns_used).toBe(0)
     }),
   )
 })
@@ -650,9 +736,6 @@ describe("Goal.deleteAndPublishDone — terminal sequence is uninterruptible (F1
       const sessionID = SessionID.descending()
 
       yield* goal.set(sessionID, "ship feature X", 10)
-      // Persist a done row WITHOUT publishing — mirrors what loop.ts does
-      // (updateAfterJudge) before invoking deleteAndPublishDone.
-      yield* goal.updateAfterJudge(sessionID, "done", "delivered", false)
       seen.length = 0
 
       const fiber = yield* goal.deleteAndPublishDone(sessionID, "delivered").pipe(Effect.forkScoped)

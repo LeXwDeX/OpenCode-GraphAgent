@@ -51,5 +51,6 @@ export const migrations = (
     import("./migration/20260803083938_restore_goal_state"),
     import("./migration/20260805094941_workflow_node_timeout_extensions"),
     import("./migration/20260805094942_workflow_node_escalation_pending"),
+    import("./migration/20260811060000_goal_outcome"),
   ])
 ).map((module) => module.default) satisfies DatabaseMigration.Migration[]

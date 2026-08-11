@@ -157,6 +157,14 @@ export default {
         );
       `)
       yield* tx.run(`
+        CREATE TABLE \`goal_outcome\` (
+          \`goal_id\` text PRIMARY KEY,
+          \`session_id\` text NOT NULL,
+          \`payload\` text NOT NULL,
+          \`completed_at\` integer NOT NULL
+        );
+      `)
+      yield* tx.run(`
         CREATE TABLE \`permission\` (
           \`id\` text PRIMARY KEY,
           \`project_id\` text NOT NULL,
@@ -324,6 +332,7 @@ export default {
       yield* tx.run(`CREATE UNIQUE INDEX \`event_aggregate_seq_idx\` ON \`event\` (\`aggregate_id\`,\`seq\`);`)
       yield* tx.run(`CREATE INDEX \`event_aggregate_type_seq_idx\` ON \`event\` (\`aggregate_id\`,\`type\`,\`seq\`);`)
       yield* tx.run(`CREATE INDEX \`goal_state_updated_at_idx\` ON \`goal_state\` (\`updated_at\`);`)
+      yield* tx.run(`CREATE INDEX \`goal_outcome_session_completed_idx\` ON \`goal_outcome\` (\`session_id\`, \`completed_at\`);`)
       yield* tx.run(
         `CREATE UNIQUE INDEX \`permission_project_action_resource_idx\` ON \`permission\` (\`project_id\`,\`action\`,\`resource\`);`,
       )

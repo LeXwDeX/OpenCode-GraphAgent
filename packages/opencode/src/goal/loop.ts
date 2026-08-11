@@ -13,6 +13,7 @@ import { GoalJudge } from "./judge"
 import { GoalPrompts } from "./prompts"
 import { generateText } from "ai"
 import { SessionID } from "@/session/schema"
+import { SessionAutomationLease } from "@/session/automation-lease"
 
 export interface Interface {
   readonly init: () => Effect.Effect<void>
@@ -97,7 +98,7 @@ export function isStaleZombie(
   )
 }
 
-export const layer = Layer.effect(
+const serviceLayer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const events = yield* EventV2Bridge.Service
@@ -106,6 +107,14 @@ export const layer = Layer.effect(
     const provider = yield* Provider.Service
     const goal = yield* Goal.Service
     const status = yield* SessionStatus.Service
+    const automation = yield* SessionAutomationLease.Service
+
+    const pauseGoal = Effect.fnUntraced(function* (sessionID: SessionID, reason: string) {
+      const paused = yield* goal.pauseAndPublish(sessionID, reason)
+      if (paused)
+        yield* automation.unregister(sessionID, { kind: "goal", id: paused.goal_id ?? "legacy" })
+      return paused
+    })
 
     const state = yield* InstanceState.make(
       Effect.fn("GoalLoop.state")(function* (_ctx) {
@@ -150,6 +159,10 @@ export const layer = Layer.effect(
     const afterIdle = Effect.fn("GoalLoop.afterIdle")(function* (sessionID: SessionID) {
       const goalState = yield* goal.load(sessionID)
       if (!goalState || goalState.status !== "active") return
+      const goalOwner = { kind: "goal" as const, id: goalState.goal_id ?? "legacy" }
+      yield* automation.register(sessionID, goalOwner)
+      const observedLease = Option.getOrUndefined(yield* automation.claim(sessionID, goalOwner))
+      if (!observedLease) return
 
       // Zombie-goal freshness guard (D6). If the goal is active but has run
       // zero continuations and is older than FRESHNESS_THRESHOLD, the initial
@@ -172,12 +185,10 @@ export const layer = Layer.effect(
         const probeMsgs = yield* sessions.messages({ sessionID, limit: 1 })
         const hasAssistant = probeMsgs.some((m) => m.info.role === "assistant")
         if (isStaleZombie(goalState, hasAssistant)) {
-          yield* goal
-            .pauseAndPublish(
+          yield* pauseGoal(
               sessionID,
               `initial kick produced no assistant response within ${GoalPrompts.FRESHNESS_THRESHOLD / 1000}s — likely provider error or model refusal. Use /goal resume to retry.`,
-            )
-            .pipe(Effect.ignore)
+            ).pipe(Effect.ignore)
           return
         }
       }
@@ -189,7 +200,7 @@ export const layer = Layer.effect(
         // been compacted or the initial kick failed after the stale-zombie
         // guard window. Pause visibly instead of silently stalling.
         const pauseMsg = "近期消息中无 assistant 回复，目标已暂停。使用 /goal resume 重试。"
-        yield* goal.pauseAndPublish(sessionID, pauseMsg).pipe(Effect.ignore)
+        yield* pauseGoal(sessionID, pauseMsg).pipe(Effect.ignore)
         yield* promptSvc.prompt({ sessionID, noReply: true, parts: [{ type: "text", text: `⏸ 目标已暂停 — ${pauseMsg}` }] }).pipe(Effect.ignore)
         return
       }
@@ -240,30 +251,26 @@ export const layer = Layer.effect(
           )
         : { verdict: "continue" as const, reason: "上一轮无文本输出（纯工具调用），跳过判定直接继续", parseFailed: false }
 
-      const updateResult = yield* goal.updateAfterJudge(sessionID, verdict.verdict, verdict.reason, verdict.parseFailed)
+      const updateResult = Option.getOrUndefined(
+        yield* automation.use(
+          observedLease,
+          goal.updateAfterJudge(
+            sessionID,
+            verdict.verdict,
+            verdict.reason,
+            verdict.parseFailed,
+            {
+              goalID: goalState.goal_id ?? "legacy",
+              revision: goalState.revision ?? 0,
+            },
+          ),
+        ),
+      )
       if (!updateResult) return
 
       if (!updateResult.shouldContinue) {
-        // Inject visible completion message when goal is achieved, then
-        // auto-clear the goal state. `updateAfterJudge` already persisted
-        // a done snapshot and published goal.updated — that snapshot is
-        // only kept long enough to emit the completion message, then the
-        // row is removed so done is a transient visual-only state (mirrors
-        // how /goal clear behaves). This is what makes goal completion
-        // not require a manual /goal clear afterwards.
+        yield* automation.unregister(sessionID, goalOwner)
         if (verdict.verdict === "done") {
-          // Run the terminal event sequence FIRST (F1): publish(done) →
-          // delete → publish(cleared) is the contract SSE/TUI consumers
-          // rely on, so it must complete before any other effect that could
-          // race the loop fiber. deleteAndPublishDone is uninterruptible and
-          // fiber-safe (no clearFiber), so this ordering is pure
-          // defense-in-depth — the completion message text is computed from
-          // updateResult.message (pre-deletion state) and is unaffected by
-          // running after the delete. The noReply path returns before any
-          // status transition today, but completing the terminal sequence
-          // first makes the contract structurally enforced rather than
-          // dependent on that noReply implementation detail.
-          yield* goal.deleteAndPublishDone(sessionID, verdict.reason).pipe(Effect.ignore)
           yield* promptSvc.prompt({
             sessionID,
             noReply: true,
@@ -295,7 +302,7 @@ export const layer = Layer.effect(
         // "active" with no continuation. Pause with a visible reason so the
         // user knows the loop was interrupted by a status change.
         const pauseMsg = `judge 期间会话状态变化（${currentStatus.type}），目标已暂停`
-        yield* goal.pauseAndPublish(sessionID, pauseMsg).pipe(Effect.ignore)
+        yield* pauseGoal(sessionID, pauseMsg).pipe(Effect.ignore)
         yield* promptSvc.prompt({ sessionID, noReply: true, parts: [{ type: "text", text: `⏸ 目标已暂停 — ${pauseMsg}` }] }).pipe(Effect.ignore)
         return
       }
@@ -311,7 +318,7 @@ export const layer = Layer.effect(
         // publishGoal(paused) reaches the event bus. Use pauseAndPublish
         // which skips fiber management — the fiber naturally terminates
         // when this function returns.
-        yield* goal.pauseAndPublish(sessionID, "当前轮被中断").pipe(Effect.ignore) // user preempted
+        yield* pauseGoal(sessionID, "当前轮被中断").pipe(Effect.ignore) // user preempted
         return
       }
 
@@ -345,12 +352,14 @@ export const layer = Layer.effect(
       // cause (recoverable failures + defects) and transition to a recoverable
       // paused state via the fiber-safe pauseAndPublish (goal.pause would
       // clearFiber — us — mid-publish; see the preempt branches above).
-      yield* promptSvc
-        .prompt({
+      const continuationLease = Option.getOrUndefined(yield* automation.claim(sessionID, goalOwner))
+      if (!continuationLease) return
+      yield* automation.use(
+        continuationLease,
+        promptSvc.promptIfIdle({
           sessionID,
           parts: [{ type: "text", text: continuationText }],
-        })
-        .pipe(
+        }).pipe(
           Effect.catchCause((cause) =>
             Effect.gen(function* () {
               // F1: Only pause for non-interrupt causes. An interrupt (user
@@ -372,15 +381,20 @@ export const layer = Layer.effect(
               // misclassified as a dispatch failure and spuriously paused here.
               if (Cause.hasInterrupts(cause)) {
                 yield* Effect.logInfo("goal continuation interrupted (likely user ESC) — not pausing; shouldPreempt handles next cycle")
-                return
+                return Option.none()
               }
               const errMsg = `continuation dispatch failed: ${Cause.pretty(cause)}`
               yield* Effect.logWarning("goal continuation dispatch failed", { error: Cause.pretty(cause) })
               yield* goal.pauseAndPublish(sessionID, errMsg).pipe(Effect.ignore)
               yield* promptSvc.prompt({ sessionID, noReply: true, parts: [{ type: "text", text: `⏸ 目标已暂停 — ${errMsg}` }] }).pipe(Effect.ignore)
+              return Option.none()
             }),
           ),
-        )
+        ),
+      )
+      const afterDispatch = yield* goal.load(sessionID)
+      if (!afterDispatch || afterDispatch.status !== "active")
+        yield* automation.unregister(sessionID, goalOwner)
 
       // NOTE: We deliberately DO NOT call goal.clearLoopFiber here. The
       // promptSvc.prompt above triggers a fresh agent loop, which when it
@@ -399,6 +413,8 @@ export const layer = Layer.effect(
     return Service.of({ init })
   }),
 )
+
+export const layer = serviceLayer.pipe(Layer.provide(SessionAutomationLease.defaultLayer))
 
 // GoalLoop.defaultLayer self-provides its construction deps. Because
 // Layer.provideMerge(self, layer) requires `layer` (GoalLoop) to be

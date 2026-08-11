@@ -1,5 +1,5 @@
 import { describe, expect } from "bun:test"
-import { Cause, Effect, Layer } from "effect"
+import { Cause, Effect, Layer, Option } from "effect"
 import { GoalLoop, GoalLoopJudgeLLM } from "@/goal/loop"
 import { Goal } from "@/goal/goal"
 import { GoalEvent } from "@/goal/events"
@@ -9,6 +9,7 @@ import { Session } from "@/session/session"
 import { SessionPrompt } from "@/session/prompt"
 import { Provider } from "@/provider/provider"
 import { SessionID } from "@/session/schema"
+import { SessionAutomationLease } from "@/session/automation-lease"
 import { testEffect, pollWithTimeout } from "../lib/effect"
 
 // P2b: full-cycle Goal regression (D5). Drives set → idle → judge(continue) →
@@ -66,16 +67,21 @@ const mkAssistantTools = () =>
 // assertions. Resolves void — these tests never drive a real agent turn from
 // the mock; the goal state and event captures are the observable contract.
 const recordingPrompt = (sink: { noReply?: boolean; text: string }[]) =>
-  Layer.succeed(SessionPrompt.Service, {
-    prompt: (input: { noReply?: boolean; parts?: Array<{ type: string; text: string }> }) =>
+  Layer.succeed(SessionPrompt.Service, (() => {
+    const record = (input: { noReply?: boolean; parts?: Array<{ type: string; text: string }> }) =>
       Effect.sync(() => {
         sink.push({
           noReply: input.noReply,
           text: input.parts?.map((p) => p.text).join("\n") ?? "",
         })
         return undefined as never
-      }),
-  } as never)
+      })
+    return {
+      prompt: record,
+      promptIfIdle: (input: { noReply?: boolean; parts?: Array<{ type: string; text: string }> }) =>
+        record(input).pipe(Effect.map(Option.some)),
+    } as never
+  })())
 
 describe("GoalLoop end-to-end — continue → done lifecycle (P2b)", () => {
   // Per-test mutable mock state (each it.instance runs in its own scope, but
@@ -92,16 +98,21 @@ describe("GoalLoop end-to-end — continue → done lifecycle (P2b)", () => {
   const sessionMock = Layer.succeed(Session.Service, {
     messages: () => Effect.succeed([mkAssistant()]),
   } as never)
-  const promptMock = Layer.succeed(SessionPrompt.Service, {
-    prompt: (input: { noReply?: boolean; parts?: Array<{ type: string; text: string }> }) =>
+  const promptMock = Layer.succeed(SessionPrompt.Service, (() => {
+    const record = (input: { noReply?: boolean; parts?: Array<{ type: string; text: string }> }) =>
       Effect.sync(() => {
         promptCalls.push({
           noReply: input.noReply,
           text: input.parts?.map((p) => p.text).join("\n") ?? "",
         })
         return undefined as never
-      }),
-  } as never)
+      })
+    return {
+      prompt: record,
+      promptIfIdle: (input: { noReply?: boolean; parts?: Array<{ type: string; text: string }> }) =>
+        record(input).pipe(Effect.map(Option.some)),
+    } as never
+  })())
   const providerMock = Layer.succeed(Provider.Service, {} as never)
   const judgeMock = Layer.succeed(
     GoalLoopJudgeLLM,
@@ -177,6 +188,142 @@ describe("GoalLoop end-to-end — continue → done lifecycle (P2b)", () => {
   )
 })
 
+describe("GoalLoop — shared Session automation lease", () => {
+  let leaseAttempts = 0
+  let directPromptAttempts = 0
+  const sessionMock = Layer.succeed(Session.Service, {
+    messages: () => Effect.succeed([mkAssistant()]),
+  } as never)
+  const promptMock = Layer.succeed(SessionPrompt.Service, {
+    prompt: () =>
+      Effect.sync(() => {
+        directPromptAttempts += 1
+        return undefined as never
+      }),
+    promptIfIdle: () =>
+      Effect.sync(() => {
+        leaseAttempts += 1
+        return Option.none()
+      }),
+  } as never)
+  const judgeMock = Layer.succeed(
+    GoalLoopJudgeLLM,
+    GoalLoopJudgeLLM.of({
+      call: () => Effect.succeed(JSON.stringify({ verdict: "continue", reason: "more work" })),
+    }),
+  )
+  const leaseLayer = GoalLoop.layer.pipe(
+    Layer.provide(sessionMock),
+    Layer.provide(promptMock),
+    Layer.provide(Layer.succeed(Provider.Service, {} as never)),
+    Layer.provide(judgeMock),
+    Layer.provideMerge(Goal.defaultLayer),
+    Layer.provide(SessionStatus.defaultLayer),
+    Layer.provideMerge(EventV2Bridge.defaultLayer),
+  )
+  const it = testEffect(leaseLayer)
+
+  it.instance("a busy Session lease rejects Goal continuation without direct prompt admission", () =>
+    Effect.gen(function* () {
+      leaseAttempts = 0
+      directPromptAttempts = 0
+      const loop = yield* GoalLoop.Service
+      const goal = yield* Goal.Service
+      const events = yield* EventV2Bridge.Service
+      yield* loop.init()
+      const sessionID = SessionID.descending()
+      yield* goal.set(sessionID, "ship the feature", 10)
+      yield* Effect.yieldNow
+
+      yield* events.publish(SessionStatus.Event.Status, {
+        sessionID,
+        status: { type: "idle" },
+      })
+      yield* pollWithTimeout(
+        Effect.sync(() => (leaseAttempts > 0 ? true : undefined)),
+        "GoalLoop never attempted the shared Session automation lease",
+        "5 seconds",
+      )
+
+      expect(directPromptAttempts).toBe(0)
+      expect((yield* goal.load(sessionID))?.status).toBe("active")
+    }),
+  )
+})
+
+describe("GoalLoop + DAG owner arbitration", () => {
+  let judgeCalls = 0
+  let continuationCalls = 0
+  const sessionMock = Layer.succeed(Session.Service, {
+    messages: () => Effect.succeed([mkAssistant()]),
+  } as never)
+  const promptMock = Layer.succeed(SessionPrompt.Service, {
+    prompt: () => Effect.succeed(undefined as never),
+    promptIfIdle: () =>
+      Effect.sync(() => {
+        continuationCalls += 1
+        return Option.some(undefined as never)
+      }),
+  } as never)
+  const judgeMock = Layer.succeed(
+    GoalLoopJudgeLLM,
+    GoalLoopJudgeLLM.of({
+      call: () =>
+        Effect.sync(() => {
+          judgeCalls += 1
+          return JSON.stringify({ verdict: "continue", reason: "more work" })
+        }),
+    }),
+  )
+  const arbitrationLayer = GoalLoop.layer.pipe(
+    Layer.provide(sessionMock),
+    Layer.provide(promptMock),
+    Layer.provide(Layer.succeed(Provider.Service, {} as never)),
+    Layer.provide(judgeMock),
+    Layer.provideMerge(Goal.defaultLayer),
+    Layer.provide(SessionStatus.defaultLayer),
+    Layer.provideMerge(EventV2Bridge.defaultLayer),
+    Layer.provideMerge(SessionAutomationLease.defaultLayer),
+  )
+  const it = testEffect(arbitrationLayer)
+
+  it.instance("a live DAG owns the Session; Goal resumes after the DAG releases it", () =>
+    Effect.gen(function* () {
+      judgeCalls = 0
+      continuationCalls = 0
+      const loop = yield* GoalLoop.Service
+      const goal = yield* Goal.Service
+      const events = yield* EventV2Bridge.Service
+      const automation = yield* SessionAutomationLease.Service
+      yield* loop.init()
+      const sessionID = SessionID.descending()
+      yield* goal.set(sessionID, "ship the feature", 10)
+      yield* automation.register(sessionID, { kind: "dag", id: "dag-executor" })
+      yield* Effect.yieldNow
+
+      yield* events.publish(SessionStatus.Event.Status, {
+        sessionID,
+        status: { type: "idle" },
+      })
+      yield* Effect.sleep("50 millis")
+      expect(judgeCalls).toBe(0)
+      expect(continuationCalls).toBe(0)
+
+      yield* automation.unregister(sessionID, { kind: "dag", id: "dag-executor" })
+      yield* events.publish(SessionStatus.Event.Status, {
+        sessionID,
+        status: { type: "idle" },
+      })
+      yield* pollWithTimeout(
+        Effect.sync(() => (continuationCalls === 1 ? true : undefined)),
+        "Goal did not resume after the DAG released the Session lease",
+        "5 seconds",
+      )
+      expect(judgeCalls).toBe(1)
+    }),
+  )
+})
+
 // D1 (hooks-goal-completeness): a continuation dispatch failure must surface as a
 // recoverable paused state, not a silent stall. Reuses the e2e harness with a
 // prompt mock that always fails — the only prompt in this flow is the
@@ -194,6 +341,7 @@ describe("GoalLoop — continuation dispatch failure → recoverable pause (D1)"
   // Always-failing prompt — simulates provider fault / session write error.
   const promptFailMock = Layer.succeed(SessionPrompt.Service, {
     prompt: () => Effect.fail(new Error("continuation provider down")),
+    promptIfIdle: () => Effect.fail(new Error("continuation provider down")),
   } as never)
   const providerMock = Layer.succeed(Provider.Service, {} as never)
   const judgeMock = Layer.succeed(
@@ -520,6 +668,7 @@ describe("GoalLoop — continuation interrupted → no pause, goal stays active 
   let interruptCause: Cause.Cause<never> = Cause.interrupt(0)
   const promptInterruptMock = Layer.succeed(SessionPrompt.Service, {
     prompt: () => Effect.failCause(interruptCause),
+    promptIfIdle: () => Effect.failCause(interruptCause),
   } as never)
   const providerMock = Layer.succeed(Provider.Service, {} as never)
   const judgeMock = Layer.succeed(
