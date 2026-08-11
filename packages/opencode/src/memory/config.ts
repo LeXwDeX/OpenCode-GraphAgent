@@ -1,13 +1,16 @@
 export * as MemoryConfig from "./config"
 
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Flag } from "@opencode-ai/core/flag/flag"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Global } from "@opencode-ai/core/global"
+import { Git } from "@/git"
 import { Context, Effect, Layer, Option, Schema } from "effect"
-import { dirname, join } from "node:path"
+import { dirname, isAbsolute, join, resolve } from "node:path"
 import { parse, type ParseError } from "jsonc-parser"
 import { MemoryFile } from "./file"
+import { MemoryPaths } from "./paths"
 import { MemorySchema } from "./schema"
 
 export type Loaded = {
@@ -33,6 +36,21 @@ export const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const fs = yield* FSUtil.Service
+    const git = yield* Git.Service
+
+    const ensureProjectExclude = Effect.fnUntraced(function* (projectDir: string) {
+      const result = yield* git.run(["rev-parse", "--git-path", "info/exclude"], { cwd: projectDir })
+      if (result.exitCode !== 0) return
+      const raw = result.text().trim()
+      if (!raw) return
+      const file = isAbsolute(raw) ? raw : resolve(projectDir, raw)
+      const current = (yield* fs.readFileStringSafe(file)) ?? ""
+      const lines = new Set(current.split(/\r?\n/).map((line) => line.trim()))
+      const missing = MemoryPaths.PROJECT_CONFIG_PATHS.filter((rule) => !lines.has(rule))
+      if (missing.length === 0) return
+      const prefix = current.length === 0 || current.endsWith("\n") ? current : current + "\n"
+      yield* MemoryFile.atomicWrite(fs, file, prefix + missing.join("\n") + "\n")
+    })
 
     const readFirst = Effect.fnUntraced(function* (paths: string[]) {
       for (const path of paths) {
@@ -43,13 +61,13 @@ export const layer = Layer.effect(
     })
 
     const readConfig = Effect.fnUntraced(function* (found: { path: string; text: string }) {
-      const decoded = decode(found.text)
+      const decoded = decodeConfig(found.text)
       if (Option.isNone(decoded)) {
         yield* Effect.logWarning("memory config is invalid — ignoring", { path: found.path })
         return undefined
       }
       if (decoded.value.topic_limit === decoded.value.topic_limit_floor) return decoded.value
-      const config = MemorySchema.updateConfig(decoded.value, { topic_limit_floor: decoded.value.topic_limit })
+      const config = normalizeConfig(decoded.value)
       yield* MemoryFile.atomicWrite(fs, found.path, serialize(config))
       return config
     })
@@ -78,6 +96,7 @@ export const layer = Layer.effect(
       config: MemorySchema.Config,
       existingPath?: string,
     ) {
+      yield* ensureProjectExclude(projectDir)
       yield* MemoryFile.atomicWrite(fs, existingPath ?? projectPath(projectDir), serialize(config))
     })
 
@@ -107,9 +126,12 @@ export const layer = Layer.effect(
   }),
 )
 
-export const defaultLayer = layer.pipe(Layer.provide(FSUtil.defaultLayer))
+export const defaultLayer = layer.pipe(
+  Layer.provide(FSUtil.defaultLayer),
+  Layer.provide(Git.defaultLayer.pipe(Layer.provide(CrossSpawnSpawner.defaultLayer))),
+)
 
-export const node = LayerNode.make(layer, [FSUtil.node])
+export const node = LayerNode.make(layer, [FSUtil.node, Git.node])
 
 export function projectPath(projectDir: string) {
   return join(projectDir, ".opencode", "memory.jsonc")
@@ -123,7 +145,7 @@ export function globalConfigDir() {
   return Flag.OPENCODE_CONFIG_DIR ?? Global.Path.config
 }
 
-function projectCandidates(projectDir: string) {
+export function projectCandidates(projectDir: string) {
   return [join(projectDir, ".opencode", "memory.jsonc"), join(projectDir, ".opencode", "memory.json")]
 }
 
@@ -135,7 +157,7 @@ function serialize(config: MemorySchema.Config) {
   return JSON.stringify(config, null, 2) + "\n"
 }
 
-function decode(text: string) {
+export function decodeConfig(text: string) {
   const errors: ParseError[] = []
   const value = parse(text, errors, { allowTrailingComma: true })
   if (errors.length > 0) return Option.none<MemorySchema.Config>()
@@ -143,4 +165,9 @@ function decode(text: string) {
   if (Option.isNone(decoded) || decoded.value.topic_limit < decoded.value.topic_limit_floor)
     return Option.none<MemorySchema.Config>()
   return decoded
+}
+
+export function normalizeConfig(config: MemorySchema.Config) {
+  if (config.topic_limit === config.topic_limit_floor) return config
+  return MemorySchema.updateConfig(config, { topic_limit_floor: config.topic_limit })
 }

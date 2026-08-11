@@ -21,8 +21,13 @@ import { AppProcess } from "@opencode-ai/core/process"
 import { ProjectV2 } from "@opencode-ai/core/project"
 import { ProjectDirectories } from "@opencode-ai/core/project/directories"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
+import { EffectFlock } from "@opencode-ai/core/util/effect-flock"
 import { testEffect } from "../lib/effect"
 import { RuntimeFlags } from "@/effect/runtime-flags"
+import { MemoryHome } from "@/memory/home"
+import { MemoryIdentityMigration } from "@/memory/identity-migration"
+import { MemoryStore } from "@/memory/store"
+import { ProjectIdentityMigration } from "@/project/identity-migration"
 
 const encoder = new TextEncoder()
 
@@ -79,6 +84,7 @@ function projectLayerWithFailure(failArg: string) {
     Layer.provide(NodePath.layer),
     Layer.provide(Database.defaultLayer),
     Layer.provide(RuntimeFlags.defaultLayer),
+    Layer.provide(ProjectIdentityMigration.defaultLayer),
   )
 }
 
@@ -92,7 +98,38 @@ function projectLayerWithRuntimeFlags(flags: Parameters<typeof RuntimeFlags.laye
     Layer.provide(NodePath.layer),
     Layer.provide(Database.defaultLayer),
     Layer.provide(RuntimeFlags.layer(flags)),
+    Layer.provide(ProjectIdentityMigration.defaultLayer),
   )
+}
+
+function projectLayerWithMemoryRoot(root: string) {
+  const database = Database.defaultLayer
+  const home = Layer.succeed(MemoryHome.Service, MemoryHome.make(root))
+  const store = MemoryStore.layer.pipe(
+    Layer.provide(FSUtil.defaultLayer),
+    Layer.provide(EffectFlock.defaultLayer),
+    Layer.provide(home),
+  )
+  const memoryMigration = MemoryIdentityMigration.layer.pipe(
+    Layer.provide(FSUtil.defaultLayer),
+    Layer.provide(EffectFlock.defaultLayer),
+    Layer.provide(home),
+    Layer.provide(store),
+  )
+  const identityMigration = ProjectIdentityMigration.layer.pipe(Layer.provide(memoryMigration))
+  const project = Project.layer.pipe(
+    Layer.provide(EventV2Bridge.defaultLayer),
+    Layer.provide(ProjectV2.defaultLayer),
+    Layer.provide(ProjectDirectories.defaultLayer),
+    Layer.provide(AppProcess.defaultLayer),
+    Layer.provide(CrossSpawnSpawner.defaultLayer),
+    Layer.provide(FSUtil.defaultLayer),
+    Layer.provide(NodePath.layer),
+    Layer.provide(database),
+    Layer.provide(RuntimeFlags.defaultLayer),
+    Layer.provide(identityMigration),
+  )
+  return Layer.mergeAll(project, database, home, store)
 }
 
 const failureIt = (failArg: string) =>
@@ -239,6 +276,112 @@ describe("Project.fromDirectory", () => {
         (yield* db.select().from(WorkspaceTable).where(eq(WorkspaceTable.id, workspaceID)).get().pipe(Effect.orDie))
           ?.project_id,
       ).toBe(remoteID)
+    }),
+  )
+
+  it.live("migrates Project Memory before retiring the previous Project identity", () =>
+    Effect.gen(function* () {
+      const dataRoot = yield* tmpdirScoped()
+      const tmp = yield* tmpdirScoped({ git: true })
+      yield* Effect.gen(function* () {
+        const home = yield* MemoryHome.Service
+        const projects = yield* Project.Service
+        const store = yield* MemoryStore.Service
+        const rootProject = (yield* projects.fromDirectory(tmp)).project
+        const value = {
+          schema_version: 1,
+          id: "project-term",
+          name: "项目术语",
+          summary: "术语 Project Memory 指项目级持久化记忆",
+          metadata: {
+            categories: ["term"],
+            status: "active",
+            importance: "core",
+            keywords: ["Project Memory"],
+            related_topics: [],
+            created_at: "2026-08-11T00:00:00Z",
+            updated_at: "2026-08-11T00:00:00Z",
+            last_matched_at: null,
+            match_count: 0,
+            revision: 1,
+            item_count: 1,
+          },
+          items: [
+            {
+              id: "term-01",
+              kind: "term",
+              content: "术语 Project Memory 指项目级持久化记忆",
+              rationale: "该术语由用户确认并长期适用",
+              confirmed_at: "2026-08-11T00:00:00Z",
+            },
+          ],
+        } as const
+        yield* store.commit(rootProject.id, 0, { topics: [value], changed: [value.id], deleted: [] })
+        yield* Effect.promise(() => $`git remote add origin git@github.com:acme/memory-app.git`.cwd(tmp).quiet())
+
+        const migrated = yield* projects.fromDirectory(tmp)
+
+        expect(yield* store.readTopics(migrated.project.id)).toEqual([value])
+        expect(yield* Effect.promise(() => Bun.file(home.directory(rootProject.id)).exists())).toBe(false)
+      }).pipe(Effect.provide(projectLayerWithMemoryRoot(dataRoot)))
+    }),
+  )
+
+  it.live("keeps the previous Project identity when Memory migration conflicts", () =>
+    Effect.gen(function* () {
+      const dataRoot = yield* tmpdirScoped()
+      const tmp = yield* tmpdirScoped({ git: true })
+      yield* Effect.gen(function* () {
+        const { db } = yield* Database.Service
+        const projects = yield* Project.Service
+        const store = yield* MemoryStore.Service
+        const rootProject = (yield* projects.fromDirectory(tmp)).project
+        const remoteID = remoteProjectID("github.com/acme/conflicting-memory")
+        const base = {
+          schema_version: 1,
+          id: "project-term",
+          name: "项目术语",
+          summary: "术语 Project Memory 指项目级持久化记忆",
+          metadata: {
+            categories: ["term"],
+            status: "active",
+            importance: "core",
+            keywords: ["Project Memory"],
+            related_topics: [],
+            created_at: "2026-08-11T00:00:00Z",
+            updated_at: "2026-08-11T00:00:00Z",
+            last_matched_at: null,
+            match_count: 0,
+            revision: 1,
+            item_count: 1,
+          },
+          items: [
+            {
+              id: "term-01",
+              kind: "term",
+              content: "术语 Project Memory 指项目级持久化记忆",
+              rationale: "该术语由用户确认并长期适用",
+              confirmed_at: "2026-08-11T00:00:00Z",
+            },
+          ],
+        } as const
+        const conflicting = { ...base, summary: "术语 Project Memory 指共享的持久化记忆" }
+        yield* store.commit(rootProject.id, 0, { topics: [base], changed: [base.id], deleted: [] })
+        yield* store.commit(remoteID, 0, { topics: [conflicting], changed: [conflicting.id], deleted: [] })
+        yield* Effect.promise(() =>
+          $`git remote add origin git@github.com:acme/conflicting-memory.git`.cwd(tmp).quiet(),
+        )
+
+        const exit = yield* Effect.exit(projects.fromDirectory(tmp))
+
+        expect(exit._tag).toBe("Failure")
+        expect(
+          yield* db.select().from(ProjectTable).where(eq(ProjectTable.id, rootProject.id)).get().pipe(Effect.orDie),
+        ).toBeDefined()
+        expect(yield* db.select().from(ProjectTable).where(eq(ProjectTable.id, remoteID)).get().pipe(Effect.orDie)).toBeUndefined()
+        expect(yield* store.readTopics(rootProject.id)).toEqual([base])
+        expect(yield* store.readTopics(remoteID)).toEqual([conflicting])
+      }).pipe(Effect.provide(projectLayerWithMemoryRoot(dataRoot)))
     }),
   )
 })

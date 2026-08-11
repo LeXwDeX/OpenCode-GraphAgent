@@ -21,6 +21,8 @@ import { AppProcess } from "@opencode-ai/core/process"
 import { InstanceState } from "@/effect/instance-state"
 import { WorktreeEvent } from "@opencode-ai/schema/worktree-event"
 import { SettingsHook } from "@/hook/settings"
+import { MemoryAdmission } from "@/memory/admission"
+import { MemoryPaths } from "@/memory/paths"
 import * as Option from "effect/Option"
 
 export const Event = WorktreeEvent
@@ -156,6 +158,7 @@ export const layer: Layer.Layer<
     const gitSvc = yield* Git.Service
     const project = yield* Project.Service
     const store = yield* InstanceStore.Service
+    const memoryAdmission = Option.getOrUndefined(yield* Effect.serviceOption(MemoryAdmission.Service))
     const settingsHook = Option.getOrUndefined(yield* Effect.serviceOption(SettingsHook.Service))
 
     const git = Effect.fnUntraced(
@@ -227,7 +230,7 @@ export const layer: Layer.Layer<
         { cwd: ctx.worktree },
       )
       if (created.code !== 0) {
-        return yield* new CreateFailedError({
+        yield* new CreateFailedError({
           message: created.stderr || created.text || "Failed to create git worktree",
         })
       }
@@ -341,11 +344,18 @@ export const layer: Layer.Layer<
       return process.platform === "win32" ? normalized.toLowerCase() : normalized
     })
 
+    const registeredSandbox = Effect.fnUntraced(function* (sandboxes: string[], directory: string) {
+      const key = yield* canonical(directory)
+      return (yield* Effect.forEach(sandboxes, (sandbox) =>
+        canonical(sandbox).pipe(Effect.map((candidate) => ({ candidate, sandbox }))),
+      )).find((sandbox) => sandbox.candidate === key)?.sandbox
+    })
+
     function parseWorktreeList(text: string) {
       return text
         .split("\n")
         .map((line) => line.trim())
-        .reduce<{ path?: string; branch?: string }[]>((acc, line) => {
+        .reduce<{ path?: string; branch?: string; prunable?: boolean }[]>((acc, line) => {
           if (!line) return acc
           if (line.startsWith("worktree ")) {
             acc.push({ path: line.slice("worktree ".length).trim() })
@@ -356,12 +366,13 @@ export const layer: Layer.Layer<
           if (line.startsWith("branch ")) {
             current.branch = line.slice("branch ".length).trim()
           }
+          if (line.startsWith("prunable ")) current.prunable = true
           return acc
         }, [])
     }
 
     const locateWorktree = Effect.fnUntraced(function* (
-      entries: { path?: string; branch?: string }[],
+      entries: { path?: string; branch?: string; prunable?: boolean }[],
       directory: string,
     ) {
       for (const item of entries) {
@@ -383,11 +394,31 @@ export const layer: Layer.Layer<
         return yield* new ListFailedError({ message: result.stderr || result.text || "Failed to read git worktrees" })
       }
 
+      const entries = parseWorktreeList(result.text)
+      const prunable = entries.flatMap((entry) => (entry.prunable && entry.path ? [entry.path] : []))
+      if (prunable.length > 0) {
+        const pruned = yield* git(["worktree", "prune"], { cwd: ctx.worktree })
+        if (pruned.code !== 0)
+          return yield* new ListFailedError({
+            message: pruned.stderr || pruned.text || "Failed to prune stale git worktrees",
+          })
+        const current = (yield* project.get(ctx.project.id)) ?? ctx.project
+        yield* Effect.forEach(
+          prunable,
+          (directory) =>
+            Effect.gen(function* () {
+              const sandbox = yield* registeredSandbox(current.sandboxes, directory)
+              if (sandbox) yield* project.removeSandbox(ctx.project.id, sandbox)
+            }),
+          { concurrency: 1, discard: true },
+        )
+      }
+
       const primary = yield* canonical(ctx.project.worktree)
       const primaryName = pathSvc.basename(primary).toLowerCase()
-      return yield* Effect.forEach(parseWorktreeList(result.text), (entry) =>
+      return yield* Effect.forEach(entries, (entry) =>
         Effect.gen(function* () {
-          if (!entry.path) return undefined
+          if (!entry.path || entry.prunable) return undefined
           const directory = yield* canonical(entry.path)
           if (directory === primary) return undefined
           const name = pathSvc.basename(directory).toLowerCase()
@@ -427,42 +458,89 @@ export const layer: Layer.Layer<
       })
     }
 
+    const hasUnresolvedLegacyMemory = Effect.fnUntraced(function* (directory: string) {
+      const found = yield* Effect.forEach(
+        MemoryPaths.PROJECT_PATHS,
+        (relative) => fs.exists(pathSvc.join(directory, relative)).pipe(Effect.orDie),
+        { concurrency: "unbounded" },
+      )
+      return found.some(Boolean)
+    })
+
+    const reconcileLegacyMemory = Effect.fnUntraced(function* (input: {
+      projectID: ProjectV2.ID
+      projectDirectory: string
+      directory: string
+      updated: number
+    }) {
+      if (memoryAdmission) {
+        yield* memoryAdmission.invalidate(input.projectID)
+        const memory = yield* memoryAdmission.ensure({
+          projectID: input.projectID,
+          projectDirectory: input.projectDirectory,
+          directories: [input.directory],
+          updated: input.updated,
+        })
+        if (memory.unresolved > 0)
+          return `Cannot continue with unresolved legacy project memory: ${memory.diagnostics
+            .filter((item) => item.code.endsWith(".invalid") || item.code.endsWith(".conflict"))
+            .map((item) => `${item.code} ${item.path}`)
+            .join(", ")}`
+      }
+      if (!(yield* hasUnresolvedLegacyMemory(input.directory))) return undefined
+      return "Cannot continue while unresolved legacy project memory remains. Move or back up .opencode/memory* outside this worktree, then retry."
+    })
+
     const removeLocked = Effect.fnUntraced(function* (input: RemoveInput, directory: string) {
       const ctx = yield* InstanceState.context
       if (ctx.project.vcs !== "git") {
         return yield* new NotGitError({ message: "Worktrees are only supported for git projects" })
       }
 
-      yield* FiberMap.remove(bootFibers, directory)
-
-      if (settingsHook) {
-        const wrResult = yield* settingsHook
-          .trigger(
-            { event: "WorktreeRemove", path: directory, branch: pathSvc.basename(directory) },
-            { sessionID: "", transcriptPath: "" },
-          )
-          .pipe(Effect.catch(() => Effect.succeed({ additionalContexts: [], systemMessages: [] })))
-        yield* SettingsHook.landSystemMessages(wrResult, { sessionID: "" })
+      const primary = yield* canonical(ctx.project.worktree)
+      const current = yield* canonical(ctx.worktree)
+      if (directory === primary || directory === current) {
+        return yield* new RemoveFailedError({ message: "Cannot remove the primary or current worktree" })
       }
 
-      // Preserve the loaded path casing for the store cache; `directory` is lowercased on Windows.
-      if (directory !== (yield* canonical(ctx.worktree))) yield* store.disposeDirectory(input.directory)
+      const currentProject = (yield* project.get(ctx.project.id)) ?? ctx.project
+      const registered = yield* registeredSandbox(currentProject.sandboxes, directory)
+      if (!registered) {
+        return yield* new RemoveFailedError({ message: "Worktree is not registered with this Project" })
+      }
 
       const list = yield* git(["worktree", "list", "--porcelain"], { cwd: ctx.worktree })
       if (list.code !== 0) {
         return yield* new RemoveFailedError({ message: list.stderr || list.text || "Failed to read git worktrees" })
       }
 
-      const entries = parseWorktreeList(list.text)
-      const entry = yield* locateWorktree(entries, directory)
-
+      const entry = yield* locateWorktree(parseWorktreeList(list.text), directory)
       if (!entry?.path) {
-        const directoryExists = yield* fs.exists(directory).pipe(Effect.orDie)
-        if (directoryExists) {
-          yield* stopFsmonitor(directory)
-          yield* cleanDirectory(directory)
-        }
-        return true
+        return yield* new RemoveFailedError({ message: "Worktree is not registered with this Project" })
+      }
+
+      const blocker = yield* reconcileLegacyMemory({
+        projectID: ctx.project.id,
+        projectDirectory: ctx.project.worktree,
+        directory: entry.path,
+        updated: currentProject.time.updated,
+      }).pipe(
+        Effect.mapError(
+          (error) => new RemoveFailedError({ message: `Failed to migrate legacy project memory: ${error.message}` }),
+        ),
+      )
+      if (blocker) return yield* new RemoveFailedError({ message: blocker })
+
+      yield* FiberMap.remove(bootFibers, directory)
+
+      if (settingsHook) {
+        const wrResult = yield* settingsHook
+          .trigger(
+            { event: "WorktreeRemove", path: entry.path, branch: pathSvc.basename(entry.path) },
+            { sessionID: "", transcriptPath: "" },
+          )
+          .pipe(Effect.catch(() => Effect.succeed({ additionalContexts: [], systemMessages: [] })))
+        yield* SettingsHook.landSystemMessages(wrResult, { sessionID: "" })
       }
 
       // Git may return the original casing when a caller supplied a normalized Windows path.
@@ -491,12 +569,19 @@ export const layer: Layer.Layer<
       if (branch) {
         const deleted = yield* git(["branch", "-D", branch], { cwd: ctx.worktree })
         if (deleted.code !== 0) {
+          const restored = yield* git(["worktree", "add", entry.path, branch], { cwd: ctx.worktree })
+          if (restored.code !== 0) yield* project.removeSandbox(ctx.project.id, registered)
+          const recovery =
+            restored.code === 0
+              ? "the worktree registration was restored"
+              : `the worktree could not be restored and its Project registration was removed: ${restored.stderr || restored.text}`
           return yield* new RemoveFailedError({
-            message: deleted.stderr || deleted.text || "Failed to delete worktree branch",
+            message: `Failed to delete worktree branch: ${deleted.stderr || deleted.text}; ${recovery}`,
           })
         }
       }
 
+      yield* project.removeSandbox(ctx.project.id, registered)
       return true
     })
 
@@ -519,7 +604,7 @@ export const layer: Layer.Layer<
       function* (directory: string, cmd: string) {
         const [shell, args] = process.platform === "win32" ? ["cmd", ["/c", cmd]] : ["bash", ["-lc", cmd]]
         const result = yield* appProcess.run(
-          ChildProcess.make(shell, args as string[], { cwd: directory, extendEnv: true, stdin: "ignore" }),
+          ChildProcess.make(shell, args, { cwd: directory, extendEnv: true, stdin: "ignore" }),
         )
         return { code: result.exitCode, stderr: result.stderr.toString("utf8") }
       },
@@ -569,14 +654,15 @@ export const layer: Layer.Layer<
     })
 
     const sweep = Effect.fnUntraced(function* (root: string) {
-      const first = yield* git(["clean", "-ffdx"], { cwd: root })
+      const args = ["clean", "-ffdx", ...MemoryPaths.PROJECT_PATHS.flatMap((relative) => ["-e", relative])]
+      const first = yield* git(args, { cwd: root })
       if (first.code === 0) return first
 
       const entries = failedRemoves(first.stderr, first.text)
       if (!entries.length) return first
 
       yield* prune(root, entries)
-      return yield* git(["clean", "-ffdx"], { cwd: root })
+      return yield* git(args, { cwd: root })
     })
 
     const resetLocked = Effect.fnUntraced(function* (input: ResetInput, directory: string) {
@@ -585,9 +671,15 @@ export const layer: Layer.Layer<
         return yield* new NotGitError({ message: "Worktrees are only supported for git projects" })
       }
 
-      const primary = yield* canonical(ctx.worktree)
-      if (directory === primary) {
-        return yield* new ResetFailedError({ message: "Cannot reset the primary workspace" })
+      const primary = yield* canonical(ctx.project.worktree)
+      const current = yield* canonical(ctx.worktree)
+      if (directory === primary || directory === current) {
+        return yield* new ResetFailedError({ message: "Cannot reset the primary or current worktree" })
+      }
+
+      const currentProject = (yield* project.get(ctx.project.id)) ?? ctx.project
+      if (!(yield* registeredSandbox(currentProject.sandboxes, directory))) {
+        return yield* new ResetFailedError({ message: "Worktree is not registered with this Project" })
       }
       yield* FiberMap.remove(bootFibers, directory)
 
@@ -602,6 +694,18 @@ export const layer: Layer.Layer<
       }
 
       const worktreePath = entry.path
+
+      const blocker = yield* reconcileLegacyMemory({
+        projectID: ctx.project.id,
+        projectDirectory: ctx.project.worktree,
+        directory: worktreePath,
+        updated: currentProject.time.updated,
+      }).pipe(
+        Effect.mapError(
+          (error) => new ResetFailedError({ message: `Failed to migrate legacy project memory: ${error.message}` }),
+        ),
+      )
+      if (blocker) return yield* new ResetFailedError({ message: blocker })
 
       const base = yield* gitSvc.defaultBranch(ctx.worktree)
       if (!base) {
@@ -650,13 +754,18 @@ export const layer: Layer.Layer<
         (r) => new ResetFailedError({ message: r.stderr || r.text || "Failed to clean submodules" }),
       )
 
-      const status = yield* git(["-c", "core.fsmonitor=false", "status", "--porcelain=v1"], { cwd: worktreePath })
+      const status = yield* git(["-c", "core.fsmonitor=false", "status", "--porcelain=v1", "--untracked-files=all"], {
+        cwd: worktreePath,
+      })
       if (status.code !== 0) {
         return yield* new ResetFailedError({ message: status.stderr || status.text || "Failed to read git status" })
       }
 
-      if (status.text.trim()) {
-        return yield* new ResetFailedError({ message: `Worktree reset left local changes:\n${status.text.trim()}` })
+      const dirty = status.text
+        .split("\n")
+        .filter((line) => line && !(line.startsWith("?? ") && MemoryPaths.isProjectMemoryPath(line.slice(3))))
+      if (dirty.length > 0) {
+        return yield* new ResetFailedError({ message: `Worktree reset left local changes:\n${dirty.join("\n")}` })
       }
 
       yield* FiberMap.run(
@@ -683,6 +792,7 @@ export const appLayer = layer.pipe(
   Layer.provide(Git.defaultLayer),
   Layer.provide(AppProcess.defaultLayer),
   Layer.provide(Project.defaultLayer),
+  Layer.provide(MemoryAdmission.defaultLayer),
   Layer.provide(Database.defaultLayer),
   Layer.provide(FSUtil.defaultLayer),
   Layer.provide(NodePath.layer),
@@ -696,6 +806,7 @@ export const node = LayerNode.make(layer, [
   AppProcess.node,
   Git.node,
   Project.node,
+  MemoryAdmission.node,
   InstanceStore.node,
   Database.node,
   SettingsHook.node,

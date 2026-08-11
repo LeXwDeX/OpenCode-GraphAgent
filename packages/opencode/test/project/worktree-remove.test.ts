@@ -5,10 +5,11 @@ import path from "path"
 import { Effect, Layer } from "effect"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Worktree } from "../../src/worktree"
+import { Project } from "../../src/project/project"
 import { TestInstance } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
 
-const it = testEffect(Layer.mergeAll(Worktree.defaultLayer, CrossSpawnSpawner.defaultLayer))
+const it = testEffect(Layer.mergeAll(Worktree.defaultLayer, Project.defaultLayer, CrossSpawnSpawner.defaultLayer))
 const wintest = process.platform === "win32" ? it.instance : it.instance.skip
 
 describe("Worktree.remove", () => {
@@ -17,6 +18,7 @@ describe("Worktree.remove", () => {
     () =>
       Effect.gen(function* () {
         const root = (yield* TestInstance).directory
+        const project = yield* Project.Service
         const svc = yield* Worktree.Service
         const name = `remove-regression-${Date.now().toString(36)}`
         const branch = `opencode/${name}`
@@ -24,6 +26,8 @@ describe("Worktree.remove", () => {
 
         yield* Effect.promise(() => $`git worktree add --no-checkout -b ${branch} ${dir}`.cwd(root).quiet())
         yield* Effect.promise(() => $`git reset --hard`.cwd(dir).quiet())
+        const current = yield* project.fromDirectory(root)
+        yield* project.addSandbox(current.project.id, dir)
 
         const real = (yield* Effect.promise(() => $`which git`.quiet().text())).trim()
         expect(real).toBeTruthy()

@@ -22,6 +22,7 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { EventV2 } from "@opencode-ai/core/event"
 import { Project } from "@opencode-ai/schema/project"
+import { ProjectIdentityMigration } from "./identity-migration"
 
 export const Info = Project.Info
 export type Info = Types.DeepMutable<Schema.Schema.Type<typeof Info>>
@@ -112,6 +113,7 @@ export const layer = Layer.effect(
     const projectDirectories = yield* ProjectDirectories.Service
     const events = yield* EventV2Bridge.Service
     const flags = yield* RuntimeFlags.Service
+    const identityMigration = yield* ProjectIdentityMigration.Service
     const { db } = yield* Database.Service
 
     const git = Effect.fnUntraced(
@@ -150,6 +152,8 @@ export const layer = Layer.effect(
       if (!oldID) return
       if (oldID === ProjectV2.ID.global) return
       if (oldID === newID) return
+
+      yield* identityMigration.migrate(oldID, newID)
 
       yield* db
         .transaction(
@@ -472,6 +476,7 @@ export const defaultLayer = layer.pipe(
   Layer.provide(FSUtil.defaultLayer),
   Layer.provide(Database.defaultLayer),
   Layer.provide(RuntimeFlags.defaultLayer),
+  Layer.provide(ProjectIdentityMigration.defaultLayer),
 )
 
 export const use = serviceUse(Service)
@@ -484,6 +489,7 @@ export const node = LayerNode.make(layer, [
   ProjectDirectories.node,
   EventV2Bridge.node,
   RuntimeFlags.node,
+  ProjectIdentityMigration.node,
   Database.node,
 ])
 
