@@ -33,7 +33,7 @@ https://codeload.github.com/LeXwDeX/opencode-dag-config/zip/refs/heads/main
 ```
 
 Extract it into a temporary directory. The archive contains a top-level folder
-(typically `opencode-dag-config-main/`) whose root holds the `*.yaml`
+(typically `opencode-dag-config-main/`) whose root holds the `*.yaml` and `*.yml`
 templates.
 
 ## Dry-run preview (always show before applying)
@@ -47,6 +47,28 @@ Compare the extracted templates against the current
 - local-only files (present locally, absent from the archive) are kept as-is
 
 Show the user the three lists, or report that nothing needs updating.
+
+## Validate downloaded templates (fail closed, before any replacement)
+
+Before any copy or overwrite, discover and validate EVERY extracted `*.yaml` and `*.yml` template with
+the same validation authority `start` and `list` use — the workflow tool's
+`validate` action. For each extracted template call:
+
+```
+workflow(action: "validate", spec_path: "<absolute path of the extracted file>", profile: "portable")
+```
+
+- Every template must come back `valid: true`.
+- If both `<name>.yaml` and `<name>.yml` exist, abort before applying anything;
+  one logical workflow name cannot have two source files.
+- If ANY template is invalid: keep the current global library exactly as it
+  is — copy nothing, overwrite nothing. Report a per-file diagnostic list
+  (code, path, message, hint) for every failing template plus the names that
+  passed, and stop. Treat validation failure like a download failure: never
+  partially apply.
+- Use the portable profile: the global library doubles as the distributable
+  builtin source, so a template that only works inside one specific project
+  does not belong here.
 
 ## Merge
 
@@ -94,6 +116,8 @@ not just the workflow library listing:
 - Download failure (network, 404, rate limit): report the actual error
   verbatim and stop — never invent success.
 - Extraction failure (corrupt archive): report and stop.
+- Validation failure (any template invalid): report per-file diagnostics and
+  stop; the existing library stays untouched.
 - If `<config dir>/workflows` does not exist, create it before applying.
 
 ## Notes

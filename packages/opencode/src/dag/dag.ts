@@ -9,9 +9,7 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 import { Database } from "@opencode-ai/core/database/database"
 import { KeyedMutex } from "@opencode-ai/core/effect/keyed-mutex"
 import { isRecord } from "@/util/record"
-import { validateRequiredNodes } from "@opencode-ai/core/dag/core/required-validator"
-import { buildGraph, WorkflowRuntime, toSchedulingNodes } from "@opencode-ai/core/dag/core/scheduling"
-import { CycleError } from "@opencode-ai/core/dag/core/graph"
+import { WorkflowRuntime, toSchedulingNodes } from "@opencode-ai/core/dag/core/scheduling"
 import { planReplan } from "@opencode-ai/core/dag/core/replan"
 import {
   getValidNextWorkflowStatuses,
@@ -29,10 +27,10 @@ import {
   transitionAdmission,
   validateAdmission,
 } from "./admission"
-import { unresolvedReviewOutcomes, validateReviewLifecycle } from "./review-lifecycle"
-import { conditionReference } from "./runtime/eval"
-import { unsupportedSchemaKeywords } from "./runtime/capture"
-import { placeholderKeys } from "./templates/resolve"
+import { unresolvedReviewOutcomes } from "./review-lifecycle"
+import { DagValidation, StructuralValidationError } from "./validation"
+
+export { StructuralValidationError } from "./validation"
 
 // Re-export domain types
 export const ID = DagEvent.DagID
@@ -63,7 +61,7 @@ export interface NodeConfig {
   name: string
   worker_type: string
   depends_on: string[]
-  required: boolean
+  required?: boolean
   prompt_template: { id?: string; inline?: string; input?: Record<string, unknown> }
   worker_config?: { timeout_ms?: number }
   input_mapping?: Record<string, string>
@@ -85,6 +83,10 @@ export interface NodeDefaults {
   worker_config?: { timeout_ms?: number }
   report_to_parent?: boolean
   model?: { modelID: string; providerID: string }
+}
+
+interface NormalizedNodeConfig extends NodeConfig {
+  required: boolean
 }
 
 export interface WorkflowConfig {
@@ -142,7 +144,7 @@ function normalizeNodeDefaults(defaults: NodeDefaults | undefined): NodeDefaults
   }
 }
 
-function normalizeNodeConfig(node: NodeConfig, defaults: NodeDefaults): NodeConfig {
+function normalizeNodeConfig(node: NodeConfig, defaults: NodeDefaults): NormalizedNodeConfig {
   const model = normalizeModel(node.model ?? defaults.model)
   return {
     ...node,
@@ -162,13 +164,17 @@ function normalizeNodeConfig(node: NodeConfig, defaults: NodeDefaults): NodeConf
 // back to 10min — implicit budget shortening). The replace bucket (definition
 // replaced, execution kept) preserves the existing node's timeout for the
 // merged config and the deadline recompute.
-function normalizeFragmentNode(node: NodeConfig, existingTimeoutMs: number | undefined, defaults: NodeDefaults): NodeConfig {
+function normalizeFragmentNode(
+  node: NodeConfig,
+  existingTimeoutMs: number | undefined,
+  defaults: NodeDefaults,
+): NormalizedNodeConfig {
   const timeoutMs = node.worker_config?.timeout_ms ?? existingTimeoutMs
   const withTimeout = timeoutMs == null ? node : { ...node, worker_config: { ...node.worker_config, timeout_ms: timeoutMs } }
   return normalizeNodeConfig(withTimeout, defaults)
 }
 
-function normalizeWorkflowConfig(config: WorkflowConfig): WorkflowConfig {
+function normalizeWorkflowConfig(config: WorkflowConfig): WorkflowConfig & { nodes: NormalizedNodeConfig[] } {
   const defaults = normalizeNodeDefaults(config.node_defaults)
   return {
     ...config,
@@ -232,62 +238,11 @@ export function parseWorkflowConfig(raw: string): WorkflowConfig | undefined {
   return parsed.value as WorkflowConfig
 }
 
-/**
- * A parseable condition may only reference the node's direct dependencies —
- * anything else silently resolves to undefined and evaluates false at spawn
- * time. Shared by create (all nodes) and replan (fragment nodes).
- */
-function conditionReferenceErrors(nodes: readonly NodeConfig[]): string[] {
-  return nodes.flatMap((node) => {
-    const ref = conditionReference(node.condition)
-    if (!ref || node.depends_on.includes(ref)) return []
-    return [
-      `node "${node.id}" condition references "${ref}" which is not in its depends_on (condition inputs come from direct dependencies only; this would silently evaluate false)`,
-    ]
-  })
-}
-
-/**
- * An inline prompt_template may only reference variables that have a binding
- * source: static prompt_template.input keys, input_mapping target names, or —
- * when input_mapping is omitted — the direct depends_on ids that feed the
- * spawn-time input. Anything else is guaranteed to die at spawn (verdict_fail:
- * Unresolved template placeholders), so rejecting at acceptance removes the
- * "Added, then spawn-dead" silent window. `id` templates are read lazily from
- * disk and cannot be binding-checked here; spawn-time enforcement still
- * covers them.
- */
-function templateBindingErrors(nodes: readonly NodeConfig[]): string[] {
-  return nodes.flatMap((node) => {
-    const template = node.prompt_template.inline
-    if (template === undefined) return []
-    const bound = new Set([
-      ...Object.keys(node.prompt_template.input ?? {}),
-      ...Object.keys(node.input_mapping ?? Object.fromEntries(node.depends_on.map((dep) => [dep, dep]))),
-    ])
-    return placeholderKeys(template)
-      .filter((key) => !bound.has(key))
-      .map((key) =>
-        `node "${node.id}" prompt_template references unbound variable "{{${key}}}" (bind it via prompt_template.input, input_mapping, or depends_on)`,
-      )
-  })
-}
-
-// The runtime validator enforces a JSON Schema subset; anything outside it is
-// inert. Warn (not reject) at create/replan so authors learn their constraint
-// won't fire before a payload silently sails past it.
-function warnUnsupportedSchemaKeywords(nodes: readonly NodeConfig[]) {
-  return Effect.forEach(
-    nodes.flatMap((node) => {
-      if (!node.output_schema) return []
-      const keywords = unsupportedSchemaKeywords(node.output_schema)
-      return keywords.length > 0 ? [{ nodeID: node.id, keywords }] : []
-    }),
-    (hit) =>
-      Effect.logWarning("output_schema uses keywords the subset validator does not enforce — they will be ignored at runtime", hit),
-    { discard: true },
-  )
-}
+// Structural validation (duplicate ids, dangling/condition references,
+// template bindings, ceilings, review lifecycle, required-node and full-graph
+// cycles) lives in the shared validation authority so create, replan, and the
+// workflow validate action all enforce the same invariants with the same
+// codes and field paths.
 
 export interface Interface {
   readonly create: (input: {
@@ -383,37 +338,23 @@ export const layer = Layer.effect(
       config: WorkflowConfig
     }) {
       const config = normalizeWorkflowConfig(input.config)
-      // Structural validation first (mirrors planReplan's fragment checks so
-      // create and replan reject the same malformed shapes): duplicate ids
-      // would silently merge via the projector's upsert, and a dangling
-      // depends_on reference would silently drop the edge in buildGraph —
-      // turning a typo'd dependency into an immediately-runnable root node.
-      const ids = config.nodes.map((n) => n.id)
-      const idSet = new Set(ids)
-      if (idSet.size !== ids.length) {
-        const duplicates = [...new Set(ids.filter((id, index) => ids.indexOf(id) !== index))]
-        return yield* Effect.fail(new Error(`Invalid workflow config: duplicate node ids: ${duplicates.join(", ")}`))
+      // Structural validation first, via the shared authority (the same one
+      // the workflow validate action runs): duplicate ids would silently
+      // merge via the projector's upsert, and a dangling depends_on reference
+      // would silently drop the edge in buildGraph — turning a typo'd
+      // dependency into an immediately-runnable root node. Rejection happens
+      // before any event publication.
+      const structural = DagValidation.structuralDiagnostics({
+        nodes: config.nodes,
+        mode: config.mode,
+        max_total_nodes: config.max_total_nodes,
+      })
+      const structuralErrors = DagValidation.sortLegacyStructural(structural.filter((d) => d.severity === "error"))
+      for (const warning of structural.filter((d) => d.severity === "warning")) {
+        yield* Effect.logWarning("DAG structural validation diagnostic", { diagnostic: warning })
       }
-      const danglingDeps = config.nodes.flatMap((n) =>
-        n.depends_on.filter((dep) => !idSet.has(dep)).map((dep) => `node "${n.id}" depends on unknown node "${dep}"`),
-      )
-      if (danglingDeps.length > 0) {
-        return yield* Effect.fail(new Error(`Invalid workflow config: ${danglingDeps.join("; ")}`))
-      }
-      const conditionErrors = conditionReferenceErrors(config.nodes)
-      if (conditionErrors.length > 0) {
-        return yield* Effect.fail(new Error(`Invalid workflow config: ${conditionErrors.join("; ")}`))
-      }
-      const bindingErrors = templateBindingErrors(config.nodes)
-      if (bindingErrors.length > 0) {
-        return yield* Effect.fail(new Error(`Invalid workflow config: ${bindingErrors.join("; ")}`))
-      }
-      yield* warnUnsupportedSchemaKeywords(config.nodes)
-      // Enforce the total node ceiling at creation, not only on replan — the
-      // ceiling is a lifetime cap and the initial graph counts toward it.
-      const maxTotalNodes = config.max_total_nodes ?? DEFAULT_WORKFLOW_CONFIG.maxTotalNodes
-      if (config.nodes.length > maxTotalNodes) {
-        return yield* Effect.fail(new Error(`Total node ceiling exceeded: ${config.nodes.length} nodes > ${maxTotalNodes} max`))
+      if (structuralErrors.length > 0) {
+        return yield* Effect.fail(new StructuralValidationError({ diagnostics: structuralErrors }))
       }
       if (config.mode === "deep") {
         if (!config.admission) {
@@ -445,37 +386,6 @@ export const layer = Layer.effect(
             },
           }
         : config
-      const reviewLifecycle = validateReviewLifecycle(durableConfig)
-      if (!reviewLifecycle.valid) {
-        return yield* Effect.fail(new Error(
-          `Invalid review lifecycle: ${reviewLifecycle.errors.join("; ")}`,
-        ))
-      }
-      for (const warning of reviewLifecycle.warnings) {
-        yield* Effect.logWarning("DAG review lifecycle diagnostic", { warning })
-      }
-      const validation = validateRequiredNodes({
-        nodes: durableConfig.nodes.map((n) => ({ id: n.id, depends_on: n.depends_on, required: n.required })),
-      })
-      if (!validation.valid) return yield* Effect.fail(new Error(`Invalid workflow config: ${validation.errors.join("; ")}`))
-
-      // Full-graph cycle detection — validates ALL nodes (not just required),
-      // so a cycle among optional nodes cannot silently create a zombie graph.
-      // buildGraph throws CycleError via addEdge's wouldCreateCycle pre-check.
-      const cyclePath: string[] | null = yield* Effect.sync(() => {
-        try {
-          const graph = buildGraph(
-            durableConfig.nodes.map((n) => ({ id: n.id, dependsOn: n.depends_on, status: "pending" as const, required: n.required })),
-          )
-          return graph.hasCycle() ? (graph.findCycles()[0] ?? null) : null
-        } catch (e) {
-          if (e instanceof CycleError) return e.cycle
-          throw e
-        }
-      })
-      if (cyclePath) {
-        return yield* Effect.fail(new Error(`Workflow config contains a dependency cycle: ${cyclePath.join(" -> ")}`))
-      }
 
       const dagID = DagEvent.DagID.create()
       const ts = yield* DateTime.now
@@ -627,38 +537,29 @@ export const layer = Layer.effect(
         const status = nodeStatusById.get(n.id)
         return status === undefined || !isNodeTerminalStatus(status as NodeStatus)
       })
-      const conditionErrors = conditionReferenceErrors(rerunNodes)
-      if (conditionErrors.length > 0) {
-        return yield* Effect.fail(new Error(`Replan rejected: ${conditionErrors.join("; ")}`))
-      }
-      const bindingErrors = templateBindingErrors(rerunNodes)
-      if (bindingErrors.length > 0) {
-        return yield* Effect.fail(new Error(`Replan rejected: ${bindingErrors.join("; ")}`))
-      }
-      yield* warnUnsupportedSchemaKeywords(normalizedFragment.nodes)
 
+      // Structural validation through the SAME authority as create — condition,
+      // binding, dangling-dep, ceiling, review-lifecycle, and topology checks
+      // all run through DagValidation.replanStructuralDiagnostics (which reuses
+      // the exact same helper functions as structuralDiagnostics). This is the
+      // create/replan parity the spec requires: one authority, two entry points
+      // that differ only in scoping (fragment + rerun-only vs whole-graph).
       const maxReplanAttempts = wfConfig?.max_node_replan_attempts ?? DEFAULT_WORKFLOW_CONFIG.maxNodeReplanAttempts
-      const maxTotalNodes = wfConfig?.max_total_nodes ?? DEFAULT_WORKFLOW_CONFIG.maxTotalNodes
-
-      // Enforce total node ceiling BEFORE any event publication so a rejected
-      // replan leaves no durable side effects. Count ALL nodes ever registered
-      // (cumulative lifetime) — terminal nodes still count toward the cap.
-      if (nodes.length + plan.add.length > maxTotalNodes) {
-        return yield* Effect.fail(new Error(`Total node ceiling exceeded: ${nodes.length} existing + ${plan.add.length} new > ${maxTotalNodes} max`))
+      const replanDiagnostics = DagValidation.replanStructuralDiagnostics({
+        fragmentNodes: normalizedFragment.nodes,
+        rerunNodes,
+        existingNodeIds: new Set(nodes.map((n) => n.id)),
+        existingNodeCount: nodes.length,
+        addCount: plan.add.length,
+        merged: wfConfig ? computeMergedConfig(wfConfig, normalizedFragment, plan) : { nodes: normalizedFragment.nodes },
+        config: { mode: wfConfig?.mode, max_total_nodes: wfConfig?.max_total_nodes },
+      })
+      const replanErrors = DagValidation.sortLegacyStructural(replanDiagnostics.filter((d) => d.severity === "error"))
+      for (const warning of replanDiagnostics.filter((d) => d.severity === "warning")) {
+        yield* Effect.logWarning("DAG structural validation diagnostic", { diagnostic: warning })
       }
-
-      if (wfConfig) {
-        const reviewLifecycle = validateReviewLifecycle(
-          computeMergedConfig(wfConfig, normalizedFragment, plan),
-        )
-        if (!reviewLifecycle.valid) {
-          return yield* Effect.fail(new Error(
-            `Invalid review lifecycle: ${reviewLifecycle.errors.join("; ")}`,
-          ))
-        }
-        for (const warning of reviewLifecycle.warnings) {
-          yield* Effect.logWarning("DAG review lifecycle diagnostic", { warning })
-        }
+      if (replanErrors.length > 0) {
+        return yield* Effect.fail(new StructuralValidationError({ diagnostics: replanErrors }))
       }
 
       const nodeById = new Map(nodes.map((n) => [n.id, n]))

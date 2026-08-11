@@ -1,0 +1,53 @@
+title: "Prototype detour: evidence → experiments → production plan"
+config:
+  name: prototype-decision-route
+  max_concurrency: 3
+  max_node_replan_attempts: 2
+  max_total_nodes: 16
+  node_defaults:
+    worker_config:
+      timeout_ms: 1800000
+  objective: >-
+    Resolve a confirmed runnable design uncertainty with disposable experiments,
+    then convert only supported observations into a reviewed production plan.
+  blocks:
+    - id: uncertainty-map
+      kind: explore
+      instruction: >-
+        Define the exact unknown, current evidence, falsifiable success signal,
+        constraints, and what the experiment must not attempt to prove.
+
+    - id: simplest-experiment
+      kind: prototype
+      depends_on: [uncertainty-map]
+      instruction: >-
+        Build the shortest disposable path that can falsify the leading design.
+        Keep it isolated from production wiring and record reproducible observations.
+
+    - id: contrast-experiment
+      kind: prototype
+      depends_on: [uncertainty-map]
+      instruction: >-
+        Test the strongest contrasting mechanism or failure mode. Optimize for
+        information gained, not polish, and keep all artifacts disposable.
+
+    - id: production-plan
+      kind: plan
+      depends_on: [simplest-experiment, contrast-experiment]
+      instruction: >-
+        Separate observations from inference, discard prototype shortcuts, and
+        propose production boundaries, migration steps, tests, and stop criteria.
+
+    - id: plan-decision
+      kind: review
+      depends_on: [production-plan]
+      instruction: >-
+        Verify that the plan follows from experiment evidence, does not promote
+        throwaway code implicitly, and exposes unresolved risks and falsifiers.
+
+    - id: decision-record
+      kind: synthesize
+      depends_on: [plan-decision]
+      instruction: >-
+        Record what was learned, what was disproven, the reviewed production path,
+        acceptance checks, and remaining uncertainty.

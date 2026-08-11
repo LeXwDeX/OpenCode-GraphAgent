@@ -4,17 +4,10 @@
 $ARGUMENTS
 </dag-flow-task>
 
-If the task is empty or contains only whitespace, ask for it and do not start a workflow. Otherwise load
-the `orchestration-router` skill and route the request through one consolidated
-graph. `/dag-flow` explicitly selects DAG execution, but it does not waive a
-material user decision.
-
-When the route requires a decision checkpoint or GRILL qualification, inspect
-discoverable facts first, proactively write recommended answers, surface the
-compact brief in the main conversation, and ask for one combined confirmation.
-Do not call `workflow(action="start")` until that confirmation arrives. Do not
-put the checkpoint in a child node. If the request is already bounded and
-confirmed, start without manufacturing another question.
+If the task is empty or contains only whitespace, ask for it; do not start a workflow.
+Otherwise apply the resident Orchestration Router and route the
+request through one consolidated graph. `/dag-flow` explicitly selects DAG
+execution; the router still owns any material Decision Checkpoint.
 
 Prefer composable blocks for a fresh flow. Load
 `workflow(action="guide", topic="blocks")` only if the block contract is not

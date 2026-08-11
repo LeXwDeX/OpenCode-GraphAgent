@@ -235,10 +235,14 @@ describe("Dag prompt_template binding validation", () => {
           title: "binding-extend",
           config: { name: "binding-extend", nodes: [node("explore")] },
         }).pipe(Effect.orDie)
-        const errorMessage = yield* dag.extend(dagID, [
+        // extend internally routes through _replan, which now uses the same
+        // StructuralValidationError as create (shared authority).
+        const error = yield* dag.extend(dagID, [
           { ...node("repair", ["explore"]), prompt_template: { inline: "Use {{path}}" } },
-        ]).pipe(Effect.catch((e: Error) => Effect.succeed(e.message)))
-        expect(errorMessage).toContain('Replan rejected: node "repair" prompt_template references unbound variable "{{path}}"')
+        ]).pipe(Effect.catch((e: unknown) => Effect.succeed(e)))
+        expect(error).toBeInstanceOf(Dag.StructuralValidationError)
+        if (!(error instanceof Error)) throw error
+        expect(error.message).toContain('node "repair" prompt_template references unbound variable "{{path}}"')
       }).pipe(Effect.scoped, Effect.provide(dagLayer)),
     )
   })

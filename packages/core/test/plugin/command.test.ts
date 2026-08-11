@@ -49,25 +49,25 @@ describe("CommandPlugin.Plugin", () => {
         template: CommandPlugin.DagFlowContent,
       })
       expect(CommandPlugin.DagFlowContent).toContain("$ARGUMENTS")
-      expect(CommandPlugin.DagFlowContent).toContain('workflow(action="start")')
+      expect(CommandPlugin.DagFlowContent).toContain("`action=start`")
       expect(CommandPlugin.DagFlowContent).toContain("exact Workflow ID")
       expect(CommandPlugin.DagFlowContent).toContain("run `/dag`")
-      expect(CommandPlugin.DagFlowContent).toContain("orchestration-router")
-      expect(CommandPlugin.DagFlowContent).toContain("one combined confirmation")
+      expect(CommandPlugin.DagFlowContent).toContain("resident Orchestration Router")
+      expect(CommandPlugin.DagFlowContent).toContain("Decision Checkpoint")
     }),
   )
 
   it.effect("documents the smallest child execution mode", () =>
     Effect.sync(() => {
-      expect(CommandPlugin.WorkflowContent).toContain("## Execution Mode Selection")
-      expect(CommandPlugin.WorkflowContent).toContain("Use direct execution for")
-      expect(CommandPlugin.WorkflowContent).toContain("one `task` subagent")
+      expect(CommandPlugin.WorkflowContent).toContain("## Execution mode")
+      expect(CommandPlugin.WorkflowContent).toContain("Direct execution:")
+      expect(CommandPlugin.WorkflowContent).toContain("One `task` child")
       expect(CommandPlugin.WorkflowContent).toContain("Related work for one objective")
       expect(CommandPlugin.WorkflowFactsContent).toContain("project-level source or test changes")
       expect(CommandPlugin.WorkflowFactsContent).toMatch(/even when only\s+one project file/)
       expect(CommandPlugin.WorkflowFactsContent).not.toContain("when ANY")
       expect(CommandPlugin.WorkflowFactsContent).not.toContain("- **Multi-model**:")
-      expect(CommandPlugin.DagFlowContent).toContain('workflow(action="start")')
+      expect(CommandPlugin.DagFlowContent).toContain("`action=start`")
     }),
   )
 
@@ -75,13 +75,22 @@ describe("CommandPlugin.Plugin", () => {
     Effect.sync(() => {
       expect(CommandPlugin.WorkflowContent.length).toBeLessThan(5_000)
       expect(CommandPlugin.WorkflowContent).toContain("project-level source or test changes")
-      expect(CommandPlugin.WorkflowContent).toContain("only one project file")
+      expect(CommandPlugin.WorkflowContent).toMatch(/even one project\s+file/)
       expect(CommandPlugin.WorkflowContent).toContain("isolated utility scripts")
-      expect(CommandPlugin.WorkflowContent).toContain("orchestration-router")
-      expect(CommandPlugin.WorkflowContent).toContain("**guide**")
+      expect(CommandPlugin.WorkflowContent).toContain("# Orchestration Router")
+      expect(CommandPlugin.WorkflowContent).toContain("Workflow Brief")
+      expect(CommandPlugin.WorkflowContent).toContain("smallest justified graph")
+      expect(CommandPlugin.WorkflowContent).not.toMatch(/load (?:the )?[`"']?orchestration-router/i)
+      expect(CommandPlugin.WorkflowContent).toContain(
+        "Do not discover, load, or apply an external Skill to select the workflow route",
+      )
+      expect(CommandPlugin.WorkflowContent).toContain('guide(topic="blocks")')
       expect(CommandPlugin.WorkflowContent).not.toContain("# Orchestration Domains")
       expect(CommandPlugin.WorkflowBlocksContent).toContain("# Composable Workflow Blocks")
-      expect(CommandPlugin.WorkflowBlocksContent).toContain("combined confirmation")
+      expect(CommandPlugin.WorkflowContent).toContain("combined confirmation")
+      expect(CommandPlugin.WorkflowBlocksContent).not.toContain("combined confirmation")
+      expect(CommandPlugin.WorkflowContent).toContain("product or architecture decision")
+      expect(CommandPlugin.WorkflowBlocksContent).not.toContain("product or architecture decision")
       expect(CommandPlugin.WorkflowFactsContent.length).toBeGreaterThan(CommandPlugin.WorkflowContent.length)
     }),
   )
@@ -102,7 +111,11 @@ describe("CommandPlugin.Plugin", () => {
     Effect.sync(() => {
       expect(CommandPlugin.WorkflowFactsContent).toContain("For a one-off graph, pass `spec` inline")
       expect(CommandPlugin.WorkflowFactsContent).toContain("Use `spec_path` only")
-      expect(CommandPlugin.WorkflowContent).toContain("**read**")
+      // The resident description keeps tool selection and the progressive
+      // guide index only; per-action field semantics live in the parameter
+      // schema (change repair-workflow-authoring-validation).
+      expect(CommandPlugin.WorkflowContent).not.toContain("## Actions")
+      expect(CommandPlugin.WorkflowContent).toContain("parameter schema")
       expect(CommandPlugin.WorkflowFactsContent).toContain('{ action: "read", spec_path: "code-review" }')
       expect(CommandPlugin.WorkflowFactsContent).toContain("retarget its objective and block instructions")
       expect(CommandPlugin.WorkflowFactsContent).not.toContain("Never inline graph nodes")

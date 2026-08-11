@@ -50,13 +50,19 @@ export function resolveTemplate(ref: TemplateRef, projectDir: string): Effect.Ef
   return renderTemplate(ref, projectDir).pipe(Effect.map((result) => result.text))
 }
 
+/** Read a template asset by id without interpolation — validation needs the
+ * raw source to check placeholder bindings before any node spawn. */
+export function templateSourceById(id: string, projectDir: string): Effect.Effect<string, Error> {
+  return readById(id, projectDir)
+}
+
 export function renderTemplate(
   ref: TemplateRef,
   projectDir: string,
   dynamicInput: Record<string, unknown> = {},
 ) {
   return Effect.gen(function* () {
-    const input = sanitizeInput({ ...dynamicInput, ...(ref.input ?? {}) })
+    const input = sanitizeInput({ ...dynamicInput, ...ref.input })
     const raw = yield* readTemplateSource(ref, projectDir)
     return interpolate(raw, input)
   })
@@ -106,7 +112,10 @@ function interpolate(template: string, input: Record<string, unknown>) {
   const text = template.replace(INTERPOLATION_RE, (match, key: string) => {
     const value = input[key]
     if (value !== null && value !== undefined) {
-      return typeof value === "object" ? JSON.stringify(value, null, 2) : String(value)
+      if (typeof value === "object") return JSON.stringify(value, null, 2)
+      if (typeof value === "symbol") return value.description ?? ""
+      if (typeof value === "function") return value.name
+      return value.toString()
     }
     unresolvedPlaceholders.push(key)
     return match

@@ -1,0 +1,15 @@
+{
+  "captured_from": "workflow-parameters-post-change.json before internalize-dag-block-capabilities",
+  "schema_bytes": 29768,
+  "provider_block_item_fields": [
+    "id",
+    "kind",
+    "depends_on",
+    "instruction",
+    "skills",
+    "worker_type",
+    "required",
+    "report_to_parent"
+  ],
+  "compiled_prompt_fragment": "Before working, load these relevant skills with the skill tool when available"
+}
