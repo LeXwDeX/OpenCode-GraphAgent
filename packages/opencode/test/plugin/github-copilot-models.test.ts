@@ -330,3 +330,72 @@ test("remaps fallback oauth model urls to the enterprise host", async () => {
   expect(models.claude.api.url).toBe("https://copilot-api.ghe.example.com")
   expect(models.claude.api.npm).toBe("@ai-sdk/github-copilot")
 })
+
+test("detects PDF input support when vision and media type are advertised", async () => {
+  globalThis.fetch = mock(() =>
+    Promise.resolve(
+      new Response(
+        JSON.stringify({
+          data: [
+            {
+              model_picker_enabled: true,
+              id: "pdf-model",
+              name: "PDF Model",
+              version: "pdf-model-2026-06-01",
+              capabilities: {
+                family: "pdf-model",
+                limits: {
+                  max_context_window_tokens: 128000,
+                  max_output_tokens: 16384,
+                  max_prompt_tokens: 128000,
+                  vision: {
+                    max_prompt_image_size: 10000000,
+                    max_prompt_images: 10,
+                    supported_media_types: ["application/pdf"],
+                  },
+                },
+                supports: {
+                  streaming: true,
+                  vision: true,
+                  tool_calls: true,
+                },
+              },
+            },
+            {
+              model_picker_enabled: true,
+              id: "vision-only-model",
+              name: "Vision Only Model",
+              version: "vision-only-model-2026-06-01",
+              capabilities: {
+                family: "vision-only-model",
+                limits: {
+                  max_context_window_tokens: 128000,
+                  max_output_tokens: 16384,
+                  max_prompt_tokens: 128000,
+                  vision: {
+                    max_prompt_image_size: 10000000,
+                    max_prompt_images: 10,
+                    supported_media_types: ["image/png"],
+                  },
+                },
+                supports: {
+                  streaming: true,
+                  vision: true,
+                  tool_calls: true,
+                },
+              },
+            },
+          ],
+        }),
+        { status: 200 },
+      ),
+    ),
+  ) as unknown as typeof fetch
+
+  const models = (await CopilotModels.get("https://api.githubcopilot.com")).models
+  const model = models["pdf-model"]
+
+  expect(model.capabilities.input.pdf).toBe(true)
+  expect(models["vision-only-model"].capabilities.input.pdf).toBe(false)
+})
+
