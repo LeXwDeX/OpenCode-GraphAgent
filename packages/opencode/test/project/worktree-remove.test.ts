@@ -2,9 +2,14 @@ import { $ } from "bun"
 import { describe, expect } from "bun:test"
 import * as fs from "fs/promises"
 import path from "path"
-import { Effect, Exit, Layer } from "effect"
+import { Duration, Effect, Exit, Fiber, Layer } from "effect"
 import { stringify } from "yaml"
+import { Database } from "@opencode-ai/core/database/database"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
+import { ProjectTable } from "@opencode-ai/core/project/sql"
+import { EffectFlock } from "@opencode-ai/core/util/effect-flock"
+import { eq } from "drizzle-orm"
+import { MemoryHome } from "@/memory/home"
 import { MemoryStore } from "@/memory/store"
 import { Worktree } from "../../src/worktree"
 import { Project } from "../../src/project/project"
@@ -12,7 +17,15 @@ import { TestInstance } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
 
 const it = testEffect(
-  Layer.mergeAll(Worktree.defaultLayer, Project.defaultLayer, CrossSpawnSpawner.defaultLayer, MemoryStore.defaultLayer),
+  Layer.mergeAll(
+    Worktree.defaultLayer,
+    Project.defaultLayer,
+    CrossSpawnSpawner.defaultLayer,
+    MemoryStore.defaultLayer,
+    Database.defaultLayer,
+    EffectFlock.defaultLayer,
+    MemoryHome.defaultLayer,
+  ),
 )
 const wintest = process.platform === "win32" ? it.instance : it.instance.skip
 
@@ -391,6 +404,58 @@ describe("Worktree.remove", () => {
         expect(Exit.isFailure(outcome)).toBe(true)
         if (Exit.isFailure(outcome)) expect(String(outcome.cause)).toContain("topic.invalid")
         expect(yield* exists(invalidFile)).toBe(true)
+      }),
+    { git: true },
+  )
+
+  it.instance(
+    "blocks removal when the identity retires mid-remove with un-admitted legacy memory (MEM-PR01-R9-P2A)",
+    () =>
+      Effect.gen(function* () {
+        const root = (yield* TestInstance).directory
+        const project = yield* Project.Service
+        const svc = yield* Worktree.Service
+        const flock = yield* EffectFlock.Service
+        const home = yield* MemoryHome.Service
+        const { db } = yield* Database.Service
+        const current = yield* project.fromDirectory(root)
+        yield* project.setInitialized(current.project.id)
+
+        const stamp = Date.now().toString(36)
+        const dir = path.join(root, "..", `retired-remove-${stamp}`)
+        yield* Effect.promise(() => $`git worktree add -b opencode/retired-remove-${stamp} ${dir}`.cwd(root).quiet())
+        yield* project.addSandbox(current.project.id, dir)
+
+        // Legacy memory that was never admitted into any Home.
+        const legacyDir = path.join(dir, ".opencode", "memory", "topics")
+        yield* Effect.promise(() => fs.mkdir(legacyDir, { recursive: true }))
+        const legacyFile = path.join(legacyDir, "never-admitted.yaml")
+        yield* Effect.promise(() => fs.writeFile(legacyFile, "id: never-admitted\n"))
+
+        // Hold the admission lock: the remove's reconcile blocks inside ensure
+        // AFTER its own row-liveness check passed. While it blocks, the
+        // identity row is retired by a concurrent upgrade. The in-fence
+        // liveness recheck must then fail the removal closed instead of
+        // destroying the never-admitted legacy content.
+        const fiber = yield* flock.withLock(
+          Effect.gen(function* () {
+            const fiber = yield* svc.remove({ directory: dir }).pipe(Effect.forkDetach)
+            yield* Effect.sleep(Duration.millis(500))
+            yield* db
+              .delete(ProjectTable)
+              .where(eq(ProjectTable.id, current.project.id))
+              .run()
+              .pipe(Effect.orDie)
+            return fiber
+          }),
+          `memory-admission:${current.project.id}`,
+          home.locks,
+        )
+        const outcome = yield* Fiber.join(fiber).pipe(Effect.exit)
+
+        expect(Exit.isFailure(outcome)).toBe(true)
+        if (Exit.isFailure(outcome)) expect(String(outcome.cause)).toContain("identity")
+        expect(yield* exists(legacyFile)).toBe(true)
       }),
     { git: true },
   )

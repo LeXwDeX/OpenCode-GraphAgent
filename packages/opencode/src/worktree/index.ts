@@ -488,9 +488,12 @@ export const layer: Layer.Layer<
             updated: input.updated,
           })
           .pipe(Effect.catchTag("MemoryAdmission.IdentityRetired", () => Effect.succeed(undefined)))
-        // The identity was retired concurrently: the legacy migration is moot
-        // (the Home moved to the successor) — do not block the operation.
-        if (!memory) return undefined
+        // The identity was retired concurrently. Legacy sources may never have
+        // been admitted anywhere, so a destructive step (worktree remove) must
+        // fail closed instead of destroying them; a retry under the successor
+        // identity imports them first.
+        if (!memory)
+          return "Project identity is being upgraded. Retry once the upgrade completes."
         if (memory.unresolved > 0)
           return `Cannot continue with unresolved legacy project memory: ${memory.diagnostics
             .filter((item) => item.code.endsWith(".invalid") || item.code.endsWith(".conflict"))

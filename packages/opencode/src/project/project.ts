@@ -165,57 +165,57 @@ export const layer = Layer.effect(
           .transaction(
             (d) =>
               Effect.gen(function* () {
-              const oldProject = yield* d.select().from(ProjectTable).where(eq(ProjectTable.id, oldID)).get()
-              const newProject = yield* d.select().from(ProjectTable).where(eq(ProjectTable.id, newID)).get()
-              if (oldProject && !newProject) {
-                yield* d
-                  .insert(ProjectTable)
-                  .values({
-                    ...oldProject,
-                    id: newID,
-                    time_updated: Date.now(),
-                  })
-                  .run()
-              }
-
-              // Project directories may be shared across distinct
-              // checkouts which have diverged. Clear the directory
-              // list and rely on it being re-populated to ensure
-              // accuracy
-              yield* d.delete(ProjectDirectoryTable).where(eq(ProjectDirectoryTable.project_id, oldID)).run()
-
-              yield* d
-                .update(SessionTable)
-                .set({ project_id: newID, time_updated: sql`${SessionTable.time_updated}` })
-                .where(eq(SessionTable.project_id, oldID))
-                .run()
-              yield* d
-                .update(WorkspaceTable)
-                .set({ project_id: newID })
-                .where(eq(WorkspaceTable.project_id, oldID))
-                .run()
-
-              // Repoint the Project-owned references that the old row's deletion would otherwise
-              // cascade-destroy. Both workflow and permission carry ON DELETE CASCADE on project_id,
-              // so without this repointing, gaining a first remote would silently delete every DAG
-              // workflow and every saved permission for the project.
-              yield* d.update(WorkflowTable).set({ project_id: newID }).where(eq(WorkflowTable.project_id, oldID)).run()
-              // (project_id, action, resource) is unique on permission. When the successor
-              // identity already holds a row with the same (action, resource), it already grants
-              // the identical permission: drop the old row instead of repointing it. A bulk
-              // UPDATE would violate the unique index and wedge the whole identity upgrade.
-              const successorPermissions = new Set(
-                (yield* d.select().from(PermissionTable).where(eq(PermissionTable.project_id, newID)).all()).map(
-                  (row) => JSON.stringify([row.action, row.resource]),
-                ),
-              )
-              for (const row of yield* d.select().from(PermissionTable).where(eq(PermissionTable.project_id, oldID)).all()) {
-                if (successorPermissions.has(JSON.stringify([row.action, row.resource]))) {
-                  yield* d.delete(PermissionTable).where(eq(PermissionTable.id, row.id)).run()
-                } else {
-                  yield* d.update(PermissionTable).set({ project_id: newID }).where(eq(PermissionTable.id, row.id)).run()
+                const oldProject = yield* d.select().from(ProjectTable).where(eq(ProjectTable.id, oldID)).get()
+                const newProject = yield* d.select().from(ProjectTable).where(eq(ProjectTable.id, newID)).get()
+                if (oldProject && !newProject) {
+                  yield* d
+                    .insert(ProjectTable)
+                    .values({
+                      ...oldProject,
+                      id: newID,
+                      time_updated: Date.now(),
+                    })
+                    .run()
                 }
-              }
+
+                // Project directories may be shared across distinct
+                // checkouts which have diverged. Clear the directory
+                // list and rely on it being re-populated to ensure
+                // accuracy
+                yield* d.delete(ProjectDirectoryTable).where(eq(ProjectDirectoryTable.project_id, oldID)).run()
+
+                yield* d
+                  .update(SessionTable)
+                  .set({ project_id: newID, time_updated: sql`${SessionTable.time_updated}` })
+                  .where(eq(SessionTable.project_id, oldID))
+                  .run()
+                yield* d
+                  .update(WorkspaceTable)
+                  .set({ project_id: newID })
+                  .where(eq(WorkspaceTable.project_id, oldID))
+                  .run()
+
+                // Repoint the Project-owned references that the old row's deletion would otherwise
+                // cascade-destroy. Both workflow and permission carry ON DELETE CASCADE on project_id,
+                // so without this repointing, gaining a first remote would silently delete every DAG
+                // workflow and every saved permission for the project.
+                yield* d.update(WorkflowTable).set({ project_id: newID }).where(eq(WorkflowTable.project_id, oldID)).run()
+                // (project_id, action, resource) is unique on permission. When the successor
+                // identity already holds a row with the same (action, resource), it already grants
+                // the identical permission: drop the old row instead of repointing it. A bulk
+                // UPDATE would violate the unique index and wedge the whole identity upgrade.
+                const successorPermissions = new Set(
+                  (yield* d.select().from(PermissionTable).where(eq(PermissionTable.project_id, newID)).all()).map(
+                    (row) => JSON.stringify([row.action, row.resource]),
+                  ),
+                )
+                for (const row of yield* d.select().from(PermissionTable).where(eq(PermissionTable.project_id, oldID)).all()) {
+                  if (successorPermissions.has(JSON.stringify([row.action, row.resource]))) {
+                    yield* d.delete(PermissionTable).where(eq(PermissionTable.id, row.id)).run()
+                  } else {
+                    yield* d.update(PermissionTable).set({ project_id: newID }).where(eq(PermissionTable.id, row.id)).run()
+                  }
+                }
 
                 if (oldProject) yield* d.delete(ProjectTable).where(eq(ProjectTable.id, oldID)).run()
               }),
