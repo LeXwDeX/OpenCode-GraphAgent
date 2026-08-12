@@ -149,15 +149,21 @@ describe("MEM-PR01-R1-03: memory is inert once the identity row is retired", () 
     () =>
       Effect.gen(function* () {
         const dir = yield* tmpdirScoped({ git: true })
-        yield* provideInstance(dir)(
+        // Resolve the identity ONCE and hand it to the instance store: the
+        // boot-time resolution runs in a separate Effect graph (own Database)
+        // and can transiently degrade to the global identity on loaded CI
+        // runners (git failures are silently swallowed), which would make the
+        // stamped context and this body disagree — failing the search closed.
+        const project = yield* Project.Service
+        const { project: info } = yield* project.fromDirectory(dir)
+        expect(info.id).not.toBe(ProjectV2.ID.global)
+        yield* provideInstance({ directory: dir, worktree: info.worktree, project: info })(
           Effect.gen(function* () {
             const project = yield* Project.Service
             const memory = yield* Memory.Service
             const configStore = yield* MemoryConfig.Service
             const { db } = yield* Database.Service
 
-            const { project: info } = yield* project.fromDirectory(dir)
-            expect(info.id).not.toBe(ProjectV2.ID.global)
             yield* project.setInitialized(info.id)
             yield* configStore.writeGlobal(baseConfig)
 
@@ -193,14 +199,15 @@ describe("MEM-PR01-R1-23: the runtime admission snapshot covers every registered
       Effect.gen(function* () {
         const dir = yield* tmpdirScoped({ git: true })
         const sandbox = yield* tmpdirScoped()
-        yield* provideInstance(dir)(
+        const project = yield* Project.Service
+        const { project: info } = yield* project.fromDirectory(dir)
+        yield* provideInstance({ directory: dir, worktree: info.worktree, project: info })(
           Effect.gen(function* () {
             const project = yield* Project.Service
             const memory = yield* Memory.Service
             const configStore = yield* MemoryConfig.Service
             const store = yield* MemoryStore.Service
 
-            const { project: info } = yield* project.fromDirectory(dir)
             yield* project.setInitialized(info.id)
             yield* project.addSandbox(info.id, sandbox)
             yield* configStore.writeGlobal(baseConfig)
@@ -353,14 +360,15 @@ describe("MEM-PR01-00: memory is inert under the shared global identity", () => 
     () =>
       Effect.gen(function* () {
         const dir = yield* tmpdirScoped({ git: true })
-        yield* provideInstance(dir)(
+        const project = yield* Project.Service
+        const { project: info } = yield* project.fromDirectory(dir)
+        expect(info.id).not.toBe(ProjectV2.ID.global)
+        yield* provideInstance({ directory: dir, worktree: info.worktree, project: info })(
           Effect.gen(function* () {
             const project = yield* Project.Service
             const memory = yield* Memory.Service
             const configStore = yield* MemoryConfig.Service
 
-            const { project: info } = yield* project.fromDirectory(dir)
-            expect(info.id).not.toBe(ProjectV2.ID.global)
             yield* project.setInitialized(info.id)
             yield* configStore.writeGlobal(baseConfig)
 
