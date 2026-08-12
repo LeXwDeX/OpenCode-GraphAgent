@@ -9,6 +9,9 @@ import { Database } from "@opencode-ai/core/database/database"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
 import { SessionTable } from "@opencode-ai/core/session/sql"
 import { WorkspaceTable } from "@opencode-ai/core/control-plane/workspace.sql"
+import { WorkflowTable } from "@opencode-ai/core/dag/sql"
+import { PermissionSaved } from "@opencode-ai/core/permission/saved"
+import { PermissionTable } from "@opencode-ai/core/permission/sql"
 import { eq } from "drizzle-orm"
 import { Hash } from "@opencode-ai/core/util/hash"
 import { SessionID } from "@/session/schema"
@@ -21,8 +24,13 @@ import { AppProcess } from "@opencode-ai/core/process"
 import { ProjectV2 } from "@opencode-ai/core/project"
 import { ProjectDirectories } from "@opencode-ai/core/project/directories"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
+import { EffectFlock } from "@opencode-ai/core/util/effect-flock"
 import { testEffect } from "../lib/effect"
 import { RuntimeFlags } from "@/effect/runtime-flags"
+import { MemoryHome } from "@/memory/home"
+import { MemoryIdentityMigration } from "@/memory/identity-migration"
+import { MemoryStore } from "@/memory/store"
+import { ProjectIdentityMigration } from "@/project/identity-migration"
 
 const encoder = new TextEncoder()
 
@@ -79,6 +87,7 @@ function projectLayerWithFailure(failArg: string) {
     Layer.provide(NodePath.layer),
     Layer.provide(Database.defaultLayer),
     Layer.provide(RuntimeFlags.defaultLayer),
+    Layer.provide(ProjectIdentityMigration.defaultLayer),
   )
 }
 
@@ -92,7 +101,42 @@ function projectLayerWithRuntimeFlags(flags: Parameters<typeof RuntimeFlags.laye
     Layer.provide(NodePath.layer),
     Layer.provide(Database.defaultLayer),
     Layer.provide(RuntimeFlags.layer(flags)),
+    Layer.provide(ProjectIdentityMigration.defaultLayer),
   )
+}
+
+function projectLayerWithMemoryRoot(root: string) {
+  const database = Database.defaultLayer
+  const home = Layer.succeed(MemoryHome.Service, MemoryHome.make(root))
+  const store = MemoryStore.layer.pipe(
+    Layer.provide(FSUtil.defaultLayer),
+    Layer.provide(EffectFlock.defaultLayer),
+    Layer.provide(home),
+  )
+  const memoryMigration = MemoryIdentityMigration.layer.pipe(
+    Layer.provide(FSUtil.defaultLayer),
+    Layer.provide(EffectFlock.defaultLayer),
+    Layer.provide(home),
+    Layer.provide(store),
+  )
+  const identityMigration = ProjectIdentityMigration.layer.pipe(
+    Layer.provide(memoryMigration),
+    Layer.provide(EffectFlock.defaultLayer),
+    Layer.provide(home),
+  )
+  const project = Project.layer.pipe(
+    Layer.provide(EventV2Bridge.defaultLayer),
+    Layer.provide(ProjectV2.defaultLayer),
+    Layer.provide(ProjectDirectories.defaultLayer),
+    Layer.provide(AppProcess.defaultLayer),
+    Layer.provide(CrossSpawnSpawner.defaultLayer),
+    Layer.provide(FSUtil.defaultLayer),
+    Layer.provide(NodePath.layer),
+    Layer.provide(database),
+    Layer.provide(RuntimeFlags.defaultLayer),
+    Layer.provide(identityMigration),
+  )
+  return Layer.mergeAll(project, database, home, store)
 }
 
 const failureIt = (failArg: string) =>
@@ -223,6 +267,27 @@ describe("Project.fromDirectory", () => {
         .values({ id: workspaceID, type: "local", name: "test", project_id: rootProject.id })
         .run()
         .pipe(Effect.orDie)
+      // A DAG workflow and a saved permission belong to the root identity. Both are
+      // ON DELETE CASCADE on project_id, so they must be repointed (not lost) on upgrade.
+      yield* db
+        .insert(WorkflowTable)
+        .values({
+          id: "dag-app",
+          project_id: rootProject.id,
+          session_id: sessionID,
+          title: "App workflow",
+          status: "running",
+          config: "{}",
+          seq: 1,
+          wake_reported: false,
+        })
+        .run()
+        .pipe(Effect.orDie)
+      yield* db
+        .insert(PermissionTable)
+        .values({ id: "perm-app" as never, project_id: rootProject.id, action: "allow", resource: "test" })
+        .run()
+        .pipe(Effect.orDie)
       yield* Effect.promise(() => $`git remote add origin git@github.com:acme/app.git`.cwd(tmp).quiet())
 
       const result = yield* projects.fromDirectory(tmp)
@@ -239,6 +304,188 @@ describe("Project.fromDirectory", () => {
         (yield* db.select().from(WorkspaceTable).where(eq(WorkspaceTable.id, workspaceID)).get().pipe(Effect.orDie))
           ?.project_id,
       ).toBe(remoteID)
+      expect(
+        (yield* db.select().from(WorkflowTable).where(eq(WorkflowTable.id, "dag-app")).get().pipe(Effect.orDie))
+          ?.project_id,
+      ).toBe(remoteID)
+      expect(
+        (yield* db.select().from(PermissionTable).where(eq(PermissionTable.id, "perm-app" as never)).get().pipe(Effect.orDie))
+          ?.project_id,
+      ).toBe(remoteID)
+    }),
+  )
+
+  it.live(
+    "identity upgrade survives a permission uniqueness collision with the successor identity (MEM-PR01-R1-11)",
+    () =>
+      Effect.gen(function* () {
+        const { db } = yield* Database.Service
+        const tmp = yield* tmpdirScoped({ git: true })
+        const projects = yield* Project.Service
+        const rootResult = yield* projects.fromDirectory(tmp)
+        const rootProject = rootResult.project
+        const remoteID = remoteProjectID("github.com/acme/collide")
+
+        // The successor identity already exists (another checkout resolved it
+        // first) and owns a permission colliding with the root identity's on
+        // (project_id, action, resource). The upgrade must not wedge on the
+        // unique index: the successor row wins, the duplicate is dropped, and
+        // disjoint permissions still repoint.
+        const rootRow = yield* db
+          .select()
+          .from(ProjectTable)
+          .where(eq(ProjectTable.id, rootProject.id))
+          .get()
+          .pipe(Effect.orDie)
+        yield* db
+          .insert(ProjectTable)
+          .values({ ...rootRow!, id: remoteID, time_updated: Date.now() })
+          .run()
+          .pipe(Effect.orDie)
+        yield* db
+          .insert(PermissionTable)
+          .values({ id: PermissionSaved.ID.make("perm-successor"), project_id: remoteID, action: "allow", resource: "test" })
+          .run()
+          .pipe(Effect.orDie)
+        yield* db
+          .insert(PermissionTable)
+          .values({ id: PermissionSaved.ID.make("perm-colliding"), project_id: rootProject.id, action: "allow", resource: "test" })
+          .run()
+          .pipe(Effect.orDie)
+        yield* db
+          .insert(PermissionTable)
+          .values({ id: PermissionSaved.ID.make("perm-disjoint"), project_id: rootProject.id, action: "allow", resource: "other" })
+          .run()
+          .pipe(Effect.orDie)
+        yield* Effect.promise(() => $`git remote add origin git@github.com:acme/collide.git`.cwd(tmp).quiet())
+
+        const result = yield* projects.fromDirectory(tmp)
+
+        expect(result.project.id).toBe(remoteID)
+        const permissions = yield* db
+          .select()
+          .from(PermissionTable)
+          .where(eq(PermissionTable.project_id, remoteID))
+          .all()
+          .pipe(Effect.orDie)
+        expect(permissions.map((row) => row.id).sort()).toEqual([
+          PermissionSaved.ID.make("perm-disjoint"),
+          PermissionSaved.ID.make("perm-successor"),
+        ])
+        expect(
+          yield* db
+            .select()
+            .from(PermissionTable)
+            .where(eq(PermissionTable.id, PermissionSaved.ID.make("perm-colliding")))
+            .get()
+            .pipe(Effect.orDie),
+        ).toBeUndefined()
+      }),
+  )
+
+  it.live("migrates Project Memory before retiring the previous Project identity", () =>
+    Effect.gen(function* () {
+      const dataRoot = yield* tmpdirScoped()
+      const tmp = yield* tmpdirScoped({ git: true })
+      yield* Effect.gen(function* () {
+        const home = yield* MemoryHome.Service
+        const projects = yield* Project.Service
+        const store = yield* MemoryStore.Service
+        const rootProject = (yield* projects.fromDirectory(tmp)).project
+        const value = {
+          schema_version: 1,
+          id: "project-term",
+          name: "项目术语",
+          summary: "术语 Project Memory 指项目级持久化记忆",
+          metadata: {
+            categories: ["term"],
+            status: "active",
+            importance: "core",
+            keywords: ["Project Memory"],
+            related_topics: [],
+            created_at: "2026-08-11T00:00:00Z",
+            updated_at: "2026-08-11T00:00:00Z",
+            last_matched_at: null,
+            match_count: 0,
+            revision: 1,
+            item_count: 1,
+          },
+          items: [
+            {
+              id: "term-01",
+              kind: "term",
+              content: "术语 Project Memory 指项目级持久化记忆",
+              rationale: "该术语由用户确认并长期适用",
+              confirmed_at: "2026-08-11T00:00:00Z",
+            },
+          ],
+        } as const
+        yield* store.commit(rootProject.id, 0, { topics: [value], changed: [value.id], deleted: [] })
+        yield* Effect.promise(() => $`git remote add origin git@github.com:acme/memory-app.git`.cwd(tmp).quiet())
+
+        const migrated = yield* projects.fromDirectory(tmp)
+
+        expect(yield* store.readTopics(migrated.project.id)).toEqual([value])
+        expect(yield* Effect.promise(() => Bun.file(home.directory(rootProject.id)).exists())).toBe(false)
+      }).pipe(Effect.provide(projectLayerWithMemoryRoot(dataRoot)))
+    }),
+  )
+
+  it.live("keeps the previous Project identity when Memory migration conflicts", () =>
+    Effect.gen(function* () {
+      const dataRoot = yield* tmpdirScoped()
+      const tmp = yield* tmpdirScoped({ git: true })
+      yield* Effect.gen(function* () {
+        const { db } = yield* Database.Service
+        const projects = yield* Project.Service
+        const store = yield* MemoryStore.Service
+        const rootProject = (yield* projects.fromDirectory(tmp)).project
+        const remoteID = remoteProjectID("github.com/acme/conflicting-memory")
+        const base = {
+          schema_version: 1,
+          id: "project-term",
+          name: "项目术语",
+          summary: "术语 Project Memory 指项目级持久化记忆",
+          metadata: {
+            categories: ["term"],
+            status: "active",
+            importance: "core",
+            keywords: ["Project Memory"],
+            related_topics: [],
+            created_at: "2026-08-11T00:00:00Z",
+            updated_at: "2026-08-11T00:00:00Z",
+            last_matched_at: null,
+            match_count: 0,
+            revision: 1,
+            item_count: 1,
+          },
+          items: [
+            {
+              id: "term-01",
+              kind: "term",
+              content: "术语 Project Memory 指项目级持久化记忆",
+              rationale: "该术语由用户确认并长期适用",
+              confirmed_at: "2026-08-11T00:00:00Z",
+            },
+          ],
+        } as const
+        const conflicting = { ...base, summary: "术语 Project Memory 指共享的持久化记忆" }
+        yield* store.commit(rootProject.id, 0, { topics: [base], changed: [base.id], deleted: [] })
+        yield* store.commit(remoteID, 0, { topics: [conflicting], changed: [conflicting.id], deleted: [] })
+        yield* Effect.promise(() =>
+          $`git remote add origin git@github.com:acme/conflicting-memory.git`.cwd(tmp).quiet(),
+        )
+
+        const exit = yield* Effect.exit(projects.fromDirectory(tmp))
+
+        expect(exit._tag).toBe("Failure")
+        expect(
+          yield* db.select().from(ProjectTable).where(eq(ProjectTable.id, rootProject.id)).get().pipe(Effect.orDie),
+        ).toBeDefined()
+        expect(yield* db.select().from(ProjectTable).where(eq(ProjectTable.id, remoteID)).get().pipe(Effect.orDie)).toBeUndefined()
+        expect(yield* store.readTopics(rootProject.id)).toEqual([base])
+        expect(yield* store.readTopics(remoteID)).toEqual([conflicting])
+      }).pipe(Effect.provide(projectLayerWithMemoryRoot(dataRoot)))
     }),
   )
 })

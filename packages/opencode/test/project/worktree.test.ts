@@ -6,17 +6,28 @@ import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { AppProcess } from "@opencode-ai/core/process"
 import { NodePath } from "@effect/platform-node"
 import { Cause, Context, Deferred, Effect, Exit, Fiber, Layer, Ref } from "effect"
+import { Global } from "@opencode-ai/core/global"
 import { GlobalBus, type GlobalEvent } from "../../src/bus/global"
 import { Git } from "../../src/git"
 import { SettingsHook } from "../../src/hook/settings"
 import { InstanceLayer } from "../../src/project/instance-layer"
+import { InstanceState } from "../../src/effect/instance-state"
+import { MemoryHome } from "../../src/memory/home"
+import { MemoryStore } from "../../src/memory/store"
 import { Project } from "../../src/project/project"
 import { Worktree } from "../../src/worktree"
 import { disposeAllInstances, provideInstance, TestInstance } from "../fixture/fixture"
 import { pollWithTimeout, testEffect } from "../lib/effect"
 
 const it = testEffect(
-  Layer.mergeAll(Worktree.defaultLayer, FSUtil.defaultLayer, CrossSpawnSpawner.defaultLayer, Git.defaultLayer),
+  Layer.mergeAll(
+    Worktree.defaultLayer,
+    Project.defaultLayer,
+    FSUtil.defaultLayer,
+    CrossSpawnSpawner.defaultLayer,
+    Git.defaultLayer,
+    MemoryStore.defaultLayer,
+  ),
 )
 const wintest = process.platform !== "win32" ? it.instance : it.instance.skip
 
@@ -181,9 +192,12 @@ function makeStartCommandProbe(directory: string, name: string) {
 
 const removeCreatedWorktree = (directory: string) =>
   Effect.gen(function* () {
-    const svc = yield* Worktree.Service
-    const ok = yield* svc.remove({ directory })
-    if (!ok) return yield* Effect.fail(new Error(`failed to remove worktree ${directory}`))
+    const fs = yield* FSUtil.Service
+    if (yield* fs.exists(directory).pipe(Effect.orDie)) {
+      const svc = yield* Worktree.Service
+      const ok = yield* svc.remove({ directory })
+      if (!ok) yield* Effect.fail(new Error(`failed to remove worktree ${directory}`))
+    }
   })
 
 const withCreatedWorktree = <A, E, R>(
@@ -331,6 +345,62 @@ describe("Worktree", () => {
     )
 
     it.instance(
+      "refuses to remove a worktree while project memory would be destroyed",
+      () =>
+        withCreatedWorktree(undefined, ({ info }) =>
+          Effect.gen(function* () {
+            const fs = yield* FSUtil.Service
+            const svc = yield* Worktree.Service
+            const ctx = yield* InstanceState.context
+            const project = yield* Project.Service
+            yield* project.setInitialized(ctx.project.id)
+            const memory = path.join(info.directory, ".opencode", "memory", "topics", "project.yaml")
+            yield* fs.makeDirectory(path.dirname(memory), { recursive: true })
+            yield* fs.writeFileString(memory, "id: project\n")
+
+            const exit = yield* svc.remove({ directory: info.directory }).pipe(Effect.exit)
+            const preserved = yield* fs.exists(memory).pipe(Effect.orDie)
+
+            // Let the fixture's release remove the worktree after the assertion
+            // signal has been captured.
+            yield* fs.remove(path.join(info.directory, ".opencode"), { recursive: true }).pipe(Effect.ignore)
+
+            expect(Exit.isFailure(exit)).toBe(true)
+            if (Exit.isFailure(exit)) expect(Cause.pretty(exit.cause)).toContain("topic.invalid")
+            expect(preserved).toBe(true)
+          }),
+        ),
+      { git: true },
+    )
+
+    it.instance(
+      "migrates valid legacy memory before removing a worktree",
+      () =>
+        withCreatedWorktree(undefined, ({ info }) =>
+          Effect.gen(function* () {
+            const ctx = yield* InstanceState.context
+            const fs = yield* FSUtil.Service
+            const project = yield* Project.Service
+            const store = yield* MemoryStore.Service
+            const svc = yield* Worktree.Service
+            yield* project.setInitialized(ctx.project.id)
+            const home = MemoryHome.make(Global.Path.data)
+            const projectHome = home.directory(ctx.project.id)
+            const legacy = path.join(info.directory, ".opencode", "memory", "topics", "project-architecture.yaml")
+            yield* Effect.addFinalizer(() => fs.remove(projectHome, { recursive: true }).pipe(Effect.ignore))
+            yield* fs.makeDirectory(path.dirname(legacy), { recursive: true })
+            yield* fs.writeFileString(legacy, Bun.YAML.stringify(memoryTopic()))
+
+            expect(yield* svc.remove({ directory: info.directory })).toBe(true)
+            expect(yield* fs.exists(info.directory).pipe(Effect.orDie)).toBe(false)
+            expect((yield* store.readTopics(ctx.project.id))[0]?.id).toBe("project-architecture")
+            expect((yield* project.get(ctx.project.id))?.sandboxes).not.toContain(info.directory)
+          }),
+        ),
+      { git: true },
+    )
+
+    it.instance(
       "create returns after setup and fires Event.Ready after bootstrap",
       () =>
         withCreatedWorktree(undefined, ({ info, ready }) =>
@@ -462,10 +532,121 @@ describe("Worktree", () => {
           expect((yield* probe.overlap.pipe(Effect.timeoutOption("250 millis")))._tag).toBe("None")
           yield* probe.release
           expect(yield* Fiber.join(first)).toBe(true)
-          expect(yield* Fiber.join(second)).toBe(true)
+          const repeated = yield* Fiber.await(second)
+          expect(Exit.isFailure(repeated)).toBe(true)
         }),
       { git: true },
       { timeout: 20_000 },
+    )
+  })
+
+  describe("reset", () => {
+    it.instance(
+      "migrates project memory before removing other untracked files",
+      () =>
+        withCreatedWorktree(undefined, ({ info }) =>
+          Effect.gen(function* () {
+            const fs = yield* FSUtil.Service
+            const ctx = yield* InstanceState.context
+            const svc = yield* Worktree.Service
+            const store = yield* MemoryStore.Service
+            const project = yield* Project.Service
+            yield* project.setInitialized(ctx.project.id)
+            const home = MemoryHome.make(Global.Path.data)
+            const projectHome = home.directory(ctx.project.id)
+            const topic = path.join(info.directory, ".opencode", "memory", "topics", "project-architecture.yaml")
+            const disposable = path.join(info.directory, ".opencode", "disposable.tmp")
+            yield* Effect.addFinalizer(() => fs.remove(projectHome, { recursive: true }).pipe(Effect.ignore))
+            yield* fs.makeDirectory(path.dirname(topic), { recursive: true })
+            yield* fs.writeFileString(topic, Bun.YAML.stringify(memoryTopic()))
+            yield* fs.writeFileString(disposable, "remove me\n")
+
+            yield* svc.reset({ directory: info.directory })
+
+            const topicPreserved = (yield* store.readTopics(ctx.project.id)).length === 1
+            const legacyPreserved = yield* fs.exists(topic).pipe(Effect.orDie)
+            const disposablePreserved = yield* fs.exists(disposable).pipe(Effect.orDie)
+
+            expect(topicPreserved).toBe(true)
+            expect(legacyPreserved).toBe(false)
+            expect(disposablePreserved).toBe(false)
+          }),
+        ),
+      { git: true },
+    )
+
+    it.instance(
+      "migrates modified tracked legacy memory before hard reset",
+      () =>
+        withCreatedWorktree(undefined, ({ info }) =>
+          Effect.gen(function* () {
+            const ctx = yield* InstanceState.context
+            const fs = yield* FSUtil.Service
+            const svc = yield* Worktree.Service
+            const store = yield* MemoryStore.Service
+            const project = yield* Project.Service
+            yield* project.setInitialized(ctx.project.id)
+            const home = MemoryHome.make(Global.Path.data)
+            const projectHome = home.directory(ctx.project.id)
+            const legacy = path.join(info.directory, ".opencode", "memory", "topics", "project-architecture.yaml")
+            yield* Effect.addFinalizer(() => fs.remove(projectHome, { recursive: true }).pipe(Effect.ignore))
+            yield* fs.makeDirectory(path.dirname(legacy), { recursive: true })
+            yield* fs.writeFileString(legacy, Bun.YAML.stringify(memoryTopic("committed")))
+            yield* git(info.directory, ["add", ".opencode/memory/topics/project-architecture.yaml"])
+            yield* git(info.directory, ["commit", "-m", "test: add legacy memory"])
+            yield* fs.writeFileString(legacy, Bun.YAML.stringify(memoryTopic("modified before reset")))
+
+            yield* svc.reset({ directory: info.directory })
+
+            expect((yield* store.readTopics(ctx.project.id))[0]?.summary).toBe("modified before reset")
+          }),
+        ),
+      { git: true },
+    )
+
+    it.instance(
+      "rejects reset of the primary or current worktree",
+      () =>
+        withCreatedWorktree(undefined, ({ info }) =>
+          Effect.gen(function* () {
+            const test = yield* TestInstance
+            const svc = yield* Worktree.Service
+            const primary = yield* svc.reset({ directory: test.directory }).pipe(Effect.exit)
+            const current = yield* svc
+              .reset({ directory: info.directory })
+              .pipe(provideInstance(info.directory), Effect.exit)
+
+            expect(Exit.isFailure(primary)).toBe(true)
+            expect(Exit.isFailure(current)).toBe(true)
+            if (Exit.isFailure(primary)) expect(Cause.pretty(primary.cause)).toContain("primary or current")
+            if (Exit.isFailure(current)) expect(Cause.pretty(current.cause)).toContain("primary or current")
+          }),
+        ),
+      { git: true },
+    )
+
+    it.instance(
+      "rejects reset of an unregistered git worktree",
+      () =>
+        Effect.gen(function* () {
+          const test = yield* TestInstance
+          const svc = yield* Worktree.Service
+          const target = path.join(path.dirname(test.directory), `unregistered-reset-${Date.now()}`)
+          const branch = `unregistered-reset-${Date.now()}`
+          yield* git(test.directory, ["worktree", "add", "-b", branch, target])
+          yield* Effect.addFinalizer(() =>
+            gitResult(test.directory, ["worktree", "remove", "--force", target]).pipe(
+              Effect.andThen(gitResult(test.directory, ["branch", "-D", branch])),
+              Effect.ignore,
+            ),
+          )
+
+          const exit = yield* svc.reset({ directory: target }).pipe(Effect.exit)
+
+          expect(Exit.isFailure(exit)).toBe(true)
+          if (Exit.isFailure(exit)) expect(Cause.pretty(exit.cause)).toContain("not registered")
+        }),
+      { git: true },
     )
   })
 
@@ -499,6 +680,8 @@ describe("Worktree", () => {
         Effect.gen(function* () {
           const test = yield* TestInstance
           const fs = yield* FSUtil.Service
+          const ctx = yield* InstanceState.context
+          const project = yield* Project.Service
           const svc = yield* Worktree.Service
           const parent = path.join(path.dirname(test.directory), `${path.basename(test.directory)}-parent`)
           const target = path.join(parent, path.basename(test.directory))
@@ -506,6 +689,7 @@ describe("Worktree", () => {
 
           yield* fs.ensureDir(parent)
           yield* git(test.directory, ["worktree", "add", "-b", branch, target])
+          yield* project.addSandbox(ctx.project.id, target)
 
           const list = yield* svc.list()
           const directory = yield* fs.realPath(target).pipe(Effect.catch(() => Effect.succeed(target)))
@@ -520,17 +704,60 @@ describe("Worktree", () => {
         }),
       { git: true },
     )
+
+    it.instance(
+      "hides a missing worktree in list and cleans it up on explicit remove",
+      () =>
+        withCreatedWorktree(undefined, ({ info }) =>
+          Effect.gen(function* () {
+            const ctx = yield* InstanceState.context
+            const fs = yield* FSUtil.Service
+            const project = yield* Project.Service
+            const svc = yield* Worktree.Service
+            yield* fs.remove(info.directory, { recursive: true })
+
+            // list() is non-destructive: the entry is hidden from the listing
+            // but the git admin data and registration stay untouched.
+            expect((yield* svc.list()).map((item) => item.directory)).not.toContain(info.directory)
+            expect(yield* git(ctx.worktree, ["worktree", "list", "--porcelain"])).toContain(info.directory)
+            expect((yield* project.get(ctx.project.id))?.sandboxes.length).toBeGreaterThan(0)
+
+            // Explicit remove does the cleanup: prune admin data, drop the
+            // registration.
+            expect(yield* svc.remove({ directory: info.directory })).toBe(true)
+            expect(yield* git(ctx.worktree, ["worktree", "list", "--porcelain"])).not.toContain(info.directory)
+            const after = yield* project.get(ctx.project.id)
+            expect(after?.sandboxes.some((sandbox) => sandbox === info.directory)).toBe(false)
+          }),
+        ),
+      { git: true },
+    )
   })
 
   describe("remove edge cases", () => {
     it.instance(
-      "remove non-existent directory succeeds silently",
+      "rejects a directory that is not a registered worktree",
       () =>
         Effect.gen(function* () {
           const test = yield* TestInstance
           const svc = yield* Worktree.Service
-          const ok = yield* svc.remove({ directory: path.join(test.directory, "does-not-exist") })
-          expect(ok).toBe(true)
+          const exit = yield* svc.remove({ directory: path.join(test.directory, "does-not-exist") }).pipe(Effect.exit)
+          expect(Exit.isFailure(exit)).toBe(true)
+          if (Exit.isFailure(exit)) expect(Cause.pretty(exit.cause)).toContain("not registered")
+        }),
+      { git: true },
+    )
+
+    it.instance(
+      "rejects removal of the primary or current worktree",
+      () =>
+        Effect.gen(function* () {
+          const test = yield* TestInstance
+          const svc = yield* Worktree.Service
+          const exit = yield* svc.remove({ directory: test.directory }).pipe(Effect.exit)
+
+          expect(Exit.isFailure(exit)).toBe(true)
+          if (Exit.isFailure(exit)) expect(Cause.pretty(exit.cause)).toContain("primary or current")
         }),
       { git: true },
     )
@@ -551,3 +778,34 @@ describe("Worktree", () => {
     )
   })
 })
+
+function memoryTopic(summary = "已确认的核心架构边界") {
+  return {
+    schema_version: 1,
+    id: "project-architecture",
+    name: "架构边界",
+    summary,
+    metadata: {
+      categories: ["decision"],
+      status: "active",
+      importance: "core",
+      keywords: ["架构"],
+      related_topics: [],
+      created_at: "2026-08-11T00:00:00Z",
+      updated_at: "2026-08-11T00:00:00Z",
+      last_matched_at: null,
+      match_count: 0,
+      revision: 1,
+      item_count: 1,
+    },
+    items: [
+      {
+        id: "decision-01",
+        kind: "decision",
+        content: "已确认决定：核心模块之间使用稳定边界",
+        rationale: "该边界由用户确认并长期适用",
+        confirmed_at: "2026-08-11T00:00:00Z",
+      },
+    ],
+  }
+}

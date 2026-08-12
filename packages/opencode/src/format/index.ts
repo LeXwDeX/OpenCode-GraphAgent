@@ -83,7 +83,7 @@ export const layer = Layer.effect(
               const dir = yield* InstanceState.directory
               const result = yield* appProcess
                 .run(
-                  ChildProcess.make(replaced[0]!, replaced.slice(1), {
+                  ChildProcess.make(replaced[0], replaced.slice(1), {
                     cwd: dir,
                     env: item.environment,
                     extendEnv: true,
