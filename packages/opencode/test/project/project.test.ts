@@ -9,6 +9,8 @@ import { Database } from "@opencode-ai/core/database/database"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
 import { SessionTable } from "@opencode-ai/core/session/sql"
 import { WorkspaceTable } from "@opencode-ai/core/control-plane/workspace.sql"
+import { WorkflowTable } from "@opencode-ai/core/dag/sql"
+import { PermissionTable } from "@opencode-ai/core/permission/sql"
 import { eq } from "drizzle-orm"
 import { Hash } from "@opencode-ai/core/util/hash"
 import { SessionID } from "@/session/schema"
@@ -260,6 +262,27 @@ describe("Project.fromDirectory", () => {
         .values({ id: workspaceID, type: "local", name: "test", project_id: rootProject.id })
         .run()
         .pipe(Effect.orDie)
+      // A DAG workflow and a saved permission belong to the root identity. Both are
+      // ON DELETE CASCADE on project_id, so they must be repointed (not lost) on upgrade.
+      yield* db
+        .insert(WorkflowTable)
+        .values({
+          id: "dag-app",
+          project_id: rootProject.id,
+          session_id: sessionID,
+          title: "App workflow",
+          status: "running",
+          config: "{}",
+          seq: 1,
+          wake_reported: false,
+        })
+        .run()
+        .pipe(Effect.orDie)
+      yield* db
+        .insert(PermissionTable)
+        .values({ id: "perm-app" as never, project_id: rootProject.id, action: "allow", resource: "test" })
+        .run()
+        .pipe(Effect.orDie)
       yield* Effect.promise(() => $`git remote add origin git@github.com:acme/app.git`.cwd(tmp).quiet())
 
       const result = yield* projects.fromDirectory(tmp)
@@ -274,6 +297,14 @@ describe("Project.fromDirectory", () => {
       ).toBe(remoteID)
       expect(
         (yield* db.select().from(WorkspaceTable).where(eq(WorkspaceTable.id, workspaceID)).get().pipe(Effect.orDie))
+          ?.project_id,
+      ).toBe(remoteID)
+      expect(
+        (yield* db.select().from(WorkflowTable).where(eq(WorkflowTable.id, "dag-app")).get().pipe(Effect.orDie))
+          ?.project_id,
+      ).toBe(remoteID)
+      expect(
+        (yield* db.select().from(PermissionTable).where(eq(PermissionTable.id, "perm-app" as never)).get().pipe(Effect.orDie))
           ?.project_id,
       ).toBe(remoteID)
     }),

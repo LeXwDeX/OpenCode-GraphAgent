@@ -5,6 +5,8 @@ import { ProjectDirectoryTable, ProjectTable } from "@opencode-ai/core/project/s
 import { ProjectDirectories } from "@opencode-ai/core/project/directories"
 import { SessionTable } from "@opencode-ai/core/session/sql"
 import { WorkspaceTable } from "@opencode-ai/core/control-plane/workspace.sql"
+import { WorkflowTable } from "@opencode-ai/core/dag/sql"
+import { PermissionTable } from "@opencode-ai/core/permission/sql"
 import { Flag } from "@opencode-ai/core/flag/flag"
 import { GlobalBus } from "@/bus/global"
 import { which } from "@opencode-ai/core/util/which"
@@ -187,6 +189,18 @@ export const layer = Layer.effect(
                 .update(WorkspaceTable)
                 .set({ project_id: newID })
                 .where(eq(WorkspaceTable.project_id, oldID))
+                .run()
+
+              // Repoint the Project-owned references that the old row's deletion would otherwise
+              // cascade-destroy. Both workflow and permission carry ON DELETE CASCADE on project_id,
+              // so without this repointing, gaining a first remote would silently delete every DAG
+              // workflow and every saved permission for the project. A (newID, action, resource)
+              // collision on permission fails the immediate transaction closed (no data loss).
+              yield* d.update(WorkflowTable).set({ project_id: newID }).where(eq(WorkflowTable.project_id, oldID)).run()
+              yield* d
+                .update(PermissionTable)
+                .set({ project_id: newID })
+                .where(eq(PermissionTable.project_id, oldID))
                 .run()
 
               if (oldProject) yield* d.delete(ProjectTable).where(eq(ProjectTable.id, oldID)).run()
