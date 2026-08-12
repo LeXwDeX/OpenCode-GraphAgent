@@ -1,7 +1,7 @@
 # Memory Authority Redo Plan — from `d7b011738`
 
 Date: 2026-08-12. Worktree: `/private/tmp/oc-dag-wt-lifecycle` (branch `chore/worktree-lifecycle-audit`).
-Status: PLANNING (awaiting user confirmation before any implementation/loop).
+Status: ADR-0004 **Rejected**; Occam path (§10) **adopted and implemented** (#1 done; #2 deferred by user; #3/#4 closed as non-gaps). The two-round MEM-PR01 review then landed fixes/pins #5–#18 below. Nothing is left to implement autonomously; remaining items are user decisions (#2 typed-error cascade, source-Home retention/GC).
 
 ## 0. Why this plan exists
 
@@ -207,7 +207,7 @@ After the survey + ultracode adversarial review, the user applied Occam's Razor 
 
 **Explicitly cut by Occam** (do NOT build): MEM-ATOMIC-10 (Policy stays in `.opencode/memory.jsonc`; memory is topic content); the authority facade, 6-phase journal, alias tombstone, opaque Revision, destruction guard, crash harness; MEM-CRASH-06 as a forward-journal state machine (POSIX `rename` + the store's generation/manifest atomicity cover content; `migrateHome` can be made idempotent if a crash-retry need is shown).
 
-**Resume protocol (replaces §8 steps 3–4):** do the next pending Fix in order (#2 → #3 → #4). Per fix: re-read exact baseline → implement → `cd packages/opencode && bun typecheck` AND `cd packages/core && bun typecheck` → targeted test (package dir ONLY) → mutation gate (temp-revert ⇒ a real test flips Red, restore) → `git commit` (conventional) → update this §10 table. Exclusions unchanged: no Goal/DAG-config/CI/push/PR, no source-Home GC.
+**Resume protocol (replaces §8 steps 3–4):** ~~do the next pending Fix in order (#2 → #3 → #4)~~ — SUPERSEDED: #1 done, #3/#4 closed (then #3 reopened by the MEM-PR01 review and fixed by construction), #5–#18 done/pinned by the MEM-PR01 slices. There is **no pending autonomous fix**. The only open items are user decisions: #2 (typed-error cascade — approved deferred as MEM-TYPED-02) and source-Home retention/GC. Per-slice discipline (kept for future work): re-read exact baseline → implement → `cd packages/opencode && bun typecheck` AND `cd packages/core && bun typecheck` → targeted test (package dir ONLY) → mutation gate (temp-revert ⇒ a real test flips Red, restore) → `git commit` (conventional) → update this plan. Exclusions unchanged: no Goal/DAG-config/CI, no source-Home GC, no dev→main/release.
 
 ### M-C additions (two-round review findings, 2026-08-12)
 
@@ -244,3 +244,12 @@ After the survey + ultracode adversarial review, the user applied Occam's Razor 
 |---|---|---|
 | **#17** All writers of a MEMORY config file now serialize on a per-file cross-process flock (`memory-config:<file>`): `writeProject`, `writeGlobal`, and the normalization rewrite in `readConfig`. atomicWrite's byte-atomicity is no longer undermined by whole-document last-writer-wins between `/memory on|off`, admission promotion, and normalization rewrites across worktrees/processes. Pinned by a blocking-observation test (mutation-proven: dropping the lock lets the concurrent writer complete during the hold). Residual (documented, not fixed — Occam): decision-level read-modify-write across processes is not CAS-protected; only the write primitives are serialized. | MEM-PR01-R2-02 (P3, newly-exposed) | ✅ done (Red→Green→mutation) |
 | **#18** Cross-process commit protocol now has a real second-process test: a spawned worker commits with a stale expectedRevision and must observe `MemoryStore.CommitConflictError` (ADR-0002's explicit-conflict guarantee), deterministic — unlike the timing-probabilistic updateTopics race test. | MEM-PR01-R2-03 (P3 test-gap) | ✅ pinned |
+
+### M-G additions (documentation alignment, 2026-08-12)
+
+| Item | Finding | Resolution |
+|---|---|---|
+| **#19** `packages/opencode/src/memory/CONTEXT.md` rewritten to the shipped Occam design: rejected-design glossary/invariants removed (Identity Alias, Canonical Project ID, tombstone retirement, opaque Revision, destruction guard); source Home described as migrate-then-remove (retention deferred); Project Configuration described as the unversioned `.opencode/memory.jsonc` (not Home-versioned); read-leniency split stated (runtime read projects empty; strict reads/migration fail closed); ADR-0001 policy clause restored as live; ADR-0004 marked Rejected; M-A…M-F behaviors reflected (global inertness, content-only conflicts, non-destructive list, fail-closed reset/remove, per-file config lock). | MEM-PR01-R1-01 (P3, blocking) | ✅ done |
+| **#20** Redo-plan internal consistency: header status no longer says PLANNING; the §10 resume protocol is marked superseded (no pending autonomous fix; only user decisions remain). | MEM-PR01-R1-25 (P3) | ✅ done |
+| **#21 (decision)** Git-exclusion narrowing is intentional and documented here: `ensureProjectExclude` installs only the two config candidates, not `.opencode/memory/`. Legacy topic files preserved fail-closed (topic.invalid/topic.conflict) are therefore visible in `git status` and committable. Trade-off accepted: surfacing repair-pending files beats silently git-excluding user data; the delta spec drops the old scenario and the test pins the narrowed behavior. | MEM-PR01-R1-09 (P3 spec-gap) | ✅ decision recorded |
+| **#22 (requirement)** Identity-upgrade requirement recorded (the openspec workspace is untracked, so this plan carries it): **Identity upgrade preserves Project Memory and Project-owned references.** Scenarios: (a) root→first-remote migrates the Memory Home before the old Project row is deleted and repoints session/workspace/workflow/permission references; (b) a successor permission colliding on (project_id,action,resource) wins without wedging; (c) merge (not fork) when the successor already has Memory, content-conflicts fail closed; (d) crash mid-migration retries to convergence; (e) global identity is inert. Pinned by the M-A/M-B/M-C/M-E tests. | MEM-PR01-R1-14 (P3 spec-gap) | ✅ requirement recorded |
