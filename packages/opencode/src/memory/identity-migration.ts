@@ -182,8 +182,16 @@ export const layer = Layer.effect(
     const migrateHome: Interface["migrateHome"] = (oldID, newID) => {
       if (oldID === newID) return Effect.void
       const pair = [oldID, newID].sort().join("|")
+      // Lock order (outermost→innermost): memory-migrate (pair) → memory-identity
+      // (oldID) → memory-project (inside migrateHomeUnsafe). The identity lock
+      // fences out in-flight writers still producing under oldID: they hold
+      // memory-identity:oldID for their whole read-modify-write, so the rename
+      // waits for them and moves their writes along with the Home instead of
+      // letting them recreate a retired Home afterwards. Writers take
+      // identity→project, the same relative order, so no ABBA.
+      const body = flock.withLock(migrateHomeUnsafe(oldID, newID), `memory-identity:${oldID}`, home.locks)
       return flock
-        .withLock(migrateHomeUnsafe(oldID, newID), `memory-migrate:${pair}`, home.locks)
+        .withLock(body, `memory-migrate:${pair}`, home.locks)
         .pipe(Effect.asVoid, Effect.withSpan("MemoryIdentityMigration.migrateHome"))
     }
 

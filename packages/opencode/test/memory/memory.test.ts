@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
+import { EffectFlock } from "@opencode-ai/core/util/effect-flock"
 import { Deferred, Duration, Effect, Fiber, Layer } from "effect"
 import fs from "node:fs/promises"
 import path from "node:path"
@@ -97,6 +98,7 @@ const unavailableModelIt = testEffect(
     Layer.provide(
       Layer.mergeAll(
         emptyConfigLayer,
+        EffectFlock.defaultLayer,
         replacementProvider.layer,
         Layer.mock(Project.Service, {
           get: (id) =>
@@ -191,6 +193,7 @@ function bootstrapFixture() {
   const layer = Memory.layer.pipe(
     Layer.provide(
       Layer.mergeAll(
+        EffectFlock.defaultLayer,
         Layer.mock(Config.Service, {
           get: () =>
             Effect.succeed({
@@ -320,6 +323,7 @@ function recallFixture() {
     Layer.provide(
       Layer.mergeAll(
         emptyConfigLayer,
+        EffectFlock.defaultLayer,
         provider.layer,
         Layer.mock(Project.Service, {
           get: (id) =>

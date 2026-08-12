@@ -6,6 +6,7 @@ import { ModelV2 } from "@opencode-ai/core/model"
 import { ProjectV2 } from "@opencode-ai/core/project"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
+import { EffectFlock } from "@opencode-ai/core/util/effect-flock"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Effect, Layer } from "effect"
 import { stringify } from "yaml"
@@ -106,6 +107,7 @@ const base = Layer.mergeAll(
   Project.defaultLayer,
   Database.defaultLayer,
   Git.defaultLayer,
+  EffectFlock.defaultLayer,
   MemoryAdmission.defaultLayer,
   MemoryConfig.defaultLayer,
   MemoryLock.defaultLayer,

@@ -18,7 +18,7 @@ Each successful mutation writes a complete Topic generation into a temporary dir
 
 Legacy `topics/` data is revision zero and is promoted on the first commit. Previous and orphaned generations remain non-authoritative. Their garbage collection requires the separate Project Memory retention policy.
 
-Project identity migration holds the old Project's process lock while moving or merging its Memory Home. The Project database retires the old identity only after Memory migration succeeds.
+Project identity migration serializes on a `memory-migrate:<sorted pair>` flock and a `memory-identity:<oldID>` flock, then runs a three-phase merge: snapshot the source under the source lock, merge into the target (the target update takes the target lock), and remove the source only after re-reading it and confirming its revision has not changed since the snapshot (`SourceChangedError` otherwise). In-flight writers still producing under the old identity hold `memory-identity:<oldID>` for their whole read-modify-write, so the migration waits for them and moves their writes along with the Home. The Project database retires the old identity only after Memory migration succeeds.
 
 ## Consequences
 

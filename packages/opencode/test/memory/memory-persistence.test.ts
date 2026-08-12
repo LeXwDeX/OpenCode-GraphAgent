@@ -764,4 +764,108 @@ describe("Project-owned MEMORY persistence", () => {
         }).pipe(Effect.provide(layers(root)))
       }),
   )
+
+  it.live(
+    "write paths fail closed on a corrupt manifest (pins the strict re-read before write)",
+    () =>
+      Effect.gen(function* () {
+        const root = yield* tmpdirScoped()
+        yield* Effect.gen(function* () {
+          const fs = yield* FSUtil.Service
+          const home = yield* MemoryHome.Service
+          const store = yield* MemoryStore.Service
+          yield* replaceTopics(store, projectID, [topic()])
+
+          yield* fs.writeFileString(home.manifest(projectID), "{ not json")
+
+          const exit = yield* Effect.exit(replaceTopics(store, projectID, [topic("修订后的边界")]))
+          expect(Exit.isFailure(exit)).toBe(true)
+          // The corrupt manifest is left untouched (no silent re-init).
+          expect(yield* fs.readFileString(home.manifest(projectID))).toBe("{ not json")
+        }).pipe(Effect.provide(layers(root)))
+      }),
+  )
+
+  it.live(
+    "never caches unresolved admission results (pins the ADR-0003 cache rule)",
+    () =>
+      Effect.gen(function* () {
+        const root = yield* tmpdirScoped()
+        const primary = yield* tmpdirScoped({ git: true })
+        const sandbox = yield* tmpdirScoped()
+        yield* Effect.gen(function* () {
+          const fs = yield* FSUtil.Service
+          const admission = yield* MemoryAdmission.Service
+          const file = path.join(sandbox, ".opencode", "memory", "topics", "broken.yaml")
+          yield* fs.makeDirectory(path.dirname(file), { recursive: true })
+          yield* fs.writeFileString(file, "id: broken\n")
+
+          const snapshot = { projectID, projectDirectory: primary, directories: [primary, sandbox], updated: 1 }
+          const first = yield* admission.ensure(snapshot)
+          expect(first.unresolved).toBeGreaterThan(0)
+
+          // Repair the legacy file. A cached unresolved result would keep
+          // blocking; the cache rule requires a fresh scan.
+          yield* fs.remove(file)
+          const second = yield* admission.ensure(snapshot)
+          expect(second.unresolved).toBe(0)
+        }).pipe(Effect.provide(layers(root)))
+      }),
+  )
+
+  it.live(
+    "fails closed with SourceChanged when the source changes mid-merge (pins the verify-before-delete guard)",
+    () =>
+      Effect.gen(function* () {
+        const root = yield* tmpdirScoped()
+        yield* Effect.gen(function* () {
+          const fs = yield* FSUtil.Service
+          const home = yield* MemoryHome.Service
+          const flock = yield* EffectFlock.Service
+          const migration = yield* MemoryIdentityMigration.Service
+          const store = yield* MemoryStore.Service
+
+          // Both Homes populated → merge path (not the rename fast path).
+          yield* replaceTopics(store, projectID, [topic()])
+          yield* replaceTopics(store, otherProjectID, [terminologyTopic()])
+
+          // Hold the target's store lock in this flow; migrateHome blocks there
+          // in phase 2 AFTER snapshotting the source — a deterministic window in
+          // which the source may still change. Fork migrateHome detached so it
+          // survives the withLock scope closing, then bump the source while the
+          // target lock is still held; releasing the lock (withLock end) lets
+          // the migration proceed into the verify-before-delete check.
+          const migratingCell = yield* Ref.make<Fiber.Fiber<void, unknown> | undefined>(undefined)
+          yield* flock.withLock(
+            Effect.gen(function* () {
+              const migrating = yield* migration.migrateHome(projectID, otherProjectID).pipe(Effect.forkDetach)
+              yield* Ref.set(migratingCell, migrating)
+              yield* Effect.sleep("500 millis")
+              // A concurrent writer bumps the source revision mid-merge.
+              yield* replaceTopics(store, projectID, [topic("迁移进行中被修订的边界")])
+            }),
+            `memory-project:${otherProjectID}`,
+            home.locks,
+          )
+          const migrating = (yield* Ref.get(migratingCell))!
+          const exit = yield* Fiber.join(migrating).pipe(Effect.exit)
+
+          expect(Exit.isFailure(exit)).toBe(true)
+          if (Exit.isFailure(exit)) expect(String(exit.cause)).toContain("SourceChanged")
+          // The source Home survives (verify-before-delete refused to remove it).
+          expect(yield* fs.exists(home.directory(projectID))).toBe(true)
+        }).pipe(
+          Effect.provide(
+            Layer.mergeAll(
+              Layer.provideMerge(
+                MemoryIdentityMigration.layer.pipe(Layer.provide(EffectFlock.defaultLayer)),
+                layers(root),
+              ),
+              EffectFlock.defaultLayer,
+            ),
+          ),
+        )
+      }),
+    { timeout: 20_000 },
+  )
 })

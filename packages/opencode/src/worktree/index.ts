@@ -508,7 +508,14 @@ export const layer: Layer.Layer<
         return yield* new RemoveFailedError({ message: "Cannot remove the primary or current worktree" })
       }
 
-      const currentProject = (yield* project.get(ctx.project.id)) ?? ctx.project
+      // Fail closed if the identity row is gone (retired by an upgrade): never
+      // reconcile, prune, or drop registrations under a stale instance identity.
+      const currentProject = yield* project.get(ctx.project.id)
+      if (!currentProject) {
+        return yield* new RemoveFailedError({
+          message: "Project identity is no longer registered; reload the project before removing worktrees",
+        })
+      }
       const matches = yield* registeredSandboxes(currentProject.sandboxes, directory)
       if (matches.length === 0) {
         return yield* new RemoveFailedError({ message: "Worktree is not registered with this Project" })
@@ -524,13 +531,24 @@ export const layer: Layer.Layer<
         return yield* new RemoveFailedError({ message: list.stderr || list.text || "Failed to read git worktrees" })
       }
 
-      const entry = yield* locateWorktree(parseWorktreeList(list.text), directory)
+      const entries = parseWorktreeList(list.text)
+      const entry = yield* locateWorktree(entries, directory)
       if (!entry?.path) {
         // Registered, but git has no record of the worktree (admin data lost or
         // the git side was already removed). Recover deterministically instead
         // of failing with a false "not registered": legacy memory is reconciled
         // fail-closed against the directory when it still exists, then the stale
         // registration is dropped. The directory itself is never deleted here.
+        yield* FiberMap.remove(bootFibers, directory)
+        if (settingsHook) {
+          const wrResult = yield* settingsHook
+            .trigger(
+              { event: "WorktreeRemove", path: directory, branch: pathSvc.basename(directory) },
+              { sessionID: "", transcriptPath: "" },
+            )
+            .pipe(Effect.catch(() => Effect.succeed({ additionalContexts: [], systemMessages: [] })))
+          yield* SettingsHook.landSystemMessages(wrResult, { sessionID: "" })
+        }
         const blocker = yield* reconcileLegacyMemory({
           projectID: ctx.project.id,
           projectDirectory: ctx.project.worktree,
@@ -544,10 +562,23 @@ export const layer: Layer.Layer<
           ),
         )
         if (blocker) return yield* new RemoveFailedError({ message: blocker })
-        yield* FiberMap.remove(bootFibers, directory)
         yield* store.disposeDirectory(directory)
         yield* dropRegistrations
         return true
+      }
+
+      // The WorktreeRemove hook may run user scripts that still write legacy
+      // memory files; fire it BEFORE taking the fail-closed memory proof so the
+      // proof observes everything the hook produced.
+      yield* FiberMap.remove(bootFibers, directory)
+      if (settingsHook) {
+        const wrResult = yield* settingsHook
+          .trigger(
+            { event: "WorktreeRemove", path: entry.path, branch: pathSvc.basename(entry.path) },
+            { sessionID: "", transcriptPath: "" },
+          )
+          .pipe(Effect.catch(() => Effect.succeed({ additionalContexts: [], systemMessages: [] })))
+        yield* SettingsHook.landSystemMessages(wrResult, { sessionID: "" })
       }
 
       const blocker = yield* reconcileLegacyMemory({
@@ -569,9 +600,15 @@ export const layer: Layer.Layer<
         // broken gitdir link). The destructive cleanup belongs on this action
         // path — never on list(): prune the admin data, remove the directory if
         // it still exists, then drop the registration(s).
-        yield* FiberMap.remove(bootFibers, directory)
         yield* store.disposeDirectory(entry.path)
-        yield* git(["worktree", "prune"], { cwd: ctx.worktree })
+        // `git worktree prune` is repo-global: it would also destroy the admin
+        // data of any OTHER merely-prunable worktree (e.g. an unmounted volume
+        // or locked parent — prunable does not mean gone). Only prune when this
+        // entry is the sole prunable one; otherwise leave the stale admin data
+        // for an explicit later cleanup.
+        if (entries.every((item) => !item.prunable || item === entry)) {
+          yield* git(["worktree", "prune"], { cwd: ctx.worktree })
+        }
         if (yield* fs.existsSafe(entry.path)) yield* cleanDirectory(entry.path)
         const prunedBranch = entry.branch?.replace(/^refs\/heads\//, "")
         if (prunedBranch) {
@@ -590,18 +627,6 @@ export const layer: Layer.Layer<
         }
         yield* dropRegistrations
         return true
-      }
-
-      yield* FiberMap.remove(bootFibers, directory)
-
-      if (settingsHook) {
-        const wrResult = yield* settingsHook
-          .trigger(
-            { event: "WorktreeRemove", path: entry.path, branch: pathSvc.basename(entry.path) },
-            { sessionID: "", transcriptPath: "" },
-          )
-          .pipe(Effect.catch(() => Effect.succeed({ additionalContexts: [], systemMessages: [] })))
-        yield* SettingsHook.landSystemMessages(wrResult, { sessionID: "" })
       }
 
       // Git may return the original casing when a caller supplied a normalized Windows path.
@@ -738,7 +763,14 @@ export const layer: Layer.Layer<
         return yield* new ResetFailedError({ message: "Cannot reset the primary or current worktree" })
       }
 
-      const currentProject = (yield* project.get(ctx.project.id)) ?? ctx.project
+      // Fail closed if the identity row is gone (retired by an upgrade): never
+      // reconcile or mutate under a stale instance identity.
+      const currentProject = yield* project.get(ctx.project.id)
+      if (!currentProject) {
+        return yield* new ResetFailedError({
+          message: "Project identity is no longer registered; reload the project before resetting worktrees",
+        })
+      }
       if (!(yield* registeredSandbox(currentProject.sandboxes, directory))) {
         return yield* new ResetFailedError({ message: "Worktree is not registered with this Project" })
       }

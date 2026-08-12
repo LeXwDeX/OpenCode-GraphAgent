@@ -383,11 +383,16 @@ export const layer = Layer.effect(
 
     const cleanupLegacyDirectory = Effect.fnUntraced(function* (directory: string) {
       const topics = MemoryPaths.legacyTopics(directory)
-      if ((yield* fs.existsSafe(topics)) && (yield* fs.readDirectoryEntries(topics)).length === 0)
-        yield* fs.remove(topics, { recursive: true })
+      if ((yield* fs.existsSafe(topics)) && (yield* fs.readDirectoryEntries(topics)).length === 0) {
+        // Re-check immediately before removing: an older-version writer that
+        // does not take our locks may have created a file after the first
+        // listing. Removing on a stale empty listing would destroy it.
+        if ((yield* fs.readDirectoryEntries(topics)).length === 0) yield* fs.remove(topics, { recursive: true })
+      }
       const legacy = join(directory, ".opencode", "memory")
-      if ((yield* fs.existsSafe(legacy)) && (yield* fs.readDirectoryEntries(legacy)).length === 0)
-        yield* fs.remove(legacy, { recursive: true })
+      if ((yield* fs.existsSafe(legacy)) && (yield* fs.readDirectoryEntries(legacy)).length === 0) {
+        if ((yield* fs.readDirectoryEntries(legacy)).length === 0) yield* fs.remove(legacy, { recursive: true })
+      }
     })
 
     const ensureUnsafe = Effect.fnUntraced(function* (snapshot: ProjectSnapshot, key: string) {
@@ -418,8 +423,11 @@ export const layer = Layer.effect(
         updated: snapshot.updated,
       })
       const key = JSON.stringify([snapshot.projectID, directories, snapshot.updated])
+      // Lock order (outermost→innermost): memory-admission → memory-identity →
+      // memory-project (inside updateTopics). The identity lock serializes the
+      // import against a concurrent identity retirement renaming the Home.
       return yield* flock.withLock(
-        ensureUnsafe(normalized, key),
+        flock.withLock(ensureUnsafe(normalized, key), `memory-identity:${snapshot.projectID}`, home.locks),
         `memory-admission:${snapshot.projectID}`,
         home.locks,
       )

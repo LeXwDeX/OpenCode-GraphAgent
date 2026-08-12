@@ -2,6 +2,7 @@ export * as Memory from "./memory"
 
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { ProjectV2 } from "@opencode-ai/core/project"
+import { EffectFlock } from "@opencode-ai/core/util/effect-flock"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Context, Duration, Effect, Layer, Option, Ref, Schema, Semaphore } from "effect"
 import { stringify } from "yaml"
@@ -67,6 +68,7 @@ export const layer: Layer.Layer<
   | Config.Service
   | Provider.Service
   | Project.Service
+  | EffectFlock.Service
   | MemoryAdmission.Service
   | MemoryConfig.Service
   | MemoryLock.Service
@@ -78,6 +80,7 @@ export const layer: Layer.Layer<
     const config = yield* Config.Service
     const provider = yield* Provider.Service
     const project = yield* Project.Service
+    const flock = yield* EffectFlock.Service
     const admission = yield* MemoryAdmission.Service
     const configStore = yield* MemoryConfig.Service
     const lock = yield* MemoryLock.Service
@@ -358,38 +361,49 @@ export const layer: Layer.Layer<
       session.firstTurnAttempted = true
       if (!due && !shouldMatch) return
 
-      yield* lock.withProject(current.project.id)(
+      // Cross-process identity guard (see checkpointUnsafe): re-check identity
+      // liveness under the identity lock before writing.
+      yield* flock.withLock(
         Effect.gen(function* () {
-          const topics = yield* store.readTopics(current.project.id)
-          const maintained = due
-            ? yield* maintain({
-                model: current.model,
-                config: current.loaded.config,
-                topics,
-                messages: input.messages,
-                projectID: current.project.id,
-              }).pipe(
-                Effect.catchCause((cause) =>
-                  Effect.gen(function* () {
-                    yield* Effect.logWarning("periodic MEMORY maintenance failed", { cause })
-                    return topics
-                  }),
-                ),
-              )
-            : topics
-          const rendered = shouldMatch
-            ? (yield* select({
-                model: current.model,
-                config: current.loaded.config,
-                topics: maintained,
-                text: user.text,
-                projectID: current.project.id,
-              })).rendered
-            : (data.sessions.get(input.sessionID)?.turn.rendered ?? [])
-          const entry = data.sessions.get(input.sessionID)
-          if (entry?.turn.messageID !== user.info.id) return
-          entry.turn = { ...entry.turn, completedTurns: turns, rendered }
+          if (!(yield* project.get(current.project.id))) {
+            yield* clearSession(input.sessionID)
+            return
+          }
+          yield* lock.withProject(current.project.id)(
+            Effect.gen(function* () {
+              const topics = yield* store.readTopics(current.project.id)
+              const maintained = due
+                ? yield* maintain({
+                    model: current.model,
+                    config: current.loaded.config,
+                    topics,
+                    messages: input.messages,
+                    projectID: current.project.id,
+                  }).pipe(
+                    Effect.catchCause((cause) =>
+                      Effect.gen(function* () {
+                        yield* Effect.logWarning("periodic MEMORY maintenance failed", { cause })
+                        return topics
+                      }),
+                    ),
+                  )
+                : topics
+              const rendered = shouldMatch
+                ? (yield* select({
+                    model: current.model,
+                    config: current.loaded.config,
+                    topics: maintained,
+                    text: user.text,
+                    projectID: current.project.id,
+                  })).rendered
+                : (data.sessions.get(input.sessionID)?.turn.rendered ?? [])
+              const entry = data.sessions.get(input.sessionID)
+              if (entry?.turn.messageID !== user.info.id) return
+              entry.turn = { ...entry.turn, completedTurns: turns, rendered }
+            }),
+          )
         }),
+        `memory-identity:${current.project.id}`,
       )
     })
 
@@ -452,35 +466,46 @@ export const layer: Layer.Layer<
       }
       const origin = user.info.id
 
-      return yield* lock.withProject(current.project.id)(
+      // Cross-process identity guard (see checkpointUnsafe): re-check identity
+      // liveness under the identity lock before matching/writing.
+      return yield* flock.withLock(
         Effect.gen(function* () {
-          const activeTurn = data.sessions.get(input.sessionID)?.turn
-          if (activeTurn?.messageID !== origin) return { status: "stale" as const }
-          const repeated = activeTurn.queries.get(key)
-          if (repeated) {
-            activeTurn.rendered = repeated.rendered
-            return repeated.count > 0
-              ? { status: "attached" as const, count: repeated.count, reused: true }
-              : { status: "empty" as const, reused: true }
+          if (!(yield* project.get(current.project.id))) {
+            yield* clearSession(input.sessionID)
+            return { status: "unavailable" as const }
           }
-          if (activeTurn.queryCount >= 2) return { status: "limit" as const }
-          activeTurn.queryCount++
-          const topics = yield* store.readTopics(current.project.id)
-          const selected = yield* select({
-            model: current.model,
-            config: current.loaded.config,
-            topics,
-            text: query,
-            projectID: current.project.id,
-          })
-          const latest = data.sessions.get(input.sessionID)?.turn
-          if (latest?.messageID !== origin) return { status: "stale" as const }
-          latest.queries.set(key, selected)
-          latest.rendered = selected.rendered
-          return selected.count > 0
-            ? { status: "attached" as const, count: selected.count, reused: false }
-            : { status: "empty" as const, reused: false }
+          return yield* lock.withProject(current.project.id)(
+            Effect.gen(function* () {
+              const activeTurn = data.sessions.get(input.sessionID)?.turn
+              if (activeTurn?.messageID !== origin) return { status: "stale" as const }
+              const repeated = activeTurn.queries.get(key)
+              if (repeated) {
+                activeTurn.rendered = repeated.rendered
+                return repeated.count > 0
+                  ? { status: "attached" as const, count: repeated.count, reused: true }
+                  : { status: "empty" as const, reused: true }
+              }
+              if (activeTurn.queryCount >= 2) return { status: "limit" as const }
+              activeTurn.queryCount++
+              const topics = yield* store.readTopics(current.project.id)
+              const selected = yield* select({
+                model: current.model,
+                config: current.loaded.config,
+                topics,
+                text: query,
+                projectID: current.project.id,
+              })
+              const latest = data.sessions.get(input.sessionID)?.turn
+              if (latest?.messageID !== origin) return { status: "stale" as const }
+              latest.queries.set(key, selected)
+              latest.rendered = selected.rendered
+              return selected.count > 0
+                ? { status: "attached" as const, count: selected.count, reused: false }
+                : { status: "empty" as const, reused: false }
+            }),
+          )
         }),
+        `memory-identity:${current.project.id}`,
       )
     })
 
@@ -506,32 +531,47 @@ export const layer: Layer.Layer<
         return []
       }
       const user = latestRealUser(input.messages)
-      return yield* lock.withProject(current.project.id)(
+      // Cross-process identity guard: a concurrent upgrade may retire this
+      // identity (row deleted, Home renamed away) while this write is in
+      // flight. Serialize on the identity lock and re-check liveness inside it;
+      // writing after retirement would re-create the retired Home and orphan
+      // the new content permanently (the identity cache already points at the
+      // successor, so no migration would ever run for this pair again).
+      return yield* flock.withLock(
         Effect.gen(function* () {
-          const topics = yield* store.readTopics(current.project.id)
-          const maintained = yield* maintain({
-            model: current.model,
-            config: current.loaded.config,
-            topics,
-            messages: input.messages,
-            projectID: current.project.id,
-          }).pipe(
-            Effect.catchCause((cause) =>
-              Effect.gen(function* () {
-                yield* Effect.logWarning("pre-compaction MEMORY maintenance failed", { cause })
-                return topics
-              }),
-            ),
+          if (!(yield* project.get(current.project.id))) {
+            yield* clearSession(input.sessionID)
+            return []
+          }
+          return yield* lock.withProject(current.project.id)(
+            Effect.gen(function* () {
+              const topics = yield* store.readTopics(current.project.id)
+              const maintained = yield* maintain({
+                model: current.model,
+                config: current.loaded.config,
+                topics,
+                messages: input.messages,
+                projectID: current.project.id,
+              }).pipe(
+                Effect.catchCause((cause) =>
+                  Effect.gen(function* () {
+                    yield* Effect.logWarning("pre-compaction MEMORY maintenance failed", { cause })
+                    return topics
+                  }),
+                ),
+              )
+              const rendered = (yield* select({
+                model: current.model,
+                config: current.loaded.config,
+                topics: maintained,
+                text: user?.text ?? "",
+                projectID: current.project.id,
+              })).rendered
+              return rendered
+            }),
           )
-          const rendered = (yield* select({
-            model: current.model,
-            config: current.loaded.config,
-            topics: maintained,
-            text: user?.text ?? "",
-            projectID: current.project.id,
-          })).rendered
-          return rendered
         }),
+        `memory-identity:${current.project.id}`,
       )
     })
 
@@ -595,6 +635,7 @@ export const defaultLayer: Layer.Layer<Service> = Layer.suspend(() =>
     Layer.provide(Config.defaultLayer),
     Layer.provide(Provider.defaultLayer),
     Layer.provide(Project.defaultLayer),
+    Layer.provide(EffectFlock.defaultLayer),
     Layer.provide(MemoryAdmission.defaultLayer),
     Layer.provide(MemoryConfig.defaultLayer),
     Layer.provide(MemoryLock.defaultLayer),
@@ -607,6 +648,7 @@ export const node = LayerNode.make(layer, [
   Config.node,
   Provider.node,
   Project.node,
+  EffectFlock.node,
   MemoryAdmission.node,
   MemoryConfig.node,
   MemoryLock.node,
