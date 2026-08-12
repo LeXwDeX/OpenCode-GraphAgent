@@ -3,7 +3,7 @@ import { FSUtil } from "@opencode-ai/core/fs-util"
 import { ProjectV2 } from "@opencode-ai/core/project"
 import { EffectFlock } from "@opencode-ai/core/util/effect-flock"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
-import { Effect, Layer, Schema } from "effect"
+import { Effect, Exit, Layer, Schema } from "effect"
 import path from "node:path"
 import { MemoryConfig } from "@/memory/config"
 import { MemoryHome } from "@/memory/home"
@@ -601,5 +601,92 @@ describe("Project-owned MEMORY persistence", () => {
         expect(yield* fs.exists(sandboxConfig)).toBe(false)
       }).pipe(Effect.provide(layers(root)))
     }),
+  )
+
+  it.live(
+    "fails closed on a corrupt manifest and never deletes the unread Home (MEM-PR01-R1-02)",
+    () =>
+      Effect.gen(function* () {
+        const root = yield* tmpdirScoped()
+        yield* Effect.gen(function* () {
+          const fs = yield* FSUtil.Service
+          const home = yield* MemoryHome.Service
+          const migration = yield* MemoryIdentityMigration.Service
+          const store = yield* MemoryStore.Service
+          // Both identities hold Memory so the migration takes the merge path
+          // (the rename fast path never deletes anything).
+          yield* replaceTopics(store, projectID, [topic()])
+          yield* replaceTopics(store, otherProjectID, [topic("新身份的主题")])
+
+          // (a) invalid manifest JSON
+          yield* fs.writeFileString(home.manifest(projectID), "{ not json")
+          expect(Exit.isFailure(yield* Effect.exit(store.readSnapshot(projectID)))).toBe(true)
+          const invalid = yield* Effect.exit(migration.migrateHome(projectID, otherProjectID))
+          expect(Exit.isFailure(invalid)).toBe(true)
+          expect(yield* fs.exists(home.directory(projectID))).toBe(true)
+
+          // (b) manifest referencing a generation that does not exist
+          yield* fs.writeFileString(
+            home.manifest(projectID),
+            JSON.stringify({ schema_version: 1, revision: 1, generation: "1-deadbeef" }) + "\n",
+          )
+          expect(Exit.isFailure(yield* Effect.exit(store.readSnapshot(projectID)))).toBe(true)
+          const missing = yield* Effect.exit(migration.migrateHome(projectID, otherProjectID))
+          expect(Exit.isFailure(missing)).toBe(true)
+          expect(yield* fs.exists(home.directory(projectID))).toBe(true)
+        }).pipe(
+          Effect.provide(
+            Layer.provideMerge(
+              MemoryIdentityMigration.layer.pipe(Layer.provide(EffectFlock.defaultLayer)),
+              layers(root),
+            ),
+          ),
+        )
+      }),
+  )
+
+  it.live(
+    "rejects Topics whose item_count disagrees with their items (MEM-PR01-R1-20)",
+    () =>
+      Effect.gen(function* () {
+        const base = topic()
+        const drifted = { ...base, metadata: { ...base.metadata, item_count: base.items.length + 1 } }
+        expect(MemoryStore.decodeTopic(drifted, drifted.id)).toBeUndefined()
+
+        const root = yield* tmpdirScoped()
+        yield* Effect.gen(function* () {
+          const store = yield* MemoryStore.Service
+          const exit = yield* Effect.exit(replaceTopics(store, projectID, [drifted]))
+          expect(Exit.isFailure(exit)).toBe(true)
+          expect(yield* store.readTopics(projectID)).toEqual([])
+        }).pipe(Effect.provide(layers(root)))
+      }),
+  )
+
+  it.live(
+    "an orphaned staging generation never shadows the committed generation (MEM-PR01-R1-21)",
+    () =>
+      Effect.gen(function* () {
+        const root = yield* tmpdirScoped()
+        yield* Effect.gen(function* () {
+          const fs = yield* FSUtil.Service
+          const home = yield* MemoryHome.Service
+          const store = yield* MemoryStore.Service
+          const value = topic()
+          yield* replaceTopics(store, projectID, [value])
+
+          // Simulate a crash mid-writeSnapshot: a staging generation exists but
+          // its manifest was never published.
+          const staging = path.join(home.generations(projectID), ".2-orphaned.tmp")
+          yield* fs.makeDirectory(staging, { recursive: true })
+          yield* fs.writeFileString(path.join(staging, "orphan.yaml"), "id: orphan\n")
+
+          expect(yield* store.readTopics(projectID)).toEqual([value])
+          // The store still commits cleanly afterwards.
+          const next = topic("第二版边界")
+          yield* replaceTopics(store, projectID, [next])
+          expect(yield* store.readTopics(projectID)).toEqual([next])
+        }).pipe(Effect.provide(layers(root)))
+      }),
   )
 })

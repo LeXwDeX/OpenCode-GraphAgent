@@ -229,3 +229,11 @@ After the survey + ultracode adversarial review, the user applied Occam's Razor 
 | **#15** Destructive cleanup moved to the action path: `remove()` gains a prunable branch (prune admin data + remove directory if present + branch cleanup + drop registrations) and a git-unknown recovery branch (registered but no git record: reconcile fail-closed, drop the stale registration, never delete the directory). Registration cleanup drops ALL canonically-equal entries (symlinked /var vs /private/var duplicates). | MEM-PR01-R1-18 (P3) + serialization regression | ✅ done (Red→Green→mutation) |
 | pin | reset fails closed over invalid legacy memory and preserves it. | MEM-PR01-R1-17 (P2 test-gap) | ✅ pinned (mutation-proven) |
 | pin | reset/remove invalidate the admission cache before the rescan (deterministic TOCTOU via reset-primed cache). | MEM-PR01-R1-19 (P2 test-gap, blocking) | ✅ pinned (mutation-proven) |
+
+### M-E additions (store resilience pins, 2026-08-12)
+
+| Fix | Finding | Status |
+|---|---|---|
+| **#16** Corrupt-manifest fail-closed reads are now Red-tested: an invalid manifest and a manifest referencing a missing generation both fail `readSnapshot`, and `migrateHome` fails closed on the merge path without deleting the unread source Home. Both fail-closed guards proven load-bearing by mutation (fail-open revert → the test Red). | MEM-PR01-R1-02 (P2 test-gap) | ✅ pinned (mutation-proven) |
+| pin | `decodeTopic` rejects Topics whose `item_count` disagrees with `items.length`; the store refuses to publish such a generation. | MEM-PR01-R1-20 (P3 test-gap) | ✅ pinned (mutation-proven) |
+| pin | An orphaned staging generation (crash mid-`writeSnapshot`, manifest never published) never shadows the committed generation; the store still commits cleanly afterwards. | MEM-PR01-R1-21 (P3 test-gap) | ✅ pinned (mutation-proven) |
