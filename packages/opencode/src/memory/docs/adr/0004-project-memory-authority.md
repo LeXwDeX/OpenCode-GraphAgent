@@ -1,6 +1,6 @@
 # ADR-0004: Project Memory authority owns identity and commits
 
-- Status: **Proposed** (awaiting user approval — P0 gate)
+- Status: **Rejected** (2026-08-12) — superseded by the Occam minimal path (redo plan §10). After survey + adversarial review the user applied Occam's Razor: this elaborate redesign (authority facade, 6-phase retirement journal, alias tombstone, opaque Revision, destruction guard, 8 phases) is over-engineered for the actual needs — one shared memory per project and no fork are already in the baseline; an imperceptible identity upgrade and no data loss are achievable with small in-place fixes. Kept as a record of the considered-and-rejected direction.
 - Date: 2026-08-12
 - Supersedes: the Policy-source clause of [ADR-0001](./0001-project-owned-memory.md) and the lock/commit framing of [ADR-0002](./0002-project-memory-commit-protocol.md); adds Identity Retirement. Reconstructs the lost authority redesign (uncommitted WIP, /tmp-cleaned) from design memory, now written down so it is auditable.
 

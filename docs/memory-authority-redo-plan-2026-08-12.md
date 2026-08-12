@@ -179,3 +179,20 @@ The lost ADR-0004 is **unrecoverable** (repo's only ADR-0004 is an unrelated DAG
 | P6 — fromDirectory cutover (1C, MEM-ID-AUTO-11) | pending | — | + project.test.ts/memory-persistence.test.ts scope; Spec/Standards review + pause |
 | P7 — crash harness (1A, MEM-CRASH-06/LOCK-02) | pending | — | |
 | P8 — destruction guard + worktree + remove parallel authorities | pending | — | + Green/mutation per §7.B |
+
+> **§4/§7.C/§9 (the elaborate 8-phase redesign) are SUPERSEDED by §10 below.** Kept for history.
+
+## 10. Occam minimal path (ADOPTED 2026-08-12 — the actual work)
+
+After the survey + ultracode adversarial review, the user applied Occam's Razor ("一切从简"): the elaborate ProjectMemoryAuthority / retirement journal / alias tombstone / opaque Revision / destruction guard / 8-phase plan is over-engineered for the real needs. Confirmed user principles: **one shared Memory per Project (worktrees share it, hold none of their own); Memory never forks; identity upgrade is imperceptible; no data loss.** Shared + no-fork are already satisfied by the baseline d7b011738 (Home follows identity). So the work collapses to small in-place fixes on the existing seams. **ADR-0004 is Rejected.**
+
+| Fix | Gap | Status | Commit |
+|---|---|---|---|
+| **#1** Repoint `workflow`+`permission` FK on identity upgrade (was `ON DELETE CASCADE` silent data loss) | MEM-REF-07 | ✅ done (mutation-proven) | `ec6972b22` |
+| **#2** Remove `.orDie` on the migration seam (`memory/identity-migration.ts` via `project/identity-migration.ts:19`); propagate `ConflictError`/`InvalidHomeError` as typed errors to the instance-store Deferred + HTTP project handler boundary | typed-error invariant (#5) | pending | — |
+| **#3** `migrateHome` acquires its two project flocks in **sorted** order (no reverse-retirement ABBA) | MEM-LOCK-02 | pending | — |
+| **#4** Destructive admission (worktree reset/remove) **force-rescans**, never trusts the process-local admission cache | MEM-ADMIT-03 / RET-04 | pending | — |
+
+**Explicitly cut by Occam** (do NOT build): MEM-ATOMIC-10 (Policy stays in `.opencode/memory.jsonc`; memory is topic content); the authority facade, 6-phase journal, alias tombstone, opaque Revision, destruction guard, crash harness; MEM-CRASH-06 as a forward-journal state machine (POSIX `rename` + the store's generation/manifest atomicity cover content; `migrateHome` can be made idempotent if a crash-retry need is shown).
+
+**Resume protocol (replaces §8 steps 3–4):** do the next pending Fix in order (#2 → #3 → #4). Per fix: re-read exact baseline → implement → `cd packages/opencode && bun typecheck` AND `cd packages/core && bun typecheck` → targeted test (package dir ONLY) → mutation gate (temp-revert ⇒ a real test flips Red, restore) → `git commit` (conventional) → update this §10 table. Exclusions unchanged: no Goal/DAG-config/CI/push/PR, no source-Home GC.
