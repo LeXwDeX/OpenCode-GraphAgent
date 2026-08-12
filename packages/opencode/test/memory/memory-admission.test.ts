@@ -1,13 +1,17 @@
 import { describe, expect } from "bun:test"
+import { Database } from "@opencode-ai/core/database/database"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { ProjectV2 } from "@opencode-ai/core/project"
+import { ProjectTable } from "@opencode-ai/core/project/sql"
+import { AbsolutePath } from "@opencode-ai/core/schema"
 import { EffectFlock } from "@opencode-ai/core/util/effect-flock"
-import { Duration, Effect, Fiber, Layer } from "effect"
+import { Cause, Duration, Effect, Exit, Fiber, Layer } from "effect"
 import path from "node:path"
 import { MemoryAdmission } from "@/memory/admission"
 import { MemoryConfig } from "@/memory/config"
 import { MemoryHome } from "@/memory/home"
+import { MemoryIdentityFence } from "@/memory/identity-fence"
 import { MemoryStore } from "@/memory/store"
 import { tmpdirScoped } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
@@ -58,8 +62,16 @@ function topic(id: string, summary = `已确认的 ${id} 决策`) {
 
 function layers(root: string) {
   const home = Layer.succeed(MemoryHome.Service, MemoryHome.make(root))
+  // One shared Database layer: the fence's liveness recheck and the test
+  // body's row setup must see the same rows.
+  const database = Database.defaultLayer
   const store = MemoryStore.layer.pipe(
     Layer.provide(FSUtil.defaultLayer),
+    Layer.provide(EffectFlock.defaultLayer),
+    Layer.provide(home),
+  )
+  const fence = MemoryIdentityFence.layer.pipe(
+    Layer.provide(database),
     Layer.provide(EffectFlock.defaultLayer),
     Layer.provide(home),
   )
@@ -69,8 +81,9 @@ function layers(root: string) {
     Layer.provide(MemoryConfig.defaultLayer),
     Layer.provide(home),
     Layer.provide(store),
+    Layer.provide(fence),
   )
-  return Layer.mergeAll(admission, store, MemoryConfig.defaultLayer)
+  return Layer.mergeAll(admission, store, MemoryConfig.defaultLayer, database)
 }
 
 describe("MemoryAdmission", () => {
@@ -84,6 +97,13 @@ describe("MemoryAdmission", () => {
         const fs = yield* FSUtil.Service
         const admission = yield* MemoryAdmission.Service
         const configStore = yield* MemoryConfig.Service
+        const { db } = yield* Database.Service
+        // ensure() runs for live identities; the fence re-checks the row.
+        yield* db
+          .insert(ProjectTable)
+          .values({ id: projectID, worktree: AbsolutePath.make(primary), vcs: "git", sandboxes: [] })
+          .run()
+          .pipe(Effect.orDie)
         const files = [first, second].map((directory) => path.join(directory, ".opencode", "memory.jsonc"))
         yield* Effect.forEach(files, (file) => fs.makeDirectory(path.dirname(file), { recursive: true }), {
           concurrency: 1,
@@ -116,6 +136,12 @@ describe("MemoryAdmission", () => {
       yield* Effect.gen(function* () {
         const fs = yield* FSUtil.Service
         const admission = yield* MemoryAdmission.Service
+        const { db } = yield* Database.Service
+        yield* db
+          .insert(ProjectTable)
+          .values({ id: projectID, worktree: AbsolutePath.make(primary), vcs: "git", sandboxes: [] })
+          .run()
+          .pipe(Effect.orDie)
         const snapshot = { projectID, projectDirectory: primary, directories: [primary, sandbox], updated: 1 }
 
         expect((yield* admission.ensure(snapshot)).diagnostics).toEqual([])
@@ -141,6 +167,12 @@ describe("MemoryAdmission", () => {
         const fs = yield* FSUtil.Service
         const admission = yield* MemoryAdmission.Service
         const store = yield* MemoryStore.Service
+        const { db } = yield* Database.Service
+        yield* db
+          .insert(ProjectTable)
+          .values({ id: projectID, worktree: AbsolutePath.make(primary), vcs: "git", sandboxes: [] })
+          .run()
+          .pipe(Effect.orDie)
         const topics = [topic("architecture"), topic("product")]
         const files = [first, second].map((directory, index) =>
           path.join(directory, ".opencode", "memory", "topics", `${topics[index].id}.yaml`),
@@ -168,9 +200,15 @@ describe("MemoryAdmission", () => {
   const fullLayers = (root: string) => {
     const home = Layer.succeed(MemoryHome.Service, MemoryHome.make(root))
     const flock = EffectFlock.defaultLayer
-    const base = Layer.mergeAll(FSUtil.defaultLayer, flock, home, MemoryConfig.defaultLayer)
+    const database = Database.defaultLayer
+    const fence = MemoryIdentityFence.layer.pipe(
+      Layer.provide(database),
+      Layer.provide(flock),
+      Layer.provide(home),
+    )
+    const base = Layer.mergeAll(FSUtil.defaultLayer, flock, home, MemoryConfig.defaultLayer, database)
     const store = MemoryStore.layer.pipe(Layer.provide(base))
-    const admission = MemoryAdmission.layer.pipe(Layer.provide(base), Layer.provide(store))
+    const admission = MemoryAdmission.layer.pipe(Layer.provide(base), Layer.provide(store), Layer.provide(fence))
     return Layer.mergeAll(base, store, admission)
   }
 
@@ -186,6 +224,12 @@ describe("MemoryAdmission", () => {
           const home = yield* MemoryHome.Service
           const admission = yield* MemoryAdmission.Service
           const store = yield* MemoryStore.Service
+          const { db } = yield* Database.Service
+          yield* db
+            .insert(ProjectTable)
+            .values({ id: projectID, worktree: AbsolutePath.make(primary), vcs: "git", sandboxes: [] })
+            .run()
+            .pipe(Effect.orDie)
 
           const dir = path.join(primary, ".opencode", "memory", "topics")
           const file = path.join(dir, "moving-topic.yaml")
@@ -234,6 +278,12 @@ describe("MemoryAdmission", () => {
         yield* Effect.gen(function* () {
           const fs = yield* FSUtil.Service
           const admission = yield* MemoryAdmission.Service
+          const { db } = yield* Database.Service
+          yield* db
+            .insert(ProjectTable)
+            .values({ id: projectID, worktree: AbsolutePath.make(primary), vcs: "git", sandboxes: [] })
+            .run()
+            .pipe(Effect.orDie)
 
           const configA = { ...config, model: "test/config-jsonc" }
           const configB = { ...config, model: "test/config-json" }
@@ -266,5 +316,38 @@ describe("MemoryAdmission", () => {
         }).pipe(Effect.provide(fullLayers(root)))
       }),
       { timeout: 30_000 },
+  )
+
+  it.live(
+    "does not import legacy topics for a retired identity nor delete the legacy files (MEM-PR01-R7-F1)",
+    () =>
+      Effect.gen(function* () {
+        const root = yield* tmpdirScoped()
+        const primary = yield* tmpdirScoped({ git: true })
+        yield* Effect.gen(function* () {
+          const fs = yield* FSUtil.Service
+          const home = yield* MemoryHome.Service
+          const admission = yield* MemoryAdmission.Service
+
+          // A pre-upgrade writer left legacy topic files in the worktree.
+          const file = path.join(primary, ".opencode", "memory", "topics", "retired-import.yaml")
+          yield* fs.makeDirectory(path.dirname(file), { recursive: true })
+          yield* fs.writeFileString(file, Bun.YAML.stringify(topic("retired-import")))
+
+          // The identity row was retired by a concurrent upgrade: the snapshot is
+          // still stamped under the old identity but the row no longer exists.
+          const result = yield* admission
+            .ensure({ projectID, projectDirectory: primary, directories: [primary], updated: 1 })
+            .pipe(Effect.exit)
+
+          // Fail-closed: the import must not re-create the retired Home and must
+          // not delete the only remaining copy of the legacy content.
+          expect(Exit.isFailure(result)).toBe(true)
+          const failReasons = Exit.isFailure(result) ? result.cause.reasons.filter(Cause.isFailReason) : []
+          expect(failReasons.map((reason) => reason.error._tag)).toEqual(["MemoryAdmission.IdentityRetired"])
+          expect(yield* fs.existsSafe(file)).toBe(true)
+          expect(yield* fs.existsSafe(home.directory(projectID))).toBe(false)
+        }).pipe(Effect.provide(fullLayers(root)))
+      }),
   )
 })

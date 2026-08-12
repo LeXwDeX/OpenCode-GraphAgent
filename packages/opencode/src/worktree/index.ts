@@ -480,12 +480,17 @@ export const layer: Layer.Layer<
       // flip the project-wide effective config past disagreeing siblings.
       if (memoryAdmission && input.initialized) {
         yield* memoryAdmission.invalidate(input.projectID)
-        const memory = yield* memoryAdmission.ensure({
-          projectID: input.projectID,
-          projectDirectory: input.projectDirectory,
-          directories: input.directories,
-          updated: input.updated,
-        })
+        const memory = yield* memoryAdmission
+          .ensure({
+            projectID: input.projectID,
+            projectDirectory: input.projectDirectory,
+            directories: input.directories,
+            updated: input.updated,
+          })
+          .pipe(Effect.catchTag("MemoryAdmission.IdentityRetired", () => Effect.succeed(undefined)))
+        // The identity was retired concurrently: the legacy migration is moot
+        // (the Home moved to the successor) — do not block the operation.
+        if (!memory) return undefined
         if (memory.unresolved > 0)
           return `Cannot continue with unresolved legacy project memory: ${memory.diagnostics
             .filter((item) => item.code.endsWith(".invalid") || item.code.endsWith(".conflict"))

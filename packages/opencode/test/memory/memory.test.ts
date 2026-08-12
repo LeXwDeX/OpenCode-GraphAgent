@@ -10,6 +10,7 @@ import { Git } from "@/git"
 import { MemoryAdmission } from "@/memory/admission"
 import { MemoryConfig } from "@/memory/config"
 import { MemoryHome } from "@/memory/home"
+import { MemoryIdentityFence } from "@/memory/identity-fence"
 import { MemoryLock } from "@/memory/lock"
 import { Memory } from "@/memory/memory"
 import { MemoryModel } from "@/memory/model"
@@ -101,6 +102,7 @@ const unavailableModelIt = testEffect(
         emptyConfigLayer,
         EffectFlock.defaultLayer,
         MemoryHome.defaultLayer,
+        MemoryIdentityFence.defaultLayer,
         replacementProvider.layer,
         Layer.mock(Project.Service, {
           get: (id) =>
@@ -197,6 +199,7 @@ function bootstrapFixture() {
       Layer.mergeAll(
         EffectFlock.defaultLayer,
         MemoryHome.defaultLayer,
+        MemoryIdentityFence.defaultLayer,
         Layer.mock(Config.Service, {
           get: () =>
             Effect.succeed({
@@ -328,6 +331,7 @@ function recallFixture() {
         emptyConfigLayer,
         EffectFlock.defaultLayer,
         MemoryHome.defaultLayer,
+        MemoryIdentityFence.defaultLayer,
         provider.layer,
         Layer.mock(Project.Service, {
           get: (id) =>

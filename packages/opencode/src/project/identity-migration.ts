@@ -5,6 +5,7 @@ import { EffectFlock } from "@opencode-ai/core/util/effect-flock"
 import { ProjectV2 } from "@opencode-ai/core/project"
 import { Context, Effect, Layer } from "effect"
 import { MemoryHome } from "@/memory/home"
+import { MemoryIdentityFence } from "@/memory/identity-fence"
 import { MemoryIdentityMigration } from "@/memory/identity-migration"
 
 export interface Interface {
@@ -40,7 +41,7 @@ export const layer = Layer.effect(
               yield* memory.migrateHome(oldID, newID)
               yield* retireReferences()
             }),
-            `memory-identity:${oldID}`,
+            MemoryIdentityFence.key(oldID),
             home.locks,
           )
           .pipe(Effect.orDie, Effect.withSpan("ProjectIdentityMigration.migrate")),

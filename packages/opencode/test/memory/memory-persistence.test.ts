@@ -1,12 +1,16 @@
 import { describe, expect } from "bun:test"
+import { Database } from "@opencode-ai/core/database/database"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { ProjectV2 } from "@opencode-ai/core/project"
+import { ProjectTable } from "@opencode-ai/core/project/sql"
+import { AbsolutePath } from "@opencode-ai/core/schema"
 import { EffectFlock } from "@opencode-ai/core/util/effect-flock"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Effect, Exit, Fiber, Layer, Ref, Schema } from "effect"
 import path from "node:path"
 import { MemoryConfig } from "@/memory/config"
 import { MemoryHome } from "@/memory/home"
+import { MemoryIdentityFence } from "@/memory/identity-fence"
 import { MemoryIdentityMigration } from "@/memory/identity-migration"
 import { MemoryAdmission } from "@/memory/admission"
 import { MemoryPaths } from "@/memory/paths"
@@ -86,8 +90,16 @@ function terminologyTopic() {
 
 function layers(root: string) {
   const home = Layer.succeed(MemoryHome.Service, MemoryHome.make(root))
+  // One shared Database layer: the fence's liveness recheck and the test
+  // body's row setup must see the same rows.
+  const database = Database.defaultLayer
   const store = MemoryStore.layer.pipe(
     Layer.provide(FSUtil.defaultLayer),
+    Layer.provide(EffectFlock.defaultLayer),
+    Layer.provide(home),
+  )
+  const fence = MemoryIdentityFence.layer.pipe(
+    Layer.provide(database),
     Layer.provide(EffectFlock.defaultLayer),
     Layer.provide(home),
   )
@@ -97,8 +109,25 @@ function layers(root: string) {
     Layer.provide(MemoryConfig.defaultLayer),
     Layer.provide(home),
     Layer.provide(store),
+    Layer.provide(fence),
   )
-  return Layer.mergeAll(home, store, admission, MemoryConfig.defaultLayer)
+  return Layer.mergeAll(home, store, admission, MemoryConfig.defaultLayer, database)
+}
+
+/**
+ * Inserts a live identity row. Production callers of ensure() always run with
+ * a live row (configuration() re-reads it, the worktree guard requires an
+ * initialized project); the fence's liveness recheck needs it in tests too.
+ */
+function insertLiveRow(id: ProjectV2.ID) {
+  return Effect.gen(function* () {
+    const { db } = yield* Database.Service
+    yield* db
+      .insert(ProjectTable)
+      .values({ id, worktree: AbsolutePath.make("/unused"), vcs: "git", sandboxes: [] })
+      .run()
+      .pipe(Effect.orDie)
+  })
 }
 
 function replaceTopics(store: MemoryStore.Interface, id: ProjectV2.ID, topics: MemorySchema.Topic[]) {
@@ -304,6 +333,7 @@ describe("Project-owned MEMORY persistence", () => {
         const home = yield* MemoryHome.Service
         const admission = yield* MemoryAdmission.Service
         const store = yield* MemoryStore.Service
+        yield* insertLiveRow(projectID)
         const file = path.join(MemoryPaths.legacyTopics(sandbox), "project-architecture.yaml")
         yield* fs.makeDirectory(path.dirname(file), { recursive: true })
         yield* fs.writeFileString(file, Bun.YAML.stringify(topic()))
@@ -356,6 +386,7 @@ describe("Project-owned MEMORY persistence", () => {
         const fs = yield* FSUtil.Service
         const admission = yield* MemoryAdmission.Service
         const store = yield* MemoryStore.Service
+        yield* insertLiveRow(projectID)
         const firstFile = path.join(MemoryPaths.legacyTopics(first), "project-architecture.yaml")
         const secondFile = path.join(MemoryPaths.legacyTopics(second), "project-architecture.yaml")
         yield* fs.makeDirectory(path.dirname(firstFile), { recursive: true })
@@ -503,6 +534,7 @@ describe("Project-owned MEMORY persistence", () => {
         const fs = yield* FSUtil.Service
         const configStore = yield* MemoryConfig.Service
         const admission = yield* MemoryAdmission.Service
+        yield* insertLiveRow(projectID)
         const invalid = path.join(MemoryPaths.legacyTopics(sandbox), "broken.yaml")
         const sandboxConfig = path.join(sandbox, ".opencode", "memory.jsonc")
         yield* fs.makeDirectory(path.dirname(invalid), { recursive: true })
@@ -550,6 +582,7 @@ describe("Project-owned MEMORY persistence", () => {
           Effect.gen(function* () {
             const fs = yield* FSUtil.Service
             const admission = yield* MemoryAdmission.Service
+            yield* insertLiveRow(projectID)
             const sandboxConfig = path.join(sandbox, ".opencode", "memory.jsonc")
             yield* fs.writeFileString(path.join(global, "memory.jsonc"), JSON.stringify(config))
             yield* fs.makeDirectory(path.dirname(sandboxConfig), { recursive: true })
@@ -584,6 +617,7 @@ describe("Project-owned MEMORY persistence", () => {
         const fs = yield* FSUtil.Service
         const configStore = yield* MemoryConfig.Service
         const admission = yield* MemoryAdmission.Service
+        yield* insertLiveRow(projectID)
         const value = { ...config, topic_limit: 50, topic_limit_floor: 10 }
         const sandboxConfig = path.join(sandbox, ".opencode", "memory.jsonc")
         yield* configStore.writeProject(primary, value)
@@ -796,6 +830,7 @@ describe("Project-owned MEMORY persistence", () => {
         yield* Effect.gen(function* () {
           const fs = yield* FSUtil.Service
           const admission = yield* MemoryAdmission.Service
+          yield* insertLiveRow(projectID)
           const file = path.join(sandbox, ".opencode", "memory", "topics", "broken.yaml")
           yield* fs.makeDirectory(path.dirname(file), { recursive: true })
           yield* fs.writeFileString(file, "id: broken\n")

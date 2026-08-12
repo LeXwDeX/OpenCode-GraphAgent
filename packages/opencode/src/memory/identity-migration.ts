@@ -4,7 +4,7 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { ProjectV2 } from "@opencode-ai/core/project"
 import { EffectFlock } from "@opencode-ai/core/util/effect-flock"
-import { Context, Effect, Layer, Schema } from "effect"
+import { Context, Effect, Exit, Layer, Schema } from "effect"
 import { dirname, join } from "node:path"
 import { MemoryHome } from "./home"
 import { MemorySchema } from "./schema"
@@ -117,8 +117,12 @@ export const layer = Layer.effect(
           if (!(yield* fs.existsSafe(source))) return undefined
           yield* fs.makeDirectory(dirname(target), { recursive: true })
           if (!(yield* fs.existsSafe(target))) {
-            yield* fs.rename(source, target)
-            return undefined
+            const renamed = yield* fs.rename(source, target).pipe(Effect.exit)
+            if (Exit.isSuccess(renamed)) return undefined
+            // A writer under newID created the target between existsSafe and
+            // rename (ENOTEMPTY/EEXIST race). Nothing was removed — fall
+            // through to the snapshot-merge path below, which converges.
+            if (!(yield* fs.existsSafe(target))) return yield* renamed
           }
           yield* inspectHome(source)
           return yield* store.readSnapshot(oldID)

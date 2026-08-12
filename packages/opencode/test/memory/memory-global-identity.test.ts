@@ -18,6 +18,7 @@ import { Git } from "@/git"
 import { MemoryAdmission } from "@/memory/admission"
 import { MemoryConfig } from "@/memory/config"
 import { MemoryHome } from "@/memory/home"
+import { MemoryIdentityFence } from "@/memory/identity-fence"
 import { MemoryLock } from "@/memory/lock"
 import { Memory } from "@/memory/memory"
 import { MemoryModel } from "@/memory/model"
@@ -112,6 +113,7 @@ const base = Layer.mergeAll(
   MemoryAdmission.defaultLayer,
   MemoryConfig.defaultLayer,
   MemoryHome.defaultLayer,
+  MemoryIdentityFence.defaultLayer,
   MemoryLock.defaultLayer,
   MemoryStore.defaultLayer,
   Layer.mock(MemoryModel.Service, {

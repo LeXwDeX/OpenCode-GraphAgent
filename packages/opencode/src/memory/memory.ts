@@ -2,7 +2,6 @@ export * as Memory from "./memory"
 
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { ProjectV2 } from "@opencode-ai/core/project"
-import { EffectFlock } from "@opencode-ai/core/util/effect-flock"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Context, Duration, Effect, Layer, Option, Ref, Schema, Semaphore } from "effect"
 import { stringify } from "yaml"
@@ -14,7 +13,7 @@ import { MessageID, SessionID } from "@/session/schema"
 import { Token } from "@/util/token"
 import { MemoryAdmission } from "./admission"
 import { MemoryConfig } from "./config"
-import { MemoryHome } from "./home"
+import { MemoryIdentityFence } from "./identity-fence"
 import { MemoryLock } from "./lock"
 import { MemoryModel } from "./model"
 import { MemoryPrompts } from "./prompts"
@@ -69,10 +68,9 @@ export const layer: Layer.Layer<
   | Config.Service
   | Provider.Service
   | Project.Service
-  | EffectFlock.Service
   | MemoryAdmission.Service
   | MemoryConfig.Service
-  | MemoryHome.Service
+  | MemoryIdentityFence.Service
   | MemoryLock.Service
   | MemoryModel.Service
   | MemoryStore.Service
@@ -82,8 +80,7 @@ export const layer: Layer.Layer<
     const config = yield* Config.Service
     const provider = yield* Provider.Service
     const project = yield* Project.Service
-    const flock = yield* EffectFlock.Service
-    const home = yield* MemoryHome.Service
+    const fence = yield* MemoryIdentityFence.Service
     const admission = yield* MemoryAdmission.Service
     const configStore = yield* MemoryConfig.Service
     const lock = yield* MemoryLock.Service
@@ -193,12 +190,17 @@ export const layer: Layer.Layer<
       // activates once the repository gains a real identity.
       if (current.id === ProjectV2.ID.global) return undefined
       if (current.vcs !== "git" || !current.time.initialized) return undefined
-      const migration = yield* admission.ensure({
-        projectID: current.id,
-        projectDirectory: current.worktree,
-        directories: Array.from(new Set([current.worktree, ...current.sandboxes, ctx.worktree])),
-        updated: current.time.updated,
-      })
+      const migration = yield* admission
+        .ensure({
+          projectID: current.id,
+          projectDirectory: current.worktree,
+          directories: Array.from(new Set([current.worktree, ...current.sandboxes, ctx.worktree])),
+          updated: current.time.updated,
+        })
+        .pipe(Effect.catchTag("MemoryAdmission.IdentityRetired", () => Effect.succeed(undefined)))
+      // The identity was retired between the row check above and the fence
+      // acquisition: fail closed and stay inert.
+      if (!migration) return undefined
       if (migration.unresolved) {
         yield* Effect.logWarning("Project MEMORY migration needs manual repair", {
           projectID: current.id,
@@ -364,14 +366,11 @@ export const layer: Layer.Layer<
       session.firstTurnAttempted = true
       if (!due && !shouldMatch) return
 
-      // Cross-process identity guard (see checkpointUnsafe): re-check identity
-      // liveness under the identity lock before writing.
-      yield* flock.withLock(
+      // Cross-process identity guard (see checkpointUnsafe): MemoryIdentityFence
+      // re-checks identity liveness under the identity lock before writing.
+      const live = yield* fence.withLiveIdentity(
+        current.project.id,
         Effect.gen(function* () {
-          if (!(yield* project.get(current.project.id))) {
-            yield* clearSession(input.sessionID)
-            return
-          }
           yield* lock.withProject(current.project.id)(
             Effect.gen(function* () {
               const topics = yield* store.readTopics(current.project.id)
@@ -406,9 +405,11 @@ export const layer: Layer.Layer<
             }),
           )
         }),
-        `memory-identity:${current.project.id}`,
-        home.locks,
       )
+      if (Option.isNone(live)) {
+        yield* clearSession(input.sessionID)
+        return
+      }
     })
 
     const prepare: Interface["prepare"] = Effect.fn("Memory.prepare")((input) =>
@@ -470,14 +471,11 @@ export const layer: Layer.Layer<
       }
       const origin = user.info.id
 
-      // Cross-process identity guard (see checkpointUnsafe): re-check identity
-      // liveness under the identity lock before matching/writing.
-      return yield* flock.withLock(
+      // Cross-process identity guard (see checkpointUnsafe): MemoryIdentityFence
+      // re-checks identity liveness under the identity lock before matching/writing.
+      const live = yield* fence.withLiveIdentity(
+        current.project.id,
         Effect.gen(function* () {
-          if (!(yield* project.get(current.project.id))) {
-            yield* clearSession(input.sessionID)
-            return { status: "unavailable" as const }
-          }
           return yield* lock.withProject(current.project.id)(
             Effect.gen(function* () {
               const activeTurn = data.sessions.get(input.sessionID)?.turn
@@ -509,9 +507,12 @@ export const layer: Layer.Layer<
             }),
           )
         }),
-        `memory-identity:${current.project.id}`,
-        home.locks,
       )
+      if (Option.isNone(live)) {
+        yield* clearSession(input.sessionID)
+        return { status: "unavailable" as const }
+      }
+      return live.value
     })
 
     const search: Interface["search"] = Effect.fn("Memory.search")((input) =>
@@ -542,12 +543,9 @@ export const layer: Layer.Layer<
       // writing after retirement would re-create the retired Home and orphan
       // the new content permanently (the identity cache already points at the
       // successor, so no migration would ever run for this pair again).
-      return yield* flock.withLock(
+      const live = yield* fence.withLiveIdentity(
+        current.project.id,
         Effect.gen(function* () {
-          if (!(yield* project.get(current.project.id))) {
-            yield* clearSession(input.sessionID)
-            return []
-          }
           return yield* lock.withProject(current.project.id)(
             Effect.gen(function* () {
               const topics = yield* store.readTopics(current.project.id)
@@ -576,9 +574,12 @@ export const layer: Layer.Layer<
             }),
           )
         }),
-        `memory-identity:${current.project.id}`,
-        home.locks,
       )
+      if (Option.isNone(live)) {
+        yield* clearSession(input.sessionID)
+        return []
+      }
+      return live.value
     })
 
     const checkpoint: Interface["checkpoint"] = Effect.fn("Memory.checkpoint")((input) =>
@@ -641,10 +642,9 @@ export const defaultLayer: Layer.Layer<Service> = Layer.suspend(() =>
     Layer.provide(Config.defaultLayer),
     Layer.provide(Provider.defaultLayer),
     Layer.provide(Project.defaultLayer),
-    Layer.provide(EffectFlock.defaultLayer),
     Layer.provide(MemoryAdmission.defaultLayer),
     Layer.provide(MemoryConfig.defaultLayer),
-    Layer.provide(MemoryHome.defaultLayer),
+    Layer.provide(MemoryIdentityFence.defaultLayer),
     Layer.provide(MemoryLock.defaultLayer),
     Layer.provide(MemoryModel.defaultLayer),
     Layer.provide(MemoryStore.defaultLayer),
@@ -655,10 +655,9 @@ export const node = LayerNode.make(layer, [
   Config.node,
   Provider.node,
   Project.node,
-  EffectFlock.node,
   MemoryAdmission.node,
   MemoryConfig.node,
-  MemoryHome.node,
+  MemoryIdentityFence.node,
   MemoryLock.node,
   MemoryModel.node,
   MemoryStore.node,

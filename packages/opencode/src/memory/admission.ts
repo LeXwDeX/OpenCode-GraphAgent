@@ -9,6 +9,7 @@ import { basename, join } from "node:path"
 import { parse } from "yaml"
 import { MemoryConfig } from "./config"
 import { MemoryHome } from "./home"
+import { MemoryIdentityFence } from "./identity-fence"
 import { MemoryPaths } from "./paths"
 import { MemoryStore } from "./store"
 
@@ -45,10 +46,20 @@ export class ProjectSnapshot extends Schema.Class<ProjectSnapshot>("MemoryAdmiss
   updated: Schema.Number,
 }) {}
 
+/**
+ * The identity was retired between the caller's snapshot and fence
+ * acquisition. The import is abandoned: writing would re-create the retired
+ * Home and destroy the only remaining copy of the legacy content.
+ */
+export class IdentityRetiredError extends Schema.TaggedErrorClass<IdentityRetiredError>()(
+  "MemoryAdmission.IdentityRetired",
+  { project_id: Schema.String },
+) {}
+
 export interface Interface {
   readonly ensure: (
     snapshot: ProjectSnapshot,
-  ) => Effect.Effect<Result, FSUtil.Error | MemoryStore.StoreError | EffectFlock.LockError>
+  ) => Effect.Effect<Result, FSUtil.Error | MemoryStore.StoreError | EffectFlock.LockError | IdentityRetiredError>
   readonly invalidate: (projectID: ProjectV2.ID) => Effect.Effect<void>
 }
 
@@ -70,6 +81,7 @@ export const layer = Layer.effect(
   Effect.gen(function* () {
     const fs = yield* FSUtil.Service
     const flock = yield* EffectFlock.Service
+    const fence = yield* MemoryIdentityFence.Service
     const config = yield* MemoryConfig.Service
     const home = yield* MemoryHome.Service
     const store = yield* MemoryStore.Service
@@ -424,10 +436,18 @@ export const layer = Layer.effect(
       })
       const key = JSON.stringify([snapshot.projectID, directories, snapshot.updated])
       // Lock order (outermost→innermost): memory-admission → memory-identity →
-      // memory-project (inside updateTopics). The identity lock serializes the
-      // import against a concurrent identity retirement renaming the Home.
+      // memory-project (inside updateTopics). The identity fence is owned by
+      // MemoryIdentityFence: it re-checks identity liveness inside the fence,
+      // so the import can never re-create a retired Home or delete the legacy
+      // source files after a concurrent retirement.
       return yield* flock.withLock(
-        flock.withLock(ensureUnsafe(normalized, key), `memory-identity:${snapshot.projectID}`, home.locks),
+        Effect.gen(function* () {
+          const imported = yield* fence.withLiveIdentity(snapshot.projectID, ensureUnsafe(normalized, key))
+          if (Option.isNone(imported)) {
+            return yield* new IdentityRetiredError({ project_id: snapshot.projectID })
+          }
+          return imported.value
+        }),
         `memory-admission:${snapshot.projectID}`,
         home.locks,
       )
@@ -449,6 +469,7 @@ export const defaultLayer = layer.pipe(
   Layer.provide(MemoryConfig.defaultLayer),
   Layer.provide(MemoryHome.defaultLayer),
   Layer.provide(MemoryStore.defaultLayer),
+  Layer.provide(MemoryIdentityFence.defaultLayer),
 )
 
 export const node = LayerNode.make(layer, [
@@ -457,6 +478,7 @@ export const node = LayerNode.make(layer, [
   MemoryConfig.node,
   MemoryHome.node,
   MemoryStore.node,
+  MemoryIdentityFence.node,
 ])
 
 function same(left: unknown, right: unknown) {
