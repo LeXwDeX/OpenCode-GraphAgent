@@ -3,7 +3,7 @@ import { FSUtil } from "@opencode-ai/core/fs-util"
 import { ProjectV2 } from "@opencode-ai/core/project"
 import { EffectFlock } from "@opencode-ai/core/util/effect-flock"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
-import { Effect, Exit, Layer, Schema } from "effect"
+import { Effect, Exit, Fiber, Layer, Ref, Schema } from "effect"
 import path from "node:path"
 import { MemoryConfig } from "@/memory/config"
 import { MemoryHome } from "@/memory/home"
@@ -659,6 +659,81 @@ describe("Project-owned MEMORY persistence", () => {
           const exit = yield* Effect.exit(replaceTopics(store, projectID, [drifted]))
           expect(Exit.isFailure(exit)).toBe(true)
           expect(yield* store.readTopics(projectID)).toEqual([])
+        }).pipe(Effect.provide(layers(root)))
+      }),
+  )
+
+  it.live(
+    "serializes project config writes on a per-file lock (MEM-PR01-R2-02)",
+    () =>
+      Effect.gen(function* () {
+        const root = yield* tmpdirScoped()
+        const primary = yield* tmpdirScoped({ git: true })
+        yield* Effect.gen(function* () {
+          const flock = yield* EffectFlock.Service
+          const fs = yield* FSUtil.Service
+          const configStore = yield* MemoryConfig.Service
+          const target = MemoryConfig.projectPath(primary)
+
+          // Hold the file's write lock; a concurrent writeProject must queue
+          // behind it and may only complete after the release.
+          const done = yield* Ref.make(false)
+          const writerCell = yield* Ref.make<Fiber.Fiber<void, unknown> | undefined>(undefined)
+          // Hold the file's write lock; a writer forked while the lock is held
+          // must stay blocked until the lock is released at the end of withLock.
+          yield* flock.withLock(
+            Effect.gen(function* () {
+              const writer = yield* Effect.gen(function* () {
+                yield* configStore.writeProject(primary, config)
+                yield* Ref.set(done, true)
+              }).pipe(Effect.forkDetach)
+              yield* Ref.set(writerCell, writer)
+              yield* Effect.sleep("300 millis")
+              expect(yield* Ref.get(done)).toBe(false)
+            }),
+            MemoryConfig.writeLockKey(target),
+          )
+          const writer = (yield* Ref.get(writerCell))!
+          yield* Fiber.join(writer)
+          expect(yield* Ref.get(done)).toBe(true)
+          expect(yield* fs.existsSafe(target)).toBe(true)
+        }).pipe(Effect.provide(Layer.mergeAll(layers(root), EffectFlock.defaultLayer)))
+      }),
+    { timeout: 20_000 },
+  )
+
+  it.live(
+    "a second process committing a stale revision observes the explicit conflict (MEM-PR01-R2-03)",
+    () =>
+      Effect.gen(function* () {
+        const root = yield* tmpdirScoped()
+        const coordination = yield* tmpdirScoped()
+        yield* Effect.gen(function* () {
+          const store = yield* MemoryStore.Service
+          const value = topic()
+          yield* replaceTopics(store, projectID, [value])
+
+          const go = path.join(coordination, "go")
+          const ready = path.join(coordination, "stale.ready")
+          const child = Bun.spawn([
+            process.execPath,
+            path.join(import.meta.dir, "../fixture/memory-commit-worker.ts"),
+            JSON.stringify({
+              root,
+              projectID,
+              ready,
+              go,
+              expectedRevision: 0,
+              summary: "跨进程的陈旧修订",
+            }),
+          ])
+          while (!(yield* Effect.promise(() => Bun.file(ready).exists()))) yield* Effect.sleep("5 millis")
+          yield* Effect.promise(() => Bun.write(go, "go"))
+
+          // Exit 0 means the worker observed CommitConflictError — the explicit
+          // cross-process conflict guarantee of the commit protocol.
+          expect(yield* Effect.promise(() => child.exited)).toBe(0)
+          expect(yield* store.readSnapshot(projectID)).toEqual({ revision: 1, topics: [value] })
         }).pipe(Effect.provide(layers(root)))
       }),
   )

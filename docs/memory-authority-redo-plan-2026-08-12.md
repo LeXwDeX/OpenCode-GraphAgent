@@ -237,3 +237,10 @@ After the survey + ultracode adversarial review, the user applied Occam's Razor 
 | **#16** Corrupt-manifest fail-closed reads are now Red-tested: an invalid manifest and a manifest referencing a missing generation both fail `readSnapshot`, and `migrateHome` fails closed on the merge path without deleting the unread source Home. Both fail-closed guards proven load-bearing by mutation (fail-open revert → the test Red). | MEM-PR01-R1-02 (P2 test-gap) | ✅ pinned (mutation-proven) |
 | pin | `decodeTopic` rejects Topics whose `item_count` disagrees with `items.length`; the store refuses to publish such a generation. | MEM-PR01-R1-20 (P3 test-gap) | ✅ pinned (mutation-proven) |
 | pin | An orphaned staging generation (crash mid-`writeSnapshot`, manifest never published) never shadows the committed generation; the store still commits cleanly afterwards. | MEM-PR01-R1-21 (P3 test-gap) | ✅ pinned (mutation-proven) |
+
+### M-F additions (config concurrency findings, 2026-08-12)
+
+| Fix | Finding | Status |
+|---|---|---|
+| **#17** All writers of a MEMORY config file now serialize on a per-file cross-process flock (`memory-config:<file>`): `writeProject`, `writeGlobal`, and the normalization rewrite in `readConfig`. atomicWrite's byte-atomicity is no longer undermined by whole-document last-writer-wins between `/memory on|off`, admission promotion, and normalization rewrites across worktrees/processes. Pinned by a blocking-observation test (mutation-proven: dropping the lock lets the concurrent writer complete during the hold). Residual (documented, not fixed — Occam): decision-level read-modify-write across processes is not CAS-protected; only the write primitives are serialized. | MEM-PR01-R2-02 (P3, newly-exposed) | ✅ done (Red→Green→mutation) |
+| **#18** Cross-process commit protocol now has a real second-process test: a spawned worker commits with a stale expectedRevision and must observe `MemoryStore.CommitConflictError` (ADR-0002's explicit-conflict guarantee), deterministic — unlike the timing-probabilistic updateTopics race test. | MEM-PR01-R2-03 (P3 test-gap) | ✅ pinned |

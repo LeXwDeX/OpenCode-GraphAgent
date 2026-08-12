@@ -2,6 +2,7 @@ export * as MemoryConfig from "./config"
 
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
+import { EffectFlock } from "@opencode-ai/core/util/effect-flock"
 import { Flag } from "@opencode-ai/core/flag/flag"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Global } from "@opencode-ai/core/global"
@@ -20,14 +21,17 @@ export type Loaded = {
 }
 
 export interface Interface {
-  readonly load: (projectDir: string) => Effect.Effect<Loaded | undefined, FSUtil.Error>
-  readonly loadGlobal: () => Effect.Effect<Loaded | undefined, FSUtil.Error>
+  readonly load: (projectDir: string) => Effect.Effect<Loaded | undefined, FSUtil.Error | EffectFlock.LockError>
+  readonly loadGlobal: () => Effect.Effect<Loaded | undefined, FSUtil.Error | EffectFlock.LockError>
   readonly writeProject: (
     projectDir: string,
     config: MemorySchema.Config,
     existingPath?: string,
-  ) => Effect.Effect<void, FSUtil.Error>
-  readonly writeGlobal: (config: MemorySchema.Config, existingPath?: string) => Effect.Effect<boolean, FSUtil.Error>
+  ) => Effect.Effect<void, FSUtil.Error | EffectFlock.LockError>
+  readonly writeGlobal: (
+    config: MemorySchema.Config,
+    existingPath?: string,
+  ) => Effect.Effect<boolean, FSUtil.Error | EffectFlock.LockError>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/MemoryConfig") {}
@@ -37,6 +41,7 @@ export const layer = Layer.effect(
   Effect.gen(function* () {
     const fs = yield* FSUtil.Service
     const git = yield* Git.Service
+    const flock = yield* EffectFlock.Service
 
     const ensureProjectExclude = Effect.fnUntraced(function* (projectDir: string) {
       const result = yield* git.run(["rev-parse", "--git-path", "info/exclude"], { cwd: projectDir })
@@ -68,7 +73,7 @@ export const layer = Layer.effect(
       }
       if (decoded.value.topic_limit === decoded.value.topic_limit_floor) return decoded.value
       const config = normalizeConfig(decoded.value)
-      yield* MemoryFile.atomicWrite(fs, found.path, serialize(config))
+      yield* flock.withLock(MemoryFile.atomicWrite(fs, found.path, serialize(config)), writeLockKey(found.path))
       return config
     })
 
@@ -97,7 +102,13 @@ export const layer = Layer.effect(
       existingPath?: string,
     ) {
       yield* ensureProjectExclude(projectDir)
-      yield* MemoryFile.atomicWrite(fs, existingPath ?? projectPath(projectDir), serialize(config))
+      // One Project = one shared policy file, written by several paths
+      // (/memory on|off, admission promotion, normalization rewrites) from
+      // multiple worktrees and processes. Serialize the writes on the target
+      // file so atomicWrite's byte-atomicity is not undermined by
+      // whole-document last-writer-wins.
+      const target = existingPath ?? projectPath(projectDir)
+      yield* flock.withLock(MemoryFile.atomicWrite(fs, target, serialize(config)), writeLockKey(target))
     })
 
     const writeGlobal = Effect.fn("MemoryConfig.writeGlobal")(function* (
@@ -105,14 +116,14 @@ export const layer = Layer.effect(
       existingPath?: string,
     ) {
       if (existingPath && globalCandidates().includes(existingPath)) {
-        yield* MemoryFile.atomicWrite(fs, existingPath, serialize(config))
+        yield* flock.withLock(MemoryFile.atomicWrite(fs, existingPath, serialize(config)), writeLockKey(existingPath))
         return true
       }
       const file = join(globalConfigDir(), "memory.jsonc")
       const found = yield* readFirst(globalCandidates())
       if (found) {
         if (yield* readConfig(found)) return false
-        yield* MemoryFile.atomicWrite(fs, found.path, serialize(config))
+        yield* flock.withLock(MemoryFile.atomicWrite(fs, found.path, serialize(config)), writeLockKey(found.path))
         return true
       }
       yield* fs.makeDirectory(dirname(file), { recursive: true })
@@ -128,10 +139,16 @@ export const layer = Layer.effect(
 
 export const defaultLayer = layer.pipe(
   Layer.provide(FSUtil.defaultLayer),
+  Layer.provide(EffectFlock.defaultLayer),
   Layer.provide(Git.defaultLayer.pipe(Layer.provide(CrossSpawnSpawner.defaultLayer))),
 )
 
-export const node = LayerNode.make(layer, [FSUtil.node, Git.node])
+export const node = LayerNode.make(layer, [FSUtil.node, EffectFlock.node, Git.node])
+
+/** Cross-process serialization key for writes to one MEMORY config file. */
+export function writeLockKey(file: string) {
+  return `memory-config:${file}`
+}
 
 export function projectPath(projectDir: string) {
   return join(projectDir, ".opencode", "memory.jsonc")
