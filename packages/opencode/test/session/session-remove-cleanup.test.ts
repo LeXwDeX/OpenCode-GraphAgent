@@ -145,7 +145,10 @@ describe("Session.remove dag lease cleanup (GOAL-FP-01-06)", () => {
         )
         .get()
         .pipe(Effect.orDie)
-      expect(cancelledEvent).not.toBeNull()
+      // P2-B: toBeNull() was vacuous — drizzle .get() returns undefined for a
+      // missing row and `expect(undefined).not.toBeNull()` always passes.
+      // toBeDefined() actually pins the durable dag.workflow.cancelled event.
+      expect(cancelledEvent).toBeDefined()
 
       // Recovery scan contract (dag/runtime/loop.ts adopts only
       // running/paused/stepping rows): the workflow must not be re-adoptable.

@@ -655,9 +655,10 @@ export const layer: Layer.Layer<
           yield* remove(child.id)
         }
 
-        yield* events.publish(SessionV1.Event.Deleted, { sessionID, info: session })
         // SettingsHook: SessionEnd fires before session-scoped hook state is cleared
         // (the trigger implementation clears seen-cache and session hooks after execution).
+        // It deliberately runs BEFORE the destructive steps below so the hook
+        // observes the session and its workflows while they still fully exist.
         if (settingsHook) {
           const seResult = yield* settingsHook
             .trigger({ event: "SessionEnd", reason: "delete" }, { sessionID, transcriptPath: "" })
@@ -666,11 +667,16 @@ export const layer: Layer.Layer<
         }
         // Cleanup durable automation state BEFORE the Deleted publish: the
         // SessionProjector deletes the session row (and FK cascades wipe the
-        // workflow rows) inside the Deleted publish transaction, so running
-        // cleanup first means a crash mid-way can only leave a live session
-        // with no goal/workflows (consistent, recoverable) — never orphan
-        // goal rows or re-adoptable workflows under a deleted session. The
-        // three steps live in separate aggregates (goal_state/goal_outcome,
+        // workflow rows) inside the Deleted publish transaction. Publishing
+        // first would make `dag.store.listBySession` below return [] (the
+        // cascade already removed the rows), turning the cancel loop into
+        // dead code — the WorkflowCancelled event would never fire, the
+        // DagLoop terminal handler would never abort running child sessions,
+        // and a crash between publish and cleanup would orphan goal rows.
+        // Running cleanup first means a crash mid-way can only leave a live
+        // session with no goal/workflows (consistent, recoverable) — never
+        // orphan goal rows or re-adoptable workflows under a deleted session.
+        // The three steps live in separate aggregates (goal_state/goal_outcome,
         // workflow events, the lease map) so no shared transaction is
         // available; each step is individually atomic.
         yield* goal.purgeSession(sessionID).pipe(
@@ -706,6 +712,9 @@ export const layer: Layer.Layer<
             Effect.logWarning("automation lease purge failed during session remove", { sessionID, cause }),
           ),
         )
+        // Session-row deletion (projector, inside this publish's transaction)
+        // comes LAST, after every cleanup step above.
+        yield* events.publish(SessionV1.Event.Deleted, { sessionID, info: session })
         yield* events.remove(sessionID)
       } catch (error) {
         yield* Effect.logError("failed to remove session", { sessionID, error })
