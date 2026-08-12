@@ -35,6 +35,12 @@ export const layer = Layer.sync(Service, () => {
     SessionID,
     { readonly goals: Set<string>; readonly dags: Set<string>; generation: number }
   >()
+  // Sessions whose goal claim was rejected because a dag owns the automation
+  // lease. Set by claim, cleared by a successful (or non-dag-rejected) goal
+  // claim, and CONSUMED by the unregister re-trigger below — all under the
+  // per-session lock, so the re-trigger decision is atomic with claim
+  // serialization (GOAL-FP-01-02 follow-up / R1).
+  const blockedGoalClaims = new Set<SessionID>()
 
   const entry = (sessionID: SessionID) => {
     const current = registrations.get(sessionID)
@@ -90,7 +96,16 @@ export const layer = Layer.sync(Service, () => {
     // (GoalLoop / DagLoop fork their work before touching the lease lock), so
     // no deadlock is possible. Set.delete is idempotent and only the removal
     // of the LAST dag flips the owner, so the emit cannot duplicate.
-    const dagOwnershipReleased = yield* locks.withLock(sessionID)(
+    //
+    // R1 (GOAL-FP-01-02 follow-up): the re-trigger fires ONLY when a goal
+    // claim was actually rejected by the dag (blockedGoalClaims). A rejected
+    // claim's evaluation fiber yields at the claim itself, so the retry
+    // evaluation it spawns is the only evaluation in flight — the duplicate
+    // evaluation that raced the turn-idle fiber (double commit / interrupt
+    // between commit and dispatch) is unconstructible. A successful goal
+    // claim clears the flag (under the same lock), so a release that a
+    // boundary evaluation already picked up does not double-fire.
+    const goalRetryDue = yield* locks.withLock(sessionID)(
       Effect.sync(() => {
         const current = registrations.get(sessionID)
         if (!current) return false
@@ -100,10 +115,13 @@ export const layer = Layer.sync(Service, () => {
         current.generation += 1
         if (current.goals.size === 0 && current.dags.size === 0) registrations.delete(sessionID)
         const after = owner(sessionID)
-        return before?.kind === "dag" && after?.kind !== "dag"
+        if (before?.kind !== "dag" || after?.kind === "dag") return false
+        // Consume the retry obligation: exactly one re-trigger per blocked
+        // claim, even when several dags release back-to-back.
+        return blockedGoalClaims.delete(sessionID)
       }),
     )
-    if (!dagOwnershipReleased) return
+    if (!goalRetryDue) return
     // SessionStatus is resolved optionally: automation-lease is deliberately
     // dependency-free (consumers wire it standalone, e.g.
     // test/session/automation-lease.test.ts), and every entry point that runs
@@ -130,6 +148,14 @@ export const layer = Layer.sync(Service, () => {
       Effect.sync(() => {
         const current = registrations.get(sessionID)
         const selected = owner(sessionID)
+        if (request.kind === "goal") {
+          // Track dag-blocked goal claims: the unregister re-trigger only
+          // fires for sessions whose goal evaluation was actually rejected by
+          // a dag owner. Any other outcome (success, or a rejection that is
+          // not dag-blocking) clears the obligation.
+          if (selected?.kind === "dag") blockedGoalClaims.add(sessionID)
+          else blockedGoalClaims.delete(sessionID)
+        }
         if (!current || !selected) return Option.none<Token>()
         if (request.kind === "goal" && (selected.kind !== "goal" || selected.id !== request.id))
           return Option.none<Token>()

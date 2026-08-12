@@ -31,7 +31,9 @@ import { pollWithTimeout } from "../lib/effect"
 // still exists and yields; no further idle event follows, so an active goal
 // silently stalls. Contract under test: when the dag owner disappears,
 // unregister itself must re-trigger the goal evaluation through the existing
-// idle status event mechanism — with NO further external idle events.
+// idle status event mechanism — with NO idle events AFTER U2 (the wake turn's
+// own idle, which the real runner emits and the prompt mock reproduces here,
+// is what blocks the claim in the first place and arms the re-trigger).
 //
 // Real DagLoop (adoption, terminal handler, wake delivery end-to-end so U2
 // fires inside the delivery tap) + real GoalLoop (idle subscription on the
@@ -100,9 +102,11 @@ function takeWithin<A>(queue: Queue.Queue<A>, message: string) {
 // Mutable observation state shared by the layer mocks and the test body.
 let judgeCalls = 0
 let promptCalls: { noReply?: boolean; text: string }[] = []
+let parentPromptCalls = 0
 const reset = () => {
   judgeCalls = 0
   promptCalls = []
+  parentPromptCalls = 0
 }
 
 function goalWakeLayer(input: { childPrompts: Queue.Queue<ChildPromptGate> }) {
@@ -169,6 +173,26 @@ function goalWakeLayer(input: { childPrompts: Queue.Queue<ChildPromptGate> }) {
           text: value.parts?.map((p) => (p.type === "text" ? p.text : "")).join("\n") ?? "",
         })
       })
+      // The FIRST parent prompt is the wake delivery. Mirror the real runner:
+      // a completed wake turn emits the session idle event before its awaiter
+      // resolves — i.e., before the delivery tap's U2. That idle event drives
+      // GoalLoop's evaluation, whose claim is rejected by the still-registered
+      // dag — the blocked claim the unregister re-trigger exists to retry
+      // (GOAL-FP-01-02 / R1). Later parent prompts are goal continuations and
+      // must not re-emit (the mock has no real runner turn).
+      if (parentPromptCalls === 0) {
+        parentPromptCalls += 1
+        yield* Effect.serviceOption(EventV2Bridge.Service).pipe(
+          Effect.flatMap((bridge) =>
+            Option.isSome(bridge)
+              ? bridge.value.publish(SessionStatus.Event.Status, {
+                  sessionID: SessionID.make(sessionID),
+                  status: { type: "idle" },
+                })
+              : Effect.void,
+          ),
+        )
+      }
       return reply(sessionID, "parent turn")
     }
     const release = yield* Deferred.make<string>()
@@ -178,7 +202,7 @@ function goalWakeLayer(input: { childPrompts: Queue.Queue<ChildPromptGate> }) {
   const prompt = Layer.mock(SessionPrompt.Service, {
     cancel: () => Effect.void,
     prompt: deliver,
-    promptIfIdle: (value) => deliver(value).pipe(Effect.map(Option.some)),
+    promptIfIdle: (value: SessionPrompt.PromptInput) => deliver(value).pipe(Effect.map(Option.some)),
   })
   const agent = Layer.mock(Agent.Service, {
     get: () =>

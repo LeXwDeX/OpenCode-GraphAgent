@@ -1,5 +1,5 @@
 import { describe, expect } from "bun:test"
-import { Cause, Effect, Layer, Option } from "effect"
+import { Cause, Deferred, Effect, Exit, Layer, Option } from "effect"
 import { GoalLoop, GoalLoopJudgeLLM } from "@/goal/loop"
 import { Goal } from "@/goal/goal"
 import { GoalEvent } from "@/goal/events"
@@ -324,6 +324,137 @@ describe("GoalLoop + DAG owner arbitration", () => {
         "5 seconds",
       )
       expect(judgeCalls).toBe(1)
+    }),
+  )
+})
+
+// GOAL-FP-01-02 follow-up (R1): the dag-release re-trigger must NOT publish a
+// duplicate idle when no goal evaluation was ever blocked by the dag. The
+// unfixed re-trigger forks a full evaluation (D) whose commit consumes the
+// turn boundary; the real turn-idle fiber (B) then commits AGAIN for the same
+// boundary — turns inflation (and, with a live runner, the busy→pause path).
+//
+// Deterministic construction through the public seam: the dag releases while
+// the session is idle, THEN the turn-boundary idle event is published. The
+// re-trigger's evaluation (if any) completes before the boundary evaluation
+// forks, so the boundary fiber always double-commits under the unfixed
+// re-trigger. The second continuation dispatch is parked on a gate so the
+// test observes the settled double-commit state instead of a transient.
+//
+// The judge is scripted out of the picture entirely: the assistant message
+// carries no text, so afterIdle takes the synthetic "continue" verdict path
+// (loop.ts branch 2) and the judge mock must never be reached.
+describe("GoalLoop — dag release must not double-evaluate a boundary (GOAL-FP-01-02 follow-up)", () => {
+  let continuationCalls = 0
+  let gateHit = false
+  let gateRelease = Deferred.makeUnsafe<void>()
+  const reset = () => {
+    continuationCalls = 0
+    gateHit = false
+    gateRelease = Deferred.makeUnsafe<void>()
+  }
+
+  const sessionMock = Layer.mock(Session.Service, {
+    messages: () => Effect.succeed([mkAssistantTools()]),
+  })
+  // Second continuation dispatch parks on a gate: under the unfixed
+  // re-trigger the boundary fiber commits (turns 1 → 2) and reaches the gate;
+  // the test then observes the settled double-commit state.
+  const promptMock = Layer.mock(SessionPrompt.Service, {
+    prompt: () => Effect.die("the direct prompt path is not exercised in this scenario"),
+    promptIfIdle: () =>
+      Effect.sync(() => {
+        continuationCalls += 1
+      }).pipe(
+        Effect.flatMap(() => {
+          if (continuationCalls === 2) {
+            gateHit = true
+            return Deferred.await(gateRelease)
+          }
+          return Effect.void
+        }),
+        Effect.map(() => Option.none()),
+      ),
+  })
+  const judgeMock = Layer.succeed(
+    GoalLoopJudgeLLM,
+    GoalLoopJudgeLLM.of({
+      call: () => Effect.die("the synthetic no-text verdict path must never reach the judge"),
+    }),
+  )
+  const raceLayer = GoalLoop.layer.pipe(
+    Layer.provide(sessionMock),
+    Layer.provide(promptMock),
+    Layer.provide(Layer.mock(Provider.Service, {})),
+    Layer.provide(judgeMock),
+    Layer.provideMerge(Goal.defaultLayer),
+    // provideMerge (not provide): unregister runs in the test body context and
+    // the lease's re-trigger resolves SessionStatus from it (see the
+    // arbitration describe above).
+    Layer.provideMerge(SessionStatus.defaultLayer),
+    Layer.provideMerge(EventV2Bridge.defaultLayer),
+    Layer.provideMerge(SessionAutomationLease.defaultLayer),
+  )
+  const it = testEffect(raceLayer)
+
+  it.instance("an unblocked goal is evaluated exactly once when the dag releases before the boundary idle", () =>
+    Effect.gen(function* () {
+      reset()
+      const loop = yield* GoalLoop.Service
+      const goal = yield* Goal.Service
+      const events = yield* EventV2Bridge.Service
+      const automation = yield* SessionAutomationLease.Service
+      yield* loop.init()
+      const sessionID = SessionID.descending()
+      yield* goal.set(sessionID, "ship the feature", 10)
+      yield* automation.register(sessionID, { kind: "dag", id: "dag-executor" })
+      yield* Effect.yieldNow
+
+      // The dag releases while the session is idle and NO evaluation was ever
+      // blocked by it. The re-trigger must stay silent here.
+      yield* automation.unregister(sessionID, { kind: "dag", id: "dag-executor" })
+
+      // Under the unfixed re-trigger an evaluation (D) was already forked by
+      // the unregister's idle publish. Wait for it to settle so the boundary
+      // fiber below cannot interrupt it mid-flight.
+      const spuriousEvaluation = yield* pollWithTimeout(
+        Effect.sync(() => (continuationCalls >= 1 ? true : undefined)),
+        "unfixed re-trigger evaluation never dispatched",
+        "500 millis",
+      )
+        .pipe(Effect.exit)
+        .pipe(Effect.map(Exit.isSuccess))
+
+      // The real turn-boundary idle event (the runner's idle emit).
+      yield* events.publish(SessionStatus.Event.Status, {
+        sessionID,
+        status: { type: "idle" },
+      })
+
+      // Under the unfixed re-trigger the boundary fiber commits a SECOND time
+      // (turns inflation) and parks at the second-dispatch gate.
+      const doubleCommit = yield* pollWithTimeout(
+        Effect.sync(() => (gateHit ? true : undefined)),
+        "boundary fiber never reached the second dispatch (no double evaluation)",
+        "500 millis",
+      )
+        .pipe(Effect.exit)
+        .pipe(Effect.map(Exit.isSuccess))
+
+      // Let the parked boundary fiber finish (no-op when it was never parked).
+      yield* Deferred.succeed(gateRelease, undefined)
+      yield* pollWithTimeout(
+        Effect.sync(() => (continuationCalls >= (spuriousEvaluation ? 2 : 1) ? true : undefined)),
+        "boundary evaluation never dispatched its continuation",
+        "5 seconds",
+      )
+
+      const g = yield* goal.load(sessionID)
+      expect(g?.status).toBe("active")
+      // The R1 harm: the boundary's single real evaluation must account for
+      // exactly one turn — not two.
+      expect(Number(g?.turns_used)).toBe(1)
+      expect(doubleCommit).toBe(false)
     }),
   )
 })
