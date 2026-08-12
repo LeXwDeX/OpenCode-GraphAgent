@@ -10,6 +10,7 @@ import { ProjectTable } from "@opencode-ai/core/project/sql"
 import { SessionTable } from "@opencode-ai/core/session/sql"
 import { WorkspaceTable } from "@opencode-ai/core/control-plane/workspace.sql"
 import { WorkflowTable } from "@opencode-ai/core/dag/sql"
+import { PermissionSaved } from "@opencode-ai/core/permission/saved"
 import { PermissionTable } from "@opencode-ai/core/permission/sql"
 import { eq } from "drizzle-orm"
 import { Hash } from "@opencode-ai/core/util/hash"
@@ -308,6 +309,74 @@ describe("Project.fromDirectory", () => {
           ?.project_id,
       ).toBe(remoteID)
     }),
+  )
+
+  it.live(
+    "identity upgrade survives a permission uniqueness collision with the successor identity (MEM-PR01-R1-11)",
+    () =>
+      Effect.gen(function* () {
+        const { db } = yield* Database.Service
+        const tmp = yield* tmpdirScoped({ git: true })
+        const projects = yield* Project.Service
+        const rootResult = yield* projects.fromDirectory(tmp)
+        const rootProject = rootResult.project
+        const remoteID = remoteProjectID("github.com/acme/collide")
+
+        // The successor identity already exists (another checkout resolved it
+        // first) and owns a permission colliding with the root identity's on
+        // (project_id, action, resource). The upgrade must not wedge on the
+        // unique index: the successor row wins, the duplicate is dropped, and
+        // disjoint permissions still repoint.
+        const rootRow = yield* db
+          .select()
+          .from(ProjectTable)
+          .where(eq(ProjectTable.id, rootProject.id))
+          .get()
+          .pipe(Effect.orDie)
+        yield* db
+          .insert(ProjectTable)
+          .values({ ...rootRow!, id: remoteID, time_updated: Date.now() })
+          .run()
+          .pipe(Effect.orDie)
+        yield* db
+          .insert(PermissionTable)
+          .values({ id: PermissionSaved.ID.make("perm-successor"), project_id: remoteID, action: "allow", resource: "test" })
+          .run()
+          .pipe(Effect.orDie)
+        yield* db
+          .insert(PermissionTable)
+          .values({ id: PermissionSaved.ID.make("perm-colliding"), project_id: rootProject.id, action: "allow", resource: "test" })
+          .run()
+          .pipe(Effect.orDie)
+        yield* db
+          .insert(PermissionTable)
+          .values({ id: PermissionSaved.ID.make("perm-disjoint"), project_id: rootProject.id, action: "allow", resource: "other" })
+          .run()
+          .pipe(Effect.orDie)
+        yield* Effect.promise(() => $`git remote add origin git@github.com:acme/collide.git`.cwd(tmp).quiet())
+
+        const result = yield* projects.fromDirectory(tmp)
+
+        expect(result.project.id).toBe(remoteID)
+        const permissions = yield* db
+          .select()
+          .from(PermissionTable)
+          .where(eq(PermissionTable.project_id, remoteID))
+          .all()
+          .pipe(Effect.orDie)
+        expect(permissions.map((row) => row.id).sort()).toEqual([
+          PermissionSaved.ID.make("perm-disjoint"),
+          PermissionSaved.ID.make("perm-successor"),
+        ])
+        expect(
+          yield* db
+            .select()
+            .from(PermissionTable)
+            .where(eq(PermissionTable.id, PermissionSaved.ID.make("perm-colliding")))
+            .get()
+            .pipe(Effect.orDie),
+        ).toBeUndefined()
+      }),
   )
 
   it.live("migrates Project Memory before retiring the previous Project identity", () =>
