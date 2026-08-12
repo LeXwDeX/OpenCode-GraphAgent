@@ -165,3 +165,17 @@ The lost ADR-0004 is **unrecoverable** (repo's only ADR-0004 is an unrelated DAG
 3. If **P0 not approved yet**: recreate ADR-0004 + CONTEXT resolving §7.A D1–D4, present to user, **PAUSE**. Do not start P1.
 4. Else advance the next un-committed phase (§7.C order). Per phase: re-read exact baseline → implement → `cd packages/opencode && bun typecheck` → targeted tests (package dir only) → mutation gate → `git commit` → update this doc's phase status.
 5. Exclusions: no Goal/DAG/DAG-config/CI, no push/PR/dev→main, no source-Home GC. Tests never from repo root.
+
+## 9. Phase status (living tracker)
+
+| Phase | Status | Commit | Notes |
+|---|---|---|---|
+| P0 — recreate ADR-0004 + CONTEXT | **Proposed (awaiting user approval)** | (this commit) | ADR-0004 + CONTEXT.md written; resolves D1–D4; encodes user principles (shared/no-fork/imperceptible). User must approve before P1. |
+| P1 — identity + atomic store API | pending | — | blocked on P0 approval |
+| P2 — authority skeleton + lock + repository (MEM-BOOT-09) | pending | — | |
+| P4 — reference adapter (all 5 FK) | pending | — | reorder before P3 |
+| P3 — retirement journal + rules + state machine | pending | — | uses P4 adapter (or injected seams) |
+| P5 — dual Layer wiring | pending | — | effect/app-runtime.ts + server.ts app group |
+| P6 — fromDirectory cutover (1C, MEM-ID-AUTO-11) | pending | — | + project.test.ts/memory-persistence.test.ts scope; Spec/Standards review + pause |
+| P7 — crash harness (1A, MEM-CRASH-06/LOCK-02) | pending | — | |
+| P8 — destruction guard + worktree + remove parallel authorities | pending | — | + Green/mutation per §7.B |
