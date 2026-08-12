@@ -3,7 +3,7 @@ import { Deferred, Effect, Layer, Option, Queue } from "effect"
 import type { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Database } from "@opencode-ai/core/database/database"
 import { DagProjector } from "@opencode-ai/core/dag/projector"
-import { WorkflowTable } from "@opencode-ai/core/dag/sql"
+import { WorkflowNodeTable, WorkflowTable } from "@opencode-ai/core/dag/sql"
 import { DagStore } from "@opencode-ai/core/dag/store"
 import { EventV2 } from "@opencode-ai/core/event"
 import { Project } from "@opencode-ai/core/project"
@@ -115,18 +115,25 @@ function leaseLifecycleLayer(input: { childPrompts: Queue.Queue<ChildPromptGate>
   const childTitles = new Map<string, string>()
   const created: string[] = []
   const session = Layer.mock(Session.Service, {
-    get: () =>
-      Effect.succeed({
-        id: SessionID.make(PARENT_SESSION),
-        slug: "parent",
-        projectID: Project.ID.make(PROJECT_ID),
-        directory: process.cwd(),
-        title: "Parent",
-        version: "test",
-        time: { created: 0, updated: 0 },
-        permission: [],
-        agent: "build",
-      }),
+    get: (sessionID) =>
+      sessionID === "ses_child_ghost"
+        ? // Simulated session-store DEFECT: a die passes through the checker's
+          // catchTag("NotFoundError") (recovery.ts: "any other failure must
+          // propagate"), so reconcileWorkflow aborts recoverWorkflow for the
+          // ghost workflow — leaving its row non-terminal with NO runtime
+          // entry, the P2-A registration-leak precondition.
+          Effect.die("simulated session store defect (ghost child)")
+        : Effect.succeed({
+            id: SessionID.make(PARENT_SESSION),
+            slug: "parent",
+            projectID: Project.ID.make(PROJECT_ID),
+            directory: process.cwd(),
+            title: "Parent",
+            version: "test",
+            time: { created: 0, updated: 0 },
+            permission: [],
+            agent: "build",
+          }),
     create: (value) =>
       Effect.sync(() => {
         const id = `ses_child_${created.length + 1}`
@@ -356,6 +363,103 @@ describe("DagLoop lease lifecycle — terminal event release (GOAL-FP-01-03)", (
           )
 
           // And the goal can now be admitted.
+          const goalOwner = { kind: "goal" as const, id: "goal-1" }
+          yield* automation.register(sid, goalOwner)
+          expect(Option.isSome(yield* automation.claim(sid, goalOwner))).toBe(true)
+        }),
+      ),
+    )
+  })
+})
+
+describe("DagLoop lease lifecycle — runtime-less terminal release (GOAL-FP-01-03 follow-up)", () => {
+  it("releases a swept registration when a workflow with no runtime entry is terminalized by a control op", async () => {
+    await Effect.runPromise(
+      runLeaseTest(({ loop, dag, store, status, automation, database }) =>
+        Effect.gen(function* () {
+          const sid = SessionID.make(PARENT_SESSION)
+
+          // A workflow whose recovery FAILS at startup: its running node
+          // references a child session the session store cannot read, so
+          // reconcileWorkflow's checker failure aborts recoverWorkflow
+          // BEFORE the runtime entry is created. The row stays non-terminal
+          // with no runtime entry — the P2-A precondition.
+          yield* database.db
+            .insert(WorkflowTable)
+            .values({
+              id: "dag-wf-ghost",
+              project_id: Project.ID.make(PROJECT_ID),
+              session_id: SessionID.make(PARENT_SESSION),
+              title: "unrecoverable",
+              status: "running",
+              config: "",
+              seq: 1,
+              wake_reported: true,
+            })
+            .run()
+            .pipe(Effect.orDie)
+          yield* database.db
+            .insert(WorkflowNodeTable)
+            .values({
+              id: "n1",
+              workflow_id: "dag-wf-ghost",
+              name: "n1",
+              worker_type: "build",
+              status: "running",
+              required: true,
+              depends_on: [],
+              child_session_id: "ses_child_ghost",
+              seq: 1,
+            })
+            .run()
+            .pipe(Effect.orDie)
+
+          // An unreported terminal workflow makes the session visible to the
+          // startup wake sweep — which registers the non-terminal ghost.
+          yield* database.db
+            .insert(WorkflowTable)
+            .values({
+              id: "dag-wf-undone",
+              project_id: Project.ID.make(PROJECT_ID),
+              session_id: SessionID.make(PARENT_SESSION),
+              title: "terminal before delivery",
+              status: "failed",
+              config: "",
+              seq: 2,
+              wake_reported: false,
+            })
+            .run()
+            .pipe(Effect.orDie)
+
+          // The session is NOT idle when DagLoop boots, so the forked wake
+          // redelivery aborts — no delivery-side register/unregister.
+          yield* status.set(sid, { type: "busy" })
+          yield* loop.init()
+
+          // The sweep registered the ghost (non-terminal) even though its
+          // recovery failed and no runtime entry exists.
+          expect(Option.isSome(yield* automation.claim(sid, { kind: "dag" }))).toBe(true)
+          expect((yield* store.getWorkflow("dag-wf-ghost"))?.status).toBe("running")
+
+          // A control op terminalizes it — a real WorkflowCancelled event
+          // that no runtime entry backs.
+          yield* dag.cancel("dag-wf-ghost")
+          yield* pollWithTimeout(
+            store.getWorkflow("dag-wf-ghost").pipe(
+              Effect.map((wf) => (wf?.status === "cancelled" ? wf : undefined)),
+            ),
+            "runtime-less workflow did not cancel",
+          )
+
+          // Public contract: the terminal event must release the swept
+          // registration even though the workflow has no runtime entry.
+          yield* pollWithTimeout(
+            automation.claim(sid, { kind: "dag" }).pipe(
+              Effect.map((token) => (Option.isNone(token) ? true : undefined)),
+            ),
+            "dag lease was not released when a runtime-less workflow terminalized",
+          )
+
           const goalOwner = { kind: "goal" as const, id: "goal-1" }
           yield* automation.register(sid, goalOwner)
           expect(Option.isSome(yield* automation.claim(sid, goalOwner))).toBe(true)

@@ -923,8 +923,16 @@ const serviceLayer = Layer.effect(
         )
 
         for (const def of [DagEvent.WorkflowCompleted, DagEvent.WorkflowFailed, DagEvent.WorkflowCancelled]) {
+          // Deliberately NO runtimes.has filter: a workflow terminalized by a
+          // control op after a failed startup recovery (e.g. recoverWorkflow
+          // aborted on an unreadable persisted row) has no runtime entry but
+          // may still hold a dag registration from the startup wake sweep.
+          // The handler stays a no-op for events not concerning this
+          // instance: the evalLock cleanup and wake fork remain gated on
+          // `entry`, and the no-entry release below is scoped by the durable
+          // row's project — the same cross-instance guard every adoption
+          // path uses.
           yield* events.subscribe(def).pipe(
-            Stream.filter((e) => runtimes.has(e.data.dagID as string)),
             Stream.runForEach((evt) =>
               Effect.gen(function* () {
                 const dagID = evt.data.dagID as string
@@ -959,6 +967,18 @@ const serviceLayer = Layer.effect(
                   // claiming the wake lease when a delivery is attempted.
                   yield* automation.unregister(SessionID.make(parentSessionID), { kind: "dag", id: dagID })
                   yield* tryDeliverWake(parentSessionID).pipe(Effect.ignore, Effect.forkScoped)
+                } else {
+                  // GOAL-FP-01-03 follow-up (P2-A): no runtime entry, but the
+                  // startup wake sweep may have registered this non-terminal
+                  // row before its recovery failed. Release from the durable
+                  // row (session_id + project) so a control-op
+                  // terminalization cannot leave a permanent registration
+                  // with no runtime to ever clean it. Foreign-project events
+                  // are a no-op here.
+                  const wf = yield* store.getWorkflow(dagID)
+                  if (wf && wf.projectId === ctx.project.id) {
+                    yield* automation.unregister(SessionID.make(wf.sessionId), { kind: "dag", id: dagID })
+                  }
                 }
               }).pipe(guarded("WorkflowTerminal")),
             ),
