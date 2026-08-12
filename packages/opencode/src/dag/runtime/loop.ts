@@ -949,6 +949,15 @@ const serviceLayer = Layer.effect(
                 // P1-6: trigger wake on workflow terminal so the parent
                 // learns the final outcome even if no idle event fires.
                 if (parentSessionID) {
+                  // GOAL-FP-01-03: the dag registration lifetime is bound to
+                  // workflow state, not to wake delivery. A workflow that
+                  // terminalizes without a successful wake delivery must not
+                  // keep its registration (and the Session's ownership)
+                  // indefinitely. The key matches the registration key
+                  // (WorkflowTable.id === event dagID, per the projector);
+                  // tryDeliverWake re-registers its batch itself before
+                  // claiming the wake lease when a delivery is attempted.
+                  yield* automation.unregister(SessionID.make(parentSessionID), { kind: "dag", id: dagID })
                   yield* tryDeliverWake(parentSessionID).pipe(Effect.ignore, Effect.forkScoped)
                 }
               }).pipe(guarded("WorkflowTerminal")),
@@ -1295,8 +1304,17 @@ const serviceLayer = Layer.effect(
             ),
           )
           if (!snapshot.workflows.some((wf) => wf.projectId === ctx.project.id)) continue
+          // GOAL-FP-01-01: register only NON-terminal workflows. Terminal
+          // workflows with wake_reported=true would otherwise be re-registered
+          // on every restart and never unregistered (the only unregister for
+          // them lives in the wake-delivery SUCCESS path, whose batch only
+          // carries unreported workflows) — permanently leaking a dag
+          // registration and blocking the goal. Terminal-but-unreported
+          // workflows are safe to skip here too: tryDeliverWake registers
+          // every workflow in its batch itself right before claiming the wake
+          // lease, so wake redelivery does not depend on this sweep.
           yield* Effect.forEach(
-            snapshot.workflows,
+            snapshot.workflows.filter((workflow) => !isWorkflowTerminalStatus(workflow.status as never)),
             (workflow) =>
               automation.register(SessionID.make(sessionID), { kind: "dag", id: workflow.id }),
             { discard: true },
