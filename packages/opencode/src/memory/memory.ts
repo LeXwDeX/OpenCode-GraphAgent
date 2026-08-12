@@ -1,6 +1,7 @@
 export * as Memory from "./memory"
 
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { ProjectV2 } from "@opencode-ai/core/project"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Context, Duration, Effect, Layer, Option, Ref, Schema, Semaphore } from "effect"
 import { stringify } from "yaml"
@@ -174,6 +175,12 @@ export const layer: Layer.Layer<
     const configuration = Effect.fn("Memory.configuration")(function* () {
       const ctx = yield* InstanceState.context
       const current = (yield* project.get(ctx.project.id)) ?? ctx.project
+      // Fail-closed inertness for the shared global identity: every commit-less
+      // repository resolves to the same ProjectV2.ID.global, so an active Memory
+      // would share one Home across unrelated repositories and be orphaned by the
+      // first commit (migrateProjectId never migrates away from global). Memory
+      // activates once the repository gains a real identity.
+      if (current.id === ProjectV2.ID.global) return undefined
       if (current.vcs !== "git" || !current.time.initialized) return undefined
       const migration = yield* admission.ensure({
         projectID: current.id,
