@@ -4,6 +4,7 @@ import { Context, Effect, Layer, Option } from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { KeyedMutex } from "@opencode-ai/core/effect/keyed-mutex"
 import { SessionID } from "./schema"
+import { SessionStatus } from "./status"
 
 export type Owner =
   | { readonly kind: "goal"; readonly id: string }
@@ -71,16 +72,54 @@ export const layer = Layer.sync(Service, () => {
     sessionID: SessionID,
     value: Owner,
   ) {
-    yield* locks.withLock(sessionID)(
+    // GOAL-FP-01-02: when the dag ownership actually disappears (owner
+    // transitions dag → goal/none), re-trigger the goal evaluation through
+    // the EXISTING idle status event mechanism so a goal that yielded to the
+    // dag on the last idle event gets a fresh evaluation. The final dag
+    // unregister of a wake delivery (U2 in dag/runtime/loop.ts) lands AFTER
+    // the wake turn's idle event — without this re-trigger the goal silently
+    // stalls until the next external idle. This is also the GOAL-FP-01-11
+    // mitigation surface: a claim that lost the ownership race gets another
+    // chance once the owner actually transfers.
+    //
+    // The dag-release decision is computed atomically under the per-session
+    // lock (compare owner before/after the Set removal, accounting for the
+    // generation bump); the idle publish itself runs AFTER the lock. The
+    // publish is an unconditional fire-and-forget bus enqueue — no interleave
+    // can suppress it — and subscribers process it in their own fibers
+    // (GoalLoop / DagLoop fork their work before touching the lease lock), so
+    // no deadlock is possible. Set.delete is idempotent and only the removal
+    // of the LAST dag flips the owner, so the emit cannot duplicate.
+    const dagOwnershipReleased = yield* locks.withLock(sessionID)(
       Effect.sync(() => {
         const current = registrations.get(sessionID)
-        if (!current) return
+        if (!current) return false
+        const before = owner(sessionID)
         const values = value.kind === "dag" ? current.dags : current.goals
-        if (!values.delete(value.id)) return
+        if (!values.delete(value.id)) return false
         current.generation += 1
         if (current.goals.size === 0 && current.dags.size === 0) registrations.delete(sessionID)
+        const after = owner(sessionID)
+        return before?.kind === "dag" && after?.kind !== "dag"
       }),
     )
+    if (!dagOwnershipReleased) return
+    // SessionStatus is resolved optionally: automation-lease is deliberately
+    // dependency-free (consumers wire it standalone, e.g.
+    // test/session/automation-lease.test.ts), and every entry point that runs
+    // the lease (AppLayer, DagLoop, GoalLoop) provides SessionStatus. Without
+    // it the re-trigger degrades to the pre-fix behavior (the caller's next
+    // idle event still drives the goal — claim re-evaluation is never
+    // load-bearing for correctness of the lease itself).
+    const status = yield* Effect.serviceOption(SessionStatus.Service)
+    if (Option.isNone(status)) return
+    // Only re-trigger when the session is actually idle: a busy session's
+    // turn ALWAYS re-emits idle when it finishes (runner onIdle →
+    // SessionStatus.set), which re-drives the goal claim with the dag already
+    // released. Emitting here mid-turn would waste a judge call and transiently
+    // drop the busy entry from the status map.
+    if ((yield* status.value.get(sessionID)).type !== "idle") return
+    yield* status.value.set(sessionID, { type: "idle" })
   })
 
   const claim = Effect.fn("SessionAutomationLease.claim")(function* (

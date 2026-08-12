@@ -281,13 +281,17 @@ describe("GoalLoop + DAG owner arbitration", () => {
     Layer.provide(Layer.succeed(Provider.Service, {} as never)),
     Layer.provide(judgeMock),
     Layer.provideMerge(Goal.defaultLayer),
-    Layer.provide(SessionStatus.defaultLayer),
+    // provideMerge (not provide): the lease's GOAL-FP-01-02 re-trigger runs
+    // in the test body's context when unregister is called from the body, so
+    // SessionStatus must be part of the output context (branch 3 documents
+    // the same pattern).
+    Layer.provideMerge(SessionStatus.defaultLayer),
     Layer.provideMerge(EventV2Bridge.defaultLayer),
     Layer.provideMerge(SessionAutomationLease.defaultLayer),
   )
   const it = testEffect(arbitrationLayer)
 
-  it.instance("a live DAG owns the Session; Goal resumes after the DAG releases it", () =>
+  it.instance("a live DAG owns the Session; Goal resumes when the DAG releases it", () =>
     Effect.gen(function* () {
       judgeCalls = 0
       continuationCalls = 0
@@ -309,11 +313,11 @@ describe("GoalLoop + DAG owner arbitration", () => {
       expect(judgeCalls).toBe(0)
       expect(continuationCalls).toBe(0)
 
+      // GOAL-FP-01-02: the dag release itself re-triggers the goal evaluation
+      // through the idle status event mechanism — no follow-up idle event is
+      // needed. This is exactly the stall that previously required the manual
+      // second idle publish below.
       yield* automation.unregister(sessionID, { kind: "dag", id: "dag-executor" })
-      yield* events.publish(SessionStatus.Event.Status, {
-        sessionID,
-        status: { type: "idle" },
-      })
       yield* pollWithTimeout(
         Effect.sync(() => (continuationCalls === 1 ? true : undefined)),
         "Goal did not resume after the DAG released the Session lease",
