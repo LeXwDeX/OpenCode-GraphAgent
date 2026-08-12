@@ -25,6 +25,8 @@ export interface Interface {
   readonly pause: (sessionID: SessionID, reason: string) => Effect.Effect<GoalState.Info | undefined>
   readonly resume: (sessionID: SessionID) => Effect.Effect<GoalState.Info | undefined>
   readonly clear: (sessionID: SessionID) => Effect.Effect<void>
+  /** Session-deletion cleanup: remove goal_state AND all goal_outcome rows. */
+  readonly purgeSession: (sessionID: SessionID) => Effect.Effect<void>
   readonly markDone: (sessionID: SessionID, reason: string) => Effect.Effect<GoalState.Info | undefined>
   readonly addSubgoal: (sessionID: SessionID, subgoal: string) => Effect.Effect<GoalState.Info | undefined>
   readonly removeSubgoal: (
@@ -180,6 +182,9 @@ const serviceLayer = Layer.effect(
       | {
           readonly tag: "delete"
           readonly terminal?: GoalState.Info
+          /** GOAL-FP-01-16: also delete every goal_outcome row for the session
+           * in the same transaction (session deletion, not a plain clear). */
+          readonly deleteOutcomes?: boolean
           readonly value: A
         }
 
@@ -246,6 +251,12 @@ const serviceLayer = Layer.effect(
                     yield* tx
                       .delete(GoalStateTable)
                       .where(eq(GoalStateTable.session_id, sessionID))
+                      .run()
+                  }
+                  if (next.tag === "delete" && next.deleteOutcomes) {
+                    yield* tx
+                      .delete(GoalOutcomeTable)
+                      .where(eq(GoalOutcomeTable.session_id, sessionID))
                       .run()
                   }
                   return next
@@ -372,6 +383,21 @@ const serviceLayer = Layer.effect(
 
     const clear = Effect.fn("Goal.clear")(function* (sessionID: SessionID) {
       const cleared = yield* transition(sessionID, (state) => ({ tag: "delete", value: state }))
+      if (cleared)
+        yield* automation.unregister(sessionID, { kind: "goal", id: cleared.goal_id ?? "legacy" })
+      yield* clearFiber(sessionID)
+    })
+
+    // GOAL-FP-01-05/-16: session-deletion cleanup. `clear` keeps the
+    // goal_outcome history (lastOutcome readers), but a deleted session has no
+    // readers — its outcome rows are garbage and must go in the SAME durable
+    // transition as the goal_state row so the pair cannot be split by a crash.
+    const purgeSession = Effect.fn("Goal.purgeSession")(function* (sessionID: SessionID) {
+      const cleared = yield* transition(sessionID, (state) => ({
+        tag: "delete",
+        deleteOutcomes: true,
+        value: state,
+      }))
       if (cleared)
         yield* automation.unregister(sessionID, { kind: "goal", id: cleared.goal_id ?? "legacy" })
       yield* clearFiber(sessionID)
@@ -703,6 +729,7 @@ const serviceLayer = Layer.effect(
       pause,
       resume,
       clear,
+      purgeSession,
       markDone,
       addSubgoal,
       removeSubgoal,

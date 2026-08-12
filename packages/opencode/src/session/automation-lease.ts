@@ -25,6 +25,8 @@ export interface Interface {
   readonly unregister: (sessionID: SessionID, owner: Owner) => Effect.Effect<void>
   readonly claim: (sessionID: SessionID, request: Request) => Effect.Effect<Option.Option<Token>>
   readonly use: <A, E, R>(token: Token, effect: Effect.Effect<A, E, R>) => Effect.Effect<Option.Option<A>, E, R>
+  /** Drop every registration and retry obligation for a session (session deletion). */
+  readonly purgeSession: (sessionID: SessionID) => Effect.Effect<void>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SessionAutomationLease") {}
@@ -182,7 +184,22 @@ export const layer = Layer.sync(Service, () => {
     return Option.some(yield* effect)
   })
 
-  return Service.of({ register, unregister, claim, use })
+  // GOAL-FP-01-06: session deletion must drop every registration the session
+  // holds (goal, dag, and any wake-sweep registration) so the automation
+  // ownership map cannot keep a deleted session's claim alive until process
+  // exit. Runs under the per-session lock, same as every other mutation, and
+  // deliberately does NOT emit the unregister goal re-trigger — the session is
+  // being deleted, so a goal re-evaluation would be work on a dead session.
+  const purgeSession = Effect.fn("SessionAutomationLease.purgeSession")(function* (sessionID: SessionID) {
+    yield* locks.withLock(sessionID)(
+      Effect.sync(() => {
+        registrations.delete(sessionID)
+        blockedGoalClaims.delete(sessionID)
+      }),
+    )
+  })
+
+  return Service.of({ register, unregister, claim, use, purgeSession })
 })
 
 export const defaultLayer = layer

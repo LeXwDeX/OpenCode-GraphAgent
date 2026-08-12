@@ -45,6 +45,9 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { SessionMessageID } from "@opencode-ai/schema/session-message-id"
 import { Goal } from "@/goal/goal"
+import { SessionAutomationLease } from "./automation-lease"
+import { Dag } from "@/dag/dag"
+import { isWorkflowTerminalStatus } from "@opencode-ai/core/dag/core/types"
 import { landSystemMessages } from "@/hook/trigger-result"
 
 const runtime = makeRuntime(Database.Service, Database.defaultLayer)
@@ -486,7 +489,13 @@ export type Patch = Omit<Partial<Info>, "time" | "share" | "summary" | "revert" 
 export const layer: Layer.Layer<
   Service,
   never,
-  BackgroundJob.Service | RuntimeFlags.Service | Database.Service | EventV2Bridge.Service
+  | BackgroundJob.Service
+  | RuntimeFlags.Service
+  | Database.Service
+  | EventV2Bridge.Service
+  | Goal.Service
+  | SessionAutomationLease.Service
+  | Dag.Service
 > = Layer.effect(
   Service,
   Effect.gen(function* () {
@@ -507,10 +516,21 @@ export const layer: Layer.Layer<
     // deferred import resolves to the cached module instantly.
     const { SettingsHook } = yield* Effect.promise(() => import("@/hook/settings"))
     const settingsHook = Option.getOrUndefined(yield* Effect.serviceOption(SettingsHook.Service))
-    // Goal cleanup is optional — Session must not require Goal at construction
-    // (that would force every Session.defaultLayer consumer to provide Goal's
-    // transitive deps). Resolved lazily via serviceOption.
-    const goalOpt = yield* Effect.serviceOption(Goal.Service)
+    // GOAL-FP-01-05: goal/dag/lease cleanup used to resolve via
+    // Effect.serviceOption(Goal.Service), which yields None in the production
+    // AppLayer — Goal.defaultLayer and Session.defaultLayer are
+    // Layer.mergeAll siblings (effect/app-runtime.ts) and mergeAll does not
+    // cross-provide, so Session's layer context never contained Goal and
+    // `opencode session delete` silently skipped the cleanup. The cleanup is
+    // NOT optional (delete integrity), so these are now hard layer
+    // requirements: typecheck enforces that every composition of Session's
+    // layer provides them (defaultLayer self-provides all three below; the
+    // node graph lists them in Session.node). No layer cycle exists — Goal,
+    // Dag and SessionAutomationLease defaultLayers are all self-contained and
+    // none of them depends on Session.
+    const goal = yield* Goal.Service
+    const dag = yield* Dag.Service
+    const automation = yield* SessionAutomationLease.Service
 
     const createNext = Effect.fn("Session.createNext")(function* (input: {
       id?: SessionID
@@ -644,10 +664,48 @@ export const layer: Layer.Layer<
             .pipe(Effect.catch(() => Effect.succeed({ additionalContexts: [], systemMessages: [] })))
           yield* landSystemMessages(seResult, { sessionID })
         }
-        // Cleanup goal state (only when Goal service is available in context)
-        if (goalOpt._tag === "Some") {
-          yield* goalOpt.value.clear(sessionID).pipe(Effect.catchCause(() => Effect.void))
+        // Cleanup durable automation state BEFORE the Deleted publish: the
+        // SessionProjector deletes the session row (and FK cascades wipe the
+        // workflow rows) inside the Deleted publish transaction, so running
+        // cleanup first means a crash mid-way can only leave a live session
+        // with no goal/workflows (consistent, recoverable) — never orphan
+        // goal rows or re-adoptable workflows under a deleted session. The
+        // three steps live in separate aggregates (goal_state/goal_outcome,
+        // workflow events, the lease map) so no shared transaction is
+        // available; each step is individually atomic.
+        yield* goal.purgeSession(sessionID).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("goal purge failed during session remove", { sessionID, cause }),
+          ),
+        )
+        // GOAL-FP-01-06: cancel workflows owned by this session so the running
+        // DagLoop runtime stops (aborts child sessions, releases the dag
+        // lease) and a restart recovery scan can never re-adopt them.
+        // Terminal rows are already inert; pending rows are terminalized by
+        // the startup orphan-pending sweep (cancel is not a valid transition
+        // from pending).
+        const workflows = yield* dag.store.listBySession(sessionID).pipe(Effect.orDie)
+        for (const workflow of workflows) {
+          // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion -- WorkflowRow.status is a plain string column whose values are the WorkflowStatus literals (only the projector writes it, via validated transitions).
+          if (isWorkflowTerminalStatus(workflow.status as never)) continue
+          yield* dag.cancel(workflow.id).pipe(
+            Effect.catchCause((cause) =>
+              Effect.logWarning("workflow cancellation failed during session remove", {
+                dagID: workflow.id,
+                sessionID,
+                cause,
+              }),
+            ),
+          )
         }
+        // Belt-and-braces lease sweep: drops goal registrations, wake-sweep
+        // registrations, and any dag registration whose workflow did not
+        // reach the terminalization handler above (e.g. cancel rejected).
+        yield* automation.purgeSession(sessionID).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("automation lease purge failed during session remove", { sessionID, cause }),
+          ),
+        )
         yield* events.remove(sessionID)
       } catch (error) {
         yield* Effect.logError("failed to remove session", { sessionID, error })
@@ -973,6 +1031,15 @@ export const defaultLayer = layer.pipe(
   Layer.provide(SessionExecution.noopLayer),
   Layer.provide(SessionV2.defaultLayer),
   Layer.provide(RuntimeFlags.defaultLayer),
+  // GOAL-FP-01-05/-06: self-provide the remove() cleanup dependencies so the
+  // cleanup runs in EVERY composition of Session.defaultLayer (AppLayer
+  // mergeAll siblings, DagLoop, workspace, share, MoveSession, …). All three
+  // defaultLayers are self-contained (never requirements) and none depends on
+  // Session, so this cannot introduce a layer cycle; memoization shares the
+  // instances with the other group-1 siblings.
+  Layer.provide(Goal.defaultLayer),
+  Layer.provide(SessionAutomationLease.defaultLayer),
+  Layer.provide(Dag.defaultLayer),
 )
 
 const cancelBackgroundJobs = Effect.fn("Session.cancelBackgroundJobs")(function* (
@@ -1117,6 +1184,14 @@ export function* listGlobal(input?: {
   }
 }
 
-export const node = LayerNode.make(layer, [BackgroundJob.node, RuntimeFlags.node, Database.node, EventV2Bridge.node, Goal.node])
+export const node = LayerNode.make(layer, [
+  BackgroundJob.node,
+  RuntimeFlags.node,
+  Database.node,
+  EventV2Bridge.node,
+  Goal.node,
+  SessionAutomationLease.node,
+  Dag.node,
+])
 
 export * as Session from "./session"

@@ -14,6 +14,9 @@ import * as Statement from "effect/unstable/sql/Statement"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import { eq, sql } from "drizzle-orm"
 import { Session as SessionNs } from "@/session/session"
+import { Goal } from "@/goal/goal"
+import { SessionAutomationLease } from "@/session/automation-lease"
+import { Dag } from "@/dag/dag"
 import { MessageID, PartID } from "../../src/session/schema"
 import { testInstanceStoreLayer } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
@@ -148,6 +151,9 @@ const it = testEffect(
       Layer.provide(projectorLayer),
       Layer.provide(RuntimeFlags.layer({ experimentalWorkspaces: false })),
       Layer.provide(BackgroundJob.defaultLayer),
+      Layer.provide(Goal.defaultLayer),
+      Layer.provide(SessionAutomationLease.defaultLayer),
+      Layer.provide(Dag.defaultLayer),
     ),
     CrossSpawnSpawner.defaultLayer,
     testInstanceStoreLayer,
