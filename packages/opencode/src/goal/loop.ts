@@ -117,38 +117,49 @@ const serviceLayer = Layer.effect(
     })
 
     const state = yield* InstanceState.make(
-      Effect.fn("GoalLoop.state")(function* (_ctx) {
-        const scope = yield* Scope.Scope
+      Effect.fn("GoalLoop.state")(function* () {
         yield* events.subscribe(SessionStatus.Event.Status).pipe(
           Stream.filter((evt) => evt.data.status.type === "idle"),
-          Stream.runForEach((evt) =>
-            Effect.gen(function* () {
-              const sid = evt.data.sessionID
-              // D4 (fiber lifecycle): do NOT fork or register a fiber for
-              // sessions without an active goal. Without this pre-check the
-              // fibers Map grows once per idle event for every session that
-              // ever went idle — including ones that never set a goal. afterIdle
-              // re-checks goal state internally too; that internal check stays
-              // as a TOCTOU guard (goal could be cleared between this load and
-              // the fork). v1.17.11: idle has no cause field; afterIdle handles
-              // abort detection via shouldPreempt (user message after cancel).
-              const goalState = yield* goal.load(sid)
-              if (!goalState || goalState.status !== "active") return
-              const fiber = yield* afterIdle(sid).pipe(Effect.ignore, Effect.forkIn(scope))
-              yield* goal.registerLoopFiber(sid, fiber)
-              // D4 self-clean: when this afterIdle fiber completes naturally,
-              // remove it from the fibers Map IF it is still the registered one.
-              // A newer idle event may have already registered a fresh fiber
-              // (registerLoopFiber interrupts + overwrites the old one);
-              // clearLoopFiberIf's identity check avoids evicting the new fiber.
-              // The watcher never interrupts and completes right after its
-              // target, so it does not accumulate across idle events.
-              yield* Fiber.await(fiber).pipe(
-                Effect.flatMap(() => goal.clearLoopFiberIf(sid, fiber)),
-                Effect.ignore,
-                Effect.forkIn(scope),
-              )
-            }).pipe(Effect.ignore),
+          // D4 (fiber lifecycle): triggerEvaluation below carries the full
+          // discipline (active-goal pre-check, fork, fiber registration,
+          // identity-scoped self-clean), shared verbatim with the
+          // GOAL-FP-01-04 startup scan so both drivers use one path.
+          Stream.runForEach((evt) => triggerEvaluation(evt.data.sessionID).pipe(Effect.ignore)),
+          Effect.forkScoped,
+        )
+        // GOAL-FP-01-04: the startup resume scan. Its durable snapshot is
+        // captured HERE — at instance boot, inside the builder — not inside
+        // the forked scan fiber: a fiber delayed by scheduling could query
+        // AFTER this process already evaluated a goal (the session's own
+        // idle event), and re-evaluating that same turn boundary would
+        // double-commit turns (the R1 turns-inflation harm). Querying at
+        // boot means only goals that were active BEFORE this process started
+        // are ever scanned, and the per-session trigger re-checks the
+        // snapshot revision (bumped by every durable transition) to absorb
+        // the query→trigger window.
+        //
+        // The builder context matters too: service resolution inside the
+        // scan's evaluation fibers happens against the fiber's ambient
+        // runtime context, and the builder runs under the ScopedCache
+        // environment captured at layer build — the same context the
+        // idle-event subscription above sees. Forking the scan from init's
+        // caller context would inherit a context that lacks build-scope
+        // services (e.g. the test-injected GoalLoopJudgeLLM, or the
+        // Provider in slim callers) — the scan would silently no-op or
+        // crash. The per-session triggers are forked after the subscription
+        // is armed and into the same scope; failures are logged, never fatal
+        // to init.
+        const bootSnapshot = yield* goal.listActiveSessions().pipe(
+          Effect.tapError((error) =>
+            Effect.logWarning("goal startup scan query failed", { error: String(error) }),
+          ),
+          Effect.orElseSucceed(
+            (): ReadonlyArray<{ readonly sessionID: SessionID; readonly revision: number }> => [],
+          ),
+        )
+        yield* scanForActiveGoals(bootSnapshot).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("goal startup scan failed", { cause: Cause.pretty(cause) }),
           ),
           Effect.forkScoped,
         )
@@ -404,6 +415,97 @@ const serviceLayer = Layer.effect(
       // clearLoopFiber from within ourselves would race with that override
       // and could interrupt the newly registered fiber C, silently
       // stalling the goal loop.
+    })
+
+    // Shared evaluation trigger for BOTH the idle-event subscription above
+    // and the GOAL-FP-01-04 startup scan below — no second evaluation path.
+    //
+    // D4 (fiber lifecycle): do NOT fork or register a fiber for sessions
+    // without an active goal. Without this pre-check the fibers Map grows
+    // once per idle event for every session that ever went idle — including
+    // ones that never set a goal. afterIdle re-checks goal state internally
+    // too; that internal check stays as a TOCTOU guard (goal could be cleared
+    // between this load and the fork). v1.17.11: idle has no cause field;
+    // afterIdle handles abort detection via shouldPreempt (user message after
+    // cancel).
+    //
+    // D4 self-clean: when the afterIdle fiber completes naturally, remove it
+    // from the fibers Map IF it is still the registered one. A newer idle
+    // event may have already registered a fresh fiber (registerLoopFiber
+    // interrupts + overwrites the old one); clearLoopFiberIf's identity check
+    // avoids evicting the new fiber. The watcher never interrupts and
+    // completes right after its target, so it does not accumulate.
+    const triggerEvaluation = Effect.fnUntraced(function* (
+      sessionID: SessionID,
+      scanExpected?: { readonly expectedRevision: number },
+    ) {
+      const scope = yield* Scope.Scope
+      const goalState = yield* goal.load(sessionID)
+      if (!goalState || goalState.status !== "active") return
+      // GOAL-FP-01-04 crash window (query → trigger): the boot snapshot may
+      // go stale before the forked scan fiber triggers. A TERMINAL change is
+      // absorbed by the active-status re-check above (row deleted or paused
+      // → return). A NON-terminal change — the goal is still active but was
+      // touched by this process after the snapshot, e.g. the session's own
+      // idle event already evaluated this turn boundary — is absorbed here:
+      // revision bumps on EVERY durable transition (set, pause, resume,
+      // judge update, subgoal edits). Firing on a stale revision would
+      // double-commit turns for the same boundary (the R1 turns-inflation
+      // harm). The idle subscription never passes scanExpected, so this gate
+      // only narrows the scan.
+      if (scanExpected && (goalState.revision ?? 0) !== scanExpected.expectedRevision) return
+      const fiber = yield* afterIdle(sessionID).pipe(Effect.ignore, Effect.forkIn(scope))
+      yield* goal.registerLoopFiber(sessionID, fiber)
+      yield* Fiber.await(fiber).pipe(
+        Effect.flatMap(() => goal.clearLoopFiberIf(sessionID, fiber)),
+        Effect.ignore,
+        Effect.forkIn(scope),
+      )
+    })
+
+    // GOAL-FP-01-04: startup resume scan. GoalLoop is purely event-driven —
+    // the idle subscription above is the only driver, and no component emits
+    // idle for sessions that already existed at startup. An active goal that
+    // survived a crash therefore sleeps until the next user interaction (the
+    // D6 zombie guard also never fires: it runs inside afterIdle). The scan
+    // restores the automation obligation: after the subscription is armed,
+    // query the durable store for sessions with an active goal and trigger
+    // the EXISTING idle evaluation path for each.
+    //
+    // - Mutual exclusion: the lease claim is the sole authority. A session
+    //   whose owner is dag is rejected by claim inside afterIdle exactly as
+    //   on a real idle, and the blocked-claim re-trigger (GOAL-FP-01-02)
+    //   re-evaluates it once the dag releases — the rejected trigger is
+    //   harmless and self-healing.
+    // - Busy sessions: the SessionStatus gate below mirrors the
+    //   automation-lease re-trigger gate; a session mid-turn is skipped and
+    //   will be driven by its own turn-end idle event. At startup the status
+    //   map is empty (get defaults to idle), so this only filters sessions
+    //   that genuinely flipped busy between bootstrap and the scan.
+    // - Crash window (query → trigger): a goal may go terminal between the
+    //   boot snapshot and triggerEvaluation. The existing guards absorb it —
+    //   triggerEvaluation re-loads the goal and returns when it is no longer
+    //   active, and updateAfterJudge re-checks goalID+revision under the
+    //   lease token. The NON-terminal window (goal still active but touched
+    //   by this process after the snapshot) is absorbed by the
+    //   expectedRevision gate in triggerEvaluation (see there).
+    // - The scan runs once, forkScoped, and never fails init: per-session
+    //   and query failures are logged and swallowed.
+    const scanForActiveGoals = Effect.fnUntraced(function* (
+      snapshot: ReadonlyArray<{ readonly sessionID: SessionID; readonly revision: number }>,
+    ) {
+      for (const { sessionID, revision } of snapshot) {
+        const current = yield* status.get(sessionID)
+        if (current.type !== "idle") continue
+        yield* triggerEvaluation(sessionID, { expectedRevision: revision }).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("goal startup scan failed for session", {
+              sessionID,
+              cause: Cause.pretty(cause),
+            }),
+          ),
+        )
+      }
     })
 
     const init = Effect.fn("GoalLoop.init")(function* () {

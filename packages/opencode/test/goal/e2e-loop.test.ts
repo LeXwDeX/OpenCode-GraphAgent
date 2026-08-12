@@ -910,3 +910,167 @@ describe("GoalLoop — continuation interrupted → no pause, goal stays active 
     }),
   )
 })
+
+// GOAL-FP-01-04: GoalLoop is purely event-driven — the idle subscription is
+// the only driver, and nothing re-emits idle for sessions that already
+// existed at startup. An active goal that survived a crash therefore sleeps
+// until the next user interaction (and the D6 zombie guard cannot fire
+// without an idle event). The startup scan in GoalLoop.init must resume it:
+// seed the goal in the durable store BEFORE boot, publish ZERO idle/status
+// events, and the goal must still get evaluated (judge + continuation).
+//
+// The shared scanLayer mirrors the e2e harness: Goal / SessionStatus /
+// EventV2Bridge / the lease are real; Session / SessionPrompt / Provider and
+// the judge LLM are mocked. provideMerge exposes SessionStatus and the lease
+// to the test body so pre-boot setup (busy / dag owner) shares the SAME
+// instances the scan reads.
+describe("GoalLoop — startup scan resumes pre-boot active goals (GOAL-FP-01-04)", () => {
+  let judgeCalls = 0
+  let continuationCalls = 0
+  const reset = () => {
+    judgeCalls = 0
+    continuationCalls = 0
+  }
+
+  // Layer.mock (not Layer.succeed(… as never)) — the R1 describe above shows
+  // the warning-free pattern; `as never` would add lint-ratchet warnings.
+  const sessionMock = Layer.mock(Session.Service, {
+    messages: () => Effect.succeed([mkAssistant()]),
+  })
+  const promptMock = Layer.mock(SessionPrompt.Service, {
+    prompt: () => Effect.die("the direct prompt path is not exercised in this scenario"),
+    promptIfIdle: () =>
+      Effect.sync(() => {
+        continuationCalls += 1
+        return Option.none()
+      }),
+  })
+  const judgeMock = Layer.succeed(
+    GoalLoopJudgeLLM,
+    GoalLoopJudgeLLM.of({
+      call: () =>
+        Effect.sync(() => {
+          judgeCalls += 1
+          return JSON.stringify({ done: false, reason: "more steps needed" })
+        }),
+    }),
+  )
+  const scanLayer = GoalLoop.layer.pipe(
+    Layer.provide(sessionMock),
+    Layer.provide(promptMock),
+    Layer.provide(Layer.mock(Provider.Service, {})),
+    Layer.provide(judgeMock),
+    Layer.provideMerge(Goal.defaultLayer),
+    // provideMerge (not provide): the test body seeds pre-boot busy / dag
+    // owner through SessionStatus and the lease, and the scan must read the
+    // SAME instances (see the arbitration describe above).
+    Layer.provideMerge(SessionStatus.defaultLayer),
+    Layer.provideMerge(EventV2Bridge.defaultLayer),
+    Layer.provideMerge(SessionAutomationLease.defaultLayer),
+  )
+  const it = testEffect(scanLayer)
+
+  it.instance("a goal active before boot is evaluated with ZERO idle events", () =>
+    Effect.gen(function* () {
+      reset()
+      const loop = yield* GoalLoop.Service
+      const goal = yield* Goal.Service
+      // Seed the durable store BEFORE GoalLoop boots — models a goal_state
+      // row surviving a crash-restart. No idle/status event is published.
+      const sid = SessionID.descending()
+      yield* goal.set(sid, "ship the feature", 10)
+      yield* loop.init()
+
+      // The only driver available is the startup scan: assert the full
+      // claim+judge+continuation flow ran within the poll window.
+      yield* pollWithTimeout(
+        Effect.sync(() => (continuationCalls >= 1 ? true : undefined)),
+        "startup scan never evaluated the pre-boot active goal",
+        "5 seconds",
+      )
+      expect(judgeCalls).toBe(1)
+      const g = yield* goal.load(sid)
+      expect(g?.status).toBe("active")
+      expect(Number(g?.turns_used)).toBe(1)
+    }),
+  )
+
+  it.instance("a dag-owned session yields to the startup scan and resumes when the dag releases", () =>
+    Effect.gen(function* () {
+      reset()
+      const loop = yield* GoalLoop.Service
+      const goal = yield* Goal.Service
+      const automation = yield* SessionAutomationLease.Service
+
+      // Session B is a plain active goal — its evaluation is the positive
+      // signal that the scan RAN (judgeCalls 0→1). Session A is dag-owned:
+      // the scan's claim must be rejected exactly like a real idle, so A
+      // contributes no judge call and stays untouched.
+      const sidA = SessionID.descending()
+      const sidB = SessionID.descending()
+      yield* goal.set(sidA, "goal owned by dag", 10)
+      yield* goal.set(sidB, "goal evaluated by scan", 10)
+      yield* automation.register(sidA, { kind: "dag", id: "dag-executor" })
+      yield* loop.init()
+
+      yield* pollWithTimeout(
+        Effect.sync(() => (judgeCalls >= 1 ? true : undefined)),
+        "startup scan never evaluated the unblocked goal",
+        "5 seconds",
+      )
+      const a = yield* goal.load(sidA)
+      expect(a?.status).toBe("active")
+      expect(Number(a?.turns_used)).toBe(0) // claim rejected — trigger harmless
+      expect(judgeCalls).toBe(1) // only B was evaluated
+
+      // GOAL-FP-01-02: releasing the dag re-triggers the blocked goal
+      // evaluation through the idle mechanism — no manual idle event needed.
+      yield* automation.unregister(sidA, { kind: "dag", id: "dag-executor" })
+      yield* pollWithTimeout(
+        Effect.sync(() => (judgeCalls >= 2 ? true : undefined)),
+        "goal did not resume after the dag released the session",
+        "5 seconds",
+      )
+      const a2 = yield* goal.load(sidA)
+      expect(Number(a2?.turns_used)).toBe(1)
+    }),
+  )
+
+  it.instance("a busy session is not force-evaluated by the scan; its own idle event drives it", () =>
+    Effect.gen(function* () {
+      reset()
+      const loop = yield* GoalLoop.Service
+      const goal = yield* Goal.Service
+      const status = yield* SessionStatus.Service
+
+      const sidA = SessionID.descending()
+      const sidB = SessionID.descending()
+      yield* goal.set(sidA, "goal on busy session", 10)
+      yield* goal.set(sidB, "goal on idle session", 10)
+      yield* status.set(sidA, { type: "busy" })
+      yield* loop.init()
+
+      // B's evaluation proves the scan ran; A must have been skipped by the
+      // SessionStatus gate — no force-evaluation mid-turn.
+      yield* pollWithTimeout(
+        Effect.sync(() => (judgeCalls >= 1 ? true : undefined)),
+        "startup scan never evaluated the idle-session goal",
+        "5 seconds",
+      )
+      expect(judgeCalls).toBe(1)
+      const a = yield* goal.load(sidA)
+      expect(a?.status).toBe("active")
+      expect(Number(a?.turns_used)).toBe(0)
+
+      // When the busy session finishes, its own idle event drives the goal.
+      yield* status.set(sidA, { type: "idle" })
+      yield* pollWithTimeout(
+        Effect.sync(() => (judgeCalls >= 2 ? true : undefined)),
+        "busy session's goal was not driven by its own idle event",
+        "5 seconds",
+      )
+      const a2 = yield* goal.load(sidA)
+      expect(Number(a2?.turns_used)).toBe(1)
+    }),
+  )
+})

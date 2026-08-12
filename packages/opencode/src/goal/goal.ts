@@ -20,6 +20,17 @@ export type RemoveSubgoalResult =
 
 export interface Interface {
   readonly load: (sessionID: SessionID) => Effect.Effect<GoalState.Info | undefined>
+  /**
+   * GOAL-FP-01-04: durable sessions whose goal_state row is still "active" —
+   * the startup-resume scan input for GoalLoop.init. Returns the session id
+   * plus the goal's current revision so the scan can detect goals that were
+   * touched after its boot-time snapshot (revision bumps on every durable
+   * transition). Best-effort: rows whose payload fails to decode are skipped,
+   * not fatal.
+   */
+  readonly listActiveSessions: () => Effect.Effect<
+    ReadonlyArray<{ readonly sessionID: SessionID; readonly revision: number }>
+  >
   readonly lastOutcome: (sessionID: SessionID) => Effect.Effect<GoalState.Info | undefined>
   readonly set: (sessionID: SessionID, goal: string, maxTurns?: number) => Effect.Effect<GoalState.Info>
   readonly pause: (sessionID: SessionID, reason: string) => Effect.Effect<GoalState.Info | undefined>
@@ -294,6 +305,32 @@ const serviceLayer = Layer.effect(
 
     const load = Effect.fn("Goal.load")(function* (sessionID: SessionID) {
       return yield* loadState(sessionID)
+    })
+
+    // GOAL-FP-01-04: startup-resume scan accessor. GoalLoop is event-driven;
+    // after a restart nothing emits idle for sessions whose goal was active
+    // when the process died, so GoalLoop.init queries this durable set and
+    // re-triggers its existing idle evaluation path. Only "active" rows are
+    // returned — paused rows are user-visible and terminal rows are deleted
+    // by transition. Each entry carries the goal revision so the scan can
+    // skip goals that were touched after its boot-time snapshot. A row whose
+    // payload cannot be decoded is skipped defensively: the scan is
+    // best-effort, and the session's own idle event or /goal resume remains
+    // available as the recovery path.
+    const listActiveSessions = Effect.fn("Goal.listActiveSessions")(function* () {
+      const rows = yield* db.select().from(GoalStateTable).all().pipe(Effect.orDie)
+      const active: Array<{ sessionID: SessionID; revision: number }> = []
+      for (const row of rows) {
+        let state: GoalState.Info
+        try {
+          state = Schema.decodeUnknownSync(GoalState.Info)(JSON.parse(row.payload))
+        } catch {
+          continue
+        }
+        if (state.status === "active")
+          active.push({ sessionID: SessionID.make(row.session_id), revision: state.revision ?? 0 })
+      }
+      return active
     })
 
     const lastOutcome = Effect.fn("Goal.lastOutcome")(function* (sessionID: SessionID) {
@@ -724,6 +761,7 @@ const serviceLayer = Layer.effect(
 
     return Service.of({
       load,
+      listActiveSessions,
       lastOutcome,
       set,
       pause,
