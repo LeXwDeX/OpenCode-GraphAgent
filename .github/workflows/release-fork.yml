@@ -116,7 +116,7 @@ jobs:
           save-cache: false
 
       - name: Install Runtime Dependencies
-        run: bun install
+        run: bun install --frozen-lockfile
 
       - name: Validate and Package Templates (fail closed)
         working-directory: packages/opencode
