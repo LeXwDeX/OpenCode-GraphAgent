@@ -1,4 +1,4 @@
-import { describe, expect } from "bun:test"
+import { afterAll, beforeAll, describe, expect } from "bun:test"
 import { Database } from "@opencode-ai/core/database/database"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
 import { eq } from "drizzle-orm"
@@ -12,6 +12,7 @@ import { Effect, Layer } from "effect"
 import { stringify } from "yaml"
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process"
 import fs from "node:fs"
+import os from "node:os"
 import path from "node:path"
 import { Config } from "@/config/config"
 import { Git } from "@/git"
@@ -30,6 +31,24 @@ import { ProviderTest } from "../fake/provider"
 import { InstanceRef } from "@/effect/instance-ref"
 import { provideInstance, testInstanceStoreLayer, tmpdirScoped } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
+
+// bun test runs all files in one process, sequentially, sharing one
+// XDG_CONFIG_HOME — so a test file that runs before this one and triggers
+// global-memory initialization leaves a VALID memory.jsonc whose model this
+// file's fake provider does not know; writeGlobal then silently no-ops over
+// it and search fails closed with "unavailable" (dev CI, deterministic).
+// Pin a private config dir per file so the global file can never be
+// contaminated by earlier files.
+const pinnedConfigDir = path.join(os.tmpdir(), `opencode-memory-global-identity-${process.pid}`)
+const previousConfigDir = process.env.OPENCODE_CONFIG_DIR
+beforeAll(() => {
+  fs.mkdirSync(pinnedConfigDir, { recursive: true })
+  process.env.OPENCODE_CONFIG_DIR = pinnedConfigDir
+})
+afterAll(() => {
+  if (previousConfigDir === undefined) delete process.env.OPENCODE_CONFIG_DIR
+  else process.env.OPENCODE_CONFIG_DIR = previousConfigDir
+})
 
 const now = "2026-08-12T12:00:00Z"
 const providerID = ProviderV2.ID.make("test")
@@ -166,6 +185,10 @@ describe("MEM-PR01-R1-03: memory is inert once the identity row is retired", () 
 
             yield* project.setInitialized(info.id)
             yield* configStore.writeGlobal(baseConfig)
+            // Tripwire: writeGlobal silently no-ops over a pre-existing VALID
+            // config, so a contaminated global dir would leave a foreign model
+            // here and every search would fail closed.
+            expect((yield* configStore.loadGlobal())?.config.model).toBe("test/memory-on")
 
             const sessionID = SessionID.make("ses_retired_identity")
             const active = yield* memory.search({ sessionID, messages: [userMessage(sessionID)], query: "任意查询" })
