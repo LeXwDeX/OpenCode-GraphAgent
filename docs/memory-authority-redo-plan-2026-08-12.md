@@ -189,9 +189,15 @@ After the survey + ultracode adversarial review, the user applied Occam's Razor 
 | Fix | Gap | Status | Commit |
 |---|---|---|---|
 | **#1** Repoint `workflow`+`permission` FK on identity upgrade (was `ON DELETE CASCADE` silent data loss) | MEM-REF-07 | ✅ done (mutation-proven) | `ec6972b22` |
-| **#2** Remove `.orDie` on the migration seam (`memory/identity-migration.ts` via `project/identity-migration.ts:19`); propagate `ConflictError`/`InvalidHomeError` as typed errors to the instance-store Deferred + HTTP project handler boundary | typed-error invariant (#5) | pending | — |
-| **#3** `migrateHome` acquires its two project flocks in **sorted** order (no reverse-retirement ABBA) | MEM-LOCK-02 | pending | — |
-| **#4** Destructive admission (worktree reset/remove) **force-rescans**, never trusts the process-local admission cache | MEM-ADMIT-03 / RET-04 | pending | — |
+| **#2** Remove `.orDie` on the migration seam (`memory/identity-migration.ts` via `project/identity-migration.ts:19`); propagate `ConflictError`/`InvalidHomeError` as typed errors to the instance-store Deferred + HTTP project handler boundary | typed-error invariant (#5) | ⏸ **deferred** — full typed-propagation is a multi-file cascade (seam→migrateProjectId→fromDirectory Interface→instance-store load/reload/Deferred→HTTP) for a marginal gain (HTTP 409 vs 500 on a rare migration conflict; `.orDie` already preserves `ConflictError` in the Die cause, so it stays diagnosable). Awaits user decision: Occam cut vs invariant #5. | — |
+| **#3** `migrateHome` acquires its two project flocks in **sorted** order (no reverse-retirement ABBA) | MEM-LOCK-02 | ✅ **closed — not reachable** | — |
+| **#4** Destructive admission (worktree reset/remove) **force-rescans**, never trusts the process-local admission cache | MEM-ADMIT-03 / RET-04 | ✅ **closed — already handled** | — |
+
+**#3 rationale:** `migrateHome` is called only via `migrateProjectId(previous=oldID, current=newID)`; identity retirement is one-way (root→remote), so there is no `migrateHome(B,A)` reverse caller — the two project flocks are never acquired in opposite orders. ABBA is unreachable; no code change warranted.
+
+**#4 rationale:** `worktree/index.ts reconcileLegacyMemory` already runs `memoryAdmission.invalidate(projectID)` **before** `ensure(...)`; invalidation clears the cache entry, so the destructive `ensure` always rescans fresh. The "no stale-cache trust" invariant already holds; no code change warranted.
+
+**Occam path outcome (2026-08-12):** the only *real* gap was **#1** (silent `workflow`+`permission` cascade-loss on identity upgrade) — fixed, tested, mutation-proven, no regressions (project 38, memory-persistence 16, memory 36, worktree 26 — all 0 fail; opencode+core typecheck clean; `git diff --check` 0). #3 and #4 verified as non-gaps; #2 deferred as a cascade awaiting the user's Occam-vs-invariant-#5 call. The driving loop is removed; nothing more to advance autonomously.
 
 **Explicitly cut by Occam** (do NOT build): MEM-ATOMIC-10 (Policy stays in `.opencode/memory.jsonc`; memory is topic content); the authority facade, 6-phase journal, alias tombstone, opaque Revision, destruction guard, crash harness; MEM-CRASH-06 as a forward-journal state machine (POSIX `rename` + the store's generation/manifest atomicity cover content; `migrateHome` can be made idempotent if a crash-retry need is shown).
 
