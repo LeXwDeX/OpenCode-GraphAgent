@@ -109,12 +109,28 @@ export const layer = Layer.effect(
       ).pipe(Effect.map((items) => items.flat().sort((left, right) => left.file.localeCompare(right.file))))
     })
 
+    // A legacy file may change between the scan and its removal (an older-version
+    // runtime still writing .opencode/memory, or a hand edit). Re-read each file
+    // right before deleting it; if the content no longer matches what was scanned,
+    // preserve the file and surface a conflict instead of destroying the new content.
+    const revalidateTopicFile = Effect.fnUntraced(function* (candidate: TopicCandidate) {
+      const text = yield* fs.readFileStringSafe(candidate.file)
+      if (text === undefined) return true
+      const parsed = yield* Effect.try({
+        try: () => parse(text),
+        catch: () => undefined,
+      }).pipe(Effect.option)
+      if (Option.isNone(parsed) || parsed.value === undefined) return false
+      const decoded = MemoryStore.decodeTopic(parsed.value, candidate.id)
+      return decoded !== undefined && same(decoded, candidate.topic)
+    })
+
     const reconcileTopics = Effect.fnUntraced(function* (snapshot: ProjectSnapshot, candidates: TopicCandidate[]) {
       const updated = yield* store.updateTopics(snapshot.projectID, (topics) => {
         const next = [...topics]
         const byID = new Map(next.map((topic) => [topic.id, topic]))
         const changed: string[] = []
-        const removable: string[] = []
+        const removable: TopicCandidate[] = []
         const diagnostics = candidates.map((candidate) => {
           if (!candidate.topic)
             return new Diagnostic({
@@ -128,7 +144,7 @@ export const layer = Layer.effect(
             next.push(candidate.topic)
             byID.set(candidate.id, candidate.topic)
             changed.push(candidate.id)
-            removable.push(candidate.file)
+            removable.push(candidate)
             return new Diagnostic({
               code: "topic.imported",
               path: candidate.file,
@@ -137,7 +153,7 @@ export const layer = Layer.effect(
             })
           }
           if (same(existing, candidate.topic)) {
-            removable.push(candidate.file)
+            removable.push(candidate)
             return new Diagnostic({
               code: "topic.duplicate",
               path: candidate.file,
@@ -157,17 +173,40 @@ export const layer = Layer.effect(
           result: { diagnostics, removable },
         }
       })
-      yield* Effect.forEach(updated.result.removable, (file) => fs.remove(file, { force: true }), {
-        concurrency: 1,
-        discard: true,
-      })
-      return updated.result.diagnostics
+      const preserved = new Set<string>()
+      for (const candidate of updated.result.removable) {
+        if (!(yield* revalidateTopicFile(candidate))) preserved.add(candidate.file)
+      }
+      yield* Effect.forEach(
+        updated.result.removable.filter((candidate) => !preserved.has(candidate.file)),
+        (candidate) => fs.remove(candidate.file, { force: true }),
+        {
+          concurrency: 1,
+          discard: true,
+        },
+      )
+      return updated.result.diagnostics.map((diagnostic) =>
+        preserved.has(diagnostic.path)
+          ? new Diagnostic({
+              code: "topic.conflict",
+              path: diagnostic.path,
+              topic_id: diagnostic.topic_id,
+              message: `Legacy MEMORY topic ${diagnostic.topic_id} changed during migration and was preserved`,
+            })
+          : diagnostic,
+      )
     })
 
     const readConfigCandidates = Effect.fnUntraced(function* (directories: ReadonlyArray<string>) {
       const files = directories.flatMap((directory) =>
         MemoryPaths.PROJECT_CONFIG_PATHS.map((relative) => join(directory, relative)),
       )
+      // Keep the flatMap order (directory-major, and within one directory
+      // memory.jsonc BEFORE memory.json — exactly MemoryConfig.load's
+      // precedence). A localeCompare sort would flip jsonc/json and make
+      // admission disagree with the runtime loader about which file is
+      // authoritative.
+      const order = new Map(files.map((file, index) => [file, index]))
       return yield* Effect.forEach(
         files,
         (file) =>
@@ -185,9 +224,32 @@ export const layer = Layer.effect(
         Effect.map((items) =>
           items
             .filter((item): item is ConfigCandidate => item !== undefined)
-            .sort((left, right) => left.file.localeCompare(right.file)),
+            .sort((left, right) => (order.get(left.file) ?? 0) - (order.get(right.file) ?? 0)),
         ),
       )
+    })
+
+    // Same stale-scan protection as topics: a config file may change between the
+    // scan and its removal. Re-read and compare before deleting.
+    const revalidateConfigFile = Effect.fnUntraced(function* (candidate: ConfigCandidate) {
+      const text = yield* fs.readFileStringSafe(candidate.file)
+      if (text === undefined) return true
+      const decoded = MemoryConfig.decodeConfig(text)
+      if (Option.isNone(decoded)) return false
+      return same(MemoryConfig.normalizeConfig(decoded.value), candidate.config)
+    })
+
+    const removeValidated = Effect.fnUntraced(function* (candidates: ReadonlyArray<ConfigCandidate>) {
+      const preserved = new Set<string>()
+      for (const candidate of candidates) {
+        if (!(yield* revalidateConfigFile(candidate))) preserved.add(candidate.file)
+      }
+      yield* Effect.forEach(
+        candidates.filter((candidate) => !preserved.has(candidate.file)),
+        (candidate) => fs.remove(candidate.file, { force: true }),
+        { concurrency: 1, discard: true },
+      )
+      return preserved
     })
 
     const reconcileConfigs = Effect.fnUntraced(function* (snapshot: ProjectSnapshot) {
@@ -197,29 +259,73 @@ export const layer = Layer.effect(
       )
       const explicit = project[0]
       if (explicit) {
-        const projectDiagnostic = explicit.config
-          ? []
-          : [
+        const diagnostics: Diagnostic[] = []
+        if (!explicit.config)
+          diagnostics.push(
+            new Diagnostic({
+              code: "config.invalid",
+              path: explicit.file,
+              message: "Project MEMORY config is invalid and was preserved",
+            }),
+          )
+        // A project directory holding BOTH memory.jsonc and memory.json is a
+        // fork of the durable configuration: diagnose it explicitly instead of
+        // silently following one side. Equal copies collapse to a duplicate.
+        for (const extra of project.slice(1)) {
+          if (!extra.config || !explicit.config) {
+            diagnostics.push(
               new Diagnostic({
                 code: "config.invalid",
-                path: explicit.file,
+                path: extra.file,
                 message: "Project MEMORY config is invalid and was preserved",
               }),
-            ]
-        const diagnostics = yield* Effect.forEach(
-          legacy,
-          (candidate) => {
-            if (candidate.config && explicit.config && same(candidate.config, explicit.config))
-              return fs.remove(candidate.file, { force: true }).pipe(
-                Effect.as(
-                  new Diagnostic({
+            )
+          } else if (same(extra.config, explicit.config)) {
+            const preserved = yield* removeValidated([extra])
+            diagnostics.push(
+              preserved.has(extra.file)
+                ? new Diagnostic({
+                    code: "config.conflict",
+                    path: extra.file,
+                    message: "Project MEMORY config changed during migration and was preserved",
+                  })
+                : new Diagnostic({
+                    code: "config.duplicate",
+                    path: extra.file,
+                    message: "Project MEMORY config duplicates the authoritative config and was removed",
+                  }),
+            )
+          } else {
+            diagnostics.push(
+              new Diagnostic({
+                code: "config.conflict",
+                path: extra.file,
+                message: "Project MEMORY config fork (jsonc/json) disagrees with the authoritative config and was preserved",
+              }),
+            )
+          }
+        }
+        const duplicates = legacy.filter(
+          (candidate) => candidate.config && explicit.config && same(candidate.config, explicit.config),
+        )
+        const preserved = yield* removeValidated(duplicates)
+        for (const candidate of legacy) {
+          if (duplicates.some((duplicate) => duplicate.file === candidate.file)) {
+            diagnostics.push(
+              preserved.has(candidate.file)
+                ? new Diagnostic({
+                    code: "config.conflict",
+                    path: candidate.file,
+                    message: "Legacy sandbox MEMORY config changed during migration and was preserved",
+                  })
+                : new Diagnostic({
                     code: "config.duplicate",
                     path: candidate.file,
                     message: "Legacy sandbox MEMORY config duplicates the Project config",
                   }),
-                ),
-              )
-            return Effect.succeed(
+            )
+          } else {
+            diagnostics.push(
               new Diagnostic({
                 code: candidate.config ? "config.conflict" : "config.invalid",
                 path: candidate.file,
@@ -228,10 +334,9 @@ export const layer = Layer.effect(
                   : "Legacy sandbox MEMORY config is invalid and was preserved",
               }),
             )
-          },
-          { concurrency: 1 },
-        )
-        return [...projectDiagnostic, ...diagnostics]
+          }
+        }
+        return diagnostics
       }
 
       const valid = legacy.filter(
@@ -253,24 +358,25 @@ export const layer = Layer.effect(
 
       const promoted = valid[0]
       yield* config.writeProject(snapshot.projectDirectory, promoted.config)
-      yield* Effect.forEach(valid, (candidate) => fs.remove(candidate.file, { force: true }), {
-        concurrency: 1,
-        discard: true,
-      })
+      const preserved = yield* removeValidated(valid)
       return legacy.map(
         (candidate) =>
           new Diagnostic({
             code: !candidate.config
               ? "config.invalid"
-              : candidate.file === promoted.file
-                ? "config.promoted"
-                : "config.duplicate",
+              : preserved.has(candidate.file)
+                ? "config.conflict"
+                : candidate.file === promoted.file
+                  ? "config.promoted"
+                  : "config.duplicate",
             path: candidate.file,
             message: !candidate.config
               ? "Legacy sandbox MEMORY config is invalid and was preserved"
-              : candidate.file === promoted.file
-                ? "Legacy sandbox MEMORY config was promoted to the Project config"
-                : "Legacy sandbox MEMORY config duplicates the promoted Project config",
+              : preserved.has(candidate.file)
+                ? "Legacy sandbox MEMORY config changed during migration and was preserved"
+                : candidate.file === promoted.file
+                  ? "Legacy sandbox MEMORY config was promoted to the Project config"
+                  : "Legacy sandbox MEMORY config duplicates the promoted Project config",
           }),
       )
     })

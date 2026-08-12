@@ -471,14 +471,20 @@ export const layer: Layer.Layer<
       projectID: ProjectV2.ID
       projectDirectory: string
       directory: string
+      directories: ReadonlyArray<string>
+      initialized: boolean
       updated: number
     }) {
-      if (memoryAdmission) {
+      // Migration runs only for initialized projects (the memory path's own
+      // eligibility gate) and always against the COMPLETE directory snapshot:
+      // promoting a legacy config seen from a single directory could silently
+      // flip the project-wide effective config past disagreeing siblings.
+      if (memoryAdmission && input.initialized) {
         yield* memoryAdmission.invalidate(input.projectID)
         const memory = yield* memoryAdmission.ensure({
           projectID: input.projectID,
           projectDirectory: input.projectDirectory,
-          directories: [input.directory],
+          directories: input.directories,
           updated: input.updated,
         })
         if (memory.unresolved > 0)
@@ -523,6 +529,8 @@ export const layer: Layer.Layer<
         projectID: ctx.project.id,
         projectDirectory: ctx.project.worktree,
         directory: entry.path,
+        directories: currentProject.sandboxes,
+        initialized: currentProject.time.initialized !== undefined,
         updated: currentProject.time.updated,
       }).pipe(
         Effect.mapError(
@@ -699,6 +707,8 @@ export const layer: Layer.Layer<
         projectID: ctx.project.id,
         projectDirectory: ctx.project.worktree,
         directory: worktreePath,
+        directories: currentProject.sandboxes,
+        initialized: currentProject.time.initialized !== undefined,
         updated: currentProject.time.updated,
       }).pipe(
         Effect.mapError(

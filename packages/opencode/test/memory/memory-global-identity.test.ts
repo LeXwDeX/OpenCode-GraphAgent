@@ -1,11 +1,14 @@
 import { describe, expect } from "bun:test"
 import { Database } from "@opencode-ai/core/database/database"
+import { ProjectTable } from "@opencode-ai/core/project/sql"
+import { eq } from "drizzle-orm"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ProjectV2 } from "@opencode-ai/core/project"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Effect, Layer } from "effect"
+import { stringify } from "yaml"
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process"
 import fs from "node:fs"
 import path from "node:path"
@@ -21,6 +24,7 @@ import { MemoryStore } from "@/memory/store"
 import { Project } from "@/project/project"
 import { MessageID, PartID, SessionID } from "@/session/schema"
 import { ProviderTest } from "../fake/provider"
+import { InstanceRef } from "@/effect/instance-ref"
 import { provideInstance, testInstanceStoreLayer, tmpdirScoped } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
 
@@ -132,6 +136,142 @@ function gitInitWithoutCommit(dir: string) {
     yield* git("config", "user.name", "Test")
   })
 }
+
+describe("MEM-PR01-R1-03: memory is inert once the identity row is retired", () => {
+  it.live(
+    "a stale process whose project row was deleted by a concurrent upgrade does not fork a retired Home",
+    () =>
+      Effect.gen(function* () {
+        const dir = yield* tmpdirScoped({ git: true })
+        yield* provideInstance(dir)(
+          Effect.gen(function* () {
+            const project = yield* Project.Service
+            const memory = yield* Memory.Service
+            const configStore = yield* MemoryConfig.Service
+            const { db } = yield* Database.Service
+
+            const { project: info } = yield* project.fromDirectory(dir)
+            expect(info.id).not.toBe(ProjectV2.ID.global)
+            yield* project.setInitialized(info.id)
+            yield* configStore.writeGlobal(baseConfig)
+
+            const sessionID = SessionID.make("ses_retired_identity")
+            const active = yield* memory.search({ sessionID, messages: [userMessage(sessionID)], query: "任意查询" })
+            expect(active.status).not.toBe("unavailable")
+
+            // A long-running process holds a context stamped while the row
+            // existed. Read the stamped row, then let another process complete
+            // an identity upgrade: the old row is deleted.
+            const stamped = yield* project.get(info.id)
+            expect(stamped?.time.initialized).toBeDefined()
+            yield* db.delete(ProjectTable).where(eq(ProjectTable.id, info.id)).run().pipe(Effect.orDie)
+
+            yield* Effect.provideService(InstanceRef, { directory: dir, worktree: info.worktree, project: stamped! })(
+              Effect.gen(function* () {
+                const retired = yield* memory.search({ sessionID, messages: [userMessage(sessionID)], query: "任意查询" })
+                expect(retired.status).toBe("unavailable")
+                expect(yield* memory.setEnabled(true)).toBe("Memory remains off")
+              }),
+            )
+          }),
+        ).pipe(Effect.provide(testInstanceStoreLayer))
+      }),
+    { timeout: 30_000 },
+  )
+})
+
+describe("MEM-PR01-R1-23: the runtime admission snapshot covers every registered sandbox", () => {
+  it.live(
+    "a legacy topic living only in a registered sandbox is imported on activation",
+    () =>
+      Effect.gen(function* () {
+        const dir = yield* tmpdirScoped({ git: true })
+        const sandbox = yield* tmpdirScoped()
+        yield* provideInstance(dir)(
+          Effect.gen(function* () {
+            const project = yield* Project.Service
+            const memory = yield* Memory.Service
+            const configStore = yield* MemoryConfig.Service
+            const store = yield* MemoryStore.Service
+
+            const { project: info } = yield* project.fromDirectory(dir)
+            yield* project.setInitialized(info.id)
+            yield* project.addSandbox(info.id, sandbox)
+            yield* configStore.writeGlobal(baseConfig)
+
+            // The only legacy topic lives in the sandbox, not the primary.
+            const legacyDir = path.join(sandbox, ".opencode", "memory", "topics")
+            fs.mkdirSync(legacyDir, { recursive: true })
+            const seeded = topic()
+            fs.writeFileSync(path.join(legacyDir, `${seeded.id}.yaml`), stringify(seeded))
+
+            // Activation (any product surface) must admit the FULL snapshot —
+            // primary plus every registered sandbox.
+            const sessionID = SessionID.make("ses_sandbox_snapshot")
+            yield* memory.search({ sessionID, messages: [userMessage(sessionID)], query: "架构边界" })
+
+            const snapshot = yield* store.readSnapshot(info.id)
+            expect(snapshot.topics.map((value) => value.id)).toContain(seeded.id)
+          }),
+        ).pipe(Effect.provide(testInstanceStoreLayer))
+      }),
+    { timeout: 30_000 },
+  )
+})
+
+describe("MEM-PR01-R1-07: /memory writes the Project config to the primary directory", () => {
+  it.live(
+    "enabling memory from a non-primary instance context still writes to the project worktree",
+    () =>
+      Effect.gen(function* () {
+        const dir = yield* tmpdirScoped({ git: true })
+        const elsewhere = yield* tmpdirScoped()
+        yield* provideInstance(dir)(
+          Effect.gen(function* () {
+            const project = yield* Project.Service
+            const memory = yield* Memory.Service
+            const configStore = yield* MemoryConfig.Service
+
+            const { project: info } = yield* project.fromDirectory(dir)
+            yield* project.setInitialized(info.id)
+            const stamped = (yield* project.get(info.id))!
+            // Memory activates from a DISABLED global config (no project config
+            // yet): enabling must then CREATE the project config. Write the
+            // global file directly because writeGlobal is a no-op over an
+            // existing valid config. Clean it up afterwards so later tests see
+            // a fresh global state.
+            const globalFile = path.join(MemoryConfig.globalConfigDir(), "memory.jsonc")
+            fs.mkdirSync(path.dirname(globalFile), { recursive: true })
+            fs.writeFileSync(globalFile, JSON.stringify({ ...baseConfig, enabled: false }))
+            yield* Effect.addFinalizer(() =>
+              Effect.sync(() => {
+                fs.rmSync(globalFile, { force: true })
+              }),
+            )
+
+            // The instance context lives in a different worktree than the
+            // project primary (a registered sandbox); the config must still
+            // land in the project worktree, not the context's worktree.
+            yield* Effect.provideService(InstanceRef, {
+              directory: elsewhere,
+              worktree: elsewhere,
+              project: stamped,
+            })(
+              Effect.gen(function* () {
+                expect(yield* memory.setEnabled(true)).toBe("Memory on")
+              }),
+            )
+
+            const written = yield* configStore.load(info.worktree)
+            expect(written?.config.enabled).toBe(true)
+            expect(written?.level).toBe("project")
+            expect(fs.existsSync(path.join(elsewhere, ".opencode", "memory.jsonc"))).toBe(false)
+          }),
+        ).pipe(Effect.provide(testInstanceStoreLayer))
+      }),
+    { timeout: 30_000 },
+  )
+})
 
 describe("MEM-PR01-00: memory is inert under the shared global identity", () => {
   it.live(

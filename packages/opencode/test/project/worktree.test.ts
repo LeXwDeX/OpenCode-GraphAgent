@@ -351,6 +351,9 @@ describe("Worktree", () => {
           Effect.gen(function* () {
             const fs = yield* FSUtil.Service
             const svc = yield* Worktree.Service
+            const ctx = yield* InstanceState.context
+            const project = yield* Project.Service
+            yield* project.setInitialized(ctx.project.id)
             const memory = path.join(info.directory, ".opencode", "memory", "topics", "project.yaml")
             yield* fs.makeDirectory(path.dirname(memory), { recursive: true })
             yield* fs.writeFileString(memory, "id: project\n")
@@ -380,6 +383,7 @@ describe("Worktree", () => {
             const project = yield* Project.Service
             const store = yield* MemoryStore.Service
             const svc = yield* Worktree.Service
+            yield* project.setInitialized(ctx.project.id)
             const home = MemoryHome.make(Global.Path.data)
             const projectHome = home.directory(ctx.project.id)
             const legacy = path.join(info.directory, ".opencode", "memory", "topics", "project-architecture.yaml")
@@ -546,6 +550,8 @@ describe("Worktree", () => {
             const ctx = yield* InstanceState.context
             const svc = yield* Worktree.Service
             const store = yield* MemoryStore.Service
+            const project = yield* Project.Service
+            yield* project.setInitialized(ctx.project.id)
             const home = MemoryHome.make(Global.Path.data)
             const projectHome = home.directory(ctx.project.id)
             const topic = path.join(info.directory, ".opencode", "memory", "topics", "project-architecture.yaml")
@@ -578,6 +584,8 @@ describe("Worktree", () => {
             const fs = yield* FSUtil.Service
             const svc = yield* Worktree.Service
             const store = yield* MemoryStore.Service
+            const project = yield* Project.Service
+            yield* project.setInitialized(ctx.project.id)
             const home = MemoryHome.make(Global.Path.data)
             const projectHome = home.directory(ctx.project.id)
             const legacy = path.join(info.directory, ".opencode", "memory", "topics", "project-architecture.yaml")

@@ -208,3 +208,15 @@ After the survey + ultracode adversarial review, the user applied Occam's Razor 
 **Explicitly cut by Occam** (do NOT build): MEM-ATOMIC-10 (Policy stays in `.opencode/memory.jsonc`; memory is topic content); the authority facade, 6-phase journal, alias tombstone, opaque Revision, destruction guard, crash harness; MEM-CRASH-06 as a forward-journal state machine (POSIX `rename` + the store's generation/manifest atomicity cover content; `migrateHome` can be made idempotent if a crash-retry need is shown).
 
 **Resume protocol (replaces §8 steps 3–4):** do the next pending Fix in order (#2 → #3 → #4). Per fix: re-read exact baseline → implement → `cd packages/opencode && bun typecheck` AND `cd packages/core && bun typecheck` → targeted test (package dir ONLY) → mutation gate (temp-revert ⇒ a real test flips Red, restore) → `git commit` (conventional) → update this §10 table. Exclusions unchanged: no Goal/DAG-config/CI/push/PR, no source-Home GC.
+
+### M-C additions (two-round review findings, 2026-08-12)
+
+| Fix | Finding | Status |
+|---|---|---|
+| **#9** Memory is inert when the identity row is gone: `configuration()` no longer falls back to the stale instance context (`?? ctx.project` removed). A process holding a retired identity can no longer fork a Home under it. | MEM-PR01-R1-03 (P2) | ✅ done (Red→Green→mutation) |
+| **#10** Worktree remove/reset reconcile against the **complete** directory snapshot (primary + every registered sandbox), never a single directory: a lone sandbox config can no longer be promoted past disagreeing siblings. | MEM-PR01-R1-06 (P2, blocking) | ✅ done (Red→Green; Red captured on the legacy single-directory behavior) |
+| **#11** Migration is gated on `time.initialized` (the memory path's own eligibility rule): uninitialized projects stay inert on worktree remove/reset; residue still fails closed. Existing migration tests stamp initialized accordingly. | MEM-PR01-R1-08 (P3) | ✅ done (Red→Green) |
+| **#12** Legacy topic/config files are **re-read and compared immediately before deletion**; content that changed after the scan (older-version writer, hand edit) is preserved and surfaced as a conflict instead of destroyed. Deterministic TOCTOU test holds the store flock to pin the scan→delete window. | MEM-PR01-R1-04 (P2) | ✅ done (Red→Green→mutation) |
+| **#13** Admission's explicit-config choice follows `MemoryConfig.load` precedence (memory.jsonc before memory.json); a jsonc/json fork inside the project directory is diagnosed as `config.conflict` instead of silently picking a side, and legacy configs equal only to the non-effective side are no longer deleted as duplicates. | MEM-PR01-R1-10 (P3) | ✅ done (Red→Green→mutation) |
+| pin | `/memory on|off` creates/updates the config in the **project worktree** even when the instance context lives in another worktree (sandbox). | MEM-PR01-R1-07 (P2 test-gap) | ✅ pinned |
+| pin | Runtime admission snapshot covers **every registered sandbox**: a legacy topic living only in a sandbox is imported on activation. | MEM-PR01-R1-23 (P3 test-gap) | ✅ pinned |

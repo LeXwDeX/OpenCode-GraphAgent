@@ -174,7 +174,12 @@ export const layer: Layer.Layer<
 
     const configuration = Effect.fn("Memory.configuration")(function* () {
       const ctx = yield* InstanceState.context
-      const current = (yield* project.get(ctx.project.id)) ?? ctx.project
+      // No fallback to the instance context: a missing row means the identity
+      // was retired by a concurrent upgrade (or never registered). Resurrecting
+      // the stale context identity would fork a Home under a retired Project —
+      // fail closed instead and stay inert.
+      const current = yield* project.get(ctx.project.id)
+      if (!current) return undefined
       // Fail-closed inertness for the shared global identity: every commit-less
       // repository resolves to the same ProjectV2.ID.global, so an active Memory
       // would share one Home across unrelated repositories and be orphaned by the

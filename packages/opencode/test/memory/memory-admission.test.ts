@@ -3,7 +3,7 @@ import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { ProjectV2 } from "@opencode-ai/core/project"
 import { EffectFlock } from "@opencode-ai/core/util/effect-flock"
-import { Effect, Layer } from "effect"
+import { Duration, Effect, Fiber, Layer } from "effect"
 import path from "node:path"
 import { MemoryAdmission } from "@/memory/admission"
 import { MemoryConfig } from "@/memory/config"
@@ -163,5 +163,108 @@ describe("MemoryAdmission", () => {
         expect(yield* Effect.forEach(files, (file) => fs.existsSafe(file))).toEqual([false, false])
       }).pipe(Effect.provide(layers(root)))
     }),
+  )
+
+  const fullLayers = (root: string) => {
+    const home = Layer.succeed(MemoryHome.Service, MemoryHome.make(root))
+    const flock = EffectFlock.defaultLayer
+    const base = Layer.mergeAll(FSUtil.defaultLayer, flock, home, MemoryConfig.defaultLayer)
+    const store = MemoryStore.layer.pipe(Layer.provide(base))
+    const admission = MemoryAdmission.layer.pipe(Layer.provide(base), Layer.provide(store))
+    return Layer.mergeAll(base, store, admission)
+  }
+
+  it.live(
+    "preserves a legacy topic file whose content changes between the scan and the delete (MEM-PR01-R1-04)",
+    () =>
+      Effect.gen(function* () {
+        const root = yield* tmpdirScoped()
+        const primary = yield* tmpdirScoped({ git: true })
+        yield* Effect.gen(function* () {
+          const fs = yield* FSUtil.Service
+          const flock = yield* EffectFlock.Service
+          const home = yield* MemoryHome.Service
+          const admission = yield* MemoryAdmission.Service
+          const store = yield* MemoryStore.Service
+
+          const dir = path.join(primary, ".opencode", "memory", "topics")
+          const file = path.join(dir, "moving-topic.yaml")
+          yield* fs.makeDirectory(dir, { recursive: true })
+          const original = topic("moving-topic")
+          yield* fs.writeFileString(file, Bun.YAML.stringify(original))
+
+          // Hold the store's project lock while ensure() runs: it scans first
+          // (reading the original), then blocks in updateTopics behind this lock.
+          // While it blocks, a concurrent writer that does not take the admission
+          // flock (older runtime, hand edit) replaces the file. When the lock is
+          // released the migration continues — the delete must then see the
+          // changed content and preserve the file instead of destroying it.
+          const ensureFiber = yield* flock.withLock(
+            Effect.gen(function* () {
+              const fiber = yield* admission
+                .ensure({ projectID, projectDirectory: primary, directories: [primary], updated: 1 })
+                .pipe(Effect.forkDetach)
+              yield* Effect.sleep(Duration.millis(500))
+              const modified = { ...original, summary: "迁移进行中被并发写入的新摘要" }
+              yield* fs.writeFileString(file, Bun.YAML.stringify(modified))
+              return fiber
+            }),
+            `memory-project:${projectID}`,
+            home.locks,
+          )
+          const result = yield* Fiber.join(ensureFiber)
+
+          expect(yield* fs.existsSafe(file)).toBe(true)
+          expect(result.diagnostics.some((item) => item.code === "topic.conflict")).toBe(true)
+          // The scanned version still landed in Project Memory exactly once.
+          const snapshot = yield* store.readSnapshot(projectID)
+          expect(snapshot.topics.filter((value) => value.id === "moving-topic")).toHaveLength(1)
+        }).pipe(Effect.provide(fullLayers(root)))
+      }),
+      { timeout: 30_000 },
+  )
+
+  it.live(
+    "follows the loader's jsonc-over-json precedence and diagnoses an in-project config fork (MEM-PR01-R1-10)",
+    () =>
+      Effect.gen(function* () {
+        const root = yield* tmpdirScoped()
+        const primary = yield* tmpdirScoped({ git: true })
+        const sandbox = yield* tmpdirScoped()
+        yield* Effect.gen(function* () {
+          const fs = yield* FSUtil.Service
+          const admission = yield* MemoryAdmission.Service
+
+          const configA = { ...config, model: "test/config-jsonc" }
+          const configB = { ...config, model: "test/config-json" }
+          const opencode = path.join(primary, ".opencode")
+          yield* fs.makeDirectory(opencode, { recursive: true })
+          // The loader (MemoryConfig.load) prefers memory.jsonc; admission must
+          // agree, and the disagreeing memory.json must be diagnosed as a fork
+          // instead of silently becoming authoritative.
+          yield* fs.writeFileString(path.join(opencode, "memory.jsonc"), JSON.stringify(configA))
+          yield* fs.writeFileString(path.join(opencode, "memory.json"), JSON.stringify(configB))
+          // A sandbox legacy config equal to the NON-effective json content must
+          // not be deleted as a duplicate of the effective config.
+          const sandboxFile = path.join(sandbox, ".opencode", "memory.jsonc")
+          yield* fs.makeDirectory(path.dirname(sandboxFile), { recursive: true })
+          yield* fs.writeFileString(sandboxFile, JSON.stringify(configB))
+
+          const result = yield* admission.ensure({
+            projectID,
+            projectDirectory: primary,
+            directories: [primary, sandbox],
+            updated: 1,
+          })
+
+          const fork = result.diagnostics.filter((item) => item.path.endsWith("memory.json"))
+          expect(fork.length).toBe(1)
+          expect(fork[0].code).toBe("config.conflict")
+          expect(result.diagnostics.some((item) => item.path === sandboxFile && item.code === "config.conflict")).toBe(true)
+          expect(yield* fs.existsSafe(sandboxFile)).toBe(true)
+          expect(result.unresolved).toBeGreaterThan(0)
+        }).pipe(Effect.provide(fullLayers(root)))
+      }),
+      { timeout: 30_000 },
   )
 })
