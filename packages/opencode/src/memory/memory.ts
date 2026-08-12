@@ -14,6 +14,7 @@ import { MessageID, SessionID } from "@/session/schema"
 import { Token } from "@/util/token"
 import { MemoryAdmission } from "./admission"
 import { MemoryConfig } from "./config"
+import { MemoryHome } from "./home"
 import { MemoryLock } from "./lock"
 import { MemoryModel } from "./model"
 import { MemoryPrompts } from "./prompts"
@@ -71,6 +72,7 @@ export const layer: Layer.Layer<
   | EffectFlock.Service
   | MemoryAdmission.Service
   | MemoryConfig.Service
+  | MemoryHome.Service
   | MemoryLock.Service
   | MemoryModel.Service
   | MemoryStore.Service
@@ -81,6 +83,7 @@ export const layer: Layer.Layer<
     const provider = yield* Provider.Service
     const project = yield* Project.Service
     const flock = yield* EffectFlock.Service
+    const home = yield* MemoryHome.Service
     const admission = yield* MemoryAdmission.Service
     const configStore = yield* MemoryConfig.Service
     const lock = yield* MemoryLock.Service
@@ -404,6 +407,7 @@ export const layer: Layer.Layer<
           )
         }),
         `memory-identity:${current.project.id}`,
+        home.locks,
       )
     })
 
@@ -506,6 +510,7 @@ export const layer: Layer.Layer<
           )
         }),
         `memory-identity:${current.project.id}`,
+        home.locks,
       )
     })
 
@@ -572,6 +577,7 @@ export const layer: Layer.Layer<
           )
         }),
         `memory-identity:${current.project.id}`,
+        home.locks,
       )
     })
 
@@ -638,6 +644,7 @@ export const defaultLayer: Layer.Layer<Service> = Layer.suspend(() =>
     Layer.provide(EffectFlock.defaultLayer),
     Layer.provide(MemoryAdmission.defaultLayer),
     Layer.provide(MemoryConfig.defaultLayer),
+    Layer.provide(MemoryHome.defaultLayer),
     Layer.provide(MemoryLock.defaultLayer),
     Layer.provide(MemoryModel.defaultLayer),
     Layer.provide(MemoryStore.defaultLayer),
@@ -651,6 +658,7 @@ export const node = LayerNode.make(layer, [
   EffectFlock.node,
   MemoryAdmission.node,
   MemoryConfig.node,
+  MemoryHome.node,
   MemoryLock.node,
   MemoryModel.node,
   MemoryStore.node,

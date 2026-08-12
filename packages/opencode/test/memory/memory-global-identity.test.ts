@@ -17,6 +17,7 @@ import { Config } from "@/config/config"
 import { Git } from "@/git"
 import { MemoryAdmission } from "@/memory/admission"
 import { MemoryConfig } from "@/memory/config"
+import { MemoryHome } from "@/memory/home"
 import { MemoryLock } from "@/memory/lock"
 import { Memory } from "@/memory/memory"
 import { MemoryModel } from "@/memory/model"
@@ -110,6 +111,7 @@ const base = Layer.mergeAll(
   EffectFlock.defaultLayer,
   MemoryAdmission.defaultLayer,
   MemoryConfig.defaultLayer,
+  MemoryHome.defaultLayer,
   MemoryLock.defaultLayer,
   MemoryStore.defaultLayer,
   Layer.mock(MemoryModel.Service, {

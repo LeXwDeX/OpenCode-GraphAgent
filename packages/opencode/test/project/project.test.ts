@@ -119,7 +119,11 @@ function projectLayerWithMemoryRoot(root: string) {
     Layer.provide(home),
     Layer.provide(store),
   )
-  const identityMigration = ProjectIdentityMigration.layer.pipe(Layer.provide(memoryMigration))
+  const identityMigration = ProjectIdentityMigration.layer.pipe(
+    Layer.provide(memoryMigration),
+    Layer.provide(EffectFlock.defaultLayer),
+    Layer.provide(home),
+  )
   const project = Project.layer.pipe(
     Layer.provide(EventV2Bridge.defaultLayer),
     Layer.provide(ProjectV2.defaultLayer),

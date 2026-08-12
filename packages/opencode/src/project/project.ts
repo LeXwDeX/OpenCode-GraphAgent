@@ -155,12 +155,16 @@ export const layer = Layer.effect(
       if (oldID === ProjectV2.ID.global) return
       if (oldID === newID) return
 
-      yield* identityMigration.migrate(oldID, newID)
-
-      yield* db
-        .transaction(
-          (d) =>
-            Effect.gen(function* () {
+      // The retirement seam holds the memory-identity:<oldID> fence across BOTH
+      // the Home migration and this reference/row retirement, so an in-flight
+      // writer under oldID cannot slip in between the Home move and the row
+      // deletion. This callback runs inside that fence; it does not touch the
+      // fence itself.
+      yield* identityMigration.migrate(oldID, newID, () =>
+        db
+          .transaction(
+            (d) =>
+              Effect.gen(function* () {
               const oldProject = yield* d.select().from(ProjectTable).where(eq(ProjectTable.id, oldID)).get()
               const newProject = yield* d.select().from(ProjectTable).where(eq(ProjectTable.id, newID)).get()
               if (oldProject && !newProject) {
@@ -213,11 +217,11 @@ export const layer = Layer.effect(
                 }
               }
 
-              if (oldProject) yield* d.delete(ProjectTable).where(eq(ProjectTable.id, oldID)).run()
-            }),
-          { behavior: "immediate" },
-        )
-        .pipe(Effect.orDie)
+                if (oldProject) yield* d.delete(ProjectTable).where(eq(ProjectTable.id, oldID)).run()
+              }),
+            { behavior: "immediate" },
+          ).pipe(Effect.orDie),
+      )
     })
 
     const saveProjectDirectory = Effect.fn("Project.saveProjectDirectory")(function* (input: {
