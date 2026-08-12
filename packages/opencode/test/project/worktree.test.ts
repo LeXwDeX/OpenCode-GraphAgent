@@ -706,7 +706,7 @@ describe("Worktree", () => {
     )
 
     it.instance(
-      "prunes missing worktrees and removes their Project registration",
+      "hides a missing worktree in list and cleans it up on explicit remove",
       () =>
         withCreatedWorktree(undefined, ({ info }) =>
           Effect.gen(function* () {
@@ -716,9 +716,18 @@ describe("Worktree", () => {
             const svc = yield* Worktree.Service
             yield* fs.remove(info.directory, { recursive: true })
 
+            // list() is non-destructive: the entry is hidden from the listing
+            // but the git admin data and registration stay untouched.
             expect((yield* svc.list()).map((item) => item.directory)).not.toContain(info.directory)
+            expect(yield* git(ctx.worktree, ["worktree", "list", "--porcelain"])).toContain(info.directory)
+            expect((yield* project.get(ctx.project.id))?.sandboxes.length).toBeGreaterThan(0)
+
+            // Explicit remove does the cleanup: prune admin data, drop the
+            // registration.
+            expect(yield* svc.remove({ directory: info.directory })).toBe(true)
             expect(yield* git(ctx.worktree, ["worktree", "list", "--porcelain"])).not.toContain(info.directory)
-            expect((yield* project.get(ctx.project.id))?.sandboxes).not.toContain(info.directory)
+            const after = yield* project.get(ctx.project.id)
+            expect(after?.sandboxes.some((sandbox) => sandbox === info.directory)).toBe(false)
           }),
         ),
       { git: true },

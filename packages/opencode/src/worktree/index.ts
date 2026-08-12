@@ -351,6 +351,18 @@ export const layer: Layer.Layer<
       )).find((sandbox) => sandbox.candidate === key)?.sandbox
     })
 
+    // All registrations canonically equal to `directory` — symlinked paths
+    // (/var vs /private/var) can register the same worktree twice; cleanup must
+    // drop every equivalent entry, not just the first match.
+    const registeredSandboxes = Effect.fnUntraced(function* (sandboxes: string[], directory: string) {
+      const key = yield* canonical(directory)
+      const matches: string[] = []
+      for (const sandbox of sandboxes) {
+        if ((yield* canonical(sandbox)) === key) matches.push(sandbox)
+      }
+      return matches
+    })
+
     function parseWorktreeList(text: string) {
       return text
         .split("\n")
@@ -395,25 +407,12 @@ export const layer: Layer.Layer<
       }
 
       const entries = parseWorktreeList(result.text)
-      const prunable = entries.flatMap((entry) => (entry.prunable && entry.path ? [entry.path] : []))
-      if (prunable.length > 0) {
-        const pruned = yield* git(["worktree", "prune"], { cwd: ctx.worktree })
-        if (pruned.code !== 0)
-          return yield* new ListFailedError({
-            message: pruned.stderr || pruned.text || "Failed to prune stale git worktrees",
-          })
-        const current = (yield* project.get(ctx.project.id)) ?? ctx.project
-        yield* Effect.forEach(
-          prunable,
-          (directory) =>
-            Effect.gen(function* () {
-              const sandbox = yield* registeredSandbox(current.sandboxes, directory)
-              if (sandbox) yield* project.removeSandbox(ctx.project.id, sandbox)
-            }),
-          { concurrency: 1, discard: true },
-        )
-      }
-
+      // list() is an observation path: it must never prune or deregister.
+      // "prunable" does not prove a worktree is gone — git also marks merely
+      // inaccessible directories (unmounted volume, locked parent) and broken
+      // gitdir links whose directories still exist. Pruning there destroys git
+      // admin data and live registrations. Cleanup belongs to remove/reset,
+      // which can prove each case.
       const primary = yield* canonical(ctx.project.worktree)
       const primaryName = pathSvc.basename(primary).toLowerCase()
       return yield* Effect.forEach(entries, (entry) =>
@@ -510,10 +509,15 @@ export const layer: Layer.Layer<
       }
 
       const currentProject = (yield* project.get(ctx.project.id)) ?? ctx.project
-      const registered = yield* registeredSandbox(currentProject.sandboxes, directory)
-      if (!registered) {
+      const matches = yield* registeredSandboxes(currentProject.sandboxes, directory)
+      if (matches.length === 0) {
         return yield* new RemoveFailedError({ message: "Worktree is not registered with this Project" })
       }
+      const dropRegistrations = Effect.forEach(
+        matches,
+        (match) => project.removeSandbox(ctx.project.id, match),
+        { concurrency: 1, discard: true },
+      )
 
       const list = yield* git(["worktree", "list", "--porcelain"], { cwd: ctx.worktree })
       if (list.code !== 0) {
@@ -522,7 +526,28 @@ export const layer: Layer.Layer<
 
       const entry = yield* locateWorktree(parseWorktreeList(list.text), directory)
       if (!entry?.path) {
-        return yield* new RemoveFailedError({ message: "Worktree is not registered with this Project" })
+        // Registered, but git has no record of the worktree (admin data lost or
+        // the git side was already removed). Recover deterministically instead
+        // of failing with a false "not registered": legacy memory is reconciled
+        // fail-closed against the directory when it still exists, then the stale
+        // registration is dropped. The directory itself is never deleted here.
+        const blocker = yield* reconcileLegacyMemory({
+          projectID: ctx.project.id,
+          projectDirectory: ctx.project.worktree,
+          directory,
+          directories: currentProject.sandboxes,
+          initialized: currentProject.time.initialized !== undefined,
+          updated: currentProject.time.updated,
+        }).pipe(
+          Effect.mapError(
+            (error) => new RemoveFailedError({ message: `Failed to migrate legacy project memory: ${error.message}` }),
+          ),
+        )
+        if (blocker) return yield* new RemoveFailedError({ message: blocker })
+        yield* FiberMap.remove(bootFibers, directory)
+        yield* store.disposeDirectory(directory)
+        yield* dropRegistrations
+        return true
       }
 
       const blocker = yield* reconcileLegacyMemory({
@@ -538,6 +563,34 @@ export const layer: Layer.Layer<
         ),
       )
       if (blocker) return yield* new RemoveFailedError({ message: blocker })
+
+      if (entry.prunable) {
+        // git already considers this worktree gone (directory deleted, or a
+        // broken gitdir link). The destructive cleanup belongs on this action
+        // path — never on list(): prune the admin data, remove the directory if
+        // it still exists, then drop the registration(s).
+        yield* FiberMap.remove(bootFibers, directory)
+        yield* store.disposeDirectory(entry.path)
+        yield* git(["worktree", "prune"], { cwd: ctx.worktree })
+        if (yield* fs.existsSafe(entry.path)) yield* cleanDirectory(entry.path)
+        const prunedBranch = entry.branch?.replace(/^refs\/heads\//, "")
+        if (prunedBranch) {
+          const deleted = yield* git(["branch", "-D", prunedBranch], { cwd: ctx.worktree })
+          if (deleted.code !== 0) {
+            const restored = yield* git(["worktree", "add", entry.path, prunedBranch], { cwd: ctx.worktree })
+            if (restored.code !== 0) yield* dropRegistrations
+            const recovery =
+              restored.code === 0
+                ? "the worktree registration was restored"
+                : `the worktree could not be restored and its Project registration was removed: ${restored.stderr || restored.text}`
+            return yield* new RemoveFailedError({
+              message: `Failed to delete worktree branch: ${deleted.stderr || deleted.text}; ${recovery}`,
+            })
+          }
+        }
+        yield* dropRegistrations
+        return true
+      }
 
       yield* FiberMap.remove(bootFibers, directory)
 
@@ -578,7 +631,7 @@ export const layer: Layer.Layer<
         const deleted = yield* git(["branch", "-D", branch], { cwd: ctx.worktree })
         if (deleted.code !== 0) {
           const restored = yield* git(["worktree", "add", entry.path, branch], { cwd: ctx.worktree })
-          if (restored.code !== 0) yield* project.removeSandbox(ctx.project.id, registered)
+          if (restored.code !== 0) yield* dropRegistrations
           const recovery =
             restored.code === 0
               ? "the worktree registration was restored"
@@ -589,7 +642,7 @@ export const layer: Layer.Layer<
         }
       }
 
-      yield* project.removeSandbox(ctx.project.id, registered)
+      yield* dropRegistrations
       return true
     })
 

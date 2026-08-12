@@ -220,3 +220,12 @@ After the survey + ultracode adversarial review, the user applied Occam's Razor 
 | **#13** Admission's explicit-config choice follows `MemoryConfig.load` precedence (memory.jsonc before memory.json); a jsonc/json fork inside the project directory is diagnosed as `config.conflict` instead of silently picking a side, and legacy configs equal only to the non-effective side are no longer deleted as duplicates. | MEM-PR01-R1-10 (P3) | ✅ done (Red→Green→mutation) |
 | pin | `/memory on|off` creates/updates the config in the **project worktree** even when the instance context lives in another worktree (sandbox). | MEM-PR01-R1-07 (P2 test-gap) | ✅ pinned |
 | pin | Runtime admission snapshot covers **every registered sandbox**: a legacy topic living only in a sandbox is imported on activation. | MEM-PR01-R1-23 (P3 test-gap) | ✅ pinned |
+
+### M-D additions (worktree lifecycle findings, 2026-08-12)
+
+| Fix | Finding | Status |
+|---|---|---|
+| **#14** `list()` is a pure observation path: no more unconditional `git worktree prune` + deregistration on merely-prunable entries (git also marks inaccessible directories and broken gitdir links prunable while the directory still exists). Prunable entries stay hidden from the listing but otherwise untouched. | MEM-PR01-R1-16 (P2, blocking) | ✅ done (Red→Green→mutation) |
+| **#15** Destructive cleanup moved to the action path: `remove()` gains a prunable branch (prune admin data + remove directory if present + branch cleanup + drop registrations) and a git-unknown recovery branch (registered but no git record: reconcile fail-closed, drop the stale registration, never delete the directory). Registration cleanup drops ALL canonically-equal entries (symlinked /var vs /private/var duplicates). | MEM-PR01-R1-18 (P3) + serialization regression | ✅ done (Red→Green→mutation) |
+| pin | reset fails closed over invalid legacy memory and preserves it. | MEM-PR01-R1-17 (P2 test-gap) | ✅ pinned (mutation-proven) |
+| pin | reset/remove invalidate the admission cache before the rescan (deterministic TOCTOU via reset-primed cache). | MEM-PR01-R1-19 (P2 test-gap, blocking) | ✅ pinned (mutation-proven) |

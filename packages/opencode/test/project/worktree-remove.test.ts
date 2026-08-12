@@ -5,12 +5,15 @@ import path from "path"
 import { Effect, Exit, Layer } from "effect"
 import { stringify } from "yaml"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
+import { MemoryStore } from "@/memory/store"
 import { Worktree } from "../../src/worktree"
 import { Project } from "../../src/project/project"
 import { TestInstance } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
 
-const it = testEffect(Layer.mergeAll(Worktree.defaultLayer, Project.defaultLayer, CrossSpawnSpawner.defaultLayer))
+const it = testEffect(
+  Layer.mergeAll(Worktree.defaultLayer, Project.defaultLayer, CrossSpawnSpawner.defaultLayer, MemoryStore.defaultLayer),
+)
 const wintest = process.platform === "win32" ? it.instance : it.instance.skip
 
 describe("Worktree.remove", () => {
@@ -232,6 +235,162 @@ describe("Worktree.remove", () => {
         const outcome = yield* Effect.exit(svc.remove({ directory: dirA }))
         expect(Exit.isFailure(outcome)).toBe(true)
         expect(yield* exists(path.join(dirA, ".opencode", "memory", "topics", "legacy-topic.yaml"))).toBe(true)
+      }),
+    { git: true },
+  )
+
+  const legacyTopicYaml = (id: string) =>
+    stringify({
+      schema_version: 1,
+      id,
+      name: "生命周期测试主题",
+      summary: "用于验证工作树生命周期行为的主题",
+      metadata: {
+        categories: ["decision"],
+        status: "active",
+        importance: "core",
+        keywords: ["边界"],
+        related_topics: [],
+        created_at: "2026-08-12T00:00:00Z",
+        updated_at: "2026-08-12T00:00:00Z",
+        last_matched_at: null,
+        match_count: 0,
+        revision: 1,
+        item_count: 1,
+      },
+      items: [
+        {
+          id: `${id}-item`,
+          kind: "decision",
+          content: `已确认决定：保留 ${id} 的稳定边界`,
+          rationale: "该边界由用户确认并长期适用",
+          confirmed_at: "2026-08-12T00:00:00Z",
+        },
+      ],
+    })
+
+  it.instance(
+    "list never prunes or deregisters a merely-prunable worktree (MEM-PR01-R1-16)",
+    () =>
+      Effect.gen(function* () {
+        const root = (yield* TestInstance).directory
+        const project = yield* Project.Service
+        const svc = yield* Worktree.Service
+        const current = yield* project.fromDirectory(root)
+
+        const stamp = Date.now().toString(36)
+        const dirA = path.join(root, "..", `prunable-${stamp}`)
+        yield* Effect.promise(() => $`git worktree add -b opencode/prunable-${stamp} ${dirA}`.cwd(root).quiet())
+        yield* project.addSandbox(current.project.id, dirA)
+
+        // Break the gitdir link: git now reports the entry as prunable even
+        // though the directory still exists.
+        const adminDir = path.join(root, ".git", "worktrees", `prunable-${stamp}`)
+        yield* Effect.promise(() => fs.writeFile(path.join(adminDir, "gitdir"), "/nonexistent/gitdir-link\n"))
+        const porcelain = yield* Effect.promise(() => $`git worktree list --porcelain`.cwd(root).quiet().text())
+        expect(porcelain).toContain("prunable")
+
+        yield* svc.list()
+
+        // Observation must not destroy: git admin data and the registration
+        // both survive a list() that saw a prunable entry.
+        expect(yield* exists(path.join(adminDir, "gitdir"))).toBe(true)
+        const after = yield* project.get(current.project.id)
+        expect(after?.sandboxes.some((sandbox) => sandbox === dirA)).toBe(true)
+      }),
+    { git: true },
+  )
+
+  it.instance(
+    "remove recovers a registered worktree whose git admin data is gone (MEM-PR01-R1-18)",
+    () =>
+      Effect.gen(function* () {
+        const root = (yield* TestInstance).directory
+        const project = yield* Project.Service
+        const svc = yield* Worktree.Service
+        const current = yield* project.fromDirectory(root)
+
+        const stamp = Date.now().toString(36)
+        const dirA = path.join(root, "..", `zombie-${stamp}`)
+        yield* Effect.promise(() => $`git worktree add -b opencode/zombie-${stamp} ${dirA}`.cwd(root).quiet())
+        yield* project.addSandbox(current.project.id, dirA)
+
+        // Lose the git admin data while the directory survives.
+        yield* Effect.promise(() =>
+          fs.rm(path.join(root, ".git", "worktrees", `zombie-${stamp}`), { recursive: true, force: true }),
+        )
+
+        expect(yield* svc.remove({ directory: dirA })).toBe(true)
+        const after = yield* project.get(current.project.id)
+        expect(after?.sandboxes.some((sandbox) => sandbox === dirA)).toBe(false)
+        // Registration cleanup must never delete the directory itself.
+        expect(yield* exists(dirA)).toBe(true)
+      }),
+    { git: true },
+  )
+
+  it.instance(
+    "reset invalidates the admission cache before rescanning legacy memory (MEM-PR01-R1-19)",
+    () =>
+      Effect.gen(function* () {
+        const root = (yield* TestInstance).directory
+        const project = yield* Project.Service
+        const svc = yield* Worktree.Service
+        const store = yield* MemoryStore.Service
+        const current = yield* project.fromDirectory(root)
+        yield* project.setInitialized(current.project.id)
+
+        const stamp = Date.now().toString(36)
+        const dirA = path.join(root, "..", `cache-a-${stamp}`)
+        const dirB = path.join(root, "..", `cache-b-${stamp}`)
+        yield* Effect.promise(() => $`git worktree add -b opencode/cache-a-${stamp} ${dirA}`.cwd(root).quiet())
+        yield* Effect.promise(() => $`git worktree add -b opencode/cache-b-${stamp} ${dirB}`.cwd(root).quiet())
+        yield* project.addSandbox(current.project.id, dirA)
+        yield* project.addSandbox(current.project.id, dirB)
+
+        // Prime the admission cache with a clean full-snapshot scan.
+        yield* svc.reset({ directory: dirB })
+
+        // A legacy topic appears in A after the cached clean scan; the reset of
+        // A must invalidate the cache and rescan, importing it before the sweep.
+        const legacyDir = path.join(dirA, ".opencode", "memory", "topics")
+        yield* Effect.promise(() => fs.mkdir(legacyDir, { recursive: true }))
+        yield* Effect.promise(() =>
+          fs.writeFile(path.join(legacyDir, "cache-topic.yaml"), legacyTopicYaml("cache-topic")),
+        )
+
+        const outcome = yield* Effect.exit(svc.reset({ directory: dirA }))
+        expect(Exit.isSuccess(outcome)).toBe(true)
+        const topics = yield* store.readTopics(current.project.id)
+        expect(topics.map((value) => value.id)).toContain("cache-topic")
+      }),
+    { git: true },
+  )
+
+  it.instance(
+    "reset fails closed over invalid legacy memory and preserves it (MEM-PR01-R1-17)",
+    () =>
+      Effect.gen(function* () {
+        const root = (yield* TestInstance).directory
+        const project = yield* Project.Service
+        const svc = yield* Worktree.Service
+        const current = yield* project.fromDirectory(root)
+        yield* project.setInitialized(current.project.id)
+
+        const stamp = Date.now().toString(36)
+        const dirA = path.join(root, "..", `resetblock-${stamp}`)
+        yield* Effect.promise(() => $`git worktree add -b opencode/resetblock-${stamp} ${dirA}`.cwd(root).quiet())
+        yield* project.addSandbox(current.project.id, dirA)
+
+        const legacyDir = path.join(dirA, ".opencode", "memory", "topics")
+        yield* Effect.promise(() => fs.mkdir(legacyDir, { recursive: true }))
+        const invalidFile = path.join(legacyDir, "broken.yaml")
+        yield* Effect.promise(() => fs.writeFile(invalidFile, "id: broken\n"))
+
+        const outcome = yield* Effect.exit(svc.reset({ directory: dirA }))
+        expect(Exit.isFailure(outcome)).toBe(true)
+        if (Exit.isFailure(outcome)) expect(String(outcome.cause)).toContain("topic.invalid")
+        expect(yield* exists(invalidFile)).toBe(true)
       }),
     { git: true },
   )
