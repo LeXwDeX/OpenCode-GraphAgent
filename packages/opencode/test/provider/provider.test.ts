@@ -96,7 +96,7 @@ const emptyModelCatalogLayer = Layer.succeed(
   ModelsDev.Service,
   ModelsDev.Service.of({
     get: () => Effect.succeed({}),
-    refresh: () => Effect.dieMessage("models.dev refresh must not be called by the aggregator contract"),
+    refresh: () => Effect.die(new Error("models.dev refresh must not be called by the aggregator contract")),
   }),
 )
 
