@@ -4,11 +4,9 @@ import { Parameters } from "../../src/tool/workflow"
 import { ToolJsonSchema } from "../../src/tool/json-schema"
 import { ProviderTransform } from "../../src/provider/transform"
 
-// Wire-shape regression for change repair-workflow-authoring-validation:
-// the discriminated union must survive provider transformation — every action
-// keeps its discriminator and required fields, and nested block/node fields
-// stay visible to the model (the pre-change Record spec collapsed to
-// `properties: {}` on OpenAI — see fixtures/workflow-parameters-pre-change.json).
+// Wire-shape regression for the file-backed workflow entry: every action keeps
+// its discriminator and owned fields, while graph content stays out of the
+// provider call and is supplied through spec_path.
 
 const openaiModel = { providerID: "openai", api: { id: "gpt-4.1", npm: "@ai-sdk/openai" } } as never
 const azureModel = { providerID: "azure", api: { id: "gpt-4.1", npm: "@ai-sdk/azure" } } as never
@@ -43,12 +41,12 @@ function record(node: JsonSchemaNode | undefined): Record<string, JsonSchemaNode
 }
 
 describe("workflow provider-facing schema", () => {
-  test("base wire shape is the 14-branch discriminated union", async () => {
+  test("base wire shape is the 10-branch file-backed discriminated union", async () => {
     const schema = ToolJsonSchema.fromSchema(Parameters as never) as JsonSchemaNode
     const evidence = (await Bun.file(
       new URL("./fixtures/workflow-parameters-post-change.json", import.meta.url),
     ).json()) as JsonSchemaNode
-    expect(schema.anyOf?.length).toBe(14)
+    expect(schema.anyOf?.length).toBe(10)
     const flat = JSON.stringify(schema)
     expect(flat).not.toContain('"session_id"')
     expect(flat).not.toContain('"project_id"')
@@ -71,36 +69,18 @@ describe("workflow provider-facing schema", () => {
     expect(Object.keys(status.properties ?? {})).toEqual(["action", "workflow_id"])
   })
 
-  test("OpenAI transformation exposes the nested blocks spec instead of properties: {}", () => {
+  test("OpenAI transformation exposes paths without inline graph objects", () => {
     const transformed = ProviderTransform.schema(
       openaiModel,
       ToolJsonSchema.fromSchema(Parameters as never),
     ) as JsonSchemaNode
-    const startInline = branchByAction(transformed, "start", "spec")[0]
-    const config = record(startInline)["spec"]
-    expect(record(config)["config"]).toBeDefined()
-    const configUnion = record(config)["config"].anyOf ?? []
-    const blocksBranch = configUnion.find((branch) => branch.properties?.blocks !== undefined)
-    const nodesBranch = configUnion.find((branch) => branch.properties?.nodes !== undefined)
-    expect(blocksBranch).toBeDefined()
-    expect(nodesBranch).toBeDefined()
-    expect(record(blocksBranch)["objective"]).toBeDefined()
-    expect(blocksBranch?.required).toEqual(expect.arrayContaining(["name", "objective", "blocks"]))
-    expect(nodesBranch?.required).toEqual(expect.arrayContaining(["name", "nodes"]))
-    const blockItem = record(blocksBranch)["blocks"]?.items
-    expect(Object.keys(record(blockItem))).toEqual(expect.arrayContaining(["id", "kind", "depends_on", "instruction"]))
-    expect(Object.keys(record(blockItem))).not.toContain("skills")
-    const nodeItem = record(nodesBranch)["nodes"]?.items
-    expect(Object.keys(record(nodeItem))).toEqual(
-      expect.arrayContaining(["id", "name", "worker_type", "depends_on", "prompt_template"]),
-    )
-    expect(Object.keys(record(nodeItem))).not.toContain("model")
-    expect(Object.keys(record(record(nodesBranch)["node_defaults"]))).not.toContain("model")
-    // Exactly-one-source prompt_template: both variants declared.
-    const promptTemplate = record(nodeItem)["prompt_template"]
-    const promptVariants = promptTemplate?.anyOf ?? []
-    expect(promptVariants.some((variant) => variant.properties?.inline !== undefined)).toBe(true)
-    expect(promptVariants.some((variant) => variant.properties?.id !== undefined)).toBe(true)
+    for (const action of ["start", "extend", "validate"]) {
+      expect(branchByAction(transformed, action, "spec_path").length).toBe(1)
+      expect(branchByAction(transformed, action, "spec")).toEqual([])
+    }
+    expect(branchByAction(transformed, "control", "spec_path").length).toBe(1)
+    expect(branchByAction(transformed, "control", "spec")).toEqual([])
+    expect(Object.keys(record(branchByAction(transformed, "start", "spec_path")[0]))).toEqual(["action", "spec_path"])
   })
 
   test("pins the removed Skill-dependent block surface as red evidence", async () => {
@@ -119,19 +99,19 @@ describe("workflow provider-facing schema", () => {
       azureModel,
       ToolJsonSchema.fromSchema(Parameters as never),
     ) as JsonSchemaNode
-    expect(transformed.anyOf?.length).toBe(14)
-    expect(branchByAction(transformed, "start", "spec").length).toBeGreaterThan(0)
+    expect(transformed.anyOf?.length).toBe(10)
+    expect(branchByAction(transformed, "start", "spec_path").length).toBe(1)
     expect(branchByAction(transformed, "validate", "spec_path").length).toBeGreaterThan(0)
   })
 
-  test("Gemini transformation keeps every branch and nested fields", () => {
+  test("Gemini transformation keeps every file-backed branch", () => {
     const transformed = ProviderTransform.schema(
       geminiModel,
       ToolJsonSchema.fromSchema(Parameters as never),
     ) as JsonSchemaNode
-    expect(transformed.anyOf?.length).toBe(14)
-    const startInline = branchByAction(transformed, "start", "spec")[0]
-    expect(record(record(startInline)["spec"])["config"]).toBeDefined()
+    expect(transformed.anyOf?.length).toBe(10)
+    expect(branchByAction(transformed, "start", "spec_path").length).toBe(1)
+    expect(branchByAction(transformed, "start", "spec")).toEqual([])
     const resultBranch = branchByAction(transformed, "result")[0]
     expect(resultBranch.required).toEqual(expect.arrayContaining(["workflow_id", "node_id"]))
     expect(Object.keys(record(resultBranch))).toEqual(expect.arrayContaining(["cursor", "limit"]))

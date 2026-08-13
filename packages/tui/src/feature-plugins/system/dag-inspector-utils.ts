@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 LeXwDeX
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 /** Pure topology helpers for the DAG inspector. Extracted for unit testing,
  * mirroring the diff-viewer-file-tree-utils pattern in this directory. */
 

@@ -542,7 +542,7 @@ describe("workflow tool schema (negative tests)", () => {
     expect(() => decode({ action: "guide", topic: "blocks" })).not.toThrow()
   })
 
-  it("retains an inline structured spec", () => {
+  it("rejects inline structured specs and JSON-stringified specs", () => {
     const decode = Schema.decodeUnknownSync(Parameters)
     const spec = {
       config: {
@@ -551,7 +551,8 @@ describe("workflow tool schema (negative tests)", () => {
       },
     }
 
-    expect(decode({ action: "start", spec })).toEqual({ action: "start", spec })
+    expect(() => decode({ action: "start", spec })).toThrow()
+    expect(() => decode({ action: "start", spec: JSON.stringify(spec) })).toThrow()
   })
 
   it("action field rejects unknown actions", () => {
@@ -585,7 +586,7 @@ describe("workflow tool schema (negative tests)", () => {
     }
   })
 
-  it("control replan requires exactly one graph source", () => {
+  it("control replan requires a YAML graph source", () => {
     const decode = Schema.decodeUnknownSync(Parameters, { onExcessProperty: "error" })
     expect(() =>
       decode({ action: "control", workflow_id: "dag_wf_1", operation: "replan", spec_path: "fragment.yaml" }),
@@ -597,7 +598,7 @@ describe("workflow tool schema (negative tests)", () => {
         operation: "replan",
         spec: { fragment: { name: "fragment", nodes: [] } },
       }),
-    ).not.toThrow()
+    ).toThrow()
     expect(() => decode({ action: "control", workflow_id: "dag_wf_1", operation: "replan" })).toThrow()
   })
 
@@ -607,9 +608,9 @@ describe("workflow tool schema (negative tests)", () => {
     expect(() => decode({ action: "control", workflow_id: "dag_wf_1", operation: "start" })).toThrow()
   })
 
-  it("keeps workflow graph and admission fields inside spec", () => {
-    const decode = Schema.decodeUnknownSync(Parameters)
-    expect(
+  it("keeps workflow graph and admission fields inside the YAML file", () => {
+    const decode = Schema.decodeUnknownSync(Parameters, { onExcessProperty: "error" })
+    expect(() =>
       decode({
         action: "start",
         spec_path: ".opencode/workflows/deep.yaml",
@@ -620,7 +621,8 @@ describe("workflow tool schema (negative tests)", () => {
           nodes: [],
         },
       }),
-    ).toEqual({
+    ).toThrow()
+    expect(decode({ action: "start", spec_path: ".opencode/workflows/deep.yaml" })).toEqual({
       action: "start",
       spec_path: ".opencode/workflows/deep.yaml",
     })
@@ -841,7 +843,7 @@ describe("workflow tool execution", () => {
       )
       const extendExit = yield* Effect.exit(
         workflow.execute(
-          { action: "extend", workflow_id: Dag.ID.make("dag_defaults"), spec: { nodes: [] } },
+          { action: "extend", workflow_id: Dag.ID.make("dag_defaults"), spec_path: "foreign.yaml" },
           foreignContext,
         ),
       )
@@ -908,25 +910,26 @@ describe("workflow tool execution", () => {
     }),
   )
 
-  runtime.effect("starts from an inline structured spec without a file", () =>
+  runtime.effect("starts from a YAML workflow file", () =>
     Effect.gen(function* () {
       published.length = 0
       const info = yield* WorkflowTool
       const workflow = yield* info.init()
+      const spec_path = yield* writeWorkflowSpec("file-start", {
+        config: {
+          name: "file-start",
+          nodes: [],
+        },
+      })
       const result = yield* workflow.execute(
         Schema.decodeUnknownSync(Parameters)({
           action: "start",
-          spec: {
-            config: {
-              name: "inline-start",
-              nodes: [],
-            },
-          },
+          spec_path,
         }),
         toolContext(),
       )
 
-      expect(result.title).toBe("Workflow started: inline-start")
+      expect(result.title).toBe("Workflow started: file-start")
       expect(result.metadata.workflowId).toBeDefined()
       expect(published.some((event) => event.type === DagEvent.WorkflowCreated.type)).toBe(true)
     }),
@@ -937,20 +940,21 @@ describe("workflow tool execution", () => {
       published.length = 0
       const info = yield* WorkflowTool
       const workflow = yield* info.init()
+      const spec_path = yield* writeWorkflowSpec("block-start", {
+        config: {
+          name: "block-start",
+          objective: "Implement and review session recovery",
+          blocks: [
+            { id: "build", kind: "coding" },
+            { id: "verify", kind: "verify", depends_on: ["build"] },
+            { id: "review", kind: "review", depends_on: ["verify"] },
+          ],
+        },
+      })
       const result = yield* workflow.execute(
         Schema.decodeUnknownSync(Parameters)({
           action: "start",
-          spec: {
-            config: {
-              name: "block-start",
-              objective: "Implement and review session recovery",
-              blocks: [
-                { id: "build", kind: "coding" },
-                { id: "verify", kind: "verify", depends_on: ["build"] },
-                { id: "review", kind: "review", depends_on: ["verify"] },
-              ],
-            },
-          },
+          spec_path,
         }),
         toolContext(),
       )
@@ -973,33 +977,34 @@ describe("workflow tool execution", () => {
     }),
   )
 
-  runtime.effect("extends from an inline structured spec without a file", () =>
+  runtime.effect("extends from a YAML workflow file", () =>
     Effect.gen(function* () {
       published.length = 0
       const info = yield* WorkflowTool
       const workflow = yield* info.init()
+      const spec_path = yield* writeWorkflowSpec("file-extend", {
+        nodes: [
+          {
+            id: "file-added",
+            name: "File added",
+            worker_type: "general",
+            depends_on: [],
+            prompt_template: { inline: "work" },
+          },
+        ],
+      })
       const result = yield* workflow.execute(
         Schema.decodeUnknownSync(Parameters)({
           action: "extend",
           workflow_id: "dag_defaults",
-          spec: {
-            nodes: [
-              {
-                id: "inline-added",
-                name: "Inline added",
-                worker_type: "general",
-                depends_on: [],
-                prompt_template: { inline: "work" },
-              },
-            ],
-          },
+          spec_path,
         }),
         toolContext(),
       )
 
       expect(result.title).toBe("Workflow extended: 1 nodes added")
       expect(published.find((event) => event.type === DagEvent.NodeRegistered.type)?.data).toEqual(
-        expect.objectContaining({ nodeID: "inline-added" }),
+        expect.objectContaining({ nodeID: "file-added" }),
       )
     }),
   )
@@ -1009,14 +1014,15 @@ describe("workflow tool execution", () => {
       published.length = 0
       const info = yield* WorkflowTool
       const workflow = yield* info.init()
+      const spec_path = yield* writeWorkflowSpec("block-extend", {
+        objective: "Repair from the current diagnostic evidence",
+        blocks: [{ id: "repair", kind: "coding", depends_on: ["node_running"] }],
+      })
       const result = yield* workflow.execute(
         Schema.decodeUnknownSync(Parameters)({
           action: "extend",
           workflow_id: "dag_status",
-          spec: {
-            objective: "Repair from the current diagnostic evidence",
-            blocks: [{ id: "repair", kind: "coding", depends_on: ["node_running"] }],
-          },
+          spec_path,
         }),
         toolContext(),
       )
@@ -1028,42 +1034,43 @@ describe("workflow tool execution", () => {
     }),
   )
 
-  runtime.effect("replans from an inline structured spec without a file", () =>
+  runtime.effect("replans from a YAML workflow file", () =>
     Effect.gen(function* () {
       published.length = 0
       const info = yield* WorkflowTool
       const workflow = yield* info.init()
+      const spec_path = yield* writeWorkflowSpec("file-replan", {
+        fragment: {
+          name: "file-replan",
+          nodes: [
+            {
+              id: "file-replanned",
+              name: "File replanned",
+              worker_type: "general",
+              depends_on: [],
+              prompt_template: { inline: "work" },
+            },
+          ],
+        },
+      })
       const result = yield* workflow.execute(
         Schema.decodeUnknownSync(Parameters)({
           action: "control",
           workflow_id: "dag_defaults",
           operation: "replan",
-          spec: {
-            fragment: {
-              name: "inline-replan",
-              nodes: [
-                {
-                  id: "inline-replanned",
-                  name: "Inline replanned",
-                  worker_type: "general",
-                  depends_on: [],
-                  prompt_template: { inline: "work" },
-                },
-              ],
-            },
-          },
+          spec_path,
         }),
         toolContext(),
       )
 
       expect(result.title).toContain("Workflow replanned: +1")
       expect(published.find((event) => event.type === DagEvent.NodeRegistered.type)?.data).toEqual(
-        expect.objectContaining({ nodeID: "inline-replanned" }),
+        expect.objectContaining({ nodeID: "file-replanned" }),
       )
     }),
   )
 
-  runtime.effect("rejects ambiguous or missing spec sources before side effects", () =>
+  runtime.effect("rejects inline or missing spec sources before side effects", () =>
     Effect.gen(function* () {
       const info = yield* WorkflowTool
       const workflow = yield* info.init()
@@ -1093,10 +1100,10 @@ describe("workflow tool execution", () => {
         expect(published).toHaveLength(0)
       }
 
-      // The recovery guidance names both valid source variants.
+      // Recovery guidance tells the model to move graph content into YAML.
       const guidance = workflow.formatValidationError?.(new Error("no branch matched")) ?? ""
-      expect(guidance).toContain("exactly one source")
-      expect(guidance).toContain("spec or spec_path")
+      expect(guidance).toContain("start {spec_path}")
+      expect(guidance).toContain("Put graph content in a .yaml/.yml file")
     }),
   )
 
@@ -1419,9 +1426,15 @@ config:
         depends_on: [],
         prompt_template: { inline: "work" },
       }
+      const extendPath = path.join(missingModelDirectory, "unresolved-extend.yaml")
+      const replanPath = path.join(missingModelDirectory, "unresolved-replan.yaml")
+      yield* Effect.promise(() => Bun.write(extendPath, JSON.stringify({ nodes: [node] })))
+      yield* Effect.promise(() =>
+        Bun.write(replanPath, JSON.stringify({ fragment: { name: "unresolved-replan", nodes: [node] } })),
+      )
 
       const extendExit = yield* workflow
-        .execute({ action: "extend", workflow_id: Dag.ID.make("dag_paused"), spec: { nodes: [node] } }, toolContext())
+        .execute({ action: "extend", workflow_id: Dag.ID.make("dag_paused"), spec_path: extendPath }, toolContext())
         .pipe(Effect.exit)
       const replanExit = yield* workflow
         .execute(
@@ -1429,7 +1442,7 @@ config:
             action: "control",
             operation: "replan",
             workflow_id: Dag.ID.make("dag_paused"),
-            spec: { fragment: { name: "unresolved-replan", nodes: [node] } },
+            spec_path: replanPath,
           },
           toolContext(),
         )
@@ -1456,9 +1469,11 @@ config:
         depends_on: [],
         prompt_template: { inline: "work" },
       }
+      const extendPath = path.join(missingModelDirectory, "modeled-extend.yaml")
+      yield* Effect.promise(() => Bun.write(extendPath, JSON.stringify({ nodes: [node] })))
 
       const extended = yield* workflow.execute(
-        { action: "extend", workflow_id: Dag.ID.make("dag_defaults"), spec: { nodes: [node] } },
+        { action: "extend", workflow_id: Dag.ID.make("dag_defaults"), spec_path: extendPath },
         toolContext(),
       )
       const replanned = yield* workflow.execute(
@@ -1915,20 +1930,7 @@ config:
         decode({
           action: "start",
           session_id: "ses_other_parent",
-          spec: {
-            config: {
-              name: "foreign-parent",
-              nodes: [
-                {
-                  id: "work",
-                  name: "work",
-                  worker_type: "build",
-                  depends_on: [],
-                  prompt_template: { inline: "work" },
-                },
-              ],
-            },
-          },
+          spec_path: "foreign-parent.yaml",
         }),
       ).toThrow()
     }),
@@ -2133,12 +2135,15 @@ describe("workflow tool saved workflows", () => {
       environmentSkillListCalls = 0
       const info = yield* WorkflowTool
       const workflow = yield* info.init()
+      const spec_path = yield* writeWorkflowSpec("portable-file", {
+        config: { name: "portable-file", nodes: [] },
+      })
 
       const result = yield* workflow.execute(
         {
           action: "validate",
           profile: "portable",
-          spec: { config: { name: "portable-inline", nodes: [] } },
+          spec_path,
         },
         toolContext(),
       )
@@ -2157,32 +2162,33 @@ describe("workflow tool saved workflows", () => {
       environmentProviderGetModelCalls = 0
       const info = yield* WorkflowTool
       const workflow = yield* info.init()
+      const spec_path = yield* writeWorkflowSpec("catalog-snapshot", {
+        config: {
+          name: "catalog-snapshot",
+          nodes: [
+            {
+              id: "first",
+              name: "First",
+              worker_type: "build",
+              depends_on: [],
+              prompt_template: { inline: "First" },
+            },
+            {
+              id: "second",
+              name: "Second",
+              worker_type: "build",
+              depends_on: ["first"],
+              prompt_template: { inline: "Second" },
+            },
+          ],
+        },
+      })
 
       const result = yield* workflow.execute(
         {
           action: "validate",
           profile: "environment",
-          spec: {
-            config: {
-              name: "catalog-snapshot",
-              nodes: [
-                {
-                  id: "first",
-                  name: "First",
-                  worker_type: "build",
-                  depends_on: [],
-                  prompt_template: { inline: "First" },
-                },
-                {
-                  id: "second",
-                  name: "Second",
-                  worker_type: "build",
-                  depends_on: ["first"],
-                  prompt_template: { inline: "Second" },
-                },
-              ],
-            },
-          },
+          spec_path,
         },
         toolContext(),
       )
@@ -2200,7 +2206,7 @@ describe("workflow tool saved workflows", () => {
       Effect.gen(function* () {
         published.length = 0
         // project scope shadows global for the same name; builtin fills the
-        // gap a file scope does not own; inline stays session-local.
+        // gap a file scope does not own; an explicit path stays session-local.
         const routeSpec = (name: string) =>
           `title: ${name} title\nconfig:\n  name: ${name}\n  objective: Route objective\n  blocks:\n    - id: plan\n      kind: plan\n`
         yield* Effect.promise(() =>
@@ -2211,6 +2217,7 @@ describe("workflow tool saved workflows", () => {
               path.join(workflowSpecDirectory, ".opencode", "workflows", "shared-route.yaml"),
               routeSpec("project-route"),
             ),
+            Bun.write(path.join(workflowSpecDirectory, "path-route.yaml"), routeSpec("path-route")),
           ]),
         )
         const previousBuiltin = (globalThis as Record<string, unknown>).OPENCODE_DAG_TEMPLATES
@@ -2240,24 +2247,18 @@ describe("workflow tool saved workflows", () => {
           expect(builtinResult.profile).toBe("portable")
           expect(builtinResult.valid).toBe(true)
 
-          // inline source validates under the environment profile by default
-          const inlineValidate = yield* workflow.execute(
+          // explicit path source validates under the environment profile by default
+          const pathValidate = yield* workflow.execute(
             {
               action: "validate",
-              spec: {
-                config: {
-                  name: "inline-route",
-                  objective: "Inline objective",
-                  blocks: [{ id: "plan", kind: "plan" }],
-                },
-              },
+              spec_path: "path-route.yaml",
             },
             contextWith([]),
           )
-          const inlineResult = JSON.parse(inlineValidate.output)
-          expect(inlineResult.source).toBe("<inline>")
-          expect(inlineResult.profile).toBe("environment")
-          expect(inlineResult.valid).toBe(true)
+          const pathResult = JSON.parse(pathValidate.output)
+          expect(pathResult.source).toBe(path.join(workflowSpecDirectory, "path-route.yaml"))
+          expect(pathResult.profile).toBe("environment")
+          expect(pathResult.valid).toBe(true)
 
           // validate and start see the same resolved content: validate passes,
           // start succeeds from the same name, and mutating the file changes

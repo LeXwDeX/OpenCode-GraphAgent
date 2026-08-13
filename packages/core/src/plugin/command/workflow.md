@@ -36,18 +36,18 @@ as independent workstreams, cross-domain uncertainty, high blast radius,
 conflicting constraints, evidence gathering, or multiple verification
 perspectives.
 
-For a one-off graph, pass `spec` inline on `start`, `extend`, or
-`control(replan)`. This is the default: do not create a transient YAML file.
-Use `spec_path` only for a saved workflow name, a reusable workflow file, or an
-explicitly requested file-backed spec. Exactly one of `spec` and `spec_path` is
-valid. After a validation failure, correct the same source and retry the call.
+Before `start`, `extend`, `control(replan)`, or `validate`, write the graph to a
+`.yaml` or `.yml` file and pass only `spec_path`. A one-off graph may use a
+task-local file such as `.opencode/.dag-specs/<name>.yaml`; it does not need to
+become a saved library workflow. After a validation failure, edit that same
+file and retry with the same path.
 
 Before a deep start, qualify the request interactively in the parent session.
 The start spec places `mode: deep`, a versioned `READY` or informed `WAIVED`
-admission input, and `config` at the same level. The admission input contains
-`brief_revision`, `qa_mode`, `verdict`, `brief`, and waiver audit fields when
-applicable; the workflow boundary owns `protocol_version`, `state`, and
-`fingerprint`. Do not put admission QA inside the graph: its answers define the
+admission input, and `config` at the same level. The admission input accepts
+only `brief_revision`, `qa_mode`, `verdict`, `brief`, and waiver audit fields
+when applicable. Do not copy additional fields from persisted records or tool
+responses. Do not put admission QA inside the graph: its answers define the
 graph. Use the orchestration policy below for QA modes, round budgets, verdict
 recovery, revision invalidation, and waiver audit fields.
 
@@ -94,10 +94,11 @@ Prefer a saved workflow when the user names a recurring procedure ("run the
 code review workflow") and the saved target/inputs already match: starting it
 is one call, and its graph has already been reviewed. When only its topology
 matches, call `{ action: "read", spec_path: "code-review" }`, retarget its objective and block instructions to the current task, prune or add lanes, then
-start that edited value as an inline spec. `read` never starts a workflow.
-Compose a fresh inline `spec` when the task is one-off or no reference fits.
-To turn a working one-off spec into a saved workflow, persist it as YAML in one
-of the two workflow-library directories under a descriptive name.
+write the edited value to a task-local YAML file and start its `spec_path`.
+`read` never starts a workflow. Compose a fresh task-local YAML file when the
+task is one-off or no reference fits. To turn a working one-off spec into a
+saved workflow, move it into one of the two workflow-library directories under
+a descriptive name.
 
 ## Orchestration Lifecycle
 
@@ -141,8 +142,9 @@ config:
       timeout_ms: 600000
 ```
 
-Never emit `node.model` or `config.node_defaults.model`. Model selection is
-configuration-owned: critical nodes (`required: true` and review workers) use
+The listed node and default fields are exhaustive; workflow YAML has no
+model-selection field. Model selection is configuration-owned: critical nodes
+(`required: true` and review workers) use
 the `advanced` tier in `dag.jsonc`, other nodes use `standard`, then resolution
 falls back to the selected agent model and the parent-session model. If no
 source provides a model, the workflow tool starts parent-session QA and leaves
@@ -151,9 +153,9 @@ the workflow uncreated so the user can configure a model and retry.
 ## Collaboration Patterns
 
 Four structural patterns cover the common cases. Real workflows often combine
-them. Every block below shows the object shape for inline `spec`; pass the
-selected shape with `{ action: "start", spec: { ... } }`. Persist it as YAML
-and use `spec_path` only when the workflow itself should be saved.
+them. Every block below is YAML file content. Save the selected shape, validate
+it with `{ action: "validate", spec_path: "<file>.yaml" }`, then start it with
+`{ action: "start", spec_path: "<file>.yaml" }`.
 
 ### 1. Staged Pipeline with Gate
 
@@ -466,11 +468,10 @@ is believed to be running. Two disciplines close the gap:
 
 ## Model Assignment Strategy
 
-Workflow definitions MUST NOT specify `node.model` or
-`config.node_defaults.model`. Resolution follows the `dag.jsonc` tier, then the
-configured agent model, then the parent-session model. If all three are absent,
-the workflow tool asks the user to configure a model and does not create the
-workflow.
+Workflow YAML has no model-selection field. Resolution follows the `dag.jsonc`
+tier, then the configured agent model, then the parent-session model. If all
+three are absent, the workflow tool asks the user to configure a model and does
+not create the workflow.
 
 - Expensive models for planning, review, and arbitration — high-stakes decisions where reasoning quality matters.
 - Fast models for mechanical implementation — well-specified edits where speed and cost matter.
@@ -540,10 +541,9 @@ All nodes share the same workspace. Write conflicts are an orchestration concern
 ### Actions
 
 **start** — Create a workflow from `config` and optional `title`, `mode`, and
-admission input. For a one-off graph call
-`{ action: "start", spec: { config: { ... } } }`. Use `spec_path` for a saved
-workflow name (`{ action: "start", spec_path: "code-review" }`) or an explicit
-YAML path.
+admission input stored in YAML. Pass a task-local YAML path for one-off work or
+a saved workflow name such as
+`{ action: "start", spec_path: "code-review" }`.
 Returns the workflow ID. Nodes declare `depends_on` (node IDs); layers and
 execution order are computed automatically.
 
@@ -553,14 +553,15 @@ not running workflows; use `status` for a workflow's live state.
 
 **read** — Return one saved workflow as structured JSON without starting it.
 Pass `spec_path`, then retarget generic objectives and block instructions in
-the parent before using the edited result as an inline `start` spec.
+the parent, write the edited result to YAML, and start that file by path.
 
 **extend** — Add nodes to a running workflow. Existing nodes are unaffected;
 new nodes are immediately eligible for scheduling if their dependencies are
 met. It also accepts a genuinely additive wave after a reporting leaf
 checkpoint naturally completed the current graph; an early
-`control(complete)` workflow remains terminal. Put the new nodes under `spec.nodes`,
-then call `{ action: "extend", workflow_id: "dag_...", spec: { nodes: [...] } }`.
+`control(complete)` workflow remains terminal. Put the new nodes under `nodes`
+in a YAML file, then call
+`{ action: "extend", workflow_id: "dag_...", spec_path: "extend.yaml" }`.
 
 **status** — Read the durable state of one workflow and all of its nodes. Pass `workflow_id`. Use it when the user explicitly asks for current state or once before a decision that requires fresh state, such as replan/control. Do not poll a running workflow merely to wait: node reports and terminal outcomes wake the parent session automatically.
 
@@ -576,7 +577,7 @@ omitted content from its preview.
 - `pause` — let running nodes finish, don't spawn new ones (pause does NOT stop nodes that are already running). On a cancel/replan intent, always pause FIRST: it needs no fragment and freezes scheduling while you compose the replan, so the graph cannot terminalize under you.
 - `resume` — resume scheduling
 - `cancel` — cancel the entire workflow
-- `replan` — pass `spec: { fragment: { ... } }` with the graph fields and node definitions; running nodes can be `restart: true` or `cancel: true`; pending nodes absent from the fragment are cancelled. Valid while paused — the pause → compose spec → replan → resume sequence is the safe path. Use `spec_path` only for a saved or explicitly file-backed fragment.
+- `replan` — put `fragment: { ... }` with the graph fields and node definitions in YAML and pass its `spec_path`; running nodes can be `restart: true` or `cancel: true`; pending nodes absent from the fragment are cancelled. Valid while paused — the pause → write file → replan → resume sequence is the safe path.
 - `complete` — early-complete: remaining pending nodes are skipped (non-violation)
 - `step` — advance exactly one ready node (the first by node ID lexicographic order), then wait. Use for controlled debugging or staged verification of a critical path. Unlike `pause`, which freezes all scheduling, `step` advances one node and re-waits. A second `step` while the stepped node is still running is rejected. Use `resume` to return to full-speed scheduling. Nodes are selected in lexicographic ID order for determinism.
 

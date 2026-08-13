@@ -55,12 +55,13 @@ instructions specialize the task and never name external Skills.
 
 When a saved route matches the topology, read it, retarget its objective and
 block instructions, and prune or add justified blocks before starting the
-edited inline spec. Start `spec_path` directly only when its target already
-matches exactly. Use low-level nodes only for bindings, conditions, output
-schemas, or lifecycle metadata blocks cannot express.
+edited YAML file. Start the saved `spec_path` directly only when its target
+already matches exactly. Use low-level nodes only for bindings, conditions,
+output schemas, or lifecycle metadata blocks cannot express.
 
-Validate the composed or edited spec before start. Fix every diagnostic and
-validate again; validation creates no workflow. A successful start returns the
+Write the composed or edited graph to YAML and validate that `spec_path` before
+start. Fix every diagnostic in the same file and validate again; validation
+creates no workflow. A successful start returns the
 exact workflow ID. The parent owns the brief, graph, user interaction,
 checkpoints, controls, and final report; children own bounded executable work.
 End after start and let the workflow wake the parent. Do not poll merely to
@@ -74,5 +75,6 @@ wait, and never claim an unstarted graph is running.
 - `guide(topic="policy")`: gates, recovery, and bounded repair.
 - `guide(topic="patterns")`: larger domain playbooks.
 
-The tool parameter schema owns required fields and exclusivity; author calls
-from that schema rather than reconstructed prose.
+The tool parameter schema owns action fields and requires `spec_path`; the
+on-demand block/interface guides own author-written YAML fields, and validation
+is the final authority for the file.

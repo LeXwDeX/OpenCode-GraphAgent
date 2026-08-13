@@ -159,18 +159,16 @@ continue QA, reduce scope, use `standard`, or explicitly waive. A `WAIVED`
 start is informed only when both `waiver_reason` and `acknowledged_risks` are
 non-empty; preserve them for audit.
 
-Do not supply `protocol_version`, `state`, or `fingerprint` in the admission
-input. Those are durable audit fields owned by the workflow boundary:
-it sets protocol version 1, initializes state from the verdict, normalizes the
-Brief for fingerprint computation, and computes the lowercase hexadecimal
-SHA-256 hash. A successful deep start alone transitions the durable record to
-`CONSUMED`.
+The author-written admission input accepts only `brief_revision`, `qa_mode`,
+`verdict`, `brief`, and, for an informed waiver, `waiver_reason` and
+`acknowledged_risks`. Do not copy any additional fields from a persisted
+workflow or tool response. The workflow boundary creates and advances its
+durable audit record.
 
 Material changes to goal, scope, constraints, assumptions, or acceptance
-criteria create a new brief revision, invalidate the prior fingerprint, and
-return admission to questioning. The workflow boundary generates the
-replacement fingerprint from the revised Brief. Do not replay QA from a
-consumed record after recovery.
+criteria create a new brief revision, invalidate the prior admission record,
+and return admission to questioning. Do not replay QA from a consumed record
+after recovery.
 
 ## Role Resolution
 
@@ -185,8 +183,8 @@ If a required capability has no eligible role, report the missing capability and
 
 ## Model Assignment
 
-Never emit `node.model` or `config.node_defaults.model`. Model assignment belongs
-to runtime configuration, not the workflow graph:
+Workflow YAML has no model-selection field. Model assignment belongs to
+runtime configuration, not the workflow graph:
 
 `dag.jsonc` tier → configured agent model → parent session model
 

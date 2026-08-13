@@ -7,6 +7,10 @@ an AI coding agent. It is not affiliated with or endorsed by the OpenCode team.
 License boundaries
 ------------------
 
+The machine-readable source of truth for these boundaries is
+`./LICENSE-SCOPE.json`. The human-readable paths below use the same values and
+are checked for consistency in CI.
+
 1. Upstream opencode code (the vast majority of this repository)
 
    License:  MIT
@@ -17,14 +21,15 @@ License boundaries
    are minor patches to upstream files (bug fixes, localization fixes, hook
    system, tool improvements), remains under the upstream MIT license.
 
-2. DAG workflow engine (self-developed by the fork author)
+2. Self-developed AGPL modules
 
    License:  GNU Affero General Public License v3.0 or later (AGPL-3.0-or-later)
    Text:     ./packages/core/src/dag/LICENSE
              ./packages/opencode/src/dag/LICENSE
+             ./packages/core/src/runtime-asset/LICENSE
    Copyright (c) 2026 LeXwDeX
 
-   Covered directories and files:
+   2.1 DAG workflow engine (active)
 
    - packages/core/src/dag/                  DAG core: state machine, dependency
                                              graph, scheduling, event projection,
@@ -42,11 +47,23 @@ License boundaries
    - packages/opencode/src/server/routes/instance/httpapi/groups/dag.ts
    - packages/opencode/src/server/routes/instance/httpapi/handlers/dag.ts
                                              DAG HTTP API routes
-   - .opencode/dag-prompts/                  DAG node prompt templates
+   2.2 Portable desktop runtime (active)
 
-   The AGPL applies to these files and to derivative works of them, including
-   network-server deployments. Using the rest of the repository without the
-   DAG engine is governed by the MIT license alone.
+   - packages/core/src/runtime-asset/        Runtime asset discovery, bundled
+                                             assets, verified cache, internal
+                                             mirrors, and public fallback
+   - packages/opencode/script/prefetch-ripgrep.ts
+                                             Verified ripgrep release prefetch
+                                             for distributable artifacts
+   - packages/desktop/scripts/runtime-assets.ts
+   - packages/desktop/scripts/verify-runtime-assets.ts
+                                             Required desktop runtime asset
+                                             preparation and package gate
+
+   The AGPL applies to these paths and to derivative works of them, including
+   network-server deployments. Files outside the scopes recorded in
+   `LICENSE-SCOPE.json` remain under their existing licenses unless they carry
+   an explicit license notice that says otherwise.
 
 When a file under an AGPL-covered directory imports MIT-licensed upstream
 modules, the upstream modules remain MIT; only the AGPL-covered files and

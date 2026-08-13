@@ -107,10 +107,10 @@ describe("CommandPlugin.Plugin", () => {
     }),
   )
 
-  it.effect("uses inline specs for one-off graphs without removing saved workflows", () =>
+  it.effect("uses file-backed specs for one-off and saved workflows", () =>
     Effect.sync(() => {
-      expect(CommandPlugin.WorkflowFactsContent).toContain("For a one-off graph, pass `spec` inline")
-      expect(CommandPlugin.WorkflowFactsContent).toContain("Use `spec_path` only")
+      expect(CommandPlugin.WorkflowFactsContent).toContain("write the graph to a")
+      expect(CommandPlugin.WorkflowFactsContent).toContain("task-local file")
       // The resident description keeps tool selection and the progressive
       // guide index only; per-action field semantics live in the parameter
       // schema (change repair-workflow-authoring-validation).
@@ -118,9 +118,35 @@ describe("CommandPlugin.Plugin", () => {
       expect(CommandPlugin.WorkflowContent).toContain("parameter schema")
       expect(CommandPlugin.WorkflowFactsContent).toContain('{ action: "read", spec_path: "code-review" }')
       expect(CommandPlugin.WorkflowFactsContent).toContain("retarget its objective and block instructions")
-      expect(CommandPlugin.WorkflowFactsContent).not.toContain("Never inline graph nodes")
-      expect(CommandPlugin.WorkflowFactsContent).not.toContain("Before any graph-carrying action")
-      expect(CommandPlugin.DagFlowContent).toContain("inline `spec`")
+      expect(CommandPlugin.WorkflowFactsContent).not.toContain("pass `spec` inline")
+      expect(CommandPlugin.DagFlowContent).toContain("task-local YAML file")
+      expect(CommandPlugin.DagFlowContent).toContain("`spec_path`")
+    }),
+  )
+
+  it.effect("publishes an exact block YAML authoring contract", () =>
+    Effect.sync(() => {
+      expect(CommandPlugin.WorkflowBlocksContent).toContain("Never infer or invent a YAML field")
+      expect(CommandPlugin.WorkflowBlocksContent).toContain("### Start file")
+      expect(CommandPlugin.WorkflowBlocksContent).toContain("### Extend file")
+      expect(CommandPlugin.WorkflowBlocksContent).toContain("### Replan file")
+      expect(CommandPlugin.WorkflowBlocksContent).toMatch(
+        /`id`, `kind`, `depends_on`, `instruction`,\s+`worker_type`, `required`, and `report_to_parent`/,
+      )
+      expect(CommandPlugin.WorkflowBlocksContent).toMatch(
+        /`action`, `workflow_id`, `operation`, and `spec_path` are tool-call fields/,
+      )
+      const authoringContract = CommandPlugin.WorkflowBlocksContent.slice(
+        CommandPlugin.WorkflowBlocksContent.indexOf("## Authoring contract"),
+        CommandPlugin.WorkflowBlocksContent.indexOf("This guide owns"),
+      )
+      expect(authoringContract).toMatch(/[Tt]he\s+listed YAML fields are exhaustive/)
+      expect(authoringContract).not.toMatch(
+        /session_id|project_id|protocol_version|fingerprint|node_defaults\.model|node\.model/,
+      )
+      expect(CommandPlugin.WorkflowBlocksContent).toContain(
+        '{ action: "control", operation: "replan", workflow_id: "dag_...", spec_path: "replan.yaml" }',
+      )
     }),
   )
 
@@ -137,9 +163,7 @@ describe("CommandPlugin.Plugin", () => {
 
   it.effect("documents config-first model fallback without invented identifiers", () =>
     Effect.sync(() => {
-      expect(CommandPlugin.OrchestrationPolicyContent).toContain(
-        "Never emit `node.model` or `config.node_defaults.model`",
-      )
+      expect(CommandPlugin.OrchestrationPolicyContent).toContain("Workflow YAML has no model-selection field")
       expect(CommandPlugin.OrchestrationPolicyContent).toContain(
         "`dag.jsonc` tier → configured agent model → parent session model",
       )
@@ -338,15 +362,19 @@ describe("CommandPlugin.Plugin", () => {
       expect(CommandPlugin.OrchestrationPolicyContent).toContain("waiver_reason")
       expect(CommandPlugin.OrchestrationPolicyContent).toContain("acknowledged_risks")
       expect(CommandPlugin.OrchestrationPolicyContent).toContain("Material changes")
-      expect(CommandPlugin.OrchestrationPolicyContent).toContain("invalidate the prior fingerprint")
-      expect(CommandPlugin.OrchestrationPolicyContent).toContain("SHA-256 hash")
+      expect(CommandPlugin.OrchestrationPolicyContent).toContain("invalidate the prior admission record")
+      const admissionPolicy = CommandPlugin.OrchestrationPolicyContent.slice(
+        CommandPlugin.OrchestrationPolicyContent.indexOf("## Deep Admission QA"),
+        CommandPlugin.OrchestrationPolicyContent.indexOf("## Role Resolution"),
+      )
+      expect(admissionPolicy).not.toMatch(/protocol_version|fingerprint/)
       expect(CommandPlugin.WorkflowFactsContent).toContain(
         "The start spec places `mode: deep`, a versioned `READY` or informed `WAIVED`",
       )
-      expect(CommandPlugin.WorkflowFactsContent).toContain(
-        "the workflow boundary owns `protocol_version`, `state`, and\n`fingerprint`",
-      )
-      expect(CommandPlugin.WorkflowFactsContent).toContain("For a one-off graph, pass `spec` inline")
+      expect(CommandPlugin.WorkflowFactsContent).toContain("The admission input accepts\nonly `brief_revision`")
+      expect(CommandPlugin.WorkflowFactsContent).not.toMatch(/protocol_version|node_defaults\.model|node\.model/)
+      expect(CommandPlugin.WorkflowFactsContent).toContain("A one-off graph may use a")
+      expect(CommandPlugin.WorkflowFactsContent).toContain("task-local file")
       expect(CommandPlugin.WorkflowFactsContent).not.toContain("`config.mode`")
     }),
   )
@@ -387,11 +415,9 @@ describe("CommandPlugin.Plugin", () => {
       expect(CommandPlugin.WorkflowFactsContent).not.toContain("Gate failure cancels the workflow automatically")
       expect(CommandPlugin.WorkflowFactsContent).toContain("Static `prompt_template.input`")
       expect(CommandPlugin.WorkflowFactsContent).toContain("it must\nnever appear as `[object Object]`")
-      expect(CommandPlugin.WorkflowFactsContent).toContain(
-        "Workflow definitions MUST NOT specify `node.model` or\n`config.node_defaults.model`",
-      )
+      expect(CommandPlugin.WorkflowFactsContent).toContain("Workflow YAML has no model-selection field")
       expect(CommandPlugin.WorkflowFactsContent).toMatch(
-        /`dag\.jsonc` tier, then the\s+configured agent model, then the parent-session model/,
+        /`dag\.jsonc`\s+tier, then the\s+configured agent model, then the parent-session model/,
       )
       expect(CommandPlugin.WorkflowFactsContent).toContain("Propose-then-assemble")
       const reviewExample = CommandPlugin.WorkflowFactsContent.slice(
