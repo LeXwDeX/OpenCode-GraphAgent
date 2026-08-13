@@ -153,6 +153,20 @@ const serviceLayer = Layer.effect(
         // Defect, so ANY query failure degrades to no-scan + a log and can
         // never kill the builder — which would close the ScopedCache entry
         // scope and take the idle subscription down with it.
+        //
+        // S-2: defensive read. The ref being set before the first state get
+        // is an invariant of the init→builder chain, not of the type system —
+        // if any future path builds this state without init setting the ref
+        // first, scanning with the empty value would silently match no
+        // session (a quiet no-op that looks healthy). Fail LOUD instead:
+        // log an error and skip the scan. The idle subscription above stays
+        // armed either way, so the event-driven path is unaffected.
+        if (!scanDirectoryRef.current) {
+          yield* Effect.logError(
+            "goal startup scan skipped: instance directory not resolved before state build",
+          )
+          return {}
+        }
         const snapshot = yield* goal.listActiveSessions(scanDirectoryRef.current).pipe(
           Effect.catchCause((cause) => {
             const empty: ReadonlyArray<SessionID> = []

@@ -31,8 +31,16 @@ export interface Interface {
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SessionAutomationLease") {}
 
-export const layer = Layer.sync(Service, () => {
-  const locks = KeyedMutex.makeUnsafe<SessionID>()
+// S-3: SessionStatus is a HARD requirement of the lease layer. The
+// dag-release re-trigger (GOAL-FP-01-02) must never silently degrade — a
+// busy session's turn always re-emits idle when it finishes, so the
+// re-trigger needs the real status map to gate and emit. SessionStatus is
+// lightweight and dependency-free, so this adds no cycle.
+export const layer = Layer.effect(
+  Service,
+  Effect.gen(function* () {
+    const sessionStatus = yield* SessionStatus.Service
+    const locks = KeyedMutex.makeUnsafe<SessionID>()
   const registrations = new Map<
     SessionID,
     { readonly goals: Set<string>; readonly dags: Set<string>; generation: number }
@@ -124,22 +132,15 @@ export const layer = Layer.sync(Service, () => {
       }),
     )
     if (!goalRetryDue) return
-    // SessionStatus is resolved optionally: automation-lease is deliberately
-    // dependency-free (consumers wire it standalone, e.g.
-    // test/session/automation-lease.test.ts), and every entry point that runs
-    // the lease (AppLayer, DagLoop, GoalLoop) provides SessionStatus. Without
-    // it the re-trigger degrades to the pre-fix behavior (the caller's next
-    // idle event still drives the goal — claim re-evaluation is never
-    // load-bearing for correctness of the lease itself).
-    const status = yield* Effect.serviceOption(SessionStatus.Service)
-    if (Option.isNone(status)) return
     // Only re-trigger when the session is actually idle: a busy session's
     // turn ALWAYS re-emits idle when it finishes (runner onIdle →
     // SessionStatus.set), which re-drives the goal claim with the dag already
-    // released. Emitting here mid-turn would waste a judge call and transiently
-    // drop the busy entry from the status map.
-    if ((yield* status.value.get(sessionID)).type !== "idle") return
-    yield* status.value.set(sessionID, { type: "idle" })
+    // released. Emitting here mid-turn would waste a judge call and
+    // transiently drop the busy entry from the status map. SessionStatus is
+    // a hard requirement of the lease layer (S-3), so this gate can never
+    // silently degrade to a dropped re-trigger.
+    if ((yield* sessionStatus.get(sessionID)).type !== "idle") return
+    yield* sessionStatus.set(sessionID, { type: "idle" })
   })
 
   const claim = Effect.fn("SessionAutomationLease.claim")(function* (
@@ -200,7 +201,8 @@ export const layer = Layer.sync(Service, () => {
   })
 
   return Service.of({ register, unregister, claim, use, purgeSession })
-})
+  }),
+)
 
-export const defaultLayer = layer
-export const node = LayerNode.make(layer, [])
+export const defaultLayer = layer.pipe(Layer.provide(SessionStatus.defaultLayer))
+export const node = LayerNode.make(layer, [SessionStatus.node])

@@ -46,6 +46,7 @@ import { ModelV2 } from "@opencode-ai/core/model"
 import { SessionMessageID } from "@opencode-ai/schema/session-message-id"
 import { Goal } from "@/goal/goal"
 import { SessionAutomationLease } from "./automation-lease"
+import { SessionStatus } from "./status"
 import { Dag } from "@/dag/dag"
 import { isWorkflowTerminalStatus } from "@opencode-ai/core/dag/core/types"
 import { landSystemMessages } from "@/hook/trigger-result"
@@ -1200,6 +1201,10 @@ export const node = LayerNode.make(layer, [
   EventV2Bridge.node,
   Goal.node,
   SessionAutomationLease.node,
+  // S-3: the lease node now requires SessionStatus (hard requirement for
+  // the dag-release re-trigger); consumers listing the lease node must
+  // provide it or the wiring fails silently.
+  SessionStatus.node,
   Dag.node,
 ])
 
