@@ -4,12 +4,23 @@ Blocks are the high-level interface for assembling a one-off workflow YAML
 file. The tool compiles them into ordinary durable DAG nodes before validation
 and persistence. Existing node-based YAML remains compatible.
 
-## Shape
+## Authoring contract
 
-Use `objective` and `blocks` inside `config` for **start**, or alongside
-`blocks` for **extend**. A replan uses the same fields inside `fragment`.
+Never infer or invent a YAML field. Copy the envelope for the intended action
+and change values only. Unknown fields are errors; a field from a tool call,
+runtime result, low-level node, or another action does not belong here unless
+it is explicitly listed below.
+
+### Start file
+
+The author-written top-level fields are optional `title`, optional `mode`,
+optional `admission`, and required `config`. For the block route, `config`
+contains required `name`, `objective`, and `blocks`; its only optional fields
+are `node_defaults`, `max_concurrency`, `max_node_replan_attempts`, and
+`max_total_nodes`.
 
 ```yaml
+title: Implement session recovery
 config:
   name: implement-session-recovery
   objective: Implement session recovery with focused tests and evidence-backed review.
@@ -32,6 +43,69 @@ config:
       kind: review
       depends_on: [verify]
 ```
+
+### Extend file
+
+An extend file contains exactly `objective` and `blocks`. It has no `config`,
+`name`, or `fragment` wrapper.
+
+```yaml
+objective: Add regression coverage for the newly confirmed recovery edge case.
+blocks:
+  - id: recovery-fix
+    kind: coding
+    instruction: Implement only the confirmed edge-case fix and its regression test.
+  - id: recovery-verify
+    kind: verify
+    depends_on: [recovery-fix]
+```
+
+### Replan file
+
+A replan file contains only `fragment`. For the block route, `fragment` has the
+same fields as start's `config`: required `name`, `objective`, and `blocks`,
+plus the four optional config fields listed above.
+
+```yaml
+fragment:
+  name: recover-session-recovery
+  objective: Replace the invalid route with a diagnosed, verified repair path.
+  blocks:
+    - id: diagnose
+      kind: debug
+      instruction: Reproduce the failure and identify the evidence-backed root cause.
+    - id: repair
+      kind: coding
+      depends_on: [diagnose]
+      instruction: Apply the smallest repair supported by the diagnosis.
+    - id: verify
+      kind: verify
+      depends_on: [repair]
+```
+
+Every block accepts only `id`, `kind`, `depends_on`, `instruction`,
+`worker_type`, `required`, and `report_to_parent`. `id` and `kind` are required.
+Allowed `kind` values are `explore`, `plan`, `prototype`, `debug`, `coding`,
+`verify`, `review`, and `synthesize`. Omit `worker_type` unless the exact
+configured agent name is already known; never invent one.
+
+For optional `node_defaults`, the only fields are `required`,
+`report_to_parent`, and `worker_config`; `worker_config` accepts only
+`timeout_ms`.
+
+`action`, `workflow_id`, `operation`, and `spec_path` are tool-call fields, not
+YAML fields. `profile` is also a tool-call field used only by validate. The
+listed YAML fields are exhaustive: do not copy extra fields from read/status
+output or persisted runtime records. Deep admission is the only exception to
+the minimal start envelope; load `guide(topic=policy)` and copy its
+author-written admission shape instead of guessing fields.
+
+Use these exact calls after writing the file:
+
+- validate: `{ action: "validate", spec_path: "workflow.yaml", profile: "portable" }`
+- start: `{ action: "start", spec_path: "workflow.yaml" }`
+- extend: `{ action: "extend", workflow_id: "dag_...", spec_path: "extend.yaml" }`
+- replan: `{ action: "control", operation: "replan", workflow_id: "dag_...", spec_path: "replan.yaml" }`
 
 This guide owns the author-written block fields and semantics. The action
 schema stays shallow and accepts only `spec_path`; the YAML validator rejects

@@ -44,10 +44,10 @@ file and retry with the same path.
 
 Before a deep start, qualify the request interactively in the parent session.
 The start spec places `mode: deep`, a versioned `READY` or informed `WAIVED`
-admission input, and `config` at the same level. The admission input contains
-`brief_revision`, `qa_mode`, `verdict`, `brief`, and waiver audit fields when
-applicable; the workflow boundary owns `protocol_version`, `state`, and
-`fingerprint`. Do not put admission QA inside the graph: its answers define the
+admission input, and `config` at the same level. The admission input accepts
+only `brief_revision`, `qa_mode`, `verdict`, `brief`, and waiver audit fields
+when applicable. Do not copy additional fields from persisted records or tool
+responses. Do not put admission QA inside the graph: its answers define the
 graph. Use the orchestration policy below for QA modes, round budgets, verdict
 recovery, revision invalidation, and waiver audit fields.
 
@@ -142,8 +142,9 @@ config:
       timeout_ms: 600000
 ```
 
-Never emit `node.model` or `config.node_defaults.model`. Model selection is
-configuration-owned: critical nodes (`required: true` and review workers) use
+The listed node and default fields are exhaustive; workflow YAML has no
+model-selection field. Model selection is configuration-owned: critical nodes
+(`required: true` and review workers) use
 the `advanced` tier in `dag.jsonc`, other nodes use `standard`, then resolution
 falls back to the selected agent model and the parent-session model. If no
 source provides a model, the workflow tool starts parent-session QA and leaves
@@ -467,11 +468,10 @@ is believed to be running. Two disciplines close the gap:
 
 ## Model Assignment Strategy
 
-Workflow definitions MUST NOT specify `node.model` or
-`config.node_defaults.model`. Resolution follows the `dag.jsonc` tier, then the
-configured agent model, then the parent-session model. If all three are absent,
-the workflow tool asks the user to configure a model and does not create the
-workflow.
+Workflow YAML has no model-selection field. Resolution follows the `dag.jsonc`
+tier, then the configured agent model, then the parent-session model. If all
+three are absent, the workflow tool asks the user to configure a model and does
+not create the workflow.
 
 - Expensive models for planning, review, and arbitration — high-stakes decisions where reasoning quality matters.
 - Fast models for mechanical implementation — well-specified edits where speed and cost matter.

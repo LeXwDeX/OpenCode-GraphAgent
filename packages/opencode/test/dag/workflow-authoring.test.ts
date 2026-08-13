@@ -1,6 +1,7 @@
 import { describe, expect } from "bun:test"
 import { Effect } from "effect"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
+import { CommandPlugin } from "@opencode-ai/core/plugin/command"
 import { WorkflowAuthoring } from "../../src/dag/authoring"
 import { DagValidation } from "../../src/dag/validation"
 import { testEffect } from "../lib/effect"
@@ -23,6 +24,35 @@ const start = {
 }
 
 describe("WorkflowAuthoring source-to-graph seam", () => {
+  it.effect("keeps every block-guide YAML envelope executable", () =>
+    Effect.gen(function* () {
+      const guide = CommandPlugin.WorkflowBlocksContent
+      const example = (heading: string) => {
+        const section = guide.slice(guide.indexOf(`### ${heading}`))
+        const match = section.match(/```yaml\n([\s\S]*?)```/)
+        expect(match?.[1]).toBeDefined()
+        return match?.[1] ?? ""
+      }
+      const authoring = WorkflowAuthoring.make()
+      const inputs = [
+        { action: "start" as const, content: example("Start file") },
+        { action: "extend" as const, content: example("Extend file") },
+        { action: "replan" as const, content: example("Replan file") },
+      ]
+
+      for (const input of inputs) {
+        const result = yield* authoring.prepare({
+          action: input.action,
+          source: { kind: "yaml", source: `${input.action}.yaml`, content: input.content },
+          profile: "portable",
+        })
+        expect(result.errors).toEqual([])
+        expect(result.valid).toBe(true)
+        expect(result.prepared?.nodes.length).toBeGreaterThan(0)
+      }
+    }),
+  )
+
   it.effect("prepares start, extend, and replan through one action-aware interface", () =>
     Effect.gen(function* () {
       const authoring = WorkflowAuthoring.make()
