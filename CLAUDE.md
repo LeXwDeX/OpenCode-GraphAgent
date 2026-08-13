@@ -140,8 +140,7 @@ Curated *global* workflows live in a separate repo, [`LeXwDeX/opencode-dag-confi
   established capability specs. Active proposals (e.g. `harden-goal-state-machine`,
   `internalize-dag-block-capabilities`) define in-flight work.
 - **`CONTEXT-MAP.md` → `CONTEXT.md`** — multi-context domain docs. `CONTEXT-MAP.md` is the
-  index; read the linked `CONTEXT.md`(s) relevant to the area before working in it. A DAG
-  `CONTEXT.md` does not yet exist.
+  index; read the linked `CONTEXT.md`(s) relevant to the area before working in it.
 - **`docs/agents/`** — issue-tracker workflow, triage labels, domain-doc conventions.
 
 ## Critical, non-obvious rules
