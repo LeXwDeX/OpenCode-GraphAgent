@@ -6,7 +6,7 @@ import { eq } from "drizzle-orm"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { FetchHttpClient } from "effect/unstable/http"
 import { expect } from "bun:test"
-import { Cause, Deferred, Duration, Effect, Exit, Fiber, Layer } from "effect"
+import { Cause, Deferred, Duration, Effect, Exit, Fiber, Layer, Option } from "effect"
 import path from "path"
 import { fileURLToPath, pathToFileURL } from "url"
 import { NamedError } from "@opencode-ai/core/util/error"
@@ -1851,6 +1851,39 @@ it.instance("idle-only prompt resolves only after the full provider turn complet
       "idle-only prompt did not resolve after turn completion",
     )
     expect(result._tag).toBe("Some")
+  }),
+)
+
+it.instance("idle-only preparation keeps the provider stopped until activation", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+    let releaseTurn: (value: unknown) => void = () => {}
+    yield* llm.hold("wake handled", new Promise((resolve) => {
+      releaseTurn = resolve
+    }))
+
+    const prepared = Option.getOrThrow(yield* prompt.prepareIfIdle({
+      sessionID: chat.id,
+      agent: "build",
+      model: ref,
+      parts: [{ type: "text", text: "fenced synthetic wake", synthetic: true }],
+    }))
+    const beforeActivation = yield* llm.wait(1).pipe(
+      Effect.as("provider-started" as const),
+      Effect.timeoutOrElse({
+        duration: "250 millis",
+        orElse: () => Effect.succeed("provider-stopped" as const),
+      }),
+    )
+    expect(beforeActivation).toBe("provider-stopped")
+
+    yield* prepared.activate
+    yield* awaitWithTimeout(llm.wait(1), "idle-only preparation did not activate the provider")
+    releaseTurn(undefined)
+    yield* awaitWithTimeout(prepared.result, "idle-only preparation did not finish")
   }),
 )
 

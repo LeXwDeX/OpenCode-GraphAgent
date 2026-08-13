@@ -18,10 +18,11 @@ import { DagLoop } from "@/dag/runtime/loop"
 import { InstanceRef } from "@/effect/instance-ref"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { SessionPrompt } from "@/session/prompt"
-import { MessageID } from "@/session/schema"
+import { MessageID, SessionID } from "@/session/schema"
 import { Session } from "@/session/session"
 import { SessionStatus } from "@/session/status"
 import { pollWithTimeout, testEffect } from "../lib/effect"
+import { withIdleAdmission } from "../lib/session-prompt"
 
 const integration = testEffect(Layer.empty)
 
@@ -146,11 +147,11 @@ function wakeLayer(input: {
     })
     return reply(sessionID, yield* Deferred.await(release))
   })
-  const prompt = Layer.mock(SessionPrompt.Service, {
+  const prompt = Layer.mock(SessionPrompt.Service, withIdleAdmission({
     cancel: () => Effect.void,
     prompt: deliver,
     promptIfIdle: (value) => deliver(value).pipe(Effect.map(Option.some)),
-  })
+  }))
   const agent = Layer.mock(Agent.Service, {
     get: () => Effect.succeed({
       name: "build",
@@ -1043,6 +1044,34 @@ describe("DagLoop atomic wake integration", () => {
 
           expect(yield* store.getUnreportedWakeNodes("ses_parent")).toHaveLength(1)
           expect(yield* store.getUnreportedWakeWorkflows("ses_parent")).toHaveLength(1)
+        }),
+      ),
+    )
+  })
+
+  it("retries the parent prompt after a provider failure instead of silently marking the wake", async () => {
+    await Effect.runPromise(
+      runWakeTest(({ dag, store, status, childPrompts, parentPrompts, parentSettled }) =>
+        Effect.gen(function* () {
+          yield* dag.create({
+            projectID: "project-1",
+            sessionID: "ses_parent",
+            title: "Retryable workflow",
+            config: { name: "retryable", nodes: [node("retryable-node")] },
+          })
+          const child = yield* takeWithin(childPrompts, "retryable node did not start")
+          yield* Deferred.succeed(child.release, "retry me")
+          const first = yield* takeWithin(parentPrompts, "retryable batch did not wake the parent")
+          yield* Deferred.succeed(first.release, "failure")
+          yield* takeWithin(parentSettled, "failed parent prompt did not settle")
+          yield* status.set(SessionID.make("ses_parent"), { type: "idle" })
+
+          const second = yield* takeWithin(parentPrompts, "failed provider wake was not prompted again")
+          expect(promptText(second.input)).toContain('Node "retryable-node" completed: retry me')
+          yield* Deferred.succeed(second.release, "success")
+          yield* takeWithin(parentSettled, "successful retry did not settle")
+          expect(yield* store.getUnreportedWakeNodes("ses_parent")).toHaveLength(0)
+          expect(yield* store.getUnreportedWakeWorkflows("ses_parent")).toHaveLength(0)
         }),
       ),
     )

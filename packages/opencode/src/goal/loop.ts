@@ -425,12 +425,14 @@ const serviceLayer = Layer.effect(
       // clearFiber — us — mid-publish; see the preempt branches above).
       const continuationLease = Option.getOrUndefined(yield* automation.claim(sessionID, goalOwner))
       if (!continuationLease) return
-      yield* automation.use(
-        continuationLease,
-        promptSvc.promptIfIdle({
+      yield* Effect.gen(function* () {
+        const admitted = yield* SessionPrompt.admitIfIdle(promptSvc, automation, continuationLease, {
           sessionID,
           parts: [{ type: "text", text: continuationText }],
-        }).pipe(
+        })
+        if (Option.isNone(admitted)) return
+        yield* admitted.value
+      }).pipe(
           Effect.catchCause((cause) =>
             Effect.gen(function* () {
               // F1: Only pause for non-interrupt causes. An interrupt (user
@@ -468,7 +470,6 @@ const serviceLayer = Layer.effect(
               return Option.none()
             }),
           ),
-        ),
       )
       const afterDispatch = yield* goal.load(sessionID)
       if (!afterDispatch || afterDispatch.status !== "active") {

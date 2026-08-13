@@ -67,6 +67,7 @@ import { HookStartContext } from "@/hook/start-context"
 import { Goal } from "@/goal/goal"
 import { KeyedMutex } from "@opencode-ai/core/effect/keyed-mutex"
 import { Memory } from "@/memory/memory"
+import { SessionAutomationLease } from "./automation-lease"
 
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -113,11 +114,18 @@ function isOrphanedInterruptedTool(part: SessionV1.ToolPart) {
 export interface Interface {
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
   readonly prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
+  readonly prepareIfIdle: (input: PromptInput) => Effect.Effect<Option.Option<IdleAdmission>, Image.Error>
   readonly promptIfIdle: (input: PromptInput) => Effect.Effect<Option.Option<SessionV1.WithParts>, Image.Error>
   readonly loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts>
   readonly shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError>
   readonly command: (input: CommandInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
   readonly resolvePromptParts: (template: string) => Effect.Effect<PromptInput["parts"]>
+}
+
+export interface IdleAdmission {
+  readonly activate: Effect.Effect<void>
+  readonly result: Effect.Effect<SessionV1.WithParts>
+  readonly abort: Effect.Effect<void>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SessionPrompt") {}
@@ -1386,11 +1394,12 @@ export const layer = Layer.effect(
       return yield* wait
     })
 
-    const promptIfIdle: Interface["promptIfIdle"] = Effect.fn("SessionPrompt.promptIfIdle")(
+    const prepareIfIdle: Interface["prepareIfIdle"] = Effect.fn("SessionPrompt.prepareIfIdle")(
       function* (input: PromptInput) {
-        const wait = yield* promptLocks.withLock(input.sessionID)(
+        return yield* promptLocks.withLock(input.sessionID)(
           Effect.uninterruptibleMask((restore) =>
             Effect.gen(function* () {
+              const activation = yield* Deferred.make<void>()
               const admission = yield* Deferred.make<
                 Exit.Exit<{ readonly message: SessionV1.WithParts; readonly run: boolean }, Image.Error>
               >()
@@ -1398,24 +1407,42 @@ export const layer = Layer.effect(
                 input.sessionID,
                 lastAssistant(input.sessionID),
                 Effect.gen(function* () {
+                  yield* Deferred.await(activation)
                   const admitted = yield* Deferred.await(admission)
                   if (Exit.isFailure(admitted)) return yield* Effect.failCause(admitted.cause)
                   if (!admitted.value.run) return admitted.value.message
                   return yield* runLoop(input.sessionID)
                 }).pipe(Effect.orDie),
               )
-              if (Option.isNone(wait)) return wait
+              if (Option.isNone(wait)) return Option.none<IdleAdmission>()
 
               const admitted = yield* restore(admitPrompt(input)).pipe(Effect.exit)
               yield* Deferred.succeed(admission, admitted)
-              if (Exit.isFailure(admitted)) return yield* Effect.failCause(admitted.cause)
-              return wait
+              if (Exit.isFailure(admitted)) {
+                yield* Deferred.succeed(activation, undefined)
+                return yield* Effect.failCause(admitted.cause)
+              }
+              return Option.some({
+                activate: Deferred.succeed(activation, undefined).pipe(Effect.asVoid),
+                result: wait.value,
+                abort: state.cancel(input.sessionID),
+              })
             }),
           ),
         )
-        if (Option.isNone(wait)) return Option.none()
-        return Option.some(yield* wait.value)
       },
+    )
+
+    const promptIfIdle: Interface["promptIfIdle"] = Effect.fn("SessionPrompt.promptIfIdle")(
+      (input: PromptInput) =>
+        Effect.uninterruptibleMask((restore) =>
+          Effect.gen(function* () {
+            const prepared = yield* restore(prepareIfIdle(input))
+            if (Option.isNone(prepared)) return Option.none()
+            yield* prepared.value.activate.pipe(Effect.onError(() => prepared.value.abort))
+            return Option.some(yield* restore(prepared.value.result))
+          }),
+        ),
     )
 
     const lastAssistant = Effect.fnUntraced(function* (sessionID: SessionID) {
@@ -2097,6 +2124,7 @@ export const layer = Layer.effect(
     return Service.of({
       cancel,
       prompt,
+      prepareIfIdle,
       promptIfIdle,
       loop,
       shell,
@@ -2294,5 +2322,14 @@ export const node = LayerNode.make(layer, [
   Memory.node,
   HookStartContext.node, SettingsHook.node, Goal.node,
 ])
+
+export function admitIfIdle(
+  service: Interface,
+  automation: SessionAutomationLease.Interface,
+  token: SessionAutomationLease.Token,
+  input: PromptInput,
+): Effect.Effect<Option.Option<Effect.Effect<SessionV1.WithParts>>, Image.Error> {
+  return automation.handoff(token, service.prepareIfIdle(input))
+}
 
 export * as SessionPrompt from "./prompt"

@@ -17,6 +17,7 @@ import { SessionPrompt } from "@/session/prompt"
 import { Session } from "@/session/session"
 import { SessionStatus } from "@/session/status"
 import { pollWithTimeout } from "../lib/effect"
+import { withIdleAdmission } from "../lib/session-prompt"
 
 function node(id: string, timeoutMs?: number): NodeConfig {
   return {
@@ -74,7 +75,7 @@ function recoveryLayer(input: { wakes: string[] }) {
     get: () => Effect.succeed({} as never),
     messages: () => Effect.succeed([]),
   })
-  const prompt = Layer.mock(SessionPrompt.Service, {
+  const prompt = Layer.mock(SessionPrompt.Service, withIdleAdmission({
     cancel: () => Effect.void,
     prompt: () => Effect.never,
     promptIfIdle: (value) =>
@@ -84,7 +85,7 @@ function recoveryLayer(input: { wakes: string[] }) {
       }).pipe(
         Effect.map(() => Option.some(reply(value.sessionID as string, "wake handled"))),
       ),
-  })
+  }))
   const loop = DagLoop.layer.pipe(
     Layer.provide(base),
     Layer.provide(session),

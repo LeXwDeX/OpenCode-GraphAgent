@@ -16,6 +16,12 @@ export interface Token {
   readonly generation: number
 }
 
+export interface AfterFence<A, E = never, R = never> {
+  readonly activate: Effect.Effect<void>
+  readonly result: Effect.Effect<A, E, R>
+  readonly abort: Effect.Effect<void>
+}
+
 type Request =
   | { readonly kind: "goal"; readonly id: string }
   | { readonly kind: "dag" }
@@ -25,6 +31,10 @@ export interface Interface {
   readonly unregister: (sessionID: SessionID, owner: Owner) => Effect.Effect<void>
   readonly claim: (sessionID: SessionID, request: Request) => Effect.Effect<Option.Option<Token>>
   readonly use: <A, E, R>(token: Token, effect: Effect.Effect<A, E, R>) => Effect.Effect<Option.Option<A>, E, R>
+  readonly handoff: <A, E, R, E2, R2>(
+    token: Token,
+    prepare: Effect.Effect<Option.Option<AfterFence<A, E, R>>, E2, R2>,
+  ) => Effect.Effect<Option.Option<Effect.Effect<A, E, R>>, E2, R2>
   /** Drop every registration and retry obligation for a session (session deletion). */
   readonly purgeSession: (sessionID: SessionID) => Effect.Effect<void>
 }
@@ -169,20 +179,45 @@ export const layer = Layer.effect(
   })
 
   const use: Interface["use"] = Effect.fn("SessionAutomationLease.use")(function* (token, effect) {
-    const valid = yield* locks.withLock(token.sessionID)(
-      Effect.sync(() => {
+    return yield* locks.withLock(token.sessionID)(
+      Effect.gen(function* () {
         const current = registrations.get(token.sessionID)
         const selected = owner(token.sessionID)
-        return !(
+        const valid = !(
           !current ||
           current.generation !== token.generation ||
           selected?.kind !== token.owner.kind ||
           selected.id !== token.owner.id
         )
+        if (!valid) return Option.none()
+        return Option.some(yield* effect)
       }),
     )
-    if (!valid) return Option.none()
-    return Option.some(yield* effect)
+  })
+
+  const handoff: Interface["handoff"] = Effect.fn("SessionAutomationLease.handoff")(function* (token, prepare) {
+    return yield* Effect.uninterruptibleMask((restore) =>
+      Effect.gen(function* () {
+        const prepared = yield* restore(
+          locks.withLock(token.sessionID)(
+            Effect.gen(function* () {
+              const current = registrations.get(token.sessionID)
+              const selected = owner(token.sessionID)
+              if (
+                !current ||
+                current.generation !== token.generation ||
+                selected?.kind !== token.owner.kind ||
+                selected.id !== token.owner.id
+              ) return Option.none()
+              return yield* prepare
+            }),
+          ),
+        )
+        if (Option.isNone(prepared)) return Option.none()
+        yield* prepared.value.activate.pipe(Effect.onError(() => prepared.value.abort))
+        return Option.some(prepared.value.result)
+      }),
+    )
   })
 
   // GOAL-FP-01-06: session deletion must drop every registration the session
@@ -200,7 +235,7 @@ export const layer = Layer.effect(
     )
   })
 
-  return Service.of({ register, unregister, claim, use, purgeSession })
+  return Service.of({ register, unregister, claim, use, handoff, purgeSession })
   }),
 )
 

@@ -21,7 +21,7 @@ Standing Goal keeps one durable autonomous objective for a Session and advances 
 - Terminal completion writes `goal_outcome` and deletes the current row in one transition; a durable `done` row is never an intermediate cleanup obligation.
 - `blocked` pauses the Goal and remains distinguishable from `done` in state, events, transcript text, and judge prompts.
 - `SessionAutomationLease` elects one automation owner per Session. DAG owns the Session while any registered workflow remains; Goal is eligible only after the final DAG owner releases it.
-- Goal and DAG effects revalidate the claimed generation immediately before mutation or prompt admission. `SessionPrompt.promptIfIdle` remains the final idle-state guard.
+- Goal and DAG hold the claimed generation fence through a durable mutation or prompt admission. Provider execution starts only after that fence is released; `SessionPrompt.promptIfIdle` remains the final idle-state guard.
 - The current Session runner is process-local, so the automation lease is process-local. Clustered execution requires a separate durable lease design.
 
 ## Boundaries
