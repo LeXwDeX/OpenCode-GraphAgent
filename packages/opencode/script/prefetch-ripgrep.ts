@@ -76,7 +76,9 @@ function derivePlatform(directory: string): RuntimeAsset.Platform | undefined {
   const parts = directory.split("-")
   const os = parts[1] === "windows" ? "win32" : parts[1]
   const arch = parts[2]
-  if (os !== "darwin" && os !== "linux" && os !== "win32") return
-  if (!arch || !RipgrepAsset.descriptor.targets.some((target) => target.os === os && target.arch === arch)) return
+  if (os !== "darwin" && os !== "linux" && os !== "win32") return undefined
+  if (!arch || !RipgrepAsset.descriptor.targets.some((target) => target.os === os && target.arch === arch)) {
+    return undefined
+  }
   return { os, arch }
 }

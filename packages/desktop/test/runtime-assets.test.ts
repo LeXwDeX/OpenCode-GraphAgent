@@ -15,11 +15,15 @@ describe("desktop runtime assets", () => {
     const directory = await mkdtemp(path.join(os.tmpdir(), "desktop-runtime-assets-"))
     roots.push(directory)
 
-    await expect(
-      verifyDesktopRuntimeAssets({
-        directory,
-        platform: { os: "linux", arch: "x64" },
-      }),
-    ).rejects.toThrow("Required runtime asset is unavailable: ripgrep@15.1.0")
+    const failure = await verifyDesktopRuntimeAssets({
+      directory,
+      platform: { os: "linux", arch: "x64" },
+    }).then(
+      () => undefined,
+      (error: unknown) => error,
+    )
+    expect(failure).toBeInstanceOf(Error)
+    if (!(failure instanceof Error)) throw new Error("expected runtime asset verification to fail")
+    expect(failure.message).toContain("Required runtime asset is unavailable: ripgrep@15.1.0")
   })
 })

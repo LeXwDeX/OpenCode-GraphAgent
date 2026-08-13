@@ -41,9 +41,13 @@ describe("corresponding source", () => {
     })
     await unlink(result.archive)
 
-    await expect(verifyCorrespondingSourceArtifacts(path.dirname(result.archive))).rejects.toThrow(
-      "Corresponding source archive is missing",
+    const failure = await verifyCorrespondingSourceArtifacts(path.dirname(result.archive)).then(
+      () => undefined,
+      (error: unknown) => error,
     )
+    expect(failure).toBeInstanceOf(Error)
+    if (!(failure instanceof Error)) throw new Error("expected source verification to fail")
+    expect(failure.message).toContain("Corresponding source archive is missing")
   })
 })
 

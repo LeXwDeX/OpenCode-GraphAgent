@@ -8,7 +8,7 @@ import { RuntimeAsset } from "@opencode-ai/core/runtime-asset"
 const cleanups: Array<() => void | Promise<void>> = []
 
 afterEach(async () => {
-  await Promise.all(cleanups.splice(0).map((cleanup) => cleanup()))
+  await Promise.all(cleanups.splice(0).map(async (cleanup) => cleanup()))
 })
 
 describe("RuntimeAsset managed candidates", () => {
