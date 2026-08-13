@@ -94,6 +94,16 @@ const serviceLayer = Layer.effect(
         const spawnReady = Effect.fn("DagLoop.spawnReady")(function* (dagID: string) {
           const entry = runtimes.get(dagID)
           if (!entry) return
+          // P2-C execution-location revalidation: every spawn call site funnels
+          // through here. A workflow whose durable identity was repainted
+          // (identity migration) or cascade-deleted must not keep scheduling
+          // children under this instance's directory context — drop the stale
+          // entry so no later stimulus acts on it either (its watchers
+          // self-exit on terminal rows; its prompt fibers finish naturally).
+          if (!(yield* DagLocation.ownsWorkflow(dagID, ctx.directory))) {
+            runtimes.delete(dagID)
+            return
+          }
           // D13: settle cascade-skips before spawning. A node whose dependencies
           // are all skipped can never receive a real input; publish a durable
           // NodeSkipped(orphan_cascade) wave by wave until a fixpoint so gated
@@ -417,6 +427,12 @@ const serviceLayer = Layer.effect(
             if (isPaused) runtime.setPaused(true)
             if (isStepping) runtime.setStepMode(true)
             const entry: WorkflowEntry = { runtime, semaphore, evalLock: Semaphore.makeUnsafe(1), parentSessionID: wf.sessionId, config, fibers: new Map(), watchers: new Map() }
+            // P2-E deletion-race re-check: the SessionV1.Event.Deleted sweep
+            // only removes entries already published into `runtimes`. If the
+            // FK cascade deleted this workflow's row while reconciliation ran,
+            // publishing now would leak an inert entry the sweep can no longer
+            // reach. The ensuring below still clears the recovering reservation.
+            if (!(yield* DagLocation.ownsWorkflow(dagID, ctx.directory))) return
             runtimes.set(dagID, entry)
             yield* automation.register(SessionID.make(wf.sessionId), { kind: "dag", id: dagID })
             // Reconciliation settles every persisted running attempt before the
@@ -512,6 +528,12 @@ const serviceLayer = Layer.effect(
               const runtime = new WorkflowRuntime(toSchedulingNodes(nodes), maxConcurrency)
               const semaphore = Semaphore.makeUnsafe(maxConcurrency)
               const entry: WorkflowEntry = { runtime, semaphore, evalLock: Semaphore.makeUnsafe(1), parentSessionID: wf.sessionId, config, fibers: new Map(), watchers: new Map() }
+              // P2-E deletion-race re-check (same window as recoverWorkflow):
+              // the Deleted sweep only removes entries already in `runtimes`,
+              // and getNodes above is an awaited yield a deletion can slip
+              // through. A row cascade-deleted after the first guard must not
+              // be adopted into an inert entry.
+              if (!(yield* DagLocation.ownsWorkflow(dagID, ctx.directory))) return
               runtimes.set(dagID, entry)
               yield* automation.register(SessionID.make(wf.sessionId), { kind: "dag", id: dagID })
               yield* entry.evalLock.withPermits(1)(

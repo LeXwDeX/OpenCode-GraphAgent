@@ -49,6 +49,25 @@ export const stampDirectory = (): Effect.Effect<string> =>
   Effect.map(InstanceRef, (instance) => (instance ? canonicalDirectory(instance.directory) : ""))
 
 /**
+ * P2-D: a workflow whose directory stamp is NULL (created by a pre-DAG-LOC-01
+ * build after the one-shot backfill) matches no instance and is silently
+ * skipped by every adoption/recovery/wake path forever. Log that skip once
+ * per workflow per process so the zombie is visible; the conservative
+ * never-match policy stays.
+ */
+const nullDirectoryWarned = new Set<string>()
+
+const warnNullDirectory = (row: { id: string; directory: string | null }): Effect.Effect<void> =>
+  Effect.suspend(() => {
+    if (row.directory !== null || nullDirectoryWarned.has(row.id)) return Effect.void
+    nullDirectoryWarned.add(row.id)
+    return Effect.logWarning(
+      "DagLocation skipping workflow with a NULL execution-location directory (created before the DAG-LOC-01 stamp and never backfilled) — it will never be adopted, recovered, or woken; recreate the workflow to re-enable it",
+      { dagID: row.id },
+    )
+  })
+
+/**
  * Owns the workflow iff its DURABLE row (re-read on every check) still belongs
  * to the ambient instance: the project id matches (fast-reject + R6 identity
  * revalidation — a repainted project_id must not keep driving the old entry)
@@ -70,7 +89,11 @@ export const ownsWorkflow = (workflowID: string, directory: string): Effect.Effe
       .pipe(Effect.orDie)
     if (!row) return false
     if (row.project_id !== instance.project.id) return false
-    return row.directory !== null && canonicalDirectory(row.directory) === canonicalDirectory(directory)
+    if (row.directory === null) {
+      yield* warnNullDirectory(row)
+      return false
+    }
+    return canonicalDirectory(row.directory) === canonicalDirectory(directory)
   })
 
 /**
@@ -96,10 +119,16 @@ export const ownsSession = (sessionID: string, directory: string): Effect.Effect
       .where(eq(WorkflowTable.session_id, sessionID))
       .all()
       .pipe(Effect.orDie)
-    return rows.every(
-      (row) =>
-        row.project_id === instance.project.id &&
-        row.directory !== null &&
-        canonicalDirectory(row.directory) === canonicalDirectory(directory),
-    )
+    let owned = true
+    for (const row of rows) {
+      if (row.project_id !== instance.project.id) {
+        owned = false
+      } else if (row.directory === null) {
+        yield* warnNullDirectory(row)
+        owned = false
+      } else if (canonicalDirectory(row.directory) !== canonicalDirectory(directory)) {
+        owned = false
+      }
+    }
+    return owned
   })

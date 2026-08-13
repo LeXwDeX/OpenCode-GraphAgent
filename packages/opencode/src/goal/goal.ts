@@ -13,6 +13,29 @@ import { GoalPrompts } from "./prompts"
 import { SessionID } from "@/session/schema"
 import { SessionStatus } from "@/session/status"
 import { SessionAutomationLease } from "@/session/automation-lease"
+import { SessionLocation } from "@/session/location"
+import { DagLocation } from "@/dag/location"
+
+/**
+ * DAG-LOC-01 (P2-A) — goal-side execution-location ownership.
+ *
+ * The DAG-side authority keys ownership on the workflow row, which is
+ * vacuously true for goal-only sessions (no workflow rows). The goal loop
+ * therefore needs a REAL directory check: the durable session row's
+ * directory (SessionTable — legal here, the goal module is outside the dag
+ * trees) must match the calling instance's directory, same canonicalization
+ * as the workflow-keyed authority. Vacuous-own remains ONLY where no
+ * durable answer exists: a missing session row (synthetic test sessions /
+ * already-deleted sessions whose goal state is gone with them) or a runtime
+ * graph without the Database service (goal e2e fixtures; production always
+ * carries it).
+ */
+export const ownsSession = (sessionID: SessionID, directory: string): Effect.Effect<boolean> =>
+  Effect.gen(function* () {
+    const durable = yield* SessionLocation.sessionDirectory(sessionID)
+    if (durable._tag === "None") return true
+    return DagLocation.canonicalDirectory(durable.value) === DagLocation.canonicalDirectory(directory)
+  })
 
 export type RemoveSubgoalResult =
   | { tag: "ok"; removed: string; state: GoalState.Info }

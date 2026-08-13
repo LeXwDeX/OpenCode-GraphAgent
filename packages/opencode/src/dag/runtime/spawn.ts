@@ -31,6 +31,7 @@
  */
 
 import { Effect, Semaphore, Scope, Fiber, Option, Clock, Cause, Exit } from "effect"
+import { Database } from "@opencode-ai/core/database/database"
 import { Agent } from "@/agent/agent"
 import { Session } from "@/session/session"
 import { SessionID, MessageID } from "@/session/schema"
@@ -38,6 +39,8 @@ import { deriveSubagentSessionPermission } from "@/agent/subagent-permissions"
 import { SessionPrompt } from "@/session/prompt"
 import { Dag } from "../dag"
 import { DagModel } from "../model"
+import { DagLocation } from "../location"
+import { InstanceRef } from "@/effect/instance-ref"
 import { isTransitionRejection, isNodeTerminalStatus } from "@opencode-ai/core/dag/core/types"
 import type { DagStore } from "@opencode-ai/core/dag/store"
 import { ModelV2 } from "@opencode-ai/core/model"
@@ -137,6 +140,21 @@ export function makeDeadlineWatcher(
         continue
       }
       if (isNodeTerminalStatus(node.status as never)) return
+      // DAG-LOC-01 (P2-C): revalidate ownership before the write section —
+      // escalation and cap-enforcement writes must not land on a workflow
+      // whose durable identity was repainted (identity migration) or whose
+      // rows were cascade-deleted. Losing ownership ends this watcher's
+      // mandate; the instance that owns the repainted workflow supervises it.
+      // The check only runs when it can DISPROVE ownership (instance context
+      // and Database both present — always true for watchers forked from
+      // DagLoop): absent either, supervision must not end (R13).
+      {
+        const instance = yield* InstanceRef
+        const db = yield* Effect.serviceOption(Database.Service)
+        if (instance && db._tag === "Some") {
+          if (!(yield* DagLocation.ownsWorkflow(input.dagID, instance.directory))) return
+        }
+      }
       const now = yield* Clock.currentTimeMillis
       const deadline = node.deadlineMs
       if (node.status !== "running") {

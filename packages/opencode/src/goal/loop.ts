@@ -11,7 +11,6 @@ import { Provider } from "@/provider/provider"
 import { Goal } from "./goal"
 import { GoalJudge } from "./judge"
 import { GoalPrompts } from "./prompts"
-import { DagLocation } from "@/dag/location"
 import { generateText } from "ai"
 import { SessionID } from "@/session/schema"
 import { SessionAutomationLease } from "@/session/automation-lease"
@@ -140,14 +139,26 @@ const serviceLayer = Layer.effect(
               const sid = evt.data.sessionID
               // DAG-LOC-01 execution-location guard: idle Status events are
               // store-global. Only the instance whose DIRECTORY owns the
-              // session may drive its goal loop — the same authority the DAG
-              // wake paths use (the goal scan is already directory-scoped
-              // through the per-directory InstanceState; this aligns the idle
-              // trigger with that scoping). Sessions without workflow rows
-              // are owned vacuously (goal-only sessions predate stamping).
-              if (!(yield* DagLocation.ownsSession(sid, ctx.directory))) return
+              // session may drive its goal loop — the real session-row check
+              // (Goal.ownsSession reads SessionTable.directory; the workflow-
+              // keyed DAG authority is vacuous for goal-only sessions, P2-A).
+              // Sessions without a durable row are owned vacuously (synthetic
+              // test sessions; a deleted session's goal state is gone with it).
+              if (!(yield* Goal.ownsSession(sid, ctx.directory))) return
               yield* triggerEvaluation(sid)
-            }).pipe(Effect.ignore),
+              // P2-B subscription survival: this handler now contains the
+              // first defect-capable durable reads in the goal idle path
+              // (Goal.ownsSession / goal.load both orDie). Effect.ignore does
+              // NOT absorb defects — a transient store failure would
+              // permanently kill the runForEach subscription and the loop
+              // would never evaluate another idle event. catchCause absorbs
+              // failures AND defects at the boundary, so a store defect
+              // degrades to a logged, skipped evaluation — never a dead loop.
+            }).pipe(
+              Effect.catchCause((cause) =>
+                Effect.logWarning("GoalLoop idle handler failed", { sessionID: evt.data.sessionID, cause }),
+              ),
+            ),
           ),
           Effect.forkScoped,
         )

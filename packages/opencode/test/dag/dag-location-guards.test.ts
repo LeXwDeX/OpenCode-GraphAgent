@@ -34,7 +34,7 @@
  * AMBIENT instance directory, so each probe can tell which instance acted.
  */
 import { describe, expect, it } from "bun:test"
-import { DateTime, Deferred, Effect, Layer, Option, Queue } from "effect"
+import { DateTime, Deferred, Effect, Layer, Option, Queue, Logger } from "effect"
 import type { SessionV1 } from "@opencode-ai/core/v1/session"
 import { SessionV1 as SessionV1Events } from "@opencode-ai/core/v1/session"
 import { Database } from "@opencode-ai/core/database/database"
@@ -49,6 +49,10 @@ import { SessionStatusEvent } from "@opencode-ai/schema/session-status-event"
 import { Agent } from "@/agent/agent"
 import { Dag, type NodeConfig } from "@/dag/dag"
 import { DagLoop } from "@/dag/runtime/loop"
+import { DagLocation } from "@/dag/location"
+import { Goal } from "@/goal/goal"
+import { GoalLoop, GoalLoopJudgeLLM } from "@/goal/loop"
+import { Provider } from "@/provider/provider"
 import { InstanceRef } from "@/effect/instance-ref"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { SessionPrompt } from "@/session/prompt"
@@ -689,5 +693,322 @@ describe("DAG execution-location static contract (DAG-LOC-01 R7)", () => {
       }
     }
     expect(unguarded).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// P2 follow-up probes (review findings against the round-3 slice)
+// ---------------------------------------------------------------------------
+
+/**
+ * Goal-side harness: real Database + real Goal + real EventV2Bridge +
+ * real SessionStatus with the GoalLoop layer on top, Session/Prompt/Provider
+ * mocked. The judge LLM is injected (GoalLoopJudgeLLM) and routed by the
+ * AMBIENT instance directory so a probe can attribute each judge call to
+ * instance A or B — the same routing trick the dag two-instance harness uses.
+ */
+function goalLoopLayer(input: {
+  readonly judgeCalls: Map<string, number[]>
+  readonly messagesBySession: Map<string, SessionV1.WithParts[]>
+  /** Ambient Database output for the merged graph; defaults to the shared one. */
+  readonly ambientDatabase?: Layer.Layer<Database.Service>
+}) {
+  const database = Database.layerFromPath(":memory:")
+  const events = EventV2.layer.pipe(Layer.provide(database))
+  const bridge = EventV2Bridge.layer.pipe(Layer.provide(events))
+  const status = SessionStatus.layer.pipe(Layer.provide(bridge))
+  const goal = Goal.layer.pipe(
+    Layer.provide(bridge),
+    Layer.provide(database),
+    Layer.provide(status),
+  )
+  const judge = Layer.succeed(
+    GoalLoopJudgeLLM,
+    GoalLoopJudgeLLM.of({
+      call: () =>
+        Effect.gen(function* () {
+          const dir = (yield* InstanceRef)?.directory ?? ""
+          const list = input.judgeCalls.get(dir) ?? []
+          list.push(1)
+          input.judgeCalls.set(dir, list)
+          return JSON.stringify({ done: false, reason: "continue" })
+        }),
+    }),
+  )
+  const session = Layer.mock(Session.Service, {
+    messages: (value) =>
+      Effect.sync(() => input.messagesBySession.get((value as { sessionID?: string }).sessionID ?? "") ?? []),
+  })
+  const prompt = Layer.mock(SessionPrompt.Service, {
+    prompt: () => Effect.succeed(reply("goal-parent", "continuation dispatched")),
+  })
+  const provider = Layer.mock(Provider.Service, {})
+  const loop = GoalLoop.layer.pipe(
+    Layer.provide(session),
+    Layer.provide(prompt),
+    Layer.provide(provider),
+    Layer.provide(judge),
+    Layer.provide(goal),
+    Layer.provide(status),
+    Layer.provide(bridge),
+  )
+  return Layer.mergeAll(input.ambientDatabase ?? database, bridge, goal, loop)
+}
+
+describe("DAG-LOC-01 P2 follow-ups", () => {
+  it("P2-A: a sibling instance does not drive another directory's goal-only session", async () => {
+    const judgeCalls = new Map<string, number[]>()
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const database = yield* Database.Service
+        const goal = yield* Goal.Service
+        const loop = yield* GoalLoop.Service
+        const bridge = yield* EventV2Bridge.Service
+        yield* database.db.insert(ProjectTable).values({
+          id: PROJECT_ID as never,
+          worktree: DIR_A as never,
+          sandboxes: [],
+        }).run().pipe(Effect.orDie)
+        for (const [id, dir, slug] of [
+          [SES_A, DIR_A, "a"],
+          [SES_B, DIR_B, "b"],
+        ] as const) {
+          yield* database.db.insert(SessionTable).values({
+            id: id as never,
+            project_id: PROJECT_ID as never,
+            slug,
+            directory: dir as never,
+            title: id,
+            version: "test",
+          }).run().pipe(Effect.orDie)
+        }
+        // A goal-only session: no workflow rows, so the workflow-keyed DAG
+        // authority is vacuous — only the goal-side session-row check can
+        // tell the instances apart (P2-A).
+        yield* goal.set(SES_A as never, "ship the feature", 10)
+        // Boot BOTH instances (A ambient, B via refB).
+        yield* loop.init()
+        yield* loop.init().pipe(Effect.provideService(InstanceRef, {
+          directory: DIR_B,
+          worktree: DIR_B,
+          project: { id: PROJECT_ID },
+        } as never))
+        yield* Effect.yieldNow
+        yield* bridge.publish(SessionStatusEvent.Status, {
+          sessionID: SES_A as never,
+          status: { type: "idle" },
+        }).pipe(Effect.orDie)
+        // A owns /wtA and drives the goal; B must never judge it.
+        yield* pollWithTimeout(
+          Effect.sync(() => ((judgeCalls.get(DIR_A)?.length ?? 0) > 0 ? true : undefined)),
+          "owner instance did not drive the goal-only session",
+          "2 seconds",
+        )
+        yield* Effect.sleep("300 millis")
+        expect(judgeCalls.get(DIR_B) ?? []).toEqual([])
+      }).pipe(
+        Effect.provide(goalLoopLayer({
+          judgeCalls,
+          messagesBySession: new Map([[SES_A, [reply(SES_A, "making progress")]]]),
+        })),
+        Effect.provideService(InstanceRef, {
+          directory: DIR_A,
+          worktree: DIR_A,
+          project: { id: PROJECT_ID },
+        } as never),
+        Effect.scoped,
+      ),
+    )
+  })
+
+  it("P2-F: creating a workflow for a foreign session stamps the SESSION's directory", async () => {
+    await Effect.runPromise(
+      runTwoInstanceGuardTest(
+        {},
+        ({ dag, store }) =>
+          Effect.gen(function* () {
+            // Ambient instance is A; the target session belongs to B's
+            // directory. The stamp must come from the durable SESSION row,
+            // not the requesting instance (P2-F) — otherwise A stamps /wtA
+            // and B's loops never adopt the workflow.
+            const dagID = yield* dag.create({
+              projectID: PROJECT_ID,
+              sessionID: SES_B,
+              title: "B's workflow created via A",
+              config: { name: "p2f", nodes: [node()] },
+            })
+            const wf = yield* store.getWorkflow(dagID)
+            expect(wf?.directory).toBe(DIR_B)
+          }),
+      ),
+    )
+  })
+
+  it("P2-C: after an identity repaint, the stale instance spawns no further children", async () => {
+    await Effect.runPromise(
+      runTwoInstanceGuardTest(
+        {},
+        ({ dag, store, database, initA, childPromptsA }) =>
+          Effect.gen(function* () {
+            yield* initA
+            const dagID = yield* dag.create({
+              projectID: PROJECT_ID,
+              sessionID: SES_A,
+              title: "Repaint spawn gate",
+              config: { name: "p2c", nodes: [node({ id: "n1" }), node({ id: "n2", depends_on: ["n1"] })] },
+            })
+            yield* takeWithin(childPromptsA, "n1 did not start")
+            // Identity migration: repaint the workflow's project id. The
+            // stale in-memory entry must stop scheduling (spawnReady
+            // revalidation, P2-C) — settling n1 makes n2 ready, and without
+            // the gate the stale instance would materialize a child for the
+            // migrated workflow.
+            yield* database.db.update(WorkflowTable)
+              .set({ project_id: "project-new" as never })
+              .where(eq(WorkflowTable.id, dagID as never))
+              .run().pipe(Effect.orDie)
+            yield* dag.nodeCompleted(dagID, "n1", { ok: true })
+            const second = yield* Queue.take(childPromptsA).pipe(Effect.timeoutOption("1 second"))
+            expect(Option.isNone(second)).toBe(true)
+            expect((yield* store.getWorkflow(dagID))?.status).toBe("running")
+            expect((yield* store.getNode(dagID, "n2"))?.status).toBe("pending")
+          }),
+        ({ database }) =>
+          database.db.insert(ProjectTable).values({
+            id: "project-new" as never,
+            worktree: process.cwd() as never,
+            sandboxes: [],
+          }).run().pipe(Effect.orDie, Effect.as(undefined)),
+      ),
+    )
+  })
+
+  it("P2-B: a store defect in the goal guard degrades to a skipped evaluation, not a dead loop", async () => {
+    const judgeCalls = new Map<string, number[]>()
+    const fail = { armed: true }
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const database = yield* Database.Service
+        const goal = yield* Goal.Service
+        const loop = yield* GoalLoop.Service
+        const bridge = yield* EventV2Bridge.Service
+        yield* database.db.insert(ProjectTable).values({
+          id: PROJECT_ID as never,
+          worktree: DIR_A as never,
+          sandboxes: [],
+        }).run().pipe(Effect.orDie)
+        yield* database.db.insert(SessionTable).values({
+          id: SES_A as never,
+          project_id: PROJECT_ID as never,
+          slug: "a",
+          directory: DIR_A as never,
+          title: SES_A,
+          version: "test",
+        }).run().pipe(Effect.orDie)
+        yield* goal.set(SES_A as never, "ship the feature", 10)
+        yield* loop.init()
+        yield* Effect.yieldNow
+        // First idle: the guard's session-row read defects. The handler must
+        // absorb it (P2-B) — otherwise the runForEach subscription dies and
+        // the NEXT idle event is never evaluated.
+        yield* bridge.publish(SessionStatusEvent.Status, {
+          sessionID: SES_A as never,
+          status: { type: "idle" },
+        }).pipe(Effect.orDie)
+        // Second idle: with the subscription alive, the goal is driven.
+        yield* bridge.publish(SessionStatusEvent.Status, {
+          sessionID: SES_A as never,
+          status: { type: "idle" },
+        }).pipe(Effect.orDie)
+        yield* pollWithTimeout(
+          Effect.sync(() => ((judgeCalls.get(DIR_A)?.length ?? 0) > 0 ? true : undefined)),
+          "goal loop did not evaluate the idle event after the store defect (subscription died)",
+          "2 seconds",
+        )
+        expect(fail.armed).toBe(false)
+      }).pipe(
+        Effect.provide(goalLoopLayer({
+          judgeCalls,
+          messagesBySession: new Map([[SES_A, [reply(SES_A, "making progress")]]]),
+          ambientDatabase: Layer.effect(
+            Database.Service,
+            Effect.gen(function* () {
+              const real = yield* Database.Service
+              // One-shot defect on the first durable SELECT (the guard's
+              // session-row read): throws synchronously, i.e. a defect that
+              // Effect.ignore would NOT absorb.
+              const proxy = new Proxy(real.db, {
+                get(target, prop) {
+                  if (prop === "select" && fail.armed) {
+                    fail.armed = false
+                    return () => {
+                      throw new Error("injected transient store defect")
+                    }
+                  }
+                  return Reflect.get(target, prop)
+                },
+              })
+              return Database.Service.of({ db: proxy })
+            }),
+          ).pipe(Layer.provide(Database.layerFromPath(":memory:"))),
+        })),
+        Effect.provideService(InstanceRef, {
+          directory: DIR_A,
+          worktree: DIR_A,
+          project: { id: PROJECT_ID },
+        } as never),
+        Effect.scoped,
+      ),
+    )
+  })
+
+  it("P2-D: a NULL-directory workflow is skipped with a deduped visible warning", async () => {
+    const lines: string[] = []
+    const collector = Logger.make((opts) => {
+      lines.push(String(opts.message))
+    })
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const database = yield* Database.Service
+        yield* database.db.insert(ProjectTable).values({
+          id: PROJECT_ID as never,
+          worktree: DIR_A as never,
+          sandboxes: [],
+        }).run().pipe(Effect.orDie)
+        yield* database.db.insert(SessionTable).values({
+          id: SES_A as never,
+          project_id: PROJECT_ID as never,
+          slug: "a",
+          directory: DIR_A as never,
+          title: SES_A,
+          version: "test",
+        }).run().pipe(Effect.orDie)
+        // A pre-DAG-LOC-01 workflow with no directory stamp (post-backfill
+        // cross-version write): every ownership check must skip it and say
+        // so — exactly once per workflow per process (P2-D).
+        yield* database.db.insert(WorkflowTable).values({
+          id: "p2d-null-wf",
+          project_id: PROJECT_ID as never,
+          session_id: SES_A as never,
+          title: "NULL zombie",
+          status: "running",
+          config: "{}",
+          seq: 1,
+        }).run().pipe(Effect.orDie)
+        yield* DagLocation.ownsWorkflow("p2d-null-wf", DIR_A).pipe(Effect.ignore)
+        yield* DagLocation.ownsWorkflow("p2d-null-wf", DIR_A).pipe(Effect.ignore)
+        const warnings = lines.filter((line) => line.includes("NULL execution-location directory"))
+        expect(warnings).toHaveLength(1)
+      }).pipe(
+        Effect.withLogger(collector),
+        Effect.provide(Database.layerFromPath(":memory:")),
+        Effect.provideService(InstanceRef, {
+          directory: DIR_A,
+          worktree: DIR_A,
+          project: { id: PROJECT_ID },
+        } as never),
+        Effect.scoped,
+      ),
+    )
   })
 })
