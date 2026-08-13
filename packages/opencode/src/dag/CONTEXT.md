@@ -1,12 +1,12 @@
 # Workflow Orchestration Context
 
-Workflow Orchestration turns one user objective into one durable DAG. It supports saved or inline custom workflows and recommends heuristic composition from reusable Blocks. Low-level Nodes remain available when a Block route cannot express the objective.
+Workflow Orchestration turns one user objective into one durable DAG. Its model-facing tool accepts saved or file-backed custom workflows and recommends heuristic composition from reusable Blocks. Low-level Nodes remain available when a Block route cannot express the objective.
 
 ## Glossary
 
 | Term | Meaning |
 | --- | --- |
-| Workflow Source | An inline object or YAML document supplied to start, extend, replan, read, validate, or release tooling. |
+| Workflow Source | An in-memory object used by trusted internal callers or a YAML document supplied to runtime and release tooling. Model-authored graph actions use YAML through `spec_path`. |
 | Workflow Authoring Check | The side-effect-free source-to-graph boundary that parses, normalizes file compatibility, decodes the action shape, compiles Blocks, applies the selected validation profile, and returns diagnostics or a Prepared Workflow Graph. |
 | Prepared Workflow Graph | A strictly decoded and compiled graph that passed the requested authoring checks and is ready for a runtime mutation. |
 | Workflow Route | A complete Block or Node composition selected for one objective. It may be custom, saved, or assembled heuristically. |
@@ -28,6 +28,7 @@ Workflow Orchestration turns one user objective into one durable DAG. It support
 - `portable` validation does not load user environment catalogs. `environment` validation reads current catalogs and verifies actual model availability.
 - No workflow event or durable mutation occurs before a valid Prepared Workflow Graph exists.
 - The model-facing schema contains fields the model owns. Session/Project identity, admission audit state, model assignment, and other runtime-derived fields remain hidden.
+- Model-facing graph actions expose only `spec_path`; graph fields live in YAML so provider tool-call serialization cannot turn a nested graph into a string.
 - Legacy YAML may be adapted at the file boundary without making legacy fields valid inline input.
 - Runtime Admission and Workflow Authoring Check have separate names, state, and responsibilities.
 

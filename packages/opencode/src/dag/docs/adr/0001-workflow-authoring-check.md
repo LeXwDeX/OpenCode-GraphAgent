@@ -5,7 +5,7 @@
 
 ## Context
 
-Workflow input was interpreted independently by the provider-facing tool schema, start, validate, list/read, replan, CLI, generation, and packaging. Hidden YAML authoring removed the model's accidental examples while leaving it unable to infer required fields. Later patches added validators at individual callers, so accepted shapes and diagnostics drifted and some paths reached durable DAG operations before equivalent checks had run.
+Workflow input was interpreted independently by the provider-facing tool schema, start, validate, list/read, replan, CLI, generation, and packaging. Earlier hidden YAML authoring left the model unable to infer required fields. Exposing the complete graph as an inline tool argument fixed discoverability but introduced another failure mode: providers or models could double-serialize the nested `spec` object into a JSON string before validation. Field guidance now belongs to the on-demand workflow guides, while the model-facing action remains shallow and file-backed.
 
 The product supports a single custom workflow, saved workflows, and heuristic Block composition. Those are source choices for one orchestration product, not separate validation systems.
 
@@ -15,13 +15,18 @@ The product supports a single custom workflow, saved workflows, and heuristic Bl
 
 All tool graph actions and offline config/release consumers call this boundary. Callers may authorize and read files or perform durable DAG mutations, but they do not reinterpret source shape or decide graph validity.
 
+Model-facing `start`, `extend`, `control(replan)`, and `validate` accept only
+`spec_path`. One-off graphs use task-local YAML files; saved workflow names use
+the same field. Trusted internal consumers may still pass an in-memory source
+directly to `WorkflowAuthoring` without creating a second validation path.
+
 The provider schema exposes only author-owned fields. Runtime identity, model assignment, and persisted admission audit fields are derived or adapted behind the boundary. Portable checks are environment-free; environment checks resolve live catalogs and are not cached as content-only facts.
 
 ## Consequences
 
 - A valid source has one compiled meaning across validate, start, extend, replan, read/list diagnostics, CI, generation, and packaging.
-- Provider schema is sufficient for model authoring without exposing runtime-owned fields.
-- Legacy YAML remains readable while new inline input stays strict.
+- Provider schema stays shallow; on-demand guides describe author-owned YAML fields without exposing runtime-owned fields.
+- File-backed custom and saved workflows share one YAML validation path; internal in-memory input stays strict.
 - Environment changes are observed on the next environment check.
 - Durable DAG methods retain lifecycle validation as defense in depth, but do not become a second raw-source validator.
 

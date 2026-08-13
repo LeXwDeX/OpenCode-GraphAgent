@@ -107,10 +107,10 @@ describe("CommandPlugin.Plugin", () => {
     }),
   )
 
-  it.effect("uses inline specs for one-off graphs without removing saved workflows", () =>
+  it.effect("uses file-backed specs for one-off and saved workflows", () =>
     Effect.sync(() => {
-      expect(CommandPlugin.WorkflowFactsContent).toContain("For a one-off graph, pass `spec` inline")
-      expect(CommandPlugin.WorkflowFactsContent).toContain("Use `spec_path` only")
+      expect(CommandPlugin.WorkflowFactsContent).toContain("write the graph to a")
+      expect(CommandPlugin.WorkflowFactsContent).toContain("task-local file")
       // The resident description keeps tool selection and the progressive
       // guide index only; per-action field semantics live in the parameter
       // schema (change repair-workflow-authoring-validation).
@@ -118,9 +118,9 @@ describe("CommandPlugin.Plugin", () => {
       expect(CommandPlugin.WorkflowContent).toContain("parameter schema")
       expect(CommandPlugin.WorkflowFactsContent).toContain('{ action: "read", spec_path: "code-review" }')
       expect(CommandPlugin.WorkflowFactsContent).toContain("retarget its objective and block instructions")
-      expect(CommandPlugin.WorkflowFactsContent).not.toContain("Never inline graph nodes")
-      expect(CommandPlugin.WorkflowFactsContent).not.toContain("Before any graph-carrying action")
-      expect(CommandPlugin.DagFlowContent).toContain("inline `spec`")
+      expect(CommandPlugin.WorkflowFactsContent).not.toContain("pass `spec` inline")
+      expect(CommandPlugin.DagFlowContent).toContain("task-local YAML file")
+      expect(CommandPlugin.DagFlowContent).toContain("`spec_path`")
     }),
   )
 
@@ -346,7 +346,8 @@ describe("CommandPlugin.Plugin", () => {
       expect(CommandPlugin.WorkflowFactsContent).toContain(
         "the workflow boundary owns `protocol_version`, `state`, and\n`fingerprint`",
       )
-      expect(CommandPlugin.WorkflowFactsContent).toContain("For a one-off graph, pass `spec` inline")
+      expect(CommandPlugin.WorkflowFactsContent).toContain("A one-off graph may use a")
+      expect(CommandPlugin.WorkflowFactsContent).toContain("task-local file")
       expect(CommandPlugin.WorkflowFactsContent).not.toContain("`config.mode`")
     }),
   )
