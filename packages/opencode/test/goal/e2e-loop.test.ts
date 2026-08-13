@@ -20,6 +20,7 @@ import { AbsolutePath } from "@opencode-ai/core/schema"
 import { TestInstance } from "../fixture/fixture"
 import { logLines } from "effect/testing/TestConsole"
 import { testEffect, pollWithTimeout } from "../lib/effect"
+import { withIdleAdmission } from "../lib/session-prompt"
 
 // P2b: full-cycle Goal regression (D5). Drives set → idle → judge(continue) →
 // continuation → idle → judge(done) → terminal event sequence, with the judge
@@ -77,19 +78,19 @@ const mkAssistantTools = () =>
 // the mock; the goal state and event captures are the observable contract.
 const recordingPrompt = (sink: { noReply?: boolean; text: string }[]) =>
   Layer.succeed(SessionPrompt.Service, (() => {
-    const record = (input: { noReply?: boolean; parts?: Array<{ type: string; text: string }> }) =>
+    const record = (input: SessionPrompt.PromptInput) =>
       Effect.sync(() => {
         sink.push({
           noReply: input.noReply,
-          text: input.parts?.map((p) => p.text).join("\n") ?? "",
+          text: input.parts.map((part) => (part.type === "text" ? part.text : "")).join("\n"),
         })
         return undefined as never
       })
-    return {
+    return withIdleAdmission({
       prompt: record,
-      promptIfIdle: (input: { noReply?: boolean; parts?: Array<{ type: string; text: string }> }) =>
+      promptIfIdle: (input: SessionPrompt.PromptInput) =>
         record(input).pipe(Effect.map(Option.some)),
-    } as never
+    }) as never
   })())
 
 describe("GoalLoop end-to-end — continue → done lifecycle (P2b)", () => {
@@ -108,19 +109,19 @@ describe("GoalLoop end-to-end — continue → done lifecycle (P2b)", () => {
     messages: () => Effect.succeed([mkAssistant()]),
   } as never)
   const promptMock = Layer.succeed(SessionPrompt.Service, (() => {
-    const record = (input: { noReply?: boolean; parts?: Array<{ type: string; text: string }> }) =>
+    const record = (input: SessionPrompt.PromptInput) =>
       Effect.sync(() => {
         promptCalls.push({
           noReply: input.noReply,
-          text: input.parts?.map((p) => p.text).join("\n") ?? "",
+          text: input.parts.map((part) => (part.type === "text" ? part.text : "")).join("\n"),
         })
         return undefined as never
       })
-    return {
+    return withIdleAdmission({
       prompt: record,
-      promptIfIdle: (input: { noReply?: boolean; parts?: Array<{ type: string; text: string }> }) =>
+      promptIfIdle: (input: SessionPrompt.PromptInput) =>
         record(input).pipe(Effect.map(Option.some)),
-    } as never
+    }) as never
   })())
   const providerMock = Layer.succeed(Provider.Service, {} as never)
   const judgeMock = Layer.succeed(
@@ -203,7 +204,7 @@ describe("GoalLoop — shared Session automation lease", () => {
   const sessionMock = Layer.succeed(Session.Service, {
     messages: () => Effect.succeed([mkAssistant()]),
   } as never)
-  const promptMock = Layer.succeed(SessionPrompt.Service, {
+  const promptMock = Layer.succeed(SessionPrompt.Service, withIdleAdmission({
     prompt: () =>
       Effect.sync(() => {
         directPromptAttempts += 1
@@ -214,7 +215,7 @@ describe("GoalLoop — shared Session automation lease", () => {
         leaseAttempts += 1
         return Option.none()
       }),
-  } as never)
+  }) as never)
   const judgeMock = Layer.succeed(
     GoalLoopJudgeLLM,
     GoalLoopJudgeLLM.of({
@@ -266,14 +267,14 @@ describe("GoalLoop + DAG owner arbitration", () => {
   const sessionMock = Layer.succeed(Session.Service, {
     messages: () => Effect.succeed([mkAssistant()]),
   } as never)
-  const promptMock = Layer.succeed(SessionPrompt.Service, {
+  const promptMock = Layer.succeed(SessionPrompt.Service, withIdleAdmission({
     prompt: () => Effect.succeed(undefined as never),
     promptIfIdle: () =>
       Effect.sync(() => {
         continuationCalls += 1
         return Option.some(undefined as never)
       }),
-  } as never)
+  }) as never)
   const judgeMock = Layer.succeed(
     GoalLoopJudgeLLM,
     GoalLoopJudgeLLM.of({
@@ -369,7 +370,7 @@ describe("GoalLoop — dag release must not double-evaluate a boundary (GOAL-FP-
   // Second continuation dispatch parks on a gate: under the unfixed
   // re-trigger the boundary fiber commits (turns 1 → 2) and reaches the gate;
   // the test then observes the settled double-commit state.
-  const promptMock = Layer.mock(SessionPrompt.Service, {
+  const promptMock = Layer.mock(SessionPrompt.Service, withIdleAdmission({
     prompt: () => Effect.die("the direct prompt path is not exercised in this scenario"),
     promptIfIdle: () =>
       Effect.sync(() => {
@@ -384,7 +385,7 @@ describe("GoalLoop — dag release must not double-evaluate a boundary (GOAL-FP-
         }),
         Effect.map(() => Option.none()),
       ),
-  })
+  }))
   const judgeMock = Layer.succeed(
     GoalLoopJudgeLLM,
     GoalLoopJudgeLLM.of({
@@ -483,10 +484,10 @@ describe("GoalLoop — continuation dispatch failure → recoverable pause (D1)"
     messages: () => Effect.succeed([mkAssistant()]),
   } as never)
   // Always-failing prompt — simulates provider fault / session write error.
-  const promptFailMock = Layer.succeed(SessionPrompt.Service, {
+  const promptFailMock = Layer.succeed(SessionPrompt.Service, withIdleAdmission({
     prompt: () => Effect.fail(new Error("continuation provider down")),
     promptIfIdle: () => Effect.fail(new Error("continuation provider down")),
-  } as never)
+  }) as never)
   const providerMock = Layer.succeed(Provider.Service, {} as never)
   const judgeMock = Layer.succeed(
     GoalLoopJudgeLLM,
@@ -604,14 +605,14 @@ describe("GoalLoop — dispatch failure releases the lease without the trailing 
   // drops the goal_state table — so afterDispatch's goal.load defects: the
   // lease release must NOT depend on that trailing load. The die after the
   // gate is swallowed by the handler's Effect.ignore.
-  const promptFailAndParkMock = Layer.mock(SessionPrompt.Service, {
+  const promptFailAndParkMock = Layer.mock(SessionPrompt.Service, withIdleAdmission({
     prompt: () =>
       Effect.gen(function* () {
         yield* Deferred.await(promptGate)
         return yield* Effect.die("failure-path prompt is the last stop before the trailing load")
       }),
     promptIfIdle: () => Effect.die(new Error("continuation provider down")),
-  })
+  }))
   const judgeMock = Layer.succeed(
     GoalLoopJudgeLLM,
     GoalLoopJudgeLLM.of({
@@ -718,15 +719,17 @@ describe("GoalLoop — real SessionRunState admission seam (GOAL-FP-01-13)", () 
   // real. The mock returns Option.none() even on admission — afterIdle
   // discards the promptIfIdle result (only its failure matters), and
   // admission is observable through the real status flip and the counters.
-  const promptIfIdle = Effect.fn("test.goalSeam.SessionPrompt.promptIfIdle")(function* (
+  const prepareIfIdle = Effect.fn("test.goalSeam.SessionPrompt.prepareIfIdle")(function* (
     input: SessionPrompt.PromptInput,
   ) {
     const runState = yield* Effect.serviceOption(SessionRunState.Service)
     if (Option.isNone(runState)) return yield* Effect.die("SessionRunState not provided to the seam mock")
+    const activation = yield* Deferred.make<void>()
     const admitted = yield* runState.value.startIfIdle(
       input.sessionID,
       Effect.die("onInterrupt is not exercised in this scenario"),
       Effect.gen(function* () {
+        yield* Deferred.await(activation)
         admissions += 1
         if (admissions === 1) {
           firstAdmissionParked = true
@@ -739,13 +742,23 @@ describe("GoalLoop — real SessionRunState admission seam (GOAL-FP-01-13)", () 
       rejectedAdmissions += 1
       return Option.none()
     }
-    // Await the run's completion (the Cancelled exit is captured) so the
-    // mock's promptIfIdle stays faithful to the real one's waiting behavior.
-    yield* admitted.value.pipe(Effect.exit, Effect.asVoid)
-    return Option.none()
+    return Option.some({
+      activate: Deferred.succeed(activation, undefined).pipe(Effect.asVoid),
+      result: admitted.value.pipe(Effect.exit, Effect.as(mkAssistant())),
+      abort: runState.value.cancel(input.sessionID),
+    })
+  })
+  const promptIfIdle = Effect.fn("test.goalSeam.SessionPrompt.promptIfIdle")(function* (
+    input: SessionPrompt.PromptInput,
+  ) {
+    const prepared = yield* prepareIfIdle(input)
+    if (Option.isNone(prepared)) return Option.none()
+    yield* prepared.value.activate
+    return Option.some(yield* prepared.value.result)
   })
   const promptMock = Layer.mock(SessionPrompt.Service, {
     prompt: () => Effect.die("the direct prompt path is not exercised in this scenario"),
+    prepareIfIdle,
     promptIfIdle,
   })
   const judgeMock = Layer.succeed(
@@ -1070,10 +1083,10 @@ describe("GoalLoop — continuation interrupted → no pause, goal stays active 
   // undefined id — the F1 miss case that Cause.interruptors silently drops and
   // the old interruptors().size check misclassified as a dispatch failure.
   let interruptCause: Cause.Cause<never> = Cause.interrupt(0)
-  const promptInterruptMock = Layer.succeed(SessionPrompt.Service, {
+  const promptInterruptMock = Layer.succeed(SessionPrompt.Service, withIdleAdmission({
     prompt: () => Effect.failCause(interruptCause),
     promptIfIdle: () => Effect.failCause(interruptCause),
-  } as never)
+  }) as never)
   const providerMock = Layer.succeed(Provider.Service, {} as never)
   const judgeMock = Layer.succeed(
     GoalLoopJudgeLLM,
@@ -1206,14 +1219,14 @@ describe("GoalLoop — startup scan resumes pre-boot active goals (GOAL-FP-01-04
   const sessionMock = Layer.mock(Session.Service, {
     messages: () => Effect.succeed([mkAssistant()]),
   })
-  const promptMock = Layer.mock(SessionPrompt.Service, {
+  const promptMock = Layer.mock(SessionPrompt.Service, withIdleAdmission({
     prompt: () => Effect.die("the direct prompt path is not exercised in this scenario"),
     promptIfIdle: () =>
       Effect.sync(() => {
         continuationCalls += 1
         return Option.none()
       }),
-  })
+  }))
   const judgeMock = Layer.succeed(
     GoalLoopJudgeLLM,
     GoalLoopJudgeLLM.of({
@@ -1401,10 +1414,10 @@ describe("GoalLoop — startup scan scoping and hardening (GOAL-FP-01-04 follow-
   const sessionMock = Layer.mock(Session.Service, {
     messages: () => Effect.succeed([mkAssistant()]),
   })
-  const promptMock = Layer.mock(SessionPrompt.Service, {
+  const promptMock = Layer.mock(SessionPrompt.Service, withIdleAdmission({
     prompt: () => Effect.die("the direct prompt path is not exercised in this scenario"),
     promptIfIdle: () => Effect.sync(() => Option.none()),
-  })
+  }))
   const judgeMock = Layer.succeed(
     GoalLoopJudgeLLM,
     GoalLoopJudgeLLM.of({

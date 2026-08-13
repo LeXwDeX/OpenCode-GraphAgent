@@ -24,6 +24,7 @@ import { SessionPrompt } from "@/session/prompt"
 import { Session } from "@/session/session"
 import { SessionStatus } from "@/session/status"
 import { pollWithTimeout } from "../lib/effect"
+import { withIdleAdmission } from "../lib/session-prompt"
 
 // GOAL-FP-01-01 / GOAL-FP-01-03: the DAG automation-lease registration lifetime
 // must be bound to WORKFLOW STATE, not to wake delivery.
@@ -164,11 +165,11 @@ function leaseLifecycleLayer(input: { childPrompts: Queue.Queue<ChildPromptGate>
     yield* Queue.offer(input.childPrompts, { title: childTitles.get(sessionID) ?? sessionID, release })
     return reply(sessionID, yield* Deferred.await(release))
   })
-  const prompt = Layer.mock(SessionPrompt.Service, {
+  const prompt = Layer.mock(SessionPrompt.Service, withIdleAdmission({
     cancel: () => Effect.void,
     prompt: deliver,
     promptIfIdle: (value) => deliver(value).pipe(Effect.map(Option.some)),
-  })
+  }))
   const agent = Layer.mock(Agent.Service, {
     get: () =>
       Effect.succeed({

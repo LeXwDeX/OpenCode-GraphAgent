@@ -19,6 +19,7 @@ import { MessageID } from "@/session/schema"
 import { Session } from "@/session/session"
 import { SessionStatus } from "@/session/status"
 import { pollWithTimeout } from "../lib/effect"
+import { withIdleAdmission } from "../lib/session-prompt"
 
 interface PromptGate {
   readonly title: string
@@ -100,7 +101,7 @@ function raceLayer(input: {
       }),
     messages: (value) => input.messages(value as never) as never,
   })
-  const prompt = Layer.mock(SessionPrompt.Service, {
+  const prompt = Layer.mock(SessionPrompt.Service, withIdleAdmission({
     cancel: (sessionID) => Effect.sync(() => void input.cancelled.push(sessionID as string)),
     prompt: Effect.fn("test.SessionPrompt.prompt")(function* (value: SessionPrompt.PromptInput) {
       const sessionID = value.sessionID as string
@@ -113,7 +114,7 @@ function raceLayer(input: {
     }),
     // Keep wake delivery pending so the tests observe scheduling only.
     promptIfIdle: () => Effect.succeed(Option.none()),
-  })
+  }))
   const agent = Layer.mock(Agent.Service, {
     get: () => Effect.succeed({
       name: "build",

@@ -17,6 +17,7 @@ import { SessionPrompt } from "@/session/prompt"
 import { Session } from "@/session/session"
 import { SessionStatus } from "@/session/status"
 import { pollWithTimeout } from "../lib/effect"
+import { withIdleAdmission } from "../lib/session-prompt"
 
 type ChildStatus = "active" | "completed" | "failed" | "unknown"
 
@@ -71,14 +72,14 @@ function recoveryLayer(input: {
       return Effect.succeed([{ info: { role: "assistant", finish: "stop" } }] as never)
     }),
   })
-  const prompt = Layer.mock(SessionPrompt.Service, {
+  const prompt = Layer.mock(SessionPrompt.Service, withIdleAdmission({
     cancel: Effect.fn("test.SessionPrompt.cancel")((sessionID: string) =>
       Effect.sync(() => input.cancelled.push(sessionID)),
     ),
     // Keep wake delivery pending so tests can inspect durable unreported rows.
     prompt: () => Effect.never,
     promptIfIdle: () => Effect.succeed(Option.none()),
-  })
+  }))
   const loop = DagLoop.layer.pipe(
     Layer.provide(base),
     Layer.provide(session),

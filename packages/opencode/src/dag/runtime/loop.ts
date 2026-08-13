@@ -1232,54 +1232,42 @@ const serviceLayer = Layer.effect(
               // information. A differing summary (new results committed
               // between attempts) always prompts.
               if (deliveredWakeSummaries.size > 1024) deliveredWakeSummaries.clear()
-              const didDeliver = Option.getOrElse(
-                yield* automation.use(
-                  wakeLease,
-                  Effect.gen(function* () {
-                    if (deliveredWakeSummaries.get(sessionID) !== summary) {
-                      const delivered = yield* promptSvc.promptIfIdle({
-                        sessionID: SessionID.make(sessionID),
-                        parts: [{ type: "text", text: summary, synthetic: true }],
-                      })
-                      if (Option.isNone(delivered)) return false
-                      // Record BEFORE the mark: the transcript part was
-                      // already written (the prompt just succeeded), so the
-                      // retry must skip the prompt even when the mark below
-                      // fails again.
-                      deliveredWakeSummaries.set(sessionID, summary)
-                    }
-                    yield* store.markWakeBatchReported(batch).pipe(
-                      Effect.tap(() =>
-                        Effect.forEach(
-                          batch.workflows.filter((workflow) =>
-                            isWorkflowTerminalStatus(workflow.status as never),
-                          ),
-                          (workflow) =>
-                            automation.unregister(SessionID.make(sessionID), {
-                              kind: "dag",
-                              id: workflow.id,
-                            }),
-                          { discard: true },
-                        ),
-                      ),
-                      Effect.tap(() =>
-                        Effect.sync(() => {
-                          plan.unresponsiveDagIDs.forEach((workflowID) =>
-                            deliveredUnresponsiveDagIDs.add(workflowID),
-                          )
-                        }),
-                      ),
-                    )
-                    return true
-                  }).pipe(
-                    Effect.catchCause((cause) =>
-                      Effect.logWarning("DAG wake delivery failed", { sessionID, cause: Cause.pretty(cause) }).pipe(
-                        Effect.as(false),
-                      ),
+              const didDeliver = yield* Effect.gen(function* () {
+                if (deliveredWakeSummaries.get(sessionID) !== summary) {
+                  const delivered = yield* SessionPrompt.admitIfIdle(promptSvc, automation, wakeLease, {
+                    sessionID: SessionID.make(sessionID),
+                    parts: [{ type: "text", text: summary, synthetic: true }],
+                  })
+                  if (Option.isNone(delivered)) return false
+                  deliveredWakeSummaries.set(sessionID, summary)
+                  yield* delivered.value.pipe(
+                    Effect.onError(() =>
+                      Effect.sync(() => {
+                        if (deliveredWakeSummaries.get(sessionID) === summary) {
+                          deliveredWakeSummaries.delete(sessionID)
+                        }
+                      }),
                     ),
+                  )
+                }
+
+                const markLease = yield* automation.claim(SessionID.make(sessionID), { kind: "dag" })
+                if (Option.isNone(markLease)) return false
+                const marked = yield* automation.use(markLease.value, store.markWakeBatchReported(batch))
+                if (Option.isNone(marked)) return false
+                plan.unresponsiveDagIDs.forEach((workflowID) => deliveredUnresponsiveDagIDs.add(workflowID))
+                yield* Effect.forEach(
+                  batch.workflows.filter((workflow) => isWorkflowTerminalStatus(workflow.status as never)),
+                  (workflow) => automation.unregister(SessionID.make(sessionID), { kind: "dag", id: workflow.id }),
+                  { discard: true },
+                )
+                return true
+              }).pipe(
+                Effect.catchCause((cause) =>
+                  Effect.logWarning("DAG wake delivery failed", { sessionID, cause: Cause.pretty(cause) }).pipe(
+                    Effect.as(false),
                   ),
                 ),
-                () => false,
               )
               if (!didDeliver) return
             }
