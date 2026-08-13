@@ -11,13 +11,13 @@ execution; the router still owns any material Decision Checkpoint.
 
 Prefer composable blocks for a fresh flow. Load
 `workflow(action="guide", topic="blocks")` only if the block contract is not
-already in context. Use inline `spec` for one-off work; use `spec_path` only
-when a saved workflow already matches or persistence was requested. Preserve
+already in context. Write one-off work to a task-local YAML file and pass its
+`spec_path`; a matching saved workflow name is also a valid `spec_path`. Preserve
 the task, user constraints, named roles, read-only limits, acceptance checks,
 and confirmed decisions in the objective and block instructions.
 
-Call the workflow tool with `action=start` in the first response after the
-route is ready. Printing a plan, JSON, or YAML does not start it. Never invent
+Validate the YAML path, then call the workflow tool with `action=start` in the
+first response after the route is ready. Printing a plan or YAML does not start it. Never invent
 worker types or model IDs. If a configured capability or model is unavailable,
 report the actual gap and leave the workflow uncreated.
 

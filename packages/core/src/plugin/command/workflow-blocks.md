@@ -1,8 +1,8 @@
 # Composable Workflow Blocks
 
-Blocks are the high-level interface for assembling a one-off workflow. The
-tool compiles them into ordinary durable DAG nodes before validation and
-persistence. Existing node-based YAML remains compatible.
+Blocks are the high-level interface for assembling a one-off workflow YAML
+file. The tool compiles them into ordinary durable DAG nodes before validation
+and persistence. Existing node-based YAML remains compatible.
 
 ## Shape
 
@@ -33,10 +33,9 @@ config:
       depends_on: [verify]
 ```
 
-The parameter schema owns the exact block field shapes; the tool rejects
-unknown or missing fields by name, and `workflow(action="validate")` reports
-each field error with its path. This guide covers semantics and constraints
-only — compose blocks against the schema, not against prose.
+This guide owns the author-written block fields and semantics. The action
+schema stays shallow and accepts only `spec_path`; the YAML validator rejects
+unknown or missing graph fields by name and reports each error with its path.
 
 `objective` is required and is injected into every generated node. Use blocks
 or nodes, never both. Block IDs use letters, numbers, underscores, and hyphens.

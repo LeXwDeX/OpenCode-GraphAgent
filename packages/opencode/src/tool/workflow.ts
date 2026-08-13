@@ -47,33 +47,17 @@ export { Parameters as WorkflowParameters }
 // derives ownership from the calling session.
 // ============================================================================
 
-const specDescription = "Inline structured spec for a one-off graph. Use this or spec_path, never both"
 const specPathDescription =
-  '(start/extend/control replan/read/validate) A saved workflow name from the library (e.g. "code-review"), or a path to a YAML workflow spec. Relative paths resolve from the session directory'
+  '(start/extend/control replan/read/validate) A saved workflow name from the library (e.g. "code-review"), or a path to a YAML workflow spec. Graph content belongs in that file; relative paths resolve from the session directory'
 
-const StartInline = Schema.Struct({
-  action: Schema.Literal("start").annotate({ description: "Create a workflow" }),
-  spec: DagValidation.StartSpec.annotate({ description: specDescription }),
-})
 const StartPath = Schema.Struct({
   action: Schema.Literal("start").annotate({ description: "Create a workflow" }),
   spec_path: Schema.String.annotate({ description: specPathDescription }),
-})
-const ExtendInline = Schema.Struct({
-  action: Schema.Literal("extend").annotate({ description: "Add nodes or blocks to a live workflow" }),
-  workflow_id: Dag.ID.annotate({ description: "Target workflow ID" }),
-  spec: DagValidation.ExtendSpec.annotate({ description: specDescription }),
 })
 const ExtendPath = Schema.Struct({
   action: Schema.Literal("extend").annotate({ description: "Add nodes or blocks to a live workflow" }),
   workflow_id: Dag.ID.annotate({ description: "Target workflow ID" }),
   spec_path: Schema.String.annotate({ description: specPathDescription }),
-})
-const ControlReplanInline = Schema.Struct({
-  action: Schema.Literal("control").annotate({ description: "Control a live workflow" }),
-  operation: Schema.Literal("replan").annotate({ description: "Apply a node fragment (add/cancel/restart/replace)" }),
-  workflow_id: Dag.ID.annotate({ description: "Target workflow ID" }),
-  spec: DagValidation.ReplanSpec.annotate({ description: specDescription }),
 })
 const ControlReplanPath = Schema.Struct({
   action: Schema.Literal("control").annotate({ description: "Control a live workflow" }),
@@ -121,14 +105,7 @@ const Guide = Schema.Struct({
 })
 const ValidationProfile = Schema.optional(Schema.Literals(["portable", "environment"])).annotate({
   description:
-    "portable: distributable-template checks; environment: additionally resolves prompts, workers, and models in this project. Defaults: builtin specs portable, inline and project/global specs environment",
-})
-const ValidateInline = Schema.Struct({
-  action: Schema.Literal("validate").annotate({
-    description: "Pre-flight a custom spec without creating a workflow; returns diagnostics, never a workflow ID",
-  }),
-  spec: DagValidation.StartSpec.annotate({ description: specDescription }),
-  profile: ValidationProfile,
+    "portable: distributable-template checks; environment: additionally resolves prompts, workers, and models in this project. Defaults: builtin specs portable, project/global/path specs environment",
 })
 const ValidatePath = Schema.Struct({
   action: Schema.Literal("validate").annotate({
@@ -139,11 +116,8 @@ const ValidatePath = Schema.Struct({
 })
 
 export const Parameters = Schema.Union([
-  StartInline,
   StartPath,
-  ExtendInline,
   ExtendPath,
-  ControlReplanInline,
   ControlReplanPath,
   ControlOther,
   Status,
@@ -151,7 +125,6 @@ export const Parameters = Schema.Union([
   List,
   Read,
   Guide,
-  ValidateInline,
   ValidatePath,
 ])
 
@@ -267,7 +240,7 @@ export const WorkflowTool = Tool.define<
       formatValidationError: (error) =>
         [
           `Workflow call rejected by the action schema: ${error instanceof Error ? error.message : String(error)}`,
-          "Each action owns only its own fields: start {spec | spec_path}; extend {workflow_id, spec | spec_path}; control {workflow_id, operation} plus spec/spec_path for replan; status {workflow_id}; result {workflow_id, node_id, cursor?, limit?}; list {}; read {spec_path}; guide {topic?}; validate {spec | spec_path, profile?}. Graph-carrying actions take exactly one source (spec or spec_path), and session/project identity is never a parameter.",
+          "Each action owns only its own fields: start {spec_path}; extend {workflow_id, spec_path}; control(replan) {workflow_id, operation, spec_path}; other control operations {workflow_id, operation}; status {workflow_id}; result {workflow_id, node_id, cursor?, limit?}; list {}; read {spec_path}; guide {topic?}; validate {spec_path, profile?}. Put graph content in a .yaml/.yml file; session/project identity is never a parameter.",
         ].join("\n"),
       execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context<Metadata>) =>
         Effect.gen(function* () {
@@ -372,21 +345,18 @@ export const WorkflowTool = Tool.define<
               }
             }
             case "validate": {
-              const loaded =
-                "spec" in params
-                  ? { path: "<inline>", source: { kind: "inline" as const, value: params.spec } }
-                  : yield* loadSpecFile(params.spec_path, callingSession.directory, ctx).pipe(
-                      Effect.map((file) => ({
-                        path: file.path,
-                        source: { kind: "yaml" as const, source: file.path, content: file.content },
-                      })),
-                      Effect.catch((error: unknown) =>
-                        Effect.succeed({
-                          path: params.spec_path,
-                          loadError: error instanceof Error ? error.message : String(error),
-                        }),
-                      ),
-                    )
+              const loaded = yield* loadSpecFile(params.spec_path, callingSession.directory, ctx).pipe(
+                Effect.map((file) => ({
+                  path: file.path,
+                  source: { kind: "yaml" as const, source: file.path, content: file.content },
+                })),
+                Effect.catch((error: unknown) =>
+                  Effect.succeed({
+                    path: params.spec_path,
+                    loadError: error instanceof Error ? error.message : String(error),
+                  }),
+                ),
+              )
               const profile = params.profile ?? (DagWorkflows.isBuiltinPath(loaded.path) ? "portable" : "environment")
               const result =
                 "loadError" in loaded
@@ -537,11 +507,9 @@ export const WorkflowTool = Tool.define<
             }
             case "start": {
               const sessionID = SessionID.make(ctx.sessionID)
-              const source = yield* loadAuthoringSource(
-                "spec" in params ? { inline: params.spec } : { specPath: params.spec_path },
-                callingSession.directory,
-                ctx,
-              ).pipe(Effect.orDie)
+              const source = yield* loadAuthoringSource(params.spec_path, callingSession.directory, ctx).pipe(
+                Effect.orDie,
+              )
               const result = yield* authoring.prepare({
                 action: "start",
                 source,
@@ -612,11 +580,9 @@ export const WorkflowTool = Tool.define<
               const knownDependencies = (yield* dag.store.getNodes(params.workflow_id).pipe(Effect.orDie)).map(
                 (node) => node.id,
               )
-              const source = yield* loadAuthoringSource(
-                "spec" in params ? { inline: params.spec } : { specPath: params.spec_path },
-                callingSession.directory,
-                ctx,
-              ).pipe(Effect.orDie)
+              const source = yield* loadAuthoringSource(params.spec_path, callingSession.directory, ctx).pipe(
+                Effect.orDie,
+              )
               const result = yield* authoring.prepare({
                 action: "extend",
                 source,
@@ -642,11 +608,9 @@ export const WorkflowTool = Tool.define<
               if (params.operation === "replan") {
                 const workflowDefaults = Dag.parseWorkflowConfig(workflow.config)?.node_defaults
                 const knownDependencies = (yield* dag.store.getNodes(wfId).pipe(Effect.orDie)).map((node) => node.id)
-                const source = yield* loadAuthoringSource(
-                  "spec" in params ? { inline: params.spec } : { specPath: params.spec_path },
-                  callingSession.directory,
-                  ctx,
-                ).pipe(Effect.orDie)
+                const source = yield* loadAuthoringSource(params.spec_path, callingSession.directory, ctx).pipe(
+                  Effect.orDie,
+                )
                 const result = yield* authoring.prepare({
                   action: "replan",
                   source,
@@ -783,12 +747,11 @@ function loadSpecFile(specPath: string, directory: string, ctx: Tool.Context) {
 }
 
 function loadAuthoringSource(
-  input: { inline: unknown; specPath?: never } | { inline?: never; specPath: string },
+  specPath: string,
   directory: string,
   ctx: Tool.Context,
 ): Effect.Effect<AuthoringSource, Error> {
-  if ("inline" in input) return Effect.succeed({ kind: "inline" as const, value: input.inline })
-  return loadSpecFile(input.specPath, directory, ctx).pipe(
+  return loadSpecFile(specPath, directory, ctx).pipe(
     Effect.map((file) => ({ kind: "yaml" as const, source: file.path, content: file.content })),
   )
 }

@@ -23,7 +23,9 @@ const WORKTREE_LIFECYCLE_BRIEF = {
   objective:
     "Repair worktree lifecycle handling: fix bootstrap cleanup races and cover both tiers with regression tests",
   route: ["plan", "coding(worktree-core)", "coding(callers-and-fixture)", "verify", "review"],
-  skips: ["explore — the confirmed brief already supplies file references, failure mechanism, package split, risks, and acceptance checks"],
+  skips: [
+    "explore — the confirmed brief already supplies file references, failure mechanism, package split, risks, and acceptance checks",
+  ],
   packages: {
     "worktree-core": "worktree bootstrap/cleanup ownership in the core lifecycle",
     "callers-and-fixture": "call-site updates plus the isolated memory fixture in cli tests",
@@ -79,6 +81,11 @@ const worktreeLifecycleStartInput = {
   },
 } as const
 
+const worktreeLifecyclePathInput = {
+  action: "start",
+  spec_path: ".opencode/workflows/worktree-lifecycle-repair.yaml",
+} as const
+
 // The previously observed polluted calls: a start that carries another
 // action's identifiers and control fields. The empty-workflow_id shape
 // already fails the Dag.ID brand today; the plausible-id shape passes the
@@ -104,6 +111,21 @@ const decode = (input: unknown) =>
   Result.isSuccess(Schema.decodeUnknownResult(Parameters, { onExcessProperty: "error" })(input))
 
 describe("worktree-lifecycle regression fixtures", () => {
+  test("model-facing graph actions require a YAML source path", () => {
+    const spec = worktreeLifecycleStartInput.spec
+
+    expect(decode({ action: "start", spec_path: "workflow.yaml" })).toBe(true)
+    expect(decode({ action: "start", spec })).toBe(false)
+    expect(decode({ action: "extend", workflow_id: "dag_2x9k4m", spec_path: "extend.yaml" })).toBe(true)
+    expect(decode({ action: "extend", workflow_id: "dag_2x9k4m", spec })).toBe(false)
+    expect(
+      decode({ action: "control", operation: "replan", workflow_id: "dag_2x9k4m", spec_path: "replan.yaml" }),
+    ).toBe(true)
+    expect(decode({ action: "control", operation: "replan", workflow_id: "dag_2x9k4m", spec })).toBe(false)
+    expect(decode({ action: "validate", spec_path: "workflow.yaml", profile: "environment" })).toBe(true)
+    expect(decode({ action: "validate", spec, profile: "environment" })).toBe(false)
+  })
+
   test("decision brief route compiles under the block compiler", () => {
     const nodes = DagBlocks.compileWorkflowBlocks({
       objective: WORKTREE_LIFECYCLE_BRIEF.objective,
@@ -131,22 +153,23 @@ describe("worktree-lifecycle regression fixtures", () => {
     )
   })
 
-  test("accepted start fixture carries only start-owned fields and a complete config.blocks", () => {
-    expect(Object.keys(worktreeLifecycleStartInput)).toEqual(["action", "spec"])
+  test("accepted start carries only its YAML path while the authored fixture keeps complete blocks", () => {
+    expect(Object.keys(worktreeLifecyclePathInput)).toEqual(["action", "spec_path"])
     expect(worktreeLifecycleStartInput.spec.config.blocks.length).toBe(5)
-    expect(decode(worktreeLifecycleStartInput)).toBe(true)
+    expect(decode(worktreeLifecyclePathInput)).toBe(true)
   })
 
-  test("replay: the complete audit adds no explore block and strict decode keeps a clean start", () => {
+  test("replay: the complete audit adds no explore block and strict decode keeps a file-backed start", () => {
     // The confirmed brief already supplies repository evidence, so the route
     // starts at plan — no explore lane is added back.
     const blockIDs = worktreeLifecycleStartInput.spec.config.blocks.map((block) => block.id)
     expect(blockIDs.some((id) => id.includes("explore"))).toBe(false)
     expect(blockIDs).toEqual(["plan", "coding-worktree-core", "coding-callers-and-fixture", "verify", "review"])
     // Strict decoding admits exactly the start-owned fields.
-    const decoded = Schema.decodeUnknownSync(Parameters, { onExcessProperty: "error" })(worktreeLifecycleStartInput)
+    const decoded = Schema.decodeUnknownSync(Parameters, { onExcessProperty: "error" })(worktreeLifecyclePathInput)
     expect(decoded.action).toBe("start")
-    expect("spec" in decoded).toBe(true)
+    expect("spec_path" in decoded).toBe(true)
+    expect("spec" in decoded).toBe(false)
     expect("workflow_id" in decoded).toBe(false)
     expect("operation" in decoded).toBe(false)
     expect("node_id" in decoded).toBe(false)
@@ -165,17 +188,17 @@ describe("worktree-lifecycle regression fixtures", () => {
   })
 
   test("validate rejects control and result fields it does not own", () => {
-    const spec = worktreeLifecycleStartInput.spec
-    expect(decode({ action: "validate", spec, workflow_id: "dag_2x9k4m" })).toBe(false)
-    expect(decode({ action: "validate", spec, node_id: "verify" })).toBe(false)
-    expect(decode({ action: "validate", spec, operation: "cancel" })).toBe(false)
-    expect(decode({ action: "validate", spec, cursor: "", limit: 500 })).toBe(false)
-    // The validate action itself stays clean with exactly one source.
-    expect(decode({ action: "validate", spec, profile: "portable" })).toBe(true)
+    const spec_path = "workflow.yaml"
+    expect(decode({ action: "validate", spec_path, workflow_id: "dag_2x9k4m" })).toBe(false)
+    expect(decode({ action: "validate", spec_path, node_id: "verify" })).toBe(false)
+    expect(decode({ action: "validate", spec_path, operation: "cancel" })).toBe(false)
+    expect(decode({ action: "validate", spec_path, cursor: "", limit: 500 })).toBe(false)
+    // The validate action itself stays clean with its file source.
+    expect(decode({ action: "validate", spec_path, profile: "portable" })).toBe(true)
     expect(decode({ action: "validate", spec_path: "saved-route", profile: "environment" })).toBe(true)
   })
 
-  test("inline admission rejects boundary-owned audit fields; file reads strip them instead", () => {
+  test("model-facing start rejects inline admission objects entirely", () => {
     const brief = {
       goal: "Ship the change",
       scope: { in: ["dag"], out: [] },
@@ -197,13 +220,9 @@ describe("worktree-lifecycle regression fixtures", () => {
       acknowledged_risks: ["unresolved rollout"],
     }
     const spec = { ...worktreeLifecycleStartInput.spec, mode: "deep", admission: cleanAdmission }
-    expect(decode({ action: "start", spec })).toBe(true)
-    // System-generated fields never belong in the model-facing schema — the
-    // file-read boundary strips them for legacy YAML compatibility instead.
+    expect(decode({ action: "start", spec })).toBe(false)
     for (const field of ["protocol_version", "state", "fingerprint"]) {
-      expect(decode({ action: "start", spec: { ...spec, admission: { ...cleanAdmission, [field]: "x" } } })).toBe(
-        false,
-      )
+      expect(decode({ action: "start", spec: { ...spec, admission: { ...cleanAdmission, [field]: "x" } } })).toBe(false)
     }
   })
 })
