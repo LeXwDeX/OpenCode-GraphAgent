@@ -69,6 +69,17 @@ const serviceLayer = Layer.effect(
         const recovering = new Set<string>()
         const wakeInFlight = new Set<string>()
         const wakePending = new Set<string>()
+        // GOAL-FP-01-14: per-session record of the last wake summary whose
+        // transcript part was written. The durable mark runs AFTER the write
+        // (at-least-once delivery: a mark failure keeps the batch unreported
+        // for a retry), so a retry of an already-written summary would
+        // re-inject the same digest into the transcript. The retry dedupes on
+        // this map and only re-marks. In-process only — a crash between write
+        // and mark still duplicates on the restart sweep (a durable
+        // delivering-marker would need a schema change; registered, see
+        // GOAL-FP-01-14). Capped: evicting entries degrades to the pre-fix
+        // duplicate visibility, never to a lost wake.
+        const deliveredWakeSummaries = new Map<string, string>()
 
         // Seed the commented global dag.jsonc once per instance init — the
         // per-round DagConfig.load below stays a pure read so the spawn
@@ -1211,42 +1222,60 @@ const serviceLayer = Layer.effect(
               // receives the node result and can act) but NOT rendered as a user
               // message in the TUI chat — DAG data surfaces via the sidebar panel
               // and Inspector, keeping the chat conversation clean.
+              //
+              // GOAL-FP-01-14: the transcript part is written BEFORE the
+              // durable mark. A mark failure (or a crash between the two)
+              // leaves the batch unreported and the retry would re-inject the
+              // SAME summary. When this session already had this exact summary
+              // written, skip the prompt and only re-mark — the write is
+              // idempotent in effect because an identical digest adds no
+              // information. A differing summary (new results committed
+              // between attempts) always prompts.
+              if (deliveredWakeSummaries.size > 1024) deliveredWakeSummaries.clear()
               const didDeliver = Option.getOrElse(
                 yield* automation.use(
                   wakeLease,
-                  promptSvc.promptIfIdle({
-                    sessionID: SessionID.make(sessionID),
-                    parts: [{ type: "text", text: summary, synthetic: true }],
-                  }).pipe(
-                    Effect.flatMap(Option.match({
-                      onNone: () => Effect.succeed(false),
-                      onSome: () =>
-                        store.markWakeBatchReported(batch).pipe(
-                          Effect.tap(() =>
-                            Effect.forEach(
-                              batch.workflows.filter((workflow) =>
-                                isWorkflowTerminalStatus(workflow.status as never),
-                              ),
-                              (workflow) =>
-                                automation.unregister(SessionID.make(sessionID), {
-                                  kind: "dag",
-                                  id: workflow.id,
-                                }),
-                              { discard: true },
-                            ),
+                  Effect.gen(function* () {
+                    if (deliveredWakeSummaries.get(sessionID) !== summary) {
+                      const delivered = yield* promptSvc.promptIfIdle({
+                        sessionID: SessionID.make(sessionID),
+                        parts: [{ type: "text", text: summary, synthetic: true }],
+                      })
+                      if (Option.isNone(delivered)) return false
+                      // Record BEFORE the mark: the transcript part was
+                      // already written (the prompt just succeeded), so the
+                      // retry must skip the prompt even when the mark below
+                      // fails again.
+                      deliveredWakeSummaries.set(sessionID, summary)
+                    }
+                    yield* store.markWakeBatchReported(batch).pipe(
+                      Effect.tap(() =>
+                        Effect.forEach(
+                          batch.workflows.filter((workflow) =>
+                            isWorkflowTerminalStatus(workflow.status as never),
                           ),
-                          Effect.tap(() =>
-                            Effect.sync(() => {
-                              plan.unresponsiveDagIDs.forEach((workflowID) =>
-                                deliveredUnresponsiveDagIDs.add(workflowID),
-                              )
+                          (workflow) =>
+                            automation.unregister(SessionID.make(sessionID), {
+                              kind: "dag",
+                              id: workflow.id,
                             }),
-                          ),
-                          Effect.as(true),
+                          { discard: true },
                         ),
-                    })),
-                    Effect.catchCause(() =>
-                      Effect.logWarning("DAG wake delivery failed", { sessionID }).pipe(Effect.as(false)),
+                      ),
+                      Effect.tap(() =>
+                        Effect.sync(() => {
+                          plan.unresponsiveDagIDs.forEach((workflowID) =>
+                            deliveredUnresponsiveDagIDs.add(workflowID),
+                          )
+                        }),
+                      ),
+                    )
+                    return true
+                  }).pipe(
+                    Effect.catchCause((cause) =>
+                      Effect.logWarning("DAG wake delivery failed", { sessionID, cause: Cause.pretty(cause) }).pipe(
+                        Effect.as(false),
+                      ),
                     ),
                   ),
                 ),

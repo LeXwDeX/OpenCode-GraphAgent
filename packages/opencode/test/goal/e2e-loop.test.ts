@@ -7,6 +7,7 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 import { SessionStatus } from "@/session/status"
 import { Session } from "@/session/session"
 import { SessionPrompt } from "@/session/prompt"
+import { SessionRunState } from "@/session/run-state"
 import { Provider } from "@/provider/provider"
 import { SessionID } from "@/session/schema"
 import { SessionAutomationLease } from "@/session/automation-lease"
@@ -572,6 +573,266 @@ describe("GoalLoop — continuation dispatch failure → recoverable pause (D1)"
       expect(resumed?.status).toBe("active")
       expect(Number(resumed?.turns_used)).toBe(turnsBefore) // budget preserved, not reset
       expect(resumed?.paused_reason).toBeUndefined()
+    }),
+  )
+})
+
+// ── GOAL-FP-01-12: dispatch-failure unregister must not depend on the
+// trailing load ─────────────────────────────────────────────────────────
+//
+// The failure path pauses the goal and the loop releases the lease
+// registration afterwards. That release must be SYMMETRIC with the pause
+// (pauseAndPublish + unregister in the same handler) — it must not depend on
+// the afterDispatch load that follows the dispatch attempt. To make the
+// dependency observable, the failure path's visible-pause prompt parks on a
+// gate; the test body then drops the goal_state table and releases the gate,
+// so the trailing load dies with a defect: only an inline unregister can
+// release the lease.
+describe("GoalLoop — dispatch failure releases the lease without the trailing load (GOAL-FP-01-12)", () => {
+  let judgeCalls = 0
+  let promptGate = Deferred.makeUnsafe<void>()
+  const reset = () => {
+    judgeCalls = 0
+    promptGate = Deferred.makeUnsafe<void>()
+  }
+
+  const sessionMock = Layer.mock(Session.Service, {
+    messages: () => Effect.succeed([mkAssistant()]),
+  })
+  // Continuation dispatch fails (promptIfIdle). The failure handler's
+  // visible-pause prompt parks on a gate — the sync point where the test body
+  // drops the goal_state table — so afterDispatch's goal.load defects: the
+  // lease release must NOT depend on that trailing load. The die after the
+  // gate is swallowed by the handler's Effect.ignore.
+  const promptFailAndParkMock = Layer.mock(SessionPrompt.Service, {
+    prompt: () =>
+      Effect.gen(function* () {
+        yield* Deferred.await(promptGate)
+        return yield* Effect.die("failure-path prompt is the last stop before the trailing load")
+      }),
+    promptIfIdle: () => Effect.die(new Error("continuation provider down")),
+  })
+  const judgeMock = Layer.succeed(
+    GoalLoopJudgeLLM,
+    GoalLoopJudgeLLM.of({
+      call: () =>
+        Effect.sync(() => {
+          judgeCalls += 1
+          return JSON.stringify({ done: false, reason: "more steps needed" })
+        }),
+    }),
+  )
+  const failLayer = GoalLoop.layer.pipe(
+    Layer.provide(sessionMock),
+    Layer.provide(promptFailAndParkMock),
+    Layer.provide(Layer.mock(Provider.Service, {})),
+    Layer.provide(judgeMock),
+    Layer.provideMerge(Goal.defaultLayer),
+    Layer.provideMerge(SessionStatus.defaultLayer),
+    Layer.provideMerge(EventV2Bridge.defaultLayer),
+    Layer.provideMerge(SessionAutomationLease.defaultLayer),
+    Layer.provideMerge(Database.defaultLayer),
+  )
+  const it = testEffect(failLayer)
+
+  it.instance("the lease registration is gone after the failure pause even when the post-dispatch load dies", () =>
+    Effect.gen(function* () {
+      reset()
+      const loop = yield* GoalLoop.Service
+      const goal = yield* Goal.Service
+      const automation = yield* SessionAutomationLease.Service
+      const { db } = yield* Database.Service
+      const events = yield* EventV2Bridge.Service
+      const seen = yield* captureEvents(events)
+      yield* loop.init()
+      const sid = SessionID.descending()
+      const goalState = yield* goal.set(sid, "ship the feature", 10)
+      const goalOwner = { kind: "goal" as const, id: goalState.goal_id ?? "legacy" }
+      yield* Effect.yieldNow
+
+      yield* events.publish(SessionStatus.Event.Status, { sessionID: sid, status: { type: "idle" } })
+      // The pause committed and published BEFORE the handler reaches the
+      // parked prompt — the parked handler is the deterministic sync point.
+      yield* pollWithTimeout(
+        Effect.sync(() =>
+          seen.some((e) => e.type === GoalEvent.Updated.type && e.status === "paused") ? true : undefined,
+        ),
+        "failure path never paused the goal",
+        "5 seconds",
+      )
+      // Kill the trailing load: the handler is parked on the prompt gate, so
+      // dropping the table here guarantees afterDispatch's goal.load defects.
+      yield* db.run("DROP TABLE goal_state")
+      yield* Deferred.succeed(promptGate, undefined)
+      // Give the (defecting) trailing load a scheduler turn to run.
+      yield* Effect.sleep("100 millis")
+      expect(judgeCalls).toBeGreaterThanOrEqual(1)
+
+      // The registration must already be released — pre-fix it leaks until
+      // /goal clear because the trailing load (the only unregister) died.
+      expect(Option.isNone(yield* automation.claim(sid, goalOwner))).toBe(true)
+    }),
+  )
+})
+
+// ── GOAL-FP-01-13: real admission seam for the goal continuation ───────
+//
+// Every other GoalLoop harness mocks SessionPrompt with a flat
+// `promptIfIdle: () => Option.some(...)` — the real admission gate
+// (SessionRunState.startIfIdle: Runner state machine, busy flip, onIdle →
+// real SessionStatus.set → real idle event) is never exercised, so the
+// lease-claim + promptIfIdle atomicity has no regression coverage.
+//
+// The REAL SessionPrompt layer pulls in the whole app (Permission, MCP, LSP,
+// ToolRegistry, Config, Plugin, …) — disproportionate for this suite. The
+// tightest feasible real seam: the REAL SessionRunState.defaultLayer, with a
+// SessionPrompt mock that delegates promptIfIdle admission to the real gate
+// exactly like the real implementation's core. Remains mocked (reported):
+// SessionPrompt.admitPrompt (transcript write) + runLoop (provider turn),
+// Session.messages, Provider, judge LLM.
+describe("GoalLoop — real SessionRunState admission seam (GOAL-FP-01-13)", () => {
+  let judgeCalls = 0
+  let admissions = 0
+  let rejectedAdmissions = 0
+  let firstAdmissionParked = false
+  let admissionRelease = Deferred.makeUnsafe<void>()
+  const reset = () => {
+    judgeCalls = 0
+    admissions = 0
+    rejectedAdmissions = 0
+    firstAdmissionParked = false
+    admissionRelease = Deferred.makeUnsafe<void>()
+  }
+
+  const sessionMock = Layer.mock(Session.Service, {
+    messages: () => Effect.succeed([mkAssistant()]),
+  })
+  // Effect.fn-wrapped like the wake-integration harness's `deliver` mock. The
+  // real SessionRunState is resolved via serviceOption (R-free, same pattern
+  // the harness uses for the bridge) so the implementation stays assignable to
+  // the SessionPrompt Interface while still hitting the REAL admission gate.
+  //
+  // The scripted "run" completes with an interrupt (typed never, no cast):
+  // the Runner's finishRun still emits the real onIdle (status.set(idle) →
+  // real event) before completing the handle, so the loop re-drive chain is
+  // real. The mock returns Option.none() even on admission — afterIdle
+  // discards the promptIfIdle result (only its failure matters), and
+  // admission is observable through the real status flip and the counters.
+  const promptIfIdle = Effect.fn("test.goalSeam.SessionPrompt.promptIfIdle")(function* (
+    input: SessionPrompt.PromptInput,
+  ) {
+    const runState = yield* Effect.serviceOption(SessionRunState.Service)
+    if (Option.isNone(runState)) return yield* Effect.die("SessionRunState not provided to the seam mock")
+    const admitted = yield* runState.value.startIfIdle(
+      input.sessionID,
+      Effect.die("onInterrupt is not exercised in this scenario"),
+      Effect.gen(function* () {
+        admissions += 1
+        if (admissions === 1) {
+          firstAdmissionParked = true
+          yield* Deferred.await(admissionRelease)
+        }
+        return yield* Effect.interrupt
+      }),
+    )
+    if (Option.isNone(admitted)) {
+      rejectedAdmissions += 1
+      return Option.none()
+    }
+    // Await the run's completion (the Cancelled exit is captured) so the
+    // mock's promptIfIdle stays faithful to the real one's waiting behavior.
+    yield* admitted.value.pipe(Effect.exit, Effect.asVoid)
+    return Option.none()
+  })
+  const promptMock = Layer.mock(SessionPrompt.Service, {
+    prompt: () => Effect.die("the direct prompt path is not exercised in this scenario"),
+    promptIfIdle,
+  })
+  const judgeMock = Layer.succeed(
+    GoalLoopJudgeLLM,
+    GoalLoopJudgeLLM.of({
+      call: () =>
+        Effect.sync(() => {
+          judgeCalls += 1
+          // Calls 1-2 continue (drive admissions 1-2); call 3 ends the goal.
+          return judgeCalls <= 2
+            ? JSON.stringify({ done: false, reason: "more steps needed" })
+            : JSON.stringify({ done: true, reason: "feature shipped" })
+        }),
+    }),
+  )
+  const seamLayer = GoalLoop.layer.pipe(
+    Layer.provide(sessionMock),
+    Layer.provide(promptMock),
+    Layer.provide(Layer.mock(Provider.Service, {})),
+    Layer.provide(judgeMock),
+    Layer.provideMerge(Goal.defaultLayer),
+    Layer.provideMerge(SessionStatus.defaultLayer),
+    Layer.provideMerge(EventV2Bridge.defaultLayer),
+    Layer.provideMerge(SessionAutomationLease.defaultLayer),
+    Layer.provideMerge(SessionRunState.defaultLayer),
+  )
+  const it = testEffect(seamLayer)
+
+  it.instance("a continuation admitted by the real gate flips the session busy, blocks concurrent admission, and the real idle re-drives the loop to done", () =>
+    Effect.gen(function* () {
+      reset()
+      const loop = yield* GoalLoop.Service
+      const goal = yield* Goal.Service
+      const status = yield* SessionStatus.Service
+      const runState = yield* SessionRunState.Service
+      const events = yield* EventV2Bridge.Service
+      const seen = yield* captureEvents(events)
+      yield* loop.init()
+      const sid = SessionID.descending()
+      yield* goal.set(sid, "ship the feature", 10)
+      yield* Effect.yieldNow
+
+      // Turn 1: idle → judge(continue) → continuation admitted through the
+      // REAL admission gate; the scripted run parks and the session is BUSY.
+      yield* events.publish(SessionStatus.Event.Status, { sessionID: sid, status: { type: "idle" } })
+      yield* pollWithTimeout(
+        Effect.sync(() => (firstAdmissionParked ? true : undefined)),
+        "the continuation was never admitted through the real gate",
+        "5 seconds",
+      )
+      // Real seam proof: admission itself flipped the session status to busy.
+      expect((yield* status.get(sid)).type).toBe("busy")
+      // The real gate rejects concurrent admission while the goal run holds it
+      // (the probe work is Effect.never — a rejection never forks it).
+      const probe = yield* runState.startIfIdle(
+        sid,
+        Effect.die("probe onInterrupt is not exercised"),
+        Effect.never,
+      )
+      expect(Option.isNone(probe)).toBe(true)
+      expect(admissions).toBe(1)
+
+      // Release the run: the REAL Runner onIdle publishes the REAL idle
+      // status event, which re-drives GoalLoop with NO manual idle publish —
+      // the next continuation and the judge(done) terminal transition both
+      // ride the real chain.
+      yield* Deferred.succeed(admissionRelease, undefined)
+      yield* pollWithTimeout(
+        Effect.sync(() => (admissions >= 2 ? true : undefined)),
+        "the real onIdle event never re-drove the goal loop",
+        "5 seconds",
+      )
+      expect(rejectedAdmissions).toBe(0)
+      yield* pollWithTimeout(
+        Effect.sync(() => (judgeCalls >= 3 ? true : undefined)),
+        "the loop never reached the terminal judge call",
+        "5 seconds",
+      )
+
+      // Terminal contract through the real chain: exactly one done update,
+      // the cleared event, and the row is gone.
+      const doneUpdates = seen.filter((e) => e.type === GoalEvent.Updated.type && e.status === "done")
+      expect(doneUpdates.length).toBe(1)
+      expect(seen.some((e) => e.type === GoalEvent.Cleared.type)).toBe(true)
+      expect(yield* goal.load(sid)).toBeUndefined()
+      expect(admissions).toBe(2)
+      expect(judgeCalls).toBe(3)
     }),
   )
 })

@@ -60,7 +60,11 @@ export interface Interface {
     verdict: GoalState.Verdict,
     reason: string,
     parseFailed: boolean,
-    expected?: { readonly goalID: string; readonly revision: number },
+    /** GOAL-FP-01-07: the pre-judge state identity is part of the contract —
+     * a judge result is only applied when the durable row still carries this
+     * goalID+revision pair. Required (not optional): an omitted expected would
+     * let a stale loop result mutate whatever goal replaced the judged one. */
+    expected: { readonly goalID: string; readonly revision: number },
   ) => Effect.Effect<
     | {
         state: GoalState.Info
@@ -285,10 +289,8 @@ const serviceLayer = Layer.effect(
 
     const matchesExpected = (
       state: GoalState.Info,
-      expected?: { readonly goalID: string; readonly revision: number },
-    ) =>
-      !expected ||
-      ((state.goal_id ?? "legacy") === expected.goalID && (state.revision ?? 0) === expected.revision)
+      expected: { readonly goalID: string; readonly revision: number },
+    ) => (state.goal_id ?? "legacy") === expected.goalID && (state.revision ?? 0) === expected.revision
 
     const deleteAndPublishDone = Effect.fnUntraced(function* (sessionID: SessionID, reason: string) {
       return yield* transition<GoalState.Info | undefined>(sessionID, (state) => {
@@ -376,9 +378,21 @@ const serviceLayer = Layer.effect(
         consecutive_parse_failures: GoalState.nni(0),
         subgoals: [],
       })
-      const result = yield* transition(sessionID, () => ({ tag: "save", state, value: state }))
-      yield* automation.register(sessionID, { kind: "goal", id: result.goal_id ?? "legacy" })
-      return result
+      // GOAL-FP-01-08: the overwrite must stay consistent with the lease. The
+      // previous id is captured from the SAME seam read that decides the
+      // overwrite, and unregistered before the new id is registered — a stale
+      // id left in the registration set would be returned by owner() and
+      // reject the new goal's claim (loop silently starved until /goal clear).
+      const result = yield* transition(sessionID, (previous) => ({
+        tag: "save",
+        state,
+        value: { state, previousGoalID: previous?.goal_id ?? "legacy" },
+      }))
+      if (result.previousGoalID !== (result.state.goal_id ?? "legacy")) {
+        yield* automation.unregister(sessionID, { kind: "goal", id: result.previousGoalID })
+      }
+      yield* automation.register(sessionID, { kind: "goal", id: result.state.goal_id ?? "legacy" })
+      return result.state
     })
 
     const pause = Effect.fn("Goal.pause")(function* (sessionID: SessionID, reason: string) {
@@ -530,7 +544,7 @@ const serviceLayer = Layer.effect(
       verdict: GoalState.Verdict,
       reason: string,
       parseFailed: boolean,
-      expected?: { readonly goalID: string; readonly revision: number },
+      expected: { readonly goalID: string; readonly revision: number },
     ) {
       return yield* transition(sessionID, (state) => {
         if (!state || state.status !== "active" || !matchesExpected(state, expected))

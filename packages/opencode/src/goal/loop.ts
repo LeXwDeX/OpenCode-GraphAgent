@@ -314,11 +314,25 @@ const serviceLayer = Layer.effect(
         yield* automation.unregister(sessionID, goalOwner)
         evaluatedRevisions.delete(sessionID)
         if (verdict.verdict === "done") {
+          // GOAL-FP-01-15: the done transition has already committed when this
+          // prompt runs (durable state leads presentation — the row is gone
+          // and goal.updated(done)/goal.cleared are published), so a failure
+          // here loses only the transcript line, never the state. Never
+          // swallow it silently — log it so a lost confirmation is
+          // diagnosable. No retry: a retried prompt could re-inject a "done"
+          // line after the goal was re-created.
           yield* promptSvc.prompt({
             sessionID,
             noReply: true,
             parts: [{ type: "text", text: updateResult.message }],
-          }).pipe(Effect.ignore)
+          }).pipe(
+            Effect.catchCause((cause) =>
+              Effect.logWarning("goal done message delivery failed", {
+                sessionID,
+                cause: Cause.pretty(cause),
+              }),
+            ),
+          )
         } else {
           // Auto-pause branch: updateAfterJudge paused the goal due to
           // judge-parse-failure or budget exhaustion (verdict.verdict is
@@ -428,7 +442,14 @@ const serviceLayer = Layer.effect(
               }
               const errMsg = `continuation dispatch failed: ${Cause.pretty(cause)}`
               yield* Effect.logWarning("goal continuation dispatch failed", { error: Cause.pretty(cause) })
-              yield* goal.pauseAndPublish(sessionID, errMsg).pipe(Effect.ignore)
+              // GOAL-FP-01-12: symmetric with every other pause site — the
+              // unregister must be part of the failure transition, not
+              // deferred to the trailing afterDispatch load (which a defect or
+              // a concurrent replacement can skip, leaking the registration
+              // until /goal clear). pauseGoal keeps the fiber-safe
+              // pauseAndPublish (goal.pause would clearFiber — us —
+              // mid-publish) and releases the lease registration inline.
+              yield* pauseGoal(sessionID, errMsg).pipe(Effect.ignore)
               yield* promptSvc.prompt({ sessionID, noReply: true, parts: [{ type: "text", text: `⏸ 目标已暂停 — ${errMsg}` }] }).pipe(Effect.ignore)
               return Option.none()
             }),

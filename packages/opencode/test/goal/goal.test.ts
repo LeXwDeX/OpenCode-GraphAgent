@@ -1,10 +1,11 @@
 import { describe, expect } from "bun:test"
-import { Deferred, Effect, Fiber, Layer } from "effect"
+import { Deferred, Effect, Fiber, Layer, Option } from "effect"
 import { Goal } from "@/goal/goal"
 import { GoalEvent } from "@/goal/events"
 import { GoalPrompts } from "@/goal/prompts"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { SessionStatus } from "@/session/status"
+import { SessionAutomationLease } from "@/session/automation-lease"
 import { Database } from "@opencode-ai/core/database/database"
 import { SessionID } from "@/session/schema"
 import { pollWithTimeout, testEffect } from "../lib/effect"
@@ -99,10 +100,13 @@ describe("Goal.updateAfterJudge — continue branch", () => {
       const seen = yield* captureEvents(events)
       const sessionID = SessionID.descending()
 
-      yield* goal.set(sessionID, "build feature X", 10)
+      const state = yield* goal.set(sessionID, "build feature X", 10)
       seen.length = 0 // drop the set() goal.updated(active)
 
-      const result = yield* goal.updateAfterJudge(sessionID, "continue", "more steps", false)
+      const result = yield* goal.updateAfterJudge(sessionID, "continue", "more steps", false, {
+        goalID: state.goal_id ?? "legacy",
+        revision: state.revision ?? 0,
+      })
 
       expect(result?.shouldContinue).toBe(true)
       const loaded = yield* goal.load(sessionID)
@@ -128,7 +132,10 @@ describe("Goal.updateAfterJudge — atomic done transition", () => {
       const before = yield* goal.load(sessionID)
       const n = Number(before?.turns_used)
 
-      const result = yield* goal.updateAfterJudge(sessionID, "done", "delivered", false)
+      const result = yield* goal.updateAfterJudge(sessionID, "done", "delivered", false, {
+        goalID: before?.goal_id ?? "legacy",
+        revision: before?.revision ?? 0,
+      })
 
       expect(result?.state.status).toBe("done")
       expect(Number(result?.state.turns_used)).toBe(n)
@@ -148,10 +155,13 @@ describe("Goal.updateAfterJudge — done branch (terminal event contract)", () =
       const seen = yield* captureEvents(events)
       const sessionID = SessionID.descending()
 
-      yield* goal.set(sessionID, "ship feature X", 10)
+      const state = yield* goal.set(sessionID, "ship feature X", 10)
       seen.length = 0
 
-      yield* goal.updateAfterJudge(sessionID, "done", "delivered", false)
+      yield* goal.updateAfterJudge(sessionID, "done", "delivered", false, {
+        goalID: state.goal_id ?? "legacy",
+        revision: state.revision ?? 0,
+      })
 
       const types = seen.map((e) => e.type)
       expect(types).toEqual([GoalEvent.Updated.type, GoalEvent.Cleared.type])
@@ -174,7 +184,7 @@ describe("Goal.updateAfterJudge — blocked branch", () => {
       const seen = yield* captureEvents(events)
       const sessionID = SessionID.descending()
 
-      yield* goal.set(sessionID, "deploy production", 10)
+      const state = yield* goal.set(sessionID, "deploy production", 10)
       seen.length = 0
 
       const result = yield* goal.updateAfterJudge(
@@ -182,6 +192,7 @@ describe("Goal.updateAfterJudge — blocked branch", () => {
         "blocked",
         "missing production credentials",
         false,
+        { goalID: state.goal_id ?? "legacy", revision: state.revision ?? 0 },
       )
 
       expect(result?.state.status).toBe("paused")
@@ -197,12 +208,15 @@ describe("Goal transition authority — stale loop decisions", () => {
     Effect.gen(function* () {
       const goal = yield* Goal.Service
       const sessionID = SessionID.descending()
-      yield* goal.set(sessionID, "ship feature X", 10)
+      const state = yield* goal.set(sessionID, "ship feature X", 10)
 
       yield* Effect.all(
         [
           goal.pause(sessionID, "user-paused"),
-          goal.updateAfterJudge(sessionID, "continue", "racing judge result", false),
+          goal.updateAfterJudge(sessionID, "continue", "racing judge result", false, {
+            goalID: state.goal_id ?? "legacy",
+            revision: state.revision ?? 0,
+          }),
         ],
         { concurrency: 2 },
       )
@@ -215,12 +229,15 @@ describe("Goal transition authority — stale loop decisions", () => {
     Effect.gen(function* () {
       const goal = yield* Goal.Service
       const sessionID = SessionID.descending()
-      yield* goal.set(sessionID, "ship feature X", 10)
+      const state = yield* goal.set(sessionID, "ship feature X", 10)
 
       yield* Effect.all(
         [
           goal.clear(sessionID),
-          goal.updateAfterJudge(sessionID, "continue", "racing judge result", false),
+          goal.updateAfterJudge(sessionID, "continue", "racing judge result", false, {
+            goalID: state.goal_id ?? "legacy",
+            revision: state.revision ?? 0,
+          }),
         ],
         { concurrency: 2 },
       )
@@ -309,9 +326,12 @@ describe("Goal.markDone — turns_used is budget-neutral", () => {
       const seen = yield* captureEvents(events)
       const sessionID = SessionID.descending()
 
-      yield* goal.set(sessionID, "ship feature X", 10)
+      const state = yield* goal.set(sessionID, "ship feature X", 10)
       // Simulate one continuation dispatch (the budget-consuming event).
-      yield* goal.updateAfterJudge(sessionID, "continue", "more steps", false)
+      yield* goal.updateAfterJudge(sessionID, "continue", "more steps", false, {
+        goalID: state.goal_id ?? "legacy",
+        revision: state.revision ?? 0,
+      })
       const continued = yield* goal.load(sessionID)
       seen.length = 0
 
@@ -320,6 +340,39 @@ describe("Goal.markDone — turns_used is budget-neutral", () => {
       const event = doneUpdated(seen)
       // Only the continue increment; markDone adds nothing.
       expect(event.turnsUsed).toBe(Number(continued?.turns_used))
+    }),
+  )
+})
+
+// ---------------------------------------------------------------------------
+// GOAL-FP-01-08: Goal.set must not leave the previous goal's id in the lease.
+// The lease's owner() returns the FIRST id in the registration set, so a stale
+// entry makes the new goal's claim be rejected (selected.id !== request.id)
+// and the loop silently starves. Replacing a goal must unregister the previous
+// id atomically with the new registration.
+// ---------------------------------------------------------------------------
+
+const setLeaseLayer = Goal.layer.pipe(
+  Layer.provide(SessionStatus.defaultLayer),
+  Layer.provideMerge(SessionAutomationLease.defaultLayer),
+  Layer.provideMerge(Database.defaultLayer),
+  Layer.provideMerge(EventV2Bridge.defaultLayer),
+)
+
+describe("Goal.set — replacing a goal unregisters the previous lease id (GOAL-FP-01-08)", () => {
+  testEffect(setLeaseLayer).live("set on an existing goal leaves exactly the new goal id claimable", () =>
+    Effect.gen(function* () {
+      const goal = yield* Goal.Service
+      const lease = yield* SessionAutomationLease.Service
+      const sessionID = SessionID.descending()
+
+      const first = yield* goal.set(sessionID, "goal A", 10)
+      const second = yield* goal.set(sessionID, "goal B", 10)
+
+      // Pre-fix: the lease still holds BOTH ids (register never removes the
+      // previous one), so the stale id is claimable and the fresh one is not.
+      expect(Option.isNone(yield* lease.claim(sessionID, { kind: "goal", id: first.goal_id ?? "legacy" }))).toBe(true)
+      expect(Option.isSome(yield* lease.claim(sessionID, { kind: "goal", id: second.goal_id ?? "legacy" }))).toBe(true)
     }),
   )
 })
@@ -406,9 +459,12 @@ describe("Goal.resume — preserves turns_used (no fresh budget), resets parse f
       const seen = yield* captureEvents(events)
       const sessionID = SessionID.descending()
 
-      yield* goal.set(sessionID, "build feature X", 10)
+      const state = yield* goal.set(sessionID, "build feature X", 10)
       // One continuation dispatch with a parse failure → turns_used=1, cpf=1
-      yield* goal.updateAfterJudge(sessionID, "continue", "more steps", true)
+      yield* goal.updateAfterJudge(sessionID, "continue", "more steps", true, {
+        goalID: state.goal_id ?? "legacy",
+        revision: state.revision ?? 0,
+      })
       const beforePause = yield* goal.load(sessionID)
       expect(Number(beforePause?.turns_used)).toBe(1)
       expect(Number(beforePause?.consecutive_parse_failures)).toBe(1)
@@ -445,9 +501,15 @@ describe("Goal.resume — preserves turns_used (no fresh budget), resets parse f
       const sessionID = SessionID.descending()
 
       // max_turns=2: a second continue verdict trips the budget-pause branch
-      yield* goal.set(sessionID, "build feature X", 2)
-      yield* goal.updateAfterJudge(sessionID, "continue", "step 1", false) // turns_used 1
-      yield* goal.updateAfterJudge(sessionID, "continue", "step 2", false) // turns_used 2 >= max → paused
+      const state = yield* goal.set(sessionID, "build feature X", 2)
+      const step1 = yield* goal.updateAfterJudge(sessionID, "continue", "step 1", false, {
+        goalID: state.goal_id ?? "legacy",
+        revision: state.revision ?? 0,
+      }) // turns_used 1
+      yield* goal.updateAfterJudge(sessionID, "continue", "step 2", false, {
+        goalID: step1?.state.goal_id ?? "legacy",
+        revision: step1?.state.revision ?? 0,
+      }) // turns_used 2 >= max → paused
 
       const paused = yield* goal.load(sessionID)
       expect(paused?.status).toBe("paused")
@@ -587,12 +649,18 @@ describe("Goal.updateAfterJudge — transport failures trigger auto-pause (D5)",
       const seen = yield* captureEvents(events)
       const sessionID = SessionID.descending()
 
-      yield* goal.set(sessionID, "build feature X", 10)
+      const state = yield* goal.set(sessionID, "build feature X", 10)
       seen.length = 0
 
       // Two transport failures — still active, counter climbing 1 → 2
-      const r1 = yield* goal.updateAfterJudge(sessionID, "continue", "transport error 1", true)
-      const r2 = yield* goal.updateAfterJudge(sessionID, "continue", "transport error 2", true)
+      const r1 = yield* goal.updateAfterJudge(sessionID, "continue", "transport error 1", true, {
+        goalID: state.goal_id ?? "legacy",
+        revision: state.revision ?? 0,
+      })
+      const r2 = yield* goal.updateAfterJudge(sessionID, "continue", "transport error 2", true, {
+        goalID: r1?.state.goal_id ?? "legacy",
+        revision: r1?.state.revision ?? 0,
+      })
       expect(r1?.shouldContinue).toBe(true)
       expect(r2?.shouldContinue).toBe(true)
 
@@ -601,7 +669,10 @@ describe("Goal.updateAfterJudge — transport failures trigger auto-pause (D5)",
       expect(Number(midState?.consecutive_parse_failures)).toBe(2)
 
       // Third transport failure — counter reaches 3 → auto-pause
-      const r3 = yield* goal.updateAfterJudge(sessionID, "continue", "transport error 3", true)
+      const r3 = yield* goal.updateAfterJudge(sessionID, "continue", "transport error 3", true, {
+        goalID: r2?.state.goal_id ?? "legacy",
+        revision: r2?.state.revision ?? 0,
+      })
       expect(r3?.shouldContinue).toBe(false)
 
       const finalState = yield* goal.load(sessionID)
@@ -625,22 +696,31 @@ describe("Goal.updateAfterJudge — transport failures trigger auto-pause (D5)",
       const goal = yield* Goal.Service
       const sessionID = SessionID.descending()
 
-      yield* goal.set(sessionID, "build feature X", 10)
+      const seeded = yield* goal.set(sessionID, "build feature X", 10)
 
       // transport-fail (parseFailed: true) → counter 1
-      yield* goal.updateAfterJudge(sessionID, "continue", "transport error", true)
+      const first = yield* goal.updateAfterJudge(sessionID, "continue", "transport error", true, {
+        goalID: seeded.goal_id ?? "legacy",
+        revision: seeded.revision ?? 0,
+      })
       let state = yield* goal.load(sessionID)
       expect(Number(state?.consecutive_parse_failures)).toBe(1)
       expect(state?.status).toBe("active")
 
       // parse-fail (parseFailed: true) → counter 2
-      yield* goal.updateAfterJudge(sessionID, "continue", "无法解析", true)
+      yield* goal.updateAfterJudge(sessionID, "continue", "无法解析", true, {
+        goalID: first?.state.goal_id ?? "legacy",
+        revision: first?.state.revision ?? 0,
+      })
       state = yield* goal.load(sessionID)
       expect(Number(state?.consecutive_parse_failures)).toBe(2)
       expect(state?.status).toBe("active")
 
       // transport-fail (parseFailed: true) → counter 3 → PAUSE
-      const r3 = yield* goal.updateAfterJudge(sessionID, "continue", "transport error", true)
+      const r3 = yield* goal.updateAfterJudge(sessionID, "continue", "transport error", true, {
+        goalID: state?.goal_id ?? "legacy",
+        revision: state?.revision ?? 0,
+      })
       expect(r3?.shouldContinue).toBe(false)
 
       state = yield* goal.load(sessionID)
@@ -877,8 +957,11 @@ describe("Goal.dispatch resume — busy guard (D5)", () => {
         const goal = yield* Goal.Service
         const sessionID = SessionID.descending()
         // max_turns 1 → one continue exhausts the budget and auto-pauses.
-        yield* goal.set(sessionID, "ship feature X", 1)
-        yield* goal.updateAfterJudge(sessionID, "continue", "more", false)
+        const state = yield* goal.set(sessionID, "ship feature X", 1)
+        yield* goal.updateAfterJudge(sessionID, "continue", "more", false, {
+          goalID: state.goal_id ?? "legacy",
+          revision: state.revision ?? 0,
+        })
         const paused = yield* goal.load(sessionID)
         expect(paused?.status).toBe("paused")
 

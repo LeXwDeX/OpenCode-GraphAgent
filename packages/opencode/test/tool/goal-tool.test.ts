@@ -120,6 +120,28 @@ describe("tool.goal — service resolution phase", () => {
     }),
   )
 
+  // GOAL-FP-01-09: markDone re-loads the current row and can no-op when the
+  // goal was cleared or completed between the tool's `load` and the transition.
+  // The tool must NOT present that no-op as an achievement — the stale
+  // "✓ 目标已达成" line would claim a transition that never happened.
+  it.instance("complete does not claim achievement when markDone did not transition (GOAL-FP-01-09)", () =>
+    Effect.gen(function* () {
+      const info = yield* GoalTool
+      const tool = yield* info.init()
+      const goalLayer = Layer.mock(Goal.Service, {
+        load: () => Effect.succeed(activeGoal),
+        markDone: () => Effect.succeed(undefined),
+      })
+
+      const result = yield* tool.execute({ action: "complete", reason: "docs read" }, ctx()).pipe(
+        Effect.provide(goalLayer),
+      )
+
+      expect(result.output).not.toContain("目标已达成")
+      expect(result.output).toContain("Cannot complete goal")
+    }),
+  )
+
   it.instance("status degrades gracefully when Goal.Service is absent (headless)", () =>
     Effect.gen(function* () {
       const info = yield* GoalTool

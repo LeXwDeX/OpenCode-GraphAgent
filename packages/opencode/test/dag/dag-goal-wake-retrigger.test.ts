@@ -103,17 +103,39 @@ function takeWithin<A>(queue: Queue.Queue<A>, message: string) {
 let judgeCalls = 0
 let promptCalls: { noReply?: boolean; text: string }[] = []
 let parentPromptCalls = 0
+let markReportCalls = 0
 const reset = () => {
   judgeCalls = 0
   promptCalls = []
   parentPromptCalls = 0
+  markReportCalls = 0
 }
 
-function goalWakeLayer(input: { childPrompts: Queue.Queue<ChildPromptGate> }) {
+function goalWakeLayer(input: { childPrompts: Queue.Queue<ChildPromptGate>; failFirstMarkReport?: boolean }) {
   const database = Database.layerFromPath(":memory:")
   const events = EventV2.layer.pipe(Layer.provide(database))
   const bridge = EventV2Bridge.layer.pipe(Layer.provide(events))
-  const store = DagStore.layer.pipe(Layer.provide(database))
+  const store = input.failFirstMarkReport
+    ? // GOAL-FP-01-14 harness: the real store with ONE injected failure on the
+      // first markWakeBatchReported call — the wake transcript part has
+      // already been written when that mark fails, and the retry must not
+      // re-inject the summary.
+      Layer.effect(
+        DagStore.Service,
+        Effect.gen(function* () {
+          const real = yield* DagStore.Service
+          return DagStore.Service.of({
+            ...real,
+            markWakeBatchReported: (batch: DagStore.WakeBatch) =>
+              Effect.gen(function* () {
+                markReportCalls += 1
+                if (markReportCalls === 1) return yield* Effect.die("injected markWakeBatchReported failure")
+                return yield* real.markWakeBatchReported(batch)
+              }),
+          })
+        }),
+      ).pipe(Layer.provide(DagStore.layer.pipe(Layer.provide(database))))
+    : DagStore.layer.pipe(Layer.provide(database))
   const status = SessionStatus.layer.pipe(Layer.provide(bridge))
   const projector = DagProjector.layer.pipe(
     Layer.provide(events),
@@ -263,6 +285,7 @@ function runGoalWakeTest<A>(
     readonly database: Database.Interface
     readonly childPrompts: Queue.Queue<ChildPromptGate>
   }) => Effect.Effect<A, Error>,
+  layerInput: { failFirstMarkReport?: boolean } = {},
 ) {
   return Effect.gen(function* () {
     const childPrompts = yield* Queue.unbounded<ChildPromptGate>()
@@ -297,7 +320,7 @@ function runGoalWakeTest<A>(
         .pipe(Effect.orDie)
       return yield* test({ dag, loop, goalLoop, store, goal, automation, database, childPrompts })
     }).pipe(
-      Effect.provide(goalWakeLayer({ childPrompts })),
+      Effect.provide(goalWakeLayer({ childPrompts, ...layerInput })),
       Effect.provideService(InstanceRef, {
         directory: process.cwd(),
         worktree: process.cwd(),
@@ -382,6 +405,65 @@ describe("DagLoop final wake delivery re-triggers the goal (GOAL-FP-01-02)", () 
           expect(Option.isNone(yield* automation.claim(sid, { kind: "dag" }))).toBe(true)
           expect(Option.isSome(yield* automation.claim(sid, goalOwner))).toBe(true)
         }),
+      ),
+    )
+  })
+})
+
+// GOAL-FP-01-14: the wake transcript part is written BEFORE the durable
+// markWakeBatchReported, so a mark failure (or a crash between the two) leaves
+// the batch unreported — and the retry re-injects the SAME summary into the
+// transcript (duplicate visibility). The delivery must dedupe on retry: when
+// the summary was already written, the retry only re-marks, it must not
+// re-prompt. The retry here is armed by the wake turn's own idle event (the
+// prompt mock mirrors the real runner's end-of-turn idle).
+describe("DagLoop wake delivery — a mark failure retry must not re-inject the summary (GOAL-FP-01-14)", () => {
+  it("the wake summary reaches the transcript exactly once when the first mark fails", async () => {
+    await Effect.runPromise(
+      runGoalWakeTest(
+        ({ dag, loop, store, childPrompts }) =>
+          Effect.gen(function* () {
+            reset()
+            yield* loop.init()
+            yield* Effect.yieldNow
+
+            const dagID = yield* dag.create({
+              projectID: PROJECT_ID,
+              sessionID: PARENT_SESSION,
+              title: "mark failure retry",
+              config: { name: "mark-fail", nodes: [node("implement")] },
+            })
+
+            const child = yield* takeWithin(childPrompts, "implement did not start")
+            yield* Deferred.succeed(child.release, "done")
+            yield* pollWithTimeout(
+              store.getWorkflow(dagID).pipe(
+                Effect.map((workflow) => (workflow?.status === "completed" ? workflow : undefined)),
+              ),
+              "workflow did not complete",
+            )
+
+            // First delivery attempt writes the transcript part, then the
+            // injected mark failure leaves the batch unreported. The retry
+            // (armed by the wake turn's own idle event) must re-mark only.
+            yield* pollWithTimeout(
+              Effect.sync(() => (markReportCalls >= 2 ? true : undefined)),
+              "wake delivery never retried after the injected mark failure",
+              "5 seconds",
+            )
+            yield* pollWithTimeout(
+              store.getWorkflow(dagID).pipe(
+                Effect.map((workflow) => (workflow?.wakeReported ? workflow : undefined)),
+              ),
+              "wake was never reported",
+            )
+
+            // Pre-fix: the retry re-prompted the identical summary — the
+            // transcript would show the wake digest twice.
+            const wakeSummaries = promptCalls.filter((p) => p.text.includes("[DAG Workflow completed]"))
+            expect(wakeSummaries.length).toBe(1)
+          }),
+        { failFirstMarkReport: true },
       ),
     )
   })
