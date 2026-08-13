@@ -34,7 +34,7 @@
  * AMBIENT instance directory, so each probe can tell which instance acted.
  */
 import { describe, expect, it } from "bun:test"
-import { DateTime, Deferred, Effect, Layer, Option, Queue, Logger } from "effect"
+import { DateTime, Deferred, Effect, Fiber, Layer, Option, Queue, Logger, Scope } from "effect"
 import type { SessionV1 } from "@opencode-ai/core/v1/session"
 import { SessionV1 as SessionV1Events } from "@opencode-ai/core/v1/session"
 import { Database } from "@opencode-ai/core/database/database"
@@ -49,6 +49,7 @@ import { SessionStatusEvent } from "@opencode-ai/schema/session-status-event"
 import { Agent } from "@/agent/agent"
 import { Dag, type NodeConfig } from "@/dag/dag"
 import { DagLoop } from "@/dag/runtime/loop"
+import { makeDeadlineWatcher } from "@/dag/runtime/spawn"
 import { DagLocation } from "@/dag/location"
 import { Goal } from "@/goal/goal"
 import { GoalLoop, GoalLoopJudgeLLM } from "@/goal/loop"
@@ -60,6 +61,7 @@ import { MessageID } from "@/session/schema"
 import { Session } from "@/session/session"
 import { SessionStatus } from "@/session/status"
 import { pollWithTimeout } from "../lib/effect"
+import { makeNodeRow } from "./fixtures"
 import { eq } from "drizzle-orm"
 import { existsSync, readFileSync, readdirSync } from "node:fs"
 import path from "node:path"
@@ -1005,6 +1007,117 @@ describe("DAG-LOC-01 P2 follow-ups", () => {
         Effect.provideService(InstanceRef, {
           directory: DIR_A,
           worktree: DIR_A,
+          project: { id: PROJECT_ID },
+        } as never),
+        Effect.scoped,
+      ),
+    )
+  })
+
+  it("P2-watcher: a transient store defect in the ownership revalidation does not end deadline supervision", async () => {
+    const fail = { armed: true }
+    let escalations = 0
+    // Deterministic defect placement through the direct-call seam (the same
+    // seam as the R13 watcher tests): readNode is a mock with no Database
+    // traffic, so the watcher's ONLY real store query is the
+    // ownership-revalidation read — the one-shot select defect lands exactly
+    // there (review P2, makeDeadlineWatcher).
+    const storeLayer = Layer.mock(DagStore.Service)({
+      getNode: () =>
+        Effect.succeed(
+          makeNodeRow({
+            id: "n1",
+            workflowId: "p2w",
+            name: "n1",
+            status: "running",
+            deadlineMs: 1,
+            timeoutExtensions: 0,
+            childSessionId: "ses_child_1",
+          }),
+        ),
+    })
+    const dagLayer = Layer.unwrap(
+      Effect.map(DagStore.Service, (store) =>
+        Layer.mock(Dag.Service)({
+          store,
+          nodeTimeoutEscalated: () =>
+            Effect.sync(() => {
+              escalations++
+            }),
+        }),
+      ),
+    ).pipe(Layer.provide(storeLayer))
+    const promptLayer = Layer.mock(SessionPrompt.Service, {
+      cancel: () => Effect.void,
+    })
+    const databaseLayer = Layer.effect(
+      Database.Service,
+      Effect.gen(function* () {
+        const real = yield* Database.Service
+        // One-shot defect on the first durable SELECT: throws synchronously
+        // (a defect the plain `yield*` cannot absorb) and disarms so the
+        // revalidation's retry reads the real row.
+        const proxy = new Proxy(real.db, {
+          get(target, prop) {
+            if (prop === "select" && fail.armed) {
+              fail.armed = false
+              return () => {
+                throw new Error("injected transient store defect")
+              }
+            }
+            return Reflect.get(target, prop)
+          },
+        })
+        return Database.Service.of({ db: proxy })
+      }),
+    ).pipe(Layer.provide(Database.layerFromPath(":memory:")))
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const database = yield* Database.Service
+        yield* database.db.insert(ProjectTable).values({
+          id: PROJECT_ID as never,
+          worktree: process.cwd() as never,
+          sandboxes: [],
+        }).run().pipe(Effect.orDie)
+        yield* database.db.insert(SessionTable).values({
+          id: SES_A as never,
+          project_id: PROJECT_ID as never,
+          slug: "a",
+          directory: process.cwd() as never,
+          title: SES_A,
+          version: "test",
+        }).run().pipe(Effect.orDie)
+        yield* database.db.insert(WorkflowTable).values({
+          id: "p2w",
+          project_id: PROJECT_ID as never,
+          session_id: SES_A as never,
+          title: "P2 watcher revalidation",
+          status: "running",
+          config: "{}",
+          seq: 1,
+          directory: process.cwd() as never,
+        }).run().pipe(Effect.orDie)
+        const scope = yield* Scope.Scope
+        const watcher = yield* makeDeadlineWatcher({ dagID: "p2w", nodeID: "n1", timeoutMs: 300 }).pipe(
+          Effect.forkIn(scope),
+        )
+        // The node is past its deadline; the watcher must still escalate
+        // after the transient defect — proof supervision survived. Without
+        // the retry the defect dies through the outer catchCause, which
+        // completes the fiber, and the escalation never happens.
+        yield* pollWithTimeout(
+          Effect.sync(() => (escalations > 0 ? true : undefined)),
+          "watcher ended deadline supervision after a transient ownership-revalidation store defect (review P2 regression)",
+        )
+        expect(fail.armed).toBe(false)
+        yield* Fiber.interrupt(watcher).pipe(Effect.ignore)
+      }).pipe(
+        Effect.provide(dagLayer),
+        Effect.provide(promptLayer),
+        Effect.provide(databaseLayer),
+        Effect.provideService(InstanceRef, {
+          directory: process.cwd(),
+          worktree: process.cwd(),
           project: { id: PROJECT_ID },
         } as never),
         Effect.scoped,

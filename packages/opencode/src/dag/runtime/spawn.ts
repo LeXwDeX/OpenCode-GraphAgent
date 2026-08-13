@@ -129,6 +129,38 @@ export function makeDeadlineWatcher(
       yield* Effect.logWarning("DAG deadline watcher giving up after store read retries", { dagID: input.dagID, nodeID: input.nodeID })
       return undefined
     })
+    // DAG-LOC-01 (P2-C + review P2): revalidate ownership before the write
+    // section — escalation and cap-enforcement writes must not land on a
+    // workflow whose durable identity was repainted (identity migration) or
+    // whose rows were cascade-deleted. Losing ownership ends this watcher's
+    // mandate; the instance that owns the repainted workflow supervises it.
+    // The check only runs when it can DISPROVE ownership (instance context
+    // and Database both present — always true for watchers forked from
+    // DagLoop): absent either, supervision must not end (R13).
+    //
+    // Review P2: this read follows the same exit+retry pattern as readNode
+    // above — a transient store defect must be treated as "cannot disprove
+    // ownership" (continue supervising), never as a reason to end the
+    // mandate. Unretried, it is the watcher's only store read without R13
+    // protection: a defect dies through the outer catchCause, which logs and
+    // completes the fiber — permanently ending deadline supervision for a
+    // still-running node (no escalation, no cap, unbounded run; nothing
+    // re-forks the watcher).
+    const ownershipLost = Effect.gen(function* () {
+      const instance = yield* InstanceRef
+      const db = yield* Effect.serviceOption(Database.Service)
+      if (!instance || db._tag === "None") return false
+      for (let attemptNo = 0; attemptNo <= 3; attemptNo++) {
+        const outcome = yield* DagLocation.ownsWorkflow(input.dagID, instance.directory).pipe(Effect.exit)
+        if (Exit.isSuccess(outcome)) return !outcome.value
+        if (attemptNo < 3) yield* Effect.sleep(500)
+      }
+      yield* Effect.logWarning(
+        "DAG deadline watcher ownership revalidation failed after store retries — keeping supervision",
+        { dagID: input.dagID, nodeID: input.nodeID },
+      )
+      return false
+    })
     for (;;) {
       const node = yield* readNode
       if (!node) {
@@ -140,21 +172,7 @@ export function makeDeadlineWatcher(
         continue
       }
       if (isNodeTerminalStatus(node.status as never)) return
-      // DAG-LOC-01 (P2-C): revalidate ownership before the write section —
-      // escalation and cap-enforcement writes must not land on a workflow
-      // whose durable identity was repainted (identity migration) or whose
-      // rows were cascade-deleted. Losing ownership ends this watcher's
-      // mandate; the instance that owns the repainted workflow supervises it.
-      // The check only runs when it can DISPROVE ownership (instance context
-      // and Database both present — always true for watchers forked from
-      // DagLoop): absent either, supervision must not end (R13).
-      {
-        const instance = yield* InstanceRef
-        const db = yield* Effect.serviceOption(Database.Service)
-        if (instance && db._tag === "Some") {
-          if (!(yield* DagLocation.ownsWorkflow(input.dagID, instance.directory))) return
-        }
-      }
+      if (yield* ownershipLost) return
       const now = yield* Clock.currentTimeMillis
       const deadline = node.deadlineMs
       if (node.status !== "running") {
