@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 LeXwDeX
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 import { sqliteTable, text, integer, index, primaryKey, uniqueIndex } from "drizzle-orm/sqlite-core"
 import { ProjectTable } from "../project/sql"
 import { SessionTable } from "../session/sql"

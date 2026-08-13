@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 LeXwDeX
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 export * as DagStore from "./store"
 
 import { and, asc, count, desc, eq, gt, inArray, or } from "drizzle-orm"

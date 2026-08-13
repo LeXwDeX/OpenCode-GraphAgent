@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 LeXwDeX
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 import { DependencyGraph } from "./graph"
 
 export type SchedulingNodeStatus = "pending" | "running" | "satisfied" | "unsatisfied" | "skipped"

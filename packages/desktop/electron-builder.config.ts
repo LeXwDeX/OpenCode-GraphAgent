@@ -59,6 +59,11 @@ const getBase = (appId: string): Configuration => ({
       to: "native/",
       filter: ["index.js", "index.d.ts", "build/Release/mac_window.node", "swift-build/**"],
     },
+    {
+      from: "resources/runtime-assets/",
+      to: "runtime-assets/",
+      filter: ["**/*"],
+    },
   ],
   mac: {
     category: "public.app-category.developer-tools",
