@@ -9,3 +9,14 @@ export const GoalStateTable = sqliteTable(
   },
   (t) => [index("goal_state_updated_at_idx").on(t.updated_at)],
 )
+
+export const GoalOutcomeTable = sqliteTable(
+  "goal_outcome",
+  {
+    goal_id: text().primaryKey(),
+    session_id: text().notNull(),
+    payload: text().notNull(),
+    completed_at: integer().notNull(),
+  },
+  (t) => [index("goal_outcome_session_completed_idx").on(t.session_id, t.completed_at)],
+)

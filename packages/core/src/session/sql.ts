@@ -62,6 +62,9 @@ export const SessionTable = sqliteTable(
     index("session_project_idx").on(table.project_id),
     index("session_workspace_idx").on(table.workspace_id),
     index("session_parent_idx").on(table.parent_id),
+    // GOAL-FP-01-04 (S-1): the GoalLoop startup scan joins goal_state →
+    // session and filters on session.directory on every instance boot.
+    index("session_directory_idx").on(table.directory),
   ],
 )
 

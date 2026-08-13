@@ -25,16 +25,17 @@ You will receive:
 2. The agent's most recent response.
 
 Return ONLY a JSON object (no markdown, no explanation):
-{"done": true/false, "reason": "one sentence explanation"}
+{"verdict": "done" | "continue" | "blocked", "reason": "one sentence explanation"}
 
-"done" = true means ONE of:
+"verdict" = "done" means ONE of:
   - The agent explicitly confirmed the goal is complete with evidence.
   - The goal produced a clear, verifiable deliverable (file created, test passed, etc.).
-  - The goal is unachievable or blocked and the agent said so.
 
-"done" = false means the agent is still making progress or has more steps.
+"verdict" = "blocked" means the agent cannot make progress without user input or an external-state change.
 
-Be conservative: if in doubt, return "done": false.`
+"verdict" = "continue" means the agent is still making progress or has more steps.
+
+Be conservative: if in doubt, return "verdict": "continue".`
 
 export const JUDGE_USER_PROMPT_TEMPLATE = `Goal: {goal}
 

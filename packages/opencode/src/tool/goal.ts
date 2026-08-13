@@ -127,18 +127,30 @@ export const GoalTool = Tool.define<typeof Parameters, Metadata, never>(
           // could be missed in the "N turns" count shown to the user.
           const finalState = yield* goal.markDone(ctx.sessionID, params.reason.trim())
 
-          const displayState = finalState ?? state
-          const completionMsg = `✓ 目标已达成（${displayState.turns_used}/${displayState.max_turns} 轮）：${displayState.goal}\nReason: ${params.reason.trim()}`
+          // GOAL-FP-01-09: markDone returns undefined when the transition did
+          // not happen (the goal was cleared or completed between the `load`
+          // above and the markDone transition). Presenting the pre-call state
+          // as completed would claim an achievement for a goal that no longer
+          // exists — report the no-op instead.
+          if (!finalState) {
+            return {
+              title: "goal no longer active",
+              output:
+                "Cannot complete goal: the goal is no longer active (it may have been cleared or completed concurrently). No state transition was applied.",
+              metadata: { goal: null },
+            }
+          }
+          const completionMsg = `✓ 目标已达成（${finalState.turns_used}/${finalState.max_turns} 轮）：${finalState.goal}\nReason: ${params.reason.trim()}`
           return {
-            title: `goal completed (${displayState.turns_used}/${displayState.max_turns})`,
+            title: `goal completed (${finalState.turns_used}/${finalState.max_turns})`,
             output: completionMsg,
             metadata: {
               goal: {
-                text: displayState.goal,
+                text: finalState.goal,
                 status: "done" as const,
-                turnsUsed: displayState.turns_used,
-                maxTurns: displayState.max_turns,
-                subgoals: displayState.subgoals ?? [],
+                turnsUsed: finalState.turns_used,
+                maxTurns: finalState.max_turns,
+                subgoals: finalState.subgoals ?? [],
               },
             },
           }

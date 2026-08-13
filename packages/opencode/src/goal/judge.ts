@@ -4,7 +4,7 @@ import { Effect } from "effect"
 import { GoalPrompts } from "./prompts"
 
 export interface JudgeResult {
-  readonly verdict: "done" | "continue"
+  readonly verdict: "done" | "continue" | "blocked"
   readonly reason: string
   readonly parseFailed: boolean
 }
@@ -16,6 +16,11 @@ export function parseJudgeResponse(raw: string): JudgeResult {
   // Step 2: try JSON.parse whole string
   try {
     const obj = JSON.parse(stripped)
+    if (
+      (obj.verdict === "done" || obj.verdict === "continue" || obj.verdict === "blocked") &&
+      typeof obj.reason === "string"
+    )
+      return { verdict: obj.verdict, reason: obj.reason, parseFailed: false }
     if (typeof obj.done === "boolean" && typeof obj.reason === "string")
       return { verdict: obj.done ? "done" : "continue", reason: obj.reason, parseFailed: false }
   } catch {}
@@ -25,6 +30,11 @@ export function parseJudgeResponse(raw: string): JudgeResult {
   if (match) {
     try {
       const obj = JSON.parse(match[0])
+      if (
+        (obj.verdict === "done" || obj.verdict === "continue" || obj.verdict === "blocked") &&
+        typeof obj.reason === "string"
+      )
+        return { verdict: obj.verdict, reason: obj.reason, parseFailed: false }
       if (typeof obj.done === "boolean" && typeof obj.reason === "string")
         return { verdict: obj.done ? "done" : "continue", reason: obj.reason, parseFailed: false }
     } catch {}

@@ -8,6 +8,9 @@ import { BackgroundJob } from "@/background/job"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Session } from "@/session/session"
+import { Goal } from "@/goal/goal"
+import { SessionAutomationLease } from "@/session/automation-lease"
+import { Dag } from "@/dag/dag"
 import { SessionID } from "@/session/schema"
 import { Permission } from "@/permission"
 import { Notification } from "@/notification"
@@ -64,6 +67,9 @@ const sessionEnv = Layer.mergeAll(
     Layer.provide(SessionProjector.defaultLayer),
     Layer.provide(RuntimeFlags.defaultLayer),
     Layer.provide(BackgroundJob.defaultLayer),
+    Layer.provide(Goal.defaultLayer),
+    Layer.provide(SessionAutomationLease.defaultLayer),
+    Layer.provide(Dag.defaultLayer),
   ),
   Database.defaultLayer,
 )
