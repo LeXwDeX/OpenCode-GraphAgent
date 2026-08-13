@@ -3,6 +3,7 @@ import { mkdir, unlink } from "fs/promises"
 import path from "path"
 import { Effect, Layer } from "effect"
 import { ModelsDev } from "@opencode-ai/core/models-dev"
+import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Global } from "@opencode-ai/core/global"
@@ -16,6 +17,7 @@ import {
 import { markPluginDependenciesReady } from "../fixture/plugin"
 import { Auth } from "@/auth"
 import { Config } from "@/config/config"
+import { ConfigParse } from "@/config/parse"
 import { Env } from "../../src/env"
 import { Plugin } from "../../src/plugin/index"
 import { Provider } from "@/provider/provider"
@@ -82,6 +84,34 @@ const paid = (providers: Record<string, { models: Record<string, { cost: { input
 }
 
 const languageBaseURL = (language: unknown) => (language as { config: { baseURL: string } }).config.baseURL
+
+const aggregatorExamplePath = path.join(import.meta.dir, "../../../../docs/examples/internal-llm-aggregator.jsonc")
+const aggregatorExample = ConfigParse.schema(
+  ConfigV1.Info,
+  ConfigParse.jsonc(await Bun.file(aggregatorExamplePath).text(), aggregatorExamplePath),
+  aggregatorExamplePath,
+)
+
+const emptyModelCatalogLayer = Layer.succeed(
+  ModelsDev.Service,
+  ModelsDev.Service.of({
+    get: () => Effect.succeed({}),
+    refresh: () => Effect.die(new Error("models.dev refresh must not be called by the aggregator contract")),
+  }),
+)
+
+const aggregatorProviderLayer = Provider.layer.pipe(
+  Layer.provide(FSUtil.defaultLayer),
+  Layer.provide(Env.defaultLayer),
+  Layer.provide(Config.defaultLayer),
+  Layer.provide(Auth.defaultLayer),
+  Layer.provide(Plugin.defaultLayer),
+  Layer.provide(emptyModelCatalogLayer),
+  Layer.provide(RuntimeFlags.layer({})),
+)
+const aggregator = testEffect(
+  Layer.mergeAll(aggregatorProviderLayer, Env.defaultLayer, Plugin.defaultLayer, emptyModelCatalogLayer),
+)
 
 const it = testEffect(Layer.mergeAll(Provider.defaultLayer, Env.defaultLayer, Plugin.defaultLayer))
 const experimentalModels = testEffect(providerLayer({ enableExperimentalModels: true }))
@@ -392,6 +422,52 @@ it.instance(
       },
     },
   },
+)
+
+aggregator.instance(
+  "internal aggregator example resolves three protocol SDKs without models.dev",
+  Effect.gen(function* () {
+    yield* set("LLM_AGGREGATOR_API_KEY", "internal-test-key")
+    const provider = yield* Provider.Service
+    const providers = yield* provider.list()
+    const modelsDev = yield* ModelsDev.Service
+
+    expect(yield* modelsDev.get()).toEqual({})
+
+    yield* Effect.forEach(
+      [
+        {
+          providerID: ProviderV2.ID.make("internal-openai"),
+          modelID: ModelV2.ID.make("gpt-5"),
+          npm: "@ai-sdk/openai",
+          baseURL: "https://llm-api.example.internal/openai/v1",
+        },
+        {
+          providerID: ProviderV2.ID.make("internal-anthropic"),
+          modelID: ModelV2.ID.make("claude-sonnet-4-20250514"),
+          npm: "@ai-sdk/anthropic",
+          baseURL: "https://llm-api.example.internal/anthropic",
+        },
+        {
+          providerID: ProviderV2.ID.make("internal-gemini"),
+          modelID: ModelV2.ID.make("gemini-2.5-pro"),
+          npm: "@ai-sdk/google",
+          baseURL: "https://llm-api.example.internal/gemini/v1beta",
+        },
+      ],
+      (item) =>
+        Effect.gen(function* () {
+          expect(providers[item.providerID]).toBeDefined()
+          expect(providers[item.providerID].key).toBe("internal-test-key")
+          expect(providers[item.providerID].options.baseURL).toBe(item.baseURL)
+          expect(providers[item.providerID].models[item.modelID].api.npm).toBe(item.npm)
+
+          const model = yield* provider.getModel(item.providerID, item.modelID)
+          expect(yield* provider.getLanguage(model)).toBeDefined()
+        }),
+    )
+  }),
+  { config: aggregatorExample },
 )
 
 it.instance(

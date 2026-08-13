@@ -1,0 +1,60 @@
+{
+  // 聚合平台按其暴露的标准协议分别配置端点。
+  // 这不是网络白名单；普通公网与封闭内网使用同一套 Provider 机制。
+  "provider": {
+    "internal-openai": {
+      "name": "Internal OpenAI Protocol",
+      "npm": "@ai-sdk/openai",
+      "env": ["LLM_AGGREGATOR_API_KEY"],
+      "options": {
+        "baseURL": "https://llm-api.example.internal/openai/v1"
+      },
+      "models": {
+        "gpt-5": {
+          "name": "GPT-5 via Internal Aggregator",
+          "tool_call": true,
+          "limit": {
+            "context": 400000,
+            "output": 128000
+          }
+        }
+      }
+    },
+    "internal-anthropic": {
+      "name": "Internal Anthropic Protocol",
+      "npm": "@ai-sdk/anthropic",
+      "env": ["LLM_AGGREGATOR_API_KEY"],
+      "options": {
+        "baseURL": "https://llm-api.example.internal/anthropic"
+      },
+      "models": {
+        "claude-sonnet-4-20250514": {
+          "name": "Claude Sonnet 4 via Internal Aggregator",
+          "tool_call": true,
+          "limit": {
+            "context": 200000,
+            "output": 64000
+          }
+        }
+      }
+    },
+    "internal-gemini": {
+      "name": "Internal Gemini Protocol",
+      "npm": "@ai-sdk/google",
+      "env": ["LLM_AGGREGATOR_API_KEY"],
+      "options": {
+        "baseURL": "https://llm-api.example.internal/gemini/v1beta"
+      },
+      "models": {
+        "gemini-2.5-pro": {
+          "name": "Gemini 2.5 Pro via Internal Aggregator",
+          "tool_call": true,
+          "limit": {
+            "context": 1048576,
+            "output": 65536
+          }
+        }
+      }
+    }
+  }
+}
