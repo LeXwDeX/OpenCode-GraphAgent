@@ -23,6 +23,7 @@ import { Session } from "@/session/session"
 import { SessionPrompt } from "@/session/prompt"
 import { SessionID } from "@/session/schema"
 import { SessionStatus } from "@/session/status"
+import { SessionAutomationLease } from "@/session/automation-lease"
 import { renderTemplate } from "../templates/resolve"
 import { sanitizeInput } from "../templates/sanitize"
 import { DagConfig } from "../config"
@@ -46,7 +47,7 @@ interface WorkflowEntry {
   watchers: Map<string, Fiber.Fiber<unknown, unknown>>
 }
 
-export const layer = Layer.effect(
+const serviceLayer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const events = yield* EventV2Bridge.Service
@@ -56,6 +57,7 @@ export const layer = Layer.effect(
     const sessionSvc = yield* Session.Service
     const promptSvc = yield* SessionPrompt.Service
     const statusSvc = yield* SessionStatus.Service
+    const automation = yield* SessionAutomationLease.Service
 
     const state = yield* InstanceState.make(
       Effect.fn("DagLoop.state")(function* (ctx) {
@@ -67,6 +69,17 @@ export const layer = Layer.effect(
         const recovering = new Set<string>()
         const wakeInFlight = new Set<string>()
         const wakePending = new Set<string>()
+        // GOAL-FP-01-14: per-session record of the last wake summary whose
+        // transcript part was written. The durable mark runs AFTER the write
+        // (at-least-once delivery: a mark failure keeps the batch unreported
+        // for a retry), so a retry of an already-written summary would
+        // re-inject the same digest into the transcript. The retry dedupes on
+        // this map and only re-marks. In-process only — a crash between write
+        // and mark still duplicates on the restart sweep (a durable
+        // delivering-marker would need a schema change; registered, see
+        // GOAL-FP-01-14). Capped: evicting entries degrades to the pre-fix
+        // duplicate visibility, never to a lost wake.
+        const deliveredWakeSummaries = new Map<string, string>()
 
         // Seed the commented global dag.jsonc once per instance init — the
         // per-round DagConfig.load below stays a pure read so the spawn
@@ -391,6 +404,7 @@ export const layer = Layer.effect(
             if (isStepping) runtime.setStepMode(true)
             const entry: WorkflowEntry = { runtime, semaphore, evalLock: Semaphore.makeUnsafe(1), parentSessionID: wf.sessionId, config, fibers: new Map(), watchers: new Map() }
             runtimes.set(dagID, entry)
+            yield* automation.register(SessionID.make(wf.sessionId), { kind: "dag", id: dagID })
             // Reconciliation settles every persisted running attempt before the
             // runtime is rebuilt. Recovery never adopts or restarts provider work;
             // a new execution attempt must come from explicit workflow control.
@@ -483,6 +497,7 @@ export const layer = Layer.effect(
               const semaphore = Semaphore.makeUnsafe(maxConcurrency)
               const entry: WorkflowEntry = { runtime, semaphore, evalLock: Semaphore.makeUnsafe(1), parentSessionID: wf.sessionId, config, fibers: new Map(), watchers: new Map() }
               runtimes.set(dagID, entry)
+              yield* automation.register(SessionID.make(wf.sessionId), { kind: "dag", id: dagID })
               yield* entry.evalLock.withPermits(1)(
                 Effect.gen(function* () {
                   yield* spawnReady(dagID)
@@ -919,8 +934,16 @@ export const layer = Layer.effect(
         )
 
         for (const def of [DagEvent.WorkflowCompleted, DagEvent.WorkflowFailed, DagEvent.WorkflowCancelled]) {
+          // Deliberately NO runtimes.has filter: a workflow terminalized by a
+          // control op after a failed startup recovery (e.g. recoverWorkflow
+          // aborted on an unreadable persisted row) has no runtime entry but
+          // may still hold a dag registration from the startup wake sweep.
+          // The handler stays a no-op for events not concerning this
+          // instance: the evalLock cleanup and wake fork remain gated on
+          // `entry`, and the no-entry release below is scoped by the durable
+          // row's project — the same cross-instance guard every adoption
+          // path uses.
           yield* events.subscribe(def).pipe(
-            Stream.filter((e) => runtimes.has(e.data.dagID as string)),
             Stream.runForEach((evt) =>
               Effect.gen(function* () {
                 const dagID = evt.data.dagID as string
@@ -945,7 +968,28 @@ export const layer = Layer.effect(
                 // P1-6: trigger wake on workflow terminal so the parent
                 // learns the final outcome even if no idle event fires.
                 if (parentSessionID) {
+                  // GOAL-FP-01-03: the dag registration lifetime is bound to
+                  // workflow state, not to wake delivery. A workflow that
+                  // terminalizes without a successful wake delivery must not
+                  // keep its registration (and the Session's ownership)
+                  // indefinitely. The key matches the registration key
+                  // (WorkflowTable.id === event dagID, per the projector);
+                  // tryDeliverWake re-registers its batch itself before
+                  // claiming the wake lease when a delivery is attempted.
+                  yield* automation.unregister(SessionID.make(parentSessionID), { kind: "dag", id: dagID })
                   yield* tryDeliverWake(parentSessionID).pipe(Effect.ignore, Effect.forkScoped)
+                } else {
+                  // GOAL-FP-01-03 follow-up (P2-A): no runtime entry, but the
+                  // startup wake sweep may have registered this non-terminal
+                  // row before its recovery failed. Release from the durable
+                  // row (session_id + project) so a control-op
+                  // terminalization cannot leave a permanent registration
+                  // with no runtime to ever clean it. Foreign-project events
+                  // are a no-op here.
+                  const wf = yield* store.getWorkflow(dagID)
+                  if (wf && wf.projectId === ctx.project.id) {
+                    yield* automation.unregister(SessionID.make(wf.sessionId), { kind: "dag", id: dagID })
+                  }
                 }
               }).pipe(guarded("WorkflowTerminal")),
             ),
@@ -1159,6 +1203,18 @@ export const layer = Layer.effect(
                   : []),
               ].join("\n\n")
 
+              const wakeWorkflowIDs = new Set([
+                ...batch.nodes.map((node) => node.workflowId),
+                ...batch.workflows.map((workflow) => workflow.id),
+              ])
+              for (const workflowID of wakeWorkflowIDs) {
+                yield* automation.register(SessionID.make(sessionID), { kind: "dag", id: workflowID })
+              }
+              const wakeLease = Option.getOrUndefined(
+                yield* automation.claim(SessionID.make(sessionID), { kind: "dag" }),
+              )
+              if (!wakeLease) return
+
               // Persist wake_reported AFTER successful delivery only.
               // A failure stays durable for a later idle event or restart scan;
               // it must not spin synchronously on the same row.
@@ -1166,26 +1222,51 @@ export const layer = Layer.effect(
               // receives the node result and can act) but NOT rendered as a user
               // message in the TUI chat — DAG data surfaces via the sidebar panel
               // and Inspector, keeping the chat conversation clean.
-              const didDeliver = yield* promptSvc.promptIfIdle({
-                sessionID: SessionID.make(sessionID),
-                parts: [{ type: "text", text: summary, synthetic: true }],
-              }).pipe(
-                Effect.flatMap(Option.match({
-                  onNone: () => Effect.succeed(false),
-                  onSome: () =>
-                    store.markWakeBatchReported(batch).pipe(
-                      Effect.tap(() =>
-                        Effect.sync(() => {
-                          plan.unresponsiveDagIDs.forEach((workflowID) =>
-                            deliveredUnresponsiveDagIDs.add(workflowID),
-                          )
-                        }),
-                      ),
-                      Effect.as(true),
+              //
+              // GOAL-FP-01-14: the transcript part is written BEFORE the
+              // durable mark. A mark failure (or a crash between the two)
+              // leaves the batch unreported and the retry would re-inject the
+              // SAME summary. When this session already had this exact summary
+              // written, skip the prompt and only re-mark — the write is
+              // idempotent in effect because an identical digest adds no
+              // information. A differing summary (new results committed
+              // between attempts) always prompts.
+              if (deliveredWakeSummaries.size > 1024) deliveredWakeSummaries.clear()
+              const didDeliver = yield* Effect.gen(function* () {
+                if (deliveredWakeSummaries.get(sessionID) !== summary) {
+                  const delivered = yield* SessionPrompt.admitIfIdle(promptSvc, automation, wakeLease, {
+                    sessionID: SessionID.make(sessionID),
+                    parts: [{ type: "text", text: summary, synthetic: true }],
+                  })
+                  if (Option.isNone(delivered)) return false
+                  deliveredWakeSummaries.set(sessionID, summary)
+                  yield* delivered.value.pipe(
+                    Effect.onError(() =>
+                      Effect.sync(() => {
+                        if (deliveredWakeSummaries.get(sessionID) === summary) {
+                          deliveredWakeSummaries.delete(sessionID)
+                        }
+                      }),
                     ),
-                })),
-                Effect.catchCause(() =>
-                  Effect.logWarning("DAG wake delivery failed", { sessionID }).pipe(Effect.as(false)),
+                  )
+                }
+
+                const markLease = yield* automation.claim(SessionID.make(sessionID), { kind: "dag" })
+                if (Option.isNone(markLease)) return false
+                const marked = yield* automation.use(markLease.value, store.markWakeBatchReported(batch))
+                if (Option.isNone(marked)) return false
+                plan.unresponsiveDagIDs.forEach((workflowID) => deliveredUnresponsiveDagIDs.add(workflowID))
+                yield* Effect.forEach(
+                  batch.workflows.filter((workflow) => isWorkflowTerminalStatus(workflow.status as never)),
+                  (workflow) => automation.unregister(SessionID.make(sessionID), { kind: "dag", id: workflow.id }),
+                  { discard: true },
+                )
+                return true
+              }).pipe(
+                Effect.catchCause((cause) =>
+                  Effect.logWarning("DAG wake delivery failed", { sessionID, cause: Cause.pretty(cause) }).pipe(
+                    Effect.as(false),
+                  ),
                 ),
               )
               if (!didDeliver) return
@@ -1260,6 +1341,21 @@ export const layer = Layer.effect(
             ),
           )
           if (!snapshot.workflows.some((wf) => wf.projectId === ctx.project.id)) continue
+          // GOAL-FP-01-01: register only NON-terminal workflows. Terminal
+          // workflows with wake_reported=true would otherwise be re-registered
+          // on every restart and never unregistered (the only unregister for
+          // them lives in the wake-delivery SUCCESS path, whose batch only
+          // carries unreported workflows) — permanently leaking a dag
+          // registration and blocking the goal. Terminal-but-unreported
+          // workflows are safe to skip here too: tryDeliverWake registers
+          // every workflow in its batch itself right before claiming the wake
+          // lease, so wake redelivery does not depend on this sweep.
+          yield* Effect.forEach(
+            snapshot.workflows.filter((workflow) => !isWorkflowTerminalStatus(workflow.status as never)),
+            (workflow) =>
+              automation.register(SessionID.make(sessionID), { kind: "dag", id: workflow.id }),
+            { discard: true },
+          )
           yield* tryDeliverWake(sessionID).pipe(Effect.forkScoped)
         }
 
@@ -1274,6 +1370,8 @@ export const layer = Layer.effect(
     return Service.of({ init })
   }),
 )
+
+export const layer = serviceLayer.pipe(Layer.provide(SessionAutomationLease.defaultLayer))
 
 export const defaultLayer = layer.pipe(
   Layer.provide(EventV2Bridge.defaultLayer),

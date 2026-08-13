@@ -2,8 +2,6 @@ import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Effect, Schema } from "effect"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import type { JSONSchema7 } from "@ai-sdk/provider"
-import type { MessageV2 } from "../session/message-v2"
-import type { Permission } from "../permission"
 import type { SessionID, MessageID } from "../session/schema"
 import * as Truncate from "./truncate"
 import { Agent } from "@/agent/agent"
@@ -60,6 +58,15 @@ export interface Def<
   description: string
   parameters: Parameters
   jsonSchema?: JSONSchema7
+  /** Parse options applied when decoding LLM-supplied arguments. Tools whose
+   * parameters are a discriminated union use `onExcessProperty: "error"` so a
+   * call carrying another action's fields is rejected instead of silently
+   * dropping them. */
+  parseOptions?: {
+    errors?: "first" | "all"
+    onExcessProperty?: "ignore" | "error" | "preserve"
+    propertyOrder?: "none" | "original"
+  }
   execute(args: Schema.Schema.Type<Parameters>, ctx: Context): Effect.Effect<ExecuteResult<M>>
   formatValidationError?(error: unknown): string
 }
@@ -108,7 +115,7 @@ function wrap<Parameters extends Schema.Decoder<unknown>, Result extends Metadat
       // Compile the parser closure once per tool init; `decodeUnknownEffect`
       // allocates a new closure per call, so hoisting avoids re-closing it for
       // every LLM tool invocation.
-      const decode = Schema.decodeUnknownEffect(toolInfo.parameters)
+      const decode = Schema.decodeUnknownEffect(toolInfo.parameters, toolInfo.parseOptions)
       const execute = toolInfo.execute
       toolInfo.execute = (args, ctx) => {
         const attrs = {

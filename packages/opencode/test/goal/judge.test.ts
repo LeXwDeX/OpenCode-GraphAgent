@@ -14,6 +14,17 @@ describe("parseJudgeResponse", () => {
     expect(result).toEqual({ verdict: "continue", reason: "still working", parseFailed: false })
   })
 
+  test("blocked verdict stays distinct from successful completion", () => {
+    const result = GoalJudge.parseJudgeResponse(
+      '{"verdict":"blocked","reason":"missing production credentials"}',
+    )
+    expect(result).toEqual({
+      verdict: "blocked",
+      reason: "missing production credentials",
+      parseFailed: false,
+    })
+  })
+
   // §1.3 — markdown-fenced JSON strips fences (step 1)
   test("markdown-fenced JSON strips fences and parses", () => {
     const raw = "```json\n{\"done\": false, \"reason\": \"more steps remain\"}\n```"

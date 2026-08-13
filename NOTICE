@@ -51,3 +51,16 @@ License boundaries
 When a file under an AGPL-covered directory imports MIT-licensed upstream
 modules, the upstream modules remain MIT; only the AGPL-covered files and
 their derivatives carry AGPL obligations.
+
+3. Engineering workflow methodologies
+
+   Source:   https://github.com/mattpocock/skills
+   Revision: 84fdeffd12f2ee307994d1eb6feb48173b6e0502
+   License:  MIT
+   Text:     ./third_party/mattpocock-skills/LICENSE
+   Copyright (c) 2026 Matt Pocock
+
+   Selected decision, evidence, debugging, test-first delivery, codebase
+   design, review, and synthesis methodologies are adapted into product-owned
+   workflow routing and block contracts. Source metadata and adaptation scope
+   are recorded in ./third_party/mattpocock-skills/SOURCE.md.

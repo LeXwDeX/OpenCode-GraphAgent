@@ -1,12 +1,17 @@
 import { describe, expect, test } from "bun:test"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
+import { EffectFlock } from "@opencode-ai/core/util/effect-flock"
 import { Deferred, Duration, Effect, Fiber, Layer } from "effect"
 import fs from "node:fs/promises"
 import path from "node:path"
 import { Config } from "@/config/config"
 import { Git } from "@/git"
+import { MemoryAdmission } from "@/memory/admission"
 import { MemoryConfig } from "@/memory/config"
+import { MemoryHome } from "@/memory/home"
+import { MemoryIdentityFence } from "@/memory/identity-fence"
+import { MemoryLock } from "@/memory/lock"
 import { Memory } from "@/memory/memory"
 import { MemoryModel } from "@/memory/model"
 import { MemoryPrompts } from "@/memory/prompts"
@@ -47,6 +52,13 @@ let writtenProjectConfig: MemorySchema.Config | undefined
 const emptyConfigLayer = Layer.mock(Config.Service, {
   get: () => Effect.succeed({}),
 })
+const readyAdmissionLayer = Layer.mock(MemoryAdmission.Service, {
+  ensure: () =>
+    Effect.succeed(new MemoryAdmission.Result({ diagnostics: [], imported: 0, duplicates: 0, unresolved: 0 })),
+  invalidate: () => Effect.void,
+})
+let loadedProjectDirectory: string | undefined
+let migrationUnresolved = 0
 
 function topic(id = "architecture-boundaries") {
   return {
@@ -88,6 +100,9 @@ const unavailableModelIt = testEffect(
     Layer.provide(
       Layer.mergeAll(
         emptyConfigLayer,
+        EffectFlock.defaultLayer,
+        MemoryHome.defaultLayer,
+        MemoryIdentityFence.defaultLayer,
         replacementProvider.layer,
         Layer.mock(Project.Service, {
           get: (id) =>
@@ -101,10 +116,13 @@ const unavailableModelIt = testEffect(
         }),
         Layer.mock(MemoryConfig.Service, {
           load: (directory) =>
-            Effect.succeed({
-              config: { ...config, enabled: false, model: "removed/model" },
-              path: directory,
-              level: "project" as const,
+            Effect.sync(() => {
+              loadedProjectDirectory = directory
+              return {
+                config: { ...config, enabled: false, model: "removed/model" },
+                path: directory,
+                level: "project" as const,
+              }
             }),
           loadGlobal: () =>
             Effect.succeed({
@@ -122,12 +140,28 @@ const unavailableModelIt = testEffect(
               writtenProjectConfig = next
             }),
         }),
+        Layer.mock(MemoryAdmission.Service, {
+          ensure: () =>
+            Effect.succeed(
+              new MemoryAdmission.Result({
+                diagnostics: [],
+                imported: 0,
+                duplicates: 0,
+                unresolved: migrationUnresolved,
+              }),
+            ),
+          invalidate: () => Effect.void,
+        }),
+        MemoryLock.defaultLayer,
         Layer.mock(MemoryModel.Service, {
           generate: () => Effect.succeed({ model: "test/replacement", topic_limit: 10, turn_interval: 5 }),
         }),
         Layer.mock(MemoryStore.Service, {
-          ensureGitExclude: () => Effect.void,
-          writeTopics: () => Effect.void,
+          updateTopics: (_projectID, update) =>
+            Effect.sync(() => {
+              const next = update([])
+              return { revision: 1, topics: next.applied.topics, result: next.result }
+            }),
         }),
       ),
     ),
@@ -163,6 +197,9 @@ function bootstrapFixture() {
   const layer = Memory.layer.pipe(
     Layer.provide(
       Layer.mergeAll(
+        EffectFlock.defaultLayer,
+        MemoryHome.defaultLayer,
+        MemoryIdentityFence.defaultLayer,
         Layer.mock(Config.Service, {
           get: () =>
             Effect.succeed({
@@ -237,10 +274,10 @@ function bootstrapFixture() {
               throw new Error("bootstrap must not call a model")
             }),
         }),
+        readyAdmissionLayer,
+        MemoryLock.defaultLayer,
         Layer.mock(MemoryStore.Service, {
           readTopics: () => Effect.succeed([]),
-          ensureGitExclude: () => Effect.void,
-          writeTopics: () => Effect.void,
         }),
       ),
     ),
@@ -292,6 +329,9 @@ function recallFixture() {
     Layer.provide(
       Layer.mergeAll(
         emptyConfigLayer,
+        EffectFlock.defaultLayer,
+        MemoryHome.defaultLayer,
+        MemoryIdentityFence.defaultLayer,
         provider.layer,
         Layer.mock(Project.Service, {
           get: (id) =>
@@ -327,14 +367,20 @@ function recallFixture() {
               return { actions: [{ type: "no_change" }] }
             }),
         }),
+        readyAdmissionLayer,
+        MemoryLock.defaultLayer,
         Layer.mock(MemoryStore.Service, {
           readTopics: () =>
             Effect.sync(() => {
               state.reads++
               return state.topics
             }),
-          writeTopics: () => Effect.void,
-          ensureGitExclude: () => Effect.void,
+          updateTopics: (_projectID, update) =>
+            Effect.sync(() => {
+              const next = update(state.topics)
+              state.topics = next.applied.topics
+              return { revision: 1, topics: state.topics, result: next.result }
+            }),
         }),
       ),
     ),
@@ -454,54 +500,6 @@ describe("memory config and YAML store", () => {
             else process.env.OPENCODE_CONFIG_DIR = previous
           }),
       )
-    }),
-  )
-
-  it.live("round-trips one fixed YAML document per topic and isolates worktrees", () =>
-    Effect.gen(function* () {
-      const store = yield* MemoryStore.Service
-      const first = yield* tmpdirScoped({ git: true })
-      const second = yield* tmpdirScoped()
-      const git = yield* Git.Service
-      yield* Effect.promise(() => fs.rm(second, { recursive: true, force: true }))
-      const added = yield* git.run(["worktree", "add", "-b", "memory-linked", second], { cwd: first })
-      expect(added.exitCode).toBe(0)
-      const firstTopic = topic("first-worktree")
-      const secondTopic = topic("second-worktree")
-
-      yield* store.writeTopics(first, { topics: [firstTopic], changed: [firstTopic.id], deleted: [] })
-      yield* store.writeTopics(second, {
-        topics: [secondTopic],
-        changed: [secondTopic.id],
-        deleted: [],
-      })
-
-      expect(yield* store.readTopics(first)).toEqual([firstTopic])
-      expect(yield* store.readTopics(second)).toEqual([secondTopic])
-      expect(MemoryStore.topicsDir(first)).not.toBe(MemoryStore.topicsDir(second))
-
-      const yaml = yield* Effect.promise(() =>
-        fs.readFile(path.join(MemoryStore.topicsDir(first), `${firstTopic.id}.yaml`), "utf-8"),
-      )
-      expect(yaml).toContain("schema_version: 1")
-      expect(yaml).toContain("metadata:")
-      expect(yaml).toContain("items:")
-      expect(MemoryStore.decodeTopic(firstTopic, "wrong-file-id")).toBeUndefined()
-      expect(MemoryStore.decodeTopic({ ...firstTopic, extra: "not allowed" })).toBeUndefined()
-      expect(
-        MemoryStore.decodeTopic({
-          ...firstTopic,
-          metadata: { ...firstTopic.metadata, item_count: 2 },
-        }),
-      ).toBeUndefined()
-
-      yield* Effect.promise(() =>
-        fs.writeFile(
-          path.join(MemoryStore.topicsDir(first), "invalid-topic.yaml"),
-          "schema_version: 1\nid: invalid-topic\n",
-        ),
-      )
-      expect(yield* store.readTopics(first)).toEqual([firstTopic])
     }),
   )
 })
@@ -667,7 +665,7 @@ describe("memory controller policy", () => {
       apply("decision", "Confirmed decision: use stable boundaries", "User explicitly confirmed this durable decision"),
     ).not.toThrow()
     expect(() =>
-      apply("term", "MEMORY means worktree-local durable preferences", "User explicitly confirmed this stable term"),
+      apply("term", "MEMORY means Project-owned durable preferences", "User explicitly confirmed this stable term"),
     ).not.toThrow()
   })
 
@@ -686,6 +684,7 @@ describe("memory controller policy", () => {
     expect(rendered).toHaveLength(1)
     expect(rendered[0]).toContain("first-topic")
     expect(rendered[0]).not.toContain("second-topic")
+    expect(rendered[0]).toContain("Project-owned historical data shared by this Project's worktrees")
     expect(rendered[0]).toContain("Current user input and higher-priority instructions always win")
     expect(
       [
@@ -1282,25 +1281,26 @@ describe("memory turn-scoped retrieval", () => {
   )
 })
 
-describe("memory Git exclusions", () => {
-  it.live("installs exact local exclusions idempotently without touching .gitignore", () =>
+describe("memory project config Git exclusions", () => {
+  it.live("installs exact config exclusions idempotently without touching .gitignore", () =>
     Effect.gen(function* () {
       const tmp = yield* tmpdirScoped({ git: true })
       const git = yield* Git.Service
-      const store = yield* MemoryStore.Service
+      const configStore = yield* MemoryConfig.Service
       yield* Effect.promise(() => fs.writeFile(path.join(tmp, ".gitignore"), "keep-me\n"))
 
-      yield* store.ensureGitExclude(tmp)
-      yield* store.ensureGitExclude(tmp)
+      yield* configStore.writeProject(tmp, config)
+      yield* configStore.writeProject(tmp, config)
 
       const resolved = yield* git.run(["rev-parse", "--git-path", "info/exclude"], { cwd: tmp })
       const raw = resolved.text().trim()
       const exclude = path.isAbsolute(raw) ? raw : path.resolve(tmp, raw)
       const lines = (yield* Effect.promise(() => fs.readFile(exclude, "utf-8"))).split(/\r?\n/)
 
-      for (const rule of [".opencode/memory.jsonc", ".opencode/memory.json", ".opencode/memory/"]) {
+      for (const rule of [".opencode/memory.jsonc", ".opencode/memory.json"]) {
         expect(lines.filter((line) => line === rule)).toHaveLength(1)
       }
+      expect(lines).not.toContain(".opencode/memory/")
       expect(yield* Effect.promise(() => fs.readFile(path.join(tmp, ".gitignore"), "utf-8"))).toBe("keep-me\n")
     }),
   )
@@ -1652,11 +1652,29 @@ describe("memory enablement", () => {
       Effect.gen(function* () {
         writtenGlobalConfig = undefined
         writtenProjectConfig = undefined
+        loadedProjectDirectory = undefined
+        migrationUnresolved = 0
         const memory = yield* Memory.Service
         yield* memory.init()
         expect(writtenGlobalConfig).toMatchObject({ model: "test/replacement" })
         expect(yield* memory.setEnabled(true)).toBe("Memory on")
         expect(writtenProjectConfig).toMatchObject({ enabled: true, model: "test/replacement" })
+        expect(String(loadedProjectDirectory)).toBe("/unused")
+      }),
+    { git: true },
+  )
+
+  unavailableModelIt.instance(
+    "keeps MEMORY inert until Project admission succeeds",
+    () =>
+      Effect.gen(function* () {
+        loadedProjectDirectory = undefined
+        migrationUnresolved = 1
+        const memory = yield* Memory.Service
+
+        expect(yield* memory.context(SessionID.make("ses_memory_unresolved"))).toEqual([])
+        expect(loadedProjectDirectory).toBeUndefined()
+        migrationUnresolved = 0
       }),
     { git: true },
   )

@@ -17,31 +17,26 @@ config:
     - id: map
       kind: explore
       instruction: Locate the ownership and persistence seams.
-    - id: design
+    - id: codebase-design
       kind: plan
       depends_on: [map]
-    - id: implement
+      instruction: Define the owning seam, deep interface, migration path, and acceptance evidence.
+    - id: coding
       kind: coding
-      depends_on: [design]
-      skills: [tdd]
-    - id: checks
+      depends_on: [codebase-design]
+      instruction: Deliver the bounded design through observable tests and focused checks.
+    - id: verify
       kind: verify
-      depends_on: [implement]
-    - id: decision
+      depends_on: [coding]
+    - id: global-review
       kind: review
-      depends_on: [checks]
-      skills: [code-review]
+      depends_on: [verify]
 ```
 
-Each block accepts:
-
-- `id`: unique dependency address and the ID of its compiled exit node.
-- `kind`: `explore`, `plan`, `prototype`, `debug`, `coding`, `verify`,
-  `review`, or `synthesize`.
-- `depends_on`: upstream block IDs; omitted means a root block.
-- `instruction`: target-specific text added to the built-in block contract.
-- `skills`: relevant skill names the child loads lazily when available.
-- `worker_type`, `required`, `report_to_parent`: optional overrides.
+The parameter schema owns the exact block field shapes; the tool rejects
+unknown or missing fields by name, and `workflow(action="validate")` reports
+each field error with its path. This guide covers semantics and constraints
+only — compose blocks against the schema, not against prose.
 
 `objective` is required and is injected into every generated node. Use blocks
 or nodes, never both. Block IDs use letters, numbers, underscores, and hyphens.
@@ -51,7 +46,8 @@ or existing durable node IDs during **extend** and replan.
 ## Block contracts
 
 - `explore`: read-only repository mapping and evidence collection.
-- `plan`: implementation-ready decomposition, seams, checks, and risks.
+- `plan`: decision- or implementation-ready options/work packages, checks,
+  falsifiers, and risks.
 - `prototype`: the smallest throwaway experiment that resolves a runnable
   uncertainty; it does not silently become production code. It still publishes
   its changed-file list and fingerprint so later verification or review cannot
@@ -65,6 +61,10 @@ or existing durable node IDs during **extend** and replan.
   fingerprint through both reviews into an `ACCEPT | REJECT` decision.
 - `synthesize`: resolves dependency outputs into the parent-facing result.
 
+Block contracts are self-contained. `instruction` specializes a lifecycle kind
+into a capability such as `codebase-design`, `domain-modeling`, or
+`global-review`; it never delegates the method to an external Skill.
+
 Judgment and acceptance gates (`plan`, debug diagnosis, `verify`, review
 decision, and `synthesize`) are required by default. Volume lanes (`explore`,
 `prototype`, `coding`, debug evidence, and independent review lanes) are
@@ -74,41 +74,10 @@ stay quiet. A block immediately after a review gate is conditioned on its
 accepted verdict. Because the condition language handles one verdict reference,
 fan multiple review lanes into one review block before continuing.
 
-## Composition routes
-
-Choose only blocks justified by current evidence:
-
-- Product or architecture decision: parallel `explore` lanes → `plan` options
-  → `review` or `synthesize`.
-- Project feature: optional parallel `explore` or proposal lanes → `plan` →
-  ordered `coding`/assembly → `verify` → `review`.
-- Hard bug: `debug` → `coding` → `verify` → `review`.
-- Runnable design uncertainty: `prototype` → `plan`; keep the prototype
-  disposable unless the confirmed scope explicitly promotes it.
-- Existing implementation review: `explore` scope lanes → `review`; add a
-  separate verification block first when test evidence is required.
-
-Do not add a phase merely because it exists. Skip exploration when repository
-facts are already known and skip a prototype when ordinary inspection resolves
-the question. All block workers share one workspace: the compiler serializes
-otherwise-unordered `coding` and `prototype` writers, while read-only discovery
-and proposal lanes remain parallel. Use `synthesize` only when multiple outputs
-need reconciliation.
-
-## Parent decision checkpoint
-
-User qualification is not a DAG block. Before executable blocks start, the
-parent gathers facts it can discover, creates recommended answers for every
-material open decision, displays one compact decision brief, and asks for one
-combined confirmation. The brief contains the recommended route, alternatives
-only where they change the result, assumptions, risks, scope, and acceptance
-evidence. A correction from the user updates the brief; unchanged confirmed
-facts are not asked again.
-
-After confirmation, encode the decision in `objective` and block instructions.
-If the request is already fully bounded and confirmed, do not manufacture a
-redundant checkpoint. Child nodes never ask the user to make product or scope
-decisions.
+All block workers share one workspace. The compiler serializes
+otherwise-unordered `coding` and `prototype` writers, while read-only lanes may
+remain parallel. The resident Orchestration Router owns route selection and
+phase pruning; this guide owns block fields, contracts, and graph mechanics.
 
 ## When to use low-level nodes
 

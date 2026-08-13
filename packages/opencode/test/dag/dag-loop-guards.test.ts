@@ -37,6 +37,7 @@ import { MessageID } from "@/session/schema"
 import { Session } from "@/session/session"
 import { SessionStatus } from "@/session/status"
 import { pollWithTimeout } from "../lib/effect"
+import { withIdleAdmission } from "../lib/session-prompt"
 
 interface PromptGate {
   readonly title: string
@@ -140,14 +141,14 @@ function guardLayer(input: {
     })
     return reply(sessionID, yield* Deferred.await(release))
   })
-  const prompt = Layer.mock(SessionPrompt.Service, {
+  const prompt = Layer.mock(SessionPrompt.Service, withIdleAdmission({
     cancel: (sessionID) =>
       Effect.sync(() => {
         input.cancels.push(sessionID as string)
       }),
     prompt: deliver,
     promptIfIdle: (value) => deliver(value).pipe(Effect.map(Option.some)),
-  })
+  }))
   const agent = Layer.mock(Agent.Service, {
     get: () => Effect.succeed({
       name: "build",

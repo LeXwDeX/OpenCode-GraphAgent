@@ -16,6 +16,7 @@ import { SessionPrompt } from "@/session/prompt"
 import { Session } from "@/session/session"
 import { SessionStatus } from "@/session/status"
 import { pollWithTimeout } from "../lib/effect"
+import { withIdleAdmission } from "../lib/session-prompt"
 
 const ORPHAN_REASON = "orphan pending workflow recovered at startup"
 
@@ -41,14 +42,14 @@ function orphanRecoveryLayer(input: { promptCalls: string[] }) {
     get: Effect.fn("test.Session.get")(() => Effect.succeed({} as never)),
     messages: Effect.fn("test.Session.messages")(() => Effect.succeed([])),
   })
-  const prompt = Layer.mock(SessionPrompt.Service, {
+  const prompt = Layer.mock(SessionPrompt.Service, withIdleAdmission({
     cancel: Effect.fn("test.SessionPrompt.cancel")(() => Effect.void),
     prompt: Effect.fn("test.SessionPrompt.prompt")(() => {
       input.promptCalls.push("prompt")
       return Effect.never
     }),
     promptIfIdle: () => Effect.succeed(Option.none()),
-  })
+  }))
   const loop = DagLoop.layer.pipe(
     Layer.provide(base),
     Layer.provide(session),

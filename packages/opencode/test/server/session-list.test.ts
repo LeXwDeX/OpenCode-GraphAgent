@@ -3,6 +3,9 @@ import { Effect, Layer } from "effect"
 import { Database } from "@opencode-ai/core/database/database"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { Session as SessionNs } from "@/session/session"
+import { Goal } from "@/goal/goal"
+import { SessionAutomationLease } from "@/session/automation-lease"
+import { Dag } from "@/dag/dag"
 import { disposeAllInstances, provideInstance, TestInstance } from "../fixture/fixture"
 import { mkdir } from "fs/promises"
 import path from "path"
@@ -25,6 +28,9 @@ const layer = (experimentalWorkspaces: boolean) =>
       Layer.provide(SessionProjector.defaultLayer),
       Layer.provide(RuntimeFlags.layer({ experimentalWorkspaces })),
       Layer.provide(BackgroundJob.defaultLayer),
+      Layer.provide(Goal.defaultLayer),
+      Layer.provide(SessionAutomationLease.defaultLayer),
+      Layer.provide(Dag.defaultLayer),
     ),
   )
 const it = testEffect(layer(false))

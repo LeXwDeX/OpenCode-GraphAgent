@@ -5,6 +5,8 @@ import { ProjectDirectoryTable, ProjectTable } from "@opencode-ai/core/project/s
 import { ProjectDirectories } from "@opencode-ai/core/project/directories"
 import { SessionTable } from "@opencode-ai/core/session/sql"
 import { WorkspaceTable } from "@opencode-ai/core/control-plane/workspace.sql"
+import { WorkflowTable } from "@opencode-ai/core/dag/sql"
+import { PermissionTable } from "@opencode-ai/core/permission/sql"
 import { Flag } from "@opencode-ai/core/flag/flag"
 import { GlobalBus } from "@/bus/global"
 import { which } from "@opencode-ai/core/util/which"
@@ -22,6 +24,7 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { EventV2 } from "@opencode-ai/core/event"
 import { Project } from "@opencode-ai/schema/project"
+import { ProjectIdentityMigration } from "./identity-migration"
 
 export const Info = Project.Info
 export type Info = Types.DeepMutable<Schema.Schema.Type<typeof Info>>
@@ -112,6 +115,7 @@ export const layer = Layer.effect(
     const projectDirectories = yield* ProjectDirectories.Service
     const events = yield* EventV2Bridge.Service
     const flags = yield* RuntimeFlags.Service
+    const identityMigration = yield* ProjectIdentityMigration.Service
     const { db } = yield* Database.Service
 
     const git = Effect.fnUntraced(
@@ -151,45 +155,73 @@ export const layer = Layer.effect(
       if (oldID === ProjectV2.ID.global) return
       if (oldID === newID) return
 
-      yield* db
-        .transaction(
-          (d) =>
-            Effect.gen(function* () {
-              const oldProject = yield* d.select().from(ProjectTable).where(eq(ProjectTable.id, oldID)).get()
-              const newProject = yield* d.select().from(ProjectTable).where(eq(ProjectTable.id, newID)).get()
-              if (oldProject && !newProject) {
+      // The retirement seam holds the memory-identity:<oldID> fence across BOTH
+      // the Home migration and this reference/row retirement, so an in-flight
+      // writer under oldID cannot slip in between the Home move and the row
+      // deletion. This callback runs inside that fence; it does not touch the
+      // fence itself.
+      yield* identityMigration.migrate(oldID, newID, () =>
+        db
+          .transaction(
+            (d) =>
+              Effect.gen(function* () {
+                const oldProject = yield* d.select().from(ProjectTable).where(eq(ProjectTable.id, oldID)).get()
+                const newProject = yield* d.select().from(ProjectTable).where(eq(ProjectTable.id, newID)).get()
+                if (oldProject && !newProject) {
+                  yield* d
+                    .insert(ProjectTable)
+                    .values({
+                      ...oldProject,
+                      id: newID,
+                      time_updated: Date.now(),
+                    })
+                    .run()
+                }
+
+                // Project directories may be shared across distinct
+                // checkouts which have diverged. Clear the directory
+                // list and rely on it being re-populated to ensure
+                // accuracy
+                yield* d.delete(ProjectDirectoryTable).where(eq(ProjectDirectoryTable.project_id, oldID)).run()
+
                 yield* d
-                  .insert(ProjectTable)
-                  .values({
-                    ...oldProject,
-                    id: newID,
-                    time_updated: Date.now(),
-                  })
+                  .update(SessionTable)
+                  .set({ project_id: newID, time_updated: sql`${SessionTable.time_updated}` })
+                  .where(eq(SessionTable.project_id, oldID))
                   .run()
-              }
+                yield* d
+                  .update(WorkspaceTable)
+                  .set({ project_id: newID })
+                  .where(eq(WorkspaceTable.project_id, oldID))
+                  .run()
 
-              // Project directories may be shared across distinct
-              // checkouts which have diverged. Clear the directory
-              // list and rely on it being re-populated to ensure
-              // accuracy
-              yield* d.delete(ProjectDirectoryTable).where(eq(ProjectDirectoryTable.project_id, oldID)).run()
+                // Repoint the Project-owned references that the old row's deletion would otherwise
+                // cascade-destroy. Both workflow and permission carry ON DELETE CASCADE on project_id,
+                // so without this repointing, gaining a first remote would silently delete every DAG
+                // workflow and every saved permission for the project.
+                yield* d.update(WorkflowTable).set({ project_id: newID }).where(eq(WorkflowTable.project_id, oldID)).run()
+                // (project_id, action, resource) is unique on permission. When the successor
+                // identity already holds a row with the same (action, resource), it already grants
+                // the identical permission: drop the old row instead of repointing it. A bulk
+                // UPDATE would violate the unique index and wedge the whole identity upgrade.
+                const successorPermissions = new Set(
+                  (yield* d.select().from(PermissionTable).where(eq(PermissionTable.project_id, newID)).all()).map(
+                    (row) => JSON.stringify([row.action, row.resource]),
+                  ),
+                )
+                for (const row of yield* d.select().from(PermissionTable).where(eq(PermissionTable.project_id, oldID)).all()) {
+                  if (successorPermissions.has(JSON.stringify([row.action, row.resource]))) {
+                    yield* d.delete(PermissionTable).where(eq(PermissionTable.id, row.id)).run()
+                  } else {
+                    yield* d.update(PermissionTable).set({ project_id: newID }).where(eq(PermissionTable.id, row.id)).run()
+                  }
+                }
 
-              yield* d
-                .update(SessionTable)
-                .set({ project_id: newID, time_updated: sql`${SessionTable.time_updated}` })
-                .where(eq(SessionTable.project_id, oldID))
-                .run()
-              yield* d
-                .update(WorkspaceTable)
-                .set({ project_id: newID })
-                .where(eq(WorkspaceTable.project_id, oldID))
-                .run()
-
-              if (oldProject) yield* d.delete(ProjectTable).where(eq(ProjectTable.id, oldID)).run()
-            }),
-          { behavior: "immediate" },
-        )
-        .pipe(Effect.orDie)
+                if (oldProject) yield* d.delete(ProjectTable).where(eq(ProjectTable.id, oldID)).run()
+              }),
+            { behavior: "immediate" },
+          ).pipe(Effect.orDie),
+      )
     })
 
     const saveProjectDirectory = Effect.fn("Project.saveProjectDirectory")(function* (input: {
@@ -472,6 +504,7 @@ export const defaultLayer = layer.pipe(
   Layer.provide(FSUtil.defaultLayer),
   Layer.provide(Database.defaultLayer),
   Layer.provide(RuntimeFlags.defaultLayer),
+  Layer.provide(ProjectIdentityMigration.defaultLayer),
 )
 
 export const use = serviceUse(Service)
@@ -484,6 +517,7 @@ export const node = LayerNode.make(layer, [
   ProjectDirectories.node,
   EventV2Bridge.node,
   RuntimeFlags.node,
+  ProjectIdentityMigration.node,
   Database.node,
 ])
 

@@ -85,11 +85,8 @@ describe("skill", () => {
           expect(yield* skill.get("workflow")).toBeUndefined()
           expect(
             (yield* skill.all()).filter((item) => item.location === "<built-in>").map((item) => item.name),
-          ).toEqual(["customize-opencode", "configure-hooks", "create-dag-workflow", "orchestration-router"])
-          expect(yield* skill.get("orchestration-router")).toMatchObject({
-            description: expect.stringContaining("without waiting for /dag-flow"),
-            location: "<built-in>",
-          })
+          ).toEqual(["customize-opencode", "configure-hooks", "create-dag-workflow"])
+          expect(yield* skill.get("orchestration-router")).toBeUndefined()
         }),
       { git: true },
     ),

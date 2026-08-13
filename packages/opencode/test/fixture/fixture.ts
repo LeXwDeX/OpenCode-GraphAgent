@@ -162,9 +162,11 @@ export function tmpdirScoped<E = never, R = never>(options?: {
 }
 
 export const provideInstance =
-  (directory: string) =>
+  (input: string | InstanceStore.LoadInput) =>
   <A, E, R>(self: Effect.Effect<A, E, R>): Effect.Effect<A, E, R | InstanceStore.Service> =>
-    InstanceStore.Service.use((store) => store.provide({ directory }, self))
+    InstanceStore.Service.use((store) =>
+      store.provide(typeof input === "string" ? { directory: input } : input, self),
+    )
 
 export const provideInstanceEffect =
   (directory: string) =>

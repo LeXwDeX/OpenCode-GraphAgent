@@ -108,7 +108,7 @@ describe("legacy command registry", () => {
         "Use @security-reviewer to review this project. Do not modify files.",
       )
 
-      expect(expanded).toContain("orchestration-router")
+      expect(expanded).toContain("resident Orchestration Router")
       expect(expanded).toMatch(/Preserve\s+the task, user constraints/)
       expect(expanded).toContain("worker types or model IDs")
       expect(expanded).toContain("configured capability or model")

@@ -1,6 +1,7 @@
 import { existsSync } from "fs"
 import path from "path"
 import { fileURLToPath } from "url"
+import { dagTemplateDirectoryFailure, validateDagTemplateDirectory } from "./dag-template-validation"
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -57,12 +58,15 @@ async function loadDagTemplatesData() {
       `DAG_TEMPLATES_DIR points to a missing directory: ${templatesDir} — check the release workflow's Extract Templates step path conversion`,
     )
   }
-  const templates: Record<string, string> = {}
-  for (const file of await Array.fromAsync(new Bun.Glob("*.yaml").scan({ cwd: templatesDir }))) {
-    const name = file.replace(/\.ya?ml$/, "")
-    templates[name] = await Bun.file(path.join(templatesDir, file)).text()
-  }
-  console.log(`Loaded dag templates snapshot from ${templatesDir}: ${Object.keys(templates).length} templates`)
+  const validation = await validateDagTemplateDirectory(templatesDir)
+  const failure = dagTemplateDirectoryFailure(validation)
+  if (failure) throw new Error(failure)
+  const templates = Object.fromEntries(
+    validation.results.map((entry) => [entry.name.replace(/\.ya?ml$/, ""), entry.content]),
+  )
+  console.log(
+    `Loaded dag templates snapshot from ${templatesDir}: ${Object.keys(templates).length} templates (all validated)`,
+  )
   return JSON.stringify(templates)
 }
 

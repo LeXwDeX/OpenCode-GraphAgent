@@ -1,9 +1,9 @@
 {
   "version": "7",
   "dialect": "sqlite",
-  "id": "abdf5c23-7f2e-4ca3-b08b-012db47b5aa5",
+  "id": "7e8e00e9-7bbb-443e-996b-f646ec030c2b",
   "prevIds": [
-    "442cdbd5-86a8-41a9-86d6-5361dbac90e0"
+    "cce2163c-da01-4239-86fa-776d48a58d89"
   ],
   "ddl": [
     {
@@ -48,6 +48,10 @@
     },
     {
       "name": "event",
+      "entityType": "tables"
+    },
+    {
+      "name": "goal_outcome",
       "entityType": "tables"
     },
     {
@@ -1017,6 +1021,46 @@
       "name": "data",
       "entityType": "columns",
       "table": "event"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "goal_id",
+      "entityType": "columns",
+      "table": "goal_outcome"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "session_id",
+      "entityType": "columns",
+      "table": "goal_outcome"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "payload",
+      "entityType": "columns",
+      "table": "goal_outcome"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "completed_at",
+      "entityType": "columns",
+      "table": "goal_outcome"
     },
     {
       "type": "text",
@@ -2366,6 +2410,15 @@
     },
     {
       "columns": [
+        "goal_id"
+      ],
+      "nameExplicit": false,
+      "name": "goal_outcome_pk",
+      "table": "goal_outcome",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
         "session_id"
       ],
       "nameExplicit": false,
@@ -2643,6 +2696,24 @@
     {
       "columns": [
         {
+          "value": "session_id",
+          "isExpression": false
+        },
+        {
+          "value": "completed_at",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "goal_outcome_session_completed_idx",
+      "entityType": "indexes",
+      "table": "goal_outcome"
+    },
+    {
+      "columns": [
+        {
           "value": "updated_at",
           "isExpression": false
         }
@@ -2907,6 +2978,20 @@
       "where": null,
       "origin": "manual",
       "name": "session_parent_idx",
+      "entityType": "indexes",
+      "table": "session"
+    },
+    {
+      "columns": [
+        {
+          "value": "directory",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "session_directory_idx",
       "entityType": "indexes",
       "table": "session"
     },

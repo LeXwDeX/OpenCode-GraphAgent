@@ -1,5 +1,5 @@
 import { describe, expect } from "bun:test"
-import { Cause, Effect, Layer } from "effect"
+import { Cause, Deferred, Effect, Exit, Layer, Option } from "effect"
 import { GoalLoop, GoalLoopJudgeLLM } from "@/goal/loop"
 import { Goal } from "@/goal/goal"
 import { GoalEvent } from "@/goal/events"
@@ -7,9 +7,20 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 import { SessionStatus } from "@/session/status"
 import { Session } from "@/session/session"
 import { SessionPrompt } from "@/session/prompt"
+import { SessionRunState } from "@/session/run-state"
 import { Provider } from "@/provider/provider"
 import { SessionID } from "@/session/schema"
+import { SessionAutomationLease } from "@/session/automation-lease"
+import { Database } from "@opencode-ai/core/database/database"
+import { SessionTable } from "@opencode-ai/core/session/sql"
+import { GoalStateTable } from "@opencode-ai/core/goal/sql"
+import { ProjectTable } from "@opencode-ai/core/project/sql"
+import { ProjectSchema } from "@opencode-ai/core/project/schema"
+import { AbsolutePath } from "@opencode-ai/core/schema"
+import { TestInstance } from "../fixture/fixture"
+import { logLines } from "effect/testing/TestConsole"
 import { testEffect, pollWithTimeout } from "../lib/effect"
+import { withIdleAdmission } from "../lib/session-prompt"
 
 // P2b: full-cycle Goal regression (D5). Drives set → idle → judge(continue) →
 // continuation → idle → judge(done) → terminal event sequence, with the judge
@@ -66,16 +77,21 @@ const mkAssistantTools = () =>
 // assertions. Resolves void — these tests never drive a real agent turn from
 // the mock; the goal state and event captures are the observable contract.
 const recordingPrompt = (sink: { noReply?: boolean; text: string }[]) =>
-  Layer.succeed(SessionPrompt.Service, {
-    prompt: (input: { noReply?: boolean; parts?: Array<{ type: string; text: string }> }) =>
+  Layer.succeed(SessionPrompt.Service, (() => {
+    const record = (input: SessionPrompt.PromptInput) =>
       Effect.sync(() => {
         sink.push({
           noReply: input.noReply,
-          text: input.parts?.map((p) => p.text).join("\n") ?? "",
+          text: input.parts.map((part) => (part.type === "text" ? part.text : "")).join("\n"),
         })
         return undefined as never
-      }),
-  } as never)
+      })
+    return withIdleAdmission({
+      prompt: record,
+      promptIfIdle: (input: SessionPrompt.PromptInput) =>
+        record(input).pipe(Effect.map(Option.some)),
+    }) as never
+  })())
 
 describe("GoalLoop end-to-end — continue → done lifecycle (P2b)", () => {
   // Per-test mutable mock state (each it.instance runs in its own scope, but
@@ -92,16 +108,21 @@ describe("GoalLoop end-to-end — continue → done lifecycle (P2b)", () => {
   const sessionMock = Layer.succeed(Session.Service, {
     messages: () => Effect.succeed([mkAssistant()]),
   } as never)
-  const promptMock = Layer.succeed(SessionPrompt.Service, {
-    prompt: (input: { noReply?: boolean; parts?: Array<{ type: string; text: string }> }) =>
+  const promptMock = Layer.succeed(SessionPrompt.Service, (() => {
+    const record = (input: SessionPrompt.PromptInput) =>
       Effect.sync(() => {
         promptCalls.push({
           noReply: input.noReply,
-          text: input.parts?.map((p) => p.text).join("\n") ?? "",
+          text: input.parts.map((part) => (part.type === "text" ? part.text : "")).join("\n"),
         })
         return undefined as never
-      }),
-  } as never)
+      })
+    return withIdleAdmission({
+      prompt: record,
+      promptIfIdle: (input: SessionPrompt.PromptInput) =>
+        record(input).pipe(Effect.map(Option.some)),
+    }) as never
+  })())
   const providerMock = Layer.succeed(Provider.Service, {} as never)
   const judgeMock = Layer.succeed(
     GoalLoopJudgeLLM,
@@ -177,6 +198,277 @@ describe("GoalLoop end-to-end — continue → done lifecycle (P2b)", () => {
   )
 })
 
+describe("GoalLoop — shared Session automation lease", () => {
+  let leaseAttempts = 0
+  let directPromptAttempts = 0
+  const sessionMock = Layer.succeed(Session.Service, {
+    messages: () => Effect.succeed([mkAssistant()]),
+  } as never)
+  const promptMock = Layer.succeed(SessionPrompt.Service, withIdleAdmission({
+    prompt: () =>
+      Effect.sync(() => {
+        directPromptAttempts += 1
+        return undefined as never
+      }),
+    promptIfIdle: () =>
+      Effect.sync(() => {
+        leaseAttempts += 1
+        return Option.none()
+      }),
+  }) as never)
+  const judgeMock = Layer.succeed(
+    GoalLoopJudgeLLM,
+    GoalLoopJudgeLLM.of({
+      call: () => Effect.succeed(JSON.stringify({ verdict: "continue", reason: "more work" })),
+    }),
+  )
+  const leaseLayer = GoalLoop.layer.pipe(
+    Layer.provide(sessionMock),
+    Layer.provide(promptMock),
+    Layer.provide(Layer.succeed(Provider.Service, {} as never)),
+    Layer.provide(judgeMock),
+    Layer.provideMerge(Goal.defaultLayer),
+    Layer.provide(SessionStatus.defaultLayer),
+    Layer.provideMerge(EventV2Bridge.defaultLayer),
+  )
+  const it = testEffect(leaseLayer)
+
+  it.instance("a busy Session lease rejects Goal continuation without direct prompt admission", () =>
+    Effect.gen(function* () {
+      leaseAttempts = 0
+      directPromptAttempts = 0
+      const loop = yield* GoalLoop.Service
+      const goal = yield* Goal.Service
+      const events = yield* EventV2Bridge.Service
+      yield* loop.init()
+      const sessionID = SessionID.descending()
+      yield* goal.set(sessionID, "ship the feature", 10)
+      yield* Effect.yieldNow
+
+      yield* events.publish(SessionStatus.Event.Status, {
+        sessionID,
+        status: { type: "idle" },
+      })
+      yield* pollWithTimeout(
+        Effect.sync(() => (leaseAttempts > 0 ? true : undefined)),
+        "GoalLoop never attempted the shared Session automation lease",
+        "5 seconds",
+      )
+
+      expect(directPromptAttempts).toBe(0)
+      expect((yield* goal.load(sessionID))?.status).toBe("active")
+    }),
+  )
+})
+
+describe("GoalLoop + DAG owner arbitration", () => {
+  let judgeCalls = 0
+  let continuationCalls = 0
+  const sessionMock = Layer.succeed(Session.Service, {
+    messages: () => Effect.succeed([mkAssistant()]),
+  } as never)
+  const promptMock = Layer.succeed(SessionPrompt.Service, withIdleAdmission({
+    prompt: () => Effect.succeed(undefined as never),
+    promptIfIdle: () =>
+      Effect.sync(() => {
+        continuationCalls += 1
+        return Option.some(undefined as never)
+      }),
+  }) as never)
+  const judgeMock = Layer.succeed(
+    GoalLoopJudgeLLM,
+    GoalLoopJudgeLLM.of({
+      call: () =>
+        Effect.sync(() => {
+          judgeCalls += 1
+          return JSON.stringify({ verdict: "continue", reason: "more work" })
+        }),
+    }),
+  )
+  const arbitrationLayer = GoalLoop.layer.pipe(
+    Layer.provide(sessionMock),
+    Layer.provide(promptMock),
+    Layer.provide(Layer.succeed(Provider.Service, {} as never)),
+    Layer.provide(judgeMock),
+    Layer.provideMerge(Goal.defaultLayer),
+    // provideMerge (not provide): the lease's GOAL-FP-01-02 re-trigger runs
+    // in the test body's context when unregister is called from the body, so
+    // SessionStatus must be part of the output context (branch 3 documents
+    // the same pattern).
+    Layer.provideMerge(SessionStatus.defaultLayer),
+    Layer.provideMerge(EventV2Bridge.defaultLayer),
+    Layer.provideMerge(SessionAutomationLease.defaultLayer),
+  )
+  const it = testEffect(arbitrationLayer)
+
+  it.instance("a live DAG owns the Session; Goal resumes when the DAG releases it", () =>
+    Effect.gen(function* () {
+      judgeCalls = 0
+      continuationCalls = 0
+      const loop = yield* GoalLoop.Service
+      const goal = yield* Goal.Service
+      const events = yield* EventV2Bridge.Service
+      const automation = yield* SessionAutomationLease.Service
+      yield* loop.init()
+      const sessionID = SessionID.descending()
+      yield* goal.set(sessionID, "ship the feature", 10)
+      yield* automation.register(sessionID, { kind: "dag", id: "dag-executor" })
+      yield* Effect.yieldNow
+
+      yield* events.publish(SessionStatus.Event.Status, {
+        sessionID,
+        status: { type: "idle" },
+      })
+      yield* Effect.sleep("50 millis")
+      expect(judgeCalls).toBe(0)
+      expect(continuationCalls).toBe(0)
+
+      // GOAL-FP-01-02: the dag release itself re-triggers the goal evaluation
+      // through the idle status event mechanism — no follow-up idle event is
+      // needed. This is exactly the stall that previously required the manual
+      // second idle publish below.
+      yield* automation.unregister(sessionID, { kind: "dag", id: "dag-executor" })
+      yield* pollWithTimeout(
+        Effect.sync(() => (continuationCalls === 1 ? true : undefined)),
+        "Goal did not resume after the DAG released the Session lease",
+        "5 seconds",
+      )
+      expect(judgeCalls).toBe(1)
+    }),
+  )
+})
+
+// GOAL-FP-01-02 follow-up (R1): the dag-release re-trigger must NOT publish a
+// duplicate idle when no goal evaluation was ever blocked by the dag. The
+// unfixed re-trigger forks a full evaluation (D) whose commit consumes the
+// turn boundary; the real turn-idle fiber (B) then commits AGAIN for the same
+// boundary — turns inflation (and, with a live runner, the busy→pause path).
+//
+// Deterministic construction through the public seam: the dag releases while
+// the session is idle, THEN the turn-boundary idle event is published. The
+// re-trigger's evaluation (if any) completes before the boundary evaluation
+// forks, so the boundary fiber always double-commits under the unfixed
+// re-trigger. The second continuation dispatch is parked on a gate so the
+// test observes the settled double-commit state instead of a transient.
+//
+// The judge is scripted out of the picture entirely: the assistant message
+// carries no text, so afterIdle takes the synthetic "continue" verdict path
+// (loop.ts branch 2) and the judge mock must never be reached.
+describe("GoalLoop — dag release must not double-evaluate a boundary (GOAL-FP-01-02 follow-up)", () => {
+  let continuationCalls = 0
+  let gateHit = false
+  let gateRelease = Deferred.makeUnsafe<void>()
+  const reset = () => {
+    continuationCalls = 0
+    gateHit = false
+    gateRelease = Deferred.makeUnsafe<void>()
+  }
+
+  const sessionMock = Layer.mock(Session.Service, {
+    messages: () => Effect.succeed([mkAssistantTools()]),
+  })
+  // Second continuation dispatch parks on a gate: under the unfixed
+  // re-trigger the boundary fiber commits (turns 1 → 2) and reaches the gate;
+  // the test then observes the settled double-commit state.
+  const promptMock = Layer.mock(SessionPrompt.Service, withIdleAdmission({
+    prompt: () => Effect.die("the direct prompt path is not exercised in this scenario"),
+    promptIfIdle: () =>
+      Effect.sync(() => {
+        continuationCalls += 1
+      }).pipe(
+        Effect.flatMap(() => {
+          if (continuationCalls === 2) {
+            gateHit = true
+            return Deferred.await(gateRelease)
+          }
+          return Effect.void
+        }),
+        Effect.map(() => Option.none()),
+      ),
+  }))
+  const judgeMock = Layer.succeed(
+    GoalLoopJudgeLLM,
+    GoalLoopJudgeLLM.of({
+      call: () => Effect.die("the synthetic no-text verdict path must never reach the judge"),
+    }),
+  )
+  const raceLayer = GoalLoop.layer.pipe(
+    Layer.provide(sessionMock),
+    Layer.provide(promptMock),
+    Layer.provide(Layer.mock(Provider.Service, {})),
+    Layer.provide(judgeMock),
+    Layer.provideMerge(Goal.defaultLayer),
+    // provideMerge (not provide): unregister runs in the test body context and
+    // the lease's re-trigger resolves SessionStatus from it (see the
+    // arbitration describe above).
+    Layer.provideMerge(SessionStatus.defaultLayer),
+    Layer.provideMerge(EventV2Bridge.defaultLayer),
+    Layer.provideMerge(SessionAutomationLease.defaultLayer),
+  )
+  const it = testEffect(raceLayer)
+
+  it.instance("an unblocked goal is evaluated exactly once when the dag releases before the boundary idle", () =>
+    Effect.gen(function* () {
+      reset()
+      const loop = yield* GoalLoop.Service
+      const goal = yield* Goal.Service
+      const events = yield* EventV2Bridge.Service
+      const automation = yield* SessionAutomationLease.Service
+      yield* loop.init()
+      const sessionID = SessionID.descending()
+      yield* goal.set(sessionID, "ship the feature", 10)
+      yield* automation.register(sessionID, { kind: "dag", id: "dag-executor" })
+      yield* Effect.yieldNow
+
+      // The dag releases while the session is idle and NO evaluation was ever
+      // blocked by it. The re-trigger must stay silent here.
+      yield* automation.unregister(sessionID, { kind: "dag", id: "dag-executor" })
+
+      // Under the unfixed re-trigger an evaluation (D) was already forked by
+      // the unregister's idle publish. Wait for it to settle so the boundary
+      // fiber below cannot interrupt it mid-flight.
+      const spuriousEvaluation = yield* pollWithTimeout(
+        Effect.sync(() => (continuationCalls >= 1 ? true : undefined)),
+        "unfixed re-trigger evaluation never dispatched",
+        "500 millis",
+      )
+        .pipe(Effect.exit)
+        .pipe(Effect.map(Exit.isSuccess))
+
+      // The real turn-boundary idle event (the runner's idle emit).
+      yield* events.publish(SessionStatus.Event.Status, {
+        sessionID,
+        status: { type: "idle" },
+      })
+
+      // Under the unfixed re-trigger the boundary fiber commits a SECOND time
+      // (turns inflation) and parks at the second-dispatch gate.
+      const doubleCommit = yield* pollWithTimeout(
+        Effect.sync(() => (gateHit ? true : undefined)),
+        "boundary fiber never reached the second dispatch (no double evaluation)",
+        "500 millis",
+      )
+        .pipe(Effect.exit)
+        .pipe(Effect.map(Exit.isSuccess))
+
+      // Let the parked boundary fiber finish (no-op when it was never parked).
+      yield* Deferred.succeed(gateRelease, undefined)
+      yield* pollWithTimeout(
+        Effect.sync(() => (continuationCalls >= (spuriousEvaluation ? 2 : 1) ? true : undefined)),
+        "boundary evaluation never dispatched its continuation",
+        "5 seconds",
+      )
+
+      const g = yield* goal.load(sessionID)
+      expect(g?.status).toBe("active")
+      // The R1 harm: the boundary's single real evaluation must account for
+      // exactly one turn — not two.
+      expect(Number(g?.turns_used)).toBe(1)
+      expect(doubleCommit).toBe(false)
+    }),
+  )
+})
+
 // D1 (hooks-goal-completeness): a continuation dispatch failure must surface as a
 // recoverable paused state, not a silent stall. Reuses the e2e harness with a
 // prompt mock that always fails — the only prompt in this flow is the
@@ -192,9 +484,10 @@ describe("GoalLoop — continuation dispatch failure → recoverable pause (D1)"
     messages: () => Effect.succeed([mkAssistant()]),
   } as never)
   // Always-failing prompt — simulates provider fault / session write error.
-  const promptFailMock = Layer.succeed(SessionPrompt.Service, {
+  const promptFailMock = Layer.succeed(SessionPrompt.Service, withIdleAdmission({
     prompt: () => Effect.fail(new Error("continuation provider down")),
-  } as never)
+    promptIfIdle: () => Effect.fail(new Error("continuation provider down")),
+  }) as never)
   const providerMock = Layer.succeed(Provider.Service, {} as never)
   const judgeMock = Layer.succeed(
     GoalLoopJudgeLLM,
@@ -281,6 +574,278 @@ describe("GoalLoop — continuation dispatch failure → recoverable pause (D1)"
       expect(resumed?.status).toBe("active")
       expect(Number(resumed?.turns_used)).toBe(turnsBefore) // budget preserved, not reset
       expect(resumed?.paused_reason).toBeUndefined()
+    }),
+  )
+})
+
+// ── GOAL-FP-01-12: dispatch-failure unregister must not depend on the
+// trailing load ─────────────────────────────────────────────────────────
+//
+// The failure path pauses the goal and the loop releases the lease
+// registration afterwards. That release must be SYMMETRIC with the pause
+// (pauseAndPublish + unregister in the same handler) — it must not depend on
+// the afterDispatch load that follows the dispatch attempt. To make the
+// dependency observable, the failure path's visible-pause prompt parks on a
+// gate; the test body then drops the goal_state table and releases the gate,
+// so the trailing load dies with a defect: only an inline unregister can
+// release the lease.
+describe("GoalLoop — dispatch failure releases the lease without the trailing load (GOAL-FP-01-12)", () => {
+  let judgeCalls = 0
+  let promptGate = Deferred.makeUnsafe<void>()
+  const reset = () => {
+    judgeCalls = 0
+    promptGate = Deferred.makeUnsafe<void>()
+  }
+
+  const sessionMock = Layer.mock(Session.Service, {
+    messages: () => Effect.succeed([mkAssistant()]),
+  })
+  // Continuation dispatch fails (promptIfIdle). The failure handler's
+  // visible-pause prompt parks on a gate — the sync point where the test body
+  // drops the goal_state table — so afterDispatch's goal.load defects: the
+  // lease release must NOT depend on that trailing load. The die after the
+  // gate is swallowed by the handler's Effect.ignore.
+  const promptFailAndParkMock = Layer.mock(SessionPrompt.Service, withIdleAdmission({
+    prompt: () =>
+      Effect.gen(function* () {
+        yield* Deferred.await(promptGate)
+        return yield* Effect.die("failure-path prompt is the last stop before the trailing load")
+      }),
+    promptIfIdle: () => Effect.die(new Error("continuation provider down")),
+  }))
+  const judgeMock = Layer.succeed(
+    GoalLoopJudgeLLM,
+    GoalLoopJudgeLLM.of({
+      call: () =>
+        Effect.sync(() => {
+          judgeCalls += 1
+          return JSON.stringify({ done: false, reason: "more steps needed" })
+        }),
+    }),
+  )
+  const failLayer = GoalLoop.layer.pipe(
+    Layer.provide(sessionMock),
+    Layer.provide(promptFailAndParkMock),
+    Layer.provide(Layer.mock(Provider.Service, {})),
+    Layer.provide(judgeMock),
+    Layer.provideMerge(Goal.defaultLayer),
+    Layer.provideMerge(SessionStatus.defaultLayer),
+    Layer.provideMerge(EventV2Bridge.defaultLayer),
+    Layer.provideMerge(SessionAutomationLease.defaultLayer),
+    Layer.provideMerge(Database.defaultLayer),
+  )
+  const it = testEffect(failLayer)
+
+  it.instance("the lease registration is gone after the failure pause even when the post-dispatch load dies", () =>
+    Effect.gen(function* () {
+      reset()
+      const loop = yield* GoalLoop.Service
+      const goal = yield* Goal.Service
+      const automation = yield* SessionAutomationLease.Service
+      const { db } = yield* Database.Service
+      const events = yield* EventV2Bridge.Service
+      const seen = yield* captureEvents(events)
+      yield* loop.init()
+      const sid = SessionID.descending()
+      const goalState = yield* goal.set(sid, "ship the feature", 10)
+      const goalOwner = { kind: "goal" as const, id: goalState.goal_id ?? "legacy" }
+      yield* Effect.yieldNow
+
+      yield* events.publish(SessionStatus.Event.Status, { sessionID: sid, status: { type: "idle" } })
+      // The pause committed and published BEFORE the handler reaches the
+      // parked prompt — the parked handler is the deterministic sync point.
+      yield* pollWithTimeout(
+        Effect.sync(() =>
+          seen.some((e) => e.type === GoalEvent.Updated.type && e.status === "paused") ? true : undefined,
+        ),
+        "failure path never paused the goal",
+        "5 seconds",
+      )
+      // Kill the trailing load: the handler is parked on the prompt gate, so
+      // dropping the table here guarantees afterDispatch's goal.load defects.
+      yield* db.run("DROP TABLE goal_state")
+      yield* Deferred.succeed(promptGate, undefined)
+      // Give the (defecting) trailing load a scheduler turn to run.
+      yield* Effect.sleep("100 millis")
+      expect(judgeCalls).toBeGreaterThanOrEqual(1)
+
+      // The registration must already be released — pre-fix it leaks until
+      // /goal clear because the trailing load (the only unregister) died.
+      expect(Option.isNone(yield* automation.claim(sid, goalOwner))).toBe(true)
+    }),
+  )
+})
+
+// ── GOAL-FP-01-13: real admission seam for the goal continuation ───────
+//
+// Every other GoalLoop harness mocks SessionPrompt with a flat
+// `promptIfIdle: () => Option.some(...)` — the real admission gate
+// (SessionRunState.startIfIdle: Runner state machine, busy flip, onIdle →
+// real SessionStatus.set → real idle event) is never exercised, so the
+// lease-claim + promptIfIdle atomicity has no regression coverage.
+//
+// The REAL SessionPrompt layer pulls in the whole app (Permission, MCP, LSP,
+// ToolRegistry, Config, Plugin, …) — disproportionate for this suite. The
+// tightest feasible real seam: the REAL SessionRunState.defaultLayer, with a
+// SessionPrompt mock that delegates promptIfIdle admission to the real gate
+// exactly like the real implementation's core. Remains mocked (reported):
+// SessionPrompt.admitPrompt (transcript write) + runLoop (provider turn),
+// Session.messages, Provider, judge LLM.
+describe("GoalLoop — real SessionRunState admission seam (GOAL-FP-01-13)", () => {
+  let judgeCalls = 0
+  let admissions = 0
+  let rejectedAdmissions = 0
+  let firstAdmissionParked = false
+  let admissionRelease = Deferred.makeUnsafe<void>()
+  const reset = () => {
+    judgeCalls = 0
+    admissions = 0
+    rejectedAdmissions = 0
+    firstAdmissionParked = false
+    admissionRelease = Deferred.makeUnsafe<void>()
+  }
+
+  const sessionMock = Layer.mock(Session.Service, {
+    messages: () => Effect.succeed([mkAssistant()]),
+  })
+  // Effect.fn-wrapped like the wake-integration harness's `deliver` mock. The
+  // real SessionRunState is resolved via serviceOption (R-free, same pattern
+  // the harness uses for the bridge) so the implementation stays assignable to
+  // the SessionPrompt Interface while still hitting the REAL admission gate.
+  //
+  // The scripted "run" completes with an interrupt (typed never, no cast):
+  // the Runner's finishRun still emits the real onIdle (status.set(idle) →
+  // real event) before completing the handle, so the loop re-drive chain is
+  // real. The mock returns Option.none() even on admission — afterIdle
+  // discards the promptIfIdle result (only its failure matters), and
+  // admission is observable through the real status flip and the counters.
+  const prepareIfIdle = Effect.fn("test.goalSeam.SessionPrompt.prepareIfIdle")(function* (
+    input: SessionPrompt.PromptInput,
+  ) {
+    const runState = yield* Effect.serviceOption(SessionRunState.Service)
+    if (Option.isNone(runState)) return yield* Effect.die("SessionRunState not provided to the seam mock")
+    const activation = yield* Deferred.make<void>()
+    const admitted = yield* runState.value.startIfIdle(
+      input.sessionID,
+      Effect.die("onInterrupt is not exercised in this scenario"),
+      Effect.gen(function* () {
+        yield* Deferred.await(activation)
+        admissions += 1
+        if (admissions === 1) {
+          firstAdmissionParked = true
+          yield* Deferred.await(admissionRelease)
+        }
+        return yield* Effect.interrupt
+      }),
+    )
+    if (Option.isNone(admitted)) {
+      rejectedAdmissions += 1
+      return Option.none()
+    }
+    return Option.some({
+      activate: Deferred.succeed(activation, undefined).pipe(Effect.asVoid),
+      result: admitted.value.pipe(Effect.exit, Effect.as(mkAssistant())),
+      abort: runState.value.cancel(input.sessionID),
+    })
+  })
+  const promptIfIdle = Effect.fn("test.goalSeam.SessionPrompt.promptIfIdle")(function* (
+    input: SessionPrompt.PromptInput,
+  ) {
+    const prepared = yield* prepareIfIdle(input)
+    if (Option.isNone(prepared)) return Option.none()
+    yield* prepared.value.activate
+    return Option.some(yield* prepared.value.result)
+  })
+  const promptMock = Layer.mock(SessionPrompt.Service, {
+    prompt: () => Effect.die("the direct prompt path is not exercised in this scenario"),
+    prepareIfIdle,
+    promptIfIdle,
+  })
+  const judgeMock = Layer.succeed(
+    GoalLoopJudgeLLM,
+    GoalLoopJudgeLLM.of({
+      call: () =>
+        Effect.sync(() => {
+          judgeCalls += 1
+          // Calls 1-2 continue (drive admissions 1-2); call 3 ends the goal.
+          return judgeCalls <= 2
+            ? JSON.stringify({ done: false, reason: "more steps needed" })
+            : JSON.stringify({ done: true, reason: "feature shipped" })
+        }),
+    }),
+  )
+  const seamLayer = GoalLoop.layer.pipe(
+    Layer.provide(sessionMock),
+    Layer.provide(promptMock),
+    Layer.provide(Layer.mock(Provider.Service, {})),
+    Layer.provide(judgeMock),
+    Layer.provideMerge(Goal.defaultLayer),
+    Layer.provideMerge(SessionStatus.defaultLayer),
+    Layer.provideMerge(EventV2Bridge.defaultLayer),
+    Layer.provideMerge(SessionAutomationLease.defaultLayer),
+    Layer.provideMerge(SessionRunState.defaultLayer),
+  )
+  const it = testEffect(seamLayer)
+
+  it.instance("a continuation admitted by the real gate flips the session busy, blocks concurrent admission, and the real idle re-drives the loop to done", () =>
+    Effect.gen(function* () {
+      reset()
+      const loop = yield* GoalLoop.Service
+      const goal = yield* Goal.Service
+      const status = yield* SessionStatus.Service
+      const runState = yield* SessionRunState.Service
+      const events = yield* EventV2Bridge.Service
+      const seen = yield* captureEvents(events)
+      yield* loop.init()
+      const sid = SessionID.descending()
+      yield* goal.set(sid, "ship the feature", 10)
+      yield* Effect.yieldNow
+
+      // Turn 1: idle → judge(continue) → continuation admitted through the
+      // REAL admission gate; the scripted run parks and the session is BUSY.
+      yield* events.publish(SessionStatus.Event.Status, { sessionID: sid, status: { type: "idle" } })
+      yield* pollWithTimeout(
+        Effect.sync(() => (firstAdmissionParked ? true : undefined)),
+        "the continuation was never admitted through the real gate",
+        "5 seconds",
+      )
+      // Real seam proof: admission itself flipped the session status to busy.
+      expect((yield* status.get(sid)).type).toBe("busy")
+      // The real gate rejects concurrent admission while the goal run holds it
+      // (the probe work is Effect.never — a rejection never forks it).
+      const probe = yield* runState.startIfIdle(
+        sid,
+        Effect.die("probe onInterrupt is not exercised"),
+        Effect.never,
+      )
+      expect(Option.isNone(probe)).toBe(true)
+      expect(admissions).toBe(1)
+
+      // Release the run: the REAL Runner onIdle publishes the REAL idle
+      // status event, which re-drives GoalLoop with NO manual idle publish —
+      // the next continuation and the judge(done) terminal transition both
+      // ride the real chain.
+      yield* Deferred.succeed(admissionRelease, undefined)
+      yield* pollWithTimeout(
+        Effect.sync(() => (admissions >= 2 ? true : undefined)),
+        "the real onIdle event never re-drove the goal loop",
+        "5 seconds",
+      )
+      expect(rejectedAdmissions).toBe(0)
+      yield* pollWithTimeout(
+        Effect.sync(() => (judgeCalls >= 3 ? true : undefined)),
+        "the loop never reached the terminal judge call",
+        "5 seconds",
+      )
+
+      // Terminal contract through the real chain: exactly one done update,
+      // the cleared event, and the row is gone.
+      const doneUpdates = seen.filter((e) => e.type === GoalEvent.Updated.type && e.status === "done")
+      expect(doneUpdates.length).toBe(1)
+      expect(seen.some((e) => e.type === GoalEvent.Cleared.type)).toBe(true)
+      expect(yield* goal.load(sid)).toBeUndefined()
+      expect(admissions).toBe(2)
+      expect(judgeCalls).toBe(3)
     }),
   )
 })
@@ -518,9 +1083,10 @@ describe("GoalLoop — continuation interrupted → no pause, goal stays active 
   // undefined id — the F1 miss case that Cause.interruptors silently drops and
   // the old interruptors().size check misclassified as a dispatch failure.
   let interruptCause: Cause.Cause<never> = Cause.interrupt(0)
-  const promptInterruptMock = Layer.succeed(SessionPrompt.Service, {
+  const promptInterruptMock = Layer.succeed(SessionPrompt.Service, withIdleAdmission({
     prompt: () => Effect.failCause(interruptCause),
-  } as never)
+    promptIfIdle: () => Effect.failCause(interruptCause),
+  }) as never)
   const providerMock = Layer.succeed(Provider.Service, {} as never)
   const judgeMock = Layer.succeed(
     GoalLoopJudgeLLM,
@@ -623,6 +1189,404 @@ describe("GoalLoop — continuation interrupted → no pause, goal stays active 
       expect(afterInterrupt?.status).toBe("active") // NOT paused
       expect(afterInterrupt?.paused_reason).toBeUndefined()
       expect(seen.some((e) => e.type === GoalEvent.Updated.type && e.status === "paused")).toBe(false)
+    }),
+  )
+})
+
+// GOAL-FP-01-04: GoalLoop is purely event-driven — the idle subscription is
+// the only driver, and nothing re-emits idle for sessions that already
+// existed at startup. An active goal that survived a crash therefore sleeps
+// until the next user interaction (and the D6 zombie guard cannot fire
+// without an idle event). The startup scan in GoalLoop.init must resume it:
+// seed the goal in the durable store BEFORE boot, publish ZERO idle/status
+// events, and the goal must still get evaluated (judge + continuation).
+//
+// The shared scanLayer mirrors the e2e harness: Goal / SessionStatus /
+// EventV2Bridge / the lease are real; Session / SessionPrompt / Provider and
+// the judge LLM are mocked. provideMerge exposes SessionStatus and the lease
+// to the test body so pre-boot setup (busy / dag owner) shares the SAME
+// instances the scan reads.
+describe("GoalLoop — startup scan resumes pre-boot active goals (GOAL-FP-01-04)", () => {
+  let judgeCalls = 0
+  let continuationCalls = 0
+  const reset = () => {
+    judgeCalls = 0
+    continuationCalls = 0
+  }
+
+  // Layer.mock (not Layer.succeed(… as never)) — the R1 describe above shows
+  // the warning-free pattern; `as never` would add lint-ratchet warnings.
+  const sessionMock = Layer.mock(Session.Service, {
+    messages: () => Effect.succeed([mkAssistant()]),
+  })
+  const promptMock = Layer.mock(SessionPrompt.Service, withIdleAdmission({
+    prompt: () => Effect.die("the direct prompt path is not exercised in this scenario"),
+    promptIfIdle: () =>
+      Effect.sync(() => {
+        continuationCalls += 1
+        return Option.none()
+      }),
+  }))
+  const judgeMock = Layer.succeed(
+    GoalLoopJudgeLLM,
+    GoalLoopJudgeLLM.of({
+      call: () =>
+        Effect.sync(() => {
+          judgeCalls += 1
+          return JSON.stringify({ done: false, reason: "more steps needed" })
+        }),
+    }),
+  )
+  const scanLayer = GoalLoop.layer.pipe(
+    Layer.provide(sessionMock),
+    Layer.provide(promptMock),
+    Layer.provide(Layer.mock(Provider.Service, {})),
+    Layer.provide(judgeMock),
+    Layer.provideMerge(Goal.defaultLayer),
+    // provideMerge (not provide): the test body seeds pre-boot busy / dag
+    // owner through SessionStatus, the lease, and the DB, and the scan must
+    // read the SAME instances (see the arbitration describe above).
+    Layer.provideMerge(SessionStatus.defaultLayer),
+    Layer.provideMerge(EventV2Bridge.defaultLayer),
+    Layer.provideMerge(SessionAutomationLease.defaultLayer),
+    Layer.provideMerge(Database.defaultLayer),
+  )
+  const it = testEffect(scanLayer)
+
+  // Seeds a durable session row (+ its project row, FK-required) so the
+  // D-1 directory join can attribute the goal_state row to an instance.
+  const seedSessionRow = (sessionID: SessionID, directory: string) =>
+    Effect.gen(function* () {
+      const { db } = yield* Database.Service
+      const projectID = ProjectSchema.ID.make(Bun.randomUUIDv7())
+      yield* db.insert(ProjectTable).values({
+        id: projectID,
+        worktree: AbsolutePath.make(directory),
+        sandboxes: [AbsolutePath.make(directory)],
+      })
+      yield* db.insert(SessionTable).values({
+        id: sessionID,
+        project_id: projectID,
+        slug: "test-session",
+        directory,
+        title: "test session",
+        version: "1",
+        time_created: Date.now(),
+        time_updated: Date.now(),
+      })
+    })
+
+  it.instance("a goal active before boot is evaluated with ZERO idle events", () =>
+    Effect.gen(function* () {
+      reset()
+      const loop = yield* GoalLoop.Service
+      const goal = yield* Goal.Service
+      const directory = (yield* TestInstance).directory
+      // Seed the durable store BEFORE GoalLoop boots — models a goal_state
+      // row surviving a crash-restart. No idle/status event is published.
+      const sid = SessionID.descending()
+      yield* seedSessionRow(sid, directory)
+      yield* goal.set(sid, "ship the feature", 10)
+      yield* loop.init()
+
+      // The only driver available is the startup scan: assert the full
+      // claim+judge+continuation flow ran within the poll window.
+      yield* pollWithTimeout(
+        Effect.sync(() => (continuationCalls >= 1 ? true : undefined)),
+        "startup scan never evaluated the pre-boot active goal",
+        "5 seconds",
+      )
+      expect(judgeCalls).toBe(1)
+      const g = yield* goal.load(sid)
+      expect(g?.status).toBe("active")
+      expect(Number(g?.turns_used)).toBe(1)
+    }),
+  )
+
+  it.instance("a dag-owned session yields to the startup scan and resumes when the dag releases", () =>
+    Effect.gen(function* () {
+      reset()
+      const loop = yield* GoalLoop.Service
+      const goal = yield* Goal.Service
+      const automation = yield* SessionAutomationLease.Service
+      const directory = (yield* TestInstance).directory
+
+      // Session B is a plain active goal — its evaluation is the positive
+      // signal that the scan RAN (judgeCalls 0→1). Session A is dag-owned:
+      // the scan's claim must be rejected exactly like a real idle, so A
+      // contributes no judge call and stays untouched.
+      const sidA = SessionID.descending()
+      const sidB = SessionID.descending()
+      yield* seedSessionRow(sidA, directory)
+      yield* seedSessionRow(sidB, directory)
+      yield* goal.set(sidA, "goal owned by dag", 10)
+      yield* goal.set(sidB, "goal evaluated by scan", 10)
+      yield* automation.register(sidA, { kind: "dag", id: "dag-executor" })
+      yield* loop.init()
+
+      yield* pollWithTimeout(
+        Effect.sync(() => (judgeCalls >= 1 ? true : undefined)),
+        "startup scan never evaluated the unblocked goal",
+        "5 seconds",
+      )
+      const a = yield* goal.load(sidA)
+      expect(a?.status).toBe("active")
+      expect(Number(a?.turns_used)).toBe(0) // claim rejected — trigger harmless
+      expect(judgeCalls).toBe(1) // only B was evaluated
+
+      // GOAL-FP-01-02: releasing the dag re-triggers the blocked goal
+      // evaluation through the idle mechanism — no manual idle event needed.
+      yield* automation.unregister(sidA, { kind: "dag", id: "dag-executor" })
+      yield* pollWithTimeout(
+        Effect.sync(() => (judgeCalls >= 2 ? true : undefined)),
+        "goal did not resume after the dag released the session",
+        "5 seconds",
+      )
+      const a2 = yield* goal.load(sidA)
+      expect(Number(a2?.turns_used)).toBe(1)
+    }),
+  )
+
+  it.instance("a busy session is not force-evaluated by the scan; its own idle event drives it", () =>
+    Effect.gen(function* () {
+      reset()
+      const loop = yield* GoalLoop.Service
+      const goal = yield* Goal.Service
+      const status = yield* SessionStatus.Service
+      const directory = (yield* TestInstance).directory
+
+      const sidA = SessionID.descending()
+      const sidB = SessionID.descending()
+      yield* seedSessionRow(sidA, directory)
+      yield* seedSessionRow(sidB, directory)
+      yield* goal.set(sidA, "goal on busy session", 10)
+      yield* goal.set(sidB, "goal on idle session", 10)
+      yield* status.set(sidA, { type: "busy" })
+      yield* loop.init()
+
+      // B's evaluation proves the scan ran; A must have been skipped by the
+      // SessionStatus gate — no force-evaluation mid-turn.
+      yield* pollWithTimeout(
+        Effect.sync(() => (judgeCalls >= 1 ? true : undefined)),
+        "startup scan never evaluated the idle-session goal",
+        "5 seconds",
+      )
+      expect(judgeCalls).toBe(1)
+      const a = yield* goal.load(sidA)
+      expect(a?.status).toBe("active")
+      expect(Number(a?.turns_used)).toBe(0)
+
+      // When the busy session finishes, its own idle event drives the goal.
+      yield* status.set(sidA, { type: "idle" })
+      yield* pollWithTimeout(
+        Effect.sync(() => (judgeCalls >= 2 ? true : undefined)),
+        "busy session's goal was not driven by its own idle event",
+        "5 seconds",
+      )
+      const a2 = yield* goal.load(sidA)
+      expect(Number(a2?.turns_used)).toBe(1)
+    }),
+  )
+})
+
+// GOAL-FP-01-04 follow-up (D-1..D-4): scoping and hardening of the startup
+// scan. D-1: the scan must be scoped to the instance's own directory (join
+// goal_state → session.directory). D-2: a defective scan query must degrade
+// to no-scan + a log, never kill init or the idle path. D-3: undecodable
+// rows must be skipped with a visible log, not silently. D-4: a scan
+// evaluation racing an idle evaluation must commit exactly once.
+describe("GoalLoop — startup scan scoping and hardening (GOAL-FP-01-04 follow-up)", () => {
+  let judgeCalls = 0
+  let foreignJudgeCalls = 0
+  let parkFirstJudge = false
+  let judgeRelease = Deferred.makeUnsafe<void>()
+  const reset = () => {
+    judgeCalls = 0
+    foreignJudgeCalls = 0
+    parkFirstJudge = false
+    judgeRelease = Deferred.makeUnsafe<void>()
+  }
+
+  // The judge LLM prompt carries the goal text verbatim, so the mock can
+  // attribute calls to the foreign-directory goal via a marker string.
+  const FOREIGN_GOAL = "FOREIGN-MARKER ship the feature"
+
+  const sessionMock = Layer.mock(Session.Service, {
+    messages: () => Effect.succeed([mkAssistant()]),
+  })
+  const promptMock = Layer.mock(SessionPrompt.Service, withIdleAdmission({
+    prompt: () => Effect.die("the direct prompt path is not exercised in this scenario"),
+    promptIfIdle: () => Effect.sync(() => Option.none()),
+  }))
+  const judgeMock = Layer.succeed(
+    GoalLoopJudgeLLM,
+    GoalLoopJudgeLLM.of({
+      call: (opts: { user: string }) =>
+        Effect.gen(function* () {
+          judgeCalls += 1
+          if (opts.user.includes("FOREIGN-MARKER")) foreignJudgeCalls += 1
+          // D-4 hook: park the first judge call so the scan and idle
+          // evaluations race deterministically.
+          if (parkFirstJudge && judgeCalls === 1) yield* Deferred.await(judgeRelease)
+          return JSON.stringify({ done: false, reason: "more steps needed" })
+        }),
+    }),
+  )
+  const hardenLayer = GoalLoop.layer.pipe(
+    Layer.provide(sessionMock),
+    Layer.provide(promptMock),
+    Layer.provide(Layer.mock(Provider.Service, {})),
+    Layer.provide(judgeMock),
+    Layer.provideMerge(Goal.defaultLayer),
+    Layer.provideMerge(SessionStatus.defaultLayer),
+    Layer.provideMerge(EventV2Bridge.defaultLayer),
+    Layer.provideMerge(SessionAutomationLease.defaultLayer),
+    Layer.provideMerge(Database.defaultLayer),
+  )
+  const it = testEffect(hardenLayer)
+
+  const seedSessionRow = (sessionID: SessionID, directory: string) =>
+    Effect.gen(function* () {
+      const { db } = yield* Database.Service
+      const projectID = ProjectSchema.ID.make(Bun.randomUUIDv7())
+      yield* db.insert(ProjectTable).values({
+        id: projectID,
+        worktree: AbsolutePath.make(directory),
+        sandboxes: [AbsolutePath.make(directory)],
+      })
+      yield* db.insert(SessionTable).values({
+        id: sessionID,
+        project_id: projectID,
+        slug: "test-session",
+        directory,
+        title: "test session",
+        version: "1",
+        time_created: Date.now(),
+        time_updated: Date.now(),
+      })
+    })
+
+  it.instance("D-1: a foreign-directory active goal is not evaluated; the same-directory goal is", () =>
+    Effect.gen(function* () {
+      reset()
+      const loop = yield* GoalLoop.Service
+      const goal = yield* Goal.Service
+      const directory = (yield* TestInstance).directory
+
+      const sidForeign = SessionID.descending()
+      const sidSame = SessionID.descending()
+      yield* seedSessionRow(sidForeign, directory + "-foreign")
+      yield* seedSessionRow(sidSame, directory)
+      yield* goal.set(sidForeign, FOREIGN_GOAL, 10)
+      yield* goal.set(sidSame, "ship the feature", 10)
+      yield* loop.init()
+
+      // Positive control: the same-directory goal IS evaluated by the scan.
+      yield* pollWithTimeout(
+        Effect.sync(() => (judgeCalls >= 1 ? true : undefined)),
+        "startup scan never evaluated the same-directory goal",
+        "5 seconds",
+      )
+      // Let any (buggy) foreign evaluation settle before asserting.
+      yield* Effect.sleep("300 millis")
+      const same = yield* goal.load(sidSame)
+      const foreign = yield* goal.load(sidForeign)
+      expect(Number(same?.turns_used)).toBe(1)
+      expect(foreignJudgeCalls).toBe(0)
+      expect(foreign?.status).toBe("active")
+      expect(Number(foreign?.turns_used)).toBe(0)
+    }),
+  )
+
+  it.instance("D-2: a defective scan query never kills init; the idle path still works", () =>
+    Effect.gen(function* () {
+      reset()
+      const { db } = yield* Database.Service
+      // Corrupt DB state: the scan query hits a missing table.
+      yield* db.run("DROP TABLE goal_state")
+      const loop = yield* GoalLoop.Service
+      yield* loop.init() // must not die
+      yield* db.run(
+        "CREATE TABLE goal_state (session_id TEXT PRIMARY KEY NOT NULL, payload TEXT NOT NULL, updated_at INTEGER NOT NULL)",
+      )
+      const goal = yield* Goal.Service
+      const events = yield* EventV2Bridge.Service
+      const directory = (yield* TestInstance).directory
+      const sid = SessionID.descending()
+      yield* seedSessionRow(sid, directory)
+      yield* goal.set(sid, "ship the feature", 10)
+      yield* Effect.yieldNow
+
+      // The idle subscription (armed before the scan) must still drive the
+      // goal — the defective scan degraded, it did not kill the loop.
+      yield* events.publish(SessionStatus.Event.Status, { sessionID: sid, status: { type: "idle" } })
+      yield* pollWithTimeout(
+        Effect.sync(() => (judgeCalls >= 1 ? true : undefined)),
+        "idle path dead after a defective scan",
+        "5 seconds",
+      )
+      expect(Number((yield* goal.load(sid))?.turns_used)).toBe(1)
+    }),
+  )
+
+  it.instance("D-3: an undecodable goal_state row is skipped with a visible warning log", () =>
+    Effect.gen(function* () {
+      reset()
+      const { db } = yield* Database.Service
+      const directory = (yield* TestInstance).directory
+      const sid = SessionID.descending()
+      yield* seedSessionRow(sid, directory)
+      yield* db
+        .insert(GoalStateTable)
+        .values({ session_id: sid, payload: "{corrupt", updated_at: Date.now() })
+      const loop = yield* GoalLoop.Service
+      yield* loop.init()
+      const logs = JSON.stringify(yield* logLines)
+      expect(logs).toContain("goal startup scan skipped undecodable goal_state row")
+      expect(logs).toContain(String(sid))
+    }),
+  )
+
+  it.instance("D-4: a scan evaluation racing an idle evaluation commits exactly once", () =>
+    Effect.gen(function* () {
+      reset()
+      parkFirstJudge = true
+      const loop = yield* GoalLoop.Service
+      const goal = yield* Goal.Service
+      const events = yield* EventV2Bridge.Service
+      const directory = (yield* TestInstance).directory
+      const sid = SessionID.descending()
+      yield* seedSessionRow(sid, directory)
+      yield* goal.set(sid, "ship the feature", 10)
+      yield* loop.init()
+
+      // Wait for the scan's evaluation to reach the judge, where it parks.
+      yield* pollWithTimeout(
+        Effect.sync(() => (judgeCalls >= 1 ? true : undefined)),
+        "the scan's evaluation never reached the judge",
+        "5 seconds",
+      )
+      // Now a second evaluation races it: the idle event drives an
+      // independent trigger for the SAME turn boundary. The fiber map's
+      // interrupt-on-replace kills the parked scan evaluation, and exactly
+      // ONE commit for the boundary must land.
+      yield* events.publish(SessionStatus.Event.Status, { sessionID: sid, status: { type: "idle" } })
+
+      yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const g = yield* goal.load(sid)
+          return Number(g?.turns_used) >= 1 ? true : undefined
+        }),
+        "no racing evaluation committed",
+        "5 seconds",
+      )
+      yield* Effect.sleep("50 millis")
+      yield* Deferred.succeed(judgeRelease, undefined)
+      const g = yield* goal.load(sid)
+      expect(g?.status).toBe("active")
+      // The single-writer commit point (matchesExpected + record gate) must
+      // yield exactly ONE commit for the boundary — not two.
+      expect(Number(g?.turns_used)).toBe(1)
     }),
   )
 })

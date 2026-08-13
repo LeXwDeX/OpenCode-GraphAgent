@@ -89,6 +89,11 @@ jobs:
   # (LeXwDeX/opencode-dag-config) into a release asset. dev/main do not manage
   # these templates anymore — the config repo is the single source of truth.
   # Read-only: no commits, no pushes, so branch protection never blocks it.
+  #
+  # Validate-before-package: the releasing runtime commit runs its directory
+  # validator against the config repo HEAD BEFORE any copy/package step. Any
+  # invalid template — or an unavailable validator — fails the job (fail
+  # closed), so an unchecked archive can never be uploaded or embedded.
   package-templates:
     name: Package Reference Templates
     if: github.event_name == 'workflow_dispatch'
@@ -96,24 +101,28 @@ jobs:
     permissions:
       contents: read
     steps:
+      - name: Checkout Runtime (releasing commit)
+        uses: actions/checkout@v4
+
       - name: Clone Config Repo
         uses: actions/checkout@v4
         with:
           repository: LeXwDeX/opencode-dag-config
           path: dag-config
 
-      - name: Package Templates
+      - name: Setup Bun
+        uses: ./.github/actions/setup-bun
+        with:
+          save-cache: false
+
+      - name: Install Runtime Dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Validate and Package Templates (fail closed)
+        working-directory: packages/opencode
         run: |
-          mkdir -p dist
-          shopt -s nullglob
-          files=(dag-config/*.yaml)
-          if [ ${#files[@]} -gt 0 ]; then
-            cp "${files[@]}" dist/
-          else
-            echo "::warning::No templates found in opencode-dag-config root; packaging empty archive"
-          fi
-          tar -czf dag-templates.tar.gz -C dist .
-          echo "Templates packaged: $(ls dist | wc -l) files"
+          echo "Packaging config commit $(git -C "$GITHUB_WORKSPACE/dag-config" rev-parse HEAD) with runtime commit $(git rev-parse HEAD)"
+          bun run script/package-dag-templates.ts "$GITHUB_WORKSPACE/dag-config" "$GITHUB_WORKSPACE/dag-templates.tar.gz"
 
       - name: Upload Templates Artifact
         uses: actions/upload-artifact@v4
@@ -224,15 +233,9 @@ jobs:
           for dir in opencode-*/; do
             base="${dir%/}"
             if [[ "$base" == *linux* ]]; then
-              tar -czf "${base}.tar.gz" -C "${base}/bin" .
+              bun run ../script/package-cli-artifact.ts "$base" "${base}.tar.gz"
             else
-              cd "${base}/bin"
-              if command -v zip &>/dev/null; then
-                zip -r "../../${base}.zip" .
-              else
-                pwsh -Command "Compress-Archive -Path '*' -DestinationPath '../../${base}.zip'" 2>/dev/null || 7z a "../../${base}.zip" . || true
-              fi
-              cd ../..
+              bun run ../script/package-cli-artifact.ts "$base" "${base}.zip"
             fi
           done
 

@@ -1,16 +1,18 @@
 export * as MemoryStore from "./store"
 
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { EffectFlock } from "@opencode-ai/core/util/effect-flock"
 import { FSUtil } from "@opencode-ai/core/fs-util"
-import { Git } from "@/git"
+import { ProjectV2 } from "@opencode-ai/core/project"
 import { Context, Effect, Layer, Option, Schema, Types } from "effect"
-import { basename, isAbsolute, join, resolve } from "node:path"
+import { basename, join } from "node:path"
+import { randomUUID } from "node:crypto"
 import { ulid } from "ulid"
 import { parse, stringify } from "yaml"
 import { MemoryFile } from "./file"
+import { MemoryHome } from "./home"
 import { MemorySchema } from "./schema"
 
-const EXCLUDE_RULES = [".opencode/memory.jsonc", ".opencode/memory.json", ".opencode/memory/"] as const
 const TOPIC_KEYS = ["schema_version", "id", "name", "summary", "metadata", "items"] as const
 const METADATA_KEYS = [
   "categories",
@@ -92,37 +94,84 @@ export type Applied = {
   readonly deleted: string[]
 }
 
+export type Update<A> = {
+  readonly applied: Applied
+  readonly result: A
+}
+
+export type Snapshot = {
+  readonly revision: number
+  readonly topics: MemorySchema.Topic[]
+}
+
 type MutableTopic = Types.DeepMutable<MemorySchema.Topic>
 
 export interface Interface {
-  readonly readTopics: (worktree: string) => Effect.Effect<MemorySchema.Topic[], FSUtil.Error>
-  readonly writeTopics: (worktree: string, applied: Applied) => Effect.Effect<void, FSUtil.Error>
-  readonly ensureGitExclude: (worktree: string) => Effect.Effect<void, FSUtil.Error | StoreError>
+  readonly readTopics: (projectID: ProjectV2.ID) => Effect.Effect<MemorySchema.Topic[], FSUtil.Error>
+  readonly readSnapshot: (
+    projectID: ProjectV2.ID,
+  ) => Effect.Effect<Snapshot, FSUtil.Error | StoreError>
+  readonly commit: (
+    projectID: ProjectV2.ID,
+    expectedRevision: number,
+    applied: Applied,
+  ) => Effect.Effect<Snapshot, FSUtil.Error | StoreError | CommitConflictError | EffectFlock.LockError>
+  readonly inspectTopics: (
+    projectID: ProjectV2.ID,
+  ) => Effect.Effect<MemorySchema.Topic[], FSUtil.Error | StoreError>
+  readonly updateTopics: <A>(
+    projectID: ProjectV2.ID,
+    update: (topics: MemorySchema.Topic[]) => Update<A>,
+  ) => Effect.Effect<
+    Snapshot & { result: A },
+    FSUtil.Error | StoreError | EffectFlock.LockError
+  >
 }
 
 export class StoreError extends Schema.TaggedErrorClass<StoreError>()("MemoryStore.Error", {
   message: Schema.String,
 }) {}
 
+export class CommitConflictError extends Schema.TaggedErrorClass<CommitConflictError>()("MemoryStore.CommitConflict", {
+  expected_revision: Schema.Number,
+  actual_revision: Schema.Number,
+}) {}
+
 export class Service extends Context.Service<Service, Interface>()("@opencode/MemoryStore") {}
+
+const Manifest = Schema.Struct({
+  schema_version: Schema.Literal(1),
+  revision: Schema.Number.check(Schema.isInt(), Schema.isGreaterThanOrEqualTo(1)),
+  generation: Schema.String,
+})
+const ManifestJson = Schema.fromJsonString(Manifest)
+const decodeManifest = Schema.decodeUnknownOption(ManifestJson)
 
 export const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const fs = yield* FSUtil.Service
-    const git = yield* Git.Service
+    const flock = yield* EffectFlock.Service
+    const home = yield* MemoryHome.Service
 
-    const readTopics = Effect.fn("MemoryStore.readTopics")(function* (worktree: string) {
-      const directory = topicsDir(worktree)
+    const readDirectoryTopics = Effect.fnUntraced(function* (directory: string, strict = false) {
       if (!(yield* fs.existsSafe(directory))) return []
-      const names = (yield* fs.readDirectoryEntries(directory))
+      const entries = yield* fs.readDirectoryEntries(directory)
+      if (strict) {
+        const unexpected = entries.filter((entry) => entry.type !== "file" || !entry.name.endsWith(".yaml"))
+        if (unexpected.length > 0)
+          return yield* new StoreError({
+            message: `Memory topics directory contains unexpected entries: ${unexpected.map((entry) => entry.name).join(", ")}`,
+          })
+      }
+      const names = entries
         .filter((entry) => entry.type === "file" && entry.name.endsWith(".yaml"))
         .map((entry) => entry.name)
         .sort()
       const topics = yield* Effect.forEach(
         names,
-        (name) =>
-          Effect.gen(function* () {
+        (name) => {
+          const read = Effect.gen(function* () {
             const file = join(directory, name)
             const text = yield* fs.readFileString(file)
             const value = yield* Effect.try({
@@ -131,62 +180,162 @@ export const layer = Layer.effect(
             })
             const decoded = decodeTopic(value, basename(name, ".yaml"))
             if (decoded) return decoded
+            if (strict) return yield* new StoreError({ message: `Memory topic is invalid: ${file}` })
             yield* Effect.logWarning("memory topic is invalid — ignoring", { path: file })
             return undefined
-          }).pipe(
+          })
+          if (strict) return read
+          return read.pipe(
             Effect.catchCause((cause) =>
               Effect.gen(function* () {
                 yield* Effect.logWarning("memory topic read failed — ignoring", { path: name, cause })
                 return undefined
               }),
             ),
-          ),
+          )
+        },
         { concurrency: 8 },
       )
       return topics.filter((topic): topic is MemorySchema.Topic => topic !== undefined)
     })
 
-    const writeTopics = Effect.fn("MemoryStore.writeTopics")(function* (worktree: string, applied: Applied) {
-      yield* fs.makeDirectory(topicsDir(worktree), { recursive: true })
+    const writeDirectoryTopics = Effect.fnUntraced(function* (directory: string, applied: Applied) {
+      yield* fs.makeDirectory(directory, { recursive: true })
       const byID = new Map(applied.topics.map((topic) => [topic.id, topic]))
       yield* Effect.forEach(
         applied.changed,
         (id) => {
           const topic = byID.get(id)
           if (!topic) return Effect.void
-          return MemoryFile.atomicWrite(fs, join(topicsDir(worktree), `${id}.yaml`), stringify(topic, { lineWidth: 0 }))
+          return MemoryFile.atomicWrite(fs, join(directory, `${id}.yaml`), stringify(topic, { lineWidth: 0 }))
         },
         { concurrency: 1, discard: true },
       )
-      yield* Effect.forEach(
-        applied.deleted,
-        (id) => fs.remove(join(topicsDir(worktree), `${id}.yaml`), { force: true }),
-        { concurrency: 1, discard: true },
+      yield* Effect.forEach(applied.deleted, (id) => fs.remove(join(directory, `${id}.yaml`), { force: true }), {
+        concurrency: 1,
+        discard: true,
+      })
+    })
+
+    const readSnapshotUnsafe = Effect.fnUntraced(function* (projectID: ProjectV2.ID, strict: boolean) {
+      const text = yield* fs.readFileStringSafe(home.manifest(projectID))
+      if (text === undefined)
+        return {
+          revision: 0,
+          topics: yield* readDirectoryTopics(home.topics(projectID), strict),
+        } satisfies Snapshot
+      const decoded = decodeManifest(text)
+      if (Option.isNone(decoded) || !/^[a-z0-9-]+$/.test(decoded.value.generation))
+        return yield* new StoreError({ message: "Memory generation manifest is invalid" })
+      const directory = join(home.generations(projectID), decoded.value.generation)
+      if (!(yield* fs.existsSafe(directory)))
+        return yield* new StoreError({ message: "Memory generation referenced by manifest is missing" })
+      return {
+        revision: decoded.value.revision,
+        topics: yield* readDirectoryTopics(directory, strict),
+      } satisfies Snapshot
+    })
+
+    const writeSnapshot = Effect.fnUntraced(function* (
+      projectID: ProjectV2.ID,
+      revision: number,
+      topics: MemorySchema.Topic[],
+    ) {
+      if (
+        new Set(topics.map((topic) => topic.id)).size !== topics.length ||
+        topics.some((topic) => !decodeTopic(topic, topic.id))
       )
+        yield* new StoreError({ message: "Memory update produced an invalid generation" })
+      const generation = `${revision}-${randomUUID()}`
+      const generations = home.generations(projectID)
+      const staging = join(generations, `.${generation}.tmp`)
+      const directory = join(generations, generation)
+      yield* Effect.gen(function* () {
+        yield* fs.makeDirectory(generations, { recursive: true })
+        yield* writeDirectoryTopics(staging, {
+          topics,
+          changed: topics.map((topic) => topic.id),
+          deleted: [],
+        })
+        yield* fs.rename(staging, directory)
+        yield* MemoryFile.atomicWrite(
+          fs,
+          home.manifest(projectID),
+          JSON.stringify({ schema_version: 1, revision, generation }) + "\n",
+        )
+      }).pipe(Effect.onError(() => fs.remove(staging, { force: true, recursive: true }).pipe(Effect.ignore)))
+      yield* fs.remove(home.topics(projectID), { force: true, recursive: true }).pipe(Effect.ignore)
     })
 
-    const ensureGitExclude = Effect.fn("MemoryStore.ensureGitExclude")(function* (worktree: string) {
-      const result = yield* git.run(["rev-parse", "--git-path", "info/exclude"], { cwd: worktree })
-      if (result.exitCode !== 0) return yield* new StoreError({ message: result.stderr.toString("utf8").trim() })
-      const raw = result.text().trim()
-      if (!raw) return yield* new StoreError({ message: "Git did not resolve info/exclude" })
-      const file = isAbsolute(raw) ? raw : resolve(worktree, raw)
-      const current = (yield* fs.readFileStringSafe(file)) ?? ""
-      const lines = new Set(current.split(/\r?\n/).map((line) => line.trim()))
-      const missing = EXCLUDE_RULES.filter((rule) => !lines.has(rule))
-      if (missing.length === 0) return yield* Effect.void
-      const prefix = current.length === 0 || current.endsWith("\n") ? current : current + "\n"
-      yield* MemoryFile.atomicWrite(fs, file, prefix + missing.join("\n") + "\n")
-      return yield* Effect.logDebug("memory Git exclusions installed", { worktree, path: file })
+    const readTopics = Effect.fn("MemoryStore.readTopics")((projectID: ProjectV2.ID) =>
+      readSnapshotUnsafe(projectID, false).pipe(
+        Effect.map((snapshot) => snapshot.topics),
+        Effect.catchTag("MemoryStore.Error", () => Effect.succeed([])),
+      ),
+    )
+
+    const readSnapshot = Effect.fn("MemoryStore.readSnapshot")((projectID: ProjectV2.ID) =>
+      readSnapshotUnsafe(projectID, true),
+    )
+
+    const inspectTopics = Effect.fn("MemoryStore.inspectTopics")((projectID: ProjectV2.ID) =>
+      readSnapshot(projectID).pipe(Effect.map((snapshot) => snapshot.topics)),
+    )
+
+    const commitUnsafe = Effect.fnUntraced(function* (
+      projectID: ProjectV2.ID,
+      expectedRevision: number,
+      applied: Applied,
+    ) {
+      const current = yield* readSnapshot(projectID)
+      if (current.revision !== expectedRevision)
+        return yield* new CommitConflictError({
+          expected_revision: expectedRevision,
+          actual_revision: current.revision,
+        })
+      if (applied.changed.length === 0 && applied.deleted.length === 0) return current
+      const revision = current.revision + 1
+      yield* writeSnapshot(projectID, revision, applied.topics)
+      return { revision, topics: applied.topics } satisfies Snapshot
     })
 
-    return Service.of({ readTopics, writeTopics, ensureGitExclude })
+    const commit = Effect.fn("MemoryStore.commit")((projectID: ProjectV2.ID, expectedRevision: number, applied: Applied) =>
+      flock.withLock(commitUnsafe(projectID, expectedRevision, applied), `memory-project:${projectID}`, home.locks),
+    )
+
+    const updateTopics: Interface["updateTopics"] = (projectID, update) =>
+      flock.withLock(
+        Effect.gen(function* () {
+          const current = yield* readSnapshot(projectID)
+          const next = yield* Effect.try({
+            try: () => update(current.topics),
+            catch: (cause) =>
+              cause instanceof StoreError
+                ? cause
+                : new StoreError({ message: `Memory update failed: ${String(cause)}` }),
+          })
+          const applied = next.applied
+          if (applied.changed.length === 0 && applied.deleted.length === 0)
+            return { revision: current.revision, topics: applied.topics, result: next.result }
+          const revision = current.revision + 1
+          yield* writeSnapshot(projectID, revision, applied.topics)
+          return { revision, topics: applied.topics, result: next.result }
+        }),
+        `memory-project:${projectID}`,
+        home.locks,
+      )
+
+    return Service.of({ readTopics, readSnapshot, commit, inspectTopics, updateTopics })
   }),
 )
 
-export const defaultLayer = layer.pipe(Layer.provide(FSUtil.defaultLayer), Layer.provide(Git.defaultLayer))
+export const defaultLayer = layer.pipe(
+  Layer.provide(FSUtil.defaultLayer),
+  Layer.provide(EffectFlock.defaultLayer),
+  Layer.provide(MemoryHome.defaultLayer),
+)
 
-export const node = LayerNode.make(layer, [FSUtil.node, Git.node])
+export const node = LayerNode.make(layer, [FSUtil.node, EffectFlock.node, MemoryHome.node])
 
 export function decodeTopic(value: unknown, expectedID?: string) {
   if (!hasExactKeys(value, TOPIC_KEYS)) return undefined
@@ -374,10 +523,6 @@ export function isAllowedMemoryItem(item: Pick<MemorySchema.TopicItem, "kind" | 
 
 export function indexes(topics: MemorySchema.Topic[]) {
   return topics.map(MemorySchema.topicIndex)
-}
-
-export function topicsDir(worktree: string) {
-  return join(worktree, ".opencode", "memory", "topics")
 }
 
 function assertSemantic(...values: string[]) {
