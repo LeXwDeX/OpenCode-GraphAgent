@@ -102,6 +102,11 @@ export const WorkflowCreated = Event.define({
     title: Schema.String,
     config: Schema.String, // YAML string (validated separately by the runtime)
     status: WorkflowStatus,
+    // Execution-location key (DAG-LOC-01): the creating instance's directory,
+    // stamped at create. Optional so legacy durable events and manual
+    // publishers still decode; absent directories project to NULL and match
+    // no instance (a foreign row, never adopted).
+    directory: Schema.optional(Schema.String),
   },
 })
 export type WorkflowCreated = typeof WorkflowCreated.Type

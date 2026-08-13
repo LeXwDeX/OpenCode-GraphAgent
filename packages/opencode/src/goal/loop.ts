@@ -11,6 +11,7 @@ import { Provider } from "@/provider/provider"
 import { Goal } from "./goal"
 import { GoalJudge } from "./judge"
 import { GoalPrompts } from "./prompts"
+import { DagLocation } from "@/dag/location"
 import { generateText } from "ai"
 import { SessionID } from "@/session/schema"
 import { SessionAutomationLease } from "@/session/automation-lease"
@@ -127,14 +128,27 @@ const serviceLayer = Layer.effect(
     const scanDirectoryRef: { current: string } = { current: "" }
 
     const state = yield* InstanceState.make(
-      Effect.fn("GoalLoop.state")(function* () {
+      Effect.fn("GoalLoop.state")(function* (ctx) {
         yield* events.subscribe(SessionStatus.Event.Status).pipe(
           Stream.filter((evt) => evt.data.status.type === "idle"),
           // D4 (fiber lifecycle): triggerEvaluation below carries the full
           // discipline (active-goal pre-check, fork, fiber registration,
           // identity-scoped self-clean), shared verbatim with the
           // GOAL-FP-01-04 startup scan so both drivers use one path.
-          Stream.runForEach((evt) => triggerEvaluation(evt.data.sessionID).pipe(Effect.ignore)),
+          Stream.runForEach((evt) =>
+            Effect.gen(function* () {
+              const sid = evt.data.sessionID
+              // DAG-LOC-01 execution-location guard: idle Status events are
+              // store-global. Only the instance whose DIRECTORY owns the
+              // session may drive its goal loop — the same authority the DAG
+              // wake paths use (the goal scan is already directory-scoped
+              // through the per-directory InstanceState; this aligns the idle
+              // trigger with that scoping). Sessions without workflow rows
+              // are owned vacuously (goal-only sessions predate stamping).
+              if (!(yield* DagLocation.ownsSession(sid, ctx.directory))) return
+              yield* triggerEvaluation(sid)
+            }).pipe(Effect.ignore),
+          ),
           Effect.forkScoped,
         )
         // GOAL-FP-01-04: the startup resume scan. The durable snapshot is

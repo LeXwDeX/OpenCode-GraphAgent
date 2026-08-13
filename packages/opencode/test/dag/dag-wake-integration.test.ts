@@ -207,7 +207,7 @@ function runWakeTest<A>(
         id: "ses_parent" as never,
         project_id: "project-1" as never,
         slug: "parent",
-        directory: process.cwd() as never,
+        directory: process.cwd(),
         title: "Parent",
         version: "test",
       }).run().pipe(Effect.orDie)
@@ -1095,6 +1095,7 @@ describe("DagLoop atomic wake integration", () => {
                 id: "recovered-workflow",
                 project_id: "project-1" as never,
                 session_id: "ses_parent" as never,
+                directory: process.cwd(),
                 title: "Recovered workflow",
                 status: "completed",
                 config: "{}",
@@ -1193,6 +1194,7 @@ describe("DagLoop atomic wake integration", () => {
                 id: "dag_recovered_conditional",
                 project_id: "project-1" as never,
                 session_id: "ses_parent" as never,
+                directory: process.cwd(),
                 title: "Recovered conditional workflow",
                 status: "running",
                 config: JSON.stringify({
@@ -1336,6 +1338,7 @@ describe("DagLoop atomic wake integration", () => {
                 id: "dag_recovered_review_rejection",
                 project_id: "project-1" as never,
                 session_id: "ses_parent" as never,
+                directory: process.cwd(),
                 title: "Recovered review rejection",
                 status: "running",
                 config: JSON.stringify({

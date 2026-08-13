@@ -32,6 +32,7 @@ import {
 } from "./admission"
 import { unresolvedReviewOutcomes } from "./review-lifecycle"
 import { DagValidation, StructuralValidationError } from "./validation"
+import { DagLocation } from "./location"
 
 export { StructuralValidationError } from "./validation"
 
@@ -400,6 +401,12 @@ export const layer = Layer.effect(
         config: JSON.stringify(durableConfig),
         status: "pending",
         timestamp: ts,
+        // DAG-LOC-01: stamp the execution-location key (the creating
+        // instance's canonical directory) on the workflow row at create.
+        // The DagLoop ownership guards decide on this stamp; sibling
+        // worktrees of the same project carry distinct directories and are
+        // mutually foreign.
+        directory: yield* DagLocation.stampDirectory(),
       })
       for (const node of durableConfig.nodes) {
         yield* events.publish(DagEvent.NodeRegistered, {

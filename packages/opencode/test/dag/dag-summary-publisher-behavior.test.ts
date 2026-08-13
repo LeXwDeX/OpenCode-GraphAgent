@@ -51,6 +51,7 @@ function workflow(id: string, sessionId: string, projectId: string): WorkflowRow
     id,
     projectId,
     sessionId,
+    directory: null,
     title: id,
     status: "running",
     config: "",
