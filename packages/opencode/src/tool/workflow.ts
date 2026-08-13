@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 LeXwDeX
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 import { Tool } from "./tool"
 import { CommandPlugin } from "@opencode-ai/core/plugin/command"
 import { Effect, Option, Schema } from "effect"
