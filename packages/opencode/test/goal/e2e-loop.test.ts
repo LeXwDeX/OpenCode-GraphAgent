@@ -10,6 +10,14 @@ import { SessionPrompt } from "@/session/prompt"
 import { Provider } from "@/provider/provider"
 import { SessionID } from "@/session/schema"
 import { SessionAutomationLease } from "@/session/automation-lease"
+import { Database } from "@opencode-ai/core/database/database"
+import { SessionTable } from "@opencode-ai/core/session/sql"
+import { GoalStateTable } from "@opencode-ai/core/goal/sql"
+import { ProjectTable } from "@opencode-ai/core/project/sql"
+import { ProjectSchema } from "@opencode-ai/core/project/schema"
+import { AbsolutePath } from "@opencode-ai/core/schema"
+import { TestInstance } from "../fixture/fixture"
+import { logLines } from "effect/testing/TestConsole"
 import { testEffect, pollWithTimeout } from "../lib/effect"
 
 // P2b: full-cycle Goal regression (D5). Drives set → idle → judge(continue) →
@@ -962,22 +970,48 @@ describe("GoalLoop — startup scan resumes pre-boot active goals (GOAL-FP-01-04
     Layer.provide(judgeMock),
     Layer.provideMerge(Goal.defaultLayer),
     // provideMerge (not provide): the test body seeds pre-boot busy / dag
-    // owner through SessionStatus and the lease, and the scan must read the
-    // SAME instances (see the arbitration describe above).
+    // owner through SessionStatus, the lease, and the DB, and the scan must
+    // read the SAME instances (see the arbitration describe above).
     Layer.provideMerge(SessionStatus.defaultLayer),
     Layer.provideMerge(EventV2Bridge.defaultLayer),
     Layer.provideMerge(SessionAutomationLease.defaultLayer),
+    Layer.provideMerge(Database.defaultLayer),
   )
   const it = testEffect(scanLayer)
+
+  // Seeds a durable session row (+ its project row, FK-required) so the
+  // D-1 directory join can attribute the goal_state row to an instance.
+  const seedSessionRow = (sessionID: SessionID, directory: string) =>
+    Effect.gen(function* () {
+      const { db } = yield* Database.Service
+      const projectID = ProjectSchema.ID.make(Bun.randomUUIDv7())
+      yield* db.insert(ProjectTable).values({
+        id: projectID,
+        worktree: AbsolutePath.make(directory),
+        sandboxes: [AbsolutePath.make(directory)],
+      })
+      yield* db.insert(SessionTable).values({
+        id: sessionID,
+        project_id: projectID,
+        slug: "test-session",
+        directory,
+        title: "test session",
+        version: "1",
+        time_created: Date.now(),
+        time_updated: Date.now(),
+      })
+    })
 
   it.instance("a goal active before boot is evaluated with ZERO idle events", () =>
     Effect.gen(function* () {
       reset()
       const loop = yield* GoalLoop.Service
       const goal = yield* Goal.Service
+      const directory = (yield* TestInstance).directory
       // Seed the durable store BEFORE GoalLoop boots — models a goal_state
       // row surviving a crash-restart. No idle/status event is published.
       const sid = SessionID.descending()
+      yield* seedSessionRow(sid, directory)
       yield* goal.set(sid, "ship the feature", 10)
       yield* loop.init()
 
@@ -1001,6 +1035,7 @@ describe("GoalLoop — startup scan resumes pre-boot active goals (GOAL-FP-01-04
       const loop = yield* GoalLoop.Service
       const goal = yield* Goal.Service
       const automation = yield* SessionAutomationLease.Service
+      const directory = (yield* TestInstance).directory
 
       // Session B is a plain active goal — its evaluation is the positive
       // signal that the scan RAN (judgeCalls 0→1). Session A is dag-owned:
@@ -1008,6 +1043,8 @@ describe("GoalLoop — startup scan resumes pre-boot active goals (GOAL-FP-01-04
       // contributes no judge call and stays untouched.
       const sidA = SessionID.descending()
       const sidB = SessionID.descending()
+      yield* seedSessionRow(sidA, directory)
+      yield* seedSessionRow(sidB, directory)
       yield* goal.set(sidA, "goal owned by dag", 10)
       yield* goal.set(sidB, "goal evaluated by scan", 10)
       yield* automation.register(sidA, { kind: "dag", id: "dag-executor" })
@@ -1042,9 +1079,12 @@ describe("GoalLoop — startup scan resumes pre-boot active goals (GOAL-FP-01-04
       const loop = yield* GoalLoop.Service
       const goal = yield* Goal.Service
       const status = yield* SessionStatus.Service
+      const directory = (yield* TestInstance).directory
 
       const sidA = SessionID.descending()
       const sidB = SessionID.descending()
+      yield* seedSessionRow(sidA, directory)
+      yield* seedSessionRow(sidB, directory)
       yield* goal.set(sidA, "goal on busy session", 10)
       yield* goal.set(sidB, "goal on idle session", 10)
       yield* status.set(sidA, { type: "busy" })
@@ -1071,6 +1111,208 @@ describe("GoalLoop — startup scan resumes pre-boot active goals (GOAL-FP-01-04
       )
       const a2 = yield* goal.load(sidA)
       expect(Number(a2?.turns_used)).toBe(1)
+    }),
+  )
+})
+
+// GOAL-FP-01-04 follow-up (D-1..D-4): scoping and hardening of the startup
+// scan. D-1: the scan must be scoped to the instance's own directory (join
+// goal_state → session.directory). D-2: a defective scan query must degrade
+// to no-scan + a log, never kill init or the idle path. D-3: undecodable
+// rows must be skipped with a visible log, not silently. D-4: a scan
+// evaluation racing an idle evaluation must commit exactly once.
+describe("GoalLoop — startup scan scoping and hardening (GOAL-FP-01-04 follow-up)", () => {
+  let judgeCalls = 0
+  let foreignJudgeCalls = 0
+  let parkFirstJudge = false
+  let judgeRelease = Deferred.makeUnsafe<void>()
+  const reset = () => {
+    judgeCalls = 0
+    foreignJudgeCalls = 0
+    parkFirstJudge = false
+    judgeRelease = Deferred.makeUnsafe<void>()
+  }
+
+  // The judge LLM prompt carries the goal text verbatim, so the mock can
+  // attribute calls to the foreign-directory goal via a marker string.
+  const FOREIGN_GOAL = "FOREIGN-MARKER ship the feature"
+
+  const sessionMock = Layer.mock(Session.Service, {
+    messages: () => Effect.succeed([mkAssistant()]),
+  })
+  const promptMock = Layer.mock(SessionPrompt.Service, {
+    prompt: () => Effect.die("the direct prompt path is not exercised in this scenario"),
+    promptIfIdle: () => Effect.sync(() => Option.none()),
+  })
+  const judgeMock = Layer.succeed(
+    GoalLoopJudgeLLM,
+    GoalLoopJudgeLLM.of({
+      call: (opts: { user: string }) =>
+        Effect.gen(function* () {
+          judgeCalls += 1
+          if (opts.user.includes("FOREIGN-MARKER")) foreignJudgeCalls += 1
+          // D-4 hook: park the first judge call so the scan and idle
+          // evaluations race deterministically.
+          if (parkFirstJudge && judgeCalls === 1) yield* Deferred.await(judgeRelease)
+          return JSON.stringify({ done: false, reason: "more steps needed" })
+        }),
+    }),
+  )
+  const hardenLayer = GoalLoop.layer.pipe(
+    Layer.provide(sessionMock),
+    Layer.provide(promptMock),
+    Layer.provide(Layer.mock(Provider.Service, {})),
+    Layer.provide(judgeMock),
+    Layer.provideMerge(Goal.defaultLayer),
+    Layer.provideMerge(SessionStatus.defaultLayer),
+    Layer.provideMerge(EventV2Bridge.defaultLayer),
+    Layer.provideMerge(SessionAutomationLease.defaultLayer),
+    Layer.provideMerge(Database.defaultLayer),
+  )
+  const it = testEffect(hardenLayer)
+
+  const seedSessionRow = (sessionID: SessionID, directory: string) =>
+    Effect.gen(function* () {
+      const { db } = yield* Database.Service
+      const projectID = ProjectSchema.ID.make(Bun.randomUUIDv7())
+      yield* db.insert(ProjectTable).values({
+        id: projectID,
+        worktree: AbsolutePath.make(directory),
+        sandboxes: [AbsolutePath.make(directory)],
+      })
+      yield* db.insert(SessionTable).values({
+        id: sessionID,
+        project_id: projectID,
+        slug: "test-session",
+        directory,
+        title: "test session",
+        version: "1",
+        time_created: Date.now(),
+        time_updated: Date.now(),
+      })
+    })
+
+  it.instance("D-1: a foreign-directory active goal is not evaluated; the same-directory goal is", () =>
+    Effect.gen(function* () {
+      reset()
+      const loop = yield* GoalLoop.Service
+      const goal = yield* Goal.Service
+      const directory = (yield* TestInstance).directory
+
+      const sidForeign = SessionID.descending()
+      const sidSame = SessionID.descending()
+      yield* seedSessionRow(sidForeign, directory + "-foreign")
+      yield* seedSessionRow(sidSame, directory)
+      yield* goal.set(sidForeign, FOREIGN_GOAL, 10)
+      yield* goal.set(sidSame, "ship the feature", 10)
+      yield* loop.init()
+
+      // Positive control: the same-directory goal IS evaluated by the scan.
+      yield* pollWithTimeout(
+        Effect.sync(() => (judgeCalls >= 1 ? true : undefined)),
+        "startup scan never evaluated the same-directory goal",
+        "5 seconds",
+      )
+      // Let any (buggy) foreign evaluation settle before asserting.
+      yield* Effect.sleep("300 millis")
+      const same = yield* goal.load(sidSame)
+      const foreign = yield* goal.load(sidForeign)
+      expect(Number(same?.turns_used)).toBe(1)
+      expect(foreignJudgeCalls).toBe(0)
+      expect(foreign?.status).toBe("active")
+      expect(Number(foreign?.turns_used)).toBe(0)
+    }),
+  )
+
+  it.instance("D-2: a defective scan query never kills init; the idle path still works", () =>
+    Effect.gen(function* () {
+      reset()
+      const { db } = yield* Database.Service
+      // Corrupt DB state: the scan query hits a missing table.
+      yield* db.run("DROP TABLE goal_state")
+      const loop = yield* GoalLoop.Service
+      yield* loop.init() // must not die
+      yield* db.run(
+        "CREATE TABLE goal_state (session_id TEXT PRIMARY KEY NOT NULL, payload TEXT NOT NULL, updated_at INTEGER NOT NULL)",
+      )
+      const goal = yield* Goal.Service
+      const events = yield* EventV2Bridge.Service
+      const directory = (yield* TestInstance).directory
+      const sid = SessionID.descending()
+      yield* seedSessionRow(sid, directory)
+      yield* goal.set(sid, "ship the feature", 10)
+      yield* Effect.yieldNow
+
+      // The idle subscription (armed before the scan) must still drive the
+      // goal — the defective scan degraded, it did not kill the loop.
+      yield* events.publish(SessionStatus.Event.Status, { sessionID: sid, status: { type: "idle" } })
+      yield* pollWithTimeout(
+        Effect.sync(() => (judgeCalls >= 1 ? true : undefined)),
+        "idle path dead after a defective scan",
+        "5 seconds",
+      )
+      expect(Number((yield* goal.load(sid))?.turns_used)).toBe(1)
+    }),
+  )
+
+  it.instance("D-3: an undecodable goal_state row is skipped with a visible warning log", () =>
+    Effect.gen(function* () {
+      reset()
+      const { db } = yield* Database.Service
+      const directory = (yield* TestInstance).directory
+      const sid = SessionID.descending()
+      yield* seedSessionRow(sid, directory)
+      yield* db
+        .insert(GoalStateTable)
+        .values({ session_id: sid, payload: "{corrupt", updated_at: Date.now() })
+      const loop = yield* GoalLoop.Service
+      yield* loop.init()
+      const logs = JSON.stringify(yield* logLines)
+      expect(logs).toContain("goal startup scan skipped undecodable goal_state row")
+      expect(logs).toContain(String(sid))
+    }),
+  )
+
+  it.instance("D-4: a scan evaluation racing an idle evaluation commits exactly once", () =>
+    Effect.gen(function* () {
+      reset()
+      parkFirstJudge = true
+      const loop = yield* GoalLoop.Service
+      const goal = yield* Goal.Service
+      const events = yield* EventV2Bridge.Service
+      const directory = (yield* TestInstance).directory
+      const sid = SessionID.descending()
+      yield* seedSessionRow(sid, directory)
+      yield* goal.set(sid, "ship the feature", 10)
+      yield* loop.init()
+
+      // Wait for the scan's evaluation to reach the judge, where it parks.
+      yield* pollWithTimeout(
+        Effect.sync(() => (judgeCalls >= 1 ? true : undefined)),
+        "the scan's evaluation never reached the judge",
+        "5 seconds",
+      )
+      // Now a second evaluation races it: the idle event drives an
+      // independent trigger for the SAME turn boundary. The fiber map's
+      // interrupt-on-replace kills the parked scan evaluation, and exactly
+      // ONE commit for the boundary must land.
+      yield* events.publish(SessionStatus.Event.Status, { sessionID: sid, status: { type: "idle" } })
+
+      yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const g = yield* goal.load(sid)
+          return Number(g?.turns_used) >= 1 ? true : undefined
+        }),
+        "no racing evaluation committed",
+        "5 seconds",
+      )
+      yield* Effect.sleep("50 millis")
+      yield* Deferred.succeed(judgeRelease, undefined)
+      const g = yield* goal.load(sid)
+      expect(g?.status).toBe("active")
+      // The single-writer commit point (matchesExpected + record gate) must
+      // yield exactly ONE commit for the boundary — not two.
+      expect(Number(g?.turns_used)).toBe(1)
     }),
   )
 })

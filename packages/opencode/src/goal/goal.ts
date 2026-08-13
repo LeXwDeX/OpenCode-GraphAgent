@@ -1,7 +1,8 @@
 export * as Goal from "./goal"
 
 import { Effect, Layer, Context, Schema, Fiber } from "effect"
-import { desc, eq } from "drizzle-orm"
+import { desc, eq, sql } from "drizzle-orm"
+import { SessionTable } from "@opencode-ai/core/session/sql"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Database } from "@opencode-ai/core/database/database"
 import { EventV2Bridge } from "@/event-v2-bridge"
@@ -21,16 +22,14 @@ export type RemoveSubgoalResult =
 export interface Interface {
   readonly load: (sessionID: SessionID) => Effect.Effect<GoalState.Info | undefined>
   /**
-   * GOAL-FP-01-04: durable sessions whose goal_state row is still "active" —
-   * the startup-resume scan input for GoalLoop.init. Returns the session id
-   * plus the goal's current revision so the scan can detect goals that were
-   * touched after its boot-time snapshot (revision bumps on every durable
-   * transition). Best-effort: rows whose payload fails to decode are skipped,
-   * not fatal.
+   * GOAL-FP-01-04: durable session ids whose goal_state row is still "active"
+   * AND whose session belongs to `directory` — the startup-resume scan input
+   * for GoalLoop.init. The session table is the directory authority
+   * (goal_state has no directory column), so one instance's scan can never
+   * drive another instance's goals. Best-effort: rows whose payload fails to
+   * decode are skipped with a logged warning, not fatal.
    */
-  readonly listActiveSessions: () => Effect.Effect<
-    ReadonlyArray<{ readonly sessionID: SessionID; readonly revision: number }>
-  >
+  readonly listActiveSessions: (directory: string) => Effect.Effect<ReadonlyArray<SessionID>, Error>
   readonly lastOutcome: (sessionID: SessionID) => Effect.Effect<GoalState.Info | undefined>
   readonly set: (sessionID: SessionID, goal: string, maxTurns?: number) => Effect.Effect<GoalState.Info>
   readonly pause: (sessionID: SessionID, reason: string) => Effect.Effect<GoalState.Info | undefined>
@@ -312,23 +311,40 @@ const serviceLayer = Layer.effect(
     // when the process died, so GoalLoop.init queries this durable set and
     // re-triggers its existing idle evaluation path. Only "active" rows are
     // returned — paused rows are user-visible and terminal rows are deleted
-    // by transition. Each entry carries the goal revision so the scan can
-    // skip goals that were touched after its boot-time snapshot. A row whose
-    // payload cannot be decoded is skipped defensively: the scan is
-    // best-effort, and the session's own idle event or /goal resume remains
-    // available as the recovery path.
-    const listActiveSessions = Effect.fn("Goal.listActiveSessions")(function* () {
-      const rows = yield* db.select().from(GoalStateTable).all().pipe(Effect.orDie)
-      const active: Array<{ sessionID: SessionID; revision: number }> = []
+    // by transition.
+    //
+    // D-1: scoped to the instance's own directory. goal_state has no
+    // directory column; the session table is the directory authority, so the
+    // query joins goal_state.session_id → session.id and filters on
+    // session.directory — the scan can never evaluate, commit, pause, or
+    // drive another instance's sessions. Goal rows whose session row is
+    // missing are dropped by the inner join (invisible to the scan, same as
+    // other instances' rows).
+    //
+    // D-3: a row whose payload cannot be decoded is skipped defensively (the
+    // scan is best-effort; the session's own idle event or /goal resume
+    // remains available) but the skip is LOGGED with the session id and the
+    // decode error — a silently-dormant goal is not diagnosable.
+    const listActiveSessions = Effect.fn("Goal.listActiveSessions")(function* (directory: string) {
+      const rows = yield* db
+        .select({ session_id: GoalStateTable.session_id, payload: GoalStateTable.payload })
+        .from(GoalStateTable)
+        .innerJoin(SessionTable, sql`${GoalStateTable.session_id} = ${SessionTable.id}`)
+        .where(eq(SessionTable.directory, directory))
+        .all()
+      const active: SessionID[] = []
       for (const row of rows) {
         let state: GoalState.Info
         try {
           state = Schema.decodeUnknownSync(GoalState.Info)(JSON.parse(row.payload))
-        } catch {
+        } catch (error) {
+          yield* Effect.logWarning(
+            `goal startup scan skipped undecodable goal_state row for ${row.session_id}`,
+            { error: String(error) },
+          )
           continue
         }
-        if (state.status === "active")
-          active.push({ sessionID: SessionID.make(row.session_id), revision: state.revision ?? 0 })
+        if (state.status === "active") active.push(SessionID.make(row.session_id))
       }
       return active
     })

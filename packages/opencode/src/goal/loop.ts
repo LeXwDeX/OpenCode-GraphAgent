@@ -116,6 +116,16 @@ const serviceLayer = Layer.effect(
       return paused
     })
 
+    // GOAL-FP-01-04 (D-1): the instance directory the scan scopes to. The
+    // state builder runs under the ScopedCache layer-build environment,
+    // which does NOT include InstanceRef in production — resolving
+    // InstanceState.directory inside the builder would die with "InstanceRef
+    // not provided". init resolves it from its CALLER's context (instance
+    // boot provides InstanceRef) and hands it to the builder through this
+    // ref, set BEFORE the first InstanceState.get so the builder always
+    // reads a populated value.
+    const scanDirectoryRef: { current: string } = { current: "" }
+
     const state = yield* InstanceState.make(
       Effect.fn("GoalLoop.state")(function* () {
         yield* events.subscribe(SessionStatus.Event.Status).pipe(
@@ -127,37 +137,35 @@ const serviceLayer = Layer.effect(
           Stream.runForEach((evt) => triggerEvaluation(evt.data.sessionID).pipe(Effect.ignore)),
           Effect.forkScoped,
         )
-        // GOAL-FP-01-04: the startup resume scan. Its durable snapshot is
-        // captured HERE — at instance boot, inside the builder — not inside
-        // the forked scan fiber: a fiber delayed by scheduling could query
-        // AFTER this process already evaluated a goal (the session's own
-        // idle event), and re-evaluating that same turn boundary would
-        // double-commit turns (the R1 turns-inflation harm). Querying at
-        // boot means only goals that were active BEFORE this process started
-        // are ever scanned, and the per-session trigger re-checks the
-        // snapshot revision (bumped by every durable transition) to absorb
-        // the query→trigger window.
+        // GOAL-FP-01-04: the startup resume scan. The durable snapshot is
+        // captured HERE — at instance boot (the builder runs at the first
+        // InstanceState.get, i.e. init), awaited — not inside the forked
+        // scan fiber: a fiber delayed by scheduling could query AFTER this
+        // process already evaluated a goal (the session's own idle event),
+        // and re-evaluating that same turn boundary would double-commit
+        // turns (the R1 turns-inflation harm). Querying at boot means only
+        // goals that were active BEFORE this process started are ever
+        // scanned. The builder context is also the layer-build context — the
+        // one the idle subscription above sees — so the scan's evaluation
+        // fibers resolve the same services.
         //
-        // The builder context matters too: service resolution inside the
-        // scan's evaluation fibers happens against the fiber's ambient
-        // runtime context, and the builder runs under the ScopedCache
-        // environment captured at layer build — the same context the
-        // idle-event subscription above sees. Forking the scan from init's
-        // caller context would inherit a context that lacks build-scope
-        // services (e.g. the test-injected GoalLoopJudgeLLM, or the
-        // Provider in slim callers) — the scan would silently no-op or
-        // crash. The per-session triggers are forked after the subscription
-        // is armed and into the same scope; failures are logged, never fatal
-        // to init.
-        const bootSnapshot = yield* goal.listActiveSessions().pipe(
-          Effect.tapError((error) =>
-            Effect.logWarning("goal startup scan query failed", { error: String(error) }),
-          ),
-          Effect.orElseSucceed(
-            (): ReadonlyArray<{ readonly sessionID: SessionID; readonly revision: number }> => [],
-          ),
+        // D-2: catchCause (unlike tapError/orElseSucceed) catches Fail AND
+        // Defect, so ANY query failure degrades to no-scan + a log and can
+        // never kill the builder — which would close the ScopedCache entry
+        // scope and take the idle subscription down with it.
+        const snapshot = yield* goal.listActiveSessions(scanDirectoryRef.current).pipe(
+          Effect.catchCause((cause) => {
+            const empty: ReadonlyArray<SessionID> = []
+            return Effect.logWarning("goal startup scan query failed", {
+              directory: scanDirectoryRef.current,
+              cause: Cause.pretty(cause),
+            }).pipe(Effect.as(empty))
+          }),
         )
-        yield* scanForActiveGoals(bootSnapshot).pipe(
+        // The per-session triggers are forked after the subscription is
+        // armed and into the same scope; failures are logged, never fatal to
+        // init.
+        yield* scanForActiveGoals(snapshot).pipe(
           Effect.catchCause((cause) =>
             Effect.logWarning("goal startup scan failed", { cause: Cause.pretty(cause) }),
           ),
@@ -167,9 +175,27 @@ const serviceLayer = Layer.effect(
       }),
     )
 
-    const afterIdle = Effect.fn("GoalLoop.afterIdle")(function* (sessionID: SessionID) {
+    // D-4 (GOAL-FP-01-04 follow-up): per-process record of which goal
+    // revision this process already evaluated. Written by afterIdle on every
+    // successful updateAfterJudge commit; consulted ONLY by the startup-scan
+    // path (scanResume) — the idle path must keep re-evaluating the same
+    // revision across new turn boundaries, so the gate never applies to it.
+    // Lifecycle mirrors the fibers map: overwritten by every commit, deleted
+    // at the same terminal points where afterIdle unregisters the goal
+    // automation.
+    const evaluatedRevisions = new Map<SessionID, number>()
+
+    const afterIdle = Effect.fn("GoalLoop.afterIdle")(function* (sessionID: SessionID, scanResume?: boolean) {
       const goalState = yield* goal.load(sessionID)
       if (!goalState || goalState.status !== "active") return
+      // D-4 entry gate (scan path only): the boot snapshot may have gone
+      // stale between triggerEvaluation's load and this entry load — an idle
+      // evaluation could have committed a new revision in between, and this
+      // scan evaluation would then double-commit the SAME boundary
+      // (matchesExpected passes because this entry load already sees the
+      // newer revision). If this process already evaluated the CURRENT
+      // revision, the scan trigger is stale — skip.
+      if (scanResume && evaluatedRevisions.get(sessionID) === (goalState.revision ?? 0)) return
       const goalOwner = { kind: "goal" as const, id: goalState.goal_id ?? "legacy" }
       yield* automation.register(sessionID, goalOwner)
       const observedLease = Option.getOrUndefined(yield* automation.claim(sessionID, goalOwner))
@@ -279,8 +305,14 @@ const serviceLayer = Layer.effect(
       )
       if (!updateResult) return
 
+      // D-4: record the committed revision as evaluated-by-this-process
+      // (every verdict — continue, done, blocked — is a completed
+      // evaluation of the pre-commit state).
+      evaluatedRevisions.set(sessionID, updateResult.state.revision ?? 0)
+
       if (!updateResult.shouldContinue) {
         yield* automation.unregister(sessionID, goalOwner)
+        evaluatedRevisions.delete(sessionID)
         if (verdict.verdict === "done") {
           yield* promptSvc.prompt({
             sessionID,
@@ -404,8 +436,10 @@ const serviceLayer = Layer.effect(
         ),
       )
       const afterDispatch = yield* goal.load(sessionID)
-      if (!afterDispatch || afterDispatch.status !== "active")
+      if (!afterDispatch || afterDispatch.status !== "active") {
         yield* automation.unregister(sessionID, goalOwner)
+        evaluatedRevisions.delete(sessionID)
+      }
 
       // NOTE: We deliberately DO NOT call goal.clearLoopFiber here. The
       // promptSvc.prompt above triggers a fresh agent loop, which when it
@@ -435,26 +469,23 @@ const serviceLayer = Layer.effect(
     // interrupts + overwrites the old one); clearLoopFiberIf's identity check
     // avoids evicting the new fiber. The watcher never interrupts and
     // completes right after its target, so it does not accumulate.
-    const triggerEvaluation = Effect.fnUntraced(function* (
-      sessionID: SessionID,
-      scanExpected?: { readonly expectedRevision: number },
-    ) {
+    const triggerEvaluation = Effect.fnUntraced(function* (sessionID: SessionID, scanResume?: boolean) {
       const scope = yield* Scope.Scope
       const goalState = yield* goal.load(sessionID)
       if (!goalState || goalState.status !== "active") return
-      // GOAL-FP-01-04 crash window (query → trigger): the boot snapshot may
-      // go stale before the forked scan fiber triggers. A TERMINAL change is
-      // absorbed by the active-status re-check above (row deleted or paused
-      // → return). A NON-terminal change — the goal is still active but was
-      // touched by this process after the snapshot, e.g. the session's own
-      // idle event already evaluated this turn boundary — is absorbed here:
-      // revision bumps on EVERY durable transition (set, pause, resume,
-      // judge update, subgoal edits). Firing on a stale revision would
-      // double-commit turns for the same boundary (the R1 turns-inflation
-      // harm). The idle subscription never passes scanExpected, so this gate
-      // only narrows the scan.
-      if (scanExpected && (goalState.revision ?? 0) !== scanExpected.expectedRevision) return
-      const fiber = yield* afterIdle(sessionID).pipe(Effect.ignore, Effect.forkIn(scope))
+      // D-4 gate (scan path only): skip when this process already evaluated
+      // the CURRENT revision — the boot snapshot went stale after a
+      // legitimate evaluation (e.g. the session's own idle event ran before
+      // the scan fiber). This replaces the boot-snapshot revision
+      // comparison: unlike that gate, a revision bumped by a non-evaluation
+      // touch (pause/resume/subgoal edit — including one made by another
+      // process before this boot) does NOT suppress the resume, which is
+      // correct — the goal still awaits its evaluation. The idle
+      // subscription never passes scanResume, so this only narrows the scan.
+      // afterIdle re-checks at its own entry load (see there) to close the
+      // window between this load and the fork.
+      if (scanResume && evaluatedRevisions.get(sessionID) === (goalState.revision ?? 0)) return
+      const fiber = yield* afterIdle(sessionID, scanResume).pipe(Effect.ignore, Effect.forkIn(scope))
       yield* goal.registerLoopFiber(sessionID, fiber)
       yield* Fiber.await(fiber).pipe(
         Effect.flatMap(() => goal.clearLoopFiberIf(sessionID, fiber)),
@@ -468,9 +499,8 @@ const serviceLayer = Layer.effect(
     // idle for sessions that already existed at startup. An active goal that
     // survived a crash therefore sleeps until the next user interaction (the
     // D6 zombie guard also never fires: it runs inside afterIdle). The scan
-    // restores the automation obligation: after the subscription is armed,
-    // query the durable store for sessions with an active goal and trigger
-    // the EXISTING idle evaluation path for each.
+    // restores the automation obligation: for each session in the boot
+    // snapshot, trigger the EXISTING idle evaluation path.
     //
     // - Mutual exclusion: the lease claim is the sole authority. A session
     //   whose owner is dag is rejected by claim inside afterIdle exactly as
@@ -482,22 +512,17 @@ const serviceLayer = Layer.effect(
     //   will be driven by its own turn-end idle event. At startup the status
     //   map is empty (get defaults to idle), so this only filters sessions
     //   that genuinely flipped busy between bootstrap and the scan.
-    // - Crash window (query → trigger): a goal may go terminal between the
-    //   boot snapshot and triggerEvaluation. The existing guards absorb it —
-    //   triggerEvaluation re-loads the goal and returns when it is no longer
-    //   active, and updateAfterJudge re-checks goalID+revision under the
-    //   lease token. The NON-terminal window (goal still active but touched
-    //   by this process after the snapshot) is absorbed by the
-    //   expectedRevision gate in triggerEvaluation (see there).
-    // - The scan runs once, forkScoped, and never fails init: per-session
-    //   and query failures are logged and swallowed.
-    const scanForActiveGoals = Effect.fnUntraced(function* (
-      snapshot: ReadonlyArray<{ readonly sessionID: SessionID; readonly revision: number }>,
-    ) {
-      for (const { sessionID, revision } of snapshot) {
+    // - Crash window (query → trigger): terminal changes are absorbed by the
+    //   active-status re-check; non-terminal changes (already evaluated in
+    //   this process) by the D-4 record gate in triggerEvaluation/afterIdle.
+    // - Failures: per-session catchCause (covers Fail AND Defect) so one bad
+    //   session never kills the rest of the scan; the whole scan is forked,
+    //   so a failure can never kill init.
+    const scanForActiveGoals = Effect.fnUntraced(function* (snapshot: ReadonlyArray<SessionID>) {
+      for (const sessionID of snapshot) {
         const current = yield* status.get(sessionID)
         if (current.type !== "idle") continue
-        yield* triggerEvaluation(sessionID, { expectedRevision: revision }).pipe(
+        yield* triggerEvaluation(sessionID, true).pipe(
           Effect.catchCause((cause) =>
             Effect.logWarning("goal startup scan failed for session", {
               sessionID,
@@ -509,6 +534,11 @@ const serviceLayer = Layer.effect(
     })
 
     const init = Effect.fn("GoalLoop.init")(function* () {
+      // Resolve the scan's directory scope BEFORE the first state get — the
+      // builder (which runs inside that get) reads it from the ref. This
+      // context carries InstanceRef (instance boot provides it); the
+      // builder's does not.
+      scanDirectoryRef.current = yield* InstanceState.directory
       yield* InstanceState.get(state)
     })
 
