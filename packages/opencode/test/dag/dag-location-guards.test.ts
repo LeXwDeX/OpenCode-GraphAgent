@@ -131,13 +131,19 @@ interface TwoInstanceInput {
   readonly messagesBySession: Map<string, SessionV1.WithParts[]>
   /** Injected one-shot defects for DagStore.getWorkflow (parity with the template). */
   readonly failGetWorkflow?: { remaining: number }
-  /**
-   * Optional deterministic park on DagStore.getNodes. When present, every
-   * getNodes call sets `parked.value = true` and then awaits `wait` before
-   * delegating to the real store — letting a probe interleave a mutation
-   * (e.g. Session.remove) inside a recovery sequence.
-   */
-  readonly parkGetNodes?: { readonly wait: Promise<void>; readonly parked: { value: boolean } }
+   /**
+    * Optional deterministic park on DagStore.getNodes. When present, every
+    * getNodes call sets `parked.value = true` and then awaits `wait` before
+    * delegating to the real store — letting a probe interleave a mutation
+    * (e.g. Session.remove) inside a recovery sequence. `calls` counts every
+    * gated getNodes invocation so a probe can tell HOW MANY distinct
+    * adoption/recovery sequences reached the seam (H1 adopt-exactly-once).
+    */
+   readonly parkGetNodes?: {
+    readonly wait: Promise<void>
+    readonly parked: { value: boolean }
+    readonly calls: { value: number }
+  }
   /**
    * Optional deterministic park on SessionPrompt.prepareIfIdle (the wake
    * delivery admission seam). When present, each prepareIfIdle call bumps
@@ -179,6 +185,7 @@ function twoInstanceLayer(input: TwoInstanceInput) {
               Effect.suspend(() => {
                 const gate = input.parkGetNodes
                 if (!gate) return real.getNodes(id)
+                gate.calls.value++
                 gate.parked.value = true
                 return Effect.promise(() => gate.wait).pipe(Effect.flatMap(() => real.getNodes(id)))
               }),
@@ -345,7 +352,11 @@ function runTwoInstanceGuardTest<A>(
     readonly sessionA?: string
     readonly sessionB?: string
     readonly failGetWorkflow?: { remaining: number }
-    readonly parkGetNodes?: { readonly wait: Promise<void>; readonly parked: { value: boolean } }
+    readonly parkGetNodes?: {
+      readonly wait: Promise<void>
+      readonly parked: { value: boolean }
+      readonly calls: { value: number }
+    }
     readonly parkWakeDelivery?: {
       readonly wait: Promise<void>
       readonly parked: { value: boolean }
@@ -1500,13 +1511,14 @@ describe("DAG-LOC-01 issue #238 evidence probes", () => {
 
   it("C6: recoverOrphanPending racing Session.remove is absorbed without killing init", async () => {
     const parked = { value: false }
+    const calls = { value: 0 }
     let release: () => void = () => {}
     const wait = new Promise<void>((resolve) => {
       release = resolve
     })
     await Effect.runPromise(
       runTwoInstanceGuardTest(
-        { parkGetNodes: { wait, parked } },
+        { parkGetNodes: { wait, parked, calls } },
         ({ database, session, store, initA }) =>
           Effect.gen(function* () {
             // An all-pending orphan under A: a create that crashed mid-way.
@@ -1549,6 +1561,121 @@ describe("DAG-LOC-01 issue #238 evidence probes", () => {
             release()
             yield* Fiber.join(initFiber)
             expect(yield* store.getWorkflow("c6-orphan")).toBeUndefined()
+          }),
+      ),
+    )
+  })
+})
+
+// ---------------------------------------------------------------------------
+// H1 mutation probe (DAG-LOC-01 REJECT follow-up, latch = 959bae7c2)
+//
+// The WorkflowStarted handler's recovering reservation is the only guard
+// between its runtimes/recovering check and runtimes.set. Within one
+// subscription duplicate WorkflowStarted events are serialized by
+// Stream.runForEach, so the falsifiable race is a reentrant stimulus on a
+// DIFFERENT subscription fiber: the WorkflowReplanned handler's no-entry
+// path calls recoverWorkflow, whose own guard observes the live adoption's
+// reservation (post-latch) or nothing (pre-latch). The probe parks the live
+// adoption at the getWorkflow/getNodes seam, publishes the reentrant
+// WorkflowReplanned from the SIBLING directory's ambient context, and
+// asserts adopt-exactly-once: while parked, exactly ONE adoption sequence
+// may sit at the seam (single runtimes.set-to-be, single automation-lease
+// registration-to-be); after release, exactly one first-wave spawn; a
+// follow-up duplicate WorkflowStarted from the sibling directory must not
+// drive a second adoption either. Reverting 959bae7c2 turns this probe RED
+// at the seam-count assertion (a second gated getNodes parks inside
+// reconcileWorkflow — the second adoption that would overwrite the first
+// runtimes entry and double-register the lease).
+// ---------------------------------------------------------------------------
+
+describe("DAG-LOC-01 H1 adopt-exactly-once latch", () => {
+  it("H1: a reentrant sibling-directory publish cannot drive a second adoption of a parked live WorkflowStarted adoption", async () => {
+    const parked = { value: false }
+    const calls = { value: 0 }
+    let release: () => void = () => {}
+    const wait = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    await Effect.runPromise(
+      runTwoInstanceGuardTest(
+        { parkGetNodes: { wait, parked, calls } },
+        ({ dag, store, bridge, initA, initB, childPromptsA, childPromptsB, cancelsA }) =>
+          Effect.gen(function* () {
+            yield* initA
+            const dagID = yield* dag.create({
+              projectID: PROJECT_ID,
+              sessionID: SES_A,
+              title: "Duplicate publish race",
+              config: { name: "h1", nodes: [node()] },
+            })
+            // The owner's live WorkflowStarted adoption parks between its
+            // guard and runtimes.set: exactly one gated getNodes proves the
+            // owner's adoption — and nothing else — is at the seam.
+            yield* pollWithTimeout(
+              Effect.sync(() => (parked.value ? true : undefined)),
+              "live WorkflowStarted adoption never parked at getNodes",
+            )
+            expect(calls.value).toBe(1)
+            // Reentrant stimulus published from the SIBLING directory's
+            // ambient context (B's InstanceRef stamps the location): a same-
+            // dagID WorkflowReplanned whose handler finds no runtimes entry
+            // takes the recoverWorkflow re-adoption path. The live adoption's
+            // reservation must repel it — pre-latch the replan passed
+            // recoverWorkflow's guard and parked a SECOND gated getNodes
+            // inside reconcileWorkflow.
+            yield* bridge.publish(DagEvent.WorkflowReplanned, {
+              dagID: dagID as never,
+              added: 0 as never,
+              removed: 0 as never,
+              replaced: 0 as never,
+              restarted: 0 as never,
+              timestamp: yield* DateTime.now,
+            }).pipe(
+              Effect.orDie,
+              Effect.provideService(InstanceRef, {
+                directory: DIR_B,
+                worktree: DIR_B,
+                project: { id: PROJECT_ID },
+              } as never),
+            )
+            // Negative window (sleep + snapshot — pollWithTimeout is a
+            // positive-wait tool): no second adoption may reach the seam.
+            yield* Effect.sleep("300 millis")
+            const adoptionsAtTheSeam = calls.value
+            // Release BEFORE asserting: the park awaits an uninterruptible
+            // Effect.promise, so a failing expectation must never abandon it
+            // (a hang at scope close would mask the RED).
+            release()
+            yield* Effect.sleep("100 millis")
+            expect(adoptionsAtTheSeam).toBe(1)
+            // Exactly one first-wave spawn for the single-node workflow.
+            const first = yield* takeWithin(childPromptsA, "owner did not adopt and spawn its first wave")
+            // Boot the sibling: its startup scan must not adopt the foreign
+            // (DIR_A-stamped) workflow either.
+            yield* initB
+            // Duplicate WorkflowStarted — same dagID, published from the
+            // sibling directory's context while the owner's entry is live —
+            // must not drive a second adoption or a re-spawn.
+            yield* bridge.publish(DagEvent.WorkflowStarted, {
+              dagID: dagID as never,
+              timestamp: yield* DateTime.now,
+            }).pipe(
+              Effect.orDie,
+              Effect.provideService(InstanceRef, {
+                directory: DIR_B,
+                worktree: DIR_B,
+                project: { id: PROJECT_ID },
+              } as never),
+            )
+            yield* Effect.sleep("300 millis")
+            expect(Option.isNone(yield* Queue.take(childPromptsA).pipe(Effect.timeoutOption("300 millis")))).toBe(true)
+            expect(Option.getOrElse(yield* Queue.poll(childPromptsB), () => null)).toBe(null)
+            expect(cancelsA).toEqual([])
+            const row = yield* store.getNode(dagID, "n1")
+            expect(row?.status).toBe("running")
+            expect(row?.childSessionId).toBe(first.input.sessionID as string)
+            expect((yield* store.getWorkflow(dagID))?.status).toBe("running")
           }),
       ),
     )
