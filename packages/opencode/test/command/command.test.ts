@@ -109,7 +109,9 @@ describe("legacy command registry", () => {
       )
 
       expect(expanded).toContain("resident Orchestration Router")
-      expect(expanded).toMatch(/Preserve\s+the task, user constraints/)
+      expect(expanded).not.toContain('workflow(action="list")')
+      expect(expanded).not.toContain('workflow(action="read"')
+      expect(expanded).toMatch(/Preserve\s+the task,\s+user constraints/)
       expect(expanded).toContain("worker types or model IDs")
       expect(expanded).toContain("configured capability or model")
       expect(expanded).toContain("real error")

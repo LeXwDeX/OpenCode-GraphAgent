@@ -5,28 +5,12 @@
 
 # Workflow Orchestration
 
-The `workflow` tool orchestrates heavy tasks as dependency-graph multi-agent workflows. Each node runs as a real child session with its own agent and tools. This skill covers when to start a workflow, how to structure it, and how to adapt it at runtime.
+The `workflow` tool orchestrates dependency-graph multi-agent workflows. Each
+node runs as a real child session with its own agent and tools. The resident
+Orchestration Router owns execution-mode and saved-reference selection; this
+guide owns the YAML/tool interface after a workflow has been selected.
 
 Compile every graph under the Tiered Orchestration Doctrine and Depth Ladder in the orchestration policy below: advanced-tier judgment nodes conduct and check, standard-tier nodes carry the volume, and accuracy is bought with breadth (concurrent fan-out) and depth (verdict-gated waves) rather than with a single trusted pass.
-
-## When to start a workflow
-
-Use one live workflow for project-level source or test changes, even when only
-one project file is expected, and when a user objective has any of these
-structural signals:
-
-- **Staged**: clear phase boundaries where later phases depend on earlier outputs (explore → plan → implement → verify).
-- **Parallelizable**: ≥2 related sub-units can execute concurrently (same fix across 5 packages).
-- **Quality gate**: intermediate output must pass review before downstream work begins (architecture review before implementation).
-- **Adaptive scope**: discovery may reveal an unknown number of work packages or require a bounded repair wave.
-
-Use one `task` subagent for one independent non-trivial leaf assignment outside
-a project-level source or test change. Keep related staged, parallel, gated, or
-adaptive flows under one workflow ID; use `extend` or `control(replan)` instead
-of starting disconnected DAGs. An explicit `/dag-flow` request always selects
-a workflow. Explicit “single agent”, “do not use DAG”, and direct-execution
-requests opt out. Direct tools in the parent are reserved for conversation,
-trivial state inspection, workflow control, and final synthesis.
 
 ## Standard and deep workflow entry
 
@@ -85,20 +69,15 @@ A `spec_path` with no path separator and no `.yaml`/`.yml` extension is a
 
 1. `.opencode/workflows/<name>.yaml` — project scope, committed with the repo
 2. `<opencode config dir>/workflows/<name>.yaml` — global scope, available in every project
+3. bundled builtin templates shipped with the runtime
 
-The project scope wins when both hold the name. `workflow(action: "list")`
-reports the saved names with their scope, title, and node count; a name that
-resolves nowhere fails with the directories that were searched.
-
-Prefer a saved workflow when the user names a recurring procedure ("run the
-code review workflow") and the saved target/inputs already match: starting it
-is one call, and its graph has already been reviewed. When only its topology
-matches, call `{ action: "read", spec_path: "code-review" }`, retarget its objective and block instructions to the current task, prune or add lanes, then
-write the edited value to a task-local YAML file and start its `spec_path`.
-`read` never starts a workflow. Compose a fresh task-local YAML file when the
-task is one-off or no reference fits. To turn a working one-off spec into a
-saved workflow, move it into one of the two workflow-library directories under
-a descriptive name.
+Project shadows global, and both shadow builtin. Call `workflow(action:
+"list")` and use only an exact returned name; never infer one. To inspect a
+saved graph without starting it, call
+`{ action: "read", spec_path: "<name-returned-by-list>" }`. Retarget its
+objective and block instructions in the parent, then write the edited value to
+a task-local YAML file. `read` never starts a workflow. A name that resolves
+nowhere fails with the searched locations.
 
 ## Orchestration Lifecycle
 
@@ -288,7 +267,7 @@ config:
       report_to_parent: true
       output_schema:
         type: object
-        required: [verdict, summary, findings, required_actions, next_action]
+        required: [verdict, summary, findings, required_actions]
         properties:
           verdict:
             type: string
@@ -296,16 +275,8 @@ config:
           summary: { type: string }
           findings: { type: array }
           required_actions: { type: array }
-          next_action:
-            type: object
-            required: [operation, targets]
-            properties:
-              operation:
-                type: string
-                enum: [continue, extend, replan, complete, stop]
-              targets: { type: array }
       prompt_template:
-        inline: "Three reviewers produced findings. Submit one structured ACCEPT, REVISE, REJECT, or BLOCKED decision with deduplicated findings, required actions, and the next bounded workflow action."
+        inline: "Three reviewers produced findings. Submit one structured ACCEPT, REVISE, REJECT, or BLOCKED decision with deduplicated findings and required actions. The parent chooses any workflow control action."
 
     - id: deep-dive
       name: deep-dive
@@ -410,12 +381,12 @@ appears as `failed` with error_reason `cancelled via replan` and NO
 `error_class` — deliberate action, no triage needed. Triage on the class
 before acting:
 
-| error_class | What it means | Correct response |
-|---|---|---|
-| `timeout` | The node exceeded `timeout_ms`; the runtime cancelled its child session at the deadline. Environmental — the task is NOT wrong. | Replace and rerun ONLY that node with a larger `worker_config.timeout_ms`. Check its `child_session_id` for partial artifacts before rerunning. |
-| `exec_failed` | Runtime/session-level failure. Gate on `error_reason`: (a) unknown/wrong model, auth, rate-limit, connection, template-resolution or condition-expression errors → config/prompt errors; (b) recovery reasons ("no child session on recovery", "child session failed (recovered)") → crash ownership loss; (c) workflow-collateral reasons (`required node(s) failed: ...`, `unresolved review outcome(s): ...`, `orchestrator_unresponsive`) → the node itself was fine; it was failed because the workflow failed. | (a) Fix the config first (`dag.jsonc` tier, provider credentials, model id, template/input mapping), then replace and rerun ONLY that node. (b) Inspect the child session's artifacts, then replace and rerun. (c) Do not rerun these collateral nodes. The wake surfaces no workflow-level reason — triage from the Failed-nodes block: `required node(s) failed: <ids>` names the culprit nodes directly (repair them); `orchestrator_unresponsive` carries NO attribution (see the recipe below). |
-| `verdict_fail` | Two shapes. Ran-but-broke-contract: missing `submit_result`, schema rejection, review fingerprint mismatch. Never-ran: pre-spawn contract failures (unresolved template placeholders, review input contract). | Ran-but-broke-contract → rerun the node with the contract stated explicitly; keep the topology. Never-ran → fix the template, input_mapping, or dependency wiring first, then rerun; prompt emphasis alone does not fix broken interpolation. |
-| (cascade — see below) | Dependents of a failed node. No dedicated class. | Repair the ROOT node first, then restore the dependent subtree. |
+| error_class           | What it means                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        | Correct response                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `timeout`             | The node exceeded `timeout_ms`; the runtime cancelled its child session at the deadline. Environmental — the task is NOT wrong.                                                                                                                                                                                                                                                                                                                                                                                      | Replace and rerun ONLY that node with a larger `worker_config.timeout_ms`. Check its `child_session_id` for partial artifacts before rerunning.                                                                                                                                                                                                                                                                                                                                                      |
+| `exec_failed`         | Runtime/session-level failure. Gate on `error_reason`: (a) unknown/wrong model, auth, rate-limit, connection, template-resolution or condition-expression errors → config/prompt errors; (b) recovery reasons ("no child session on recovery", "child session failed (recovered)") → crash ownership loss; (c) workflow-collateral reasons (`required node(s) failed: ...`, `unresolved review outcome(s): ...`, `orchestrator_unresponsive`) → the node itself was fine; it was failed because the workflow failed. | (a) Fix the config first (`dag.jsonc` tier, provider credentials, model id, template/input mapping), then replace and rerun ONLY that node. (b) Inspect the child session's artifacts, then replace and rerun. (c) Do not rerun these collateral nodes. The wake surfaces no workflow-level reason — triage from the Failed-nodes block: `required node(s) failed: <ids>` names the culprit nodes directly (repair them); `orchestrator_unresponsive` carries NO attribution (see the recipe below). |
+| `verdict_fail`        | Two shapes. Ran-but-broke-contract: missing `submit_result`, schema rejection, review fingerprint mismatch. Never-ran: pre-spawn contract failures (unresolved template placeholders, review input contract).                                                                                                                                                                                                                                                                                                        | Ran-but-broke-contract → rerun the node with the contract stated explicitly; keep the topology. Never-ran → fix the template, input_mapping, or dependency wiring first, then rerun; prompt emphasis alone does not fix broken interpolation.                                                                                                                                                                                                                                                        |
+| (cascade — see below) | Dependents of a failed node. No dedicated class.                                                                                                                                                                                                                                                                                                                                                                                                                                                                     | Repair the ROOT node first, then restore the dependent subtree.                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 
 Cascade detection has two shapes:
 
@@ -542,14 +513,15 @@ All nodes share the same workspace. Write conflicts are an orchestration concern
 
 **start** — Create a workflow from `config` and optional `title`, `mode`, and
 admission input stored in YAML. Pass a task-local YAML path for one-off work or
-a saved workflow name such as
-`{ action: "start", spec_path: "code-review" }`.
+a saved workflow name returned by `list`, such as
+`{ action: "start", spec_path: "<name-returned-by-list>" }`.
 Returns the workflow ID. Nodes declare `depends_on` (node IDs); layers and
 execution order are computed automatically.
 
-**list** — Show the saved workflow specs in the library (project and global
-scope) with their names, titles, and node counts. This lists reusable specs,
-not running workflows; use `status` for a workflow's live state.
+**list** — Show saved workflow specs in project, global, and builtin scopes
+with names, titles, bounded objectives, block or node counts, paths, and
+validation status. This lists reusable specs, not running workflows; use
+`status` for a workflow's live state.
 
 **read** — Return one saved workflow as structured JSON without starting it.
 Pass `spec_path`, then retarget generic objectives and block instructions in
@@ -583,21 +555,21 @@ omitted content from its preview.
 
 ### Node Fields
 
-| Field | Required | Description |
-|-------|----------|-------------|
-| `id` | yes | Unique node identifier, used in `depends_on` |
-| `name` | yes | Human-readable name |
-| `worker_type` | yes | Agent type (`explore`, `build`, `general`, `plan`, or custom) |
-| `depends_on` | yes | Array of node IDs this node waits for (`[]` for root) |
-| `required` | no | If true and this node fails, the workflow terminalizes as failed. Default: false |
-| `prompt_template` | yes | `{ id: "..." }` or `{ inline: "...", input: {...} }` |
-| `condition` | no | Expression evaluated before spawn; node is skipped if false |
-| `input_mapping` | no | Map upstream node outputs into template variables |
-| `report_to_parent` | no | If true, the parent agent is woken when this node completes or fails. The workflow's terminal status always wakes the parent regardless of this flag |
-| `worker_config` | no | `{ timeout_ms }` — bounds node execution (defaults to 10 minutes if omitted) |
-| `output_schema` | no | JSON Schema; when declared, the child agent must call `submit_result` to submit structured output — failure to submit results in node failure |
-| `restart` | no | (replan only) Re-spawn this running node with new prompt |
-| `cancel` | no | (replan only) Cancel this node |
+| Field              | Required | Description                                                                                                                                          |
+| ------------------ | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `id`               | yes      | Unique node identifier, used in `depends_on`                                                                                                         |
+| `name`             | yes      | Human-readable name                                                                                                                                  |
+| `worker_type`      | yes      | Agent type (`explore`, `build`, `general`, `plan`, or custom)                                                                                        |
+| `depends_on`       | yes      | Array of node IDs this node waits for (`[]` for root)                                                                                                |
+| `required`         | no       | If true and this node fails, the workflow terminalizes as failed. Default: false                                                                     |
+| `prompt_template`  | yes      | `{ id: "..." }` or `{ inline: "...", input: {...} }`                                                                                                 |
+| `condition`        | no       | Expression evaluated before spawn; node is skipped if false                                                                                          |
+| `input_mapping`    | no       | Map upstream node outputs into template variables                                                                                                    |
+| `report_to_parent` | no       | If true, the parent agent is woken when this node completes or fails. The workflow's terminal status always wakes the parent regardless of this flag |
+| `worker_config`    | no       | `{ timeout_ms }` — bounds node execution (defaults to 10 minutes if omitted)                                                                         |
+| `output_schema`    | no       | JSON Schema; when declared, the child agent must call `submit_result` to submit structured output — failure to submit results in node failure        |
+| `restart`          | no       | (replan only) Re-spawn this running node with new prompt                                                                                             |
+| `cancel`           | no       | (replan only) Cancel this node                                                                                                                       |
 
 ### What NOT to expect
 
