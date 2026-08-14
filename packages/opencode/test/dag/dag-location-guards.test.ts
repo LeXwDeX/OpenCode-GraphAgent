@@ -39,7 +39,7 @@ import type { SessionV1 } from "@opencode-ai/core/v1/session"
 import { SessionV1 as SessionV1Events } from "@opencode-ai/core/v1/session"
 import { Database } from "@opencode-ai/core/database/database"
 import { DagProjector } from "@opencode-ai/core/dag/projector"
-import { WorkflowTable } from "@opencode-ai/core/dag/sql"
+import { WorkflowTable, WorkflowNodeTable } from "@opencode-ai/core/dag/sql"
 import { DagStore } from "@opencode-ai/core/dag/store"
 import { EventV2 } from "@opencode-ai/core/event"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
@@ -131,6 +131,27 @@ interface TwoInstanceInput {
   readonly messagesBySession: Map<string, SessionV1.WithParts[]>
   /** Injected one-shot defects for DagStore.getWorkflow (parity with the template). */
   readonly failGetWorkflow?: { remaining: number }
+  /**
+   * Optional deterministic park on DagStore.getNodes. When present, every
+   * getNodes call sets `parked.value = true` and then awaits `wait` before
+   * delegating to the real store — letting a probe interleave a mutation
+   * (e.g. Session.remove) inside a recovery sequence.
+   */
+  readonly parkGetNodes?: { readonly wait: Promise<void>; readonly parked: { value: boolean } }
+  /**
+   * Optional deterministic park on SessionPrompt.prepareIfIdle (the wake
+   * delivery admission seam). When present, each prepareIfIdle call bumps
+   * `calls`; before `released.value` it parks the admission's result effect
+   * on `wait` so a probe can interleave Session.remove mid-delivery. After
+   * release, prepareIfIdle returns none (the call itself still proves the
+   * idle subscription survived).
+   */
+  readonly parkWakeDelivery?: {
+    readonly wait: Promise<void>
+    readonly parked: { value: boolean }
+    readonly released: { value: boolean }
+    readonly calls: { value: number }
+  }
 }
 
 function twoInstanceLayer(input: TwoInstanceInput) {
@@ -138,7 +159,8 @@ function twoInstanceLayer(input: TwoInstanceInput) {
   const events = EventV2.layer.pipe(Layer.provide(database))
   const bridge = EventV2Bridge.layer.pipe(Layer.provide(events))
   const realStore = DagStore.layer.pipe(Layer.provide(database))
-  const store = input.failGetWorkflow
+  const needsStoreWrapper = Boolean(input.failGetWorkflow) || Boolean(input.parkGetNodes)
+  const store = needsStoreWrapper
     ? Layer.effect(
         DagStore.Service,
         Effect.gen(function* () {
@@ -147,11 +169,18 @@ function twoInstanceLayer(input: TwoInstanceInput) {
             ...real,
             getWorkflow: (id) =>
               Effect.suspend(() => {
-                if (input.failGetWorkflow!.remaining > 0) {
-                  input.failGetWorkflow!.remaining--
+                if (input.failGetWorkflow && input.failGetWorkflow.remaining > 0) {
+                  input.failGetWorkflow.remaining--
                   return Effect.die(new Error("injected transient db failure"))
                 }
                 return real.getWorkflow(id)
+              }),
+            getNodes: (id) =>
+              Effect.suspend(() => {
+                const gate = input.parkGetNodes
+                if (!gate) return real.getNodes(id)
+                gate.parked.value = true
+                return Effect.promise(() => gate.wait).pipe(Effect.flatMap(() => real.getNodes(id)))
               }),
           })
         }),
@@ -245,6 +274,24 @@ function twoInstanceLayer(input: TwoInstanceInput) {
       }),
     prompt: deliver,
     promptIfIdle: (value) => deliver(value).pipe(Effect.map(Option.some)),
+    // Wake-delivery admission seam (C2). tryDeliverWake delivers through
+    // admitIfIdle → prepareIfIdle, not promptIfIdle. Without a gate this
+    // returns none (no admission); with parkWakeDelivery it parks the result
+    // effect on the gate so a probe can race Session.remove mid-delivery.
+    prepareIfIdle: (value) =>
+      Effect.sync(() => {
+        const gate = input.parkWakeDelivery
+        if (!gate) return Option.none()
+        gate.calls.value++
+        if (gate.released.value) return Option.none()
+        gate.parked.value = true
+        const result = Effect.promise(() => gate.wait).pipe(
+          Effect.flatMap(() =>
+            Effect.die(new Error(`session ${(value as { sessionID?: string }).sessionID} removed during wake delivery`)),
+          ),
+        )
+        return Option.some({ activate: Effect.void, result, abort: Effect.void })
+      }),
   })
   const agent = Layer.mock(Agent.Service, {
     get: () => Effect.succeed({
@@ -298,6 +345,13 @@ function runTwoInstanceGuardTest<A>(
     readonly sessionA?: string
     readonly sessionB?: string
     readonly failGetWorkflow?: { remaining: number }
+    readonly parkGetNodes?: { readonly wait: Promise<void>; readonly parked: { value: boolean } }
+    readonly parkWakeDelivery?: {
+      readonly wait: Promise<void>
+      readonly parked: { value: boolean }
+      readonly released: { value: boolean }
+      readonly calls: { value: number }
+    }
   },
   test: (services: TwoInstanceServices) => Effect.Effect<A, Error>,
   beforeInit?: (services: { readonly database: Database.Interface }) => Effect.Effect<void>,
@@ -380,6 +434,8 @@ function runTwoInstanceGuardTest<A>(
         promptInterrupts,
         messagesBySession,
         failGetWorkflow: options.failGetWorkflow,
+        parkGetNodes: options.parkGetNodes,
+        parkWakeDelivery: options.parkWakeDelivery,
       })),
       Effect.provideService(InstanceRef, {
         directory: directoryA,
@@ -1358,6 +1414,141 @@ describe("DAG-LOC-01 issue #238 evidence probes", () => {
             // workflow.
             yield* bridge.replayAll(serialized)
             expect(yield* store.getWorkflow(dagID)).toBeUndefined()
+          }),
+      ),
+    )
+  })
+
+  it("C2: Session.remove racing an in-flight wake is absorbed and the idle subscription survives", async () => {
+    const parked = { value: false }
+    const released = { value: false }
+    const calls = { value: 0 }
+    let release: () => void = () => {}
+    const wait = new Promise<void>((resolve) => {
+      release = () => {
+        released.value = true
+        resolve()
+      }
+    })
+    await Effect.runPromise(
+      runTwoInstanceGuardTest(
+        { parkWakeDelivery: { wait, parked, released, calls } },
+        ({ database, bridge, session, initA }) =>
+          Effect.gen(function* () {
+            yield* initA
+            // Re-arm BOTH stamped terminal wakes after the startup sweep passed
+            // over them (they were seeded wake_reported=true), so the delivery
+            // below can only come from the idle-Status path.
+            for (const id of ["wake-wf-a", "wake-wf-b"]) {
+              yield* database.db.update(WorkflowTable)
+                .set({ wake_reported: false })
+                .where(eq(WorkflowTable.id, id))
+                .run().pipe(Effect.orDie)
+            }
+            // Idle SES_A → wake delivery parks inside prepareIfIdle.
+            yield* bridge.publish(SessionStatusEvent.Status, {
+              sessionID: SES_A as never,
+              status: { type: "idle" },
+            }).pipe(Effect.orDie)
+            yield* pollWithTimeout(
+              Effect.sync(() => (parked.value ? true : undefined)),
+              "wake delivery never parked in prepareIfIdle",
+            )
+            expect(calls.value).toBe(1)
+            // Race: delete SES_A while the delivery is parked — FK cascade wipes
+            // the wake rows out from under the in-flight delivery.
+            yield* session.remove(SES_A as never)
+            // Release: the parked result fails; tryDeliverWake's catchCause must
+            // absorb it (no defect) and the finally must free wakeInFlight.
+            release()
+            yield* Effect.sleep("200 millis")
+            // Subscription survival: an idle for a DIFFERENT session still reaches
+            // prepareIfIdle (calls bumps again) — proof the idle wake subscription
+            // is alive after the raced deletion.
+            yield* bridge.publish(SessionStatusEvent.Status, {
+              sessionID: SES_B as never,
+              status: { type: "idle" },
+            }).pipe(Effect.orDie)
+            yield* pollWithTimeout(
+              Effect.sync(() => (calls.value >= 2 ? true : undefined)),
+              "idle wake subscription died after the Session.remove race",
+            )
+            expect(calls.value).toBe(2)
+          }),
+        ({ database }) =>
+          Effect.gen(function* () {
+            for (const [id, sessionID] of [
+              ["wake-wf-a", SES_A],
+              ["wake-wf-b", SES_B],
+            ] as const) {
+              yield* database.db.insert(WorkflowTable).values({
+                id,
+                project_id: PROJECT_ID as never,
+                session_id: sessionID as never,
+                directory: DIR_A as never,
+                title: `terminal wake ${id}`,
+                status: "failed",
+                config: "{}",
+                seq: 1,
+                wake_reported: true,
+              }).run().pipe(Effect.orDie)
+            }
+          }),
+      ),
+    )
+  })
+
+  it("C6: recoverOrphanPending racing Session.remove is absorbed without killing init", async () => {
+    const parked = { value: false }
+    let release: () => void = () => {}
+    const wait = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    await Effect.runPromise(
+      runTwoInstanceGuardTest(
+        { parkGetNodes: { wait, parked } },
+        ({ database, session, store, initA }) =>
+          Effect.gen(function* () {
+            // An all-pending orphan under A: a create that crashed mid-way.
+            // It is stamped DIR_A so instance A's recoverOrphanPending owns it.
+            yield* database.db.insert(WorkflowTable).values({
+              id: "c6-orphan",
+              project_id: PROJECT_ID as never,
+              session_id: SES_A as never,
+              directory: DIR_A as never,
+              title: "pending orphan",
+              status: "pending",
+              config: "{}",
+              seq: 1,
+              wake_reported: true,
+            }).run().pipe(Effect.orDie)
+            yield* database.db.insert(WorkflowNodeTable).values({
+              id: "n1",
+              workflow_id: "c6-orphan",
+              name: "n1",
+              worker_type: "build",
+              status: "pending",
+              required: true,
+              depends_on: [],
+              seq: 1,
+            }).run().pipe(Effect.orDie)
+            // Boot A; recoverOrphanPending parks its first getNodes on the gate.
+            const initFiber = yield* initA.pipe(Effect.forkChild)
+            yield* pollWithTimeout(
+              Effect.sync(() => (parked.value ? true : undefined)),
+              "recoverOrphanPending never parked at getNodes",
+            )
+            // While it is parked between getNodes and dag.fail, delete the
+            // session — FK cascade wipes the orphan rows out from under it.
+            yield* session.remove(SES_A as never)
+            expect(yield* store.getWorkflow("c6-orphan")).toBeUndefined()
+            // Release: dag.fail on the gone workflow fails, the startup-scan
+            // catchCause absorbs it, and Effect.ensuring frees the recovering
+            // slot. init must therefore complete — a leak or an unabsorbed
+            // defect would surface here.
+            release()
+            yield* Fiber.join(initFiber)
+            expect(yield* store.getWorkflow("c6-orphan")).toBeUndefined()
           }),
       ),
     )
