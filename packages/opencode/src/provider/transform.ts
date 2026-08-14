@@ -1537,6 +1537,19 @@ export function schema(model: Provider.Model, schema: JSONSchema7): JSONSchema7 
     schema = sanitizeGemini(schema)
   }
 
+  // DeepSeek rejects function schemas whose root type is implicit. Effect
+  // emits object-only discriminated unions as a root `anyOf`; retaining the
+  // union while declaring its shared object type preserves every branch.
+  if (
+    model.api.id.toLowerCase().includes("deepseek") &&
+    schema.type === undefined &&
+    Array.isArray(schema.anyOf) &&
+    schema.anyOf.length > 0 &&
+    schema.anyOf.every((branch) => isPlainObject(branch) && branch.type === "object")
+  ) {
+    schema = { ...schema, type: "object" }
+  }
+
   return schema
 }
 
