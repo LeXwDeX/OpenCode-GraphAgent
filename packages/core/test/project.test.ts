@@ -2,11 +2,13 @@ import { describe, expect } from "bun:test"
 import { $ } from "bun"
 import fs from "fs/promises"
 import path from "path"
-import { Effect, Layer, Schema } from "effect"
+import { Cause, Effect, Exit, Layer, Schema } from "effect"
+import { ChildProcess } from "effect/unstable/process"
 import { ProjectV2 } from "@opencode-ai/core/project"
 import { Database } from "@opencode-ai/core/database/database"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Git } from "@opencode-ai/core/git"
+import { AppProcess } from "@opencode-ai/core/process"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import { Hash } from "@opencode-ai/core/util/hash"
 import { ProjectDirectories } from "@opencode-ai/core/project/directories"
@@ -14,6 +16,34 @@ import { tmpdir } from "./fixture/tmpdir"
 import { testEffect } from "./lib/effect"
 
 const it = testEffect(Layer.mergeAll(ProjectV2.defaultLayer, Database.defaultLayer, ProjectDirectories.defaultLayer))
+const unavailableProject = projectWithProcessFailure(() => true)
+const unavailableRootCommits = projectWithProcessFailure(
+  (command) => command._tag === "StandardCommand" && command.command === "git" && command.args[0] === "rev-list",
+)
+
+function projectWithProcessFailure(matches: (command: ChildProcess.Command) => boolean) {
+  const unavailableProcess = Layer.effect(
+    AppProcess.Service,
+    Effect.gen(function* () {
+      const process = yield* AppProcess.Service
+      return AppProcess.Service.of({
+        ...process,
+        run: (command, options) =>
+          matches(command)
+            ? Effect.fail(new AppProcess.AppProcessError({ command: "git" }))
+            : process.run(command, options),
+      })
+    }),
+  ).pipe(Layer.provide(AppProcess.defaultLayer))
+  const git = Git.layer.pipe(Layer.provide(FSUtil.defaultLayer), Layer.provide(unavailableProcess))
+  return testEffect(
+    ProjectV2.layer.pipe(
+      Layer.provide(FSUtil.defaultLayer),
+      Layer.provide(git),
+      Layer.provide(ProjectDirectories.defaultLayer),
+    ),
+  )
+}
 
 function remoteID(remote: string) {
   return ProjectV2.ID.make(Hash.fast(`git-remote:${remote}`))
@@ -42,6 +72,39 @@ async function rootCommit(dir: string) {
 }
 
 describe("ProjectV2.resolve", () => {
+  unavailableProject.effect("fails closed instead of returning global when git cannot start", () =>
+    Effect.gen(function* () {
+      const tmp = yield* Effect.acquireRelease(
+        Effect.promise(() => tmpdir()),
+        (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+      )
+      yield* Effect.promise(() => fs.mkdir(path.join(tmp.path, ".git")))
+      const project = yield* ProjectV2.Service
+
+      const exit = yield* project.resolve(abs(tmp.path)).pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      expect(Exit.isSuccess(exit) ? exit.value.id : undefined).not.toBe(ProjectV2.ID.global)
+    }),
+  )
+
+  unavailableRootCommits.live("fails closed when root commit lookup cannot start", () =>
+    Effect.gen(function* () {
+      const tmp = yield* Effect.acquireRelease(
+        Effect.promise(() => tmpdir()),
+        (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+      )
+      yield* Effect.promise(() => initRepo(tmp.path, { commit: true }))
+      const project = yield* ProjectV2.Service
+
+      const exit = yield* project.resolve(abs(tmp.path)).pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) expect(Cause.squash(exit.cause)).toBeInstanceOf(AppProcess.AppProcessError)
+      expect(Exit.isSuccess(exit) ? exit.value.id : undefined).not.toBe(ProjectV2.ID.global)
+    }),
+  )
+
   it.live("returns global for non-git directory", () =>
     Effect.gen(function* () {
       const tmp = yield* Effect.acquireRelease(
