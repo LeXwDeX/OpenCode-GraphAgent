@@ -55,6 +55,24 @@ function search<T>(items: T[], target: string, key: (item: T) => string) {
   return { found: false, index: left }
 }
 
+function before(a: { id: string; time: { created: number } }, b: { id: string; time: { created: number } }) {
+  if (a.time.created !== b.time.created) return a.time.created < b.time.created
+  return a.id < b.id
+}
+
+function searchMessages(messages: Message[], target: Message) {
+  let left = 0
+  let right = messages.length - 1
+  while (left <= right) {
+    const middle = Math.floor((left + right) / 2)
+    const value = messages[middle]
+    if (before(value, target)) left = middle + 1
+    else if (before(target, value)) right = middle - 1
+    else return { found: true, index: middle }
+  }
+  return { found: false, index: left }
+}
+
 export const {
   context: SyncContext,
   use: useSync,
@@ -175,7 +193,7 @@ export const {
     function listSessions() {
       return sdk.client.session
         .list({ start: Date.now() - 30 * 24 * 60 * 60 * 1000, ...sessionListQuery() })
-        .then((x) => (x.data ?? []).toSorted((a, b) => a.id.localeCompare(b.id)))
+        .then((x) => (x.data ?? []).toSorted((a, b) => b.time.updated - a.time.updated))
     }
 
     event.subscribe((event, { workspace }) => {
@@ -338,7 +356,7 @@ export const {
             setStore("message", event.properties.info.sessionID, [event.properties.info])
             break
           }
-          const result = search(messages, event.properties.info.id, (m) => m.id)
+          const result = searchMessages(messages, event.properties.info)
           if (result.found) {
             setStore("message", event.properties.info.sessionID, result.index, reconcile(event.properties.info))
             break
@@ -374,13 +392,14 @@ export const {
         case "message.removed": {
           touchMessage(event.properties.sessionID, event.properties.messageID)
           const messages = store.message[event.properties.sessionID]
-          const result = search(messages, event.properties.messageID, (m) => m.id)
-          if (result.found) {
+          if (!messages) break
+          const index = messages.findIndex((m) => m.id === event.properties.messageID)
+          if (index >= 0) {
             setStore(
               "message",
               event.properties.sessionID,
               produce((draft) => {
-                draft.splice(result.index, 1)
+                draft.splice(index, 1)
               }),
             )
           }

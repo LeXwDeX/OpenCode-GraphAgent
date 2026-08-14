@@ -29,6 +29,7 @@ import { BoxRenderable, ScrollBoxRenderable, addDefaultParsers, TextAttributes, 
 import { Prompt, type PromptRef } from "../../component/prompt"
 import type {
   AssistantMessage,
+  Message,
   Part,
   Provider,
   ToolPart,
@@ -95,6 +96,11 @@ const GO_UPSELL_PROVIDERS = new Set(["opencode", "opencode-go"])
 export const alwaysSeparate = new WeakSet<BoxRenderable>()
 
 type RetryAction = Extract<SessionStatus, { type: "retry" }>["action"]
+
+function orderedBefore(a: { id: string; time: { created: number } }, b: { id: string; time: { created: number } }) {
+  if (a.time.created !== b.time.created) return a.time.created < b.time.created
+  return a.id < b.id
+}
 
 function goUpsellKeys(action: RetryAction) {
   if (!action) return
@@ -208,7 +214,7 @@ export function Session() {
     const parentID = session()?.parentID ?? session()?.id
     return sync.data.session
       .filter((x) => x.parentID === parentID || x.id === parentID)
-      .toSorted((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+      .toSorted((a, b) => b.time.created - a.time.created)
   })
   const messages = createMemo(() => sync.data.message[route.sessionID] ?? [])
   const foregroundTasks = createMemo(() =>
@@ -236,9 +242,10 @@ export function Session() {
   const disabled = createMemo(() => permissions().length > 0 || questions().length > 0)
 
   const pending = createMemo(() => {
-    const completed = messages().findLast((x) => x.role === "assistant" && x.time.completed)?.id
-    return messages().findLast((x) => x.role === "assistant" && !x.time.completed && (!completed || x.id > completed))
-      ?.id
+    const completed = messages().findLast((x) => x.role === "assistant" && x.time.completed)
+    return messages().findLast(
+      (x) => x.role === "assistant" && !x.time.completed && (!completed || !orderedBefore(x, completed)),
+    )
   })
 
   const lastAssistant = createMemo(() => {
@@ -611,7 +618,10 @@ export function Session() {
         const status = sync.data.session_status?.[route.sessionID]
         if (status?.type !== "idle") await sdk.client.session.abort({ sessionID: route.sessionID }).catch(() => {})
         const revert = session()?.revert?.messageID
-        const message = messages().findLast((x) => (!revert || x.id < revert) && x.role === "user")
+        const revertMessage = revert ? messages().find((m) => m.id === revert) : undefined
+        const message = messages().findLast(
+          (x) => x.role === "user" && (!revertMessage || orderedBefore(x, revertMessage)),
+        )
         if (!message) return
         void sdk.client.session
           .revert({
@@ -649,7 +659,10 @@ export function Session() {
         dialog.clear()
         const messageID = session()?.revert?.messageID
         if (!messageID) return
-        const message = messages().find((x) => x.role === "user" && x.id > messageID)
+        const revertMessage = messages().find((m) => m.id === messageID)
+        const message = revertMessage
+          ? messages().find((x) => x.role === "user" && orderedBefore(revertMessage, x))
+          : undefined
         if (!message) {
           void sdk.client.session.unrevert({
             sessionID: route.sessionID,
@@ -873,8 +886,9 @@ export function Session() {
       category: "Session",
       run: () => {
         const revertID = session()?.revert?.messageID
+        const revertMessage = revertID ? messages().find((m) => m.id === revertID) : undefined
         const lastAssistantMessage = messages().findLast(
-          (msg) => msg.role === "assistant" && (!revertID || msg.id < revertID),
+          (msg) => msg.role === "assistant" && (!revertMessage || orderedBefore(msg, revertMessage)),
         )
         if (!lastAssistantMessage) {
           toast.show({ message: "No assistant messages found", variant: "error" })
@@ -1118,13 +1132,23 @@ export function Session() {
 
   const revertInfo = createMemo(() => session()?.revert)
   const revertMessageID = createMemo(() => revertInfo()?.messageID)
+  const revertBoundary = createMemo(() => {
+    const messageID = revertMessageID()
+    if (!messageID) return undefined
+    return messages().find((m) => m.id === messageID)
+  })
+
+  const atOrAfterRevert = (message: Message) => {
+    const boundary = revertBoundary()
+    return boundary !== undefined && !orderedBefore(message, boundary)
+  }
 
   const revertDiffFiles = createMemo(() => getRevertDiffFiles(revertInfo()?.diff ?? ""))
 
   const revertRevertedMessages = createMemo(() => {
-    const messageID = revertMessageID()
-    if (!messageID) return []
-    return messages().filter((x) => x.id >= messageID && x.role === "user")
+    const boundary = revertBoundary()
+    if (!boundary) return []
+    return messages().filter((x) => x.role === "user" && !orderedBefore(x, boundary))
   })
 
   const revert = createMemo(() => {
@@ -1247,7 +1271,7 @@ export function Session() {
                           )
                         })()}
                       </Match>
-                      <Match when={revert()?.messageID && message.id >= revert()!.messageID}>
+                      <Match when={atOrAfterRevert(message)}>
                         <></>
                       </Match>
                       <Match when={message.role === "user"}>
@@ -1352,7 +1376,7 @@ function UserMessage(props: {
   parts: Part[]
   onMouseUp: () => void
   index: number
-  pending?: string
+  pending?: Message
 }) {
   const ctx = use()
   const local = useLocal()
@@ -1370,7 +1394,7 @@ function UserMessage(props: {
   const files = createMemo(() => props.parts.flatMap((x) => (x.type === "file" ? [x] : [])))
   const { theme } = useTheme()
   const [hover, setHover] = createSignal(false)
-  const queued = createMemo(() => props.pending && props.message.id > props.pending)
+  const queued = createMemo(() => props.pending && props.message.time.created > props.pending.time.created)
   const color = createMemo(() => local.agent.color(props.message.agent))
   const queuedFg = createMemo(() => selectedForeground(theme, color()))
   const metadataVisible = createMemo(() => queued() || ctx.showTimestamps())

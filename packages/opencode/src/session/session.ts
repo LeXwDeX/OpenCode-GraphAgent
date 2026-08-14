@@ -796,6 +796,7 @@ export const layer: Layer.Layer<
         metadata: structuredClone(original.metadata),
       })
       const msgs = yield* messages({ sessionID: input.sessionID })
+      const cutoff = input.messageID ? msgs.find((msg) => msg.info.id === input.messageID) : undefined
       const idMap = new Map<string, MessageID>()
 
       // Every updateMessage/updatePart publishes a durable event, and each
@@ -811,7 +812,7 @@ export const layer: Layer.Layer<
           () =>
             Effect.gen(function* () {
               for (const msg of msgs) {
-                if (input.messageID && msg.info.id >= input.messageID) break
+                if (cutoff && !MessageV2.before(msg.info, cutoff.info)) break
                 const newID = MessageID.ascending()
                 idMap.set(msg.info.id, newID)
 
