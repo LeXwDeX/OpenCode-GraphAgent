@@ -10,6 +10,13 @@
 GraphAgent 是本项目对外的产品名；仓库以 **OpenCode-GraphAgent** 发布，是 MIT 许可的
 [opencode](https://github.com/anomalyco/opencode) 终端 AI 智能体的 fork，在其之上加了 DAG 工作流引擎。**与 OpenCode 团队无任何隶属或背书关系。**
 
+> [!IMPORTANT]
+> **GraphAgent v1 现进入聚焦维护阶段。**维护范围限定为 DAG 配置、精选工作流模板，以及通过
+> [GitHub Issues](https://github.com/LeXwDeX/OpenCode-GraphAgent/issues) 提交的可复现缺陷。
+> 影响稳定性、数据完整性或 DAG 核心体验的架构问题，将采用范围可控的兼容性补丁修复；v1
+> 不再新增底层平台能力，也不再进行大规模架构重构。下一代项目将独立启动，在不继续扩大 v1
+> 兼容性约束的前提下重新设计运行时。
+
 ---
 
 ## 「Graph Engineering」这个名字出现前，GraphAgent 已经在跑
