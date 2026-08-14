@@ -122,7 +122,15 @@ export const layer = Layer.effect(
       const file = join(globalConfigDir(), "memory.jsonc")
       const found = yield* readFirst(globalCandidates())
       if (found) {
-        if (yield* readConfig(found)) return false
+        const existing = yield* readConfig(found)
+        if (existing) {
+          yield* Effect.logWarning("global MEMORY config write declined — preserving existing valid config", {
+            path: found.path,
+            existingModel: existing.model,
+            requestedModel: config.model,
+          })
+          return false
+        }
         yield* flock.withLock(MemoryFile.atomicWrite(fs, found.path, serialize(config)), writeLockKey(found.path))
         return true
       }

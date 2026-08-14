@@ -3,6 +3,7 @@ import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { EffectFlock } from "@opencode-ai/core/util/effect-flock"
 import { Deferred, Duration, Effect, Fiber, Layer } from "effect"
+import { logLines } from "effect/testing/TestConsole"
 import fs from "node:fs/promises"
 import path from "node:path"
 import { Config } from "@/config/config"
@@ -493,6 +494,42 @@ describe("memory config and YAML store", () => {
             expect(yield* memoryConfig.loadGlobal()).toBeUndefined()
             expect(yield* memoryConfig.writeGlobal(config)).toBe(true)
             expect((yield* memoryConfig.load(project))?.config).toEqual(config)
+          }),
+        () =>
+          Effect.sync(() => {
+            if (previous === undefined) delete process.env.OPENCODE_CONFIG_DIR
+            else process.env.OPENCODE_CONFIG_DIR = previous
+          }),
+      )
+    }),
+  )
+
+  it.live("warns when preserving an existing valid global configuration", () =>
+    Effect.gen(function* () {
+      const memoryConfig = yield* MemoryConfig.Service
+      const global = yield* tmpdirScoped()
+      const previous = process.env.OPENCODE_CONFIG_DIR
+      const existing = { ...config, model: "test/existing" }
+      const requested = { ...config, model: "test/requested" }
+
+      yield* Effect.acquireUseRelease(
+        Effect.sync(() => {
+          process.env.OPENCODE_CONFIG_DIR = global
+        }),
+        () =>
+          Effect.gen(function* () {
+            expect(yield* memoryConfig.writeGlobal(existing)).toBe(true)
+            expect(yield* memoryConfig.writeGlobal(requested)).toBe(false)
+            expect((yield* memoryConfig.loadGlobal())?.config).toEqual(existing)
+
+            const logs = JSON.stringify(yield* logLines)
+            expect(logs).toContain("WARN")
+            expect(logs).toContain("global MEMORY config write declined — preserving existing valid config")
+            expect(logs).toContain(path.join(global, "memory.jsonc"))
+            expect(logs).toContain("existingModel")
+            expect(logs).toContain("test/existing")
+            expect(logs).toContain("requestedModel")
+            expect(logs).toContain("test/requested")
           }),
         () =>
           Effect.sync(() => {
@@ -1360,6 +1397,9 @@ describe("memory bootstrap", () => {
           injection: { max_topics: 3, max_tokens: 1_200 },
         })
         expect(bootstrap.state.modelCalls).toBe(0)
+        const logs = JSON.stringify(yield* logLines)
+        expect(logs).toContain("global MEMORY config initialized")
+        expect(logs).not.toContain("global MEMORY model replaced")
       }),
     { git: true },
   )
@@ -1449,6 +1489,13 @@ describe("memory bootstrap", () => {
           turn_interval: 7,
         })
         expect(bootstrap.state.modelCalls).toBe(0)
+        const logs = JSON.stringify(yield* logLines)
+        expect(logs).toContain("global MEMORY model replaced")
+        expect(logs).toContain("previousModel")
+        expect(logs).toContain("removed/model")
+        expect(logs).toContain("test/compaction")
+        expect(logs).toContain("/global/memory.jsonc")
+        expect(logs).not.toContain("global MEMORY config initialized")
       }),
     { git: true },
   )
