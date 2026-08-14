@@ -20,7 +20,7 @@ describe("identifier 48-bit wrap", () => {
   test("same-millisecond ids are strictly ascending and unique", () => {
     const ids = Array.from({ length: 10 }, (_, index) => create(false, WRAP_BOUNDARY + 1000 + index))
     for (let i = 1; i < ids.length; i++) {
-      expect(ids[i - 1]! < ids[i]!).toBe(true)
+      expect(ids[i - 1] < ids[i]).toBe(true)
     }
     expect(new Set(ids).size).toBe(ids.length)
   })
@@ -28,7 +28,7 @@ describe("identifier 48-bit wrap", () => {
   test("same-millisecond descending ids are strictly descending and unique", () => {
     const ids = Array.from({ length: 10 }, (_, index) => create(true, WRAP_BOUNDARY + 2000 + index))
     for (let i = 1; i < ids.length; i++) {
-      expect(ids[i - 1]! > ids[i]!).toBe(true)
+      expect(ids[i - 1] > ids[i]).toBe(true)
     }
     expect(new Set(ids).size).toBe(ids.length)
   })
