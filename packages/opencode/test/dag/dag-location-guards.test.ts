@@ -63,6 +63,7 @@ import { SessionStatus } from "@/session/status"
 import { pollWithTimeout } from "../lib/effect"
 import { makeNodeRow } from "./fixtures"
 import { eq } from "drizzle-orm"
+import { EventTable } from "@opencode-ai/core/event/sql"
 import { existsSync, readFileSync, readdirSync } from "node:fs"
 import path from "node:path"
 
@@ -696,6 +697,78 @@ describe("DAG execution-location static contract (DAG-LOC-01 R7)", () => {
     }
     expect(unguarded).toEqual([])
   })
+
+  // #238 probe ⑤ (R7-ext): the directory stamp is WRITE-ONCE and every
+  // revalidation site that acts on a possibly-stale in-memory entry carries
+  // the ownership authority.
+  it("R7-ext: the stamp is write-once and every revalidation site carries the authority", () => {
+    const sources = [...readDagSources(opencodeDagSrc), ...readDagSources(coreDagSrc)]
+    expect(sources.length).toBeGreaterThan(20)
+    const codeLines = (source: string) =>
+      source.split("\n").filter((line) => !line.trim().startsWith("//"))
+
+    // (a) Write-once: no UPDATE writes the directory column anywhere in the
+    // dag trees. The stamp lands via the projector's INSERT (workflow create
+    // → onConflictDoNothing); a `.set({ directory })` would re-stamp a live
+    // row and violate the create-time-pins-ownership invariant.
+    const writesDirectory = sources
+      .filter(({ source }) => /\.set\(\{[\s\S]{0,300}?\bdirectory\s*:/.test(source))
+      .map(({ file }) => file)
+    expect(writesDirectory).toEqual([])
+
+    // (b) Revalidation sites. Each region must carry an executable ownership
+    // authority call (ownsWorkflow / ownsSession), located by semantic anchors
+    // so the probe survives refactors that keep the site boundaries.
+    const loopFile = sources.find((s) => s.file.endsWith("opencode/src/dag/runtime/loop.ts"))
+    expect(loopFile).toBeDefined()
+    const loopSource = loopFile!.source
+    const spawnFile = sources.find((s) => s.file.endsWith("opencode/src/dag/runtime/spawn.ts"))
+    expect(spawnFile).toBeDefined()
+
+    const regions: Array<{ name: string; source: string; from: string; to: string; authority: RegExp }> = [
+      {
+        name: "spawnReady (pre-spawn ownership revalidation + inert-entry eviction)",
+        source: loopSource,
+        from: "const spawnReady = Effect.fn(",
+        to: "const checkCompletion = Effect.fn(",
+        authority: /ownsWorkflow\(/,
+      },
+      {
+        name: "checkCompletion (terminal-transition ownership revalidation)",
+        source: loopSource,
+        from: "const checkCompletion = Effect.fn(",
+        to: "const checkSessionStatus = makeSessionStatusChecker",
+        authority: /ownsWorkflow\(/,
+      },
+      {
+        name: "makeDeadlineWatcher (deadline-supervision ownership revalidation)",
+        source: spawnFile!.source,
+        from: "export function makeDeadlineWatcher(",
+        to: "export function spawnNode(",
+        authority: /ownsWorkflow\(/,
+      },
+    ]
+    const unguarded: string[] = []
+    for (const region of regions) {
+      const start = region.source.indexOf(region.from)
+      const end = region.source.indexOf(region.to, start)
+      if (start === -1 || end === -1) {
+        unguarded.push(`${region.name}: anchor not found (from="${region.from}" to="${region.to}")`)
+        continue
+      }
+      if (!codeLines(region.source.slice(start, end)).some((line) => region.authority.test(line))) {
+        unguarded.push(`${region.name}: no ownership-authority call in handler body`)
+      }
+    }
+
+    // The goal-side idle guard lives in src/goal/loop.ts (outside the dag
+    // trees) and keys on the session row via Goal.ownsSession.
+    const goalLoopSource = readFileSync(path.resolve(import.meta.dir, "../../src/goal/loop.ts"), "utf8")
+    if (!codeLines(goalLoopSource).some((line) => /ownsSession\(/.test(line))) {
+      unguarded.push("GoalLoop idle-Status guard: no Goal.ownsSession call")
+    }
+    expect(unguarded).toEqual([])
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -1121,6 +1194,171 @@ describe("DAG-LOC-01 P2 follow-ups", () => {
           project: { id: PROJECT_ID },
         } as never),
         Effect.scoped,
+      ),
+    )
+  })
+})
+
+// ---------------------------------------------------------------------------
+// #238 evidence probes C1–C6 (TOCTOU / teardown-idempotency / negative barriers)
+// ---------------------------------------------------------------------------
+
+describe("DAG-LOC-01 issue #238 evidence probes", () => {
+  it("C1: concurrent live adoption — only the stamped directory adopts", async () => {
+    await Effect.runPromise(
+      runTwoInstanceGuardTest(
+        {},
+        ({ dag, store, initA, initB, childPromptsA, childPromptsB }) =>
+          Effect.gen(function* () {
+            // Boot BOTH instances before the workflow exists so each live
+            // WorkflowStarted subscription is already armed when adoption
+            // fires — no timing dependence on which boot wins.
+            yield* initA
+            yield* initB
+            // Session-sourced stamp: SES_A lives in DIR_A, so the row is
+            // stamped DIR_A regardless of which instance creates it.
+            const dagID = yield* dag.create({
+              projectID: PROJECT_ID,
+              sessionID: SES_A,
+              title: "concurrent live adoption",
+              config: { name: "c1", nodes: [node()] },
+            })
+            expect((yield* store.getWorkflow(dagID))?.directory).toBe(DIR_A)
+            // The owner adopts and spawns its first wave...
+            const owner = yield* takeWithin(childPromptsA, "owner instance did not adopt and spawn")
+            expect(owner.input.sessionID).toBeDefined()
+            // ...and the sibling instance must NOT adopt within the window.
+            yield* Effect.sleep("300 millis")
+            expect(Option.getOrElse(yield* Queue.poll(childPromptsB), () => null)).toBe(null)
+          }),
+      ),
+    )
+  })
+
+  it("C3: an entry orphaned by cascade-in-window deletion acts on no later stimulus", async () => {
+    await Effect.runPromise(
+      runTwoInstanceGuardTest(
+        {},
+        ({ dag, store, database, bridge, initA, childPromptsA }) =>
+          Effect.gen(function* () {
+            yield* initA
+            const dagID = yield* dag.create({
+              projectID: PROJECT_ID,
+              sessionID: SES_A,
+              title: "cascade-window orphan",
+              config: { name: "c3", nodes: [node({ id: "n1" }), node({ id: "n2", depends_on: ["n1"] })] },
+            })
+            yield* takeWithin(childPromptsA, "n1 did not start")
+            // Simulate the P2-E cascade-in-window: delete the workflow row
+            // directly (FK cascade wipes the node rows) WITHOUT publishing a
+            // SessionV1.Event.Deleted, so the Deleted sweep can never reach
+            // the live in-memory entry.
+            yield* database.db.delete(WorkflowTable)
+              .where(eq(WorkflowTable.id, dagID as never))
+              .run().pipe(Effect.orDie)
+            expect(yield* store.getWorkflow(dagID)).toBeUndefined()
+            // Stimulus 1: settle n1 via a direct bus publish (dag.nodeCompleted's
+            // guard rejects a missing node). The orphaned entry must not spawn n2.
+            yield* bridge.publish(DagEvent.NodeCompleted, {
+              dagID: dagID as never,
+              nodeID: "n1" as never,
+              output: { ok: true },
+              durationMs: 0 as never,
+              timestamp: yield* DateTime.now,
+            }).pipe(Effect.orDie)
+            expect(Option.isNone(yield* Queue.take(childPromptsA).pipe(Effect.timeoutOption("1 second")))).toBe(true)
+            // Stimulus 2: a follow-up completion also no-ops — the entry is
+            // inert (every action path revalidates ownership against the
+            // missing row), so nothing is ever spawned for a deleted workflow.
+            yield* bridge.publish(DagEvent.NodeCompleted, {
+              dagID: dagID as never,
+              nodeID: "n2" as never,
+              output: { ok: true },
+              durationMs: 0 as never,
+              timestamp: yield* DateTime.now,
+            }).pipe(Effect.orDie)
+            expect(Option.isNone(yield* Queue.take(childPromptsA).pipe(Effect.timeoutOption("1 second")))).toBe(true)
+          }),
+      ),
+    )
+  })
+
+  it("C4: a moved session's mixed stamps leave NO directory owner (pre-clustering wedge pin)", async () => {
+    await Effect.runPromise(
+      runTwoInstanceGuardTest(
+        {},
+        ({ dag, store, database }) =>
+          Effect.gen(function* () {
+            // wf1 created while SES_A lives in DIR_A → stamped DIR_A.
+            const wf1 = yield* dag.create({
+              projectID: PROJECT_ID,
+              sessionID: SES_A,
+              title: "before move",
+              config: { name: "c4a", nodes: [node()] },
+            })
+            expect((yield* store.getWorkflow(wf1))?.directory).toBe(DIR_A)
+            // Move the session to DIR_B via the durable session row.
+            yield* database.db.update(SessionTable)
+              .set({ directory: DIR_B as never })
+              .where(eq(SessionTable.id, SES_A as never))
+              .run().pipe(Effect.orDie)
+            // wf2 created after the move → session-sourced stamp = DIR_B.
+            const wf2 = yield* dag.create({
+              projectID: PROJECT_ID,
+              sessionID: SES_A,
+              title: "after move",
+              config: { name: "c4b", nodes: [node()] },
+            })
+            expect((yield* store.getWorkflow(wf2))?.directory).toBe(DIR_B)
+            // Mixed stamps: the session's workflow rows no longer agree on a
+            // single directory, so NO instance owns the session's wakes. This
+            // pins the pre-clustering create-time-stamp semantics (the wedge
+            // is pinned, not fixed — re-stamping on SessionEvent.Moved is out
+            // of scope for the single-authority design).
+            expect(yield* DagLocation.ownsSession(SES_A, DIR_A)).toBe(false)
+            expect(yield* DagLocation.ownsSession(SES_A, DIR_B)).toBe(false)
+          }),
+      ),
+    )
+  })
+
+  it("C5: replaying a deleted workflow's journal does not resurrect the read-model", async () => {
+    await Effect.runPromise(
+      runTwoInstanceGuardTest(
+        {},
+        ({ dag, store, database, bridge, session }) =>
+          Effect.gen(function* () {
+            const dagID = yield* dag.create({
+              projectID: PROJECT_ID,
+              sessionID: SES_A,
+              title: "serialize me",
+              config: { name: "c5", nodes: [node()] },
+            })
+            expect((yield* store.getWorkflow(dagID))?.status).toBe("running")
+            // Serialize the dag aggregate journal BEFORE deletion.
+            const rows = yield* database.db.select().from(EventTable)
+              .where(eq(EventTable.aggregate_id, dagID))
+              .orderBy(EventTable.seq)
+              .all().pipe(Effect.orDie)
+            const serialized = rows.map((r) => ({
+              id: r.id,
+              type: r.type,
+              seq: r.seq,
+              aggregateID: r.aggregate_id,
+              data: r.data,
+            }))
+            expect(serialized.length).toBeGreaterThan(0)
+            // Remove the session: FK cascade wipes the workflow/node read-model
+            // rows, but the dag aggregate's durable events + sequence survive.
+            yield* session.remove(SES_A as never)
+            expect(yield* store.getWorkflow(dagID)).toBeUndefined()
+            // Replay the journal through EventV2 replay: the durable-seq dedup
+            // (input.seq <= latest) skips projection, so the read-model stays
+            // deleted — a crash-recovery replay cannot resurrect a torn-down
+            // workflow.
+            yield* bridge.replayAll(serialized)
+            expect(yield* store.getWorkflow(dagID)).toBeUndefined()
+          }),
       ),
     )
   })
