@@ -1,5 +1,16 @@
 # opencode database guide
 
+## Tool parameter schema contract
+
+Tool `parameters` must serialize to a JSON Schema **plain object root** (`type:
+"object"` with `properties`). Root-level combinators (`anyOf`/`oneOf`/`allOf`)
+violate the OpenAI tools contract: OpenAI tolerates them, DeepSeek rejects them
+with a schema error, and GLM silently emits empty tool arguments. A tool that
+needs a discriminated union must nest it under a property, e.g.
+`Schema.Struct({ params: <union> })`. `Tool.define` enforces this at
+construction time (`assertObjectRootedParameters`) — a violating tool fails
+registration instead of degrading at provider runtime.
+
 ## Database
 
 - **Schema**: Drizzle schema lives in `packages/core/src/**/*.sql.ts`.

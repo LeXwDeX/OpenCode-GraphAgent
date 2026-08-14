@@ -6,7 +6,10 @@ import { ProviderTransform } from "../../src/provider/transform"
 
 // Wire-shape regression for the file-backed workflow entry: every action keeps
 // its discriminator and owned fields, while graph content stays out of the
-// provider call and is supplied through spec_path.
+// provider call and is supplied through spec_path. The schema root is a plain
+// object whose single `params` property carries the discriminated union —
+// root-level combinators are outside the OpenAI tools contract (DeepSeek
+// rejects them explicitly, GLM answers with empty tool arguments).
 
 const openaiModel = { providerID: "openai", api: { id: "gpt-4.1", npm: "@ai-sdk/openai" } } as never
 const azureModel = { providerID: "azure", api: { id: "gpt-4.1", npm: "@ai-sdk/azure" } } as never
@@ -29,9 +32,16 @@ type JsonSchemaNode = {
   [key: string]: unknown
 }
 
+function root(schema: JsonSchemaNode): JsonSchemaNode {
+  expect(schema.type).toBe("object")
+  expect(schema.anyOf).toBeUndefined()
+  return schema
+}
+
 function branches(transformed: JsonSchemaNode): JsonSchemaNode[] {
-  expect(Array.isArray(transformed.anyOf)).toBe(true)
-  return transformed.anyOf ?? []
+  const params = root(transformed).properties?.params
+  expect(Array.isArray(params?.anyOf)).toBe(true)
+  return params?.anyOf ?? []
 }
 
 function branchByAction(transformed: JsonSchemaNode, action: string, withField?: string): JsonSchemaNode[] {
@@ -49,17 +59,16 @@ function record(node: JsonSchemaNode | undefined): Record<string, JsonSchemaNode
 }
 
 describe("workflow provider-facing schema", () => {
-  test("base wire shape is the 10-branch file-backed discriminated union", async () => {
+  test("base wire shape is a plain-object root carrying the 10-branch union in params", async () => {
     const schema = ToolJsonSchema.fromSchema(Parameters as never) as JsonSchemaNode
-    const evidence = (await Bun.file(
-      new URL("./fixtures/workflow-parameters-post-change.json", import.meta.url),
-    ).json()) as JsonSchemaNode
-    expect(schema.anyOf?.length).toBe(10)
+    expect(schema.type).toBe("object")
+    expect(schema.anyOf).toBeUndefined()
+    expect(schema.required).toEqual(["params"])
+    expect(branches(schema).length).toBe(10)
     const flat = JSON.stringify(schema)
     expect(flat).not.toContain('"session_id"')
     expect(flat).not.toContain('"project_id"')
     expect(flat).not.toContain('"skills"')
-    expect(Buffer.byteLength(flat, "utf8")).toBe(evidence.schema_bytes as number)
   })
 
   test("every action stays representable after OpenAI transformation", () => {
@@ -102,12 +111,13 @@ describe("workflow provider-facing schema", () => {
     expect(schema).not.toContain('"skills"')
   })
 
-  test("Azure transformation keeps the same discriminated union", () => {
+  test("Azure transformation keeps the same params-carried union", () => {
     const transformed = ProviderTransform.schema(
       azureModel,
       ToolJsonSchema.fromSchema(Parameters as never),
     ) as JsonSchemaNode
-    expect(transformed.anyOf?.length).toBe(10)
+    expect(root(transformed).type).toBe("object")
+    expect(branches(transformed).length).toBe(10)
     expect(branchByAction(transformed, "start", "spec_path").length).toBe(1)
     expect(branchByAction(transformed, "validate", "spec_path").length).toBeGreaterThan(0)
   })
@@ -117,7 +127,7 @@ describe("workflow provider-facing schema", () => {
       geminiModel,
       ToolJsonSchema.fromSchema(Parameters as never),
     ) as JsonSchemaNode
-    expect(transformed.anyOf?.length).toBe(10)
+    expect(branches(transformed).length).toBe(10)
     expect(branchByAction(transformed, "start", "spec_path").length).toBe(1)
     expect(branchByAction(transformed, "start", "spec")).toEqual([])
     const resultBranch = branchByAction(transformed, "result")[0]
@@ -125,43 +135,15 @@ describe("workflow provider-facing schema", () => {
     expect(Object.keys(record(resultBranch))).toEqual(expect.arrayContaining(["cursor", "limit"]))
   })
 
-  test("DeepSeek transformation presents the workflow union as an object-root function schema", () => {
-    const transformed = ProviderTransform.schema(
-      deepseekModel,
-      ToolJsonSchema.fromSchema(Parameters as never),
-    ) as JsonSchemaNode
-    expect(transformed.type).toBe("object")
-    expect(branches(transformed)).toHaveLength(10)
-    expect(branchByAction(transformed, "start", "spec_path")).toHaveLength(1)
-  })
-
-  test("OpenAI-compatible transports (GLM relay) also get the object-root union", () => {
-    const transformed = ProviderTransform.schema(
-      glmModel,
-      ToolJsonSchema.fromSchema(Parameters as never),
-    ) as JsonSchemaNode
-    expect(transformed.type).toBe("object")
-    expect(branches(transformed)).toHaveLength(10)
-    expect(branchByAction(transformed, "start", "spec_path")).toHaveLength(1)
-  })
-
-  test("post-change byte sizes stay at the recorded evidence", async () => {
-    const evidence = (await Bun.file(
-      new URL("./fixtures/workflow-parameters-post-change.json", import.meta.url),
-    ).json()) as {
-      schema_bytes: number
-      transformed: { openai: { bytes: number }; azure: { bytes: number }; gemini: { bytes: number } }
+  test("OpenAI-compatible transports (DeepSeek, GLM relay) see the same plain-object root", () => {
+    for (const model of [deepseekModel, glmModel]) {
+      const transformed = ProviderTransform.schema(
+        model,
+        ToolJsonSchema.fromSchema(Parameters as never),
+      ) as JsonSchemaNode
+      expect(root(transformed).type).toBe("object")
+      expect(branches(transformed)).toHaveLength(10)
+      expect(branchByAction(transformed, "start", "spec_path")).toHaveLength(1)
     }
-    const base = JSON.stringify(ToolJsonSchema.fromSchema(Parameters as never))
-    expect(Buffer.byteLength(base, "utf8")).toBe(evidence.schema_bytes)
-    expect(Buffer.byteLength(JSON.stringify(ProviderTransform.schema(openaiModel, JSON.parse(base))), "utf8")).toBe(
-      evidence.transformed.openai.bytes,
-    )
-    expect(Buffer.byteLength(JSON.stringify(ProviderTransform.schema(azureModel, JSON.parse(base))), "utf8")).toBe(
-      evidence.transformed.azure.bytes,
-    )
-    expect(Buffer.byteLength(JSON.stringify(ProviderTransform.schema(geminiModel, JSON.parse(base))), "utf8")).toBe(
-      evidence.transformed.gemini.bytes,
-    )
   })
 })

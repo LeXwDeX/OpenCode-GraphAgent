@@ -33,7 +33,7 @@ Keep new integration code on one of these seams. Avoid importing session service
 
 ## Runtime selection
 
-Both runtimes converge on the same `LLMEvent` stream consumed by the session processor. The gate is per-request: a single session can route some calls through native and fall back for others.
+Both runtimes converge on the same `LLMEvent` stream consumed by the session processor. The gate is per-request: a single session can route some calls through native and fall back for others. The native gate keys off the model's SDK transport package (`api.npm`), not the providerID — any OpenAI-compatible relay (local proxies, DeepSeek, GLM gateways) speaks the wire protocol the native client implements.
 
 ```txt
                              ╭───────────────────╮

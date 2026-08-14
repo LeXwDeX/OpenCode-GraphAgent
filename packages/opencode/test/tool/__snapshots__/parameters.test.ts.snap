@@ -447,266 +447,275 @@ exports[`tool parameters JSON Schema (wire shape) websearch 1`] = `
 exports[`tool parameters JSON Schema (wire shape) workflow 1`] = `
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "anyOf": [
-    {
-      "properties": {
-        "action": {
-          "description": "Create a workflow",
-          "enum": [
-            "start",
+  "properties": {
+    "params": {
+      "anyOf": [
+        {
+          "properties": {
+            "action": {
+              "description": "Create a workflow",
+              "enum": [
+                "start",
+              ],
+              "type": "string",
+            },
+            "spec_path": {
+              "description": "(start/extend/control replan/read/validate) An exact saved workflow name returned by workflow(action="list"), or a path to a YAML workflow spec. Graph content belongs in that file; relative paths resolve from the session directory",
+              "type": "string",
+            },
+          },
+          "required": [
+            "action",
+            "spec_path",
           ],
-          "type": "string",
+          "type": "object",
         },
-        "spec_path": {
-          "description": "(start/extend/control replan/read/validate) An exact saved workflow name returned by workflow(action="list"), or a path to a YAML workflow spec. Graph content belongs in that file; relative paths resolve from the session directory",
-          "type": "string",
+        {
+          "properties": {
+            "action": {
+              "description": "Add nodes or blocks to a live workflow",
+              "enum": [
+                "extend",
+              ],
+              "type": "string",
+            },
+            "spec_path": {
+              "description": "(start/extend/control replan/read/validate) An exact saved workflow name returned by workflow(action="list"), or a path to a YAML workflow spec. Graph content belongs in that file; relative paths resolve from the session directory",
+              "type": "string",
+            },
+            "workflow_id": {
+              "description": "Target workflow ID",
+              "pattern": "^dag",
+              "type": "string",
+            },
+          },
+          "required": [
+            "action",
+            "workflow_id",
+            "spec_path",
+          ],
+          "type": "object",
         },
-      },
-      "required": [
-        "action",
-        "spec_path",
+        {
+          "properties": {
+            "action": {
+              "description": "Control a live workflow",
+              "enum": [
+                "control",
+              ],
+              "type": "string",
+            },
+            "operation": {
+              "description": "Apply a node fragment (add/cancel/restart/replace)",
+              "enum": [
+                "replan",
+              ],
+              "type": "string",
+            },
+            "spec_path": {
+              "description": "(start/extend/control replan/read/validate) An exact saved workflow name returned by workflow(action="list"), or a path to a YAML workflow spec. Graph content belongs in that file; relative paths resolve from the session directory",
+              "type": "string",
+            },
+            "workflow_id": {
+              "description": "Target workflow ID",
+              "pattern": "^dag",
+              "type": "string",
+            },
+          },
+          "required": [
+            "action",
+            "operation",
+            "workflow_id",
+            "spec_path",
+          ],
+          "type": "object",
+        },
+        {
+          "properties": {
+            "action": {
+              "description": "Control a live workflow",
+              "enum": [
+                "control",
+              ],
+              "type": "string",
+            },
+            "operation": {
+              "description": "pause/resume/cancel/step/complete",
+              "enum": [
+                "pause",
+                "resume",
+                "cancel",
+                "step",
+                "complete",
+              ],
+              "type": "string",
+            },
+            "workflow_id": {
+              "description": "Target workflow ID",
+              "pattern": "^dag",
+              "type": "string",
+            },
+          },
+          "required": [
+            "action",
+            "operation",
+            "workflow_id",
+          ],
+          "type": "object",
+        },
+        {
+          "properties": {
+            "action": {
+              "description": "Inspect durable workflow and node state",
+              "enum": [
+                "status",
+              ],
+              "type": "string",
+            },
+            "workflow_id": {
+              "description": "Target workflow ID",
+              "pattern": "^dag",
+              "type": "string",
+            },
+          },
+          "required": [
+            "action",
+            "workflow_id",
+          ],
+          "type": "object",
+        },
+        {
+          "properties": {
+            "action": {
+              "description": "Read one durable node output in bounded pages",
+              "enum": [
+                "result",
+              ],
+              "type": "string",
+            },
+            "cursor": {
+              "description": "Opaque continuation cursor returned by the previous page",
+              "type": "string",
+            },
+            "limit": {
+              "description": "Maximum page characters; defaults to 8000, max 12000",
+              "maximum": 12000,
+              "minimum": 1,
+              "type": "integer",
+            },
+            "node_id": {
+              "description": "Target durable node ID",
+              "type": "string",
+            },
+            "workflow_id": {
+              "description": "Target workflow ID",
+              "pattern": "^dag",
+              "type": "string",
+            },
+          },
+          "required": [
+            "action",
+            "workflow_id",
+            "node_id",
+          ],
+          "type": "object",
+        },
+        {
+          "properties": {
+            "action": {
+              "description": "Show saved workflow names, objectives, sizes, scopes, and validation status",
+              "enum": [
+                "list",
+              ],
+              "type": "string",
+            },
+          },
+          "required": [
+            "action",
+          ],
+          "type": "object",
+        },
+        {
+          "properties": {
+            "action": {
+              "description": "Inspect one saved spec before retargeting it",
+              "enum": [
+                "read",
+              ],
+              "type": "string",
+            },
+            "spec_path": {
+              "description": "(start/extend/control replan/read/validate) An exact saved workflow name returned by workflow(action="list"), or a path to a YAML workflow spec. Graph content belongs in that file; relative paths resolve from the session directory",
+              "type": "string",
+            },
+          },
+          "required": [
+            "action",
+            "spec_path",
+          ],
+          "type": "object",
+        },
+        {
+          "properties": {
+            "action": {
+              "description": "Load detailed guidance only when needed",
+              "enum": [
+                "guide",
+              ],
+              "type": "string",
+            },
+            "topic": {
+              "description": "blocks: composable block schema; interface: low-level workflow API; policy: gates/admission/recovery; patterns: domain playbooks. Omit for the compact index",
+              "enum": [
+                "blocks",
+                "interface",
+                "policy",
+                "patterns",
+              ],
+              "type": "string",
+            },
+          },
+          "required": [
+            "action",
+          ],
+          "type": "object",
+        },
+        {
+          "properties": {
+            "action": {
+              "description": "Pre-flight a custom spec without creating a workflow; returns diagnostics, never a workflow ID",
+              "enum": [
+                "validate",
+              ],
+              "type": "string",
+            },
+            "profile": {
+              "description": "portable: distributable-template checks; environment: additionally resolves prompts, workers, and models in this project. Defaults: builtin specs portable, project/global/path specs environment",
+              "enum": [
+                "portable",
+                "environment",
+              ],
+              "type": "string",
+            },
+            "spec_path": {
+              "description": "(start/extend/control replan/read/validate) An exact saved workflow name returned by workflow(action="list"), or a path to a YAML workflow spec. Graph content belongs in that file; relative paths resolve from the session directory",
+              "type": "string",
+            },
+          },
+          "required": [
+            "action",
+            "spec_path",
+          ],
+          "type": "object",
+        },
       ],
-      "type": "object",
+      "description": "The workflow action and its action-owned fields",
     },
-    {
-      "properties": {
-        "action": {
-          "description": "Add nodes or blocks to a live workflow",
-          "enum": [
-            "extend",
-          ],
-          "type": "string",
-        },
-        "spec_path": {
-          "description": "(start/extend/control replan/read/validate) An exact saved workflow name returned by workflow(action="list"), or a path to a YAML workflow spec. Graph content belongs in that file; relative paths resolve from the session directory",
-          "type": "string",
-        },
-        "workflow_id": {
-          "description": "Target workflow ID",
-          "pattern": "^dag",
-          "type": "string",
-        },
-      },
-      "required": [
-        "action",
-        "workflow_id",
-        "spec_path",
-      ],
-      "type": "object",
-    },
-    {
-      "properties": {
-        "action": {
-          "description": "Control a live workflow",
-          "enum": [
-            "control",
-          ],
-          "type": "string",
-        },
-        "operation": {
-          "description": "Apply a node fragment (add/cancel/restart/replace)",
-          "enum": [
-            "replan",
-          ],
-          "type": "string",
-        },
-        "spec_path": {
-          "description": "(start/extend/control replan/read/validate) An exact saved workflow name returned by workflow(action="list"), or a path to a YAML workflow spec. Graph content belongs in that file; relative paths resolve from the session directory",
-          "type": "string",
-        },
-        "workflow_id": {
-          "description": "Target workflow ID",
-          "pattern": "^dag",
-          "type": "string",
-        },
-      },
-      "required": [
-        "action",
-        "operation",
-        "workflow_id",
-        "spec_path",
-      ],
-      "type": "object",
-    },
-    {
-      "properties": {
-        "action": {
-          "description": "Control a live workflow",
-          "enum": [
-            "control",
-          ],
-          "type": "string",
-        },
-        "operation": {
-          "description": "pause/resume/cancel/step/complete",
-          "enum": [
-            "pause",
-            "resume",
-            "cancel",
-            "step",
-            "complete",
-          ],
-          "type": "string",
-        },
-        "workflow_id": {
-          "description": "Target workflow ID",
-          "pattern": "^dag",
-          "type": "string",
-        },
-      },
-      "required": [
-        "action",
-        "operation",
-        "workflow_id",
-      ],
-      "type": "object",
-    },
-    {
-      "properties": {
-        "action": {
-          "description": "Inspect durable workflow and node state",
-          "enum": [
-            "status",
-          ],
-          "type": "string",
-        },
-        "workflow_id": {
-          "description": "Target workflow ID",
-          "pattern": "^dag",
-          "type": "string",
-        },
-      },
-      "required": [
-        "action",
-        "workflow_id",
-      ],
-      "type": "object",
-    },
-    {
-      "properties": {
-        "action": {
-          "description": "Read one durable node output in bounded pages",
-          "enum": [
-            "result",
-          ],
-          "type": "string",
-        },
-        "cursor": {
-          "description": "Opaque continuation cursor returned by the previous page",
-          "type": "string",
-        },
-        "limit": {
-          "description": "Maximum page characters; defaults to 8000, max 12000",
-          "maximum": 12000,
-          "minimum": 1,
-          "type": "integer",
-        },
-        "node_id": {
-          "description": "Target durable node ID",
-          "type": "string",
-        },
-        "workflow_id": {
-          "description": "Target workflow ID",
-          "pattern": "^dag",
-          "type": "string",
-        },
-      },
-      "required": [
-        "action",
-        "workflow_id",
-        "node_id",
-      ],
-      "type": "object",
-    },
-    {
-      "properties": {
-        "action": {
-          "description": "Show saved workflow names, objectives, sizes, scopes, and validation status",
-          "enum": [
-            "list",
-          ],
-          "type": "string",
-        },
-      },
-      "required": [
-        "action",
-      ],
-      "type": "object",
-    },
-    {
-      "properties": {
-        "action": {
-          "description": "Inspect one saved spec before retargeting it",
-          "enum": [
-            "read",
-          ],
-          "type": "string",
-        },
-        "spec_path": {
-          "description": "(start/extend/control replan/read/validate) An exact saved workflow name returned by workflow(action="list"), or a path to a YAML workflow spec. Graph content belongs in that file; relative paths resolve from the session directory",
-          "type": "string",
-        },
-      },
-      "required": [
-        "action",
-        "spec_path",
-      ],
-      "type": "object",
-    },
-    {
-      "properties": {
-        "action": {
-          "description": "Load detailed guidance only when needed",
-          "enum": [
-            "guide",
-          ],
-          "type": "string",
-        },
-        "topic": {
-          "description": "blocks: composable block schema; interface: low-level workflow API; policy: gates/admission/recovery; patterns: domain playbooks. Omit for the compact index",
-          "enum": [
-            "blocks",
-            "interface",
-            "policy",
-            "patterns",
-          ],
-          "type": "string",
-        },
-      },
-      "required": [
-        "action",
-      ],
-      "type": "object",
-    },
-    {
-      "properties": {
-        "action": {
-          "description": "Pre-flight a custom spec without creating a workflow; returns diagnostics, never a workflow ID",
-          "enum": [
-            "validate",
-          ],
-          "type": "string",
-        },
-        "profile": {
-          "description": "portable: distributable-template checks; environment: additionally resolves prompts, workers, and models in this project. Defaults: builtin specs portable, project/global/path specs environment",
-          "enum": [
-            "portable",
-            "environment",
-          ],
-          "type": "string",
-        },
-        "spec_path": {
-          "description": "(start/extend/control replan/read/validate) An exact saved workflow name returned by workflow(action="list"), or a path to a YAML workflow spec. Graph content belongs in that file; relative paths resolve from the session directory",
-          "type": "string",
-        },
-      },
-      "required": [
-        "action",
-        "spec_path",
-      ],
-      "type": "object",
-    },
+  },
+  "required": [
+    "params",
   ],
+  "type": "object",
 }
 `;
 

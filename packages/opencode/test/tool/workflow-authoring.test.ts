@@ -82,8 +82,10 @@ const worktreeLifecycleStartInput = {
 } as const
 
 const worktreeLifecyclePathInput = {
-  action: "start",
-  spec_path: ".opencode/workflows/worktree-lifecycle-repair.yaml",
+  params: {
+    action: "start",
+    spec_path: ".opencode/workflows/worktree-lifecycle-repair.yaml",
+  },
 } as const
 
 // The previously observed polluted calls: a start that carries another
@@ -114,16 +116,16 @@ describe("worktree-lifecycle regression fixtures", () => {
   test("model-facing graph actions require a YAML source path", () => {
     const spec = worktreeLifecycleStartInput.spec
 
-    expect(decode({ action: "start", spec_path: "workflow.yaml" })).toBe(true)
-    expect(decode({ action: "start", spec })).toBe(false)
-    expect(decode({ action: "extend", workflow_id: "dag_2x9k4m", spec_path: "extend.yaml" })).toBe(true)
-    expect(decode({ action: "extend", workflow_id: "dag_2x9k4m", spec })).toBe(false)
+    expect(decode({ params: { action: "start", spec_path: "workflow.yaml" }})).toBe(true)
+    expect(decode({ params: { action: "start", spec }})).toBe(false)
+    expect(decode({ params: { action: "extend", workflow_id: "dag_2x9k4m", spec_path: "extend.yaml" }})).toBe(true)
+    expect(decode({ params: { action: "extend", workflow_id: "dag_2x9k4m", spec }})).toBe(false)
     expect(
-      decode({ action: "control", operation: "replan", workflow_id: "dag_2x9k4m", spec_path: "replan.yaml" }),
+      decode({ params: { action: "control", operation: "replan", workflow_id: "dag_2x9k4m", spec_path: "replan.yaml" }}),
     ).toBe(true)
-    expect(decode({ action: "control", operation: "replan", workflow_id: "dag_2x9k4m", spec })).toBe(false)
-    expect(decode({ action: "validate", spec_path: "workflow.yaml", profile: "environment" })).toBe(true)
-    expect(decode({ action: "validate", spec, profile: "environment" })).toBe(false)
+    expect(decode({ params: { action: "control", operation: "replan", workflow_id: "dag_2x9k4m", spec }})).toBe(false)
+    expect(decode({ params: { action: "validate", spec_path: "workflow.yaml", profile: "environment" }})).toBe(true)
+    expect(decode({ params: { action: "validate", spec, profile: "environment" }})).toBe(false)
   })
 
   test("decision brief route compiles under the block compiler", () => {
@@ -154,7 +156,7 @@ describe("worktree-lifecycle regression fixtures", () => {
   })
 
   test("accepted start carries only its YAML path while the authored fixture keeps complete blocks", () => {
-    expect(Object.keys(worktreeLifecyclePathInput)).toEqual(["action", "spec_path"])
+    expect(Object.keys(worktreeLifecyclePathInput.params)).toEqual(["action", "spec_path"])
     expect(worktreeLifecycleStartInput.spec.config.blocks.length).toBe(5)
     expect(decode(worktreeLifecyclePathInput)).toBe(true)
   })
@@ -167,12 +169,12 @@ describe("worktree-lifecycle regression fixtures", () => {
     expect(blockIDs).toEqual(["plan", "coding-worktree-core", "coding-callers-and-fixture", "verify", "review"])
     // Strict decoding admits exactly the start-owned fields.
     const decoded = Schema.decodeUnknownSync(Parameters, { onExcessProperty: "error" })(worktreeLifecyclePathInput)
-    expect(decoded.action).toBe("start")
-    expect("spec_path" in decoded).toBe(true)
-    expect("spec" in decoded).toBe(false)
-    expect("workflow_id" in decoded).toBe(false)
-    expect("operation" in decoded).toBe(false)
-    expect("node_id" in decoded).toBe(false)
+    expect(decoded.params.action).toBe("start")
+    expect("spec_path" in decoded.params).toBe(true)
+    expect("spec" in decoded.params).toBe(false)
+    expect("workflow_id" in decoded.params).toBe(false)
+    expect("operation" in decoded.params).toBe(false)
+    expect("node_id" in decoded.params).toBe(false)
   })
 
   test("start polluted with empty workflow/control/result fields is rejected", () => {
@@ -184,18 +186,18 @@ describe("worktree-lifecycle regression fixtures", () => {
   })
 
   test("start without any graph source is rejected", () => {
-    expect(decode({ action: "start" })).toBe(false)
+    expect(decode({ params: { action: "start" }})).toBe(false)
   })
 
   test("validate rejects control and result fields it does not own", () => {
     const spec_path = "workflow.yaml"
-    expect(decode({ action: "validate", spec_path, workflow_id: "dag_2x9k4m" })).toBe(false)
-    expect(decode({ action: "validate", spec_path, node_id: "verify" })).toBe(false)
-    expect(decode({ action: "validate", spec_path, operation: "cancel" })).toBe(false)
-    expect(decode({ action: "validate", spec_path, cursor: "", limit: 500 })).toBe(false)
+    expect(decode({ params: { action: "validate", spec_path, workflow_id: "dag_2x9k4m" }})).toBe(false)
+    expect(decode({ params: { action: "validate", spec_path, node_id: "verify" }})).toBe(false)
+    expect(decode({ params: { action: "validate", spec_path, operation: "cancel" }})).toBe(false)
+    expect(decode({ params: { action: "validate", spec_path, cursor: "", limit: 500 }})).toBe(false)
     // The validate action itself stays clean with its file source.
-    expect(decode({ action: "validate", spec_path, profile: "portable" })).toBe(true)
-    expect(decode({ action: "validate", spec_path: "saved-route", profile: "environment" })).toBe(true)
+    expect(decode({ params: { action: "validate", spec_path, profile: "portable" }})).toBe(true)
+    expect(decode({ params: { action: "validate", spec_path: "saved-route", profile: "environment" }})).toBe(true)
   })
 
   test("model-facing start rejects inline admission objects entirely", () => {
@@ -220,9 +222,9 @@ describe("worktree-lifecycle regression fixtures", () => {
       acknowledged_risks: ["unresolved rollout"],
     }
     const spec = { ...worktreeLifecycleStartInput.spec, mode: "deep", admission: cleanAdmission }
-    expect(decode({ action: "start", spec })).toBe(false)
+    expect(decode({ params: { action: "start", spec }})).toBe(false)
     for (const field of ["protocol_version", "state", "fingerprint"]) {
-      expect(decode({ action: "start", spec: { ...spec, admission: { ...cleanAdmission, [field]: "x" } } })).toBe(false)
+      expect(decode({ params: { action: "start", spec: { ...spec, admission: { ...cleanAdmission, [field]: "x" } } }})).toBe(false)
     }
   })
 })

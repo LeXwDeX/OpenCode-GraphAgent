@@ -4,6 +4,7 @@ import { SessionV1 } from "@opencode-ai/core/v1/session"
 import type { JSONSchema7 } from "@ai-sdk/provider"
 import type { SessionID, MessageID } from "../session/schema"
 import * as Truncate from "./truncate"
+import { ToolJsonSchema } from "./json-schema"
 import { Agent } from "@/agent/agent"
 
 interface Metadata {
@@ -103,6 +104,42 @@ export type InferDef<T> =
       ? Def<P, M>
       : never
 
+/**
+ * The OpenAI tools contract requires `parameters` to be a JSON Schema object.
+ * A root-level combinator (anyOf/oneOf/allOf) is outside that contract:
+ * OpenAI tolerates it, DeepSeek rejects it with a schema error, and GLM
+ * silently emits empty tool arguments. Tools that need a discriminated union
+ * must nest it under a property (e.g. `{ params: <union> }`). Violations fail
+ * at construction time here instead of degrading at provider runtime.
+ */
+function assertObjectRootedParameters(id: string, toolInfo: DefWithoutID<never, never> | { parameters: unknown; jsonSchema?: unknown }) {
+  const root = toolInfo.jsonSchema ?? ToolJsonSchema.fromSchema(toolInfo.parameters as Schema.Top)
+  if (!isPlainObjectRoot(root as JSONSchema7)) {
+    return yieldOrDieRootCombinator(id, root)
+  }
+}
+
+function isPlainObjectRoot(root: JSONSchema7): boolean {
+  return (
+    typeof root === "object" &&
+    root !== null &&
+    !Array.isArray(root) &&
+    (root as { type?: unknown }).type === "object" &&
+    (root as { anyOf?: unknown }).anyOf === undefined &&
+    (root as { oneOf?: unknown }).oneOf === undefined &&
+    (root as { allOf?: unknown }).allOf === undefined
+  )
+}
+
+function yieldOrDieRootCombinator(id: string, root: unknown): never {
+  const combinator = ["anyOf", "oneOf", "allOf"].find(
+    (key) => Array.isArray((root as Record<string, unknown>)?.[key]),
+  )
+  throw new Error(
+    `Tool "${id}" parameters must serialize to a plain object root (type: "object" with properties); found a root-level ${combinator ?? "non-object"} combinator. Nest the union under a property, e.g. Schema.Struct({ params: <union> }). Root-level combinators violate the OpenAI tools contract: DeepSeek rejects them and GLM answers with empty tool arguments.`,
+  )
+}
+
 function wrap<Parameters extends Schema.Decoder<unknown>, Result extends Metadata>(
   id: string,
   init: Init<Parameters, Result>,
@@ -112,6 +149,7 @@ function wrap<Parameters extends Schema.Decoder<unknown>, Result extends Metadat
   return () =>
     Effect.gen(function* () {
       const toolInfo = typeof init === "function" ? { ...(yield* init()) } : { ...init }
+      assertObjectRootedParameters(id, toolInfo as { parameters: unknown; jsonSchema?: unknown })
       // Compile the parser closure once per tool init; `decodeUnknownEffect`
       // allocates a new closure per call, so hoisting avoids re-closing it for
       // every LLM tool invocation.
