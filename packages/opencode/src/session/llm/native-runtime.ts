@@ -51,9 +51,9 @@ function statusWithFetch(
   input: Pick<StreamInput, "model" | "provider" | "auth">,
   fetch: typeof globalThis.fetch | undefined,
 ): RuntimeStatus {
-  const providerID = input.model.providerID
-  if (providerID !== "openai" && providerID !== "anthropic" && !providerID.startsWith("opencode"))
-    return { type: "unsupported", reason: "provider is not openai, opencode, or anthropic" }
+  // The gate keys off the SDK transport package, not the providerID: any
+  // OpenAI-compatible relay (local proxies, DeepSeek, GLM gateways) speaks the
+  // same wire protocol the native client implements.
   const npm = input.model.api.npm
   if (npm !== "@ai-sdk/openai" && npm !== "@ai-sdk/openai-compatible" && npm !== "@ai-sdk/anthropic")
     return { type: "unsupported", reason: "provider package is not OpenAI, OpenAI-compatible, or Anthropic" }

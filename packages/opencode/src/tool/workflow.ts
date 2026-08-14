@@ -45,9 +45,13 @@ export const StartSpec = DagValidation.StartSpec
 export { Parameters as WorkflowParameters }
 
 // ============================================================================
-// Parameters: one discriminated union, action-owned fields only.
-// Runtime-derived identity (session/project) is never model-authored — start
-// derives ownership from the calling session.
+// Parameters: a single `params` root property carrying the action union.
+// OpenAI's tools contract expects `parameters` to be a JSON Schema object; a
+// root-level combinator (anyOf/oneOf/allOf) is outside that contract and
+// OpenAI-compatible backends reject it — DeepSeek with an explicit schema
+// error, GLM by silently emitting empty tool arguments. Nesting the union one
+// level down keeps every discriminated branch intact while the schema root
+// stays a plain object on every transport.
 // ============================================================================
 
 const specPathDescription =
@@ -118,7 +122,7 @@ const ValidatePath = Schema.Struct({
   profile: ValidationProfile,
 })
 
-export const Parameters = Schema.Union([
+const ActionParams = Schema.Union([
   StartPath,
   ExtendPath,
   ControlReplanPath,
@@ -130,6 +134,10 @@ export const Parameters = Schema.Union([
   Guide,
   ValidatePath,
 ])
+
+export const Parameters = Schema.Struct({
+  params: ActionParams.annotate({ description: "The workflow action and its action-owned fields" }),
+})
 
 // ============================================================================
 // Tool definition
@@ -243,10 +251,11 @@ export const WorkflowTool = Tool.define<
       formatValidationError: (error) =>
         [
           `Workflow call rejected by the action schema: ${error instanceof Error ? error.message : String(error)}`,
-          "Each action owns only its own fields: start {spec_path}; extend {workflow_id, spec_path}; control(replan) {workflow_id, operation, spec_path}; other control operations {workflow_id, operation}; status {workflow_id}; result {workflow_id, node_id, cursor?, limit?}; list {}; read {spec_path}; guide {topic?}; validate {spec_path, profile?}. Put graph content in a .yaml/.yml file; session/project identity is never a parameter.",
+          'The call takes a single { params } object: params { action, ...action-owned fields } where each action owns only its own fields: start {spec_path}; extend {workflow_id, spec_path}; control(replan) {workflow_id, operation, spec_path}; other control operations {workflow_id, operation}; status {workflow_id}; result {workflow_id, node_id, cursor?, limit?}; list {}; read {spec_path}; guide {topic?}; validate {spec_path, profile?}. Put graph content in a .yaml/.yml file; session/project identity is never a parameter.',
         ].join("\n"),
-      execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context<Metadata>) =>
+      execute: (call: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context<Metadata>) =>
         Effect.gen(function* () {
+          const params = call.params
           const callingSession = yield* sessions.get(SessionID.make(ctx.sessionID)).pipe(Effect.orDie)
           if (callingSession.parentID) {
             return yield* Effect.die(
