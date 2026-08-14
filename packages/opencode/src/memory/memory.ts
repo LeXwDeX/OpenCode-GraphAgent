@@ -158,7 +158,16 @@ export const layer: Layer.Layer<
         : yield* selectConfiguration(yield* availableModels(), undefined, conversationModel)
       if (existing?.config.model === config.model) return
       const created = yield* configStore.writeGlobal(config, existing?.path)
-      if (created) yield* Effect.logInfo("global MEMORY config initialized", { model: config.model })
+      if (!created) return
+      if (!existing) {
+        yield* Effect.logInfo("global MEMORY config initialized", { model: config.model })
+        return
+      }
+      yield* Effect.logInfo("global MEMORY model replaced", {
+        path: existing.path,
+        previousModel: existing.config.model,
+        model: config.model,
+      })
     })
 
     const initUnsafe = Effect.fn("Memory.initUnsafe")(function* (conversationModel?: string) {

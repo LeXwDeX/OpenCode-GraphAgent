@@ -35,8 +35,8 @@ import { testEffect } from "../lib/effect"
 // bun test runs all files in one process, sequentially, sharing one
 // XDG_CONFIG_HOME — so a test file that runs before this one and triggers
 // global-memory initialization leaves a VALID memory.jsonc whose model this
-// file's fake provider does not know; writeGlobal then silently no-ops over
-// it and search fails closed with "unavailable" (dev CI, deterministic).
+// file's fake provider does not know; writeGlobal then preserves it with a
+// warning and search fails closed with "unavailable" (dev CI, deterministic).
 // Pin a private config dir per file so the global file can never be
 // contaminated by earlier files.
 const pinnedConfigDir = path.join(os.tmpdir(), `opencode-memory-global-identity-${process.pid}`)
@@ -185,8 +185,8 @@ describe("MEM-PR01-R1-03: memory is inert once the identity row is retired", () 
 
             yield* project.setInitialized(info.id)
             yield* configStore.writeGlobal(baseConfig)
-            // Tripwire: writeGlobal silently no-ops over a pre-existing VALID
-            // config, so a contaminated global dir would leave a foreign model
+            // Tripwire: writeGlobal preserves a pre-existing VALID config with
+            // a warning, so a contaminated global dir would leave a foreign model
             // here and every search would fail closed.
             expect((yield* configStore.loadGlobal())?.config.model).toBe("test/memory-on")
 
