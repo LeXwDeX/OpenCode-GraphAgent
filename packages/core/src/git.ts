@@ -953,8 +953,7 @@ interface Result {
 }
 
 function run(cwd: string, proc: AppProcess.Interface) {
-  return (args: string[]) =>
-    execute(cwd, proc)(args).pipe(Effect.catch(() => Effect.succeed({ exitCode: 1, text: "", stderr: "" })))
+  return (args: string[]) => execute(cwd, proc)(args).pipe(Effect.orDie)
 }
 
 function execute(cwd: string, proc: AppProcess.Interface) {
