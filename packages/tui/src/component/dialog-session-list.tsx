@@ -43,7 +43,9 @@ export function DialogSessionList() {
   )
 
   const currentSessionID = createMemo(() => (route.data.type === "session" ? route.data.sessionID : undefined))
-  const sessions = createMemo(() => searchResults() ?? sync.data.session)
+  // sync.data.session is id-ordered (binary-search invariant); the browse
+  // fallback re-sorts by recency for display, matching the search results.
+  const sessions = createMemo(() => searchResults() ?? [...sync.data.session].toSorted((a, b) => b.time.updated - a.time.updated))
 
   function recover(session: NonNullable<ReturnType<typeof sessions>[number]>) {
     const workspace = project.workspace.get(session.workspaceID!)
