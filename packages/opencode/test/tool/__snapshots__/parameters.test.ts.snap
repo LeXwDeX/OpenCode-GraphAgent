@@ -458,7 +458,7 @@ exports[`tool parameters JSON Schema (wire shape) workflow 1`] = `
           "type": "string",
         },
         "spec_path": {
-          "description": "(start/extend/control replan/read/validate) A saved workflow name from the library (e.g. "code-review"), or a path to a YAML workflow spec. Graph content belongs in that file; relative paths resolve from the session directory",
+          "description": "(start/extend/control replan/read/validate) An exact saved workflow name returned by workflow(action="list"), or a path to a YAML workflow spec. Graph content belongs in that file; relative paths resolve from the session directory",
           "type": "string",
         },
       },
@@ -478,7 +478,7 @@ exports[`tool parameters JSON Schema (wire shape) workflow 1`] = `
           "type": "string",
         },
         "spec_path": {
-          "description": "(start/extend/control replan/read/validate) A saved workflow name from the library (e.g. "code-review"), or a path to a YAML workflow spec. Graph content belongs in that file; relative paths resolve from the session directory",
+          "description": "(start/extend/control replan/read/validate) An exact saved workflow name returned by workflow(action="list"), or a path to a YAML workflow spec. Graph content belongs in that file; relative paths resolve from the session directory",
           "type": "string",
         },
         "workflow_id": {
@@ -511,7 +511,7 @@ exports[`tool parameters JSON Schema (wire shape) workflow 1`] = `
           "type": "string",
         },
         "spec_path": {
-          "description": "(start/extend/control replan/read/validate) A saved workflow name from the library (e.g. "code-review"), or a path to a YAML workflow spec. Graph content belongs in that file; relative paths resolve from the session directory",
+          "description": "(start/extend/control replan/read/validate) An exact saved workflow name returned by workflow(action="list"), or a path to a YAML workflow spec. Graph content belongs in that file; relative paths resolve from the session directory",
           "type": "string",
         },
         "workflow_id": {
@@ -621,7 +621,7 @@ exports[`tool parameters JSON Schema (wire shape) workflow 1`] = `
     {
       "properties": {
         "action": {
-          "description": "Show saved workflow specs in the library with their validation status",
+          "description": "Show saved workflow names, objectives, sizes, scopes, and validation status",
           "enum": [
             "list",
           ],
@@ -643,7 +643,7 @@ exports[`tool parameters JSON Schema (wire shape) workflow 1`] = `
           "type": "string",
         },
         "spec_path": {
-          "description": "(start/extend/control replan/read/validate) A saved workflow name from the library (e.g. "code-review"), or a path to a YAML workflow spec. Graph content belongs in that file; relative paths resolve from the session directory",
+          "description": "(start/extend/control replan/read/validate) An exact saved workflow name returned by workflow(action="list"), or a path to a YAML workflow spec. Graph content belongs in that file; relative paths resolve from the session directory",
           "type": "string",
         },
       },
@@ -696,7 +696,7 @@ exports[`tool parameters JSON Schema (wire shape) workflow 1`] = `
           "type": "string",
         },
         "spec_path": {
-          "description": "(start/extend/control replan/read/validate) A saved workflow name from the library (e.g. "code-review"), or a path to a YAML workflow spec. Graph content belongs in that file; relative paths resolve from the session directory",
+          "description": "(start/extend/control replan/read/validate) An exact saved workflow name returned by workflow(action="list"), or a path to a YAML workflow spec. Graph content belongs in that file; relative paths resolve from the session directory",
           "type": "string",
         },
       },

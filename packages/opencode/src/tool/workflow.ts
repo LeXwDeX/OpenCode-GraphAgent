@@ -51,7 +51,7 @@ export { Parameters as WorkflowParameters }
 // ============================================================================
 
 const specPathDescription =
-  '(start/extend/control replan/read/validate) A saved workflow name from the library (e.g. "code-review"), or a path to a YAML workflow spec. Graph content belongs in that file; relative paths resolve from the session directory'
+  '(start/extend/control replan/read/validate) An exact saved workflow name returned by workflow(action="list"), or a path to a YAML workflow spec. Graph content belongs in that file; relative paths resolve from the session directory'
 
 const StartPath = Schema.Struct({
   action: Schema.Literal("start").annotate({ description: "Create a workflow" }),
@@ -92,7 +92,7 @@ const Result = Schema.Struct({
 })
 const List = Schema.Struct({
   action: Schema.Literal("list").annotate({
-    description: "Show saved workflow specs in the library with their validation status",
+    description: "Show saved workflow names, objectives, sizes, scopes, and validation status",
   }),
 })
 const Read = Schema.Struct({
@@ -274,7 +274,7 @@ export const WorkflowTool = Tool.define<
                     "- blocks: compose explore/plan/prototype/debug/coding/verify/review/synthesize blocks",
                     "- interface: low-level node fields, bindings, model resolution, and tool actions",
                     "- policy: deep admission, gates, checkpoints, recovery, and bounded repair",
-                    "- patterns: larger review, engineering, diagnosis, and audit topologies",
+                    "- patterns: cross-domain composition and route conflicts",
                   ].join("\n"),
                   metadata: {},
                 }
@@ -312,7 +312,8 @@ export const WorkflowTool = Tool.define<
                       : entry.blocks !== undefined
                         ? ` (${entry.blocks} blocks)`
                         : "",
-                    `\n  ${entry.path}`,
+                    entry.objective ? `\n  objective: ${entry.objective}` : "",
+                    `\n  path: ${entry.path}`,
                     check.valid ? "" : `\n  ${check.summary}`,
                   ].join(""),
                 )

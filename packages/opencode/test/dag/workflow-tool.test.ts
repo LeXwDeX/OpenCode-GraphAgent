@@ -2105,6 +2105,7 @@ describe("workflow tool saved workflows", () => {
         expect(result.output).toContain("shared [project] — project-shared title")
         expect(result.output).toContain("global-only [global] — global-only title")
         expect(result.output).toContain("block-flow [global] — block flow title (1 blocks)")
+        expect(result.output).toContain("objective: Review a bounded change")
         expect(result.output).not.toContain("global-shared")
       }),
     ),

@@ -1,9 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test"
-import { Effect } from "effect"
+import { Effect, Layer } from "effect"
 import { DagWorkflows } from "@/dag/workflows"
 import * as os from "node:os"
 import * as path from "node:path"
 import * as fs from "node:fs/promises"
+import { testEffect } from "../lib/effect"
+
+const itEffect = testEffect(Layer.empty)
 
 let dir: string
 let projectDir: string
@@ -20,9 +23,9 @@ const spec = (name: string, nodes: number) =>
   ].join("\n")
 
 const writeProject = (file: string, content: string) =>
-  fs.mkdir(path.join(projectDir, ".opencode", "workflows"), { recursive: true }).then(() =>
-    fs.writeFile(path.join(projectDir, ".opencode", "workflows", file), content),
-  )
+  fs
+    .mkdir(path.join(projectDir, ".opencode", "workflows"), { recursive: true })
+    .then(() => fs.writeFile(path.join(projectDir, ".opencode", "workflows", file), content))
 
 const writeGlobal = (file: string, content: string) =>
   fs
@@ -77,6 +80,32 @@ describe("DagWorkflows.resolve", () => {
     expect(entry?.title).toBe("code-review title")
     expect(entry?.nodes).toBe(3)
   })
+
+  itEffect.live("normalizes and bounds the objective used for route selection", () =>
+    Effect.gen(function* () {
+      yield* Effect.promise(() =>
+        writeProject(
+          "bounded-objective.yaml",
+          [
+            "title: bounded objective",
+            "config:",
+            "  name: bounded-objective",
+            "  objective: >-",
+            `    ${"evidence ".repeat(40)}`,
+            "    final outcome",
+            "  nodes: []",
+          ].join("\n"),
+        ),
+      )
+
+      const entry = yield* DagWorkflows.resolve("bounded-objective", projectDir)
+
+      expect(entry?.objective).not.toContain("\n")
+      expect(entry?.objective).not.toContain("  ")
+      expect(entry?.objective?.length).toBe(240)
+      expect(entry?.objective).toEndWith("…")
+    }),
+  )
 
   it("resolves a global workflow when the project has none", async () => {
     await writeGlobal("research.yaml", spec("research", 1))
@@ -160,4 +189,3 @@ describe("DagWorkflows.list", () => {
     expect(entries[0]?.nodes).toBe(0)
   })
 })
-

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test"
+import { WorkflowRuntime } from "@opencode-ai/core/dag/core/scheduling"
 import { DagBlocks } from "@/dag/blocks"
 import { DagConfig } from "@/dag/config"
 
@@ -158,6 +159,59 @@ describe("workflow blocks", () => {
       }),
     )
     expect(nodes.find((node) => node.id === "report")?.condition).toBe('decision.output.verdict == "ACCEPT"')
+  })
+
+  it("keeps every downstream branch behind a reporting scope gate", () => {
+    const nodes = DagBlocks.compileWorkflowBlocks({
+      objective: "Deliver only while the bounded route remains valid",
+      blocks: [
+        { id: "evidence", kind: "explore" },
+        { id: "scope-gate", kind: "review", depends_on: ["evidence"], report_to_parent: true },
+        { id: "implementation", kind: "coding", depends_on: ["scope-gate"] },
+        { id: "verification", kind: "verify", depends_on: ["implementation"] },
+        { id: "decision", kind: "review", depends_on: ["verification"] },
+        { id: "report", kind: "synthesize", depends_on: ["decision"] },
+      ],
+    })
+
+    expect(nodes.find((node) => node.id === "scope-gate")).toMatchObject({
+      report_to_parent: true,
+      output_schema: {
+        properties: { verdict: { enum: ["ACCEPT", "REVISE", "REJECT", "BLOCKED"] } },
+      },
+    })
+    expect(nodes.find((node) => node.id === "implementation")?.condition).toBe('scope-gate.output.verdict == "ACCEPT"')
+    expect(nodes.find((node) => node.id === "decision--standards")?.condition).toBe(
+      'verification.output.verdict == "PASS"',
+    )
+    expect(nodes.find((node) => node.id === "decision--intent")?.condition).toBe(
+      'verification.output.verdict == "PASS"',
+    )
+    expect(nodes.find((node) => node.id === "report")?.condition).toBe('decision.output.verdict == "ACCEPT"')
+
+    const runtime = new WorkflowRuntime(
+      nodes.map((node) => ({
+        id: node.id,
+        dependsOn: node.depends_on,
+        required: node.required ?? false,
+        status: "pending" as const,
+      })),
+      8,
+    )
+    ;["evidence", "scope-gate--standards", "scope-gate--intent", "scope-gate"].forEach((id) =>
+      runtime.markSatisfied(id),
+    )
+    runtime.markSkipped("implementation")
+    expect(runtime.getReadyNodes()).toEqual([])
+    expect(runtime.getCascadeSkipNodes()).toEqual(["verification"])
+    runtime.markSkipped("verification")
+    expect(runtime.getCascadeSkipNodes()).toEqual(["decision--intent", "decision--standards"])
+    ;["decision--intent", "decision--standards"].forEach((id) => runtime.markSkipped(id))
+    expect(runtime.getCascadeSkipNodes()).toEqual(["decision"])
+    runtime.markSkipped("decision")
+    expect(runtime.getCascadeSkipNodes()).toEqual(["report"])
+    runtime.markSkipped("report")
+    expect(runtime.isComplete()).toBe(true)
   })
 
   it("rejects an implementation review without one verification gate", () => {

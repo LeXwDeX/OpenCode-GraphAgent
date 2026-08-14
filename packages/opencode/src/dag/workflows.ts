@@ -46,6 +46,8 @@ export interface Entry {
   readonly content?: string
   /** Workflow title from the spec, when the file declares one. */
   readonly title?: string
+  /** Intended outcome from config.objective, used to select before reading. */
+  readonly objective?: string
   /** Node count, for a one-glance sense of the graph's size. */
   readonly nodes?: number
   /** Block count when the saved spec uses the high-level interface. */
@@ -152,28 +154,43 @@ function scopes(projectDir: string) {
 }
 
 /** Best-effort listing metadata from a file-backed spec. */
-async function describe(file: string): Promise<{ title?: string; nodes?: number; blocks?: number }> {
+async function describe(
+  file: string,
+): Promise<{ title?: string; objective?: string; nodes?: number; blocks?: number }> {
   const text = await Bun.file(file)
     .text()
     .catch(() => undefined)
   return text === undefined ? {} : parseMeta(text)
 }
 
-/** Parse title/node metadata from spec content (shared with builtin entries).
+/** Parse bounded selection metadata from spec content (shared with builtins).
  * A malformed spec still lists — hiding it would make a typo look like a
  * missing file; the start path reports the real parse error. */
-async function parseMeta(text: string): Promise<{ title?: string; nodes?: number; blocks?: number }> {
+async function parseMeta(
+  text: string,
+): Promise<{ title?: string; objective?: string; nodes?: number; blocks?: number }> {
   const parsed = await Promise.resolve(text)
     .then((value) => Bun.YAML.parse(value))
     .catch(() => undefined)
   if (!isRecord(parsed)) return {}
   const config = isRecord(parsed["config"]) ? parsed["config"] : undefined
-  const title = typeof parsed["title"] === "string" ? parsed["title"] : undefined
+  const rawTitle = typeof parsed["title"] === "string" ? parsed["title"] : undefined
+  const rawObjective = config && typeof config["objective"] === "string" ? config["objective"] : undefined
+  const title = rawTitle ? preview(rawTitle, 160) : undefined
+  const objective = rawObjective ? preview(rawObjective, 240) : undefined
   const nodes = config && Array.isArray(config["nodes"]) ? config["nodes"].length : undefined
   const blocks = config && Array.isArray(config["blocks"]) ? config["blocks"].length : undefined
   return {
     ...(title ? { title } : {}),
+    ...(objective ? { objective } : {}),
     ...(nodes === undefined ? {} : { nodes }),
     ...(blocks === undefined ? {} : { blocks }),
   }
+}
+
+function preview(value: string, limit: number) {
+  const normalized = value.replace(/\s+/g, " ").trim()
+  const codepoints = [...normalized]
+  if (codepoints.length <= limit) return normalized
+  return `${codepoints.slice(0, limit - 1).join("")}…`
 }
