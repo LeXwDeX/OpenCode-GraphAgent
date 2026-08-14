@@ -346,6 +346,36 @@ function collectLeafIssues(issue: unknown, path: readonly string[], out: LeafIss
   if (message) out.push({ path: nextPath.join("") || "$", message })
 }
 
+// High-frequency authoring drift: fields the model reaches for from
+// neighboring vocabularies, mapped to the field that exists. The decode leaf
+// only carries the tag ("UnexpectedKey"); the offending field name lives in
+// the diagnostic path, so both are matched.
+const FIELD_DRIFT_HINTS: Record<string, string> = {
+  worker: "worker_type",
+  workers: "worker_type",
+  agent: "worker_type",
+  prompt: "instruction",
+  task: "instruction",
+  objective: "config.objective",
+  graph: "config",
+  spec: "config",
+  nodes: "blocks (or vice versa — exactly one graph source)",
+  blocks: "nodes (or vice versa — exactly one graph source)",
+}
+
+function driftHint(path: string, message: string) {
+  for (const [wrong, right] of Object.entries(FIELD_DRIFT_HINTS)) {
+    if (
+      message.includes(`"${wrong}"`) ||
+      message.includes(`'${wrong}'`) ||
+      new RegExp(`[\\"\[]${wrong}[\\"\]]`).test(path)
+    ) {
+      return `Did you mean "${right}"? Every block field is one of id, kind, depends_on, instruction, worker_type, required, report_to_parent; objective lives inside config`
+    }
+  }
+  return "Fix the field shape; blocks graphs need name+objective+blocks, nodes graphs need name+nodes"
+}
+
 export function schemaDiagnostics(error: unknown, basePath = ""): Diagnostic[] {
   const leaves: LeafIssue[] = []
   collectLeafIssues(isRecord(error) && error.issue !== undefined ? error.issue : error, basePath ? [basePath] : [], leaves)
@@ -358,7 +388,7 @@ export function schemaDiagnostics(error: unknown, basePath = ""): Diagnostic[] {
         code: DIAGNOSTIC_CODES.schemaInvalid,
         path: leaf.path,
         message: leaf.message,
-        hint: "Fix the field shape; blocks graphs need name+objective+blocks, nodes graphs need name+nodes",
+        hint: driftHint(leaf.path, leaf.message),
       }),
     ),
   )

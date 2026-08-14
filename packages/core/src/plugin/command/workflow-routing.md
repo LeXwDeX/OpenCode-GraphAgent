@@ -68,19 +68,45 @@ DAG; for a verdict, the matching audit is primary. Do not concatenate two comple
 
 Read the selected reference, retarget its objective and instructions, and
 remove phases current evidence already covers. Start its saved `spec_path`
-directly only when target and acceptance evidence match. If none fits, load
-`guide(topic="blocks")` and compose a task-local YAML. Load
+directly only when target and acceptance evidence match. If none fits, compose
+a task-local graph. Load `guide(topic="blocks")` for block contracts and
 `guide(topic="patterns")` only when domains overlap. Use low-level nodes only
 for fields blocks cannot express.
 
-Write the graph to YAML and validate that `spec_path` before start. Fix every
-diagnostic in the same file and revalidate; validation creates no workflow. A
-successful start returns the exact workflow ID. The parent owns the graph,
-controls, and final report; children own bounded work. End after start and let
-the workflow wake the parent. Do not poll merely to wait or claim an unstarted
-graph is running.
+Prefer `workflow(action="draft")` over hand-writing YAML: pass the structured
+`config` (same fields as the YAML below) and the tool renders and validates the
+spec file, returning the `spec_path` to start. Field-name drift is impossible
+because the parameter schema rejects unknown fields. Hand-write YAML only for
+features draft does not carry (admission, custom bindings). The exact start
+shape, for that fallback and for reading draft output:
 
-## Progressive guidance
+```yaml
+title: Implement session recovery
+config:
+  name: implement-session-recovery
+  objective: Implement session recovery with focused tests and review.
+  blocks:
+    - id: map
+      kind: explore
+      instruction: Locate the ownership and persistence seams.
+    - id: coding
+      kind: coding
+      depends_on: [map]
+    - id: review
+      kind: review
+      depends_on: [coding]
+```
+
+Top level is `title`/`mode`/`admission` (optional) and `config` (required);
+`objective` lives INSIDE `config`; every block field is one of `id` (required),
+`kind` (required), `depends_on`, `instruction`, `worker_type`, `required`,
+`report_to_parent` — never `worker`, `prompt`, or `agent`.
+
+Validate that `spec_path` before start. Fix every diagnostic in the same file
+and revalidate; validation creates no workflow. A successful start returns the
+exact workflow ID. The parent owns the graph, controls, and final report;
+children own bounded work. End after start and let the workflow wake the
+parent. Do not poll merely to wait or claim an unstarted graph is running.## Progressive guidance
 
 `guide` without a topic is the index. Topics: `blocks` for block shape,
 `interface` for low-level fields, `policy` for recovery, and `patterns` for

@@ -18,6 +18,7 @@ import { SessionID } from "@/session/schema"
 import { createAdmissionRecord } from "@/dag/admission"
 import { TerminalViolationError } from "@opencode-ai/core/dag/core/types"
 import { FSUtil } from "@opencode-ai/core/fs-util"
+import { stringify as yamlStringify } from "yaml"
 import { assertExternalDirectoryEffect } from "./external-directory"
 import path from "node:path"
 
@@ -110,6 +111,17 @@ const Guide = Schema.Struct({
       "blocks: composable block schema; interface: low-level workflow API; policy: gates/admission/recovery; patterns: domain playbooks. Omit for the compact index",
   }),
 })
+const Draft = Schema.Struct({
+  action: Schema.Literal("draft").annotate({
+    description:
+      'Render a structured graph into a validated YAML spec file and return its spec_path — no workflow is created. Preferred over hand-writing YAML: field names are schema-checked here, eliminating serialization drift',
+  }),
+  title: Schema.optional(Schema.String).annotate({ description: "Optional workflow title" }),
+  config: DagValidation.WorkflowGraphSchema.annotate({
+    description:
+      'Exactly one graph shape: { name, objective, blocks: [{ id, kind, depends_on?, instruction?, worker_type?, required?, report_to_parent? }], node_defaults?, max_concurrency?, max_node_replan_attempts?, max_total_nodes? } or the low-level { name, nodes: [...] } form. Fields are exhaustive — no others exist',
+  }),
+})
 const ValidationProfile = Schema.optional(Schema.Literals(["portable", "environment"])).annotate({
   description:
     "portable: distributable-template checks; environment: additionally resolves prompts, workers, and models in this project. Defaults: builtin specs portable, project/global/path specs environment",
@@ -132,6 +144,7 @@ const ActionParams = Schema.Union([
   List,
   Read,
   Guide,
+  Draft,
   ValidatePath,
 ])
 
@@ -251,7 +264,7 @@ export const WorkflowTool = Tool.define<
       formatValidationError: (error) =>
         [
           `Workflow call rejected by the action schema: ${error instanceof Error ? error.message : String(error)}`,
-          'The call takes a single { params } object: params { action, ...action-owned fields } where each action owns only its own fields: start {spec_path}; extend {workflow_id, spec_path}; control(replan) {workflow_id, operation, spec_path}; other control operations {workflow_id, operation}; status {workflow_id}; result {workflow_id, node_id, cursor?, limit?}; list {}; read {spec_path}; guide {topic?}; validate {spec_path, profile?}. Put graph content in a .yaml/.yml file; session/project identity is never a parameter.',
+          'The call takes a single { params } object: params { action, ...action-owned fields } where each action owns only its own fields: start {spec_path}; extend {workflow_id, spec_path}; control(replan) {workflow_id, operation, spec_path}; other control operations {workflow_id, operation}; status {workflow_id}; result {workflow_id, node_id, cursor?, limit?}; list {}; read {spec_path}; guide {topic?}; draft {title?, config}; validate {spec_path, profile?}. Put graph content in draft (structured, schema-checked) or a .yaml/.yml file; session/project identity is never a parameter.',
         ].join("\n"),
       execute: (call: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context<Metadata>) =>
         Effect.gen(function* () {
@@ -297,6 +310,36 @@ export const WorkflowTool = Tool.define<
               return {
                 title: `Workflow guide: ${params.topic}`,
                 output: content,
+                metadata: {},
+              }
+            }
+            case "draft": {
+              const specPath = yield* writeDraftSpec(params.config, params.title, callingSession.directory).pipe(
+                Effect.orDie,
+              )
+              const result = yield* authoring.prepare({
+                action: "start",
+                source: { kind: "yaml", source: specPath, content: yield* readDraftSpec(specPath).pipe(Effect.orDie) },
+                profile: "portable",
+              })
+              if (!result.valid) {
+                return {
+                  title: `Workflow draft written with validation errors: ${params.config.name}`,
+                  output: [
+                    `spec_path: ${specPath}`,
+                    "The file is on disk; fix the errors by calling draft again with corrected fields. Diagnostics:",
+                    ...result.errors.map((d) => `- [${d.code}] ${d.path}: ${d.message}${d.hint ? ` (${d.hint})` : ""}`),
+                  ].join("\n"),
+                  metadata: {},
+                }
+              }
+              return {
+                title: `Workflow draft valid: ${params.config.name}`,
+                output: [
+                  `spec_path: ${specPath}`,
+                  `nodes: ${result.nodes.length}`,
+                  'Next: workflow(action="start", spec_path) — or extend the file first for low-level fields, then start.',
+                ].join("\n"),
                 metadata: {},
               }
             }
@@ -727,6 +770,38 @@ function validationOutput(result: DagValidation.ValidationResult) {
     warnings: result.warnings,
     nodes: result.nodes,
   }
+}
+
+const DRAFT_DIRECTORY = path.join(".opencode", "workflow-drafts")
+const DRAFT_NAME_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9-_]*$/
+
+function writeDraftSpec(
+  config: DagValidation.StartGraph,
+  title: string | undefined,
+  directory: string,
+): Effect.Effect<string, Error> {
+  return Effect.gen(function* () {
+    if (!DRAFT_NAME_PATTERN.test(config.name)) {
+      return yield* Effect.fail(
+        new Error(
+          `Workflow name must match ${DRAFT_NAME_PATTERN.source} (it becomes the spec filename): ${config.name}`,
+        ),
+      )
+    }
+    const dir = path.join(directory, DRAFT_DIRECTORY)
+    yield* Effect.promise(() => Bun.write(Bun.file(path.join(dir, ".keep")), ""))
+    const specPath = path.join(dir, `${config.name}.yaml`)
+    const content = yamlStringify({ ...(title ? { title } : {}), config })
+    yield* Effect.promise(() => Bun.write(specPath, content))
+    return specPath
+  })
+}
+
+function readDraftSpec(specPath: string) {
+  return Effect.tryPromise({
+    try: () => Bun.file(specPath).text(),
+    catch: (error) => new Error(`Failed to read draft spec ${specPath}: ${String(error)}`),
+  })
 }
 
 function loadSpecFile(specPath: string, directory: string, ctx: Tool.Context) {
