@@ -11,6 +11,10 @@ import { ProviderTransform } from "../../src/provider/transform"
 const openaiModel = { providerID: "openai", api: { id: "gpt-4.1", npm: "@ai-sdk/openai" } } as never
 const azureModel = { providerID: "azure", api: { id: "gpt-4.1", npm: "@ai-sdk/azure" } } as never
 const geminiModel = { providerID: "google", api: { id: "gemini-3-pro", npm: "@ai-sdk/google" } } as never
+const deepseekModel = {
+  providerID: "deepseek",
+  api: { id: "deepseek-v4-pro", npm: "@ai-sdk/openai-compatible" },
+} as never
 
 type JsonSchemaNode = {
   anyOf?: JsonSchemaNode[]
@@ -115,6 +119,16 @@ describe("workflow provider-facing schema", () => {
     const resultBranch = branchByAction(transformed, "result")[0]
     expect(resultBranch.required).toEqual(expect.arrayContaining(["workflow_id", "node_id"]))
     expect(Object.keys(record(resultBranch))).toEqual(expect.arrayContaining(["cursor", "limit"]))
+  })
+
+  test("DeepSeek transformation presents the workflow union as an object-root function schema", () => {
+    const transformed = ProviderTransform.schema(
+      deepseekModel,
+      ToolJsonSchema.fromSchema(Parameters as never),
+    ) as JsonSchemaNode
+    expect(transformed.type).toBe("object")
+    expect(branches(transformed)).toHaveLength(10)
+    expect(branchByAction(transformed, "start", "spec_path")).toHaveLength(1)
   })
 
   test("post-change byte sizes stay at the recorded evidence", async () => {
