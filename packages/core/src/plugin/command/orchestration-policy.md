@@ -1,7 +1,8 @@
 # Orchestration Policy
 
-This file is the operating procedure. Where background prose or an example
-elsewhere appears to permit a shallower graph, this procedure wins.
+This guide owns tiering, admission, checkpoints, and recovery after the
+resident Orchestration Router selects an execution mode. It does not revisit
+that selection.
 
 ## Tiered Orchestration Doctrine
 
@@ -50,41 +51,17 @@ like "review X" never does.
 - **Subsystem or repo scope**: a domain playbook with planned continuation
   waves (verdict-driven replan or extend), never a one-shot graph.
 
-## Execution Mode Selection
+## Parent and Child Ownership
 
 The parent conversation owns user interaction, requirement and admission
 decisions, the macro plan, workflow controls, checkpoint interpretation, and
 the final user-facing synthesis. Once work is classified for delegation, the
 parent MUST NOT perform executable leaf work itself.
 
-Choose the smallest child execution mode that can safely complete the request:
-
-1. Use direct execution only for conversation, trivial state inspection,
-   workflow control, final synthesis, or an explicit user opt-out.
-2. Use one `task` subagent for one independent non-trivial leaf assignment
-   outside a project-level source or test change when no graph-level
-   coordination is needed. The parent launches it once, consumes its result,
-   and does not duplicate the leaf work.
-3. Use one live `workflow` DAG for project-level source or test changes, even
-   when only one project file is expected, and whenever one user objective
-   contains staged dependencies, two or more related workstreams, a quality
-   gate, unknown-size discovery, adaptive repair, or an explicit multi-role or
-   multi-model requirement.
-
-"Smallest" is measured against the Depth Ladder: a mode or graph that cannot
-deliver the ladder's hard minimum for the target size is not safe, merely
-small.
-
-Related flows for one user objective belong to one live DAG. Represent them as
-nodes and dependency edges; use `extend` or `control(replan)` when discovery or
-a verdict adds work. Start another DAG only after a terminal boundary prevents
-live adaptation, and carry the prior outputs into the continuation explicitly.
-
-Explicit user constraints override profile defaults:
-
-- "single agent", "do not use DAG", and "answer directly" disable implicit workflow selection.
-- "Do not modify files" does not disable a useful brainstorm or review DAG; it makes every node read-only.
-- Preserve named roles, exact model assignments, scope limits, and prohibited actions in every node prompt.
+The resident Router owns direct, `task`, and `workflow` selection, explicit
+opt-outs, and consolidation under one workflow ID. This guide only constrains
+the selected graph. Preserve read-only scope, named roles, exact model
+assignments, scope limits, and prohibited actions in every node prompt.
 
 ## Deep Admission QA
 
@@ -307,13 +284,13 @@ Normal leaf workers use `report_to_parent: false`. Gates, arbiters, and final au
   "verdict": "ACCEPT | REVISE | REJECT | BLOCKED",
   "summary": "string",
   "findings": [],
-  "required_actions": [],
-  "next_action": {
-    "operation": "continue | extend | replan | complete | stop",
-    "targets": []
-  }
+  "required_actions": []
 }
 ```
+
+The child reports evidence and required actions only. The parent interprets
+the verdict and chooses any workflow control action under the Verdict Disposal
+Contract.
 
 Do not poll `status` merely to wait. Atomic wake reports actionable checkpoints and workflow terminal outcomes. Use `status` only when the user asks for current state or once before a control decision that requires fresh durable state.
 
