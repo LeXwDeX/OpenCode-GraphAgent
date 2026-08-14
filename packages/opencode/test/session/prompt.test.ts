@@ -560,6 +560,45 @@ noLLMServer.instance(
   { config: cfg },
 )
 
+it.instance("loop runs the model when the newest user message sorts below the pre-wrap assistant id (cross-era wrap)", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+    const assistantID = MessageID.make("msg_fffac212c001")
+    yield* sessions.updateMessage({
+      id: assistantID,
+      role: "assistant",
+      parentID: MessageID.make("msg_fffac212c000"),
+      sessionID: chat.id,
+      mode: "build",
+      agent: "build",
+      cost: 0,
+      path: { cwd: "/tmp", root: "/tmp" },
+      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      modelID: ref.modelID,
+      providerID: ref.providerID,
+      time: { created: 1786700000000 },
+      finish: "stop",
+    } satisfies SessionV1.Assistant)
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: assistantID,
+      sessionID: chat.id,
+      type: "text",
+      text: "pre-wrap answer",
+    })
+    yield* user(chat.id, "hello after the wrap")
+    yield* llm.text("world")
+
+    const result = yield* prompt.loop({ sessionID: chat.id })
+    expect(result.info.role).toBe("assistant")
+    expect(result.info.id).not.toBe(assistantID)
+    expect(yield* llm.hits).toHaveLength(1)
+  }),
+)
+
 it.instance("loop exits without an LLM request for interrupted orphan tool calls", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig(providerCfg)

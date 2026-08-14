@@ -32,6 +32,9 @@ import {
 } from "./admission"
 import { unresolvedReviewOutcomes } from "./review-lifecycle"
 import { DagValidation, StructuralValidationError } from "./validation"
+import { DagLocation } from "./location"
+import { SessionLocation } from "@/session/location"
+import { SessionID } from "@/session/schema"
 
 export { StructuralValidationError } from "./validation"
 
@@ -400,6 +403,18 @@ export const layer = Layer.effect(
         config: JSON.stringify(durableConfig),
         status: "pending",
         timestamp: ts,
+        // DAG-LOC-01 stamp (P2-F): the execution-location key is the TARGET
+        // SESSION's durable directory — the single source of truth. Stamping
+        // the ambient request instance's directory would let a request on
+        // directory A create a workflow for B's session stamped A, orphaning
+        // it from B's loops. Fall back to the ambient instance only when the
+        // session has no durable row (the workflow insert would fail its
+        // session FK anyway).
+        directory: yield* Effect.flatMap(SessionLocation.sessionDirectory(SessionID.make(input.sessionID)), (durable) =>
+          durable._tag === "Some"
+            ? Effect.succeed(DagLocation.canonicalDirectory(durable.value))
+            : DagLocation.stampDirectory(),
+        ),
       })
       for (const node of durableConfig.nodes) {
         yield* events.publish(DagEvent.NodeRegistered, {

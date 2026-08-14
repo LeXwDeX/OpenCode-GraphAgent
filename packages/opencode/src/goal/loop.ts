@@ -127,14 +127,39 @@ const serviceLayer = Layer.effect(
     const scanDirectoryRef: { current: string } = { current: "" }
 
     const state = yield* InstanceState.make(
-      Effect.fn("GoalLoop.state")(function* () {
+      Effect.fn("GoalLoop.state")(function* (ctx) {
         yield* events.subscribe(SessionStatus.Event.Status).pipe(
           Stream.filter((evt) => evt.data.status.type === "idle"),
           // D4 (fiber lifecycle): triggerEvaluation below carries the full
           // discipline (active-goal pre-check, fork, fiber registration,
           // identity-scoped self-clean), shared verbatim with the
           // GOAL-FP-01-04 startup scan so both drivers use one path.
-          Stream.runForEach((evt) => triggerEvaluation(evt.data.sessionID).pipe(Effect.ignore)),
+          Stream.runForEach((evt) =>
+            Effect.gen(function* () {
+              const sid = evt.data.sessionID
+              // DAG-LOC-01 execution-location guard: idle Status events are
+              // store-global. Only the instance whose DIRECTORY owns the
+              // session may drive its goal loop — the real session-row check
+              // (Goal.ownsSession reads SessionTable.directory; the workflow-
+              // keyed DAG authority is vacuous for goal-only sessions, P2-A).
+              // Sessions without a durable row are owned vacuously (synthetic
+              // test sessions; a deleted session's goal state is gone with it).
+              if (!(yield* Goal.ownsSession(sid, ctx.directory))) return
+              yield* triggerEvaluation(sid)
+              // P2-B subscription survival: this handler now contains the
+              // first defect-capable durable reads in the goal idle path
+              // (Goal.ownsSession / goal.load both orDie). Effect.ignore does
+              // NOT absorb defects — a transient store failure would
+              // permanently kill the runForEach subscription and the loop
+              // would never evaluate another idle event. catchCause absorbs
+              // failures AND defects at the boundary, so a store defect
+              // degrades to a logged, skipped evaluation — never a dead loop.
+            }).pipe(
+              Effect.catchCause((cause) =>
+                Effect.logWarning("GoalLoop idle handler failed", { sessionID: evt.data.sessionID, cause }),
+              ),
+            ),
+          ),
           Effect.forkScoped,
         )
         // GOAL-FP-01-04: the startup resume scan. The durable snapshot is

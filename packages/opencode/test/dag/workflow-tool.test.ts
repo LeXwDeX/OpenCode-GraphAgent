@@ -118,6 +118,7 @@ const store = Layer.mock(DagStore.Service, {
             projectId: projectID,
             sessionId: "ses_workflow_parent",
             title: "Status workflow",
+            directory: null,
             status: "running",
             config: "{}",
             seq: 1,
@@ -133,6 +134,7 @@ const store = Layer.mock(DagStore.Service, {
               projectId: projectID,
               sessionId: "ses_workflow_parent",
               title: "Result workflow",
+            directory: null,
               status: "completed",
               config: "{}",
               seq: 1,
@@ -148,6 +150,7 @@ const store = Layer.mock(DagStore.Service, {
                 projectId: projectID,
                 sessionId: "ses_workflow_parent",
                 title: "Control workflow",
+            directory: null,
                 status: id === "dag_paused" ? "paused" : "running",
                 config: "{}",
                 seq: 1,
@@ -163,6 +166,7 @@ const store = Layer.mock(DagStore.Service, {
                   projectId: projectID,
                   sessionId: "ses_workflow_parent",
                   title: "Deep status workflow",
+            directory: null,
                   status: "running",
                   config: JSON.stringify({
                     name: "deep-status",
@@ -186,6 +190,7 @@ const store = Layer.mock(DagStore.Service, {
                     projectId: projectID,
                     sessionId: "ses_workflow_parent",
                     title: "Configured defaults",
+            directory: null,
                     status: "running",
                     config: JSON.stringify({
                       name: "configured-defaults",
@@ -626,6 +631,47 @@ describe("workflow tool schema (negative tests)", () => {
       params: { action: "start", spec_path: ".opencode/workflows/deep.yaml" },
     })
   })
+
+  it("draft accepts a structured graph and rejects unknown fields", () => {
+    const decode = Schema.decodeUnknownSync(Parameters, { onExcessProperty: "error" })
+    const draft = {
+      action: "draft",
+      title: "Structured draft",
+      config: {
+        name: "structured-draft",
+        objective: "Validate the draft rendering path.",
+        blocks: [
+          { id: "map", kind: "explore", instruction: "Map the seams." },
+          { id: "review", kind: "review", depends_on: ["map"] },
+        ],
+      },
+    }
+    expect(decode({ params: draft })).toMatchObject({ params: { action: "draft" } })
+    // The high-frequency drift shapes die at the schema boundary.
+    expect(() =>
+      decode({ params: { action: "draft", config: { ...draft.config, blocks: [{ id: "x", kind: "coding", worker: "general" }] } } }),
+    ).toThrow()
+    expect(() => decode({ params: { action: "draft", objective: "top level" } })).toThrow()
+    expect(() => decode({ params: { action: "draft" } })).toThrow()
+  })
+
+  it("draft passes mixed blocks+nodes through the schema; the authoring layer rejects them", () => {
+    const decode = Schema.decodeUnknownSync(Parameters)
+    // WorkflowGraphSchema is a permissive union at the parameter boundary —
+    // the compiled authoring check owns the blocks-xor-nodes rule, exercised
+    // in the execution tests below.
+    expect(() =>
+      decode({ params: {
+        action: "draft",
+        config: {
+          name: "mixed",
+          objective: "Both sources at once.",
+          blocks: [{ id: "a", kind: "coding" }],
+          nodes: [],
+        },
+      }}),
+    ).not.toThrow()
+  })
 })
 
 describe("workflow tool execution", () => {
@@ -668,11 +714,108 @@ describe("workflow tool execution", () => {
       const index = yield* workflow.execute({ params: { action: "guide" }}, toolContext())
       const blocks = yield* workflow.execute({ params: { action: "guide", topic: "blocks" }}, toolContext())
 
-      expect(workflow.description.length).toBeLessThan(5_000)
+      // The budget admits the routing guide's inline start-spec example
+      // (one-hop field reference for hand-written YAML) while still keeping
+      // per-action manuals out of the always-on description.
+      expect(workflow.description.length).toBeLessThan(6_500)
       expect(index.output).toContain("blocks: compose")
       expect(index.output).not.toContain("# Composable Workflow Blocks")
       expect(blocks.output).toContain("# Composable Workflow Blocks")
       expect(blocks.output).toContain("kind: coding")
+    }),
+  )
+
+  runtime.effect("draft renders a structured graph into a validated spec file", () =>
+    Effect.gen(function* () {
+      const info = yield* WorkflowTool
+      const workflow = yield* info.init()
+      const result = yield* workflow.execute(
+        {
+          params: {
+            action: "draft",
+            title: "Draft round trip",
+            config: {
+              name: "draft-round-trip",
+              objective: "Validate the draft rendering path.",
+              blocks: [
+                { id: "map", kind: "explore", instruction: "Map the seams.\nSecond line with: colons and quotes." },
+                { id: "coding", kind: "coding", depends_on: ["map"] },
+                { id: "verify", kind: "verify", depends_on: ["coding"] },
+                { id: "review", kind: "review", depends_on: ["verify"] },
+              ],
+            },
+          },
+        },
+        toolContext(),
+      )
+
+      expect(result.output).toContain(".opencode/workflow-drafts/draft-round-trip.yaml")
+      expect(result.output).toContain("nodes: ")
+
+      // The rendered file round-trips through the same authoring path start
+      // uses, and read returns the authored document with draft content.
+      const read = yield* workflow.execute(
+        { params: { action: "read", spec_path: ".opencode/workflow-drafts/draft-round-trip.yaml" } },
+        toolContext(),
+      )
+      const parsed = JSON.parse(read.output)
+      expect(parsed.validation.valid).toBe(true)
+      expect(parsed.spec.config.name).toBe("draft-round-trip")
+      expect(parsed.spec.config.blocks).toHaveLength(4)
+      expect(parsed.spec.title).toBe("Draft round trip")
+    }),
+  )
+
+  runtime.effect("draft reports validation errors without creating a workflow", () =>
+    Effect.gen(function* () {
+      const info = yield* WorkflowTool
+      const workflow = yield* info.init()
+      const decode = Schema.decodeUnknownSync(Parameters)
+      // Unknown dependency: valid at the parameter schema, rejected by the
+      // authoring validation the draft runs before returning.
+      const result = yield* workflow.execute(
+        decode({
+          params: {
+            action: "draft",
+            config: {
+              name: "draft-bad-edge",
+              objective: "Broken dependency.",
+              blocks: [{ id: "a", kind: "coding", depends_on: ["ghost"] }],
+            },
+          },
+        }),
+        toolContext(),
+      )
+
+      expect(result.title).toContain("validation errors")
+      expect(result.output).toContain(".opencode/workflow-drafts/draft-bad-edge.yaml")
+      expect(result.output).toContain("ghost")
+      expect(published).toHaveLength(0)
+    }),
+  )
+
+  runtime.effect("draft refuses unsafe workflow names and stays outside the saved library", () =>
+    Effect.gen(function* () {
+      const info = yield* WorkflowTool
+      const workflow = yield* info.init()
+      const decode = Schema.decodeUnknownSync(Parameters)
+
+      const exit = yield* workflow
+        .execute(
+          decode({
+            params: {
+              action: "draft",
+              config: { name: "../escape", objective: "x", blocks: [{ id: "a", kind: "coding" }] },
+            },
+          }),
+          toolContext(),
+        )
+        .pipe(Effect.exit)
+      expect(Exit.isFailure(exit)).toBe(true)
+
+      const list = yield* workflow.execute({ params: { action: "list" } }, toolContext())
+      expect(list.output).not.toContain("draft-round-trip")
+      expect(list.output).not.toContain("workflow-drafts")
     }),
   )
 
@@ -1099,10 +1242,12 @@ describe("workflow tool execution", () => {
         expect(published).toHaveLength(0)
       }
 
-      // Recovery guidance tells the model to move graph content into YAML.
+      // Recovery guidance tells the model to move graph content into draft
+      // or a YAML file — never an inline spec field.
       const guidance = workflow.formatValidationError?.(new Error("no branch matched")) ?? ""
       expect(guidance).toContain("start {spec_path}")
-      expect(guidance).toContain("Put graph content in a .yaml/.yml file")
+      expect(guidance).toContain("draft {title?, config}")
+      expect(guidance).toContain(".yaml/.yml file")
     }),
   )
 

@@ -52,6 +52,7 @@ describe("instance bootstrap DAG wiring", () => {
                     id: workflowID,
                     project_id: context.project.id as never,
                     session_id: parent.id as never,
+                    directory: context.directory,
                     title: "condition false",
                     status: "running",
                     config: JSON.stringify({

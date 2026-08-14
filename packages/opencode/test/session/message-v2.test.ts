@@ -1658,4 +1658,41 @@ describe("session.message-v2.latest", () => {
     expect(state.tasks).toHaveLength(1)
     expect(state.tasks[0]).toMatchObject({ type: "compaction", auto: true })
   })
+
+  const PRE_WRAP_USER = MessageID.make("msg_fff0000000000000000001")
+  const POST_WRAP_USER = MessageID.make("msg_0009000000000000000001")
+  const PRE_WRAP_ASSISTANT = MessageID.make("msg_ffe0000000000000000001")
+  const POST_WRAP_ASSISTANT = MessageID.make("msg_0008000000000000000001")
+
+  test("latest picks cross-era bindings by time.created, not by id order", () => {
+    const preWrapUser: SessionV1.WithParts = {
+      info: { ...userInfo(PRE_WRAP_USER), time: { created: 1786700000000 } },
+      parts: [],
+    }
+    const postWrapUser: SessionV1.WithParts = {
+      info: { ...userInfo(POST_WRAP_USER), time: { created: 1786707000000 } },
+      parts: [],
+    }
+    const preWrapAssistant: SessionV1.WithParts = {
+      info: {
+        ...assistantInfo(PRE_WRAP_ASSISTANT, PRE_WRAP_USER),
+        finish: "stop",
+        time: { created: 1786701000000 },
+      },
+      parts: [],
+    }
+    const postWrapAssistant: SessionV1.WithParts = {
+      info: {
+        ...assistantInfo(POST_WRAP_ASSISTANT, POST_WRAP_USER),
+        finish: "stop",
+        time: { created: 1786708000000 },
+      },
+      parts: [],
+    }
+
+    const state = MessageV2.latest([preWrapUser, postWrapUser, preWrapAssistant, postWrapAssistant])
+    expect(state.user?.id).toBe(POST_WRAP_USER)
+    expect(state.assistant?.id).toBe(POST_WRAP_ASSISTANT)
+    expect(state.finished?.id).toBe(POST_WRAP_ASSISTANT)
+  })
 })

@@ -105,6 +105,7 @@ export default {
           \`id\` text PRIMARY KEY,
           \`project_id\` text NOT NULL,
           \`session_id\` text NOT NULL,
+          \`directory\` text,
           \`title\` text NOT NULL,
           \`status\` text NOT NULL,
           \`config\` text NOT NULL,

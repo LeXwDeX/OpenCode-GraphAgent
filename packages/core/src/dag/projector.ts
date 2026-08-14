@@ -87,6 +87,10 @@ export const layer = Layer.effectDiscard(
           id: event.data.dagID,
           project_id: event.data.projectID,
           session_id: event.data.sessionID,
+          // DAG-LOC-01: the execution-location key, stamped at dag.create.
+          // A legacy event without the field projects to NULL — a row that
+          // matches no instance directory and is never adopted.
+          directory: event.data.directory ?? null,
           title: event.data.title,
           status: event.data.status,
           config: event.data.config,

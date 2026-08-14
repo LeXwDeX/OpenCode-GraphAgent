@@ -75,7 +75,9 @@ describe("CommandPlugin.Plugin", () => {
 
   it.effect("keeps always-on guidance small and loads detailed topics progressively", () =>
     Effect.sync(() => {
-      expect(Buffer.byteLength(CommandPlugin.WorkflowContent)).toBeLessThan(5_000)
+      // Budget admits the inline start-spec example (one-hop field reference
+      // for hand-written YAML) while keeping per-action manuals progressive.
+      expect(Buffer.byteLength(CommandPlugin.WorkflowContent)).toBeLessThan(6_500)
       expect(CommandPlugin.WorkflowContent).toContain("project-level source or test changes")
       expect(CommandPlugin.WorkflowContent).toMatch(/even one project\s+file/)
       expect(CommandPlugin.WorkflowContent).toMatch(/isolated utility\s+scripts/)

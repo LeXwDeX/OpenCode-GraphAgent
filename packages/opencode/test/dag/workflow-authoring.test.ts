@@ -24,6 +24,31 @@ const start = {
 }
 
 describe("WorkflowAuthoring source-to-graph seam", () => {
+  it.effect("maps high-frequency field drift to the field that exists", () =>
+    Effect.gen(function* () {
+      const authoring = WorkflowAuthoring.make()
+      const result = yield* authoring.prepare({
+        action: "start",
+        source: {
+          kind: "yaml",
+          source: "drift.yaml",
+          content: [
+            "config:",
+            "  name: drift",
+            "  objective: Field drift probe.",
+            "  blocks:",
+            "    - id: a",
+            "      kind: coding",
+            "      worker: general",
+          ].join("\n"),
+        },
+        profile: "portable",
+      })
+      expect(result.valid).toBe(false)
+      expect(result.errors.some((e) => e.hint.includes('Did you mean "worker_type"?'))).toBe(true)
+    }),
+  )
+
   it.effect("keeps every block-guide YAML envelope executable", () =>
     Effect.gen(function* () {
       const guide = CommandPlugin.WorkflowBlocksContent

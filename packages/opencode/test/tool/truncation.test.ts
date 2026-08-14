@@ -256,6 +256,10 @@ describe("Truncate", () => {
 
         yield* writeFileStringScoped(old, "old content")
         yield* writeFileStringScoped(recent, "recent content")
+        const oldMtime = new Date(Date.now() - 10 * DAY_MS)
+        const recentMtime = new Date(Date.now() - 3 * DAY_MS)
+        yield* fs.utimes(old, oldMtime, oldMtime)
+        yield* fs.utimes(recent, recentMtime, recentMtime)
         yield* svc.cleanup()
 
         expect(yield* fs.exists(old)).toBe(false)

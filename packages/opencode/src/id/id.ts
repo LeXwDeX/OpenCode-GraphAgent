@@ -15,9 +15,14 @@ const prefixes = {
 
 const LENGTH = 26
 
-// State for monotonic ID generation
-let lastTimestamp = 0
-let counter = 0
+// Latch over the raw millisecond value, shared by both directions. The prefix
+// is the full 48-bit timestamp with no shift so it only wraps after 2^48 ms
+// (~8925 years); without the latch, same-millisecond bursts would collide and
+// clock regression would emit out-of-order ids. Historical ids (pre
+// 2026-08-14) encoded (ts mod 2^36) << 12 and sort above new ids, so
+// lexicographic id comparison across that boundary is invalid by design —
+// ordering must always come from time.created.
+let lastValue = 0n
 
 export function ascending(prefix: keyof typeof prefixes, given?: string) {
   return generateID(prefix, "ascending", given)
@@ -49,17 +54,10 @@ function randomBase62(length: number): string {
 }
 
 export function create(prefix: string, direction: "descending" | "ascending", timestamp?: number): string {
-  const currentTimestamp = timestamp ?? Date.now()
-
-  if (currentTimestamp !== lastTimestamp) {
-    lastTimestamp = currentTimestamp
-    counter = 0
-  }
-  counter++
-
-  let now = BigInt(currentTimestamp) * BigInt(0x1000) + BigInt(counter)
-
-  now = direction === "descending" ? ~now : now
+  const current = BigInt(timestamp ?? Date.now())
+  const value = current > lastValue ? current : lastValue + 1n
+  lastValue = value
+  let now = direction === "descending" ? ~value : value
 
   const timeBytes = Buffer.alloc(6)
   for (let i = 0; i < 6; i++) {
@@ -73,8 +71,7 @@ export function create(prefix: string, direction: "descending" | "ascending", ti
 export function timestamp(id: string): number {
   const prefix = id.split("_")[0]
   const hex = id.slice(prefix.length + 1, prefix.length + 13)
-  const encoded = BigInt("0x" + hex)
-  return Number(encoded / BigInt(0x1000))
+  return Number(BigInt("0x" + hex))
 }
 
 export * as Identifier from "./id"
