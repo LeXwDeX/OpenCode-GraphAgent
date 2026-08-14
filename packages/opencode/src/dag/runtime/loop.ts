@@ -508,40 +508,59 @@ const serviceLayer = Layer.effect(
               // orphan sweep publishes WorkflowStarted only to legalize its
               // pending→running→failed terminalization, and adopting the
               // orphan mid-sequence would start scheduling on a dead workflow.
+              //
+              // H1 (DAG-LOC-01): the handler also reserves the slot for
+              // ITSELF — two concurrent WorkflowStarted events (e.g. a
+              // duplicate publish racing the live handler) previously both
+              // passed the guard above (neither reserves anything) and both
+              // reached runtimes.set: the second overwrote the first entry,
+              // orphaning its fibers/watchers from every interrupt sweep and
+              // double-registering the automation lease. Reserve
+              // synchronously right after the guard — no yield between the
+              // check and the add, so the second event's guard sees the
+              // reservation — and release via Effect.ensuring, exactly
+              // mirroring recoverWorkflow / recoverOrphanPending. The latch
+              // also supersedes the WorkflowReplanned no-entry re-adoption
+              // race: a replan arriving mid-adoption drops out of
+              // recoverWorkflow instead of overwriting this entry, and the
+              // adoption's own getNodes reads the already-replanned rows.
               if (runtimes.has(dagID) || recovering.has(dagID)) return
-              const wf = yield* store.getWorkflow(dagID).pipe(Effect.orDie)
-              if (!wf) return
-              // Status guard: the orphan-pending sweep publishes WorkflowStarted
-              // only to legalize the pending→running leg of its terminalization
-              // sequence. By the time the event reaches this handler the row is
-              // already failed — adopting it would rebuild a runtime and start
-              // scheduling nodes on a dead workflow. Accept running rows only.
-              if (wf.status !== "running") return
-              // Cross-instance guard via the execution-location authority:
-              // only the instance whose DIRECTORY owns the workflow adopts
-              // (see recoverWorkflow). First-wave spawns must not race across
-              // directory contexts.
-              if (!(yield* DagLocation.ownsWorkflow(dagID, ctx.directory))) return
-              const config = parseWorkflowConfig(wf.config)
-              const nodes = yield* store.getNodes(dagID)
-              const maxConcurrency = Math.max(1, config?.max_concurrency ?? Dag.DEFAULT_WORKFLOW_CONFIG.maxConcurrency)
-              const runtime = new WorkflowRuntime(toSchedulingNodes(nodes), maxConcurrency)
-              const semaphore = Semaphore.makeUnsafe(maxConcurrency)
-              const entry: WorkflowEntry = { runtime, semaphore, evalLock: Semaphore.makeUnsafe(1), parentSessionID: wf.sessionId, config, fibers: new Map(), watchers: new Map() }
-              // P2-E deletion-race re-check (same window as recoverWorkflow):
-              // the Deleted sweep only removes entries already in `runtimes`,
-              // and getNodes above is an awaited yield a deletion can slip
-              // through. A row cascade-deleted after the first guard must not
-              // be adopted into an inert entry.
-              if (!(yield* DagLocation.ownsWorkflow(dagID, ctx.directory))) return
-              runtimes.set(dagID, entry)
-              yield* automation.register(SessionID.make(wf.sessionId), { kind: "dag", id: dagID })
-              yield* entry.evalLock.withPermits(1)(
-                Effect.gen(function* () {
-                  yield* spawnReady(dagID)
-                  yield* checkCompletion(dagID)
-                }),
-              )
+              recovering.add(dagID)
+              yield* Effect.gen(function* () {
+                const wf = yield* store.getWorkflow(dagID).pipe(Effect.orDie)
+                if (!wf) return
+                // Status guard: the orphan-pending sweep publishes WorkflowStarted
+                // only to legalize the pending→running leg of its terminalization
+                // sequence. By the time the event reaches this handler the row is
+                // already failed — adopting it would rebuild a runtime and start
+                // scheduling nodes on a dead workflow. Accept running rows only.
+                if (wf.status !== "running") return
+                // Cross-instance guard via the execution-location authority:
+                // only the instance whose DIRECTORY owns the workflow adopts
+                // (see recoverWorkflow). First-wave spawns must not race across
+                // directory contexts.
+                if (!(yield* DagLocation.ownsWorkflow(dagID, ctx.directory))) return
+                const config = parseWorkflowConfig(wf.config)
+                const nodes = yield* store.getNodes(dagID)
+                const maxConcurrency = Math.max(1, config?.max_concurrency ?? Dag.DEFAULT_WORKFLOW_CONFIG.maxConcurrency)
+                const runtime = new WorkflowRuntime(toSchedulingNodes(nodes), maxConcurrency)
+                const semaphore = Semaphore.makeUnsafe(maxConcurrency)
+                const entry: WorkflowEntry = { runtime, semaphore, evalLock: Semaphore.makeUnsafe(1), parentSessionID: wf.sessionId, config, fibers: new Map(), watchers: new Map() }
+                // P2-E deletion-race re-check (same window as recoverWorkflow):
+                // the Deleted sweep only removes entries already in `runtimes`,
+                // and getNodes above is an awaited yield a deletion can slip
+                // through. A row cascade-deleted after the first guard must not
+                // be adopted into an inert entry.
+                if (!(yield* DagLocation.ownsWorkflow(dagID, ctx.directory))) return
+                runtimes.set(dagID, entry)
+                yield* automation.register(SessionID.make(wf.sessionId), { kind: "dag", id: dagID })
+                yield* entry.evalLock.withPermits(1)(
+                  Effect.gen(function* () {
+                    yield* spawnReady(dagID)
+                    yield* checkCompletion(dagID)
+                  }),
+                )
+              }).pipe(Effect.ensuring(Effect.sync(() => recovering.delete(dagID))))
             }).pipe(guarded("WorkflowStarted")),
           ),
           Effect.forkScoped({ startImmediately: true }),
