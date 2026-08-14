@@ -1,3 +1,4 @@
+/* oxlint-disable typescript-eslint/no-unsafe-type-assertion -- These wire-shape tests intentionally traverse provider-owned recursive JSON Schema values. */
 import { describe, expect, test } from "bun:test"
 import { Schema } from "effect"
 import { ProviderTransform } from "../../src/provider/transform"
@@ -34,10 +35,6 @@ function branchByAction(schema: JsonSchemaNode, action: string, field: string): 
   return branches(schema).filter(
     (branch) => branch.properties?.action?.enum?.includes(action) && field in (branch.properties ?? {}),
   )
-}
-
-function record(branch: JsonSchemaNode): Record<string, unknown> {
-  return branch.properties ?? {}
 }
 
 describe("workflow tool schema contract", () => {
