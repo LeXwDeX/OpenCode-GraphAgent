@@ -17,6 +17,8 @@ export interface WorkflowRow {
   id: string
   projectId: string
   sessionId: string
+  /** Execution-location key (DAG-LOC-01): the creating instance's directory. */
+  directory: string | null
   title: string
   status: string
   config: string
@@ -83,6 +85,7 @@ const mapWorkflow = (r: typeof WorkflowTable.$inferSelect): WorkflowRow => ({
   id: r.id,
   projectId: r.project_id,
   sessionId: r.session_id,
+  directory: r.directory,
   title: r.title,
   status: r.status,
   config: r.config,

@@ -169,7 +169,7 @@ function runRaceTest<A>(
         id: "ses_parent" as never,
         project_id: "project-1" as never,
         slug: "parent",
-        directory: process.cwd() as never,
+        directory: process.cwd(),
         title: "Parent",
         version: "test",
       }).run().pipe(Effect.orDie)
@@ -264,6 +264,7 @@ describe("DagLoop stepping race window", () => {
                   id: dagID,
                   project_id: "project-1" as never,
                   session_id: "ses_parent" as never,
+                  directory: process.cwd(),
                   title: "Step race",
                   status: "stepping",
                   config: JSON.stringify({ name: "step-race", nodes: [nodeConfig("a"), nodeConfig("b")] }),

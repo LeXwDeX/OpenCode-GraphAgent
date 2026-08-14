@@ -31,6 +31,12 @@ export const WorkflowTable = sqliteTable(
     session_id: text()
       .notNull()
       .references(() => SessionTable.id, { onDelete: "cascade" }),
+    // Execution-location key (DAG-LOC-01): the creating instance's directory,
+    // stamped at dag.create. Only the instance whose directory matches may
+    // adopt, recover, wake, or spawn for this workflow. Nullable: legacy rows
+    // predating the column match no instance (conservative — never adopted
+    // until recreated).
+    directory: text(),
     title: text().notNull(),
     status: text().notNull(),
     config: text().notNull(), // YAML string

@@ -123,6 +123,7 @@ function publishInterruptedCreate(
       config: JSON.stringify({ name: "orphan", nodes: [] }),
       status: "pending",
       timestamp: ts,
+      directory: process.cwd(),
     })
     for (let i = 1; i <= nodeCount; i++) {
       yield* events.publish(DagEvent.NodeRegistered, {
