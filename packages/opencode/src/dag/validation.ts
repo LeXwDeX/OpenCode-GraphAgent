@@ -365,11 +365,7 @@ const FIELD_DRIFT_HINTS: Record<string, string> = {
 
 function driftHint(path: string, message: string) {
   for (const [wrong, right] of Object.entries(FIELD_DRIFT_HINTS)) {
-    if (
-      message.includes(`"${wrong}"`) ||
-      message.includes(`'${wrong}'`) ||
-      new RegExp(`[\\"\[]${wrong}[\\"\]]`).test(path)
-    ) {
+    if (message.includes(`"${wrong}"`) || path.includes(`["${wrong}"]`)) {
       return `Did you mean "${right}"? Every block field is one of id, kind, depends_on, instruction, worker_type, required, report_to_parent; objective lives inside config`
     }
   }
