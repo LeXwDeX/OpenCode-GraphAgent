@@ -414,11 +414,32 @@ describe("session.llm-native.request", () => {
     })
     expect(
       LLMNativeRuntime.status({
-        model: { ...baseModel, providerID: ProviderV2.ID.make("google") },
+        model: {
+          ...baseModel,
+          providerID: ProviderV2.ID.make("google"),
+          api: { ...baseModel.api, npm: "@ai-sdk/google" },
+        },
         provider: { ...providerInfo, id: ProviderV2.ID.make("google") },
         auth: undefined,
       }),
-    ).toEqual({ type: "unsupported", reason: "provider is not openai, opencode, or anthropic" })
+    ).toEqual({
+      type: "unsupported",
+      reason: "provider package is not OpenAI, OpenAI-compatible, or Anthropic",
+    })
+    // The gate keys off the SDK transport package: any OpenAI-compatible
+    // relay (local proxies, DeepSeek, GLM gateways) is supported regardless
+    // of its providerID.
+    expect(
+      LLMNativeRuntime.status({
+        model: {
+          ...baseModel,
+          providerID: ProviderV2.ID.make("local-proxy-compatible"),
+          api: { ...baseModel.api, url: "https://proxy.example.test/v1", npm: "@ai-sdk/openai-compatible" },
+        },
+        provider: { ...providerInfo, id: ProviderV2.ID.make("local-proxy-compatible") },
+        auth: undefined,
+      }),
+    ).toMatchObject({ type: "supported" })
     expect(
       LLMNativeRuntime.status({
         model: baseModel,

@@ -1537,21 +1537,6 @@ export function schema(model: Provider.Model, schema: JSONSchema7): JSONSchema7 
     schema = sanitizeGemini(schema)
   }
 
-  // OpenAI-compatible backends (DeepSeek, GLM, and other relays) reject
-  // function schemas whose root type is implicit — the model emits empty
-  // tool arguments instead of erroring. Effect emits object-only
-  // discriminated unions as a root `anyOf`; retaining the union while
-  // declaring its shared object type preserves every branch.
-  if (
-    model.api.npm === "@ai-sdk/openai-compatible" &&
-    schema.type === undefined &&
-    Array.isArray(schema.anyOf) &&
-    schema.anyOf.length > 0 &&
-    schema.anyOf.every((branch) => isPlainObject(branch) && branch.type === "object")
-  ) {
-    schema = { ...schema, type: "object" }
-  }
-
   return schema
 }
 

@@ -150,4 +150,26 @@ describe("Tool.define", () => {
       expect(args.message).toContain(`["questions"][0]["question"]`)
     }),
   )
+
+  it.effect("rejects a root-combinator parameter schema at construction time", () =>
+    Effect.gen(function* () {
+      const union = yield* Tool.define(
+        "unionroot",
+        Effect.succeed({
+          ...makeTool("unionroot"),
+          parameters: Schema.Union([
+            Schema.Struct({ a: Schema.String }),
+            Schema.Struct({ b: Schema.String }),
+          ]) as never,
+        }),
+      )
+      const exit = yield* Effect.exit(union.init())
+      if (Exit.isSuccess(exit)) throw new Error("expected construction to die")
+      const die = exit.cause.reasons.find(Cause.isDieReason)
+      const message = String(die?.defect)
+      expect(message).toContain("unionroot")
+      expect(message).toContain("plain object")
+      expect(message).toContain("params")
+    }),
+  )
 })
