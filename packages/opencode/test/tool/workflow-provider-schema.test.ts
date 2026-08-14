@@ -15,6 +15,10 @@ const deepseekModel = {
   providerID: "deepseek",
   api: { id: "deepseek-v4-pro", npm: "@ai-sdk/openai-compatible" },
 } as never
+const glmModel = {
+  providerID: "local-proxy",
+  api: { id: "glm-5.3", npm: "@ai-sdk/openai-compatible" },
+} as never
 
 type JsonSchemaNode = {
   anyOf?: JsonSchemaNode[]
@@ -124,6 +128,16 @@ describe("workflow provider-facing schema", () => {
   test("DeepSeek transformation presents the workflow union as an object-root function schema", () => {
     const transformed = ProviderTransform.schema(
       deepseekModel,
+      ToolJsonSchema.fromSchema(Parameters as never),
+    ) as JsonSchemaNode
+    expect(transformed.type).toBe("object")
+    expect(branches(transformed)).toHaveLength(10)
+    expect(branchByAction(transformed, "start", "spec_path")).toHaveLength(1)
+  })
+
+  test("OpenAI-compatible transports (GLM relay) also get the object-root union", () => {
+    const transformed = ProviderTransform.schema(
+      glmModel,
       ToolJsonSchema.fromSchema(Parameters as never),
     ) as JsonSchemaNode
     expect(transformed.type).toBe("object")
