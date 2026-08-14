@@ -106,7 +106,9 @@ Validate that `spec_path` before start. Fix every diagnostic in the same file
 and revalidate; validation creates no workflow. A successful start returns the
 exact workflow ID. The parent owns the graph, controls, and final report;
 children own bounded work. End after start and let the workflow wake the
-parent. Do not poll merely to wait or claim an unstarted graph is running.## Progressive guidance
+parent. Do not poll merely to wait or claim an unstarted graph is running.
+
+## Progressive guidance
 
 `guide` without a topic is the index. Topics: `blocks` for block shape,
 `interface` for low-level fields, `policy` for recovery, and `patterns` for
