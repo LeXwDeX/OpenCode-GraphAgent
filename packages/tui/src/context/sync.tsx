@@ -191,9 +191,12 @@ export const {
     }
 
     function listSessions() {
+      // Store order must stay id-ascending: every session event handler
+      // binary-searches by id (search()). Recency ordering is a display
+      // concern and lives in the session-list dialog.
       return sdk.client.session
         .list({ start: Date.now() - 30 * 24 * 60 * 60 * 1000, ...sessionListQuery() })
-        .then((x) => (x.data ?? []).toSorted((a, b) => b.time.updated - a.time.updated))
+        .then((x) => (x.data ?? []).toSorted((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)))
     }
 
     event.subscribe((event, { workspace }) => {
