@@ -13,6 +13,16 @@ GraphAgent is the product name for this project; the repository is published as
 the DAG workflow engine. **Not affiliated with or endorsed by the OpenCode
 team.**
 
+> [!IMPORTANT]
+> **GraphAgent v1 is in focused maintenance.** Maintenance is limited to DAG
+> configuration, curated workflow templates, and reproducible defects reported
+> through [GitHub Issues](https://github.com/LeXwDeX/OpenCode-GraphAgent/issues).
+> Architecture defects that affect stability, data integrity, or the core DAG
+> experience will receive narrowly scoped compatibility patches; v1 will not
+> take new platform features or large foundational refactors. A successor
+> project will redesign the runtime independently, without extending v1's
+> compatibility constraints.
+
 ---
 
 ## Graph engineering, before it had a name
