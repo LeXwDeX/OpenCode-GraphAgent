@@ -301,7 +301,10 @@ const serviceLayer = Layer.effect(
           // cancellation handler can reach this point before WorkflowReplanned
           // rebuilds the in-memory graph. Durable active nodes prove that the
           // apparent completion belongs to an obsolete graph generation.
-          const nodes = yield* store.getNodes(dagID)
+          // Rev-view (v1.0.15 Train A): the guard read filters to the current
+          // revision — superseded rows are terminal and never trip the guard,
+          // and the review-outcome input below must judge only current nodes.
+          const nodes = yield* store.getCurrentNodes(dagID)
           const hasUnseenActiveNode = nodes.some(
             (node) => !isNodeTerminalStatus(node.status as never) && !entry.runtime.containsNode(node.id),
           )
@@ -419,7 +422,12 @@ const serviceLayer = Layer.effect(
                 ownershipLost: recovery.ownershipLost,
               })
             }
-            const nodes = yield* store.getNodes(dagID)
+            // Rev-view (v1.0.15 Train A): the recovery runtime rebuilds from
+            // the CURRENT graph revision — a crash must not revive the
+            // replaced segment's failures (same rebuild input as the
+            // WorkflowReplanned handler). Durable truth (the unfiltered read
+            // in recovery reconcile above) is untouched.
+            const nodes = yield* store.getCurrentNodes(dagID)
             const maxConcurrency = Math.max(1, config?.max_concurrency ?? Dag.DEFAULT_WORKFLOW_CONFIG.maxConcurrency)
             const runtime = new WorkflowRuntime(toSchedulingNodes(nodes), maxConcurrency)
             const semaphore = Semaphore.makeUnsafe(maxConcurrency)
@@ -549,7 +557,10 @@ const serviceLayer = Layer.effect(
                 // directory contexts.
                 if (!(yield* DagLocation.ownsWorkflow(dagID, ctx.directory))) return
                 const config = parseWorkflowConfig(wf.config)
-                const nodes = yield* store.getNodes(dagID)
+                // Rev-view (v1.0.15 Train A): same current-revision rebuild
+                // input as recoverWorkflow — adoption must not resurrect the
+                // replaced segment's failures either.
+                const nodes = yield* store.getCurrentNodes(dagID)
                 const maxConcurrency = Math.max(1, config?.max_concurrency ?? Dag.DEFAULT_WORKFLOW_CONFIG.maxConcurrency)
                 const runtime = new WorkflowRuntime(toSchedulingNodes(nodes), maxConcurrency)
                 const semaphore = Semaphore.makeUnsafe(maxConcurrency)
@@ -848,7 +859,15 @@ const serviceLayer = Layer.effect(
                   const wf = yield* store.getWorkflow(dagID).pipe(Effect.orDie)
                   const oldConfig = entry.config
                   if (wf) entry.config = parseWorkflowConfig(wf.config)
-                  const nodes = yield* store.getNodes(dagID)
+                  // Rev-view (v1.0.15 Train A): THE aggregation filter point.
+                  // The rebuild input is the CURRENT graph revision only —
+                  // superseded rows (cancelled via replan, or terminal
+                  // failures the fragment bypassed) must not re-seed as
+                  // required-unsatisfied, or the wake-up bug fails a workflow
+                  // on its replaced segment despite the new path succeeding.
+                  // The re-time loop below only sees running rows (superseded
+                  // rows are terminal), so the filter changes nothing there.
+                  const nodes = yield* store.getCurrentNodes(dagID)
                   entry.runtime.rebuildGraph(toSchedulingNodes(nodes))
                   // Timeout extension (Q6): a running node gets a recomputed
                   // deadline (now + new timeout) ONLY when the replan carries a
@@ -1231,7 +1250,11 @@ const serviceLayer = Layer.effect(
               const failuresByWorkflow = new Map<string, string[]>()
               for (const workflow of batch.workflows) {
                 if (workflow.status !== "failed") continue
-                const failedNodes = yield* store.getNodes(workflow.id).pipe(
+                // Rev-view (v1.0.15 Train A): attribution is terminal
+                // aggregation — only CURRENT-revision failures are attributed.
+                // Superseded replaced failures (cancelled rows already fall
+                // out via errorClass null) must not be re-attributed.
+                const failedNodes = yield* store.getCurrentNodes(workflow.id).pipe(
                   Effect.map((nodes) => nodes.filter((node): node is DagStore.NodeRow & { errorClass: string } => node.status === "failed" && node.errorClass !== null)),
                   Effect.catchCause((cause) =>
                     Effect.gen(function* () {

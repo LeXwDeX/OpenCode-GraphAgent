@@ -118,6 +118,13 @@ describe("Train A rev-view — legacy rows render unchanged (A-p4 PIN)", () => {
         const cancelled = rows.find((r) => r.id === "old_cancelled")!
         expect(cancelled.status).toBe("failed")
         expect(cancelled.errorReason).toBe("cancelled via replan")
+
+        // Migration defaults (the legacy policy itself): rows that predate the
+        // feature carry superseded=false, and the workflow carries graph_rev=1.
+        // Any other default would change the rendering pinned above.
+        expect(rows.every((r) => !r.superseded)).toBe(true)
+        const wf = yield* store.getWorkflow("wf-legacy")
+        expect(wf?.graphRev).toBe(1)
       }).pipe(Effect.provide(storeLayer()), Effect.scoped),
     )
   })

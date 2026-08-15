@@ -47,6 +47,11 @@ export const WorkflowTable = sqliteTable(
     config: text().notNull(), // YAML string
     seq: integer().notNull(), // latest durable event seq
     wake_reported: integer({ mode: "boolean" }).notNull().default(false), // D3: has workflow terminal been reported to parent?
+    // Rev-view (v1.0.15 Train A): the current graph-revision counter. Bumped
+    // by the WorkflowReplanned projection; audit/telemetry only — the view
+    // predicate is the per-node `superseded` marker below. Default 1: legacy
+    // rows predate the concept and render exactly as before.
+    graph_rev: integer().notNull().default(1),
     started_at: integer(),
     completed_at: integer(),
     ...Timestamps,
@@ -84,6 +89,13 @@ export const WorkflowNodeTable = sqliteTable(
     replan_attempts: integer().notNull().default(0), // D4: per-node replan counter for circuit breaker
     timeout_extensions: integer().notNull().default(0), // timeout escalation count (node stays running; main agent adjudicates)
     escalation_pending: integer({ mode: "boolean" }).notNull().default(false), // set on escalate, cleared on adjudication (extend) or new attempt — "awaiting main-agent adjudication"
+    // Rev-view (v1.0.15 Train A): this node was pushed OUT of the current
+    // graph revision by a replan (cancelled via replan, or a terminal row the
+    // fragment bypassed). Durable data is untouched — the marker only filters
+    // VIEW/aggregation reads (summaries, status, node lists, rebuild input,
+    // wake attribution) to the current revision. Monotonic: once true, stays
+    // true. Default false: legacy rows render exactly as before.
+    superseded: integer({ mode: "boolean" }).notNull().default(false),
     seq: integer().notNull(), // latest durable event seq for this node
     started_at: integer(),
     completed_at: integer(),

@@ -129,7 +129,11 @@ export const dagHandlers = HttpApiBuilder.group(InstanceHttpApi, "dag", (handler
 
     const nodes = Effect.fn("DagHttpApi.nodes")(function* (ctx: { params: { dagID: string } }) {
       yield* requireWorkflow(ctx.params.dagID)
-      const rows = yield* dag.store.getNodes(ctx.params.dagID).pipe(Effect.orDie)
+      // Rev-view (v1.0.15 Train A): the TUI node list is a view seam — it
+      // renders the CURRENT graph revision only (zero TUI changes: the
+      // server filters). nodeDetail below keeps the unfiltered read so a
+      // superseded node's durable state stays auditable by id.
+      const rows = yield* dag.store.getCurrentNodes(ctx.params.dagID).pipe(Effect.orDie)
       return rows.map(node)
     })
 

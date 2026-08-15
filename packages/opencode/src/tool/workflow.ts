@@ -445,7 +445,10 @@ export const WorkflowTool = Tool.define<
             }
             case "status": {
               const workflow = yield* requireOwnedWorkflow(params.workflow_id, ctx.sessionID)
-              const nodes = yield* dag.store.getNodes(params.workflow_id).pipe(Effect.orDie)
+              // Rev-view (v1.0.15 Train A): status is a view seam — it shows
+              // the CURRENT graph revision only. Superseded replaced segments
+              // stay reachable via the result seam (getNode is unfiltered).
+              const nodes = yield* dag.store.getCurrentNodes(params.workflow_id).pipe(Effect.orDie)
               const config = Dag.parseWorkflowConfig(workflow.config)
               return {
                 title: `Workflow status: ${workflow.title}`,

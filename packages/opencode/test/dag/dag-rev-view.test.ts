@@ -332,6 +332,15 @@ describe("Train A rev-view (durable data untouched, view = current revision only
           expect(d.status).toBe("failed")
           expect(d.errorReason).toBe("cancelled via replan")
 
+          // MARKER level: the replaced segment carries the superseded flag and
+          // the workflow bumped its graph revision — while current-rev rows
+          // (completed A, B; added E) stay unmarked.
+          expect((yield* store.getNode(dagID, "c"))?.superseded).toBe(true)
+          expect((yield* store.getNode(dagID, "d"))?.superseded).toBe(true)
+          expect((yield* store.getNode(dagID, "a"))?.superseded).toBe(false)
+          expect((yield* store.getNode(dagID, "e"))?.superseded).toBe(false)
+          expect((yield* store.getWorkflow(dagID))?.graphRev).toBe(2)
+
           // Complete the new path (and Z). The workflow must COMPLETE — not
           // fail on the replaced required failures.
           const gateE = yield* takeWithin(childPrompts, "e did not start after replan")
@@ -436,6 +445,8 @@ describe("Train A rev-view (durable data untouched, view = current revision only
           // Bypass the failure with G; C becomes the replaced segment.
           const plan = yield* dag.replan(dagID, { nodes: [node("g", ["b"])] })
           expect(plan.add).toEqual(["g"])
+          expect((yield* store.getNode(dagID, "c"))?.superseded).toBe(true)
+          expect((yield* store.getNode(dagID, "g"))?.superseded).toBe(false)
 
           // G fails genuinely — the current revision's true failure.
           const gateG = yield* takeWithin(childPrompts, "g did not start after replan")
