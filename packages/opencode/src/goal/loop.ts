@@ -242,6 +242,26 @@ const serviceLayer = Layer.effect(
       // newer revision). If this process already evaluated the CURRENT
       // revision, the scan trigger is stale — skip.
       if (scanResume && evaluatedRevisions.get(sessionID) === (goalState.revision ?? 0)) return
+      // issue #285 — durable boundary gate (scan path only). The
+      // evaluatedRevisions map above is process-local and dies with the
+      // process; the goal row's last_judged_msg is the crash-surviving record
+      // of which boundary was already judged and committed. While the session
+      // window still ends on that same message, no new progress has landed —
+      // re-judging would inflate turns_used and dispatch a duplicate
+      // continuation. Live idle events are never gated here: every dispatched
+      // continuation produces a fresh assistant message, so the live path
+      // always judges a new boundary.
+      if (scanResume && goalState.last_judged_msg) {
+        const win = yield* sessions
+          .messages({ sessionID, limit: 20 })
+          .pipe(
+            Effect.catchIf((e) => NotFoundError.isInstance(e), () =>
+              Effect.succeed([] as SessionV1.WithParts[]),
+            ),
+          )
+        const lastSeen = [...win].reverse().find((m) => m.info.role === "assistant")
+        if (lastSeen && lastSeen.info.id === goalState.last_judged_msg) return
+      }
       const goalOwner = { kind: "goal" as const, id: goalState.goal_id ?? "legacy" }
       yield* automation.register(sessionID, goalOwner)
       const observedLease = Option.getOrUndefined(yield* automation.claim(sessionID, goalOwner))
@@ -363,6 +383,7 @@ const serviceLayer = Layer.effect(
               goalID: goalState.goal_id ?? "legacy",
               revision: goalState.revision ?? 0,
             },
+            lastAssistant.info.id,
           ),
         ),
       )
