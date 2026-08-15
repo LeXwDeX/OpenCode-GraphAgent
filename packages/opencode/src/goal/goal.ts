@@ -1,6 +1,6 @@
 export * as Goal from "./goal"
 
-import { Effect, Layer, Context, Schema, Fiber } from "effect"
+import { Effect, Layer, Context, Schema, Fiber, Cause, Exit } from "effect"
 import { desc, eq, sql } from "drizzle-orm"
 import { SessionTable } from "@opencode-ai/core/session/sql"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
@@ -227,22 +227,39 @@ const serviceLayer = Layer.effect(
       return GoalPrompts.GOAL_TURN_MAX_STEPS
     })
 
-    // ESC-on-goal-turn: durable pause + lease release + mark clear, failure-
-    // absorbed. Called from SessionPrompt.cancel so a user ESC on a goal turn
-    // pauses the goal instead of letting the post-cancel idle event resurrect
-    // it with an unwanted continuation.
+    // ESC-on-goal-turn: durable pause + lease release + mark clear. Called
+    // from SessionPrompt.cancel so a user ESC on a goal turn pauses the goal
+    // instead of letting the post-cancel idle event resurrect it with an
+    // unwanted continuation.
+    //
+    // GOAL-FP-01-19: a transient DB failure must not silently lose the pause
+    // — the mark would clear, the pause never persist, and the next idle
+    // would resurrect the goal against the user's explicit intent
+    // (shouldPreempt cannot catch it: ESC adds no user message). Retry the
+    // pause twice with a short backoff; if it still fails, log LOUDLY — the
+    // goal may resurrect, but it will never do so invisibly.
     const pauseForUserCancel = Effect.fnUntraced(function* (sessionID: SessionID, reason: string) {
-      const paused = yield* pauseAndPublish(sessionID, reason).pipe(
-        Effect.catchCause((cause) =>
-          Effect.logWarning("goal pause on cancel failed", { sessionID, cause: String(cause) }).pipe(
-            Effect.as(undefined),
-          ),
-        ),
-      )
-      if (paused)
+      let paused: GoalState.Info | undefined
+      let lastCause: Cause.Cause<never> | undefined
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const exit = yield* pauseAndPublish(sessionID, reason).pipe(Effect.exit)
+        if (Exit.isSuccess(exit)) {
+          paused = exit.value
+          break
+        }
+        lastCause = exit.cause
+        if (attempt < 2) yield* Effect.sleep("50 millis")
+      }
+      if (paused) {
         yield* automation.unregister(sessionID, { kind: "goal", id: paused.goal_id ?? "legacy" }).pipe(
           Effect.ignore,
         )
+      } else {
+        yield* Effect.logError(
+          "goal pause on cancel failed after retries — goal may resurrect on next idle",
+          { sessionID, cause: lastCause ? Cause.pretty(lastCause) : "unknown" },
+        )
+      }
       turnDriven.delete(sessionID)
       return paused
     })

@@ -3,7 +3,6 @@ import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Effect, Layer } from "effect"
 import { HttpClientResponse } from "effect/unstable/http"
 import { Session as SessionNs } from "@/session/session"
-import { MessageV2 } from "../../src/session/message-v2"
 
 import { MessageID, PartID, type SessionID } from "../../src/session/schema"
 import { disposeAllInstances, TestInstance } from "../fixture/fixture"

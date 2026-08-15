@@ -2,6 +2,7 @@ import { describe, expect } from "bun:test"
 import { Cause, Deferred, Effect, Exit, Layer, Option } from "effect"
 import { GoalLoop, GoalLoopJudgeLLM } from "@/goal/loop"
 import { Goal } from "@/goal/goal"
+import { NotFoundError } from "@/storage/storage"
 import { GoalEvent } from "@/goal/events"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { SessionStatus } from "@/session/status"
@@ -1587,6 +1588,208 @@ describe("GoalLoop — startup scan scoping and hardening (GOAL-FP-01-04 follow-
       // The single-writer commit point (matchesExpected + record gate) must
       // yield exactly ONE commit for the boundary — not two.
       expect(Number(g?.turns_used)).toBe(1)
+    }),
+  )
+})
+
+// GOAL-FP-01-17 regression suite: every messages-window read in afterIdle
+// that fails with storage NotFoundError (session row gone mid-goal, or a
+// synthetic session) must degrade to an empty window — never a typed failure
+// escaping the fork. Before the fix the pre-judge window escaped into the
+// fork's catch and left the goal permanently "active" with zero logs.
+describe("GoalLoop — NotFoundError messages window pauses instead of stalling (GOAL-FP-01-17)", () => {
+  let judgeCalls = 0
+  const sessionMock = Layer.mock(Session.Service, {
+    messages: () => Effect.fail(new NotFoundError({ message: "Session not found" })),
+  })
+  const promptMock = Layer.mock(SessionPrompt.Service, {
+    // The pause branch only delivers a noReply transcript line; die() proves
+    // the pause happened without needing a cast for a full WithParts value.
+    prompt: () => Effect.die(new Error("unreachable outside the pause branch")),
+  })
+  const providerMock = Layer.mock(Provider.Service, {})
+  const judgeMock = Layer.succeed(
+    GoalLoopJudgeLLM,
+    GoalLoopJudgeLLM.of({
+      call: () =>
+        Effect.sync(() => {
+          judgeCalls += 1
+          return JSON.stringify({ verdict: "done", reason: "must never run" })
+        }),
+    }),
+  )
+
+  const nfLayer = GoalLoop.layer.pipe(
+    Layer.provide(sessionMock),
+    Layer.provide(promptMock),
+    Layer.provide(providerMock),
+    Layer.provide(judgeMock),
+    Layer.provideMerge(Goal.defaultLayer),
+    Layer.provide(SessionStatus.defaultLayer),
+    Layer.provideMerge(EventV2Bridge.defaultLayer),
+  )
+  const it = testEffect(nfLayer)
+
+  it.instance("idle with a NotFoundError messages window pauses the goal visibly", () =>
+    Effect.gen(function* () {
+      judgeCalls = 0
+      const loop = yield* GoalLoop.Service
+      const goal = yield* Goal.Service
+      const events = yield* EventV2Bridge.Service
+
+      yield* loop.init()
+      const sid = SessionID.descending()
+      yield* goal.set(sid, "vanished-session tolerance", 5)
+      yield* Effect.yieldNow
+
+      yield* events.publish(SessionStatus.Event.Status, { sessionID: sid, status: { type: "idle" } })
+
+      const paused = yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const g = yield* goal.load(sid)
+          return g && g.status === "paused" ? g : undefined
+        }),
+        "goal never paused after a NotFoundError messages window — typed failure escaped the fork",
+        "5 seconds",
+      )
+      expect(paused.paused_reason).toContain("无 assistant 回复")
+      // The window must short-circuit before the judge ever runs.
+      expect(judgeCalls).toBe(0)
+    }),
+  )
+})
+
+// GOAL-FP-01-18: the post-judge reload window (freshMsgs) needs the same
+// tolerance — a session row deleted during the 5-30s judge latency must not
+// stall a goal whose turn already committed. The evaluation proceeds to the
+// continuation branch (shouldPreempt is defensively false on an empty window).
+describe("GoalLoop — NotFoundError on the post-judge reload must not stall (GOAL-FP-01-18)", () => {
+  let messageCall = 0
+  const sessionMock = Layer.mock(Session.Service, {
+    messages: () =>
+      Effect.suspend(() => {
+        messageCall += 1
+        return messageCall === 1
+          ? Effect.succeed([mkAssistant()])
+          : Effect.fail(new NotFoundError({ message: "Session not found" }))
+      }),
+  })
+  const promptMock = Layer.mock(SessionPrompt.Service, {
+    prompt: () => Effect.die(new Error("unreachable - paused branch not expected")),
+    prepareIfIdle: () => Effect.succeed(Option.none()),
+  })
+  const providerMock = Layer.mock(Provider.Service, {})
+  const judgeMock = Layer.succeed(
+    GoalLoopJudgeLLM,
+    GoalLoopJudgeLLM.of({
+      call: () => Effect.succeed(JSON.stringify({ verdict: "continue", reason: "more work" })),
+    }),
+  )
+
+  const reloadLayer = GoalLoop.layer.pipe(
+    Layer.provide(sessionMock),
+    Layer.provide(promptMock),
+    Layer.provide(providerMock),
+    Layer.provide(judgeMock),
+    Layer.provideMerge(Goal.defaultLayer),
+    Layer.provide(SessionStatus.defaultLayer),
+    Layer.provideMerge(EventV2Bridge.defaultLayer),
+  )
+  const it = testEffect(reloadLayer)
+
+  it.instance("a vanished session during judge still commits the turn", () =>
+    Effect.gen(function* () {
+      messageCall = 0
+      const loop = yield* GoalLoop.Service
+      const goal = yield* Goal.Service
+      const events = yield* EventV2Bridge.Service
+
+      yield* loop.init()
+      const sid = SessionID.descending()
+      yield* goal.set(sid, "post-judge reload tolerance", 5)
+      yield* Effect.yieldNow
+
+      yield* events.publish(SessionStatus.Event.Status, { sessionID: sid, status: { type: "idle" } })
+
+      const committed = yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const g = yield* goal.load(sid)
+          return g && g.turns_used >= 1 ? g : undefined
+        }),
+        "turn never committed — the post-judge reload failure escaped",
+        "5 seconds",
+      )
+      expect(committed.turns_used).toBe(1)
+      expect(committed.status).toBe("active")
+      expect(messageCall).toBeGreaterThanOrEqual(2)
+    }),
+  )
+})
+
+// GOAL-FP-01-18b: the judge chain must survive DEFECTS, not just typed
+// failures. The production callLLM path (provider.defaultModel → small-model
+// resolution → getLanguage → generateText) can defect (config orDie, payload
+// decode throws); a defect escaping into the fork was the invisible 0-turn
+// stall class. catchCause folds it into the parseFailed budget so the loop
+// commits the turn and auto-pauses after MAX_CONSECUTIVE_PARSE_FAILURES.
+describe("GoalLoop — judge-chain defect degrades into the parse budget (GOAL-FP-01-18b)", () => {
+  let judgeCalls = 0
+  const sessionMock = Layer.mock(Session.Service, {
+    messages: () => Effect.succeed([mkAssistant()]),
+  })
+  const promptMock = Layer.mock(SessionPrompt.Service, {
+    prompt: () => Effect.die(new Error("unreachable - paused branch not expected")),
+    prepareIfIdle: () => Effect.succeed(Option.none()),
+  })
+  const providerMock = Layer.mock(Provider.Service, {})
+  const judgeMock = Layer.succeed(
+    GoalLoopJudgeLLM,
+    GoalLoopJudgeLLM.of({
+      call: () =>
+        Effect.sync(() => {
+          judgeCalls += 1
+        }).pipe(Effect.flatMap(() => Effect.die(new Error("simulated provider-chain defect")))),
+    }),
+  )
+
+  const defectLayer = GoalLoop.layer.pipe(
+    Layer.provide(sessionMock),
+    Layer.provide(promptMock),
+    Layer.provide(providerMock),
+    Layer.provide(judgeMock),
+    Layer.provideMerge(Goal.defaultLayer),
+    Layer.provide(SessionStatus.defaultLayer),
+    Layer.provideMerge(EventV2Bridge.defaultLayer),
+  )
+  const it = testEffect(defectLayer)
+
+  it.instance("a defecting judge commits the turn and counts a parse failure", () =>
+    Effect.gen(function* () {
+      judgeCalls = 0
+      const loop = yield* GoalLoop.Service
+      const goal = yield* Goal.Service
+      const events = yield* EventV2Bridge.Service
+
+      yield* loop.init()
+      const sid = SessionID.descending()
+      yield* goal.set(sid, "judge defect tolerance", 5)
+      yield* Effect.yieldNow
+
+      yield* events.publish(SessionStatus.Event.Status, { sessionID: sid, status: { type: "idle" } })
+
+      const committed = yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const g = yield* goal.load(sid)
+          return g && g.turns_used >= 1 ? g : undefined
+        }),
+        "turn never committed — the judge defect escaped the fork",
+        "5 seconds",
+      )
+      expect(judgeCalls).toBe(1)
+      expect(committed.turns_used).toBe(1)
+      expect(committed.consecutive_parse_failures).toBe(1)
+      // First defect is a blip: verdict stays continue, goal keeps running.
+      expect(committed.status).toBe("active")
     }),
   )
 })

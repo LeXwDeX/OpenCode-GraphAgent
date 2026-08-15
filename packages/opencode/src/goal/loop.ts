@@ -1,6 +1,7 @@
 export * as GoalLoop from "./loop"
 
 import { Effect, Layer, Context, Option, Stream, Scope, Fiber, Cause } from "effect"
+import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { InstanceState } from "@/effect/instance-state"
 import { EventV2Bridge } from "@/event-v2-bridge"
@@ -14,6 +15,7 @@ import { GoalPrompts } from "./prompts"
 import { generateText } from "ai"
 import { SessionID } from "@/session/schema"
 import { SessionAutomationLease } from "@/session/automation-lease"
+import { NotFoundError } from "@/storage/storage"
 
 export interface Interface {
   readonly init: () => Effect.Effect<void>
@@ -148,12 +150,12 @@ const serviceLayer = Layer.effect(
               yield* triggerEvaluation(sid)
               // P2-B subscription survival: this handler now contains the
               // first defect-capable durable reads in the goal idle path
-              // (Goal.ownsSession / goal.load both orDie). Effect.ignore does
-              // NOT absorb defects — a transient store failure would
-              // permanently kill the runForEach subscription and the loop
-              // would never evaluate another idle event. catchCause absorbs
-              // failures AND defects at the boundary, so a store defect
-              // degrades to a logged, skipped evaluation — never a dead loop.
+              // (Goal.ownsSession / goal.load both orDie). In effect v4,
+              // Effect.ignore absorbs failures, defects AND interruptions —
+              // an error here would vanish without a trace, leaving skipped
+              // evaluations permanently invisible. catchCause keeps the same
+              // absorption but LOGS at the boundary, so a store defect
+              // degrades to a logged, skipped evaluation — never a silent one.
             }).pipe(
               Effect.catchCause((cause) =>
                 Effect.logWarning("GoalLoop idle handler failed", { sessionID: evt.data.sessionID, cause }),
@@ -263,7 +265,13 @@ const serviceLayer = Layer.effect(
         goalState.turns_used === 0 &&
         Date.now() - goalState.created_at > GoalPrompts.FRESHNESS_THRESHOLD
       ) {
-        const probeMsgs = yield* sessions.messages({ sessionID, limit: 1 })
+        const probeMsgs = yield* sessions
+          .messages({ sessionID, limit: 1 })
+          .pipe(
+            Effect.catchIf((e) => NotFoundError.isInstance(e), () =>
+              Effect.succeed([] as SessionV1.WithParts[]),
+            ),
+          )
         const hasAssistant = probeMsgs.some((m) => m.info.role === "assistant")
         if (isStaleZombie(goalState, hasAssistant)) {
           yield* pauseGoal(
@@ -274,7 +282,18 @@ const serviceLayer = Layer.effect(
         }
       }
 
-      const msgs = yield* sessions.messages({ sessionID, limit: 20 })
+      // A session whose row is gone (deleted mid-goal, or a synthetic
+      // session) fails page() with NotFoundError. Treat it as an empty window
+      // (same pattern as MessageV2.stream) so the no-lastAssistant branch
+      // below pauses visibly instead of this typed failure escaping and
+      // leaving the goal permanently "active".
+      const msgs = yield* sessions
+        .messages({ sessionID, limit: 20 })
+        .pipe(
+          Effect.catchIf((e) => NotFoundError.isInstance(e), () =>
+            Effect.succeed([] as SessionV1.WithParts[]),
+          ),
+        )
       const lastAssistant = [...msgs].reverse().find((m) => m.info.role === "assistant")
       if (!lastAssistant) {
         // No assistant message in the last 20 — the conversation may have
@@ -391,7 +410,14 @@ const serviceLayer = Layer.effect(
             sessionID,
             noReply: true,
             parts: [{ type: "text", text: updateResult.message }],
-          }).pipe(Effect.ignore)
+          }).pipe(
+            Effect.catchCause((cause) =>
+              Effect.logWarning("goal pause message delivery failed", {
+                sessionID,
+                cause: Cause.pretty(cause),
+              }),
+            ),
+          )
         }
         return
       }
@@ -409,8 +435,17 @@ const serviceLayer = Layer.effect(
       }
 
       // Reload messages after judge LLM call — the snapshot from before judge
-      // may be stale if user sent messages during the 5-30s judge latency
-      const freshMsgs = yield* sessions.messages({ sessionID, limit: 20 })
+      // may be stale if user sent messages during the 5-30s judge latency.
+      // Same vanished-session tolerance as the pre-judge window: NotFoundError
+      // becomes an empty window (shouldPreempt is defensively false for it),
+      // never a typed failure escaping the fork.
+      const freshMsgs = yield* sessions
+        .messages({ sessionID, limit: 20 })
+        .pipe(
+          Effect.catchIf((e) => NotFoundError.isInstance(e), () =>
+            Effect.succeed([] as SessionV1.WithParts[]),
+          ),
+        )
 
       if (shouldPreempt(freshMsgs)) {
         // Same self-interrupt hazard as the done branch above: we ARE the
@@ -561,7 +596,20 @@ const serviceLayer = Layer.effect(
       // afterIdle re-checks at its own entry load (see there) to close the
       // window between this load and the fork.
       if (scanResume && evaluatedRevisions.get(sessionID) === (goalState.revision ?? 0)) return
-      const fiber = yield* afterIdle(sessionID, scanResume).pipe(Effect.ignore, Effect.forkIn(scope))
+      // GOAL-FP-01-17: never Effect.ignore here. A typed failure escaping
+      // afterIdle (e.g. a messages read against a vanished session row) used
+      // to vanish into ignore and left the goal permanently "active" with
+      // zero logs — an invisible stall. Interrupts (fiber replacement by a
+      // newer idle, scope disposal) stay silent: they are the normal
+      // overwrite path, same F1 discipline as the continuation catch below.
+      const fiber = yield* afterIdle(sessionID, scanResume).pipe(
+        Effect.catchCause((cause) =>
+          Cause.hasInterrupts(cause)
+            ? Effect.void
+            : Effect.logWarning("goal afterIdle failed", { sessionID, cause: Cause.pretty(cause) }),
+        ),
+        Effect.forkIn(scope),
+      )
       yield* goal.registerLoopFiber(sessionID, fiber)
       yield* Fiber.await(fiber).pipe(
         Effect.flatMap(() => goal.clearLoopFiberIf(sessionID, fiber)),
