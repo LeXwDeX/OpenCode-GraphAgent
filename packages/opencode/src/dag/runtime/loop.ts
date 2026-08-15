@@ -9,6 +9,7 @@ import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { InstanceState } from "@/effect/instance-state"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { DagEvent } from "@opencode-ai/schema/dag-event"
+import { SessionEvent } from "@opencode-ai/schema/session-event"
 import { SessionStatusEvent } from "@opencode-ai/schema/session-status-event"
 import { DagStore } from "@opencode-ai/core/dag/store"
 import { DagLocation } from "../location"
@@ -1388,6 +1389,52 @@ const serviceLayer = Layer.effect(
                 )
               }
             }).pipe(guarded("SessionDeleted")),
+          ),
+          Effect.forkScoped({ startImmediately: true }),
+        )
+
+        // #269 SessionMoved ownership convergence: the Moved projection
+        // (core session projector) re-stamps the session's workflow rows to the
+        // destination directory in the SAME durable transaction, so by the time
+        // this handler runs the durable rows already agree on ONE directory.
+        // Converge the in-memory side: (a) the instance that no LONGER owns the
+        // moved session's workflows evicts its stale runtime entries (fail-closed
+        // — its directory must not keep acting on them), and (b) the NEW owner
+        // re-forks the serialized wake drain so a terminal wake that was wedged
+        // behind the old mixed stamps delivers immediately (bounded time) instead
+        // of waiting for a fresh idle event or a restart.
+        yield* events.subscribe(SessionEvent.Moved).pipe(
+          Stream.runForEach((evt) =>
+            Effect.gen(function* () {
+              const sessionID = evt.data.sessionID as string
+              // Map iteration is mutation-safe for deletions of visited entries —
+              // only entries of THIS session are deleted, each inside its own
+              // evalLock. Evict only entries the re-stamp moved AWAY from this
+              // instance (ownsWorkflow re-reads the durable row).
+              for (const [dagID, entry] of runtimes) {
+                if (entry.parentSessionID !== sessionID) continue
+                if (yield* DagLocation.ownsWorkflow(dagID, ctx.directory)) continue
+                yield* entry.evalLock.withPermits(1)(
+                  Effect.gen(function* () {
+                    for (const [nodeID, fiber] of entry.fibers) {
+                      const node = yield* store.getNode(dagID, nodeID)
+                      yield* abortChild(nodeID, node?.childSessionId ?? null).pipe(Effect.ignore)
+                      yield* Fiber.interrupt(fiber).pipe(Effect.ignore)
+                      const watcher = entry.watchers.get(nodeID)
+                      if (watcher) yield* Fiber.interrupt(watcher).pipe(Effect.ignore)
+                    }
+                    entry.fibers.clear()
+                    entry.watchers.clear()
+                    runtimes.delete(dagID)
+                  }),
+                )
+              }
+              // New owner: the re-stamp moved ownership HERE, so wake rows that
+              // were wedged (mixed stamps → no owner) are now deliverable.
+              if (yield* DagLocation.ownsSession(sessionID, ctx.directory)) {
+                yield* tryDeliverWake(sessionID).pipe(Effect.ignore, Effect.forkScoped)
+              }
+            }).pipe(guarded("SessionMoved")),
           ),
           Effect.forkScoped({ startImmediately: true }),
         )

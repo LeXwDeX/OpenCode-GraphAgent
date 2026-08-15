@@ -39,12 +39,16 @@ import type { SessionV1 } from "@opencode-ai/core/v1/session"
 import { SessionV1 as SessionV1Events } from "@opencode-ai/core/v1/session"
 import { Database } from "@opencode-ai/core/database/database"
 import { DagProjector } from "@opencode-ai/core/dag/projector"
+import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { WorkflowTable, WorkflowNodeTable } from "@opencode-ai/core/dag/sql"
+import workflowDirectoryConvergence from "@opencode-ai/core/database/migration/20260815083000_workflow_directory_convergence"
 import { DagStore } from "@opencode-ai/core/dag/store"
 import { EventV2 } from "@opencode-ai/core/event"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
 import { SessionTable } from "@opencode-ai/core/session/sql"
 import { DagEvent } from "@opencode-ai/schema/dag-event"
+import { Location } from "@opencode-ai/schema/location"
+import { SessionEvent } from "@opencode-ai/schema/session-event"
 import { SessionStatusEvent } from "@opencode-ai/schema/session-status-event"
 import { Agent } from "@/agent/agent"
 import { Dag, type NodeConfig } from "@/dag/dag"
@@ -111,6 +115,24 @@ function reply(sessionID: string, text: string): SessionV1.WithParts {
     },
     parts: [{ type: "text", text }],
   } as never
+}
+
+/**
+ * Publish the durable SessionEvent.Moved that the control-plane's move-session
+ * publishes. The session projector's Moved projection re-stamps every workflow
+ * row of the session in the SAME transaction (payload-sourced, no SessionTable
+ * read) — the #269 atomic-adoption transition under test.
+ */
+function moveSession(bridge: EventV2.Interface, sessionID: string, directory: string): Effect.Effect<void> {
+  return Effect.gen(function* () {
+    yield* bridge
+      .publish(SessionEvent.Moved, {
+        sessionID: sessionID as never,
+        location: Location.Ref.make({ directory: directory as never }),
+        timestamp: yield* DateTime.now,
+      })
+      .pipe(Effect.orDie)
+  })
 }
 
 // ---------------------------------------------------------------------------
@@ -198,11 +220,19 @@ function twoInstanceLayer(input: TwoInstanceInput) {
     Layer.provide(events),
     Layer.provide(database),
   )
+  // The session projector runs the SessionEvent.Moved projection (session row
+  // + workflow directory re-stamp — the #269 atomic-adoption transition), so
+  // publishing Moved through the bridge converges the workflow stamps in the
+  // same durable transaction, exactly as production.
+  const sessionProjector = SessionProjector.layer.pipe(
+    Layer.provide(events),
+    Layer.provide(database),
+  )
   const dag = Dag.layer.pipe(
     Layer.provide(bridge),
     Layer.provide(store),
   )
-  const base = Layer.mergeAll(database, events, bridge, store, projector, dag, status)
+  const base = Layer.mergeAll(database, events, bridge, store, projector, sessionProjector, dag, status)
   const childTitles = new Map<string, string>()
   const created: string[] = []
   const session = Layer.mock(Session.Service, {
@@ -1350,11 +1380,11 @@ describe("DAG-LOC-01 issue #238 evidence probes", () => {
     )
   })
 
-  it("C4: a moved session's mixed stamps leave NO directory owner (pre-clustering wedge pin)", async () => {
+  it("C4: a moved session's workflow stamps move WITH the session — exactly one live owner, the new durable directory (#269 resolution)", async () => {
     await Effect.runPromise(
       runTwoInstanceGuardTest(
         {},
-        ({ dag, store, database }) =>
+        ({ dag, store, bridge }) =>
           Effect.gen(function* () {
             // wf1 created while SES_A lives in DIR_A → stamped DIR_A.
             const wf1 = yield* dag.create({
@@ -1364,11 +1394,14 @@ describe("DAG-LOC-01 issue #238 evidence probes", () => {
               config: { name: "c4a", nodes: [node()] },
             })
             expect((yield* store.getWorkflow(wf1))?.directory).toBe(DIR_A)
-            // Move the session to DIR_B via the durable session row.
-            yield* database.db.update(SessionTable)
-              .set({ directory: DIR_B as never })
-              .where(eq(SessionTable.id, SES_A as never))
-              .run().pipe(Effect.orDie)
+            // Move the session to DIR_B via the durable SessionEvent.Moved. The
+            // session projector re-stamps every workflow row of the session in
+            // the SAME transaction (payload-sourced, no SessionTable read), so
+            // the stamp moves WITH the session — no mixed-stamp window.
+            yield* moveSession(bridge, SES_A, DIR_B)
+            // The pre-move workflow's stamp MOVED WITH the session (write-once
+            // except the whitelisted Moved re-stamp).
+            expect((yield* store.getWorkflow(wf1))?.directory).toBe(DIR_B)
             // wf2 created after the move → session-sourced stamp = DIR_B.
             const wf2 = yield* dag.create({
               projectID: PROJECT_ID,
@@ -1377,13 +1410,120 @@ describe("DAG-LOC-01 issue #238 evidence probes", () => {
               config: { name: "c4b", nodes: [node()] },
             })
             expect((yield* store.getWorkflow(wf2))?.directory).toBe(DIR_B)
-            // Mixed stamps: the session's workflow rows no longer agree on a
-            // single directory, so NO instance owns the session's wakes. This
-            // pins the pre-clustering create-time-stamp semantics (the wedge
-            // is pinned, not fixed — re-stamping on SessionEvent.Moved is out
-            // of scope for the single-authority design).
+            // Resolution (acceptance #269): the session's rows agree on ONE
+            // directory, so exactly one instance owns it — the session's NEW
+            // durable directory. The old directory loses ownership (the wedge is
+            // resolved, not pinned), and the two directories never own
+            // simultaneously (no cross-directory double-adoption).
+            expect(yield* DagLocation.ownsSession(SES_A, DIR_B)).toBe(true)
             expect(yield* DagLocation.ownsSession(SES_A, DIR_A)).toBe(false)
-            expect(yield* DagLocation.ownsSession(SES_A, DIR_B)).toBe(false)
+            // Per-workflow ownership converges the same way: every workflow is
+            // owned by DIR_B only.
+            expect(yield* DagLocation.ownsWorkflow(wf1, DIR_B)).toBe(true)
+            expect(yield* DagLocation.ownsWorkflow(wf1, DIR_A)).toBe(false)
+            expect(yield* DagLocation.ownsWorkflow(wf2, DIR_B)).toBe(true)
+            expect(yield* DagLocation.ownsWorkflow(wf2, DIR_A)).toBe(false)
+          }),
+      ),
+    )
+  })
+
+  it("C8: a moved session's wedged wake is delivered by the NEW owner immediately — no idle event, no restart (#269 bounded-time resolution)", async () => {
+    const parked = { value: false }
+    const released = { value: false } // never released: the parked admission stays parked; scope cleanup interrupts it
+    const calls = { value: 0 }
+    const wait = new Promise<void>(() => {})
+    await Effect.runPromise(
+      runTwoInstanceGuardTest(
+        { parkWakeDelivery: { wait, parked, released, calls } },
+        ({ bridge, database, initA, initB }) =>
+          Effect.gen(function* () {
+            yield* initA
+            yield* initB
+            // Re-arm the seeded terminal wake AFTER both startup sweeps passed
+            // over it (seeded wake_reported=true), so the ONLY later trigger is
+            // the Moved subscription's re-fork (no idle event, no restart).
+            yield* database.db.update(WorkflowTable)
+              .set({ wake_reported: false })
+              .where(eq(WorkflowTable.id, "c8-wake"))
+              .run().pipe(Effect.orDie)
+            // Move SES_A → DIR_B. The Moved projection re-stamps the wake row to
+            // DIR_B (exactly one owner), and the NEW owner's Moved subscription
+            // re-forks tryDeliverWake — the wake delivers immediately (bounded
+            // time), no wake stays wedged behind the old mixed stamps.
+            yield* moveSession(bridge, SES_A, DIR_B)
+            yield* pollWithTimeout(
+              Effect.sync(() => (parked.value && calls.value === 1 ? true : undefined)),
+              "moved wake was not delivered to the new owner within bounded time (expected exactly one delivery attempt from the new directory)",
+            )
+            // Exactly one delivery: after the re-stamp the old directory's
+            // ownsSession is false, so only the NEW owner re-forks the drain —
+            // no cross-directory double delivery.
+            expect(calls.value).toBe(1)
+          }),
+        ({ database }) =>
+          Effect.gen(function* () {
+            yield* database.db.insert(WorkflowTable).values({
+              id: "c8-wake",
+              project_id: PROJECT_ID as never,
+              session_id: SES_A as never,
+              directory: DIR_A as never,
+              title: "terminal wake c8",
+              status: "failed",
+              config: "{}",
+              seq: 1,
+              wake_reported: true,
+            }).run().pipe(Effect.orDie)
+          }),
+      ),
+    )
+  })
+
+  it("C9: the convergence migration moves pre-fix divergent stamps WITH the session and preserves fail-closed NULL (#269 backfill)", async () => {
+    await Effect.runPromise(
+      runTwoInstanceGuardTest(
+        {},
+        ({ database }) =>
+          Effect.gen(function* () {
+            // Simulate a pre-fix moved session: the durable session row already
+            // points at DIR_B, but one workflow still carries the pre-move stamp
+            // DIR_A (the v1.0.13 mixed-stamp wedge input) and one is a NULL-stamp
+            // zombie (legacy, must stay fail-closed).
+            yield* database.db.update(SessionTable)
+              .set({ directory: DIR_B as never })
+              .where(eq(SessionTable.id, SES_A as never))
+              .run().pipe(Effect.orDie)
+            for (const [id, dir] of [
+              ["c9-wf-stale", DIR_A],
+              ["c9-wf-zombie", null],
+            ] as const) {
+              yield* database.db.insert(WorkflowTable).values({
+                id,
+                project_id: PROJECT_ID as never,
+                session_id: SES_A as never,
+                directory: dir as never,
+                title: "convergence probe",
+                status: "failed",
+                config: "{}",
+                seq: 1,
+                wake_reported: true,
+              }).run().pipe(Effect.orDie)
+            }
+            // Apply the convergence migration against the current db (twice — the
+            // second application must be a no-op: idempotent convergence).
+            for (const _ of [0, 1]) {
+              yield* database.db
+                .transaction((tx) => workflowDirectoryConvergence.up(tx as never))
+                .pipe(Effect.orDie)
+            }
+            const stamps = yield* database.db.select({ id: WorkflowTable.id, directory: WorkflowTable.directory })
+              .from(WorkflowTable)
+              .all().pipe(Effect.orDie)
+            const byId = new Map(stamps.map((row) => [row.id, row.directory]))
+            // The divergent stamp converged to the session's CURRENT directory...
+            expect(byId.get("c9-wf-stale")).toBe(DIR_B)
+            // ...and the NULL zombie stayed NULL (fail-closed is preserved).
+            expect(byId.get("c9-wf-zombie")).toBeNull()
           }),
       ),
     )
