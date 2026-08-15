@@ -1,6 +1,5 @@
 import { describe, expect, it } from "bun:test"
 import {
-  buildGraph,
   type SchedulingNode,
   WorkflowRuntime,
 } from "@opencode-ai/core/dag/core/scheduling"

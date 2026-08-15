@@ -75,10 +75,18 @@ export const run = Effect.fn("Goal.Judge.run")(function* (
     // "judge is unreliable" uniformly regardless of failure mode. The verdict
     // stays "continue" so a single transient blip does not stall the loop;
     // it only pauses after MAX_CONSECUTIVE_PARSE_FAILURES in a row.
-    Effect.orElseSucceed((): JudgeResult => ({
-      verdict: "continue",
-      reason: "judge transport error (timeout or network) — counting toward pause budget",
-      parseFailed: true,
-    })),
+    //
+    // catchCause (not orElseSucceed): the production callLLM chain can
+    // DEFECT — config first-use orDie, payload decode throws — and a defect
+    // escaping here kills afterIdle invisibly (the loop stalls at 0 turns
+    // with zero logs and no pause budget). catchCause folds defects into
+    // the same parseFailed budget.
+    Effect.catchCause(() =>
+      Effect.succeed({
+        verdict: "continue",
+        reason: "judge transport error (timeout or network) — counting toward pause budget",
+        parseFailed: true,
+      } satisfies JudgeResult),
+    ),
   )
 })
