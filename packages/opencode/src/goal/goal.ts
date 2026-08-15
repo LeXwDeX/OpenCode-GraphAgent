@@ -138,6 +138,34 @@ export interface Interface {
      * fiber AND publishes the paused event.
      */
     readonly pauseAndPublish: (sessionID: SessionID, reason: string) => Effect.Effect<GoalState.Info | undefined>
+    /**
+     * Goal-turn provenance + step ceiling (GOAL-TURN-SCOPE). Marks the session's
+     * CURRENT turn as goal-driven (kick / judge continuation / resume-kick) so
+     * (a) the prompt loop can cap its steps via goalTurnMaxSteps, and
+     * (b) SessionPrompt.cancel can map a user ESC on a goal turn into a goal
+     * pause instead of letting the idle event auto-resurrect the goal.
+     * The mark is process-local InstanceState: cleared when the turn ends
+     * (afterIdle entry, pause, clear, markDone) and safe to overwrite.
+     */
+    readonly markTurnDriven: (sessionID: SessionID) => Effect.Effect<void>
+    /** Clears the goal-turn mark. No-op when not marked. */
+    readonly clearTurnDriven: (sessionID: SessionID) => Effect.Effect<void>
+    /**
+     * ESC-on-goal-turn transition: pauses the goal (durable row + event) AND
+     * releases the automation registration AND clears the turn mark — one
+     * seam so SessionPrompt.cancel stays free of lease plumbing. No-op (returns
+     * undefined) when the goal is not active. Never fails: pause failures are
+     * logged and swallowed so a cancel path can always proceed.
+     */
+    readonly pauseForUserCancel: (sessionID: SessionID, reason: string) => Effect.Effect<GoalState.Info | undefined>
+    /** True when the session's current turn is goal-driven. */
+    readonly isTurnDriven: (sessionID: SessionID) => Effect.Effect<boolean>
+    /**
+     * Step ceiling for a goal-driven turn: min of GOAL_TURN_MAX_STEPS and the
+     * current goal's identity. Returns undefined when the turn is NOT
+     * goal-driven (the prompt loop then falls back to agent.steps unchanged).
+     */
+    readonly goalTurnMaxSteps: (sessionID: SessionID) => Effect.Effect<number | undefined>
   }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Goal") {}
@@ -166,6 +194,58 @@ const serviceLayer = Layer.effect(
       })
 
     const fibers = new Map<SessionID, Fiber.Fiber<unknown, unknown>>()
+
+    // GOAL-TURN-SCOPE: process-local provenance of the CURRENT goal-driven
+    // turn. Keyed by session; set at every goal dispatch (kick in prompt.ts,
+    // continuation in loop.ts), cleared at turn end (afterIdle entry) and at
+    // every terminal transition (pause/clear/markDone) plus ESC-cancel. A stale
+    // mark is harmless: goalTurnMaxSteps re-validates against the durable goal
+    // row before reporting a ceiling.
+    const turnDriven = new Set<SessionID>()
+
+    const markTurnDriven = Effect.fnUntraced(function* (sessionID: SessionID) {
+      turnDriven.add(sessionID)
+    })
+
+    const clearTurnDriven = Effect.fnUntraced(function* (sessionID: SessionID) {
+      turnDriven.delete(sessionID)
+    })
+
+    const isTurnDriven = Effect.fnUntraced(function* (sessionID: SessionID) {
+      return turnDriven.has(sessionID)
+    })
+
+    const goalTurnMaxSteps = Effect.fnUntraced(function* (sessionID: SessionID) {
+      if (!turnDriven.has(sessionID)) return undefined
+      // Re-validate against the durable row: a mark left over from a turn that
+      // ended with the goal cleared/paused must not cap an unrelated turn.
+      const state = yield* loadState(sessionID)
+      if (!state || state.status !== "active") {
+        turnDriven.delete(sessionID)
+        return undefined
+      }
+      return GoalPrompts.GOAL_TURN_MAX_STEPS
+    })
+
+    // ESC-on-goal-turn: durable pause + lease release + mark clear, failure-
+    // absorbed. Called from SessionPrompt.cancel so a user ESC on a goal turn
+    // pauses the goal instead of letting the post-cancel idle event resurrect
+    // it with an unwanted continuation.
+    const pauseForUserCancel = Effect.fnUntraced(function* (sessionID: SessionID, reason: string) {
+      const paused = yield* pauseAndPublish(sessionID, reason).pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("goal pause on cancel failed", { sessionID, cause: String(cause) }).pipe(
+            Effect.as(undefined),
+          ),
+        ),
+      )
+      if (paused)
+        yield* automation.unregister(sessionID, { kind: "goal", id: paused.goal_id ?? "legacy" }).pipe(
+          Effect.ignore,
+        )
+      turnDriven.delete(sessionID)
+      return paused
+    })
 
     const registerFiber = Effect.fnUntraced(function* (
       sessionID: SessionID,
@@ -431,6 +511,7 @@ const serviceLayer = Layer.effect(
       if (!updated) return undefined
       yield* automation.unregister(sessionID, { kind: "goal", id: updated.goal_id ?? "legacy" })
       yield* clearFiber(sessionID)
+      turnDriven.delete(sessionID)
       return updated
     })
 
@@ -476,6 +557,7 @@ const serviceLayer = Layer.effect(
       if (cleared)
         yield* automation.unregister(sessionID, { kind: "goal", id: cleared.goal_id ?? "legacy" })
       yield* clearFiber(sessionID)
+      turnDriven.delete(sessionID)
     })
 
     // GOAL-FP-01-05/-16: session-deletion cleanup. `clear` keeps the
@@ -491,6 +573,7 @@ const serviceLayer = Layer.effect(
       if (cleared)
         yield* automation.unregister(sessionID, { kind: "goal", id: cleared.goal_id ?? "legacy" })
       yield* clearFiber(sessionID)
+      turnDriven.delete(sessionID)
     })
 
     const markDone = Effect.fn("Goal.markDone")(function* (sessionID: SessionID, reason: string) {
@@ -505,6 +588,7 @@ const serviceLayer = Layer.effect(
       const completed = yield* deleteAndPublishDone(sessionID, reason)
       if (completed)
         yield* automation.unregister(sessionID, { kind: "goal", id: completed.goal_id ?? "legacy" })
+      turnDriven.delete(sessionID)
       return completed
     })
 
@@ -551,8 +635,17 @@ const serviceLayer = Layer.effect(
       if (!state) return undefined
       const subgoals = state.subgoals ?? []
       const sub = subgoals.length > 0 ? `，${subgoals.length} 个子目标` : ""
-      if (state.status === "active")
+      if (state.status === "active") {
+        // GOAL-TURN-SCOPE observability: a goal-driven turn in flight reads as
+        // "执行中" so a long first turn (turns_used still 0/N) does not look
+        // like a dead 0/N counter.
+        if (turnDriven.has(sessionID)) {
+          const busy = yield* sessionStatus.get(sessionID)
+          if (busy.type === "busy")
+            return `⊙ 目标（执行中，${state.turns_used}/${state.max_turns} 轮${sub}）：${state.goal}`
+        }
         return `⊙ 目标（进行中，${state.turns_used}/${state.max_turns} 轮${sub}）：${state.goal}`
+      }
       if (state.status === "paused") {
         const reason = state.paused_reason ? ` — ${state.paused_reason}` : ""
         return `⏸ 目标（已暂停，${state.turns_used}/${state.max_turns} 轮${reason}）：${state.goal}`
@@ -619,7 +712,7 @@ const serviceLayer = Layer.effect(
           newParseFailures >= GoalPrompts.MAX_CONSECUTIVE_PARSE_FAILURES
             ? "judge 模型未返回有效 JSON 判定。请检查模型配置或换用更可靠的模型，然后 /goal resume。"
             : turnsUsed >= state.max_turns
-              ? `已用 ${turnsUsed}/${state.max_turns} 轮。使用 /goal resume 继续，或 /goal clear 停止。`
+              ? `已用 ${turnsUsed}/${state.max_turns} 轮预算。/goal clear 停止；/goal resume 会重启一整轮执行（本轮内完成才会计为达成，否则仍会被再次暂停）。`
               : undefined
         const updated = GoalState.advance(state, {
           status: pauseReason ? "paused" : "active",
@@ -708,7 +801,7 @@ const serviceLayer = Layer.effect(
         // text a second later, which looks like resume didn't work.
         const announceMsg =
           result.turns_used >= result.max_turns
-            ? `⚠ 目标已恢复，但预算已耗尽（${result.turns_used}/${result.max_turns} 轮）。下一轮 judge 会立刻再次判定超预算暂停。建议 /goal clear 后重新 /goal <text>，或在 /goal set 时传更大的 maxTurns。`
+            ? `⚠ 目标已恢复，但轮预算已耗尽（${result.turns_used}/${result.max_turns} 轮）。resume 会重启一整轮执行：本轮内任务完成才会计为达成，否则 judge 会再次暂停。建议 /goal clear 后用更大的 maxTurns 重新设定。`
             : undefined
         return {
           type: "kick" as const,
@@ -834,6 +927,11 @@ const serviceLayer = Layer.effect(
       clearLoopFiberIf: clearFiberIf,
       deleteAndPublishDone,
       pauseAndPublish,
+      markTurnDriven,
+      clearTurnDriven,
+      isTurnDriven,
+      goalTurnMaxSteps,
+      pauseForUserCancel,
     })
   }),
 )

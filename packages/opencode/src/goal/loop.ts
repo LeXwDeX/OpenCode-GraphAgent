@@ -225,6 +225,11 @@ const serviceLayer = Layer.effect(
     const evaluatedRevisions = new Map<SessionID, number>()
 
     const afterIdle = Effect.fn("GoalLoop.afterIdle")(function* (sessionID: SessionID, scanResume?: boolean) {
+      // GOAL-TURN-SCOPE: the goal-driven turn that produced this idle has
+      // ended. Clear the mark up front; the continuation branch below re-marks
+      // when it dispatches the next turn. This also retires a stale mark when
+      // the idle came from an unrelated (non-goal) turn.
+      yield* goal.clearTurnDriven(sessionID)
       const goalState = yield* goal.load(sessionID)
       if (!goalState || goalState.status !== "active") return
       // D-4 entry gate (scan path only): the boot snapshot may have gone
@@ -451,11 +456,19 @@ const serviceLayer = Layer.effect(
       const continuationLease = Option.getOrUndefined(yield* automation.claim(sessionID, goalOwner))
       if (!continuationLease) return
       yield* Effect.gen(function* () {
+        // GOAL-TURN-SCOPE: mark BEFORE admission so the goal-turn provenance is
+        // already visible the instant the continuation can start — no window
+        // where an httpapi cancel slips between admit and mark. If admission
+        // is refused (session not idle), clear the speculative mark.
+        yield* goal.markTurnDriven(sessionID)
         const admitted = yield* SessionPrompt.admitIfIdle(promptSvc, automation, continuationLease, {
           sessionID,
           parts: [{ type: "text", text: continuationText }],
         })
-        if (Option.isNone(admitted)) return
+        if (Option.isNone(admitted)) {
+          yield* goal.clearTurnDriven(sessionID)
+          return
+        }
         yield* admitted.value
       }).pipe(
           Effect.catchCause((cause) =>
