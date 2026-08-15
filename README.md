@@ -25,34 +25,51 @@ team.**
 
 ---
 
-## Graph engineering, before it had a name
+## What is the graph
 
-GraphAgent treats a graph as an **executable, durable, inspectable contract** — not a diagram of agents and not a prompt chain with arrows added afterward. The public history landed the first complete DAG-engine commit on **2026-07-02**. The paper [*What makes prompts a graph: necessary and sufficient conditions for prompt graph engineering*](https://arxiv.org/abs/2607.27578), which formalized explicit structure, prompt/topology separation, executable semantics, and the graph as a first-class artifact, appeared on **2026-07-30**. The implementation was already running four weeks before the vocabulary caught up.
+A workflow is a set of nodes connected by dependency edges. Each node is a real child session with its own agent and context window; an edge means the downstream node consumes the upstream node's output. Nodes run wave by wave in dependency order, so independent work executes in parallel and dependent work waits.
 
-Our graph-engineering doctrine is operational:
+The parent agent (your main conversation) owns the graph. It designs the graph for a task, starts it, and gets woken when a node reports or the workflow finishes — it never polls. When a wave fails, the parent rewrites the failed segment and the engine continues; the view always shows the current graph, not the history of rewrites (more on this under [Revisions](#revisions)).
 
-1. **Edges must carry work.** A dependency exists only when the downstream node consumes the upstream artifact. Delete ceremonial sequencing and run truly independent work in parallel.
-2. **A template is a reference topology, not a cage.** The parent agent may expand or prune lanes to match the task, but every prune records its reason and replacement coverage.
-3. **Prediction, verification, and merge have different owners.** A `reasoner` simulates likely execution paths, a fresh-context reviewer checks the preceding local wave, and exactly one arbiter owns the verdict. These gates cannot be pruned.
-4. **Iteration is a bounded local graph rewrite.** `PASS` finalizes, `LOOP` adds a new correction/review wave through pause → replan → resume, and `BLOCKED` stops with evidence. Completed nodes never form a hidden cycle.
-5. **Reality outranks self-report.** State is event-sourced, recovery follows durable evidence, tests and code settle claims, and humans retain pause/step/cancel/replan authority where mistakes are expensive.
+Three terms worth knowing:
 
-Curated reference topologies — design decision deep-dive, parallel project delivery, deep review of an existing subsystem, compact change review — ship through the workflow library's global scope (curated by the [`opencode-dag-config`](https://github.com/LeXwDeX/opencode-dag-config) repo) and a builtin tier embedded in release binaries; the project `.opencode/workflows/` directory holds repo-specific specs. `/dag-flow` picks the closest shape by name, injects the current task, and derives the actual DAG while preserving its fail-closed gates. See the [Graph Engineering workflow catalog](./.opencode/workflows/GRAPH-ENGINEERING.md).
+- **Node** — one unit of work: an `explore`, `build`, `general`, or custom agent running one prompt, with optional timeout, retry budget, and structured-output contract.
+- **Wave** — the set of nodes whose dependencies are all satisfied; a wave runs in parallel up to a concurrency limit.
+- **Gate** — a node whose job is judgment (review, verification, arbitration). Gates emit verdicts (`ACCEPT` / `REVISE` / `REJECT` / `BLOCKED`) and downstream nodes can be conditioned on the verdict.
 
-## Why a DAG
+## Features
 
-A single agent loop struggles once a task has staged dependencies, parallelizable independent work, or a quality gate in the middle. Four judgments shaped this engine:
+**Orchestration**
 
-1. **Split decisions from volume.** Work that must be correct (decomposition, gates, arbitration, final synthesis) runs on an advanced model tier; volume work (exploration, implementation, per-angle analysis) fans out on a standard tier. The standard tier buys accuracy with redundancy: breadth means independent parallel slices fanning into one arbiter, depth means claims get re-verified against code and tests across waves.
-2. **Ask before building the graph.** Complex work (`deep` mode) goes through a bounded Q&A pass first (1, 3, or 5 rounds), producing a versioned, fingerprinted Requirement Brief with a `READY` / `NOT_READY` / `WAIVED` verdict. If the question budget runs out with blockers still open, the verdict is `NOT_READY`. There is no silent pass.
-3. **Gate verdicts need a follow-up.** When a checkpoint returns `REVISE` / `REJECT` / `BLOCKED`, the parent agent has to dispose of it in the same wake turn: extend, replan, start a new workflow, or stop with stated reasons. Summarizing the verdict and ending the turn counts as an orchestration failure under the contract.
-4. **Recover from evidence, not guesses.** Every state change is a durable event, transitions go through a declared state machine's guards, terminal states are irreversible (one exception, written into the spec), and the read model is a CQRS projection. After a crash, recovery reconciles from durable evidence and never fabricates provider work.
+- Composable blocks (`explore`, `plan`, `prototype`, `debug`, `coding`, `verify`, `review`, `synthesize`) compile into the node graph; low-level node fields remain available for anything blocks cannot express.
+- `workflow(action="draft")` renders a structured graph through the tool schema into a validated YAML spec — field-name mistakes are rejected by the provider, not discovered at validation time.
+- Saved workflow libraries at three scopes (project / global / builtin), startable by name; the `/dag-flow` command picks a curated reference topology and retargets it to the task at hand.
+- Model tiers in `dag.jsonc` separate decisions from volume: critical nodes on the `advanced` model, fan-out work on `standard`.
+
+**Reliability**
+
+- Event-sourced state with a declared state machine; the SQLite read model is projected inside the publish transaction. Crash recovery reconciles from durable evidence and never fabricates provider work.
+- Execution-location authority: each workflow row carries the directory stamp of the session that created it, re-read from the database on every ownership check, so sibling worktrees of one project cannot act on each other's workflows. Stamps move with the session when it moves.
+- Revision view: a replan supersedes the replaced segment — the inspector, status output, and summary counts render the current graph only. Live failures on the current graph (quota exhausted, API error, timeout cap) stay visible; superseded ones do not count toward the workflow's terminal state.
+- Node outputs that are a single absolute file path are captured as `{content_ref, size, sha256, summary}`; the result action returns the pointer and the parent reads the file. Inline and structured payloads unchanged.
+
+**Observability & control**
+
+- TUI DAG inspector (`dag.open` in the command palette): workflow list, wave-ordered node view with live status, node detail with deadline countdown; `p`/`r`/`s`/`x` for pause/resume/step/cancel, `enter` drops into a node's child session.
+- Sidebar panel with per-session progress; HTTP API mirroring every tool action (see [below](#observing--controlling)).
+- Deep mode admission: a bounded Q&A pass (1/3/5 rounds) produces a fingerprinted Requirement Brief with a `READY` / `NOT_READY` / `WAIVED` verdict before an expensive graph starts.
+
+**Beyond the graph**
+
+- Autonomous goal loop (`/goal`): one durable goal worked across turns of a single session, judged externally, budgeted and resumable.
+- Claude Code hooks compatibility (26 events × 5 execution types), CJK/IME terminal fixes, per-workflow worktree isolation, and a standalone Go configuration assistant.
 
 ## Using workflows
 
 Nothing has to be configured to try it: ask for work that has stages, parallel
-parts, or a review gate in the middle, and the agent designs a graph and runs
-it. Three things turn that into a repeatable setup of your own.
+parts, or a review gate in the middle (`/dag-flow <task>`), and the agent
+designs a graph and runs it. Three things turn that into a repeatable setup of
+your own.
 
 ### 1. Choose the model tiers — `.opencode/dag.jsonc`
 
@@ -130,14 +147,16 @@ scopes, the file shape, the rules a saved spec must respect (no pinned models,
 `worker_type` must exist, required template variables must be supplied), and
 how to verify it. Ask to "save this as a reusable workflow" and the agent
 establishes the phases and gates with you, writes the file into the scope you
-pick, and proves it by starting it once.
+pick, and proves it by starting it once. For one-off graphs, `workflow(action="draft")`
+takes the structured graph as tool parameters and hands back a validated
+`spec_path`, so field drift never reaches the file.
 
 Node prompts come from `.opencode/dag-prompts/*.md` — 12 templates ship
 in-repo, referenced by `prompt_template.id`. Add your own `.md` file there to
 make a new template available; a global workflow should prefer `inline` prompts
 so it does not depend on a repo-local template.
 
-## DAG workflow engine
+## The engine
 
 The engine lives in [`packages/core/src/dag`](./packages/core/src/dag) (state machine, dependency graph, scheduling, event projection, SQLite read model) and [`packages/opencode/src/dag`](./packages/opencode/src/dag) (workflow service, execution loop, node spawn, admission, review lifecycle, crash recovery, templates). Agents drive it through a single `workflow` tool; humans watch and control it through the TUI or HTTP API.
 
@@ -162,16 +181,26 @@ Workflow-level knobs: `max_concurrency` (default 5), `max_node_replan_attempts` 
 ### Scheduling & execution
 
 - Nodes spawn as real child sessions through the same code path as the `task` tool, wave by wave in dependency order, bounded by a concurrency semaphore. A node is durably `queued` at admission and the child session only materializes inside the permit, so a 100-node fan-out never creates 100 sessions at once.
-- **Dynamic replanning**, pause-first: `pause` freezes scheduling instantly, `replan` merges a fragment (add / replace / cancel / restart nodes) atomically against the live graph, `resume` continues. Terminal nodes are immutable; retrying a failed node means adding a replacement under a new id. `extend` appends nodes, and may reopen a naturally-completed workflow (the single sanctioned exception to terminal irreversibility).
-- **Step mode** runs one node at a time for debugging.
-- **The parent does not poll.** Synthetic messages wake it when a `report_to_parent` node or the workflow terminalizes. Checkpoint nodes emit a normalized verdict (`ACCEPT` / `REVISE` / `REJECT` / `BLOCKED`), and the disposal contract governs what happens next. Iteration is a bounded, verdict-driven replan wave; the graph never contains a cyclic edge.
+- Dynamic replanning, pause-first: `pause` freezes scheduling instantly, `replan` merges a fragment (add / replace / cancel / restart nodes) atomically against the live graph, `resume` continues. Terminal nodes are immutable; retrying a failed node means adding a replacement under a new id. `extend` appends nodes, and may reopen a naturally-completed workflow (the single sanctioned exception to terminal irreversibility).
+- Step mode runs one node at a time for debugging.
+- The parent does not poll. Synthetic messages wake it when a `report_to_parent` node or the workflow terminalizes. Checkpoint nodes emit a normalized verdict (`ACCEPT` / `REVISE` / `REJECT` / `BLOCKED`), and the disposal contract governs what happens next. Iteration is a bounded, verdict-driven replan wave; the graph never contains a cyclic edge.
+
+### Revisions
+
+Rewriting a graph does not erase history, but it does retire it. A replan that supersedes nodes marks them; the workflow row carries a `graph_rev` counter and every view — status output, HTTP API, TUI inspector, summary counts — filters to the current revision. Completed nodes and their outputs survive into the new revision untouched. Audit of superseded nodes stays possible through the result store (an agent can look it up by node id); the TUI exposes no entry to it.
+
+Two things this fixes. A workflow whose failed segment was rewritten now reports `completed` when the replacement succeeds, instead of dragging the old failure along. And the failure counts you see are the failures that exist — a quota exhaustion or API error on the current graph stays visible until it is actually fixed.
 
 ### State machine & persistence
 
 - Declared transition tables for workflow and node status; every mutation goes through a guard, invalid transitions and terminal violations are typed errors (HTTP 409, not 500).
 - All changes are published as durable `dag.*` events; a projector writes the SQLite read model *inside* the publish transaction. History is event replay, not a log table. A drift test fails whenever the projector's guards and the declared transition tables are edited out of sync.
-- **Crash recovery** is lazy, per-workflow, and evidence-based: nodes left `running` are reconciled against their child session's durable state. Sessions that finished back-fill their captured output; when execution ownership was genuinely lost, the workflow pauses and the parent decides disposition (replan / resume / cancel). Recovery never adopts or restarts provider work on its own.
-- **Failure triage**: every failed node carries a failure class (`timeout` / `exec_failed` / `verdict_fail`) surfaced in `workflow(action=status)` and in the parent's wake — including a failed-nodes attribution digest when a workflow terminalizes failed — so the parent agent repairs the specific node (replan with a replacement under a new id, or a continuation workflow reusing completed outputs) instead of restarting the graph.
+- Crash recovery is lazy, per-workflow, and evidence-based: nodes left `running` are reconciled against their child session's durable state. Sessions that finished back-fill their captured output; when execution ownership was genuinely lost, the workflow pauses and the parent decides disposition (replan / resume / cancel). Recovery never adopts or restarts provider work on its own.
+- Failure triage: every failed node carries a failure class (`timeout` / `exec_failed` / `verdict_fail`) surfaced in `workflow(action=status)` and in the parent's wake — including a failed-nodes attribution digest when a workflow terminalizes failed — so the parent agent repairs the specific node (replan with a replacement under a new id, or a continuation workflow reusing completed outputs) instead of restarting the graph.
+
+### Node outputs
+
+A node's final reply can be plain text, a structured payload (`output_schema` + `submit_result`), or a file. When the reply is a single absolute path to an existing non-empty file, the runtime captures `{content_ref, size, sha256, summary}`; `workflow(action="result")` returns the pointer with a short summary and the parent reads the file itself. This keeps long reports out of the transcript while preserving integrity (the hash is recorded at capture time). Report files written under `.opencode/workflow-reports/` get an append-only `.gitignore` entry on first write.
 
 ### Deep mode: admission & review
 
@@ -180,9 +209,9 @@ Workflow-level knobs: `max_concurrency` (default 5), `max_node_replan_attempts` 
 
 ### Observing & controlling
 
-- **TUI DAG inspector** (command palette → `dag.open`): workflow list, wave-ordered node view with live status, node detail (deps, errors, output preview, deadline countdown), and `p`/`r`/`s`/`x` for pause/resume/step/cancel; `enter` drops into a node's child session.
-- **Sidebar panel**: per-session workflow progress (completed/running/failed/queued), expandable node list, driven by ephemeral summary events, with a fetch-on-open safety net instead of polling.
-- **HTTP API** (same code path as the tool surface):
+- TUI DAG inspector (command palette → `dag.open`): workflow list, wave-ordered node view with live status, node detail (deps, errors, output preview, deadline countdown), and `p`/`r`/`s`/`x` for pause/resume/step/cancel; `enter` drops into a node's child session.
+- Sidebar panel: per-session workflow progress (completed/running/failed/queued), expandable node list, driven by ephemeral summary events, with a fetch-on-open safety net instead of polling.
+- HTTP API (same code path as the tool surface):
 
   ```
   GET  /dag                              list workflows
@@ -206,9 +235,26 @@ Everything else inherits the main opencode configuration.
 | `.opencode/dag.jsonc` | Model tiers (`advanced` / `standard`) and `thinking_depth` for child sessions | `<config dir>/dag.jsonc`, seeded with comments on first use |
 | `.opencode/workflows/*.yaml` | Saved workflow specs, startable by name | `<config dir>/workflows/*.yaml` |
 | `.opencode/dag-prompts/*.md` | Node prompt templates referenced by `prompt_template.id` | — (project-scoped) |
+| `.opencode/workflow-reports/` | Node report files (auto-gitignored) | — |
 
 Both `dag.jsonc` and the workflow library are read lazily, so an edit applies to
 the next workflow start without a restart.
+
+## Background
+
+GraphAgent treats a graph as an executable, durable, inspectable contract — not a diagram of agents, and not a prompt chain with arrows added afterward. The first complete DAG-engine commit landed on **2026-07-02**; the paper [*What makes prompts a graph*](https://arxiv.org/abs/2607.27578), which formalized explicit structure, prompt/topology separation, executable semantics, and the graph as a first-class artifact, appeared on **2026-07-30**.
+
+The operating doctrine that came out of it:
+
+1. Edges must carry work. A dependency exists only when the downstream node consumes the upstream artifact; ceremonial sequencing gets deleted, independent work runs in parallel.
+2. A template is a reference topology, not a cage. The parent agent may expand or prune lanes to match the task, but every prune records its reason and replacement coverage.
+3. Prediction, verification, and merge have different owners. A `reasoner` simulates likely execution paths, a fresh-context reviewer checks the preceding local wave, and exactly one arbiter owns the verdict. These gates cannot be pruned.
+4. Iteration is a bounded local graph rewrite. `PASS` finalizes, `LOOP` adds a new correction/review wave through pause → replan → resume, and `BLOCKED` stops with evidence. Completed nodes never form a hidden cycle.
+5. Reality outranks self-report. State is event-sourced, recovery follows durable evidence, tests and code settle claims, and humans retain pause/step/cancel/replan authority where mistakes are expensive.
+
+Why a DAG at all: a single agent loop struggles once a task has staged dependencies, parallelizable independent work, or a quality gate in the middle. Splitting decisions from volume (advanced vs. standard tiers), asking before building (deep-mode admission), gating verdicts with mandatory disposal, and recovering from evidence rather than guesses are the four judgments this engine is built on.
+
+Curated reference topologies — design decision deep-dive, parallel project delivery, deep review of an existing subsystem, compact change review — ship through the workflow library's global scope (curated by the [`opencode-dag-config`](https://github.com/LeXwDeX/opencode-dag-config) repo) and a builtin tier embedded in release binaries. See the [Graph Engineering workflow catalog](./.opencode/workflows/GRAPH-ENGINEERING.md).
 
 ---
 
@@ -218,10 +264,10 @@ Graph orchestration decomposes a task across child sessions; the goal loop is
 its single-session complement: one durable goal that the agent works toward
 autonomously across turns of the current session.
 
-- **Commands**: `/goal <text>` sets a goal and starts the loop; `/goal status|pause|resume|done|clear|stop` controls it; `/subgoal <text>|list|remove <n>|clear` manages subgoals attached to the active goal.
-- **Judge loop**: after each turn an external judge evaluates progress — `done` clears the goal, `continue` injects the next continuation turn against a configurable turn budget (budget exhaustion pauses the goal; it stays resumable). The agent can self-declare completion with the `goal(action: "complete")` tool, which bypasses the judge; `goal(action: "status")` inspects state.
-- **Visibility**: while a goal is active or paused, the system prompt carries a live goal block (text, status, turns used/remaining, subgoals, last judge verdict); the TUI sidebar shows a compact goal widget; `GET /session/:sessionID/goal` exposes the state (`404` when no goal is set).
-- **Durability**: goal state is persisted per session (`goal_state`), survives restarts, and is cleared automatically when the session is deleted.
+- Commands: `/goal <text>` sets a goal and starts the loop; `/goal status|pause|resume|done|clear|stop` controls it; `/subgoal <text>|list|remove <n>|clear` manages subgoals attached to the active goal.
+- Judge loop: after each turn an external judge evaluates progress — `done` clears the goal, `continue` injects the next continuation turn against a configurable turn budget (budget exhaustion pauses the goal; it stays resumable). The agent can self-declare completion with the `goal(action: "complete")` tool, which bypasses the judge; `goal(action: "status")` inspects state.
+- Visibility: while a goal is active or paused, the system prompt carries a live goal block (text, status, turns used/remaining, subgoals, last judge verdict); the TUI sidebar shows a compact goal widget; `GET /session/:sessionID/goal` exposes the state (`404` when no goal is set).
+- Durability: goal state is persisted per session (`goal_state`), survives restarts, and is cleared automatically when the session is deleted.
 
 ---
 
