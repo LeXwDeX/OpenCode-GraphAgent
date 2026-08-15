@@ -18,6 +18,15 @@ export const JUDGE_RESPONSE_SNIPPET_CHARS = 4000
 // message, is treated as orphaned and auto-paused so the user can recover via
 // /goal resume instead of the goal sitting silently "active" forever.
 export const FRESHNESS_THRESHOLD = 120_000
+// Step ceiling applied to every goal-driven turn (kick, judge continuation,
+// resume-kick). Without it a goal turn has NO step bound (agent.steps defaults
+// to Infinity for build), so a long-running task keeps the session busy
+// forever — the judge only runs on idle, and turns_used stays frozen at 0/20
+// with the goal permanently "active". This ceiling guarantees every goal turn
+// reaches an idle boundary where the judge and the turn budget can engage.
+// Applied as min(agent.steps ?? Infinity, GOAL_TURN_MAX_STEPS) so a stricter
+// user-configured agent.steps is always respected.
+export const GOAL_TURN_MAX_STEPS = 50
 
 export const JUDGE_SYSTEM_PROMPT = `You are an autonomous-goal completion judge.
 You will receive:

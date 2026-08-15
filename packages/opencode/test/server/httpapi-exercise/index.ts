@@ -1238,6 +1238,24 @@ const scenarios: Scenario[] = [
     }))
     .status(400),
   http.protected
+    .post("/session/{sessionID}/hook", "session.hook.add.empty_command")
+    .seeded((ctx) => ctx.session({ title: "Hook empty command session" }))
+    .at((ctx) => ({
+      path: route("/session/{sessionID}/hook", { sessionID: ctx.state.id }),
+      headers: ctx.headers(),
+      body: { event: "UserPromptSubmit", hooks: [{ type: "command", command: "" }] },
+    }))
+    .status(400),
+  http.protected
+    .post("/session/{sessionID}/hook", "session.hook.add.non_positive_timeout")
+    .seeded((ctx) => ctx.session({ title: "Hook bad timeout session" }))
+    .at((ctx) => ({
+      path: route("/session/{sessionID}/hook", { sessionID: ctx.state.id }),
+      headers: ctx.headers(),
+      body: { event: "UserPromptSubmit", hooks: [{ type: "command", command: "true", timeout: 0 }] },
+    }))
+    .status(400),
+  http.protected
     .get("/session/{sessionID}/hook", "session.hook.list")
     .seeded((ctx) => ctx.session({ title: "Hook list session" }))
     .at((ctx) => ({

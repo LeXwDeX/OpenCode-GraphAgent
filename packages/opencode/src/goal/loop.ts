@@ -225,6 +225,11 @@ const serviceLayer = Layer.effect(
     const evaluatedRevisions = new Map<SessionID, number>()
 
     const afterIdle = Effect.fn("GoalLoop.afterIdle")(function* (sessionID: SessionID, scanResume?: boolean) {
+      // GOAL-TURN-SCOPE: the goal-driven turn that produced this idle has
+      // ended. Clear the mark up front; the continuation branch below re-marks
+      // when it dispatches the next turn. This also retires a stale mark when
+      // the idle came from an unrelated (non-goal) turn.
+      yield* goal.clearTurnDriven(sessionID)
       const goalState = yield* goal.load(sessionID)
       if (!goalState || goalState.status !== "active") return
       // D-4 entry gate (scan path only): the boot snapshot may have gone
@@ -451,34 +456,44 @@ const serviceLayer = Layer.effect(
       const continuationLease = Option.getOrUndefined(yield* automation.claim(sessionID, goalOwner))
       if (!continuationLease) return
       yield* Effect.gen(function* () {
+        // GOAL-TURN-SCOPE: mark BEFORE admission so the goal-turn provenance is
+        // already visible the instant the continuation can start — no window
+        // where an httpapi cancel slips between admit and mark. If admission
+        // is refused (session not idle), clear the speculative mark.
+        yield* goal.markTurnDriven(sessionID)
         const admitted = yield* SessionPrompt.admitIfIdle(promptSvc, automation, continuationLease, {
           sessionID,
           parts: [{ type: "text", text: continuationText }],
         })
-        if (Option.isNone(admitted)) return
+        if (Option.isNone(admitted)) {
+          yield* goal.clearTurnDriven(sessionID)
+          return
+        }
         yield* admitted.value
       }).pipe(
           Effect.catchCause((cause) =>
             Effect.gen(function* () {
               // F1: Only pause for non-interrupt causes. An interrupt (user
-              // pressed ESC during continuation) is safe to drop because the
-              // session ALWAYS re-emits idle afterwards, which re-drives this
-              // loop: SessionRunState.cancel (run-state.ts) and the runner's
-              // onIdle callback both call status.set(idle), and
-              // SessionStatus.set (status.ts) publishes the Status+Idle event
-              // pair unconditionally — even when the session was already idle.
-              // That fresh idle event forks a new afterIdle fiber whose
-              // shouldPreempt guard detects the user's newer message and pauses
-              // there if needed. Pausing HERE would race that replacement
-              // afterIdle fiber and emit a spurious pause. Real dispatch
-              // failures (provider fault, session write error) still get the
-              // recoverable pause below.
+              // pressed ESC during continuation) is safe to drop because
+              // SessionPrompt.cancel pauses goal-driven turns SYNCHRONOUSLY via
+              // goal.pauseForUserCancel (prompt.ts) BEFORE state.cancel lets the
+              // interrupt propagate — by the time this catchCause observes the
+              // cause, the goal is already paused, and pausing again HERE would
+              // double-publish. The session still ALWAYS re-emits idle
+              // afterwards, which re-drives this loop: SessionRunState.cancel
+              // (run-state.ts) and the runner's onIdle callback both call
+              // status.set(idle), and SessionStatus.set (status.ts) publishes
+              // the Status+Idle event pair unconditionally — even when the
+              // session was already idle. On that next cycle shouldPreempt is
+              // only the DB-failure fallback for a pauseForUserCancel that could
+              // not persist. Real dispatch failures (provider fault, session
+              // write error) still get the recoverable pause below.
               // F1: hasInterrupts is a structural check; Cause.interruptors only
               // collects DEFINED fiber ids and silently ignores interrupts
               // carrying none (e.g. Cause.interrupt()), which would otherwise be
               // misclassified as a dispatch failure and spuriously paused here.
               if (Cause.hasInterrupts(cause)) {
-                yield* Effect.logInfo("goal continuation interrupted (likely user ESC) — not pausing; shouldPreempt handles next cycle")
+                yield* Effect.logInfo("goal continuation interrupted (likely user ESC) — not pausing; cancel path already paused the goal")
                 return Option.none()
               }
               const errMsg = `continuation dispatch failed: ${Cause.pretty(cause)}`

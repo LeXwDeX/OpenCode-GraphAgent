@@ -440,6 +440,16 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       // Non-empty hooks[] guard → 4xx. event/type membership is already enforced
       // by the payload's literal schemas; this completes the validation contract.
       if (ctx.payload.hooks.length === 0) return yield* new HttpApiError.BadRequest({})
+      // Per-entry guards: a command hook must carry a runnable command line
+      // (blank-only strings would spawn nothing), and timeout is a positive
+      // seconds multiplier — negative values time the request out immediately,
+      // and 0 silently falls back to the default instead of meaning "no timeout".
+      const invalidEntry = ctx.payload.hooks.some(
+        (hook) =>
+          (hook.type === "command" && !(hook.command ?? "").trim()) ||
+          (hook.timeout !== undefined && hook.timeout <= 0),
+      )
+      if (invalidEntry) return yield* new HttpApiError.BadRequest({})
       const id = yield* sessionHooks.add(ctx.params.sessionID, {
         event: ctx.payload.event as HookEvent,
         matcher: ctx.payload.matcher,
