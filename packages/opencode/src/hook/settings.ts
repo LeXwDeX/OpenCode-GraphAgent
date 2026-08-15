@@ -968,6 +968,16 @@ export function detectUnsupportedFields(
     for (const m of matchers) {
       for (const h of m.hooks ?? []) {
         if (h.shell !== undefined) unsupported.push({ field: "shell", value: h.shell, eventName })
+        // issue #286 — schema-accepted but executor-dropped fields. Surfaced
+        // here instead of silently swallowed: allowedEnvVars/statusMessage have
+        // zero consumers anywhere; per-command `once` is never read (only the
+        // entry-level _sessionEntry?.once is consumed). `timeout` is NOT
+        // flagged — every handler type applies it (incl. prompt).
+        if (h.allowedEnvVars !== undefined)
+          unsupported.push({ field: "allowedEnvVars", value: h.allowedEnvVars, eventName })
+        if (h.statusMessage !== undefined)
+          unsupported.push({ field: "statusMessage", value: h.statusMessage, eventName })
+        if (h.once !== undefined) unsupported.push({ field: "once", value: h.once, eventName })
         // `if` is implemented (condition-filter); async/asyncRewake implemented.
         // All 5 known types now have handlers; type-level unsupported set is empty by design.
       }
@@ -1537,10 +1547,19 @@ const promptHandler: HookHandler = {
         schema: HookJSONOutputZodSchema,
       } satisfies Parameters<typeof generateObject>[0]
 
+      // issue #286 — the header doc promises `timeout` for every hook type,
+      // but promptHandler was the only executor never applying it. Honor it
+      // with the same idiom as command/mcp/http; on expiry the TimeoutException
+      // is captured by Effect.exit below and degrades to the non-blocking warn.
+      const timeoutMs = entry.timeout ? entry.timeout * 1000 : DEFAULT_TIMEOUT_MS
+
       const llmExit = yield* Effect.tryPromise({
         try: () => generateObject(params).then((r) => r.object),
         catch: (e) => e,
-      }).pipe(Effect.exit)
+      }).pipe(
+        Effect.timeout(timeoutMs),
+        Effect.exit,
+      )
 
       if (llmExit._tag === "Failure") {
         log.warn("prompt hook failed (non-blocking)", { error: String(llmExit.cause) })

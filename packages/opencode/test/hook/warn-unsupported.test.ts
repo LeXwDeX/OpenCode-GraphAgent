@@ -38,4 +38,16 @@ describe("detectUnsupportedFields", () => {
     expect(detectUnsupportedFields(undefined)).toEqual([])
     expect(detectUnsupportedFields({})).toEqual([])
   })
+
+  // GOAL-FP/issue #286: HookCommand fields accepted by the schema but dropped
+  // by every executor must be surfaced, not silently swallowed. `timeout` for
+  // type "prompt" is implemented (excluded here); allowedEnvVars/statusMessage
+  // have zero consumers anywhere, and per-command `once` is never read (only
+  // the entry-level _sessionEntry?.once is consumed).
+  test("allowedEnvVars / statusMessage / per-command once are flagged (dropped by executors)", () => {
+    const unsupported = detectUnsupportedFields(
+      hooks({ allowedEnvVars: ["FOO"], statusMessage: "hi", once: true }),
+    )
+    expect(unsupported.map((u) => u.field).sort()).toEqual(["allowedEnvVars", "once", "statusMessage"])
+  })
 })
