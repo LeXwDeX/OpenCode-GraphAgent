@@ -51,9 +51,9 @@ const assistantText = "I have made progress on the feature."
 // Each scenario yields one scheduler turn before its first idle publish so that
 // fiber can acquire the PubSub subscription. No business event exists yet, so
 // outcome completion remains separately observed through public state/events.
-const mkAssistant = () =>
+const mkAssistant = (id?: string) =>
   ({
-    info: { role: "assistant", time: { created: Date.now() } },
+    info: { id, role: "assistant", time: { created: Date.now() } },
     parts: [{ type: "text", text: assistantText }],
   }) as never
 
@@ -1790,6 +1790,147 @@ describe("GoalLoop — judge-chain defect degrades into the parse budget (GOAL-F
       expect(committed.consecutive_parse_failures).toBe(1)
       // First defect is a blip: verdict stays continue, goal keeps running.
       expect(committed.status).toBe("active")
+    }),
+  )
+})
+
+// issue #285 / GOAL-FP-01-21: the boot scan must not re-judge a boundary the
+// crashed process already judged and committed. The process-local
+// evaluatedRevisions map dies with the process, so the DURABLE gate is the
+// goal row's last_judged_msg: updateAfterJudge records the judged assistant
+// message ID on every continue commit, and the scan path skips evaluation
+// while the session window still ends on that same message. Live idle events
+// are never gated (each dispatched continuation produces a fresh assistant
+// message, so the live path always sees a new boundary).
+describe("GoalLoop — boot scan must not re-evaluate an already-judged boundary (issue #285)", () => {
+  let judgeCalls = 0
+  let continuationCalls = 0
+  let boundaryID = "msg_boundary_a"
+  const reset = () => {
+    judgeCalls = 0
+    continuationCalls = 0
+    boundaryID = "msg_boundary_a"
+  }
+
+  const sessionMock = Layer.mock(Session.Service, {
+    messages: () => Effect.succeed([mkAssistant(boundaryID)]),
+  })
+  const promptMock = Layer.mock(SessionPrompt.Service, withIdleAdmission({
+    prompt: () => Effect.die("the direct prompt path is not exercised in this scenario"),
+    promptIfIdle: () =>
+      Effect.sync(() => {
+        continuationCalls += 1
+        return Option.none()
+      }),
+  }))
+  const judgeMock = Layer.succeed(
+    GoalLoopJudgeLLM,
+    GoalLoopJudgeLLM.of({
+      call: () =>
+        Effect.sync(() => {
+          judgeCalls += 1
+          return JSON.stringify({ verdict: "continue", reason: "more work" })
+        }),
+    }),
+  )
+
+  const boundaryLayer = GoalLoop.layer.pipe(
+    Layer.provide(sessionMock),
+    Layer.provide(promptMock),
+    Layer.provide(Layer.mock(Provider.Service, {})),
+    Layer.provide(judgeMock),
+    Layer.provideMerge(Goal.defaultLayer),
+    Layer.provideMerge(SessionStatus.defaultLayer),
+    Layer.provideMerge(EventV2Bridge.defaultLayer),
+    Layer.provideMerge(SessionAutomationLease.defaultLayer),
+    Layer.provideMerge(Database.defaultLayer),
+  )
+  const it = testEffect(boundaryLayer)
+
+  const seedSessionRow = (sessionID: SessionID, directory: string) =>
+    Effect.gen(function* () {
+      const { db } = yield* Database.Service
+      const projectID = ProjectSchema.ID.make(Bun.randomUUIDv7())
+      yield* db.insert(ProjectTable).values({
+        id: projectID,
+        worktree: AbsolutePath.make(directory),
+        sandboxes: [AbsolutePath.make(directory)],
+      })
+      yield* db.insert(SessionTable).values({
+        id: sessionID,
+        project_id: projectID,
+        slug: "test-session",
+        directory,
+        title: "test session",
+        version: "1",
+        time_created: Date.now(),
+        time_updated: Date.now(),
+      })
+    })
+
+  // Commits one continue evaluation ahead of the (re)boot — models a process
+  // that crashed right after the commit, before the continuation produced an
+  // assistant message.
+  const commitPriorBoundary = (sid: SessionID) =>
+    Effect.gen(function* () {
+      const goal = yield* Goal.Service
+      const before = yield* goal.load(sid)
+      const result = yield* goal.updateAfterJudge(
+        sid,
+        "continue",
+        "pre-crash commit",
+        false,
+        { goalID: before!.goal_id ?? "legacy", revision: before!.revision ?? 0 },
+        boundaryID,
+      )
+      expect(result?.state.turns_used).toBe(1)
+      return result?.state
+    })
+
+  it.instance("scan with an unchanged boundary skips re-evaluation (no inflation)", () =>
+    Effect.gen(function* () {
+      reset()
+      const loop = yield* GoalLoop.Service
+      const goal = yield* Goal.Service
+      const directory = (yield* TestInstance).directory
+      const sid = SessionID.descending()
+      yield* seedSessionRow(sid, directory)
+      yield* goal.set(sid, "boundary guard", 5)
+      yield* commitPriorBoundary(sid)
+
+      yield* loop.init()
+      // Negative assertion: the scan runs in a forked fiber with no readiness
+      // signal on the skip path, so a bounded wait stands in for polling.
+      yield* Effect.sleep("300 millis")
+      expect(judgeCalls).toBe(0)
+      expect(continuationCalls).toBe(0)
+      const g = yield* goal.load(sid)
+      expect(g?.turns_used).toBe(1)
+    }),
+  )
+
+  it.instance("scan proceeds once the window advanced past the boundary", () =>
+    Effect.gen(function* () {
+      reset()
+      const loop = yield* GoalLoop.Service
+      const goal = yield* Goal.Service
+      const directory = (yield* TestInstance).directory
+      const sid = SessionID.descending()
+      yield* seedSessionRow(sid, directory)
+      yield* goal.set(sid, "boundary guard", 5)
+      yield* commitPriorBoundary(sid)
+      // The continuation finished and produced a NEW assistant message.
+      boundaryID = "msg_boundary_b"
+
+      yield* loop.init()
+      yield* pollWithTimeout(
+        Effect.sync(() => (judgeCalls >= 1 ? true : undefined)),
+        "scan never re-evaluated the advanced boundary",
+        "5 seconds",
+      )
+      const g = yield* goal.load(sid)
+      expect(g?.turns_used).toBe(2)
+      expect(continuationCalls).toBe(1)
     }),
   )
 })
