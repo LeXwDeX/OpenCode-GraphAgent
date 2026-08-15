@@ -4,7 +4,6 @@ import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { Effect, Layer } from "effect"
 import { Session } from "@/session/session"
 import { SessionPrompt } from "../../src/session/prompt"
-import { MessageV2 } from "../../src/session/message-v2"
 import { testEffect } from "../lib/effect"
 
 // Skip tests if no API key is available
