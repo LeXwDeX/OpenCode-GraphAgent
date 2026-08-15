@@ -825,23 +825,44 @@ describe("DAG execution-location static contract (DAG-LOC-01 R7)", () => {
     expect(unguarded).toEqual([])
   })
 
-  // #238 probe ⑤ (R7-ext): the directory stamp is WRITE-ONCE and every
-  // revalidation site that acts on a possibly-stale in-memory entry carries
-  // the ownership authority.
+  // #238 probe ⑤ (R7-ext): the directory stamp is WRITE-ONCE EXCEPT the single
+  // whitelisted SessionEvent.Moved re-stamp (#269 — an invariant UPDATE mandated
+  // by #269's own wording, not a weakening), and every revalidation site that
+  // acts on a possibly-stale in-memory entry carries the ownership authority.
   it("R7-ext: the stamp is write-once and every revalidation site carries the authority", () => {
     const sources = [...readDagSources(opencodeDagSrc), ...readDagSources(coreDagSrc)]
     expect(sources.length).toBeGreaterThan(20)
     const codeLines = (source: string) =>
       source.split("\n").filter((line) => !line.trim().startsWith("//"))
 
-    // (a) Write-once: no UPDATE writes the directory column anywhere in the
-    // dag trees. The stamp lands via the projector's INSERT (workflow create
-    // → onConflictDoNothing); a `.set({ directory })` would re-stamp a live
-    // row and violate the create-time-pins-ownership invariant.
+    // (a) TWO-WRITER WHITELIST (amended for #269 — an invariant UPDATE, not a
+    // weakening): the directory stamp is WRITE-ONCE except for exactly ONE
+    // sanctioned re-stamp. The ONLY directory writers are
+    //   1. the dag projector's WorkflowCreated INSERT (create-time stamp,
+    //      onConflictDoNothing — a replay can never rewrite an existing stamp),
+    //   2. the session projector's SessionEvent.Moved re-stamp (#269 — the stamp
+    //      moves WITH the session in one transaction, payload-sourced, no
+    //      SessionTable read).
+    // Negative half (unchanged): no `.set({ directory })` anywhere in the dag
+    // trees — a dag-side re-stamp would violate create-time-pins-ownership.
     const writesDirectory = sources
       .filter(({ source }) => /\.set\(\{[\s\S]{0,300}?\bdirectory\s*:/.test(source))
       .map(({ file }) => file)
     expect(writesDirectory).toEqual([])
+    // Positive whitelist half: the Moved re-stamp MUST exist in the session
+    // projector (outside the dag trees) and MUST be the payload-sourced
+    // WorkflowTable re-stamp (event.data.location.directory). Mandated by #269's
+    // "the directory stamp must move WITH the session in one transaction" — so
+    // this probe pins it; removing the re-stamp is a regression here.
+    const sessionProjectorSource = readFileSync(
+      path.resolve(import.meta.dir, "../../../../packages/core/src/session/projector.ts"),
+      "utf8",
+    )
+    expect(
+      /\.update\(WorkflowTable\)[\s\S]{0,400}?\.set\(\{\s*directory:\s*event\.data\.location\.directory/.test(
+        sessionProjectorSource,
+      ),
+    ).toBe(true)
 
     // (b) Revalidation sites. Each region must carry an executable ownership
     // authority call (ownsWorkflow / ownsSession), located by semantic anchors
