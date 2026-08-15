@@ -1,6 +1,6 @@
 import { createStore } from "solid-js/store"
 import { createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js"
-import { useRenderer } from "@opentui/solid"
+import { useRenderer, useTerminalDimensions } from "@opentui/solid"
 import type { TextareaRenderable } from "@opentui/core"
 import { selectedForeground, tint, useTheme } from "../../context/theme"
 import type { QuestionAnswer, QuestionRequest } from "@opencode-ai/sdk/v2"
@@ -11,16 +11,33 @@ import { useBindings, useOpencodeModeStack } from "../../keymap"
 
 const QUESTION_MODE = "question"
 
+function truncateWidth(str: string, max: number) {
+  if (Bun.stringWidth(str) <= max) return str
+  let out = ""
+  let width = 0
+  for (const ch of str) {
+    const next = width + Bun.stringWidth(ch)
+    if (next > max - 1) break
+    out += ch
+    width = next
+  }
+  return out + "…"
+}
+
 export function QuestionPrompt(props: { request: QuestionRequest; directory?: string }) {
   const sdk = useSDK()
   const { theme } = useTheme()
   const renderer = useRenderer()
+  const dimensions = useTerminalDimensions()
   const tuiConfig = useTuiConfig()
   const modeStack = useOpencodeModeStack()
 
   const questions = createMemo(() => props.request.questions)
   const single = createMemo(() => questions().length === 1 && questions()[0]?.multiple !== true)
   const tabs = createMemo(() => (single() ? 1 : questions().length + 1)) // questions + confirm tab (no confirm for single select)
+  // Headers are model-generated and can be arbitrarily long (the schema only suggests "max 30 chars"),
+  // so clamp each tab to a share of the terminal width to keep the tab row on one line
+  const headerBudget = createMemo(() => Math.min(24, Math.max(6, Math.floor((dimensions().width - 8) / tabs()))))
   const [tabHover, setTabHover] = createSignal<number | "confirm" | null>(null)
   const [store, setStore] = createStore({
     tab: 0,
@@ -328,7 +345,7 @@ export function QuestionPrompt(props: { request: QuestionRequest; directory?: st
                             : theme.textMuted
                       }
                     >
-                      {q.header}
+                      {truncateWidth(q.header, headerBudget())}
                     </text>
                   </box>
                 )
