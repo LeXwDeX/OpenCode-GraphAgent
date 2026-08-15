@@ -46,6 +46,7 @@ import type { DagStore } from "@opencode-ai/core/dag/store"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { registerCaptureSlot, clearCaptureSlot, settleCapturedOutput } from "./capture"
+import { captureOutputFileRef, ensureReportAreaGitignore } from "./output-ref"
 
 type PromptParts = SessionPrompt.PromptInput["parts"]
 
@@ -55,6 +56,8 @@ export interface NodeSpawnInput {
   node: DagStore.NodeRow
   parentSessionID: string
   promptParts: PromptParts
+  /** Workflow execution directory — keys the report-area gitignore guarantee (Train B, B4). */
+  directory?: string
   outputSchema?: Record<string, unknown>
   timeoutMs?: number
   reportToParent?: boolean
@@ -492,6 +495,23 @@ export function spawnNode(
                 ),
               )
               return
+            }
+            // Train B (v1.0.15 B2): submit-time file-ref detection — when the
+            // reply IS an existing non-empty absolute path, record
+            // {content_ref, size, sha256, summary} in captured_output (the
+            // same durable column submit_result uses; reset on NodeStarted).
+            // The settlement stays the raw string: input mapping, wake
+            // digests, and legacy readers keep the exact inline behavior,
+            // and the result seam serves the pointer (B3). Any anomaly keeps
+            // the inline path — the capture must never fail the node.
+            const fileRef = yield* captureOutputFileRef(rawText)
+            if (fileRef && childSessionID) {
+              yield* dag.store.setCapturedOutput(childSessionID, fileRef).pipe(
+                Effect.catchCause((cause) =>
+                  Effect.logWarning("output-ref capture persistence failed — inline output preserved", { cause }),
+                ),
+              )
+              if (input.directory) yield* ensureReportAreaGitignore(input.directory, fileRef.path)
             }
             yield* dag.nodeCompleted(input.dagID, input.nodeID, rawText).pipe(
               Effect.catchIf(

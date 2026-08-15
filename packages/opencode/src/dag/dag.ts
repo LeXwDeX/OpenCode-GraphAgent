@@ -449,7 +449,11 @@ export const layer = Layer.effect(
       // counts as in-flight: the node is durably admitted and will start once
       // a permit frees (P0-2) — stepping alongside it would put two nodes in
       // flight.
-      const nodes = yield* store.getNodes(dagID)
+      // Rev-view (v1.0.15 Train A): step computes readiness over the CURRENT
+      // graph revision — superseded rows must not re-seed their failures or
+      // edges into the transient runtime. Superseded rows are terminal, so
+      // the in-flight check is unaffected by the filter.
+      const nodes = yield* store.getCurrentNodes(dagID)
       const hasInFlight = nodes.some((n) => n.status === "running" || n.status === "queued")
       if (hasInFlight) return yield* Effect.fail(new Error(`Node still in-flight: cannot step ${dagID}`))
       // Compute ready nodes using a transient WorkflowRuntime.
@@ -681,6 +685,14 @@ export const layer = Layer.effect(
         removed: effectivePlan.cancel.length as never,
         replaced: effectivePlan.replace.length as never,
         restarted: effectivePlan.restart.length as never,
+        // Rev-view (v1.0.15 Train A): the terminal-FAILED rows at replan time
+        // are the segment the new revision replaces — left in the rebuild
+        // input they re-seed as required-unsatisfied and weld the workflow to
+        // failure (the wake-up bug this train breaks). plan.cancel rows are
+        // marked superseded by the NodeCancelled projection instead; this
+        // list carries the genuine failures the fragment bypasses, which the
+        // engine never cancels. Durable rows stay untouched.
+        superseded: nodes.filter((n) => n.status === "failed").map((n) => DagEvent.NodeID.make(n.id)),
         timestamp: yield* DateTime.now,
       })
       return { cancel: effectivePlan.cancel, restart: effectivePlan.restart, replace: effectivePlan.replace, add: effectivePlan.add, ignore: effectivePlan.ignore }
