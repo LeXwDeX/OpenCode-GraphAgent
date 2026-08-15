@@ -46,6 +46,7 @@
   "dependencies": {
     "@kobalte/core": "catalog:",
     "@opencode-ai/core": "workspace:*",
+    "@opencode-ai/schema": "workspace:*",
     "@opencode-ai/sdk": "workspace:*",
     "@opencode-ai/session-ui": "workspace:*",
     "@opencode-ai/ui": "workspace:*",
