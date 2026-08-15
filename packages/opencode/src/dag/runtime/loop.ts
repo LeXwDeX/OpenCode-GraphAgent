@@ -263,6 +263,7 @@ const serviceLayer = Layer.effect(
               nodeID,
               node,
               parentSessionID: entry.parentSessionID,
+              directory: ctx.directory,
               promptParts,
               outputSchema: nodeConfig?.output_schema as Record<string, unknown> | undefined,
               timeoutMs: nodeConfig?.worker_config?.timeout_ms,

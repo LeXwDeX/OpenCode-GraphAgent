@@ -82,7 +82,7 @@ export const WorkflowNodeTable = sqliteTable(
     output: text({ mode: "json" }).$type<unknown>(),
     error_reason: text(),
     error_class: text(), // dag.node.failed trigger (timeout/exec_failed/verdict_fail/push_exhausted) for failure triage
-    captured_output: text({ mode: "json" }).$type<unknown>(), // durable payload from submit_result; survives a process crash, reset to null on a replan-restart via NodeStarted
+    captured_output: text({ mode: "json" }).$type<unknown>(), // durable payload from submit_result, or a Train B file-ref record ({content_ref, size, sha256, summary}); survives a process crash, reset to null on a replan-restart via NodeStarted
     deadline_ms: integer(), // absolute deadline (spawnedAt + timeout_ms) for D0 termination boundary
     wake_eligible: integer({ mode: "boolean" }).notNull().default(false), // D6: node has report_to_parent=true
     wake_reported: integer({ mode: "boolean" }).notNull().default(false), // D3: has this node's terminal event been injected into the parent session?

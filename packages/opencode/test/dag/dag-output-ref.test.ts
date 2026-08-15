@@ -54,6 +54,7 @@ import { Agent } from "@/agent/agent"
 import { Session } from "@/session/session"
 import { spawnNode, type NodeSpawnInput } from "@/dag/runtime/spawn"
 import { registerCaptureSlot, validatePayload } from "@/dag/runtime/capture"
+import { captureOutputFileRef, ensureReportAreaGitignore, REPORT_AREA } from "@/dag/runtime/output-ref"
 import { makeNodeRow } from "./fixtures"
 import type { DagStore } from "@opencode-ai/core/dag/store"
 
@@ -325,5 +326,66 @@ describe("report-area gitignore entry (Train B, B-p4)", () => {
     await runSpawn(dagLayer, makePromptLayer(reply(reportPath)), undefined, directoryOverride(projectDir))
     expect(events.find((event) => event.type === "nodeCompleted")?.output).toBe(reportPath)
     expect(await fs.readFile(path.join(projectDir, ".gitignore"), "utf8")).toBe("node_modules\n")
+  })
+})
+
+describe("output-ref module rules (Train B, post-feature units)", () => {
+  it("rejects relative paths and paths containing whitespace even when the file exists", async () => {
+    const dir = await tmpRoot("dag-ref-")
+    const spacedPath = path.join(dir, "two words.md")
+    await Bun.write(spacedPath, "spaced")
+    expect(await Effect.runPromise(captureOutputFileRef(` ${spacedPath} `))).toBeUndefined()
+    const relative = path.relative(process.cwd(), spacedPath)
+    expect(await Effect.runPromise(captureOutputFileRef(relative))).toBeUndefined()
+  })
+
+  it("captures cross-worktree refs and normalizes trailing whitespace only", async () => {
+    const dir = await tmpRoot("dag-ref-")
+    const reportPath = path.join(dir, "cross.md")
+    const content = "cross-worktree report"
+    await Bun.write(reportPath, content)
+    const ref = await Effect.runPromise(captureOutputFileRef(`\n${reportPath}\n`))
+    expect(ref).toEqual(expect.objectContaining({
+      kind: "file_ref",
+      content_ref: reportPath,
+      path: reportPath,
+      size: Buffer.byteLength(content),
+      sha256: createHash("sha256").update(content).digest("hex"),
+      summary: content,
+    }))
+  })
+
+  it("creates a missing .gitignore with only the report-area entry", async () => {
+    const projectDir = await tmpRoot("dag-ref-proj-")
+    const refPath = path.join(projectDir, REPORT_AREA, "x.md")
+    await Effect.runPromise(ensureReportAreaGitignore(projectDir, refPath))
+    expect(await fs.readFile(path.join(projectDir, ".gitignore"), "utf8")).toBe(".opencode/workflow-reports/\n")
+  })
+
+  it("separates the entry onto its own line when the existing file lacks a trailing newline", async () => {
+    const projectDir = await tmpRoot("dag-ref-proj-")
+    await Bun.write(path.join(projectDir, ".gitignore"), "node_modules")
+    const refPath = path.join(projectDir, REPORT_AREA, "x.md")
+    await Effect.runPromise(ensureReportAreaGitignore(projectDir, refPath))
+    expect(await fs.readFile(path.join(projectDir, ".gitignore"), "utf8")).toBe("node_modules\n.opencode/workflow-reports/\n")
+  })
+
+  it("leaves the file byte-identical when an entry or a covering .opencode/ rule already exists", async () => {
+    for (const covering of [".opencode/workflow-reports/", ".opencode/workflow-reports", ".opencode/", ".opencode"]) {
+      const projectDir = await tmpRoot("dag-ref-proj-")
+      const before = `${covering}\nkeep-me\n`
+      await Bun.write(path.join(projectDir, ".gitignore"), before)
+      const refPath = path.join(projectDir, REPORT_AREA, "x.md")
+      await Effect.runPromise(ensureReportAreaGitignore(projectDir, refPath))
+      expect(await fs.readFile(path.join(projectDir, ".gitignore"), "utf8")).toBe(before)
+    }
+  })
+
+  it("does not create a .gitignore for refs outside the report area", async () => {
+    const projectDir = await tmpRoot("dag-ref-proj-")
+    const outsideDir = await tmpRoot("dag-ref-outside-")
+    const refPath = path.join(outsideDir, "y.md")
+    await Effect.runPromise(ensureReportAreaGitignore(projectDir, refPath))
+    expect(await Bun.file(path.join(projectDir, ".gitignore")).exists()).toBe(false)
   })
 })

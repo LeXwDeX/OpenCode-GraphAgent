@@ -16,6 +16,7 @@ import { Provider } from "@/provider/provider"
 import { Session } from "@/session/session"
 import { SessionID } from "@/session/schema"
 import { createAdmissionRecord } from "@/dag/admission"
+import { isOutputFileRef } from "@/dag/runtime/output-ref"
 import { TerminalViolationError } from "@opencode-ai/core/dag/core/types"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { stringify as yamlStringify } from "yaml"
@@ -498,6 +499,37 @@ export const WorkflowTool = Tool.define<
               const node = yield* dag.store.getNode(params.workflow_id, params.node_id).pipe(Effect.orDie)
               if (!node) {
                 return yield* Effect.die(new Error(`Workflow node not found: ${params.workflow_id}/${params.node_id}`))
+              }
+              // Train B (v1.0.15 B3): a submit-time file ref reads as a durable
+              // pointer — content_ref + summary + path — and the parent agent
+              // fetches the content itself (read tool). No paging: the pointer
+              // is bounded by construction and next_cursor is never issued, so
+              // inline outputs below keep the exact legacy paged read.
+              if (isOutputFileRef(node.capturedOutput)) {
+                return {
+                  title: `Workflow result: ${node.name}`,
+                  output: JSON.stringify(
+                    {
+                      workflow_id: params.workflow_id,
+                      node_id: params.node_id,
+                      status: node.status,
+                      content_ref: node.capturedOutput.content_ref,
+                      path: node.capturedOutput.path,
+                      summary: node.capturedOutput.summary,
+                      size: node.capturedOutput.size,
+                      sha256: node.capturedOutput.sha256,
+                      truncated: false,
+                      next_cursor: null,
+                    },
+                    null,
+                    2,
+                  ),
+                  metadata: {
+                    workflowId: params.workflow_id,
+                    nodeId: params.node_id,
+                    truncated: false,
+                  } as Metadata,
+                }
               }
               const cursor = params.cursor
                 ? decodeResultCursor(Buffer.from(params.cursor, "base64url").toString())
