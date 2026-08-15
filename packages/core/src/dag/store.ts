@@ -148,6 +148,7 @@ const wakeDeliverableNodePredicate = or(
 
 export interface Interface {
   readonly getWorkflow: (id: string) => Effect.Effect<WorkflowRow | undefined>
+  readonly tryClaimAdoption: (id: string) => Effect.Effect<boolean>
   readonly listWorkflows: () => Effect.Effect<WorkflowRow[]>
   readonly listBySession: (sessionId: string) => Effect.Effect<WorkflowRow[]>
   readonly listByProject: (projectId: string) => Effect.Effect<WorkflowRow[]>
@@ -180,6 +181,31 @@ export const layer = Layer.effect(
       getWorkflow: Effect.fn("DagStore.getWorkflow")(function* (id) {
         const row = yield* db.select().from(WorkflowTable).where(eq(WorkflowTable.id, id)).get().pipe(Effect.orDie)
         return row ? mapWorkflow(row) : undefined
+      }),
+
+      // #270 atomic-adoption fence (C2). The adoption sites previously re-read the
+      // row (ownsWorkflow) and then published their entry into the in-memory map —
+      // a check-then-act pair a deletion cascade could commit between. The claim
+      // collapses the admission into ONE conditional UPDATE: it matches the row
+      // only while the row STILL EXISTS and is in an adoptable (non-terminal)
+      // status, and returns whether it claimed. A Session.remove (FK cascade) or a
+      // terminal transition that commits before the claim therefore makes the claim
+      // match zero rows and the adoption aborts atomically — no post-deletion
+      // admission survives. Directory ownership is NOT re-asserted here: the caller
+      // has already passed DagLocation.ownsWorkflow, which canonicalizes both sides;
+      // duplicating a directory comparison in SQL would diverge from that
+      // canonicalization (create stamps are realpathed, Moved re-stamps are not),
+      // so status conditionality is the fence and the read authority keeps the
+      // directory key. No lease column — the status conditionality IS the claim.
+      tryClaimAdoption: Effect.fn("DagStore.tryClaimAdoption")(function* (id) {
+        const claimed = yield* db
+          .update(WorkflowTable)
+          .set({ time_updated: Date.now() })
+          .where(and(eq(WorkflowTable.id, id), inArray(WorkflowTable.status, ["pending", "running", "paused", "stepping"])))
+          .returning({ id: WorkflowTable.id })
+          .get()
+          .pipe(Effect.orDie)
+        return claimed !== undefined
       }),
 
       listWorkflows: Effect.fn("DagStore.listWorkflows")(function* () {

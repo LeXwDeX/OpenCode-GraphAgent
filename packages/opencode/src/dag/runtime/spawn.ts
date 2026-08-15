@@ -404,6 +404,17 @@ export function spawnNode(
           return
         }
         try {
+          // #270 window-2 spawn-admission fence (C4): the node was durably
+          // admitted (nodeQueued above) but the child session is about to
+          // materialize — a deletion cascade (Session.remove → FK) committed in
+          // that window must fence the spawn instead of letting it create an
+          // orphan child for a dead workflow. Re-admit ATOMICALLY right before
+          // sessions.create: the claim matches only while the workflow row exists
+          // and is non-terminal, so a committed deletion matches zero rows and the
+          // spawn aborts before any child session exists (no post-deletion spawn
+          // survives). This is the revalidation that closes the spawn window the
+          // nodeQueued guard alone leaves open between its read and its publish.
+          if (!(yield* dag.store.tryClaimAdoption(input.dagID))) return
           // Permit acquired — only NOW materialize the child session and mark
           // the node running (P0-2). Before this point the node is durably
           // "queued" with no session: a 100-node fan-out holds at most

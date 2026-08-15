@@ -31,11 +31,16 @@ export const WorkflowTable = sqliteTable(
     session_id: text()
       .notNull()
       .references(() => SessionTable.id, { onDelete: "cascade" }),
-    // Execution-location key (DAG-LOC-01): the creating instance's directory,
-    // stamped at dag.create. Only the instance whose directory matches may
-    // adopt, recover, wake, or spawn for this workflow. Nullable: legacy rows
-    // predating the column match no instance (conservative — never adopted
-    // until recreated).
+    // Execution-location key (DAG-LOC-01): the directory that owns this workflow.
+    // Only the instance whose directory matches may adopt, recover, wake, or spawn
+    // for it. TWO-WRITER WHITELIST (#269): the stamp is written at dag.create
+    // (WorkflowCreated projection INSERT, onConflictDoNothing — a replay can never
+    // rewrite an existing stamp) and re-stamped ONLY by the session projector's
+    // SessionEvent.Moved projection (the stamp moves WITH the session in one
+    // transaction, payload-sourced from the Moved event — no SessionTable read).
+    // No other writer may set it; R7-ext pins the whitelist. Nullable: legacy rows
+    // predating the column match no instance (fail-closed — never adopted until
+    // recreated).
     directory: text(),
     title: text().notNull(),
     status: text().notNull(),

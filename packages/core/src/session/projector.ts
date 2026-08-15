@@ -13,6 +13,7 @@ import { SessionMessageUpdater } from "./message-updater"
 import { SessionInput } from "./input"
 import { WorkspaceV2 } from "../workspace"
 import { SessionContextEpoch } from "./context-epoch"
+import { WorkflowTable } from "../dag/sql"
 import { MessageTable, PartTable, SessionInputTable, SessionMessageTable, SessionTable } from "./sql"
 import type { DeepMutable } from "../schema"
 import { SessionMessageID } from "./message-id"
@@ -252,6 +253,21 @@ export const layer = Layer.effectDiscard(
             time_updated: DateTime.toEpochMillis(event.data.timestamp),
           })
           .where(eq(SessionTable.id, event.data.sessionID))
+          .run()
+          .pipe(Effect.orDie)
+        // #269 atomic-adoption resolution: the execution-location stamp must move
+        // WITH the session in one transaction. Re-stamp every durable workflow
+        // row of the session to the payload-sourced destination directory (NO
+        // SessionTable read — the Moved payload carries it). This runs inside the
+        // same durable publish transaction as the SessionTable update, so there is
+        // never a window where the session's rows carry mixed stamps (fail-closed
+        // ownership would otherwise wedge every wake for the session). This is the
+        // second whitelisted directory writer (see WorkflowTable.directory): the
+        // create-time INSERT is the first; only SessionEvent.Moved may re-stamp.
+        yield* db
+          .update(WorkflowTable)
+          .set({ directory: event.data.location.directory })
+          .where(eq(WorkflowTable.session_id, event.data.sessionID))
           .run()
           .pipe(Effect.orDie)
         yield* SessionContextEpoch.reset(db, event.data.sessionID)
