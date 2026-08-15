@@ -141,6 +141,26 @@ export const layer = Layer.effectDiscard(
 
     yield* events.project(DagEvent.WorkflowReplanned, (event) =>
       Effect.gen(function* () {
+        // Rev-view (v1.0.15 Train A): every replan opens a new graph
+        // revision. The two legs run in THIS order so each event bumps
+        // graph_rev exactly once: the seq-bump leg matches the active
+        // statuses first (status unchanged), and the reopen leg then matches
+        // completed rows still untouched by it — reversing the legs would let
+        // the reopened (now running) row match the seq-bump leg too and
+        // double-bump.
+        yield* db
+          .update(WorkflowTable)
+          .set({
+            graph_rev: sql`${WorkflowTable.graph_rev} + 1`,
+            seq: event.durable!.seq,
+            time_updated: toMillis(event.data.timestamp),
+          })
+          .where(and(
+            eq(WorkflowTable.id, event.data.dagID),
+            inArray(WorkflowTable.status, ["pending", "running", "paused", "stepping"]),
+          ))
+          .run()
+          .pipe(Effect.orDie)
         // Atomic wake can reach the parent only after a leaf checkpoint has
         // completed the current graph. An additive extend emits this event to
         // reopen that completed workflow without changing completed nodes.
@@ -150,6 +170,7 @@ export const layer = Layer.effectDiscard(
             status: "running",
             wake_reported: false,
             completed_at: null,
+            graph_rev: sql`${WorkflowTable.graph_rev} + 1`,
             seq: event.durable!.seq,
             time_updated: toMillis(event.data.timestamp),
           })
@@ -159,15 +180,23 @@ export const layer = Layer.effectDiscard(
           ))
           .run()
           .pipe(Effect.orDie)
-        yield* db
-          .update(WorkflowTable)
-          .set({ seq: event.durable!.seq, time_updated: toMillis(event.data.timestamp) })
-          .where(and(
-            eq(WorkflowTable.id, event.data.dagID),
-            inArray(WorkflowTable.status, ["pending", "running", "paused", "stepping"]),
-          ))
-          .run()
-          .pipe(Effect.orDie)
+        // Rev-view: mark the nodes this replan pushed out of the current
+        // revision — terminal rows the fragment bypassed (a failed node the
+        // new path routes around). plan.cancel rows are marked via the
+        // NodeCancelled projection instead. Idempotent fold: the marker is
+        // monotonic, replaying the event never resurrects a marked row.
+        const superseded = event.data.superseded
+        if (superseded && superseded.length > 0) {
+          yield* db
+            .update(WorkflowNodeTable)
+            .set({ superseded: true, seq: event.durable!.seq, time_updated: toMillis(event.data.timestamp) })
+            .where(and(
+              eq(WorkflowNodeTable.workflow_id, event.data.dagID),
+              inArray(WorkflowNodeTable.id, [...superseded]),
+            ))
+            .run()
+            .pipe(Effect.orDie)
+        }
       }),
     )
 
@@ -361,10 +390,16 @@ export const layer = Layer.effectDiscard(
     // therefore never hold status="cancelled"; see NodeStatusProjection.cancelled
     // above and the canonical proof in
     // packages/opencode/test/dag/dag-escalation-clear-flag.test.ts:130-148.
+    //
+    // Rev-view (v1.0.15 Train A): a cancelled node leaves the current graph
+    // revision — the projection also sets the superseded marker so view and
+    // aggregation reads (summaries, status, node lists, rebuild input, wake
+    // attribution) show only the current rev. This covers both plan.cancel
+    // rows and explicit dag.nodeCancelled publishes (U1: shared semantics).
     yield* events.project(DagEvent.NodeCancelled, (event) =>
       db
         .update(WorkflowNodeTable)
-        .set({ status: "failed", error_reason: "cancelled via replan", escalation_pending: false, seq: event.durable!.seq, time_updated: toMillis(event.data.timestamp) })
+        .set({ status: "failed", superseded: true, error_reason: "cancelled via replan", escalation_pending: false, seq: event.durable!.seq, time_updated: toMillis(event.data.timestamp) })
         .where(and(
           eq(WorkflowNodeTable.workflow_id, event.data.dagID),
           eq(WorkflowNodeTable.id, event.data.nodeID),

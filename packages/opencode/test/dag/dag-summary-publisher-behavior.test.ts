@@ -57,6 +57,7 @@ function workflow(id: string, sessionId: string, projectId: string): WorkflowRow
     config: "",
     seq: 0,
     wakeReported: false,
+    graphRev: 1,
     startedAt: null,
     completedAt: null,
     timeCreated: 0,

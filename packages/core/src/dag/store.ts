@@ -24,6 +24,8 @@ export interface WorkflowRow {
   config: string
   seq: number
   wakeReported: boolean
+  /** Rev-view (v1.0.15 Train A): current graph-revision counter (audit/telemetry). */
+  graphRev: number
   startedAt: number | null
   completedAt: number | null
   timeCreated: number
@@ -51,6 +53,8 @@ export interface NodeRow {
   replanAttempts: number
   timeoutExtensions: number
   escalationPending: boolean
+  /** Rev-view (v1.0.15 Train A): pushed out of the current graph revision by a replan. */
+  superseded: boolean
   seq: number
   startedAt: number | null
   completedAt: number | null
@@ -91,6 +95,7 @@ const mapWorkflow = (r: typeof WorkflowTable.$inferSelect): WorkflowRow => ({
   config: r.config,
   seq: r.seq,
   wakeReported: r.wake_reported,
+  graphRev: r.graph_rev,
   startedAt: r.started_at,
   completedAt: r.completed_at,
   timeCreated: r.time_created,
@@ -118,6 +123,7 @@ const mapNode = (r: typeof WorkflowNodeTable.$inferSelect): NodeRow => ({
   replanAttempts: r.replan_attempts,
   timeoutExtensions: r.timeout_extensions,
   escalationPending: r.escalation_pending,
+  superseded: r.superseded,
   seq: r.seq,
   startedAt: r.started_at,
   completedAt: r.completed_at,
@@ -156,6 +162,15 @@ export interface Interface {
   readonly getWorkflowSummaries: (sessionId: string) => Effect.Effect<WorkflowSummary[]>
 
   readonly getNodes: (workflowId: string) => Effect.Effect<NodeRow[]>
+  /**
+   * Rev-view (v1.0.15 Train A): the CURRENT graph revision only — rows the
+   * replan pushed out of the graph (superseded) are filtered out. This is the
+   * read for VIEW and terminal-aggregation consumers: summaries, status/node
+   * listings, the loop's rebuild/recovery/completion input, and wake failure
+   * attribution. Durable truth is untouched — getNodes still returns every
+   * row, and completed old-rev outputs stay resolvable for input mapping.
+   */
+  readonly getCurrentNodes: (workflowId: string) => Effect.Effect<NodeRow[]>
   readonly getNode: (workflowId: string, nodeId: string) => Effect.Effect<NodeRow | undefined>
   readonly getRunningNodes: (workflowId: string) => Effect.Effect<NodeRow[]>
   readonly setCapturedOutput: (childSessionID: string, payload: unknown) => Effect.Effect<void>
@@ -257,6 +272,9 @@ export const layer = Layer.effect(
         if (wfRows.length === 0) return []
         // P1-4: aggregate in SQL — pulling every node row into JS made each
         // dag.* event burst scale with total node count across the session.
+        // Rev-view (v1.0.15 Train A): superseded rows are filtered out so the
+        // counts reflect ONLY the current graph revision — a replaced segment
+        // neither counts toward nodeCount nor inflates failedNodes.
         const countRows = yield* db
           .select({
             workflowId: WorkflowNodeTable.workflow_id,
@@ -265,7 +283,7 @@ export const layer = Layer.effect(
           })
           .from(WorkflowNodeTable)
           .innerJoin(WorkflowTable, eq(WorkflowNodeTable.workflow_id, WorkflowTable.id))
-          .where(eq(WorkflowTable.session_id, sessionId))
+          .where(and(eq(WorkflowTable.session_id, sessionId), eq(WorkflowNodeTable.superseded, false)))
           .groupBy(WorkflowNodeTable.workflow_id, WorkflowNodeTable.status)
           .all()
           .pipe(Effect.orDie)
@@ -284,6 +302,7 @@ export const layer = Layer.effect(
             eq(WorkflowTable.session_id, sessionId),
             eq(WorkflowNodeTable.status, "running"),
             eq(WorkflowNodeTable.escalation_pending, true),
+            eq(WorkflowNodeTable.superseded, false),
           ))
           .groupBy(WorkflowNodeTable.workflow_id)
           .all()
@@ -314,6 +333,17 @@ export const layer = Layer.effect(
           .select()
           .from(WorkflowNodeTable)
           .where(eq(WorkflowNodeTable.workflow_id, workflowId))
+          .orderBy(desc(WorkflowNodeTable.seq))
+          .all()
+          .pipe(Effect.orDie)
+        return rows.map(mapNode)
+      }),
+
+      getCurrentNodes: Effect.fn("DagStore.getCurrentNodes")(function* (workflowId) {
+        const rows = yield* db
+          .select()
+          .from(WorkflowNodeTable)
+          .where(and(eq(WorkflowNodeTable.workflow_id, workflowId), eq(WorkflowNodeTable.superseded, false)))
           .orderBy(desc(WorkflowNodeTable.seq))
           .all()
           .pipe(Effect.orDie)

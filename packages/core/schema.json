@@ -1,9 +1,9 @@
 {
   "version": "7",
   "dialect": "sqlite",
-  "id": "4142b961-0712-4834-b475-16ea4a74c43c",
+  "id": "874d8e74-d354-4dcb-b98c-c893660c9371",
   "prevIds": [
-    "7e8e00e9-7bbb-443e-996b-f646ec030c2b"
+    "4142b961-0712-4834-b475-16ea4a74c43c"
   ],
   "ddl": [
     {
@@ -686,6 +686,16 @@
       "type": "integer",
       "notNull": true,
       "autoincrement": false,
+      "default": "false",
+      "generated": null,
+      "name": "superseded",
+      "entityType": "columns",
+      "table": "workflow_node"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
       "default": null,
       "generated": null,
       "name": "seq",
@@ -819,6 +829,16 @@
       "default": "false",
       "generated": null,
       "name": "wake_reported",
+      "entityType": "columns",
+      "table": "workflow"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "1",
+      "generated": null,
+      "name": "graph_rev",
       "entityType": "columns",
       "table": "workflow"
     },

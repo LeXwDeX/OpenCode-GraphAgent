@@ -179,6 +179,13 @@ export const WorkflowReplanned = Event.define({
     removed: NonNegativeInt,
     replaced: NonNegativeInt,
     restarted: NonNegativeInt,
+    // Rev-view (v1.0.15 Train A): nodes the replan pushes OUT of the current
+    // graph revision — terminal rows the fragment bypasses (a failed node the
+    // new path routes around). NodeCancelled covers the plan.cancel bucket
+    // separately at projection; this list covers replacements the engine
+    // never cancels. Optional so legacy durable events still decode (same
+    // precedent as WorkflowCreated.directory); absent lists project nothing.
+    superseded: Schema.optional(Schema.Array(NodeID)),
   },
 })
 export type WorkflowReplanned = typeof WorkflowReplanned.Type
