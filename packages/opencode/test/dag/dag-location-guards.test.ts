@@ -174,20 +174,34 @@ interface TwoInstanceInput {
    * release, prepareIfIdle returns none (the call itself still proves the
    * idle subscription survived).
    */
-  readonly parkWakeDelivery?: {
-    readonly wait: Promise<void>
-    readonly parked: { value: boolean }
-    readonly released: { value: boolean }
-    readonly calls: { value: number }
-  }
-}
+   readonly parkWakeDelivery?: {
+     readonly wait: Promise<void>
+     readonly parked: { value: boolean }
+     readonly released: { value: boolean }
+     readonly calls: { value: number }
+   }
+   /**
+    * Optional deterministic park on DagStore.tryClaimAdoption (the #270 atomic
+    * admission fence). Each claim bumps `calls`; the first `skip` claims pass
+    * through unparked (e.g. the adoption claim), every later claim sets
+    * `parked.value = true` and parks on `wait` before delegating — letting a
+    * probe interleave Session.remove between the passed admission and the
+    * in-flight spawn's child-session creation (the deletion-race probe C7).
+    */
+   readonly parkAdoptionClaim?: {
+     readonly wait: Promise<void>
+     readonly parked: { value: boolean }
+     readonly calls: { value: number }
+     readonly skip: number
+   }
+ }
 
 function twoInstanceLayer(input: TwoInstanceInput) {
   const database = Database.layerFromPath(":memory:")
   const events = EventV2.layer.pipe(Layer.provide(database))
   const bridge = EventV2Bridge.layer.pipe(Layer.provide(events))
   const realStore = DagStore.layer.pipe(Layer.provide(database))
-  const needsStoreWrapper = Boolean(input.failGetWorkflow) || Boolean(input.parkGetNodes)
+  const needsStoreWrapper = Boolean(input.failGetWorkflow) || Boolean(input.parkGetNodes) || Boolean(input.parkAdoptionClaim)
   const store = needsStoreWrapper
     ? Layer.effect(
         DagStore.Service,
@@ -210,6 +224,15 @@ function twoInstanceLayer(input: TwoInstanceInput) {
                 gate.calls.value++
                 gate.parked.value = true
                 return Effect.promise(() => gate.wait).pipe(Effect.flatMap(() => real.getNodes(id)))
+              }),
+            tryClaimAdoption: (id) =>
+              Effect.suspend(() => {
+                const gate = input.parkAdoptionClaim
+                if (!gate) return real.tryClaimAdoption(id)
+                gate.calls.value++
+                if (gate.calls.value <= gate.skip) return real.tryClaimAdoption(id)
+                gate.parked.value = true
+                return Effect.promise(() => gate.wait).pipe(Effect.flatMap(() => real.tryClaimAdoption(id)))
               }),
           })
         }),
@@ -393,6 +416,12 @@ function runTwoInstanceGuardTest<A>(
       readonly released: { value: boolean }
       readonly calls: { value: number }
     }
+    readonly parkAdoptionClaim?: {
+      readonly wait: Promise<void>
+      readonly parked: { value: boolean }
+      readonly calls: { value: number }
+      readonly skip: number
+    }
   },
   test: (services: TwoInstanceServices) => Effect.Effect<A, Error>,
   beforeInit?: (services: { readonly database: Database.Interface }) => Effect.Effect<void>,
@@ -477,6 +506,7 @@ function runTwoInstanceGuardTest<A>(
         failGetWorkflow: options.failGetWorkflow,
         parkGetNodes: options.parkGetNodes,
         parkWakeDelivery: options.parkWakeDelivery,
+        parkAdoptionClaim: options.parkAdoptionClaim,
       })),
       Effect.provideService(InstanceRef, {
         directory: directoryA,
@@ -1524,6 +1554,55 @@ describe("DAG-LOC-01 issue #238 evidence probes", () => {
             expect(byId.get("c9-wf-stale")).toBe(DIR_B)
             // ...and the NULL zombie stayed NULL (fail-closed is preserved).
             expect(byId.get("c9-wf-zombie")).toBeNull()
+          }),
+      ),
+    )
+  })
+
+  it("C7: a deletion committed after a passed admission check fences the in-flight spawn — no post-deletion child survives (#270 deletion race)", async () => {
+    const parked = { value: false }
+    const calls = { value: 0 }
+    let release: () => void = () => {}
+    const wait = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    await Effect.runPromise(
+      runTwoInstanceGuardTest(
+        { parkAdoptionClaim: { wait, parked, calls, skip: 1 } },
+        ({ dag, database, initA, cancelsA, childPromptsA }) =>
+          Effect.gen(function* () {
+            yield* initA
+            // A ready-node workflow: the adoption claim (skipped by the gate) runs
+            // first, then spawnReady admits the node and the SECOND claim — the
+            // window-2 spawn-admission fence — parks just before the child session
+            // would materialize.
+            const dagID = yield* dag.create({
+              projectID: PROJECT_ID,
+              sessionID: SES_A,
+              title: "deletion race",
+              config: { name: "c7", nodes: [node()] },
+            })
+            yield* pollWithTimeout(
+              Effect.sync(() => (parked.value ? true : undefined)),
+              "the spawn admission claim never parked",
+            )
+            // Deletion committed AFTER the ownership/admission check passed: drop
+            // the workflow row directly (FK cascade wipes the nodes) WITHOUT
+            // publishing SessionV1.Event.Deleted, so no in-memory sweep interrupts
+            // the parked admission — the fence must hold purely because the atomic
+            // claim re-reads the row.
+            yield* database.db.delete(WorkflowTable)
+              .where(eq(WorkflowTable.id, dagID as never))
+              .run().pipe(Effect.orDie)
+            // Release: the claim conditional UPDATE matches no row (cascade already
+            // removed it) → the spawn aborts BEFORE sessions.create — nothing a
+            // deleted workflow may run survives the admission window.
+            release()
+            yield* Effect.sleep("400 millis")
+            // Fenced: no post-deletion spawn survived — no child prompt ran and no
+            // child session was created-then-cancelled.
+            expect(Option.isNone(yield* Queue.take(childPromptsA).pipe(Effect.timeoutOption("500 millis")))).toBe(true)
+            expect(cancelsA).toEqual([])
           }),
       ),
     )

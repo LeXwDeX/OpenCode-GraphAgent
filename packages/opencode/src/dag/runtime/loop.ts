@@ -434,6 +434,13 @@ const serviceLayer = Layer.effect(
             // publishing now would leak an inert entry the sweep can no longer
             // reach. The ensuring below still clears the recovering reservation.
             if (!(yield* DagLocation.ownsWorkflow(dagID, ctx.directory))) return
+            // #270 atomic-admission fence (C3): the durable read above and the
+            // runtimes publish below are still two statements — a deletion can
+            // commit between them. Collapse the admission into ONE conditional
+            // UPDATE that matches only while the row exists and is non-terminal.
+            // A cascade committed in that final window matches zero rows and the
+            // adoption aborts here, before it ever publishes an entry.
+            if (!(yield* store.tryClaimAdoption(dagID))) return
             runtimes.set(dagID, entry)
             yield* automation.register(SessionID.make(wf.sessionId), { kind: "dag", id: dagID })
             // Reconciliation settles every persisted running attempt before the
@@ -553,6 +560,12 @@ const serviceLayer = Layer.effect(
                 // through. A row cascade-deleted after the first guard must not
                 // be adopted into an inert entry.
                 if (!(yield* DagLocation.ownsWorkflow(dagID, ctx.directory))) return
+                // #270 atomic-admission fence (C3, same as recoverWorkflow): the
+                // durable read and the runtimes publish are two statements a
+                // deletion can slip between; collapse the admission into one
+                // conditional UPDATE (exists + non-terminal). A cascade committed
+                // in the final window matches zero rows and the adoption aborts.
+                if (!(yield* store.tryClaimAdoption(dagID))) return
                 runtimes.set(dagID, entry)
                 yield* automation.register(SessionID.make(wf.sessionId), { kind: "dag", id: dagID })
                 yield* entry.evalLock.withPermits(1)(
