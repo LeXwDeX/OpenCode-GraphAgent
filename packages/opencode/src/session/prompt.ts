@@ -175,6 +175,15 @@ export const layer = Layer.effect(
 
     const cancel = Effect.fn("SessionPrompt.cancel")(function* (sessionID: SessionID) {
       yield* Effect.logInfo("cancel", { "session.id": sessionID })
+      // GOAL-TURN-SCOPE (ESC semantics): ESC on a goal-driven turn means "stop
+      // working on the goal", not just "stop this turn". Without this, the idle
+      // event after cancel re-enters afterIdle, shouldPreempt returns false (the
+      // last user message is the /goal command itself, necessarily older than
+      // this turn's assistant output), and the judge auto-resurrects the goal
+      // with a continuation the user just tried to abort. Pause instead.
+      if (goal && (yield* goal.isTurnDriven(sessionID))) {
+        yield* goal.pauseForUserCancel(sessionID, "用户中断（ESC）— /goal resume 继续").pipe(Effect.ignore)
+      }
       yield* state.cancel(sessionID)
     })
 
@@ -1663,7 +1672,12 @@ export const layer = Layer.effect(
             yield* events.publish(Session.Event.Error, { sessionID, error: error.toObject() })
             throw error
           }
-          const maxSteps = agent.steps ?? Infinity
+          // GOAL-TURN-SCOPE: cap goal-driven turns (kick / continuation /
+          // resume-kick) so every goal turn reaches an idle boundary where the
+          // judge and the turn budget can engage. min() keeps a stricter
+          // user-configured agent.steps authoritative.
+          const goalMax = goal ? yield* goal.goalTurnMaxSteps(sessionID) : undefined
+          const maxSteps = Math.min(agent.steps ?? Infinity, goalMax ?? Infinity)
           const isLastStep = step >= maxSteps
           msgs = yield* SessionReminders.apply({ messages: msgs, agent, session }).pipe(
             Effect.provideService(RuntimeFlags.Service, flags),
@@ -1996,6 +2010,10 @@ export const layer = Layer.effect(
         yield* sessions.updatePart(responsePart)
         yield* sessions.touch(input.sessionID)
         if (dispatchResult.type === "kick" && input.command === "goal") {
+          // GOAL-TURN-SCOPE: this loop() is a goal-driven turn (kick or
+          // resume-kick) — mark it so the step ceiling applies and ESC maps to
+          // a goal pause.
+          yield* goal?.markTurnDriven(input.sessionID)
           // Drain SessionStart hook contexts before loop
           if (startContext) {
             const contexts = yield* startContext.consume(input.sessionID)
