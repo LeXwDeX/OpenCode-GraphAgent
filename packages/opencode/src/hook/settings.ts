@@ -1432,10 +1432,11 @@ const mcpHandler: HookHandler = {
 
 /**
  * `type: "http"` handler. Per CC protocol, `entry.command` is the endpoint URL;
- * the envelope is POSTed as JSON. 2xx → body parsed via the same parseStdout path
- * as command stdout. Non-2xx → synthetic `exitBlock` so the trigger aggregator
- * surfaces it as a block. Network errors / timeouts → log.warn + silent allow,
- * mirroring commandHandler's spawnError behavior (hooks must never crash the host).
+ * the envelope is POSTed as JSON with `entry.headers` applied verbatim (auth
+ * tokens etc.). 2xx → body parsed via the same parseStdout path as command
+ * stdout. Non-2xx → synthetic `exitBlock` so the trigger aggregator surfaces it
+ * as a block. Network errors / timeouts → log.warn + silent allow, mirroring
+ * commandHandler's spawnError behavior (hooks must never crash the host).
  *
  * Factory takes the resolved HttpClient so the HookHandler.run signature stays
  * `R = never` (the WP-4A interface contract). Captures `http` in closure scope —
@@ -1454,6 +1455,7 @@ const httpHandler: HookHandler = {
 
     const url = httpUrl(entry)
     const exit = yield* HttpClientRequest.post(url).pipe(
+      HttpClientRequest.setHeaders(entry.headers ?? {}),
       HttpClientRequest.bodyJson(envelope),
       Effect.flatMap((req) => httpRead.execute(req)),
       Effect.flatMap((res) =>

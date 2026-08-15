@@ -474,24 +474,26 @@ const serviceLayer = Layer.effect(
           Effect.catchCause((cause) =>
             Effect.gen(function* () {
               // F1: Only pause for non-interrupt causes. An interrupt (user
-              // pressed ESC during continuation) is safe to drop because the
-              // session ALWAYS re-emits idle afterwards, which re-drives this
-              // loop: SessionRunState.cancel (run-state.ts) and the runner's
-              // onIdle callback both call status.set(idle), and
-              // SessionStatus.set (status.ts) publishes the Status+Idle event
-              // pair unconditionally — even when the session was already idle.
-              // That fresh idle event forks a new afterIdle fiber whose
-              // shouldPreempt guard detects the user's newer message and pauses
-              // there if needed. Pausing HERE would race that replacement
-              // afterIdle fiber and emit a spurious pause. Real dispatch
-              // failures (provider fault, session write error) still get the
-              // recoverable pause below.
+              // pressed ESC during continuation) is safe to drop because
+              // SessionPrompt.cancel pauses goal-driven turns SYNCHRONOUSLY via
+              // goal.pauseForUserCancel (prompt.ts) BEFORE state.cancel lets the
+              // interrupt propagate — by the time this catchCause observes the
+              // cause, the goal is already paused, and pausing again HERE would
+              // double-publish. The session still ALWAYS re-emits idle
+              // afterwards, which re-drives this loop: SessionRunState.cancel
+              // (run-state.ts) and the runner's onIdle callback both call
+              // status.set(idle), and SessionStatus.set (status.ts) publishes
+              // the Status+Idle event pair unconditionally — even when the
+              // session was already idle. On that next cycle shouldPreempt is
+              // only the DB-failure fallback for a pauseForUserCancel that could
+              // not persist. Real dispatch failures (provider fault, session
+              // write error) still get the recoverable pause below.
               // F1: hasInterrupts is a structural check; Cause.interruptors only
               // collects DEFINED fiber ids and silently ignores interrupts
               // carrying none (e.g. Cause.interrupt()), which would otherwise be
               // misclassified as a dispatch failure and spuriously paused here.
               if (Cause.hasInterrupts(cause)) {
-                yield* Effect.logInfo("goal continuation interrupted (likely user ESC) — not pausing; shouldPreempt handles next cycle")
+                yield* Effect.logInfo("goal continuation interrupted (likely user ESC) — not pausing; cancel path already paused the goal")
                 return Option.none()
               }
               const errMsg = `continuation dispatch failed: ${Cause.pretty(cause)}`
