@@ -28,6 +28,11 @@ export class Info extends Schema.Class<Info>("GoalState")({
   last_verdict: Schema.optional(Verdict),
   last_reason: Schema.optional(Schema.String),
   paused_reason: Schema.optional(Schema.String),
+  // issue #285 — the assistant message ID of the boundary judged by the last
+  // committed continue evaluation. Durable crash-recovery gate: the boot scan
+  // must not re-judge a window that still ends on this message (the
+  // process-local evaluatedRevisions map dies with the process).
+  last_judged_msg: Schema.optional(Schema.String),
   consecutive_parse_failures: NonNegativeInt,
   subgoals: Schema.Array(Schema.String).pipe(Schema.optional, Schema.withDecodingDefault(Effect.succeed([] as ReadonlyArray<string>))),
 }) {}
@@ -54,6 +59,7 @@ export function advance(state: Info, patch: Partial<Omit<Info, "revision">>) {
     last_verdict: state.last_verdict,
     last_reason: state.last_reason,
     paused_reason: state.paused_reason,
+    last_judged_msg: state.last_judged_msg,
     consecutive_parse_failures: state.consecutive_parse_failures,
     subgoals: state.subgoals,
     ...patch,

@@ -88,6 +88,11 @@ export interface Interface {
      * goalID+revision pair. Required (not optional): an omitted expected would
      * let a stale loop result mutate whatever goal replaced the judged one. */
     expected: { readonly goalID: string; readonly revision: number },
+    /** issue #285: the assistant message ID judged for this evaluation.
+     * Persisted on continue commits as the DURABLE crash-recovery gate — the
+     * boot scan skips a window still ending on this boundary (the
+     * process-local evaluatedRevisions map cannot survive a crash). */
+    judged?: string,
   ) => Effect.Effect<
     | {
         state: GoalState.Info
@@ -678,6 +683,7 @@ const serviceLayer = Layer.effect(
       reason: string,
       parseFailed: boolean,
       expected: { readonly goalID: string; readonly revision: number },
+      judged?: string,
     ) {
       return yield* transition(sessionID, (state) => {
         if (!state || state.status !== "active" || !matchesExpected(state, expected))
@@ -739,6 +745,8 @@ const serviceLayer = Layer.effect(
           last_reason: reason,
           paused_reason: pauseReason,
           consecutive_parse_failures: GoalState.nni(newParseFailures),
+          // issue #285: record the judged boundary for the durable scan gate.
+          ...(judged !== undefined ? { last_judged_msg: judged } : {}),
         })
         return {
           tag: "save",
