@@ -22,7 +22,6 @@ import {
   reviewContractForNode,
   validateReviewExecutionInput,
   reviewEvidenceKeys,
-  unresolvedReviewOutcomes,
 } from "../review-lifecycle"
 import { Agent } from "@/agent/agent"
 import { Session } from "@/session/session"
@@ -325,14 +324,12 @@ const serviceLayer = Layer.effect(
             yield* dag.fail(dagID, `required node(s) failed: ${entry.runtime.getRequiredFailures().join(", ")}`)
             return
           }
-          const unresolvedReviews = entry.config
-            ? unresolvedReviewOutcomes(entry.config, nodes)
-            : []
-          if (unresolvedReviews.length > 0) {
-            yield* dag.fail(dagID, `unresolved review outcome(s): ${unresolvedReviews.join(", ")}`)
-            return
-          }
-          yield* dag.complete(dagID)
+          // Unresolved review outcomes terminalize the graph as COMPLETED at
+          // the checkpoint, not as a failure: the REJECT shape (skipped
+          // dependents, reporting leaf) is exactly what reopen-extend is
+          // designed to pick up, and a failed workflow is immutable
+          // (issue #294). Explicit completion shortcuts keep the review gate.
+          yield* dag.complete(dagID, { skipReviewGate: true })
         })
 
         const checkSessionStatus = makeSessionStatusChecker(sessionSvc)
