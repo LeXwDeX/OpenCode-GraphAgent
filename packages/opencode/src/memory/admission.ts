@@ -11,6 +11,7 @@ import { MemoryConfig } from "./config"
 import { MemoryHome } from "./home"
 import { MemoryIdentityFence } from "./identity-fence"
 import { MemoryPaths } from "./paths"
+import { MemorySchema } from "./schema"
 import { MemoryStore } from "./store"
 
 const Code = Schema.Literals([
@@ -73,7 +74,7 @@ type TopicCandidate = {
 
 type ConfigCandidate = {
   readonly file: string
-  readonly config: ReturnType<typeof MemoryConfig.normalizeConfig> | undefined
+  readonly config: MemorySchema.Config | undefined
 }
 
 export const layer = Layer.effect(
@@ -228,7 +229,7 @@ export const layer = Layer.effect(
             const decoded = MemoryConfig.decodeConfig(text)
             return {
               file,
-              config: Option.isSome(decoded) ? MemoryConfig.normalizeConfig(decoded.value) : undefined,
+              config: Option.isSome(decoded) ? decoded.value : undefined,
             } satisfies ConfigCandidate
           }),
         { concurrency: 4 },
@@ -248,7 +249,7 @@ export const layer = Layer.effect(
       if (text === undefined) return true
       const decoded = MemoryConfig.decodeConfig(text)
       if (Option.isNone(decoded)) return false
-      return same(MemoryConfig.normalizeConfig(decoded.value), candidate.config)
+      return same(decoded.value, candidate.config)
     })
 
     const removeValidated = Effect.fnUntraced(function* (candidates: ReadonlyArray<ConfigCandidate>) {

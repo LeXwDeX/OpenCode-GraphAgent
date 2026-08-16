@@ -37,10 +37,6 @@ export class Config extends Schema.Class<Config>("MemoryConfig")({
     Schema.isInt(),
     Schema.isBetween({ minimum: MIN_TOPIC_LIMIT, maximum: MAX_TOPIC_LIMIT }),
   ),
-  topic_limit_floor: Schema.Number.check(
-    Schema.isInt(),
-    Schema.isBetween({ minimum: MIN_TOPIC_LIMIT, maximum: MAX_TOPIC_LIMIT }),
-  ),
   turn_interval: Schema.Number.check(
     Schema.isInt(),
     Schema.isBetween({ minimum: MIN_TURN_INTERVAL, maximum: MAX_TURN_INTERVAL }),
@@ -50,14 +46,13 @@ export class Config extends Schema.Class<Config>("MemoryConfig")({
 
 export function updateConfig(
   config: Config,
-  updates: { enabled?: boolean; model?: string; topic_limit_floor?: number },
+  updates: { enabled?: boolean; model?: string },
 ) {
   return new Config({
     schema_version: config.schema_version,
     enabled: updates.enabled ?? config.enabled,
     model: updates.model ?? config.model,
     topic_limit: config.topic_limit,
-    topic_limit_floor: updates.topic_limit_floor ?? config.topic_limit_floor,
     turn_interval: config.turn_interval,
     injection: config.injection,
   })
