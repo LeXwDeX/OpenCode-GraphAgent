@@ -53,12 +53,18 @@ suffice, work is reversible, and no high-risk boundary is involved. Use `full`
 when any are true: requirements or design are uncertain; work crosses modules
 or write owners; a public contract, concurrency, persistence, migration,
 identity, authorization, upstream executable dependencies, CI/release, or
-production behavior is in scope. A single matching custom workflow has no tier
-to infer: read and retarget it directly.
+production behavior is in scope. Only these risk dimensions select a tier —
+never role count or block count, which are consequences of risk, not causes.
+A single matching custom workflow has no tier to infer: read and retarget it
+directly.
 
-If a lite reporting gate returns non-`ACCEPT`, let that graph finish and use
-additive `extend` with new node IDs after reassessing the live library. Do not
-pause or replan a completed workflow; the parent owns this control decision.
+If a lite reporting gate returns non-`ACCEPT`, let that graph finish and
+dispose of the verdict under the Verdict Disposal Contract. When the findings
+cross any `full` criterion above, the correction wave MUST be full-shaped:
+escalate by appending full-shaped assurance lanes with new node IDs in the
+same workflow — a tier escalation is an additive wave, never a replacement
+workflow. Do not pause or replan a completed workflow; the parent owns this
+control decision.
 
 The primary reference follows the final artifact, not every concern. For code
 or repairs, review, security, and performance are secondary assurance in that
