@@ -37,7 +37,6 @@ const config = {
   enabled: true,
   model: "test/memory-small",
   topic_limit: 10,
-  topic_limit_floor: 10,
   turn_interval: 5,
   injection: { max_topics: 3, max_tokens: 1_200 },
 } satisfies MemorySchema.Config
@@ -454,10 +453,13 @@ describe("memory config and YAML store", () => {
       )
       expect(yield* memoryConfig.load(tmp)).toBeUndefined()
 
+      // topic_limit_floor was removed — legacy files still carrying it decode
+      // normally (extra property tolerated); the decoded config never has it,
+      // and load never rewrites the file.
       yield* Effect.promise(() =>
         fs.writeFile(path.join(directory, "memory.jsonc"), JSON.stringify({ ...config, topic_limit_floor: 50 })),
       )
-      expect(yield* memoryConfig.load(tmp)).toBeUndefined()
+      expect((yield* memoryConfig.load(tmp))?.config.topic_limit).toBe(10)
 
       yield* Effect.promise(() =>
         fs.writeFile(
@@ -465,7 +467,7 @@ describe("memory config and YAML store", () => {
           JSON.stringify({ ...config, topic_limit: 50, topic_limit_floor: 10 }),
         ),
       )
-      expect((yield* memoryConfig.load(tmp))?.config).toMatchObject({ topic_limit: 50, topic_limit_floor: 50 })
+      expect((yield* memoryConfig.load(tmp))?.config).toMatchObject({ topic_limit: 50 })
 
       yield* Effect.promise(() =>
         fs.writeFile(
@@ -473,7 +475,7 @@ describe("memory config and YAML store", () => {
           JSON.stringify({ ...config, topic_limit: 20, topic_limit_floor: 50 }),
         ),
       )
-      expect(yield* memoryConfig.load(tmp)).toBeUndefined()
+      expect((yield* memoryConfig.load(tmp))?.config.topic_limit).toBe(20)
     }),
   )
 
@@ -1392,7 +1394,6 @@ describe("memory bootstrap", () => {
           enabled: true,
           model: "test/small",
           topic_limit: 10,
-          topic_limit_floor: 10,
           turn_interval: 5,
           injection: { max_topics: 3, max_tokens: 1_200 },
         })
@@ -1446,7 +1447,6 @@ describe("memory bootstrap", () => {
           ...config,
           model: "test/conversation",
           topic_limit: 42,
-          topic_limit_floor: 42,
           turn_interval: 9,
         }
         const memory = yield* Memory.Service
@@ -1457,7 +1457,6 @@ describe("memory bootstrap", () => {
         expect(bootstrap.state.global).toMatchObject({
           model: "test/conversation",
           topic_limit: 42,
-          topic_limit_floor: 42,
           turn_interval: 9,
         })
         expect(bootstrap.state.modelCalls).toBe(0)
@@ -1475,7 +1474,6 @@ describe("memory bootstrap", () => {
           ...config,
           model: "removed/model",
           topic_limit: 37,
-          topic_limit_floor: 37,
           turn_interval: 7,
         }
         const memory = yield* Memory.Service
@@ -1485,7 +1483,6 @@ describe("memory bootstrap", () => {
         expect(bootstrap.state.written).toMatchObject({
           model: "test/compaction",
           topic_limit: 37,
-          topic_limit_floor: 37,
           turn_interval: 7,
         })
         expect(bootstrap.state.modelCalls).toBe(0)
@@ -1523,7 +1520,6 @@ describe("memory bootstrap", () => {
         expect(bootstrap.state.written).toMatchObject({
           model: "test/conversation",
           topic_limit: 10,
-          topic_limit_floor: 10,
           turn_interval: 5,
         })
         expect(bootstrap.state.modelCalls).toBe(0)
@@ -1544,7 +1540,6 @@ describe("memory bootstrap", () => {
           ...config,
           model: "removed/model",
           topic_limit: 37,
-          topic_limit_floor: 37,
           turn_interval: 7,
         }
         const memory = yield* Memory.Service
@@ -1561,7 +1556,6 @@ describe("memory bootstrap", () => {
         expect(bootstrap.state.written).toMatchObject({
           model: "test/conversation",
           topic_limit: 37,
-          topic_limit_floor: 37,
           turn_interval: 7,
         })
         expect(bootstrap.state.modelCalls).toBe(0)
@@ -1601,7 +1595,6 @@ describe("memory bootstrap", () => {
         expect(bootstrap.state.written).toMatchObject({
           model: "test/conversation",
           topic_limit: 10,
-          topic_limit_floor: 10,
           turn_interval: 5,
         })
         expect(bootstrap.state.modelCalls).toBe(0)

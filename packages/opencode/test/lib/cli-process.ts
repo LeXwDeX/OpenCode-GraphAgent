@@ -213,7 +213,6 @@ export function withCliFixture<A, E>(
         enabled: true,
         model: testModelID,
         topic_limit: 10,
-        topic_limit_floor: 10,
         turn_interval: 5,
         injection: { max_topics: 3, max_tokens: 1_200 },
       }),
