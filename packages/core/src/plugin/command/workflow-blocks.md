@@ -147,9 +147,16 @@ stay quiet. A block immediately after a review gate is conditioned on its
 accepted verdict. Because the condition language handles one verdict reference,
 fan multiple review lanes into one review block before continuing.
 
-All block workers share one workspace. The compiler serializes
-otherwise-unordered `coding` and `prototype` writers, while read-only lanes may
-remain parallel. The resident Orchestration Router owns route selection and
+All block workers share one workspace. Unordered `coding` and `prototype`
+writers run in parallel, so their work packages must be triple-disjoint:
+source files, generated artifacts, and lockfiles must not overlap, and no
+shared build may be triggered. The plan block owns this partition. For an
+implementation review over parallel writers, the compiler injects one
+read-only aggregation node between the writers and the verification gate; it
+fails loudly when the declared write sets overlap and otherwise publishes the
+union with a single implementation fingerprint computed at the convergence
+point. Total-ordered writer chains compile unchanged. Read-only lanes remain
+parallel throughout. The resident Orchestration Router owns route selection and
 phase pruning; this guide owns block fields, contracts, and graph mechanics.
 
 ## When to use low-level nodes

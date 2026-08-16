@@ -249,7 +249,7 @@ describe("workflow blocks", () => {
     })
   })
 
-  it("serializes unordered workspace writers while leaving read-only lanes parallel", () => {
+  it("keeps unordered workspace writers parallel and read-only lanes parallel", () => {
     const nodes = DagBlocks.compileWorkflowBlocks({
       objective: "Build two packages from independent evidence",
       blocks: [
@@ -264,8 +264,8 @@ describe("workflow blocks", () => {
     expect(nodes.find((node) => node.id === "map-a")?.depends_on).toEqual([])
     expect(nodes.find((node) => node.id === "map-b")?.depends_on).toEqual([])
     expect(nodes.find((node) => node.id === "package-a")?.depends_on).toEqual(["map-a"])
-    expect(nodes.find((node) => node.id === "experiment")?.depends_on).toEqual(["map-b", "package-a"])
-    expect(nodes.find((node) => node.id === "package-b")?.depends_on).toEqual(["map-b", "experiment"])
+    expect(nodes.find((node) => node.id === "experiment")?.depends_on).toEqual(["map-b"])
+    expect(nodes.find((node) => node.id === "package-b")?.depends_on).toEqual(["map-b"])
   })
 
   it("routes volume blocks to the standard tier and decision blocks to the advanced tier", () => {
@@ -299,6 +299,7 @@ describe("workflow blocks", () => {
       "diagnose--evidence": "standard",
       diagnose: "advanced",
       build: "standard",
+      "decision--aggregate": "advanced",
       verify: "advanced",
       "decision--standards": "standard",
       "decision--intent": "standard",
@@ -312,6 +313,7 @@ describe("workflow blocks", () => {
       "diagnose--evidence": false,
       diagnose: true,
       build: false,
+      "decision--aggregate": true,
       verify: true,
       "decision--standards": false,
       "decision--intent": false,
