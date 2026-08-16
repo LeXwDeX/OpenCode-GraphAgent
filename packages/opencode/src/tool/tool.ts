@@ -1,5 +1,5 @@
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
-import { Effect, Schema } from "effect"
+import { Effect, Option, Schema } from "effect"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import type { JSONSchema7 } from "@ai-sdk/provider"
 import type { SessionID, MessageID } from "../session/schema"
@@ -107,10 +107,13 @@ export type InferDef<T> =
 /**
  * The OpenAI tools contract requires `parameters` to be a JSON Schema object.
  * A root-level combinator (anyOf/oneOf/allOf) is outside that contract:
- * OpenAI tolerates it, DeepSeek rejects it with a schema error, and GLM
- * silently emits empty tool arguments. Tools that need a discriminated union
- * must nest it under a property (e.g. `{ params: <union> }`). Violations fail
- * at construction time here instead of degrading at provider runtime.
+ * OpenAI tolerates it, DeepSeek rejects it with a schema error, GLM silently
+ * emits empty tool arguments, and qwen-family models string-encode property
+ * values whose schema is a nested union (issue #297 — repaired by the
+ * retry pass in the execute wrapper below). Tools that need a discriminated
+ * union must nest it under a property (e.g. `{ params: <union> }`).
+ * Violations fail at construction time here instead of degrading at provider
+ * runtime.
  */
 function assertObjectRootedParameters(id: string, toolInfo: DefWithoutID<never, never> | { parameters: unknown; jsonSchema?: unknown }) {
   const root = toolInfo.jsonSchema ?? ToolJsonSchema.fromSchema(toolInfo.parameters as Schema.Top)
@@ -162,16 +165,19 @@ function wrap<Parameters extends Schema.Decoder<unknown>, Result extends Metadat
           "message.id": ctx.messageID,
           ...(ctx.callID ? { "tool.call_id": ctx.callID } : {}),
         }
+        const invalidArguments = (error: unknown) =>
+          new InvalidArgumentsError({
+            tool: id,
+            detail: toolInfo.formatValidationError ? toolInfo.formatValidationError(error) : String(error),
+          })
         return Effect.gen(function* () {
-          const decoded = yield* decode(args).pipe(
-            Effect.mapError(
-              (error) =>
-                new InvalidArgumentsError({
-                  tool: id,
-                  detail: toolInfo.formatValidationError ? toolInfo.formatValidationError(error) : String(error),
-                }),
-            ),
-          )
+          // Strict decode first; the lenient retry only runs once strict
+          // decoding already failed, so legitimate string arguments that look
+          // like JSON are never re-parsed.
+          const strict = yield* decode(args).pipe(Effect.option)
+          const decoded = Option.isSome(strict)
+            ? strict.value
+            : yield* decode(repairStringifiedContainers(args)).pipe(Effect.mapError(invalidArguments))
           const result = yield* execute(decoded as Schema.Schema.Type<Parameters>, ctx)
           if (result.metadata.truncated !== undefined) {
             return result
@@ -191,6 +197,33 @@ function wrap<Parameters extends Schema.Decoder<unknown>, Result extends Metadat
       }
       return toolInfo
     })
+}
+
+// Some models string-encode a tool-argument container whose schema is a
+// nested union (qwen family, issue #297): the wire carries {"params":
+// "{\"action\": \"list\"}"} instead of a nested object. Re-parse strings that
+// sit where a container is expected and let the strict decode judge the
+// result. Runs only after the strict decode failed, so plain string
+// parameters are never touched.
+function repairStringifiedContainers(value: unknown): unknown {
+  if (typeof value === "string") {
+    const trimmed = value.trim()
+    if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) return value
+    try {
+      const parsed: unknown = JSON.parse(trimmed)
+      if (typeof parsed === "object" && parsed !== null) return repairStringifiedContainers(parsed)
+    } catch {
+      return value
+    }
+    return value
+  }
+  if (Array.isArray(value)) return value.map(repairStringifiedContainers)
+  if (typeof value === "object" && value !== null) {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [key, repairStringifiedContainers(item)]),
+    )
+  }
+  return value
 }
 
 export function define<

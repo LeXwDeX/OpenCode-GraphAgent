@@ -106,6 +106,96 @@ describe("Tool.define", () => {
     }),
   )
 
+  // Regression for #297: qwen-family models string-encode a nested-union
+  // property value ({"params": "{\"action\": \"list\"}"}). The execute wrap
+  // must retry with the container re-parsed so the tool still runs.
+  it.effect("stringified container arguments decode through the lenient retry", () =>
+    Effect.gen(function* () {
+      const parameters = Schema.Struct({
+        params: Schema.Union([
+          Schema.Struct({ action: Schema.Literal("list") }),
+          Schema.Struct({ action: Schema.Literal("validate"), spec_path: Schema.String }),
+        ]),
+      })
+      const calls: Array<Schema.Schema.Type<typeof parameters>> = []
+      const info = yield* Tool.define(
+        "test-repair",
+        Effect.succeed({
+          description: "test tool",
+          parameters,
+          parseOptions: { onExcessProperty: "error" },
+          execute(args: Schema.Schema.Type<typeof parameters>) {
+            calls.push(args)
+            return Effect.succeed({ title: "test", output: "ok", metadata: { truncated: false } })
+          },
+        }),
+      )
+      const ctx = makeCtx()
+      const tool = yield* info.init()
+      const execute = tool.execute as unknown as (args: unknown, ctx: Tool.Context) => ReturnType<typeof tool.execute>
+
+      yield* execute({ params: '{"action": "list"}' }, ctx)
+      yield* execute({ params: '{"action": "validate", "spec_path": "spec.yaml"}' }, ctx)
+      yield* execute({ params: { action: "list" } }, ctx)
+
+      expect(calls).toEqual([
+        { params: { action: "list" } },
+        { params: { action: "validate", spec_path: "spec.yaml" } },
+        { params: { action: "list" } },
+      ])
+    }),
+  )
+
+  it.effect("unrepairable arguments still surface as InvalidArgumentsError", () =>
+    Effect.gen(function* () {
+      const parameters = Schema.Struct({
+        params: Schema.Union([Schema.Struct({ action: Schema.Literal("list") })]),
+      })
+      const info = yield* Tool.define(
+        "test-repair-fail",
+        Effect.succeed({
+          description: "test tool",
+          parameters,
+          execute() {
+            return Effect.succeed({ title: "test", output: "ok", metadata: { truncated: false } })
+          },
+        }),
+      )
+      const tool = yield* info.init()
+      const execute = tool.execute as unknown as (args: unknown, ctx: Tool.Context) => ReturnType<typeof tool.execute>
+
+      const exit = yield* execute({ params: "not a container" }, makeCtx()).pipe(Effect.exit)
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (!Exit.isFailure(exit)) return
+      const die = exit.cause.reasons.find(Cause.isDieReason)
+      expect(die?.defect).toBeInstanceOf(Tool.InvalidArgumentsError)
+    }),
+  )
+
+  it.effect("plain string parameters that look like JSON are not re-parsed", () =>
+    Effect.gen(function* () {
+      const parameters = Schema.Struct({ note: Schema.String })
+      const calls: Array<Schema.Schema.Type<typeof parameters>> = []
+      const info = yield* Tool.define(
+        "test-string-passthrough",
+        Effect.succeed({
+          description: "test tool",
+          parameters,
+          execute(args: Schema.Schema.Type<typeof parameters>) {
+            calls.push(args)
+            return Effect.succeed({ title: "test", output: "ok", metadata: { truncated: false } })
+          },
+        }),
+      )
+      const tool = yield* info.init()
+      const execute = tool.execute as unknown as (args: unknown, ctx: Tool.Context) => ReturnType<typeof tool.execute>
+
+      yield* execute({ note: '{"kept": "string"}' }, makeCtx())
+
+      expect(calls).toEqual([{ note: '{"kept": "string"}' }])
+    }),
+  )
+
   // Regression for #28438: the wrap is the canonical "untyped → typed" boundary.
   // When the LLM emits a tool call with a payload that fails the parameter
   // schema, the wrap must surface a typed `Tool.InvalidArgumentsError` whose
