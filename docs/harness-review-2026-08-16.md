@@ -52,8 +52,10 @@ review 带 REJECT 完成（checkpoint 候选，`report_to_parent` 默认 true）
 `ReviewGateError`（HTTP 处理器 `server/routes/instance/httpapi/handlers/dag.ts:22` 也识别它）。
 只改 loop 不够。守卫有正当用途：拦 agent 用 `control(complete)` 抹平未接受的 review。
 
-**方向**：把守卫从 `dag.complete` 上移到工具层（`tool/workflow.ts` 的 `control(complete)` 分支）。
-自然完成放行，agent 抄近路仍被拦。守卫语义是「谁在调用」而非「图的状态」。
+**方向**：自然完成放行，显式抄近路（agent 的 `control(complete)` 与 HTTP complete）仍被拦。
+守卫语义是「谁在调用」而非「图的状态」。
+**落地实况（#300）**：守卫保留在 `dag.complete` 内，新增 `skipReviewGate` 选项仅由调度循环
+的自然完成路径传入。与「上移工具层」语义等价，且同时守住 HTTP 显式完成面。
 
 ### A-2 变体：completed vs paused（A1 vs A4）
 
@@ -167,9 +169,9 @@ phase boundaries（continue / clear / handoff / subagent / compact）是现成�
 
 ## 七、落地顺序（按解锁关系排序）
 
-1. **恢复 REJECT 可达性**（本仓库，最小）。守卫从 `dag.complete` 移到 `tool/workflow.ts` 的
-   `control(complete)`；`loop.ts:328-334` 不再 `dag.fail`。验收：REJECT 图断言 `completed`、
-   reopen-extend 被接受。单独可验证，立刻第一次看到检查点后的 replan。
+1. **恢复 REJECT 可达性**（本仓库，最小）。守卫安排见 A-1 落地实况（`dag.complete` 保留守卫 +
+   `skipReviewGate` 自然路径放行）；`loop.ts:328-334` 不再 `dag.fail`。验收：REJECT 图断言
+   `completed`、reopen-extend 被接受。单独可验证，立刻第一次看到检查点后的 replan。
 2. **决定要不要 A4**。第 1 步跑通后凭真实 loop 手感判断「只能 extend」够不够。唯一应等经验数据的选择。
 3. **并行写集**（本仓库，原子改动）：B-1 解序列化 + B-2 汇聚节点替代 canonical writer + B3-a
    汇聚点指纹 + B-4 `changed_files` 重叠检测。拆开编译失败。
@@ -276,10 +278,15 @@ config 仓库。按 `runtime-compat.json` 策略运行时先合并，同一 PR �
    `input_mapping`——「supplied」并不存在。修复：把聚合/canonical 节点的
    `changed_files`+`fingerprint` 绑进 verify 的 `input_mapping`（verify 已依赖该节点，
    数据依赖与图依赖一致）。
+   **落地实况（#299）**：绑定只落在被聚合器改写的 verify 上。canonical 链式路线的 verify
+   刻意不绑——绑了会破坏「链式 routes 字节级不变」这一更强的验收项；两条文档主张冲突时
+   字节级不变优先，空头支票在并行路线上已兑现、链式路线留档为已知残余。
 2. **verify FAIL 的终态表现混乱。** verify FAIL → review 被条件跳过（`condition_false`）→
    required review 的 skip 不算 failure → 工作流最终死于
    「unresolved review outcome(s)」（`loop.ts:328-334`）——原因串误导。属 Direction A
    的 REJECT 通路改造的邻域，一并考虑。
+   **落地实况（#300）**：已修复——此类图在检查点自然 completed（不再 fail），
+   `workflow(action="status")` 以 `unresolved_reviews` 字段显式列出未解决 verdict。
 
 ## A5 改动清单（原子）与波及面
 
@@ -303,3 +310,18 @@ config 仓库。按 `runtime-compat.json` 策略运行时先合并，同一 PR �
   事后机械检测覆盖了大部分场景；声明字段是积木 DSL 的 schema 变更，等真实踩坑再加。
 - 为什么保留链式 canonical：最小差异原则——当前能编译的链式图编译结果完全不变，
   行为变化只发生在「曾经被强行串行」与「曾经编译失败」两类图上。
+
+## 附篇 B：落地对照（2026-08-16 review 回填）
+
+| 文档决策 | 落地载体 | 状态与偏差 |
+|---|---|---|
+| A-1 守卫安排 | PR #300（merge 6221fdf71） | 机制与 A-1 落地实况一致；语义等价 |
+| A-3 status 显式化 | PR #300 | `unresolved_reviews` 字段已实现 |
+| A2 并行两模式 + 聚合器 | PR #299（merge ebc5ad089）+ ADR-0002 | 按 A2 全部落地；运行时六文件零改动物证：#299 diff 不触及 runtime/review-lifecycle/dag.ts |
+| A4.1 verify 绑定 | PR #299 | 仅聚合路线兑现；链式路线为保字节级不变刻意留白（见 A4 落地实况） |
+| A4.2 verify FAIL 终态 | PR #300 | 已修复 |
+| B-1～B-4 | PR #299 | 全部落地（重叠门禁为聚合器节点级失败，非编译期检测） |
+| B-6 config 仓库 | opencode-dag-config PR #9 | 措辞 + 原生交付 + SHA→ebc5ad089 |
+| C-1/C-2 | PR #301（merge 773330b14） | 分类表与 tier 显式化按票 #296 原文落地 |
+| D-1/D-2 | — | 刻意未排期，保持结构性缺口记录 |
+| （新增）qwen union 双重编码 | PR #298（merge e3e9d76f1）、issue #297 | 调研中新发现的运行时缺陷，不在本文档原始范围 |
