@@ -112,7 +112,7 @@ export class ReviewGateError extends Error {
   readonly reviewIDs: string[]
 
   constructor(dagID: string, reviewIDs: string[]) {
-    super(`Cannot complete deep workflow ${dagID}: unresolved review outcome(s): ${reviewIDs.join(", ")}`)
+    super(`Cannot complete workflow ${dagID}: unresolved review outcome(s): ${reviewIDs.join(", ")}`)
     this.name = "ReviewGateError"
     this.dagID = dagID
     this.reviewIDs = reviewIDs
