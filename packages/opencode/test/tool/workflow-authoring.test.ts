@@ -134,24 +134,28 @@ describe("worktree-lifecycle regression fixtures", () => {
       blocks: [...worktreeLifecycleStartInput.spec.config.blocks],
     })
     const byID = new Map(nodes.map((node) => [node.id, node]))
-    // Workspace-writer serialization: the second coding writer waits for the
-    // first even though both only declared the plan dependency.
-    const writerOrder = nodes.filter((node) => node.worker_type === "build").map((node) => node.id)
-    expect(writerOrder).toEqual(["coding-worktree-core", "coding-callers-and-fixture"])
-    expect(byID.get("coding-callers-and-fixture")?.depends_on).toContain("coding-worktree-core")
-    // Verification depends on every writer; the review binds to the
-    // canonical implementation fingerprint.
-    expect(byID.get("verify")?.depends_on).toEqual(
-      expect.arrayContaining(["coding-worktree-core", "coding-callers-and-fixture"]),
+    // Parallel writers: both coding blocks only declared the plan dependency,
+    // and compilation keeps them unordered — no injected writer-to-writer edge.
+    expect(byID.get("coding-callers-and-fixture")?.depends_on).toEqual(["plan"])
+    expect(byID.get("coding-worktree-core")?.depends_on).toEqual(["plan"])
+    // The compiler injects one aggregation node between the parallel writers
+    // and the verification gate; verify is rewired onto it.
+    expect(byID.get("verify")?.depends_on).toEqual(["review--aggregate"])
+    expect(byID.get("review--aggregate")).toMatchObject({
+      worker_type: "explore",
+      required: true,
+      depends_on: ["coding-worktree-core", "coding-callers-and-fixture"],
+    })
+    expect(byID.get("review--aggregate")?.output_schema).toEqual(
+      expect.objectContaining({ required: expect.arrayContaining(["changed_files", "fingerprint"]) }),
     )
     const reviewDecision = byID.get("review")
     expect(reviewDecision?.review?.phase).toBe("diff")
-    // Canonical writer is the serialized one that transitively depends on
-    // every other writer — the second package after serialization.
-    expect(reviewDecision?.review?.implementation_node_id).toBe("coding-callers-and-fixture")
+    // The diff review binds to the aggregator's post-merge fingerprint.
+    expect(reviewDecision?.review?.implementation_node_id).toBe("review--aggregate")
     expect(reviewDecision?.review?.verification_node_id).toBe("verify")
     expect(reviewDecision?.input_mapping?.["implementation_fingerprint"]).toBe(
-      "coding-callers-and-fixture.output.fingerprint",
+      "review--aggregate.output.fingerprint",
     )
   })
 

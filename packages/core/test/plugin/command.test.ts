@@ -118,8 +118,10 @@ describe("CommandPlugin.Plugin", () => {
       expect(CommandPlugin.WorkflowContent).toContain("upstream executable dependencies")
       expect(CommandPlugin.WorkflowContent).toContain("single matching custom workflow")
       expect(CommandPlugin.WorkflowContent).toContain("Do not concatenate two complete references")
-      expect(CommandPlugin.WorkflowContent).toContain("additive `extend` with new node IDs")
-      expect(CommandPlugin.WorkflowContent).toContain("Do not\npause or replan a completed workflow")
+      expect(CommandPlugin.WorkflowContent).toContain("never role count or block count, which are consequences of risk")
+      expect(CommandPlugin.WorkflowContent).toContain("dispose of the verdict under the Verdict Disposal Contract")
+      expect(CommandPlugin.WorkflowContent).toContain("the correction wave MUST be full-shaped")
+      expect(CommandPlugin.WorkflowContent).toContain("Do not pause or replan a completed workflow")
     }),
   )
 
@@ -249,6 +251,9 @@ describe("CommandPlugin.Plugin", () => {
       )
       expect(CommandPlugin.OrchestrationPolicyContent).toContain("escapes that guard")
       expect(CommandPlugin.OrchestrationPolicyContent).toContain("Silence is not a stop decision")
+      expect(CommandPlugin.OrchestrationPolicyContent).toContain("Classify the findings first; the class selects the option")
+      expect(CommandPlugin.OrchestrationPolicyContent).toContain("The situation itself was misclassified")
+      expect(CommandPlugin.OrchestrationPolicyContent).toContain("Role or block count never selects a tier")
       expect(CommandPlugin.WorkflowFactsContent).toContain("Verdict Disposal Contract")
     }),
   )

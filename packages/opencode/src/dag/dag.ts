@@ -262,7 +262,7 @@ export interface Interface {
   readonly resume: (dagID: string) => Effect.Effect<void, Error>
   readonly step: (dagID: string) => Effect.Effect<{ status: "stepping"; nodeID?: string } | { status: "no_ready_nodes" }, Error>
   readonly cancel: (dagID: string) => Effect.Effect<void, Error>
-  readonly complete: (dagID: string) => Effect.Effect<void, Error>
+  readonly complete: (dagID: string, options?: { readonly skipReviewGate?: boolean }) => Effect.Effect<void, Error>
   readonly fail: (dagID: string, reason: string) => Effect.Effect<void, Error>
   readonly replan: (dagID: string, fragment: { nodes: NodeConfig[] }) => Effect.Effect<
     { cancel: string[]; restart: string[]; replace: string[]; add: string[]; ignore: string[] },
@@ -502,11 +502,19 @@ export const layer = Layer.effect(
       yield* events.publish(DagEvent.WorkflowCancelled, { dagID: dagID as ID, timestamp: yield* DateTime.now })
       yield* terminateNonTerminalNodes(lock, dagID, "workflow_cancelled", "workflow_cancelled", false)
     })
-    const complete = Effect.fn("Dag.complete")(function* (lock: WorkflowLock, dagID: string) {
+    const complete = Effect.fn("Dag.complete")(function* (
+      lock: WorkflowLock,
+      dagID: string,
+      options?: { readonly skipReviewGate?: boolean },
+    ) {
       yield* guardWorkflow(dagID, WorkflowStatus.COMPLETED)
       const workflow = yield* store.getWorkflow(dagID).pipe(Effect.orDie)
       const config = workflow ? parseWorkflowConfig(workflow.config) : undefined
-      const unresolvedReviews = config
+      // The review gate guards EXPLICIT completion (tool/HTTP shortcuts). A
+      // natural completion at a REJECT checkpoint must stay reachable so the
+      // parent can dispose of the verdict via reopen-extend (issue #294); the
+      // scheduling loop passes skipReviewGate for that path.
+      const unresolvedReviews = !options?.skipReviewGate && config
         ? unresolvedReviewOutcomes(config, yield* store.getNodes(dagID))
         : []
       if (unresolvedReviews.length > 0) yield* Effect.fail(new ReviewGateError(dagID, unresolvedReviews))
@@ -898,7 +906,7 @@ export const layer = Layer.effect(
       resume: (dagID) => withWorkflowLock(dagID)((lock) => resume(lock, dagID)),
       step: (dagID) => withWorkflowLock(dagID)((lock) => step(lock, dagID)),
       cancel: (dagID) => withWorkflowLock(dagID)((lock) => cancel(lock, dagID)),
-      complete: (dagID) => withWorkflowLock(dagID)((lock) => complete(lock, dagID)),
+      complete: (dagID, options) => withWorkflowLock(dagID)((lock) => complete(lock, dagID, options)),
       fail: (dagID, reason) => withWorkflowLock(dagID)((lock) => fail(lock, dagID, reason)),
       replan: (dagID, fragment) => withWorkflowLock(dagID)((lock) => _replan(lock, dagID, fragment)),
       extend: (dagID, nodes) => withWorkflowLock(dagID)((lock) => _extend(lock, dagID, nodes)),

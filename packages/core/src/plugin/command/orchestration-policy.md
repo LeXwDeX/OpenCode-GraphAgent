@@ -267,6 +267,22 @@ of it in the same wake turn with exactly one of:
 4. A reasoned stop — tell the user, finding by finding, why no further wave
    is warranted. Silence is not a stop decision.
 
+Classify the findings first; the class selects the option:
+
+| Finding nature | Disposal |
+| --- | --- |
+| Bounded within the current scope | Option 1, same graph, tier unchanged |
+| Reveals cross-module, contract, persistence, or boundary risk the current shape cannot cover | Option 1 escalated: append full-shaped assurance lanes (broader review axes, extra verification) instead of the lite correction alone |
+| The situation itself was misclassified (a change assumed, an unknown-cause defect found; a repair assumed, a design gap found) | Option 3 only — the single legitimate route switch; start the workflow whose backbone matches the real deliverable and name which prior evidence carries over |
+| Unbounded or foggy — findings that no bounded wave can discharge | Option 4, or escalate to the user with a decision request; do not launder fog into a speculative wave |
+
+Route reselection is never the default: same-objective work stays in one
+workflow, and escalation keeps additive semantics — full-shaped assurance
+lanes are appended waves, not replacement graphs. The tier discriminator is
+risk only (reversibility, module span, public contracts, concurrency,
+persistence, migration, identity, authorization, upstream executables,
+CI/release). Role or block count never selects a tier.
+
 Merely summarizing a non-ACCEPT verdict and ending the turn is an
 orchestration failure. The runtime's `orchestrator_unresponsive` guard only
 fires for workflows that are still live; a checkpoint that terminalizes its

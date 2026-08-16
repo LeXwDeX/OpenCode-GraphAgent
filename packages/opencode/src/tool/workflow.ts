@@ -5,6 +5,7 @@ import { Tool } from "./tool"
 import { CommandPlugin } from "@opencode-ai/core/plugin/command"
 import { Effect, Option, Schema } from "effect"
 import { Dag } from "@/dag/dag"
+import { DagReviewLifecycle } from "@/dag/review-lifecycle"
 import { DagConfig } from "@/dag/config"
 import { DagWorkflows } from "@/dag/workflows"
 import { DagModel } from "@/dag/model"
@@ -451,6 +452,12 @@ export const WorkflowTool = Tool.define<
               // stay reachable via the result seam (getNode is unfiltered).
               const nodes = yield* dag.store.getCurrentNodes(params.workflow_id).pipe(Effect.orDie)
               const config = Dag.parseWorkflowConfig(workflow.config)
+              // A completed graph can still carry an unresolved review verdict
+              // (REJECT checkpoint, issue #294); surface it explicitly instead
+              // of burying it in a terminal reason string.
+              const unresolvedReviews = config
+                ? DagReviewLifecycle.unresolvedReviewOutcomes(config, nodes)
+                : []
               return {
                 title: `Workflow status: ${workflow.title}`,
                 output: JSON.stringify(
@@ -460,6 +467,7 @@ export const WorkflowTool = Tool.define<
                     status: workflow.status,
                     session_id: workflow.sessionId,
                     mode: config?.mode ?? "standard",
+                    ...(unresolvedReviews.length > 0 ? { unresolved_reviews: unresolvedReviews } : {}),
                     ...(config?.admission
                       ? {
                           admission: {

@@ -1260,7 +1260,10 @@ describe("DagLoop atomic wake integration", () => {
     )
   })
 
-  it.each(["deep", "standard"] as const)("fails a recovered %s workflow when verification skips every diff review", async (mode) => {
+  // Issue #294: a workflow whose verification skips every diff review settles
+  // as COMPLETED at the checkpoint (not failed) so the parent can dispose of
+  // the unresolved review verdict via reopen-extend; failed stays immutable.
+  it.each(["deep", "standard"] as const)("completes a recovered %s workflow when verification skips every diff review", async (mode) => {
     await Effect.runPromise(
       runWakeTest(
         ({ store, parentPrompts }) =>
@@ -1271,13 +1274,13 @@ describe("DagLoop atomic wake integration", () => {
               ),
               "recovered workflow without an accepted review did not settle",
             )
-            expect(workflow.status).toBe("failed")
+            expect(workflow.status).toBe("completed")
             expect((yield* store.getNode(workflow.id, "review-diff"))?.status).toBe("skipped")
             expect((yield* store.getNode(workflow.id, "final-audit"))?.status).toBe("skipped")
 
-            const parent = yield* takeWithin(parentPrompts, "review rejection failure did not wake the parent")
+            const parent = yield* takeWithin(parentPrompts, "review rejection completion did not wake the parent")
             expect(promptText(parent.input)).toContain(
-              '[DAG Workflow failed] Workflow "Recovered review rejection" has reached terminal status.',
+              '[DAG Workflow completed] Workflow "Recovered review rejection" has reached terminal status.',
             )
             yield* Deferred.succeed(parent.release, "success")
           }),

@@ -120,9 +120,9 @@ export function compileWorkflowBlocks(
   options: WorkflowBlockCompileOptions = {},
 ): NodeConfig[] {
   requireValidBlockGraph(graph, options)
-  const blocks = serializeWorkspaceWriters(graph.blocks)
-  requireValidReviewRoutes(blocks)
-  const nodes = blocks.flatMap((block) => compileBlock(graph.objective, block, blocks))
+  requireValidReviewRoutes(graph.blocks)
+  const { blocks, aggregations, verifyAggregators } = aggregateParallelWriters(graph.blocks)
+  const nodes = blocks.flatMap((block) => compileBlock(graph.objective, block, blocks, aggregations, verifyAggregators))
   const duplicateNodeIDs = uniqueDuplicates(nodes.map((node) => node.id))
   if (duplicateNodeIDs.length > 0) {
     throw new Error(
@@ -132,7 +132,13 @@ export function compileWorkflowBlocks(
   return nodes
 }
 
-function compileBlock(objective: string, block: WorkflowBlock, blocks: WorkflowBlock[]): NodeConfig[] {
+function compileBlock(
+  objective: string,
+  block: WorkflowBlock,
+  blocks: WorkflowBlock[],
+  aggregations: Map<string, WriterAggregation>,
+  verifyAggregators: Map<string, string[]>,
+): NodeConfig[] {
   const dependencies = block.depends_on ?? []
   const required = block.required ?? (block.kind === "plan" || block.kind === "verify" || block.kind === "synthesize")
   const reviewDependency = dependencies.find(
@@ -171,20 +177,22 @@ function compileBlock(objective: string, block: WorkflowBlock, blocks: WorkflowB
   }
 
   if (block.kind === "review") {
-    const standardsID = `${block.id}--standards`
-    const intentID = `${block.id}--intent`
-    const route = implementationReviewRoute(block, blocks)
-    const reviewCondition = route ? `${route.verification.id}.output.verdict == "PASS"` : condition
+    const aggregation = aggregations.get(block.id)
+    const legacyRoute = aggregation ? undefined : implementationReviewRoute(block, blocks)
+    const implementationID = aggregation ? aggregation.aggregatorID : legacyRoute?.implementation.id
+    const verificationID = aggregation ? aggregation.verificationID : legacyRoute?.verification.id
+    const route = implementationID && verificationID ? { implementationID, verificationID } : undefined
+    const reviewCondition = route ? `${route.verificationID}.output.verdict == "PASS"` : condition
     const reviewEvidence = route
       ? {
-          implementation_changed_files: `${route.implementation.id}.output.changed_files`,
-          implementation_fingerprint: `${route.implementation.id}.output.fingerprint`,
-          verification: `${route.verification.id}.output`,
+          implementation_changed_files: `${route.implementationID}.output.changed_files`,
+          implementation_fingerprint: `${route.implementationID}.output.fingerprint`,
+          verification: `${route.verificationID}.output`,
         }
       : undefined
-    return [
+    const lanes = [
       node({
-        id: standardsID,
+        id: `${block.id}--standards`,
         name: `${block.id}: standards review`,
         workerType: block.worker_type ?? "general",
         dependencies,
@@ -197,7 +205,7 @@ function compileBlock(objective: string, block: WorkflowBlock, blocks: WorkflowB
         inputMapping: reviewEvidence,
       }),
       node({
-        id: intentID,
+        id: `${block.id}--intent`,
         name: `${block.id}: intent review`,
         workerType: block.worker_type ?? "general",
         dependencies,
@@ -213,7 +221,7 @@ function compileBlock(objective: string, block: WorkflowBlock, blocks: WorkflowB
         id: block.id,
         name: `${block.id}: review decision`,
         workerType: block.worker_type ?? "general",
-        dependencies: [standardsID, intentID, ...(route ? [route.verification.id] : [])],
+        dependencies: [`${block.id}--standards`, `${block.id}--intent`, ...(route ? [route.verificationID] : [])],
         objective,
         instruction: block.instruction,
         contract: [
@@ -229,22 +237,45 @@ function compileBlock(objective: string, block: WorkflowBlock, blocks: WorkflowB
         inputMapping: route
           ? {
               ...reviewEvidence,
-              standards_review: `${standardsID}.output`,
-              intent_review: `${intentID}.output`,
+              standards_review: `${block.id}--standards.output`,
+              intent_review: `${block.id}--intent.output`,
             }
           : undefined,
         review: route
           ? {
               phase: "diff",
-              implementation_node_id: route.implementation.id,
-              verification_node_id: route.verification.id,
+              implementation_node_id: route.implementationID,
+              verification_node_id: route.verificationID,
             }
           : undefined,
         outputSchema: route ? DIFF_REVIEW_SCHEMA : GENERAL_VERDICT_SCHEMA,
       }),
     ]
+    if (!aggregation) return lanes
+    return [
+      node({
+        id: aggregation.aggregatorID,
+        name: `${block.id}: aggregate parallel implementation evidence`,
+        workerType: "explore",
+        dependencies: aggregation.writerIDs,
+        objective,
+        contract: AGGREGATOR_CONTRACT,
+        required: true,
+        reportToParent: false,
+        inputMapping: Object.fromEntries(
+          aggregation.writerIDs.flatMap((writerID: string) => [
+            [`${writerID.replace(/-/g, "_")}_changed_files`, `${writerID}.output.changed_files`],
+            [`${writerID.replace(/-/g, "_")}_summary`, `${writerID}.output.summary`],
+          ]),
+        ),
+        outputSchema: IMPLEMENTATION_SCHEMA,
+      }),
+      ...lanes,
+    ]
   }
 
+  const verifyAggregatorIDs = verifyAggregators.get(block.id)
+  const verifyAggregator = verifyAggregatorIDs && verifyAggregatorIDs.length > 0 ? verifyAggregatorIDs[0] : undefined
   return [
     node({
       id: block.id,
@@ -257,6 +288,12 @@ function compileBlock(objective: string, block: WorkflowBlock, blocks: WorkflowB
       required,
       reportToParent: block.report_to_parent ?? block.kind === "synthesize",
       condition,
+      inputMapping: verifyAggregator
+        ? {
+            implementation_changed_files: `${verifyAggregator}.output.changed_files`,
+            implementation_fingerprint: `${verifyAggregator}.output.fingerprint`,
+          }
+        : undefined,
       outputSchema: WRITER_KINDS.has(block.kind)
         ? IMPLEMENTATION_SCHEMA
         : block.kind === "verify"
@@ -350,33 +387,75 @@ function requireValidBlockGraph(graph: WorkflowBlockGraph, options: WorkflowBloc
   topologicalBlocks(graph.blocks)
 }
 
-function serializeWorkspaceWriters(blocks: WorkflowBlock[]) {
-  const writers = topologicalBlocks(blocks).filter((block) => WRITER_KINDS.has(block.kind))
-  const previousWriter = new Map(
-    writers.slice(1).map((block, index) => [block.id, writers[index]?.id ?? block.id] as const),
-  )
-  const serialized = blocks.map((block) => {
-    const previous = previousWriter.get(block.id)
-    if (!previous || dependsTransitively(blocks, block.id, previous)) return block
+// Injected between parallel implementation writers and their verification
+// gate: mechanically detects declared write-set overlap (loud node failure)
+// and publishes the union with one fingerprint computed at the convergence
+// point, so diff review binds to a single post-merge state.
+const AGGREGATOR_CONTRACT =
+  "Collect the supplied changed-file lists and summaries from each parallel implementation writer. If any file path appears in more than one list, do not submit; fail the node naming the exact overlapping paths. Otherwise submit the union of all changed files and one stable fingerprint computed at this convergence point (for example a sha256 over the sorted union of current file contents, reporting the exact commands used). Do not modify any file."
+
+interface WriterAggregation {
+  aggregatorID: string
+  writerIDs: string[]
+  verificationID: string
+}
+
+function aggregateParallelWriters(blocks: WorkflowBlock[]) {
+  const aggregations = new Map<string, WriterAggregation>()
+  for (const block of blocks) {
+    if (block.kind !== "review") continue
+    const topology = reviewWriterTopology(block, blocks)
+    if (!topology) continue
+    if (canonicalWriter(topology, blocks)) continue
+    aggregations.set(block.id, {
+      aggregatorID: `${block.id}--aggregate`,
+      writerIDs: topology.implementations.map((writer) => writer.id),
+      verificationID: topology.verification.id,
+    })
+  }
+  if (aggregations.size === 0) {
+    return { blocks, aggregations, verifyAggregators: new Map<string, string[]>() }
+  }
+  const writerToAggregators = new Map<string, string[]>()
+  for (const aggregation of aggregations.values()) {
+    for (const writerID of aggregation.writerIDs) {
+      writerToAggregators.set(writerID, [...(writerToAggregators.get(writerID) ?? []), aggregation.aggregatorID])
+    }
+  }
+  const aggregatorIDs = new Set([...aggregations.values()].map((aggregation) => aggregation.aggregatorID))
+  const verifyAggregators = new Map<string, string[]>()
+  const rewired = blocks.map((block) => {
+    if (block.kind !== "verify") return block
+    const original = block.depends_on ?? []
+    const replaced = [...new Set(original.flatMap((dependency) => writerToAggregators.get(dependency) ?? [dependency]))]
+    if (replaced.length === original.length && replaced.every((dependency, index) => dependency === original[index])) {
+      return block
+    }
+    verifyAggregators.set(block.id, replaced.filter((dependency) => aggregatorIDs.has(dependency)))
     return new WorkflowBlock({
       id: block.id,
       kind: block.kind,
-      depends_on: [...(block.depends_on ?? []), previous],
+      depends_on: replaced,
       instruction: block.instruction,
       worker_type: block.worker_type,
       required: block.required,
       report_to_parent: block.report_to_parent,
     })
   })
-  topologicalBlocks(serialized)
-  return serialized
+  topologicalBlocks(rewired)
+  return { blocks: rewired, aggregations, verifyAggregators }
 }
 
 function requireValidReviewRoutes(blocks: WorkflowBlock[]) {
-  blocks.filter((block) => block.kind === "review").forEach((block) => implementationReviewRoute(block, blocks))
+  blocks.filter((block) => block.kind === "review").forEach((block) => reviewWriterTopology(block, blocks))
 }
 
-function implementationReviewRoute(block: WorkflowBlock, blocks: WorkflowBlock[]) {
+interface ReviewWriterTopology {
+  implementations: WorkflowBlock[]
+  verification: WorkflowBlock
+}
+
+function reviewWriterTopology(block: WorkflowBlock, blocks: WorkflowBlock[]): ReviewWriterTopology | undefined {
   const implementations = blocks.filter(
     (candidate) => WRITER_KINDS.has(candidate.kind) && dependsTransitively(blocks, block.id, candidate.id),
   )
@@ -389,8 +468,7 @@ function implementationReviewRoute(block: WorkflowBlock, blocks: WorkflowBlock[]
       `Implementation review "${block.id}" requires exactly one verification ancestor; found ${verifications.length}`,
     )
   }
-  const verification = verifications[0]
-  if (!verification) throw new Error(`Implementation review "${block.id}" has no verification ancestor`)
+  const verification = verifications[0]!
   const verifiedImplementations = implementations.filter((candidate) =>
     dependsTransitively(blocks, verification.id, candidate.id),
   )
@@ -399,15 +477,27 @@ function implementationReviewRoute(block: WorkflowBlock, blocks: WorkflowBlock[]
       `Implementation review "${block.id}" requires its verification ancestor to depend on every implementation writer`,
     )
   }
-  const implementation = verifiedImplementations.find((candidate) =>
-    verifiedImplementations.every(
+  return { implementations: verifiedImplementations, verification }
+}
+
+function canonicalWriter(topology: ReviewWriterTopology, blocks: WorkflowBlock[]): WorkflowBlock | undefined {
+  return topology.implementations.find((candidate) =>
+    topology.implementations.every(
       (other) => other.id === candidate.id || dependsTransitively(blocks, candidate.id, other.id),
     ),
   )
+}
+
+function implementationReviewRoute(block: WorkflowBlock, blocks: WorkflowBlock[]) {
+  const topology = reviewWriterTopology(block, blocks)
+  if (!topology) return undefined
+  const implementation = canonicalWriter(topology, blocks)
   if (!implementation) {
+    // Unreachable for compiled graphs: aggregateParallelWriters injects an
+    // aggregator whenever no canonical writer exists.
     throw new Error(`Implementation review "${block.id}" has no canonical serialized implementation writer`)
   }
-  return { implementation, verification }
+  return { implementation, verification: topology.verification }
 }
 
 function dependsTransitively(
