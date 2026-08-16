@@ -71,10 +71,7 @@ export const layer = Layer.effect(
         yield* Effect.logWarning("memory config is invalid — ignoring", { path: found.path })
         return undefined
       }
-      if (decoded.value.topic_limit === decoded.value.topic_limit_floor) return decoded.value
-      const config = normalizeConfig(decoded.value)
-      yield* flock.withLock(MemoryFile.atomicWrite(fs, found.path, serialize(config)), writeLockKey(found.path))
-      return config
+      return decoded.value
     })
 
     const load = Effect.fn("MemoryConfig.load")(function* (projectDir: string) {
@@ -186,13 +183,8 @@ export function decodeConfig(text: string) {
   const errors: ParseError[] = []
   const value = parse(text, errors, { allowTrailingComma: true })
   if (errors.length > 0) return Option.none<MemorySchema.Config>()
-  const decoded = Schema.decodeUnknownOption(MemorySchema.Config)(value ?? {})
-  if (Option.isNone(decoded) || decoded.value.topic_limit < decoded.value.topic_limit_floor)
-    return Option.none<MemorySchema.Config>()
-  return decoded
-}
-
-export function normalizeConfig(config: MemorySchema.Config) {
-  if (config.topic_limit === config.topic_limit_floor) return config
-  return MemorySchema.updateConfig(config, { topic_limit_floor: config.topic_limit })
+  // Legacy files may still carry the removed topic_limit_floor knob — Schema
+  // Struct decoding tolerates the extra property, so such files stay valid
+  // and the dead value is simply dropped on the next write.
+  return Schema.decodeUnknownOption(MemorySchema.Config)(value ?? {})
 }

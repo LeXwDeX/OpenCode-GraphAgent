@@ -130,7 +130,6 @@ export const layer: Layer.Layer<
         enabled: true,
         model: selected,
         topic_limit: 10,
-        topic_limit_floor: 10,
         turn_interval: 5,
         injection: {
           max_topics: MemorySchema.MAX_INJECTION_TOPICS,
