@@ -161,6 +161,27 @@ describe("workflow blocks", () => {
     expect(nodes.find((node) => node.id === "report")?.condition).toBe('decision.output.verdict == "ACCEPT"')
   })
 
+  // Issue #304: a synthesize following a review is the route's final gate —
+  // it must map the review output, otherwise an ACCEPTed review stays listed
+  // as an unresolved review outcome forever.
+  it("binds the review output into a following synthesize as the final gate", () => {
+    const nodes = DagBlocks.compileWorkflowBlocks({
+      objective: "Deliver a reviewed change with a bound final report",
+      blocks: [
+        { id: "implementation", kind: "coding" },
+        { id: "verification", kind: "verify", depends_on: ["implementation"] },
+        { id: "decision", kind: "review", depends_on: ["verification"] },
+        { id: "report", kind: "synthesize", depends_on: ["decision"] },
+        { id: "side-note", kind: "synthesize", depends_on: ["verification"] },
+      ],
+    })
+
+    expect(nodes.find((node) => node.id === "report")?.input_mapping).toEqual({
+      decision_review: "decision.output",
+    })
+    expect(nodes.find((node) => node.id === "side-note")?.input_mapping).toBeUndefined()
+  })
+
   it("keeps every downstream branch behind a reporting scope gate", () => {
     const nodes = DagBlocks.compileWorkflowBlocks({
       objective: "Deliver only while the bounded route remains valid",

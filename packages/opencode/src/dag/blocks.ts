@@ -276,6 +276,14 @@ function compileBlock(
 
   const verifyAggregatorIDs = verifyAggregators.get(block.id)
   const verifyAggregator = verifyAggregatorIDs && verifyAggregatorIDs.length > 0 ? verifyAggregatorIDs[0] : undefined
+  // A synthesize that follows a review is the route's final gate: it must map
+  // the review output so unresolvedReviewOutcomes/finalReviewGates recognize
+  // an ACCEPTed review as resolved (issue #304) — the same binding contract
+  // the verify aggregation path already honors.
+  const synthesizeGateBinding =
+    block.kind === "synthesize" && reviewDependency
+      ? { [`${reviewDependency.replace(/-/g, "_")}_review`]: `${reviewDependency}.output` }
+      : undefined
   return [
     node({
       id: block.id,
@@ -293,7 +301,7 @@ function compileBlock(
             implementation_changed_files: `${verifyAggregator}.output.changed_files`,
             implementation_fingerprint: `${verifyAggregator}.output.fingerprint`,
           }
-        : undefined,
+        : synthesizeGateBinding,
       outputSchema: WRITER_KINDS.has(block.kind)
         ? IMPLEMENTATION_SCHEMA
         : block.kind === "verify"

@@ -788,6 +788,8 @@ describe("DagLoop atomic wake integration", () => {
         expect(completion).toBeInstanceOf(Error)
         if (!(completion instanceof Error)) throw new Error("deep completion unexpectedly succeeded")
         expect(completion.message).toContain("unresolved review outcome")
+        // Issue #305: the gate message must not claim a mode it does not check.
+        expect(completion.message).not.toContain("deep workflow")
         expect((yield* store.getWorkflow(dagID))?.status).toBe("running")
         expect((yield* store.getNode(dagID, "review-diff"))?.status).toBe("pending")
       }),
