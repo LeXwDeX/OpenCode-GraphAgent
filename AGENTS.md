@@ -182,7 +182,7 @@ const table = sqliteTable("session", {
 
 ## Extending the Codebase (二次开发)
 
-Guiding invariants for adding services, HTTP API routes, or features. The build pipeline will not catch violations of these — only an understanding of the architecture will. Read the surrounding modules first (the Todo module is the reference for a lightweight, self-contained service) before wiring new dependencies.
+Guiding invariants for adding services, HTTP API routes, or features. The build pipeline will not catch violations of these — only an understanding of the architecture will. Read the surrounding modules first (`src/memory` and `src/config` are good references for lightweight, self-contained services) before wiring new dependencies.
 
 - Keep each `X.defaultLayer` self-contained. It must `Layer.provide` every dependency its layer body `yield*`s at construction. `Layer.provideMerge(self, layer)` builds `layer` in isolation — the context accumulated by `self` is not fed to it — and `Layer.mergeAll` does not cross-provide siblings. A layer that quietly assumes an ambient service will construct in one entry point and crash in another, surfacing as a runtime crash or a blank/unresponsive TUI rather than a build error.
 - `LayerNode` (`.node` exports, `LayerNode.buildLayer`) is a second, parallel composition system, separate from `defaultLayer`/`AppLayer`. The same self-containment rule applies per node, but the two systems don't share wiring. When adding a service that other services should see, find every consumer's `.node` list (not just its `defaultLayer`) and add the new service's node there.
@@ -205,21 +205,27 @@ Invariants for extending the SolidJS/opentui TUI. The DAG inspector (`src/featur
 
 ## V2 Session Core
 
-- Keep durable prompt admission separate from model execution. `SessionV2.prompt(...)` admits one durable `session_input` row before scheduling advisory `SessionExecution.wake(sessionID)` unless `resume: false` requests admit-only behavior. The serialized runner promotes admitted inputs into visible user messages at safe boundaries.
-- Reusing a Session ID adopts the existing Session. Reusing a prompt message ID reconciles an exact retry only when Session, prompt, and delivery mode match; conflicting reuse fails. Historical projected prompts lazily synthesize promoted inbox records during exact retry.
-- Keep `SessionExecution` process-global and Session-ID based. Its local implementation owns the process-local Session coordinator and discovers placement through `SessionStore` plus `LocationServiceMap.get(session.location)` only when a drain starts; no layer should take a Session ID. V2 interruption targets the active process-local ownership chain for that Session; idle or missing interruption is a no-op.
-- Keep `SessionRunner`, model resolution, tool registry, permissions, and filesystem Location-scoped. Omitted `Location.workspaceID` means implicit-local placement; explicit workspace identity remains reserved for future placement semantics.
-- Preserve one explicit `llm.stream(request)` call per provider turn and reload projected history before durable continuation. Do not bridge through legacy `SessionPrompt.loop(...)` or delegate orchestration to an in-memory tool loop.
-- Keep local Session drains process-local until clustering is implemented. `SessionRunCoordinator` joins explicit same-Session resumes, coalesces prompt wakeups, and allows different Sessions to run concurrently. Advisory wakes drain eligible durable inbox rows only; post-crash continuation recovery requires a separate explicit design before it may retry provider work. A drain has no durable identity or transcript boundary.
-- Keep delivery vocabulary explicit. Prompts steer by default and promote at the next safe provider-turn boundary while the current drain requires continuation. An explicit `queue` input remains pending until the Session would otherwise become idle; promote one queued input at that boundary, then reevaluate continuation before promoting another. Promoting any new user input resets the selected agent's provider-turn allowance; a batch of steers resets it once.
-- Keep EventV2 replay owner claims separate from clustered Session execution ownership.
-- Keep the System Context algebra, registry, and built-ins in `src/system-context`; keep Context Source producers with their observed domains, and keep Session History selection plus Context Epoch persistence Session-owned.
+_This section was removed: the `SessionV2`/`SessionExecution`/`SessionRunner`/`SessionRunCoordinator` vocabulary it described no longer exists in the codebase. The current session runtime lives in `packages/opencode/src/session/` (`prompt.ts`, `processor.ts`, `compaction.ts`); read `src/session/CONTEXT.md`-adjacent module docs there before extending it._
 
 ## DAG Configuration Repository
 
 The authoritative repository for curated DAG workflow YAML and configuration-owned block or prompt assets is [`LeXwDeX/opencode-dag-config`](https://github.com/LeXwDeX/opencode-dag-config). Inspect and update that repository when a task changes reference workflows, composable block configurations, or their embedded worker prompts; configuration-only changes do not belong in this runtime repository.
 
 This repository owns the DAG schema, compiler, validator, runtime, and release integration. Changes that cross the boundary land runtime support first, then update the config repository's `runtime-compat.json` to the merged full runtime commit SHA and pass its template-validation CI.
+
+## DAG command family
+
+- Built-in commands ship compiled into the binary: `/dag-flow` (resident orchestration router), `/dag-init` (platform handshake → writes `.opencode/dag-init.json`), `/dag-auto` (six-block ultra-flow driver), `/dag-template-update` (template refresh without git). User command files shadow built-ins by name; register new built-ins through `packages/core/src/plugin/command.ts` + `packages/opencode/src/command/index.ts` (`Default` registry).
+- Templates come from `opencode-dag-config`: 7 domains × `full`/`lite` plus cross-domain routes (`ultra-flow-route`, `release-route`). Precedence: project `.opencode/workflows/` > global config dir > builtin snapshot (the release pipeline compiles the config repo into the binary via `DAG_TEMPLATES_DIR`).
+- `dag.jsonc` supplies DAG node model tiers: `advanced` for `required: true` and review nodes, `standard` otherwise. Never pin `model` inside saved workflow specs.
+
+## Project memory
+
+- Memory is fail-closed inert until the project is initialized: running `/init` stamps `project.time_initialized`, which `/memory on` and `memory_search` require. `/memory on` silently answering "Memory remains off" means the project never ran `/init` (or has no real git identity).
+
+## Release notes
+
+Releases follow `.github/RELEASE_NOTES_TEMPLATE.md`: keep section order and emoji headers, omit empty sections, fill the test summary from the CI gates, and end with the `previous_tag...current_tag` changelog link.
 
 ## Agent skills
 
