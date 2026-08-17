@@ -253,6 +253,16 @@ Declare `output_schema` for gates and arbiters and normalize `verdict` to `ACCEP
 
 ## Verdict Disposal Contract
 
+**持续核验至上线标准 · Verify to the delivery bar.** Implementation is not the
+finish line: after implementation, keep iterating verification until the
+delivery bar the user demanded is genuinely met — 实现之后，持续迭代核验，直至
+达成用户要求的上线标准。The Router owns every judgment on that loop: verdict
+`replan` when the evidence is insufficient, reorganize the flow (a correction
+wave via `extend`, a reshape via `replan`) when the outcome deviates, and a
+new DAG when the current graph is exhausted. Neither a completed node nor a
+green build closes the loop on its own — only the user's delivery standard
+does.
+
 A gate, arbiter, or auditor verdict is a work order, not a summary. When a
 checkpoint reports `REVISE`, `REJECT`, or `BLOCKED`, the parent MUST dispose
 of it in the same wake turn with exactly one of:
