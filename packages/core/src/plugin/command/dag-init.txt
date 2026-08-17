@@ -15,12 +15,17 @@ Arguments (optional): $ARGUMENTS
    - Not a git repo, or no `origin` → STOP: "`/dag-*` requires a git remote."
    - Host is `github.com` → platform `github`, CLI `gh`.
    - Host is `gitlab.com` → platform `gitlab`, CLI `glab`.
-   - Any other host → probe whether it is a self-hosted GitLab:
-     `curl -sSf https://<host>/api/v4/version` (or `glab api version` against
-     that host once authed). Responds as GitLab → platform `gitlab`
-     (self-hosted), CLI `glab` pinned to that host. Otherwise → STOP:
-     "unsupported platform: only GitHub and GitLab (self-hosted included)
-     are supported." Bitbucket/Gitea/other remotes are rejected here.
+   - Any other host → decide whether it is a self-hosted GitLab. GitLab's
+     `/api/v4/version` endpoint REQUIRES authentication by API design, so a
+     healthy instance answers a bare request with 401 — that 401 is POSITIVE
+     evidence (the endpoint exists and answers), not a failure. Probe order:
+     `curl -sSf https://<host>/api/v4/version`; a version JSON response OR a
+     401/GitLab-shaped error → classify as GitLab; connection refused or a
+     non-GitLab answer → STOP: "unsupported platform: only GitHub and GitLab
+     (self-hosted included) are supported." Bitbucket/Gitea/other remotes are
+     rejected here. Once classified, re-verify with `glab api version` after
+     step 2 auth passes. Platform `gitlab` (self-hosted), CLI `glab` pinned
+     to that host.
    - When `origin` and a different `upstream` exist and point at different
      repositories, ask the user ONCE which remote `/dag-auto` should bind to
      and record the choice; otherwise bind `origin`.

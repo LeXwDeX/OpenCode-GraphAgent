@@ -61,6 +61,8 @@ describe("CommandPlugin.Plugin", () => {
       })
       expect(CommandPlugin.DagInitContent).toContain("$ARGUMENTS")
       expect(CommandPlugin.DagInitContent).toContain("unsupported platform: only GitHub and GitLab")
+      expect(CommandPlugin.DagInitContent).toContain("401 is POSITIVE")
+      expect(CommandPlugin.DagInitContent).toContain("re-verify with `glab api version`")
       expect(CommandPlugin.DagInitContent).toContain(".opencode/dag-init.json")
       expect(CommandPlugin.DagInitContent).toContain("merge_policy")
       expect(yield* command.get("dag-auto")).toMatchObject({
