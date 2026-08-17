@@ -57,10 +57,23 @@ type CachedApp = BackendApp & { readonly dispose: () => Promise<void> }
 
 const appCache: Partial<Record<string, CachedApp>> = {}
 
-export async function disposeApps() {
+export async function disposeApps(heartbeat?: (label: string) => void) {
   const apps = Object.values(appCache)
   for (const key of Object.keys(appCache)) delete appCache[key]
-  await Promise.all(apps.flatMap((app) => (app === undefined ? [] : [app.dispose()])))
+  heartbeat?.(`teardown: disposing ${apps.filter((app) => app !== undefined).length} app(s)`)
+  await Promise.all(
+    apps.flatMap((app, i) =>
+      app === undefined
+        ? []
+        : [
+            app.dispose().then(
+              () => heartbeat?.(`teardown: app[${i}] disposed`),
+              (err) => heartbeat?.(`teardown: app[${i}] dispose error: ${err}`),
+            ),
+          ],
+    ),
+  )
+  heartbeat?.("teardown: all apps disposed")
 }
 
 function app(modules: Runtime, options: CallOptions) {
