@@ -20,6 +20,7 @@ import { Installation } from "@/installation"
 import { LSP } from "@/lsp/lsp"
 import { MCP } from "@/mcp"
 import { McpAuth } from "@/mcp/auth"
+import { Memory } from "@/memory/memory"
 import { Permission } from "@/permission"
 import { Plugin } from "@/plugin"
 import { PluginPtyEnvironment } from "@/plugin/pty-environment"
@@ -207,7 +208,11 @@ type RouteRequirements =
   | HttpRouter.Request<"Requires", unknown>
   | HttpRouter.Request<"GlobalRequires", never>
 
-const app = LayerNode.group([
+// Exported so wiring regression tests can build the exact node graph the
+// server provides to request handlers (LayerNode.buildLayer(app)) and probe
+// its ambient service context — a hand-copied node list would not catch a
+// missing member.
+export const app = LayerNode.group([
   Npm.node,
   FSUtil.node,
   Database.node,
@@ -284,6 +289,14 @@ const app = LayerNode.group([
   // context, so it must be present in this graph or server-driven sessions
   // would silently skip rewake.
   HookRewakeLive.node,
+  // Memory: same failure class as SettingsHook above — /memory and
+  // memory_search resolve Memory.Service via serviceOption from the ambient
+  // request context (session/prompt.ts, tool/memory-search.ts), and listing
+  // Memory.node only in per-consumer dependency arrays (SessionPrompt,
+  // SystemPrompt, SessionCompaction, InstanceBootstrap) never surfaced it
+  // here, so live sessions silently degraded to "Memory remains off" /
+  // "Memory search is unavailable for this session" (issue #311).
+  Memory.node,
 ])
 
 export function createRoutes(
