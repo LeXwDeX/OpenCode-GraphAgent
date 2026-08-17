@@ -195,6 +195,7 @@ function runLoopTest<A>(
   test: (services: {
     readonly dag: Dag.Interface
     readonly store: DagStore.Interface
+    readonly status: SessionStatus.Interface
     readonly childPrompts: Queue.Queue<PromptGate>
     readonly parentPrompts: Queue.Queue<ParentPromptGate>
     readonly getCancelCount: () => number
@@ -212,6 +213,7 @@ function runLoopTest<A>(
       const dag = yield* Dag.Service
       const loop = yield* DagLoop.Service
       const store = yield* DagStore.Service
+      const status = yield* SessionStatus.Service
       const database = yield* Database.Service
       yield* database.db.insert(ProjectTable).values({
         id: Project.ID.make("project-1"),
@@ -230,6 +232,7 @@ function runLoopTest<A>(
       return yield* test({
         dag,
         store,
+        status,
         childPrompts,
         parentPrompts,
         getCancelCount: harness.getCancelCount,
@@ -1044,7 +1047,7 @@ describe("DagLoop timeout escalation", () => {
   //   P5  escalationPending ∧ wakeReported          → proceed                [recovery — test below + L880/L567]
   it("blocks re-time while the escalation wake is undelivered (Q2: escalationPending ∧ ¬wakeReported ⇒ skip)", async () => {
     await Effect.runPromise(
-      runLoopTest(({ dag, store, childPrompts, parentPrompts }) =>
+      runLoopTest(({ dag, store, status, childPrompts, parentPrompts }) =>
         Effect.gen(function* () {
           const dagID = yield* dag.create({
             projectID: "project-1",
@@ -1054,10 +1057,16 @@ describe("DagLoop timeout escalation", () => {
           })
           yield* takeWithin(childPrompts, "a did not start")
 
-          // Acceptance #2: the deadline-driven INITIAL escalation (watchdog →
-          // nodeTimeoutEscalated → first wake) is NOT touched by the gate —
-          // the gate only governs the replan re-time path. It fires and its
-          // wake reaches the parent.
+          // issue #321: wake_reported now lands at ADMIT time, so an in-flight
+          // turn no longer holds wake_reported=false (the wake is reported as
+          // soon as it is admitted). The only window that keeps the escalation
+          // wake UNDELIVERED now is a BUSY parent session — the idle-gate never
+          // admits it. Hold the wake there.
+          yield* status.set(SessionID.make("ses_parent"), { type: "busy" })
+
+          // Initial escalation fires; while the parent is busy its wake is held
+          // UNDELIVERED (never admitted). The node sits at the public-path state
+          // [escalationPending ∧ ¬wakeReported ∧ deadline≤now].
           const escalated = yield* pollWithTimeout(
             store.getNode(dagID, "a").pipe(
               Effect.map((current) => current?.timeoutExtensions === 1 ? current : undefined),
@@ -1066,17 +1075,10 @@ describe("DagLoop timeout escalation", () => {
           )
           expect(escalated.status).toBe("running")
           expect(escalated.escalationPending).toBe(true)
+          expect(escalated.wakeReported).toBe(false)
           const baselineDeadline = escalated.deadlineMs
-          const timeoutWake = yield* takeWithin(parentPrompts, "initial escalation wake did not reach the parent")
-          expect(timeoutWake.text).toContain("[DAG Node Timeout]")
-
-          // Hold the wake UNDELIVERED: the harness blocks delivery on the
-          // release Deferred, and the loop persists wake_reported=true only
-          // AFTER successful delivery (loop.ts:1125). The node sits at the
-          // public-path state [escalationPending ∧ ¬wakeReported ∧ deadline≤now].
-          const undelivered = yield* store.getNode(dagID, "a")
-          expect(undelivered?.escalationPending).toBe(true)
-          expect(undelivered?.wakeReported).toBe(false)
+          // The wake is held by the busy gate — nothing reached the parent yet.
+          expect(Option.isNone(yield* Queue.poll(parentPrompts))).toBe(true)
 
           // Main agent replans with a NEW timeout. Q2 must SKIP the re-time:
           // adjudication cannot land before the escalation wake was delivered.
@@ -1106,7 +1108,11 @@ describe("DagLoop timeout escalation", () => {
           expect(reEscalated.wakeReported).toBe(false)
           expect(reEscalated.deadlineMs).toBe(baselineDeadline)
 
-          // Release the held wake so the loop marks delivery before teardown.
+          // Release the held wake: the parent goes idle, the wake is admitted
+          // (wake_reported lands at admit, issue #321), and the turn settles.
+          yield* status.set(SessionID.make("ses_parent"), { type: "idle" })
+          const timeoutWake = yield* takeWithin(parentPrompts, "escalation wake did not reach the parent once idle")
+          expect(timeoutWake.text).toContain("[DAG Node Timeout]")
           yield* Deferred.succeed(timeoutWake.release, "success")
         }),
       ),
@@ -1179,7 +1185,7 @@ describe("DagLoop timeout escalation", () => {
   // terminal-cleanup path.
   it("C1: nodeExtendTimeout distinguishes Q2 rejection (-2) from terminal rejection (0) — three-valued contract", async () => {
     await Effect.runPromise(
-      runLoopTest(({ dag, store, childPrompts, parentPrompts }) =>
+      runLoopTest(({ dag, store, status, childPrompts, parentPrompts }) =>
         Effect.gen(function* () {
           const dagID = yield* dag.create({
             projectID: "project-1",
@@ -1189,12 +1195,15 @@ describe("DagLoop timeout escalation", () => {
           })
           const gate = yield* takeWithin(childPrompts, "a did not start")
 
-          // Escalation fires; the wake is held UNDELIVERED so the node sits at
-          // the Q2 state [escalationPending ∧ ¬wakeReported ∧ running].
+          // issue #321: wake_reported lands at ADMIT time, so the Q2 state
+          // [escalationPending ∧ ¬wakeReported] can no longer be held by an
+          // in-flight turn — hold the escalation wake UNDELIVERED via the busy
+          // idle-gate instead, which keeps it never admitted.
+          yield* status.set(SessionID.make("ses_parent"), { type: "busy" })
           const escalated = yield* pollWithTimeout(
             store.getNode(dagID, "a").pipe(
               Effect.map((current) =>
-                current?.timeoutExtensions === 1 && current.escalationPending && !current.wakeReported
+                current && current.status === "running" && current.escalationPending && !current.wakeReported
                   ? current
                   : undefined,
               ),
@@ -1213,7 +1222,9 @@ describe("DagLoop timeout escalation", () => {
           expect(afterQ2?.status).toBe("running")
           expect(afterQ2?.deadlineMs).toBe(frozenDeadline)
 
-          // Deliver the wake and let the child finish — the node terminalizes.
+          // Release the held wake (idle admits it) and let the child finish —
+          // the node terminalizes.
+          yield* status.set(SessionID.make("ses_parent"), { type: "idle" })
           const wake = yield* takeWithin(parentPrompts, "escalation wake did not reach the parent")
           yield* Deferred.succeed(wake.release, "success")
           yield* Deferred.succeed(gate.release, "done")

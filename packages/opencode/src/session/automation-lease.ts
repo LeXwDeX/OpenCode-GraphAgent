@@ -101,10 +101,13 @@ export const layer = Layer.effect(
     // GOAL-FP-01-02: when the dag ownership actually disappears (owner
     // transitions dag → goal/none), re-trigger the goal evaluation through
     // the EXISTING idle status event mechanism so a goal that yielded to the
-    // dag on the last idle event gets a fresh evaluation. The final dag
-    // unregister of a wake delivery (U2 in dag/runtime/loop.ts) lands AFTER
-    // the wake turn's idle event — without this re-trigger the goal silently
-    // stalls until the next external idle. This is also the GOAL-FP-01-11
+    // dag on the last idle event gets a fresh evaluation. Since issue #321
+    // the final dag unregister of a wake delivery lands MID-TURN at admit
+    // time (the mark moves with it), so the session is busy when the owner
+    // flips: the idle gate below skips the re-emit here, and the in-flight
+    // wake turn re-emits idle on completion, which re-drives the goal.
+    // Without this re-trigger path the goal silently stalls until the next
+    // external idle. This is also the GOAL-FP-01-11
     // mitigation surface: a claim that lost the ownership race gets another
     // chance once the owner actually transfers.
     //
