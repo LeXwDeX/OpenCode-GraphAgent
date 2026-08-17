@@ -74,16 +74,15 @@ const serviceLayer = Layer.effect(
         const recovering = new Set<string>()
         const wakeInFlight = new Set<string>()
         const wakePending = new Set<string>()
-        // GOAL-FP-01-14: per-session record of the last wake summary whose
-        // transcript part was written. The durable mark runs AFTER the write
-        // (at-least-once delivery: a mark failure keeps the batch unreported
-        // for a retry), so a retry of an already-written summary would
-        // re-inject the same digest into the transcript. The retry dedupes on
-        // this map and only re-marks. In-process only — a crash between write
-        // and mark still duplicates on the restart sweep (a durable
-        // delivering-marker would need a schema change; registered, see
-        // GOAL-FP-01-14). Capped: evicting entries degrades to the pre-fix
-        // duplicate visibility, never to a lost wake.
+        // Per-session record of the last wake summary whose transcript part was
+        // written. Admit success IS the delivery (issue #321): the durable
+        // wake_reported mark lands immediately after the write, not after the
+        // wake-driven turn completes, so the in-memory map only needs to dedupe
+        // the narrow mark-retry path — if the leased mark returns None the rows
+        // stay unreported and a later trigger re-marks WITHOUT re-prompting.
+        // In-process only; restart durability now comes from wake_reported being
+        // persisted at admit time, not from this map. Capped: evicting entries
+        // degrades to a redundant re-prompt, never to a lost wake.
         const deliveredWakeSummaries = new Map<string, string>()
 
         // Seed the commented global dag.jsonc once per instance init — the
@@ -1315,24 +1314,30 @@ const serviceLayer = Layer.effect(
               )
               if (!wakeLease) return
 
-              // Persist wake_reported AFTER successful delivery only.
-              // A failure stays durable for a later idle event or restart scan;
-              // it must not spin synchronously on the same row.
               // The part is marked synthetic: model-visible (the orchestrator
               // receives the node result and can act) but NOT rendered as a user
               // message in the TUI chat — DAG data surfaces via the sidebar panel
               // and Inspector, keeping the chat conversation clean.
               //
-              // GOAL-FP-01-14: the transcript part is written BEFORE the
-              // durable mark. A mark failure (or a crash between the two)
-              // leaves the batch unreported and the retry would re-inject the
-              // SAME summary. When this session already had this exact summary
-              // written, skip the prompt and only re-mark — the write is
-              // idempotent in effect because an identical digest adds no
-              // information. A differing summary (new results committed
-              // between attempts) always prompts.
+              // ADMIT SUCCESS == DELIVERED (issue #321). The previous contract
+              // (GOAL-FP-01-14) persisted wake_reported only AFTER the whole
+              // wake-driven parent turn completed. A restart or mid-turn
+              // interruption therefore left wake_reported=false while the
+              // synthetic part was already durable in transcript, so the startup
+              // sweep re-injected a byte-identical wake (real incident: the same
+              // 4391-char wake injected twice, ~10 min apart, after a TUI
+              // restart). Redelivery adds duplicates, never information. The
+              // mark (and the terminal-workflow unregisters) now land right
+              // after admitIfIdle admits the part, BEFORE awaiting the turn.
+              //
+              // The in-memory dedup map still guards the retry path: if the
+              // leased mark below returns None (generation/owner changed), the
+              // rows stay unreported and a later trigger re-marks without
+              // re-prompting. A differing summary (new results committed between
+              // attempts) always prompts.
               if (deliveredWakeSummaries.size > 1024) deliveredWakeSummaries.clear()
               const didDeliver = yield* Effect.gen(function* () {
+                let wakeTurn: Effect.Effect<SessionV1.WithParts> | undefined
                 if (deliveredWakeSummaries.get(sessionID) !== summary) {
                   const delivered = yield* SessionPrompt.admitIfIdle(promptSvc, automation, wakeLease, {
                     sessionID: SessionID.make(sessionID),
@@ -1340,28 +1345,63 @@ const serviceLayer = Layer.effect(
                   })
                   if (Option.isNone(delivered)) return false
                   deliveredWakeSummaries.set(sessionID, summary)
-                  yield* delivered.value.pipe(
-                    Effect.onError(() =>
-                      Effect.sync(() => {
-                        if (deliveredWakeSummaries.get(sessionID) === summary) {
-                          deliveredWakeSummaries.delete(sessionID)
-                        }
-                      }),
-                    ),
+                  wakeTurn = delivered.value
+                }
+
+                // Admit success == delivered (issue #321): persist wake_reported
+                // at admit time. A leased mark returning None (generation/owner
+                // raced) is treated as retry-later — the rows stay unreported and
+                // a later trigger re-marks — but the admitted turn still runs
+                // below (its end-of-turn idle is what re-arms that retry).
+                const markLease = Option.getOrUndefined(
+                  yield* automation.claim(SessionID.make(sessionID), { kind: "dag" }),
+                )
+                // Any mark failure (lease lost, generation raced, or the store
+                // write dying) degrades to retry-later instead of propagating:
+                // the rows stay unreported and a later trigger re-marks, while
+                // the admitted turn below still runs (its end-of-turn idle is
+                // what re-arms that retry). Only interruption propagates.
+                const markSucceeded = markLease
+                  ? Option.isSome(
+                      yield* automation.use(markLease, store.markWakeBatchReported(batch)).pipe(
+                        Effect.catchCause((cause) =>
+                          Cause.hasInterrupts(cause)
+                            ? Effect.failCause(cause)
+                            : Effect.logWarning("DAG wake batch mark failed; rows stay unreported for retry", {
+                                sessionID,
+                                cause: Cause.pretty(cause),
+                              }).pipe(Effect.as(Option.none())),
+                        ),
+                      ),
+                    )
+                  : false
+                if (markSucceeded) {
+                  plan.unresponsiveDagIDs.forEach((workflowID) => deliveredUnresponsiveDagIDs.add(workflowID))
+                  yield* Effect.forEach(
+                    batch.workflows.filter((workflow) => isWorkflowTerminalStatus(workflow.status as never)),
+                    (workflow) => automation.unregister(SessionID.make(sessionID), { kind: "dag", id: workflow.id }),
+                    { discard: true },
                   )
                 }
 
-                const markLease = yield* automation.claim(SessionID.make(sessionID), { kind: "dag" })
-                if (Option.isNone(markLease)) return false
-                const marked = yield* automation.use(markLease.value, store.markWakeBatchReported(batch))
-                if (Option.isNone(marked)) return false
-                plan.unresponsiveDagIDs.forEach((workflowID) => deliveredUnresponsiveDagIDs.add(workflowID))
-                yield* Effect.forEach(
-                  batch.workflows.filter((workflow) => isWorkflowTerminalStatus(workflow.status as never)),
-                  (workflow) => automation.unregister(SessionID.make(sessionID), { kind: "dag", id: workflow.id }),
-                  { discard: true },
-                )
-                return true
+                // Pacing — keep one wake turn at a time. The turn runs AFTER the
+                // durable mark, so its failure can no longer lose the report;
+                // swallow non-interrupt failures instead of surfacing them as a
+                // delivery failure. It also runs when the mark raced, so its
+                // end-of-turn idle re-arms the mark retry.
+                if (wakeTurn) {
+                  yield* wakeTurn.pipe(
+                    Effect.catchCause((cause) =>
+                      Cause.hasInterrupts(cause)
+                        ? Effect.failCause(cause)
+                        : Effect.logInfo("DAG wake turn did not complete; wake already reported", {
+                            sessionID,
+                            cause: Cause.pretty(cause),
+                          }),
+                    ),
+                  )
+                }
+                return markSucceeded
               }).pipe(
                 Effect.catchCause((cause) =>
                   Effect.logWarning("DAG wake delivery failed", { sessionID, cause: Cause.pretty(cause) }).pipe(
