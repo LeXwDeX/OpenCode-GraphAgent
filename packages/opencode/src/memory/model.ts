@@ -5,7 +5,13 @@ import { Context, Duration, Effect, Layer, Schema } from "effect"
 import { generateObject } from "ai"
 import { Provider } from "@/provider/provider"
 
-const DEFAULT_TIMEOUT = Duration.seconds(8)
+// Last-resort guard for a provider that never responds at all. This is not an
+// activity budget: maintenance reasoning runs are long, generation terminates
+// on its own via max_output_tokens, and transport timers own dead-connection
+// detection, so a call that keeps working finishes before this ever fires.
+const RESPONSE_TIMEOUT = Duration.minutes(5)
+
+const JSON_HINT = "Respond with a JSON object matching the provided schema."
 
 export interface Request {
   readonly model: Provider.Model
@@ -43,14 +49,21 @@ export function make(input: {
 }) {
   return Service.of({
     generate: Effect.fn("MemoryModel.generate")((request) =>
-      input.execute(request).pipe(
+      input.execute(requireJsonToken(request)).pipe(
         Effect.timeoutOrElse({
-          duration: input.timeout ?? DEFAULT_TIMEOUT,
+          duration: input.timeout ?? RESPONSE_TIMEOUT,
           orElse: () => Effect.fail(new TimeoutError()),
         }),
       ),
     ),
   })
+}
+
+// Providers serving response_format json_object reject prompts that do not
+// contain the literal word "json"; the maintenance prompts never mention it.
+function requireJsonToken(request: Request): Request {
+  if (/json/i.test(request.system) || /json/i.test(request.prompt)) return request
+  return { ...request, system: `${request.system}\n${JSON_HINT}` }
 }
 
 export const layer = Layer.effect(

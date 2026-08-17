@@ -3,7 +3,7 @@ export * as Memory from "./memory"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { ProjectV2 } from "@opencode-ai/core/project"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
-import { Context, Duration, Effect, Layer, Option, Ref, Schema, Semaphore } from "effect"
+import { Context, Effect, Layer, Option, Ref, Schema, Scope, Semaphore } from "effect"
 import { stringify } from "yaml"
 import { Config } from "@/config/config"
 import { Provider } from "@/provider/provider"
@@ -22,8 +22,10 @@ import { MemoryStore } from "./store"
 
 const EVIDENCE_MESSAGES = 16
 const EVIDENCE_CHARS = 8_000
-const PREPARE_TIMEOUT = Duration.seconds(5)
-const CHECKPOINT_TIMEOUT = Duration.seconds(8)
+// Reasoning-heavy models spend thinking tokens against max_output_tokens; size
+// the budgets so the structured reply survives the thinking phase.
+const MATCH_OUTPUT_TOKENS = 2_048
+const MAINTAIN_OUTPUT_TOKENS = 16_384
 
 type TurnCache = {
   readonly completedTurns: number
@@ -89,6 +91,8 @@ export const layer: Layer.Layer<
     const globalStarted = yield* Ref.make(false)
     const initializationLock = Semaphore.makeUnsafe(1)
     const state = yield* InstanceState.make(() => Effect.succeed({ sessions: new Map<SessionID, SessionCache>() }))
+    const scope = yield* Scope.Scope
+    const maintenanceInFlight = yield* Ref.make(new Set<ProjectV2.ID>())
 
     const availableModels = Effect.fn("Memory.availableModels")(function* () {
       const providers = yield* provider.list()
@@ -265,7 +269,7 @@ export const layer: Layer.Layer<
           topics: MemoryStore.indexes(input.topics),
         }),
         schema: MemorySchema.MatchResponse,
-        maxOutputTokens: 256,
+        maxOutputTokens: MATCH_OUTPUT_TOKENS,
       })
       const decoded = Schema.decodeUnknownOption(MemorySchema.MatchResponse)(output)
       if (Option.isNone(decoded))
@@ -276,15 +280,25 @@ export const layer: Layer.Layer<
         .slice(0, input.config.injection.max_topics)
     })
 
-    const maintain = Effect.fn("Memory.maintain")(function* (input: {
+    // Serialize the identity-liveness recheck and the per-project lock around
+    // the store write only; the model calls that produce the update run
+    // outside the fence/lock so a long reasoning call cannot wedge or leak it.
+    const applyUpdate = (projectID: ProjectV2.ID, update: (topics: MemorySchema.Topic[]) => MemoryStore.Update<undefined>) =>
+      fence.withLiveIdentity(
+        projectID,
+        lock.withProject(projectID)(store.updateTopics(projectID, update)),
+      )
+
+    // Model-only half of maintenance: evidence → inspect match → maintenance
+    // proposal. Performs no persistence; callers own admission and the commit.
+    const proposeMaintenance = Effect.fn("Memory.proposeMaintenance")(function* (input: {
       model: Provider.Model
       config: MemorySchema.Config
       topics: MemorySchema.Topic[]
       messages: SessionV1.WithParts[]
-      projectID: Project.Info["id"]
     }) {
       const evidence = maintenanceEvidence(input.messages)
-      if (!evidence) return input.topics
+      if (!evidence) return
       const inspect = yield* match({
         model: input.model,
         config: input.config,
@@ -306,16 +320,28 @@ export const layer: Layer.Layer<
           }),
         }),
         schema: MemorySchema.MaintenanceResponse,
-        maxOutputTokens: 2_048,
+        maxOutputTokens: MAINTAIN_OUTPUT_TOKENS,
       })
       const decoded = Schema.decodeUnknownOption(MemorySchema.MaintenanceResponse)(output)
       if (Option.isNone(decoded))
         return yield* new ControllerError({ message: "MEMORY maintenance returned invalid output" })
+      return decoded.value.actions
+    })
+
+    const maintain = Effect.fn("Memory.maintain")(function* (input: {
+      model: Provider.Model
+      config: MemorySchema.Config
+      topics: MemorySchema.Topic[]
+      messages: SessionV1.WithParts[]
+      projectID: Project.Info["id"]
+    }) {
+      const actions = yield* proposeMaintenance(input)
+      if (!actions) return input.topics
       return yield* store
         .updateTopics(input.projectID, (topics) => ({
           applied: MemoryStore.applyActions({
             topics,
-            actions: decoded.value.actions,
+            actions,
             topicLimit: input.config.topic_limit,
           }),
           result: undefined,
@@ -341,6 +367,76 @@ export const layer: Layer.Layer<
         return topic ? [topic] : []
       })
       return renderSelection(selected, input.config)
+    })
+
+    // Self-contained background maintenance for the checkpoint path: the
+    // matcher and maintenance model run OUTSIDE the fence/lock, and only the
+    // topic commit acquires them (applyUpdate), so a long reasoning call
+    // cannot wedge the lock, leak it on interruption, or block the caller.
+    const backgroundMaintain = Effect.fn("Memory.backgroundMaintain")(function* (input: {
+      model: Provider.Model
+      config: MemorySchema.Config
+      messages: SessionV1.WithParts[]
+      projectID: ProjectV2.ID
+    }) {
+      const topics = yield* store.readTopics(input.projectID)
+      const actions = yield* proposeMaintenance({
+        model: input.model,
+        config: input.config,
+        topics,
+        messages: input.messages,
+      })
+      if (!actions) return
+      yield* applyUpdate(input.projectID, (current) => ({
+        applied: MemoryStore.applyActions({
+          topics: current,
+          actions,
+          topicLimit: input.config.topic_limit,
+        }),
+        result: undefined,
+      }))
+    })
+
+    const releaseMaintenanceSlot = (projectID: ProjectV2.ID) =>
+      Ref.update(maintenanceInFlight, (set) => {
+        if (!set.has(projectID)) return set
+        const next = new Set(set)
+        next.delete(projectID)
+        return next
+      })
+
+    const kickMaintenance = Effect.fn("Memory.kickMaintenance")(function* (input: {
+      model: Provider.Model
+      config: MemorySchema.Config
+      messages: SessionV1.WithParts[]
+      projectID: ProjectV2.ID
+    }) {
+      const job = backgroundMaintain(input).pipe(
+        Effect.catchCause((cause) => Effect.logWarning("background MEMORY maintenance failed", { cause })),
+        Effect.ensuring(releaseMaintenanceSlot(input.projectID)),
+      )
+      // Reserve and fork atomically: an interruption between the two would
+      // leak the in-flight slot and silently skip every later maintenance for
+      // this process; a fork into a closing scope must hand the slot back.
+      yield* Effect.uninterruptible(
+        Effect.gen(function* () {
+          const reserved = yield* Ref.modify(maintenanceInFlight, (set) =>
+            set.has(input.projectID)
+              ? ([false, set] as const)
+              : ([true, new Set(set).add(input.projectID)] as const),
+          )
+          if (!reserved) return
+          yield* job.pipe(
+            Effect.forkIn(scope),
+            Effect.catchCause((cause) =>
+              Effect.gen(function* () {
+                yield* releaseMaintenanceSlot(input.projectID)
+                yield* Effect.logWarning("background MEMORY maintenance fork failed", { cause })
+              }),
+            ),
+          )
+        }),
+      )
     })
 
     const prepareUnsafe = Effect.fn("Memory.prepareUnsafe")(function* (input: {
@@ -422,7 +518,6 @@ export const layer: Layer.Layer<
 
     const prepare: Interface["prepare"] = Effect.fn("Memory.prepare")((input) =>
       prepareUnsafe(input).pipe(
-        Effect.timeout(PREPARE_TIMEOUT),
         Effect.catchCause((cause) => Effect.logWarning("MEMORY prepare failed", { cause })),
       ),
     )
@@ -525,7 +620,6 @@ export const layer: Layer.Layer<
 
     const search: Interface["search"] = Effect.fn("Memory.search")((input) =>
       searchUnsafe(input).pipe(
-        Effect.timeout(PREPARE_TIMEOUT),
         Effect.catchCause((cause) =>
           Effect.gen(function* () {
             yield* Effect.logWarning("MEMORY search failed", { cause })
@@ -545,54 +639,40 @@ export const layer: Layer.Layer<
         return []
       }
       const user = latestRealUser(input.messages)
-      // Cross-process identity guard: a concurrent upgrade may retire this
-      // identity (row deleted, Home renamed away) while this write is in
-      // flight. Serialize on the identity lock and re-check liveness inside it;
-      // writing after retirement would re-create the retired Home and orphan
-      // the new content permanently (the identity cache already points at the
-      // successor, so no migration would ever run for this pair again).
       const live = yield* fence.withLiveIdentity(
         current.project.id,
-        Effect.gen(function* () {
-          return yield* lock.withProject(current.project.id)(
-            Effect.gen(function* () {
-              const topics = yield* store.readTopics(current.project.id)
-              const maintained = yield* maintain({
-                model: current.model,
-                config: current.loaded.config,
-                topics,
-                messages: input.messages,
-                projectID: current.project.id,
-              }).pipe(
-                Effect.catchCause((cause) =>
-                  Effect.gen(function* () {
-                    yield* Effect.logWarning("pre-compaction MEMORY maintenance failed", { cause })
-                    return topics
-                  }),
-                ),
-              )
-              const rendered = (yield* select({
-                model: current.model,
-                config: current.loaded.config,
-                topics: maintained,
-                text: user?.text ?? "",
-                projectID: current.project.id,
-              })).rendered
-              return rendered
-            }),
-          )
-        }),
+        lock.withProject(current.project.id)(
+          Effect.gen(function* () {
+            const topics = yield* store.readTopics(current.project.id)
+            return (yield* select({
+              model: current.model,
+              config: current.loaded.config,
+              topics,
+              text: user?.text ?? "",
+              projectID: current.project.id,
+            })).rendered
+          }),
+        ),
       )
       if (Option.isNone(live)) {
         yield* clearSession(input.sessionID)
         return []
       }
+      // Maintenance runs in the background AFTER the identity fence: compaction
+      // must not wait on a long reasoning call, a retired identity never burns
+      // model calls, and the injection above rendered the pre-maintenance
+      // topics. At most one job per project is in flight.
+      yield* kickMaintenance({
+        model: current.model,
+        config: current.loaded.config,
+        messages: input.messages,
+        projectID: current.project.id,
+      })
       return live.value
     })
 
     const checkpoint: Interface["checkpoint"] = Effect.fn("Memory.checkpoint")((input) =>
       checkpointUnsafe(input).pipe(
-        Effect.timeout(CHECKPOINT_TIMEOUT),
         Effect.catchCause((cause) =>
           Effect.gen(function* () {
             yield* Effect.logWarning("MEMORY checkpoint failed", { cause })
