@@ -575,6 +575,38 @@ function conditionDiagnostics(nodes: readonly NodeConfig[]): Diagnostic[] {
   ]
 }
 
+/** A report_to_parent node wakes the parent for adjudication; a dependent
+ * without a condition on that node's output is spawned the moment the
+ * checkpoint completes, so the checkpoint verdict can never act first.
+ * Block-compiled graphs gate dependents on the verdict (issue #294
+ * REJECT-checkpoint shape); hand-built node graphs must do the same or keep
+ * the checkpoint as a reporting leaf. */
+export function checkpointGateDiagnostics(
+  nodes: readonly NodeConfig[],
+  defaults?: { readonly report_to_parent?: boolean },
+): Diagnostic[] {
+  const reportsToParent = (node: NodeConfig) =>
+    node.report_to_parent ?? defaults?.report_to_parent ?? DEFAULT_WORKFLOW_CONFIG.reportToParent
+  return nodes.flatMap((checkpoint) => {
+    if (!reportsToParent(checkpoint)) return []
+    return nodes
+      .filter((dependent) => dependent.depends_on.includes(checkpoint.id))
+      .filter((dependent) => conditionReference(dependent.condition) !== checkpoint.id)
+      .map((dependent) =>
+        diagnostic({
+          code: DIAGNOSTIC_CODES.dagInvalid,
+          path: `nodes[${dependent.id}].condition`,
+          message:
+            `reporting checkpoint "${checkpoint.id}" has dependent "${dependent.id}" that is not gated on its output`
+            + ` — the engine spawns "${dependent.id}" as soon as "${checkpoint.id}" completes, so the checkpoint verdict cannot be acted on first`,
+          hint:
+            `Gate "${dependent.id}" with condition: "${checkpoint.id}.output.<field> == ..." (e.g. on its verdict),`
+            + ` keep "${checkpoint.id}" a reporting leaf, or set report_to_parent: false on "${checkpoint.id}" if downstream must run unconditionally`,
+        }),
+      )
+  })
+}
+
 function bindingDiagnostics(nodes: readonly NodeConfig[]): Diagnostic[] {
   return templateBindingErrors(nodes).map((error) =>
     diagnostic({
@@ -926,7 +958,7 @@ export function validatePostCompile(input: {
   config: {
     mode?: ExecutionMode
     max_total_nodes?: number
-    node_defaults?: { required?: boolean; model?: { modelID: string; providerID: string } }
+    node_defaults?: { required?: boolean; report_to_parent?: boolean; model?: { modelID: string; providerID: string } }
   }
   nodes: readonly NodeConfig[]
   /** The original blocks when the graph used the high-level interface. */
@@ -942,11 +974,14 @@ export function validatePostCompile(input: {
     const diagnostics =
       input.structural === false
         ? []
-        : structuralDiagnostics({
-            nodes: input.nodes,
-            mode: input.config.mode,
-            max_total_nodes: input.config.max_total_nodes,
-          })
+        : [
+            ...structuralDiagnostics({
+              nodes: input.nodes,
+              mode: input.config.mode,
+              max_total_nodes: input.config.max_total_nodes,
+            }),
+            ...checkpointGateDiagnostics(input.nodes, input.config.node_defaults),
+          ]
     if (input.profile === "portable") diagnostics.push(...nonportablePromptDiagnostics(input.nodes))
     if (input.profile === "environment") {
       diagnostics.push(

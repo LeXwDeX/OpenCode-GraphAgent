@@ -108,6 +108,10 @@ Top level is `title`/`mode`/`admission` (optional) and `config` (required);
 `kind` (required), `depends_on`, `instruction`, `worker_type`, `required`,
 `report_to_parent` — never `worker`, `prompt`, or `agent`.
 
+A `report_to_parent` node with dependents is a reporting checkpoint: gate each
+dependent on its output via `condition`, keep it a reporting leaf, or drop
+`report_to_parent`.
+
 Validate that `spec_path` before start. Fix every diagnostic in the same file
 and revalidate; validation creates no workflow. A successful start returns the
 exact workflow ID. The parent owns the graph, controls, and final report;

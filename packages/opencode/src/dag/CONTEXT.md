@@ -13,6 +13,7 @@ Workflow Orchestration turns one user objective into one durable DAG. Its model-
 | Orchestration Router | The product-owned parent guidance that qualifies an objective and selects one Workflow Route without external Skill discovery. |
 | Block Composer | The Orchestration Router decision that selects the smallest Block graph justified by current evidence. |
 | Decision Checkpoint | One parent-owned confirmation for unresolved user choices that materially change behavior, scope, acceptance, or an irreversible boundary. |
+| Reporting Checkpoint | A `report_to_parent: true` node with dependents; its dependents must gate on its output via `condition`, or it must be a reporting leaf. |
 | Workflow Brief | The recommended route, scope, acceptance evidence, assumptions, risks, and material alternatives presented at a Decision Checkpoint. |
 | Block | A reusable high-level orchestration capability such as explore, plan, debug, coding, verify, or review. Blocks compile into Nodes. |
 | Node | A low-level durable unit of child-agent work with dependencies, prompt input, policy, and output contract. |
@@ -31,6 +32,7 @@ Workflow Orchestration turns one user objective into one durable DAG. Its model-
 - Model-facing graph actions expose only `spec_path`; graph fields live in YAML so provider tool-call serialization cannot turn a nested graph into a string.
 - Legacy YAML may be adapted at the file boundary without making legacy fields valid inline input.
 - Runtime Admission and Workflow Authoring Check have separate names, state, and responsibilities.
+- Dependents of a reporting checkpoint must be gated on its output; authoring rejects ungated shapes at start/validate (enforcement point: authoring boundary only, runtime create deliberately unchanged).
 
 ## Boundaries
 
@@ -43,3 +45,5 @@ Workflow Orchestration turns one user objective into one durable DAG. Its model-
 ## Decisions
 
 - [ADR-0001: One Workflow Authoring Check authority](docs/adr/0001-workflow-authoring-check.md)
+- [ADR-0002: Parallel workspace writers with an implementation aggregator](docs/adr/0002-parallel-writers-aggregator.md)
+- [ADR-0003: Reporting checkpoint gating at the authoring boundary](docs/adr/0003-reporting-checkpoint-gating.md)
