@@ -2151,7 +2151,13 @@ const llmScenarios = new Set([
 ])
 
 const main = Effect.gen(function* () {
-  yield* Effect.addFinalizer(() => Effect.promise(() => disposeApps()).pipe(Effect.andThen(cleanupExercisePaths)))
+  yield* Effect.addFinalizer(() =>
+    Effect.promise(() => disposeApps(options.heartbeat)).pipe(
+      Effect.andThen(Effect.sync(() => options.heartbeat?.("teardown: cleanupExercisePaths"))),
+      Effect.andThen(cleanupExercisePaths),
+      Effect.andThen(Effect.sync(() => options.heartbeat?.("teardown: complete"))),
+    ),
+  )
   const parsed = parseOptions(Bun.argv.slice(2))
   const options: Options = parsed.progress ? { ...parsed, heartbeat: startProgressWatchdog() } : parsed
   const modules = yield* Effect.promise(() => runtime())

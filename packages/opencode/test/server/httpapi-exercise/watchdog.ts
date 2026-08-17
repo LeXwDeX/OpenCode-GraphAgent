@@ -24,6 +24,11 @@ const pid = Number(process.env.WATCHDOG_PID)
 const file = process.env.WATCHDOG_FILE
 const timeoutMs = Number(process.env.WATCHDOG_TIMEOUT_MS)
 const pollMs = Number(process.env.WATCHDOG_POLL_MS)
+// A missing heartbeat file is treated as stalled (tracked via missingSince),
+// never as healthy: CI runners can reclaim tmpdir files, and silently
+// standing down when the file disappears is what let the 2026-08-17
+// teardown hang burn the full 15m step timeout without a kill.
+let missingSince = 0
 setInterval(() => {
   let alive = true
   try {
@@ -36,12 +41,18 @@ setInterval(() => {
   try {
     mtime = fs.statSync(file).mtimeMs
   } catch {}
-  if (!mtime || Date.now() - mtime <= timeoutMs) return
+  if (mtime) {
+    missingSince = 0
+    if (Date.now() - mtime <= timeoutMs) return
+  } else {
+    if (!missingSince) missingSince = Date.now()
+    if (Date.now() - missingSince <= timeoutMs) return
+  }
   let last = "<none>"
   try {
     last = fs.readFileSync(file, "utf8")
   } catch {}
-  console.error("[watchdog] no progress for " + Math.round((Date.now() - mtime) / 1000) + "s; last activity: " + last + " — killing pid " + pid)
+  console.error("[watchdog] no progress for " + Math.round((Date.now() - (mtime || missingSince)) / 1000) + "s; last activity: " + last + " — killing pid " + pid)
   try {
     process.kill(pid, "SIGKILL")
   } catch {}
