@@ -6,7 +6,7 @@
  *
  * Resolves a node's `prompt_template` declaration into a final prompt string:
  * - `id` reference → reads the `.md` file from project (`.opencode/dag-prompts/`)
- *   or global (`~/.config/opencode/dag-prompts/`) directory
+ *   or global (`<config dir>/dag-prompts/`) directory
  * - `inline` → used directly as the template source (no filesystem round-trip)
  *
  * Both paths go through `{{var}}` interpolation and `sanitize()`.
@@ -16,9 +16,10 @@
  */
 
 import { Effect } from "effect"
-import * as os from "node:os"
 import * as path from "node:path"
 import * as fs from "node:fs/promises"
+import { Global } from "@opencode-ai/core/global"
+import { Flag } from "@opencode-ai/core/flag/flag"
 import { sanitizeInput } from "./sanitize"
 
 export interface TemplateRef {
@@ -92,7 +93,7 @@ function readById(id: string, projectDir: string): Effect.Effect<string, Error> 
       return yield* Effect.fail(new Error(`Invalid template id: ${id}`))
     }
     const projectPath = path.join(projectDir, ".opencode", "dag-prompts", `${id}.md`)
-    const globalPath = path.join(os.homedir(), ".config", "opencode", "dag-prompts", `${id}.md`)
+    const globalPath = path.join(Flag.OPENCODE_CONFIG_DIR ?? Global.Path.config, "dag-prompts", `${id}.md`)
 
     // Try project first (overrides global), then global
     const result = yield* Effect.promise(async () => {

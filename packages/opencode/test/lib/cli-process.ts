@@ -201,7 +201,7 @@ export function withCliFixture<A, E>(
 
     const configJson = JSON.stringify(testProviderConfig(llm.url))
     const env = isolatedEnv(home, configJson)
-    const memoryConfigDir = path.join(home, ".config/opencode")
+    const memoryConfigDir = path.join(home, ".config/opencodeg")
     yield* fs.makeDirectory(memoryConfigDir, { recursive: true })
     // CLI tests own the provider response queue, while dedicated MEMORY tests
     // cover first-run model selection. Seed a valid global config so unrelated

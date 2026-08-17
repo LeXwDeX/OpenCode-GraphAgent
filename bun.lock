@@ -539,7 +539,7 @@
       "name": "opencode",
       "version": "1.17.11",
       "bin": {
-        "opencode": "./bin/opencode",
+        "opencodeg": "./bin/opencode",
       },
       "dependencies": {
         "@actions/core": "1.11.1",
