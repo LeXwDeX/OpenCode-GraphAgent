@@ -54,6 +54,26 @@ describe("CommandPlugin.Plugin", () => {
       expect(CommandPlugin.DagFlowContent).toContain("run `/dag`")
       expect(CommandPlugin.DagFlowContent).toContain("resident Orchestration Router")
       expect(CommandPlugin.DagFlowContent).toContain("Decision Checkpoint")
+      expect(yield* command.get("dag-init")).toMatchObject({
+        name: "dag-init",
+        description: CommandPlugin.DagInitDescription,
+        template: CommandPlugin.DagInitContent,
+      })
+      expect(CommandPlugin.DagInitContent).toContain("$ARGUMENTS")
+      expect(CommandPlugin.DagInitContent).toContain("unsupported platform: only GitHub and GitLab")
+      expect(CommandPlugin.DagInitContent).toContain(".opencode/dag-init.json")
+      expect(CommandPlugin.DagInitContent).toContain("merge_policy")
+      expect(yield* command.get("dag-auto")).toMatchObject({
+        name: "dag-auto",
+        description: CommandPlugin.DagAutoDescription,
+        template: CommandPlugin.DagAutoContent,
+      })
+      expect(CommandPlugin.DagAutoContent).toContain("$ARGUMENTS")
+      expect(CommandPlugin.DagAutoContent).toContain("ultra-flow-route")
+      expect(CommandPlugin.DagAutoContent).toContain("continue|replan")
+      expect(CommandPlugin.DagAutoContent).toContain("issue IS the atom")
+      expect(CommandPlugin.DagAutoContent).toContain("full-auto")
+      expect(CommandPlugin.DagAutoContent).toContain("Ordered merge")
     }),
   )
 
