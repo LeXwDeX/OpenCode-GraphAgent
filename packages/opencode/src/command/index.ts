@@ -52,6 +52,8 @@ export const Default = {
   SUBGOAL: "subgoal",
   MEMORY: "memory",
   DAG_FLOW: "dag-flow",
+  DAG_INIT: "dag-init",
+  DAG_AUTO: "dag-auto",
   IMPORT_HOOKS: "import-claude-hooks",
   CREATE_HOOK: "create-hook",
 } as const
@@ -121,6 +123,20 @@ export const layer = Layer.effect(
         source: "command",
         template: CommandPlugin.DagFlowContent,
         hints: hints(CommandPlugin.DagFlowContent),
+      }
+      commands[Default.DAG_INIT] = {
+        name: Default.DAG_INIT,
+        description: CommandPlugin.DagInitDescription,
+        source: "command",
+        template: CommandPlugin.DagInitContent,
+        hints: hints(CommandPlugin.DagInitContent),
+      }
+      commands[Default.DAG_AUTO] = {
+        name: Default.DAG_AUTO,
+        description: CommandPlugin.DagAutoDescription,
+        source: "command",
+        template: CommandPlugin.DagAutoContent,
+        hints: hints(CommandPlugin.DagAutoContent),
       }
       commands[Default.IMPORT_HOOKS] = {
         name: Default.IMPORT_HOOKS,
