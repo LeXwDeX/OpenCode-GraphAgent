@@ -726,13 +726,37 @@ export const WorkflowTool = Tool.define<
                   dag.replan(wfId, { nodes: result.prepared.nodes }),
                   "The workflow reached a terminal status before the replan arrived — terminal workflows are immutable. Recover by starting a new workflow with the updated node definitions, or extend if a reporting leaf checkpoint naturally completed the graph. Next time issue control(pause) BEFORE composing the spec.",
                 ).pipe(Effect.orDie)
+                // A paused workflow (explicit pause-first protocol, or the
+                // runtime's gate pause after a checkpoint replan verdict) must
+                // resume for the corrective nodes to run — the replan intent
+                // is "the graph changed, proceed", so resume closes the loop.
+                // Resume races with concurrent control ops are tolerated: the
+                // replan already landed, so never die on them.
+                const wfAfterReplan = yield* dag.store.getWorkflow(wfId).pipe(Effect.orDie)
+                const resumedFromPause = wfAfterReplan?.status === "paused"
+                const resumedOk = resumedFromPause
+                  ? yield* dag.resume(wfId).pipe(
+                      Effect.map(() => true),
+                      Effect.catch((error) =>
+                        Effect.gen(function* () {
+                          yield* Effect.logWarning("Workflow resume after replan failed", { wfId, error })
+                          return false
+                        }),
+                      ),
+                    )
+                  : false
                 const ignored =
                   r.ignore.length > 0
                     ? `\nIgnored (terminal, immutable — add replacements under new ids to retry): ${r.ignore.join(", ")}`
                     : ""
+                const pauseNote = !resumedFromPause
+                  ? ""
+                  : resumedOk
+                    ? "\nWorkflow was paused and has been resumed — corrective nodes are now schedulable."
+                    : "\nWorkflow was paused; automatic resume raced with another control op — check status and issue control(resume) if still paused."
                 return {
                   title: `Workflow replanned: +${r.add.length} -${r.cancel.length} ↻${r.restart.length}`,
-                  output: `<workflow id="${wfId}" action="replan">\nAdded: ${r.add.join(", ")}\nCancelled: ${r.cancel.join(", ")}\nRestarted: ${r.restart.join(", ")}\nReplaced: ${r.replace.join(", ")}${ignored}\n</workflow>`,
+                  output: `<workflow id="${wfId}" action="replan">\nAdded: ${r.add.join(", ")}\nCancelled: ${r.cancel.join(", ")}\nRestarted: ${r.restart.join(", ")}\nReplaced: ${r.replace.join(", ")}${ignored}${pauseNote}\n</workflow>`,
                   metadata: { workflowId: wfId, ...r } as Metadata,
                 }
               }
@@ -741,7 +765,7 @@ export const WorkflowTool = Tool.define<
                   yield* dag.pause(wfId).pipe(Effect.orDie)
                   return {
                     title: "Workflow paused",
-                    output: `<workflow id="${wfId}" state="paused"/>\nNote: pause stops new node spawns only — nodes already running continue to completion. To stop a running node, submit a replan spec marking it restart: true or cancel: true (replan is valid while paused).`,
+                    output: `<workflow id="${wfId}" state="paused"/>\nNote: pause stops new node spawns only — nodes already running continue to completion. To stop a running node, submit a replan spec marking it restart: true or cancel: true (replan is valid while paused, and a successful replan resumes the paused workflow so corrective nodes can run).`,
                     metadata: { workflowId: wfId } as Metadata,
                   }
                 case "resume":

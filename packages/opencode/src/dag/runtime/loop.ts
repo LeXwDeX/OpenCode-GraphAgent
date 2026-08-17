@@ -3,7 +3,7 @@
 
 export * as DagLoop from "./loop"
 
-import { Cause, Effect, Layer, Context, Stream, Semaphore, Fiber, Option, DateTime, Clock } from "effect"
+import { Cause, Effect, Layer, Context, Stream, Semaphore, Fiber, Option, DateTime, Clock, Schema } from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { InstanceState } from "@/effect/instance-state"
@@ -35,6 +35,12 @@ import { DagConfig } from "../config"
 import { spawnNode, makeDeadlineWatcher } from "./spawn"
 import { evaluateCondition, resolveInputMapping } from "./eval"
 import { reconcileWorkflow, makeSessionStatusChecker } from "./recovery"
+
+// A reporting checkpoint's replan verdict vetoes the current direction: the
+// workflow pauses durably before any downstream spawn (see NodeCompleted
+// handler). Only the verdict shape matters — any node whose submitted output
+// matches triggers the gate, so non-reporting nodes can never trip it.
+const GateReplanVerdict = Schema.Struct({ verdict: Schema.Literal("replan") })
 
 export interface Interface {
   readonly init: () => Effect.Effect<void>
@@ -652,10 +658,36 @@ const serviceLayer = Layer.effect(
                     // back. Mirrors the NodeFailed handler's isActive guard.
                     if (confirmed && entry.runtime.isActive(nodeID)) {
                       settle(entry, nodeID)
+                      const nodeConfig = entry.config?.nodes.find((n) => n.id === nodeID)
+                      const gateReplan = def === DagEvent.NodeCompleted
+                        && nodeConfig?.report_to_parent === true
+                        && Option.isSome(Schema.decodeUnknownOption(GateReplanVerdict)(node?.output))
+                      if (gateReplan) {
+                        // Verdict gate (issue #322): a reporting checkpoint that
+                        // submits verdict "replan" vetoes the direction. Pause
+                        // durably BEFORE any spawn round so dependents can never
+                        // run on the rejected direction; the parent is woken by
+                        // the report_to_parent wake and control(replan) applies
+                        // corrective nodes — a paused workflow resumes as part
+                        // of replan (workflow tool) so corrections can run.
+                        const paused = yield* dag.pause(dagID).pipe(
+                          Effect.map(() => true),
+                          Effect.catch(() =>
+                            Effect.gen(function* () {
+                              const wf = yield* store.getWorkflow(dagID).pipe(Effect.orDie)
+                              if (wf?.status !== "paused")
+                                yield* Effect.logWarning("DagLoop pause on replan verdict failed", { dagID, nodeID })
+                              return wf?.status === "paused"
+                            }),
+                          ),
+                        )
+                        entry.runtime.setPaused(paused)
+                        yield* Effect.logWarning("DagLoop paused workflow after gate verdict: replan", { dagID, nodeID })
+                      }
                       // In stepMode, do NOT auto-advance — wait for the next
                       // explicit step command. checkCompletion still runs so
                       // required-node failure / early completion is detected.
-                      if (!entry.runtime.isStepMode()) yield* spawnReady(dagID)
+                      if (!gateReplan && !entry.runtime.isStepMode()) yield* spawnReady(dagID)
                     }
                     yield* checkCompletion(dagID)
                   }),

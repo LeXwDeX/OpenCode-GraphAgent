@@ -370,3 +370,83 @@ describe("DagLoop cancel-skip race", () => {
     )
   })
 })
+
+describe("DagLoop replan verdict gate (issue #322)", () => {
+  it("pauses the workflow on a reporting checkpoint's replan verdict and blocks dependents until resume", async () => {
+    await Effect.runPromise(
+      runGuardTest({ instanceProject: "project-1" }, ({ dag, store, childPrompts }) =>
+        Effect.gen(function* () {
+          const dagID = yield* dag.create({
+            projectID: "project-1",
+            sessionID: "ses_project-1",
+            title: "Gate replan verdict",
+            config: {
+              name: "gate-replan",
+              nodes: [
+                node({ id: "gate", name: "gate", required: true, report_to_parent: true, output_schema: { type: "object" } }),
+                node({ id: "downstream", name: "downstream", required: false, depends_on: ["gate"] }),
+              ],
+            },
+          })
+          const gateChild = yield* takeWithin(childPrompts, "gate node did not start")
+          expect(gateChild.title).toBe("gate")
+          // The checkpoint submits a replan verdict (issue #322: the graph used
+          // to spawn the dependent anyway and spin to terminal).
+          yield* dag.nodeCompleted(dagID, "gate", { verdict: "replan", findings: "direction vetoed" })
+          yield* pollWithTimeout(
+            Effect.gen(function* () {
+              const wf = yield* store.getWorkflow(dagID)
+              return wf?.status === "paused" ? (true as const) : undefined
+            }),
+            "workflow did not pause after the replan verdict",
+          )
+          // The only prompt that may land while paused is the report_to_parent
+          // wake for the parent session — a dependent spawn would flip the
+          // durable row to queued/running first.
+          const woken = yield* takeWithin(childPrompts, "report_to_parent wake never delivered")
+          expect(woken.title).toBe("ses_project-1")
+          expect(Option.isNone(yield* Queue.poll(childPrompts))).toBe(true)
+          expect((yield* store.getNode(dagID, "downstream"))?.status).toBe("pending")
+          // Parent disposition: replan fragment + resume continues the graph.
+          yield* dag.resume(dagID)
+          const downstreamChild = yield* takeWithin(childPrompts, "downstream did not start after resume")
+          expect(downstreamChild.title).toBe("downstream")
+          yield* Deferred.succeed(downstreamChild.release, "done")
+        }),
+      ),
+    )
+  })
+
+  it("advances normally when a reporting checkpoint submits verdict continue", async () => {
+    await Effect.runPromise(
+      runGuardTest({ instanceProject: "project-1" }, ({ dag, store, childPrompts }) =>
+        Effect.gen(function* () {
+          const dagID = yield* dag.create({
+            projectID: "project-1",
+            sessionID: "ses_project-1",
+            title: "Gate continue verdict",
+            config: {
+              name: "gate-continue",
+              nodes: [
+                node({ id: "gate", name: "gate", required: true, report_to_parent: true, output_schema: { type: "object" } }),
+                node({ id: "downstream", name: "downstream", required: false, depends_on: ["gate"] }),
+              ],
+            },
+          })
+          const gateChild = yield* takeWithin(childPrompts, "gate node did not start")
+          expect(gateChild.title).toBe("gate")
+          yield* dag.nodeCompleted(dagID, "gate", { verdict: "continue", findings: "direction confirmed" })
+          // The report_to_parent wake and the downstream spawn can land in
+          // either order; accept the downstream prompt whichever comes second.
+          const first = yield* takeWithin(childPrompts, "no prompt after continue verdict")
+          const downstreamChild = first.title === "downstream"
+            ? first
+            : yield* takeWithin(childPrompts, "downstream did not spawn after continue verdict")
+          expect(downstreamChild.title).toBe("downstream")
+          expect((yield* store.getWorkflow(dagID))?.status).toBe("running")
+          yield* Deferred.succeed(downstreamChild.release, "done")
+        }),
+      ),
+    )
+  })
+})
