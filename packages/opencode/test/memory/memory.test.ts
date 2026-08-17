@@ -1410,6 +1410,97 @@ describe("memory hidden model", () => {
       expect(seen[1].system).toBe("Propose updates as a JSON object.")
     }),
   )
+
+  it.live("keeps an actively streaming call alive regardless of total duration", () =>
+    Effect.gen(function* () {
+      // Thirty parts arriving every 8ms: ~240ms total, far past the 40ms
+      // idle window — every arrival re-arms the watchdog, so the call lives.
+      async function* streaming() {
+        for (let index = 0; index < 30; index++) {
+          await new Promise((resolve) => setTimeout(resolve, 8))
+          yield { type: index % 2 === 0 ? "reasoning" : "text-delta" }
+        }
+      }
+      yield* Effect.promise(() =>
+        MemoryModel.drainWithLiveness({
+          parts: streaming(),
+          connectTimeout: Duration.millis(40),
+          idleTimeout: Duration.millis(40),
+          onStall: () => {},
+          errorOf: () => undefined,
+        }),
+      )
+    }),
+  )
+
+  it.live("stalls a silent stream after the idle window and invokes the abort hook", () =>
+    Effect.gen(function* () {
+      let aborts = 0
+      async function* onePartThenSilence() {
+        yield { type: "reasoning" }
+        await new Promise(() => {})
+      }
+      const error = yield* Effect.tryPromise({
+        try: () =>
+          MemoryModel.drainWithLiveness({
+            parts: onePartThenSilence(),
+            connectTimeout: Duration.millis(250),
+            idleTimeout: Duration.millis(40),
+            onStall: () => {
+              aborts++
+            },
+            errorOf: () => undefined,
+          }),
+        catch: (cause) => cause,
+      }).pipe(Effect.flip)
+      expect(error instanceof MemoryModel.Stalled).toBe(true)
+      expect(aborts).toBe(1)
+    }),
+  )
+
+  it.live("fails on a dead connection that never delivers a first part", () =>
+    Effect.gen(function* () {
+      async function* nothing() {
+        await new Promise(() => {})
+      }
+      const started = Date.now()
+      const error = yield* Effect.tryPromise({
+        try: () =>
+          MemoryModel.drainWithLiveness({
+            parts: nothing(),
+            connectTimeout: Duration.millis(40),
+            idleTimeout: Duration.millis(250),
+            onStall: () => {},
+            errorOf: () => undefined,
+          }),
+        catch: (cause) => cause,
+      }).pipe(Effect.flip)
+      expect(error instanceof MemoryModel.Stalled).toBe(true)
+      expect(Date.now() - started).toBeLessThan(200)
+    }),
+  )
+
+  it.live("propagates a stream error part without treating it as a stall", () =>
+    Effect.gen(function* () {
+      const boom = new Error("provider stream error")
+      async function* erroring() {
+        yield { type: "text-delta" }
+        yield { type: "error", error: boom }
+      }
+      const error = yield* Effect.tryPromise({
+        try: () =>
+          MemoryModel.drainWithLiveness({
+            parts: erroring(),
+            connectTimeout: Duration.millis(250),
+            idleTimeout: Duration.millis(250),
+            onStall: () => {},
+            errorOf: (part: { type: string; error?: unknown }) => (part.type === "error" ? part.error : undefined),
+          }),
+        catch: (cause) => cause,
+      }).pipe(Effect.flip)
+      expect(error).toBe(boom)
+    }),
+  )
 })
 
 describe("memory maintenance budgets", () => {
