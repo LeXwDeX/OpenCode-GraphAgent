@@ -72,6 +72,27 @@ describe("legacy command registry", () => {
     }),
   )
 
+  it.instance("registers the canonical dag-init and dag-auto commands", () =>
+    Effect.gen(function* () {
+      const commands = yield* Command.Service
+
+      expect(yield* commands.get("dag-init")).toMatchObject({
+        name: "dag-init",
+        description: CommandPlugin.DagInitDescription,
+        source: "command",
+        template: CommandPlugin.DagInitContent,
+        hints: ["$ARGUMENTS"],
+      })
+      expect(yield* commands.get("dag-auto")).toMatchObject({
+        name: "dag-auto",
+        description: CommandPlugin.DagAutoDescription,
+        source: "command",
+        template: CommandPlugin.DagAutoContent,
+        hints: ["$ARGUMENTS"],
+      })
+    }),
+  )
+
   overridden.instance("allows configured dag-flow commands to override the built-in", () =>
     Effect.gen(function* () {
       const commands = yield* Command.Service
