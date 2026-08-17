@@ -9,8 +9,12 @@ import { DagProjector } from "@opencode-ai/core/dag/projector"
 import { WorkflowNodeTable, WorkflowTable } from "@opencode-ai/core/dag/sql"
 import { DagStore } from "@opencode-ai/core/dag/store"
 import { EventV2 } from "@opencode-ai/core/event"
+import { Project } from "@opencode-ai/core/project"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
+import { AbsolutePath } from "@opencode-ai/core/schema"
 import { SessionTable } from "@opencode-ai/core/session/sql"
+import { Model } from "@opencode-ai/schema/model"
+import { Provider } from "@opencode-ai/schema/provider"
 import { Agent } from "@/agent/agent"
 import { fingerprintBrief } from "@/dag/admission"
 import { Dag, type NodeConfig } from "@/dag/dag"
@@ -1028,7 +1032,11 @@ describe("DagLoop atomic wake integration", () => {
     )
   })
 
-  it("leaves the whole batch unreported when parent delivery fails", async () => {
+  // FLIPPED for issue #321: previously a failed parent turn left the whole
+  // batch unreported (for later redelivery). Admit success now IS the
+  // delivery — the mark lands at admit time, so a failed/interrupted turn
+  // still leaves the batch reported.
+  it("reports the wake batch at admit time even when the parent turn then fails (issue #321)", async () => {
     await Effect.runPromise(
       runWakeTest(({ dag, store, childPrompts, parentPrompts, parentSettled }) =>
         Effect.gen(function* () {
@@ -1044,14 +1052,20 @@ describe("DagLoop atomic wake integration", () => {
           yield* Deferred.succeed(parent.release, "failure")
           yield* takeWithin(parentSettled, "failed parent prompt did not settle")
 
-          expect(yield* store.getUnreportedWakeNodes("ses_parent")).toHaveLength(1)
-          expect(yield* store.getUnreportedWakeWorkflows("ses_parent")).toHaveLength(1)
+          // The synthetic part is durable in transcript either way; marking at
+          // admit time means a restart or mid-turn interruption has nothing to
+          // re-inject.
+          expect(yield* store.getUnreportedWakeNodes("ses_parent")).toHaveLength(0)
+          expect(yield* store.getUnreportedWakeWorkflows("ses_parent")).toHaveLength(0)
         }),
       ),
     )
   })
 
-  it("retries the parent prompt after a provider failure instead of silently marking the wake", async () => {
+  // FLIPPED for issue #321: previously a failed parent turn was retried — a
+  // fresh idle event re-injected the SAME wake. Admit success is now the
+  // delivery, so a later trigger must inject NO duplicate prompt.
+  it("does not redeliver a wake whose parent turn failed (issue #321)", async () => {
     await Effect.runPromise(
       runWakeTest(({ dag, store, status, childPrompts, parentPrompts, parentSettled }) =>
         Effect.gen(function* () {
@@ -1066,14 +1080,16 @@ describe("DagLoop atomic wake integration", () => {
           const first = yield* takeWithin(parentPrompts, "retryable batch did not wake the parent")
           yield* Deferred.succeed(first.release, "failure")
           yield* takeWithin(parentSettled, "failed parent prompt did not settle")
-          yield* status.set(SessionID.make("ses_parent"), { type: "idle" })
 
-          const second = yield* takeWithin(parentPrompts, "failed provider wake was not prompted again")
-          expect(promptText(second.input)).toContain('Node "retryable-node" completed: retry me')
-          yield* Deferred.succeed(second.release, "success")
-          yield* takeWithin(parentSettled, "successful retry did not settle")
+          // The batch is reported at admit time even though the turn failed.
           expect(yield* store.getUnreportedWakeNodes("ses_parent")).toHaveLength(0)
           expect(yield* store.getUnreportedWakeWorkflows("ses_parent")).toHaveLength(0)
+
+          // Re-trigger the delivery path: the idle gate must NOT inject a
+          // duplicate prompt (pre-fix this re-delivered the identical wake).
+          yield* status.set(SessionID.make("ses_parent"), { type: "idle" })
+          yield* Effect.sleep("500 millis")
+          expect(Option.isNone(yield* Queue.poll(parentPrompts))).toBe(true)
         }),
       ),
     )
@@ -1120,6 +1136,190 @@ describe("DagLoop atomic wake integration", () => {
             }),
           ).pipe(Effect.orDie),
       ),
+    )
+  })
+
+  // NEW for issue #321: simulates the production restart. A wake is admitted
+  // but its parent turn NEVER finishes (the process dies mid-turn). Pre-fix the
+  // mark only landed after the turn completed, so the restart sweep saw
+  // wake_reported=false and re-injected the byte-identical wake. Post-fix the
+  // mark lands at admit time, so a fresh loop's startup sweep delivers nothing.
+  it("does not redeliver an already-admitted wake across a restart (issue #321)", async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const childTitles = new Map<string, string>()
+        const created: string[] = []
+        const session = Layer.mock(Session.Service, {
+          get: () =>
+            Effect.succeed({
+              id: SessionID.make("ses_parent"),
+              slug: "parent",
+              projectID: Project.ID.make("project-1"),
+              directory: process.cwd(),
+              title: "Parent",
+              version: "test",
+              time: { created: 0, updated: 0 },
+              permission: [],
+              agent: "build",
+            }),
+          create: (value) =>
+            Effect.sync(() => {
+              const id = `ses_child_${created.length + 1}`
+              created.push(id)
+              childTitles.set(id, (value?.title ?? id).replace(" (DAG node)", ""))
+              return {
+                id: SessionID.make(id),
+                slug: "child",
+                projectID: Project.ID.make("project-1"),
+                directory: process.cwd(),
+                title: value?.title ?? id,
+                version: "test",
+                time: { created: 0, updated: 0 },
+              }
+            }),
+          messages: () => Effect.succeed([]),
+        })
+        const agent = Layer.mock(Agent.Service, {
+          get: () =>
+            Effect.succeed({
+              name: "build",
+              mode: "all",
+              permission: [],
+              options: {},
+              description: "",
+              prompt: "",
+              model: { providerID: Provider.ID.make("test"), modelID: Model.ID.make("test-model") },
+              tools: {},
+              hooks: {},
+            }),
+        })
+        const deliver = (queues: {
+          readonly childPrompts: Queue.Queue<PromptGate>
+          readonly parentPrompts: Queue.Queue<ParentPromptGate>
+          readonly parentSettled: Queue.Queue<void>
+        }) =>
+          Effect.fn("test.SessionPrompt.deliver")(function* (value: SessionPrompt.PromptInput) {
+            const sessionID = value.sessionID as string
+            if (sessionID === "ses_parent") {
+              const release = yield* Deferred.make<"success" | "failure">()
+              yield* Queue.offer(queues.parentPrompts, { input: value, release })
+              const outcome = yield* Deferred.await(release).pipe(
+                Effect.ensuring(Queue.offer(queues.parentSettled, undefined)),
+              )
+              if (outcome === "failure") return yield* Effect.die(new Error("provider unavailable"))
+              return reply(sessionID, "parent handled wake")
+            }
+            const release = yield* Deferred.make<string>()
+            yield* Queue.offer(queues.childPrompts, {
+              title: childTitles.get(sessionID) ?? sessionID,
+              input: value,
+              release,
+            })
+            return reply(sessionID, yield* Deferred.await(release))
+          })
+        const promptLayer = (queues: {
+          readonly childPrompts: Queue.Queue<PromptGate>
+          readonly parentPrompts: Queue.Queue<ParentPromptGate>
+          readonly parentSettled: Queue.Queue<void>
+        }) => Layer.mock(SessionPrompt.Service, withIdleAdmission({
+          cancel: () => Effect.void,
+          prompt: deliver(queues),
+          promptIfIdle: (value) => deliver(queues)(value).pipe(Effect.map(Option.some)),
+        }))
+
+        const database = Database.layerFromPath(":memory:")
+        const events = EventV2.layer.pipe(Layer.provide(database))
+        const bridge = EventV2Bridge.layer.pipe(Layer.provide(events))
+        const store = DagStore.layer.pipe(Layer.provide(database))
+        const status = SessionStatus.layer.pipe(Layer.provide(bridge))
+        const projector = DagProjector.layer.pipe(Layer.provide(events), Layer.provide(database))
+        const dag = Dag.layer.pipe(Layer.provide(bridge), Layer.provide(store))
+        const base = Layer.mergeAll(database, events, bridge, store, projector, dag, status)
+
+        yield* Effect.gen(function* () {
+          const storeSvc = yield* DagStore.Service
+          const databaseSvc = yield* Database.Service
+          yield* databaseSvc.db.insert(ProjectTable).values({
+            id: Project.ID.make("project-1"),
+            worktree: AbsolutePath.make(process.cwd()),
+            sandboxes: [],
+          }).run().pipe(Effect.orDie)
+          yield* databaseSvc.db.insert(SessionTable).values({
+            id: SessionID.make("ses_parent"),
+            project_id: Project.ID.make("project-1"),
+            slug: "parent",
+            directory: AbsolutePath.make(process.cwd()),
+            title: "Parent",
+            version: "test",
+          }).run().pipe(Effect.orDie)
+
+          // Phase 1: admit the wake, then "die" before the parent turn finishes.
+          const q1 = {
+            childPrompts: yield* Queue.unbounded<PromptGate>(),
+            parentPrompts: yield* Queue.unbounded<ParentPromptGate>(),
+            parentSettled: yield* Queue.unbounded<void>(),
+          }
+          yield* Effect.scoped(
+            Effect.gen(function* () {
+              const dagSvc = yield* Dag.Service
+              const loopSvc = yield* DagLoop.Service
+              yield* loopSvc.init()
+              yield* dagSvc.create({
+                projectID: "project-1",
+                sessionID: "ses_parent",
+                title: "Restart wake",
+                config: { name: "restart-wake", nodes: [node("restart-node")] },
+              })
+              const child = yield* takeWithin(q1.childPrompts, "restart node did not start")
+              yield* Deferred.succeed(child.release, "done")
+              // The wake was admitted (mark landed at admit). Do NOT release the
+              // parent turn — disposing the scope simulates a restart mid-turn.
+              yield* takeWithin(q1.parentPrompts, "terminal workflow did not wake the parent")
+            }).pipe(Effect.provide(DagLoop.layer.pipe(
+              Layer.provide(session),
+              Layer.provide(promptLayer(q1)),
+              Layer.provide(agent),
+            ))),
+          )
+
+          // The durable rows are already reported even though the turn never ran.
+          expect(yield* storeSvc.getUnreportedWakeNodes("ses_parent")).toHaveLength(0)
+          expect(yield* storeSvc.getUnreportedWakeWorkflows("ses_parent")).toHaveLength(0)
+          expect(yield* storeSvc.getSessionsWithUnreportedWakes()).toHaveLength(0)
+
+          // Phase 2: a fresh loop over the SAME store runs the startup sweep.
+          const q2 = {
+            childPrompts: yield* Queue.unbounded<PromptGate>(),
+            parentPrompts: yield* Queue.unbounded<ParentPromptGate>(),
+            parentSettled: yield* Queue.unbounded<void>(),
+          }
+          yield* Effect.scoped(
+            Effect.gen(function* () {
+              const loopSvc = yield* DagLoop.Service
+              yield* loopSvc.init()
+              // Bound the window in which a (now-forbidden) redelivery could appear.
+              yield* Effect.sleep("500 millis")
+              expect(Option.isNone(yield* Queue.poll(q2.parentPrompts))).toBe(true)
+            }).pipe(Effect.provide(DagLoop.layer.pipe(
+              Layer.provide(session),
+              Layer.provide(promptLayer(q2)),
+              Layer.provide(agent),
+            ))),
+          )
+        }).pipe(
+          Effect.provide(base),
+          Effect.provideService(InstanceRef, {
+            directory: process.cwd(),
+            worktree: process.cwd(),
+            project: {
+              id: Project.ID.make("project-1"),
+              worktree: process.cwd(),
+              time: { created: 0, updated: 0 },
+              sandboxes: [],
+            },
+          }),
+        )
+      }).pipe(Effect.scoped),
     )
   })
 
