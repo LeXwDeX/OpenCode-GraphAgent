@@ -449,4 +449,40 @@ describe("DagLoop replan verdict gate (issue #322)", () => {
       ),
     )
   })
+
+  it("pauses on a string-typed replan verdict (no output_schema bypass)", async () => {
+    await Effect.runPromise(
+      runGuardTest({ instanceProject: "project-1" }, ({ dag, store, childPrompts }) =>
+        Effect.gen(function* () {
+          const dagID = yield* dag.create({
+            projectID: "project-1",
+            sessionID: "ses_project-1",
+            title: "Gate string verdict",
+            config: {
+              name: "gate-string-verdict",
+              nodes: [
+                // report_to_parent without output_schema: the child's final
+                // text lands as a raw string output.
+                node({ id: "gate", name: "gate", required: true, report_to_parent: true }),
+                node({ id: "downstream", name: "downstream", required: false, depends_on: ["gate"] }),
+              ],
+            },
+          })
+          const gateChild = yield* takeWithin(childPrompts, "gate node did not start")
+          expect(gateChild.title).toBe("gate")
+          // String-typed verdict (audit SOFT-2): must still trip the gate,
+          // not slip past the Object-only decode.
+          yield* dag.nodeCompleted(dagID, "gate", JSON.stringify({ verdict: "replan", findings: "vetoed" }))
+          yield* pollWithTimeout(
+            Effect.gen(function* () {
+              const wf = yield* store.getWorkflow(dagID)
+              return wf?.status === "paused" ? (true as const) : undefined
+            }),
+            "workflow did not pause after the string-typed replan verdict",
+          )
+          expect((yield* store.getNode(dagID, "downstream"))?.status).toBe("pending")
+        }),
+      ),
+    )
+  })
 })
