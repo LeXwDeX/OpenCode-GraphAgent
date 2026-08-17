@@ -41,6 +41,7 @@ import { reconcileWorkflow, makeSessionStatusChecker } from "./recovery"
 // handler). Only the verdict shape matters — any node whose submitted output
 // matches triggers the gate, so non-reporting nodes can never trip it.
 const GateReplanVerdict = Schema.Struct({ verdict: Schema.Literal("replan") })
+const parseJsonOption = Schema.decodeUnknownOption(Schema.UnknownFromJsonString)
 
 export interface Interface {
   readonly init: () => Effect.Effect<void>
@@ -658,9 +659,17 @@ const serviceLayer = Layer.effect(
                     if (confirmed && entry.runtime.isActive(nodeID)) {
                       settle(entry, nodeID)
                       const nodeConfig = entry.config?.nodes.find((n) => n.id === nodeID)
+                      // A checkpoint output can arrive as a raw string (no
+                      // output_schema, or a string-typed child reply); parse it
+                      // before matching the verdict so a string-typed
+                      // {"verdict":"replan"} cannot bypass the gate (the spin
+                      // behind issue #322).
+                      const gateOutput = typeof node?.output === "string"
+                        ? Option.getOrUndefined(parseJsonOption(node.output))
+                        : node?.output
                       const gateReplan = def === DagEvent.NodeCompleted
                         && nodeConfig?.report_to_parent === true
-                        && Option.isSome(Schema.decodeUnknownOption(GateReplanVerdict)(node?.output))
+                        && Option.isSome(Schema.decodeUnknownOption(GateReplanVerdict)(gateOutput))
                       if (gateReplan) {
                         // Verdict gate (issue #322): a reporting checkpoint that
                         // submits verdict "replan" vetoes the direction. Pause
@@ -669,17 +678,22 @@ const serviceLayer = Layer.effect(
                         // the report_to_parent wake and control(replan) applies
                         // corrective nodes — a paused workflow resumes as part
                         // of replan (workflow tool) so corrections can run.
-                        const paused = yield* dag.pause(dagID).pipe(
-                          Effect.map(() => true),
-                          Effect.catch(() =>
-                            Effect.gen(function* () {
-                              const wf = yield* store.getWorkflow(dagID).pipe(Effect.orDie)
-                              if (wf?.status !== "paused")
-                                yield* Effect.logWarning("DagLoop pause on replan verdict failed", { dagID, nodeID })
-                              return wf?.status === "paused"
-                            }),
-                          ),
-                        )
+                        const paused = yield* Effect.gen(function* () {
+                          // Pause can fail transiently (e.g. the workflow lock is
+                          // held by a concurrent long replan); retry once before
+                          // falling back to the durable status, so the workflow
+                          // is never silently stranded.
+                          const attemptPause = dag.pause(dagID).pipe(
+                            Effect.map(() => true),
+                            Effect.catch(() => Effect.succeed(false)),
+                          )
+                          if (yield* attemptPause) return true
+                          if (yield* attemptPause) return true
+                          const wf = yield* store.getWorkflow(dagID).pipe(Effect.orDie)
+                          if (wf?.status !== "paused")
+                            yield* Effect.logWarning("DagLoop pause on replan verdict failed", { dagID, nodeID })
+                          return wf?.status === "paused"
+                        })
                         entry.runtime.setPaused(paused)
                         yield* Effect.logWarning("DagLoop paused workflow after gate verdict: replan", { dagID, nodeID })
                       }
