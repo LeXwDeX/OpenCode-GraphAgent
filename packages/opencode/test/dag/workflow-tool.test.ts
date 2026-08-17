@@ -1223,6 +1223,41 @@ describe("workflow tool execution", () => {
     }),
   )
 
+  runtime.effect("replanning a gate-paused workflow resumes it so corrective nodes can run", () =>
+    Effect.gen(function* () {
+      published.length = 0
+      const info = yield* WorkflowTool
+      const workflow = yield* info.init()
+      const spec_path = yield* writeWorkflowSpec("paused-replan", {
+        fragment: {
+          name: "paused-replan",
+          nodes: [
+            {
+              id: "corrective",
+              name: "Corrective",
+              worker_type: "general",
+              depends_on: [],
+              prompt_template: { inline: "work" },
+            },
+          ],
+        },
+      })
+      const result = yield* workflow.execute(
+        Schema.decodeUnknownSync(Parameters)({ params: {
+          action: "control",
+          workflow_id: "dag_paused",
+          operation: "replan",
+          spec_path,
+        }}),
+        toolContext(),
+      )
+
+      expect(result.title).toContain("Workflow replanned: +1")
+      expect(result.output).toContain("has been resumed")
+      expect(published.some((event) => event.type === DagEvent.WorkflowResumed.type)).toBe(true)
+    }),
+  )
+
   runtime.effect("rejects inline or missing spec sources before side effects", () =>
     Effect.gen(function* () {
       const info = yield* WorkflowTool
