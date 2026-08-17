@@ -313,6 +313,7 @@ function recallFixture() {
     topics: MemorySchema.Topic[]
     failQueries: Set<string>
     maintenance: number
+    budgets: number[]
     config: MemorySchema.Config
     projectInitialized: number
     matcher?: (query: string) => Effect.Effect<unknown>
@@ -322,6 +323,7 @@ function recallFixture() {
     topics: [topic()],
     failQueries: new Set<string>(),
     maintenance: 0,
+    budgets: [],
     config,
     projectInitialized: 1,
   }
@@ -349,6 +351,7 @@ function recallFixture() {
         Layer.mock(MemoryModel.Service, {
           generate: (input) =>
             Effect.gen(function* () {
+              state.budgets.push(input.maxOutputTokens)
               if (input.system === MemoryPrompts.MATCH_SYSTEM) {
                 const request: unknown = JSON.parse(input.prompt)
                 const query =
@@ -403,6 +406,7 @@ function recallFixture() {
       state.topics = [topic()]
       state.failQueries.clear()
       state.maintenance = 0
+      state.budgets.length = 0
       state.config = config
       state.projectInitialized = 1
       state.matcher = undefined
@@ -1374,6 +1378,79 @@ describe("memory hidden model", () => {
       expect(exit._tag).toBe("Failure")
       expect(interrupted).toBe(true)
     }),
+  )
+
+  it.live("guarantees the json token reaches the model and leaves json-aware prompts untouched", () =>
+    Effect.gen(function* () {
+      const seen: MemoryModel.Request[] = []
+      const service = MemoryModel.make({
+        execute: (request) =>
+          Effect.sync(() => {
+            seen.push(request)
+            return {}
+          }),
+      })
+
+      yield* service.generate({
+        model: ProviderTest.model(),
+        system: "Select relevant topics.",
+        prompt: "plain evidence without the token",
+        schema: MemorySchema.MatchResponse,
+        maxOutputTokens: 32,
+      })
+      yield* service.generate({
+        model: ProviderTest.model(),
+        system: "Propose updates as a JSON object.",
+        prompt: "evidence",
+        schema: MemorySchema.MaintenanceResponse,
+        maxOutputTokens: 32,
+      })
+
+      expect(seen[0].system).toContain("JSON")
+      expect(seen[1].system).toBe("Propose updates as a JSON object.")
+    }),
+  )
+})
+
+describe("memory maintenance budgets", () => {
+  const recall = recallFixture()
+
+  recall.it.instance(
+    "sizes match and maintenance output for reasoning-heavy models during checkpoint",
+    () =>
+      Effect.gen(function* () {
+        recall.reset()
+        const memory = yield* Memory.Service
+        const sessionID = SessionID.make("ses_memory_budget")
+        const userID = MessageID.ascending()
+        const messages: SessionV1.WithParts[] = [
+          user(userID, sessionID, "确认一条长期偏好：回复保持简洁"),
+          {
+            info: assistant(userID, sessionID, ProviderV2.ID.make("test"), ModelV2.ID.make("test-model"), "end_turn"),
+            parts: [],
+          },
+        ]
+
+        yield* memory.checkpoint({ sessionID, messages })
+        // Checkpoint select runs synchronously; the kicked maintenance job
+        // completes in the background (its inspect-match + maintain calls).
+        yield* pollWithTimeout(
+          Effect.sync(() => (recall.state.budgets.length === 3 ? (true as const) : undefined)),
+          "background maintenance never completed",
+        )
+        expect([...recall.state.budgets].sort((a, b) => a - b)).toEqual([2_048, 2_048, 16_384])
+        // A second checkpoint must run a second maintenance: the in-flight
+        // slot is released when the first job finishes, never wedged.
+        yield* pollWithTimeout(
+          Effect.gen(function* () {
+            if (recall.state.budgets.filter((budget) => budget === 16_384).length >= 2) return true as const
+            yield* memory.checkpoint({ sessionID, messages })
+            return undefined
+          }),
+          "second background maintenance never ran — in-flight slot wedged",
+        )
+      }),
+    { git: true },
   )
 })
 
