@@ -57,4 +57,11 @@
 - 结论：非干净轮。修复后进入 Round 5。
 
 ### Round 5
+- Spec 镜：**PASS，no findings**（干净轮 1/2 候补——但 Standards 非干净，计数重置）。
+- Standards 镜：**PASS**，2 条 INFO（GOAL-01 judge-less 路径后遗留的陈旧注释）：
+  - R5-INFO-1：D-4 evaluatedRevisions 头注释仍称「仅由成功 updateAfterJudge commit 写入」，未含 gate-hit drive-restored 写入点。→ 已改写（并自查发现同根第 3 处：freshMsgs 的 "Reload messages after judge LLM call" 一并改为两可措辞）。
+  - R5-INFO-2：branch-3 首行 "Session is no longer idle after the judge call" 对 gate-hit 路径失准。→ 已改写。
+- 结论：非干净轮。进入 Round 6。
+
+### Round 6
 - 未开始

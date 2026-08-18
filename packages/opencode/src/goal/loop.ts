@@ -229,11 +229,14 @@ const serviceLayer = Layer.effect(
     )
 
     // D-4 (GOAL-FP-01-04 follow-up): per-process record of which goal
-    // revision this process already evaluated. Written by afterIdle on every
-    // successful updateAfterJudge commit; consulted ONLY by the startup-scan
+    // revision this process already evaluated. Written by afterIdle at TWO
+    // sites: every successful updateAfterJudge commit, and the GOAL-01
+    // boundary-gate hit (where the drive is restored WITHOUT a commit — the
+    // map then marks the revision as drive-restored, so a duplicate scan
+    // trigger on the same revision skips). Consulted ONLY by the startup-scan
     // path (scanResume) — the idle path must keep re-evaluating the same
     // revision across new turn boundaries, so the gate never applies to it.
-    // Lifecycle mirrors the fibers map: overwritten by every commit, deleted
+    // Lifecycle mirrors the fibers map: overwritten by every write, deleted
     // at the same terminal points where afterIdle unregisters the goal
     // automation.
     const evaluatedRevisions = new Map<SessionID, number>()
@@ -481,7 +484,9 @@ const serviceLayer = Layer.effect(
 
       const currentStatus = yield* status.get(sessionID)
       if (currentStatus.type !== "idle") {
-        // Session is no longer idle after the judge call (5-30s latency).
+        // Session is no longer idle by the time dispatch resumes — it flipped
+        // during the judge call (5-30s latency), or between the gate and here
+        // on the GOAL-01 judge-less fall-through.
         // Previously this was a bare `return` that left the goal silently
         // "active" with no continuation. Pause with a visible reason so the
         // user knows the loop was interrupted by a status change.
@@ -495,8 +500,9 @@ const serviceLayer = Layer.effect(
         return
       }
 
-      // Reload messages after judge LLM call — the snapshot from before judge
-      // may be stale if user sent messages during the 5-30s judge latency.
+      // Reload messages before dispatch — the pre-judge snapshot may be stale
+      // (the user can send messages during the 5-30s judge latency, or during
+      // the GOAL-01 judge-less fall-through).
       // Same vanished-session tolerance as the pre-judge window: NotFoundError
       // becomes an empty window (shouldPreempt is defensively false for it),
       // never a typed failure escaping the fork.
