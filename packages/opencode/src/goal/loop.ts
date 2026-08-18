@@ -100,6 +100,13 @@ export function isStaleZombie(
   )
 }
 
+// GOAL-04: the startup scan's single retry window for sessions busy at scan
+// time. Short by design: a genuinely running turn ends with its own idle
+// event, which the (already armed) idle subscription drives — the retry only
+// covers the bootstrap→scan status race and gives the skip a visible,
+// bounded end instead of a silent drop.
+const SCAN_BUSY_RETRY_DELAY = "2 seconds"
+
 const serviceLayer = Layer.effect(
   Service,
   Effect.gen(function* () {
@@ -681,6 +688,9 @@ const serviceLayer = Layer.effect(
     //   will be driven by its own turn-end idle event. At startup the status
     //   map is empty (get defaults to idle), so this only filters sessions
     //   that genuinely flipped busy between bootstrap and the scan.
+    //   GOAL-04: the skip is never silent — deferred sessions are logged and
+    //   retried once after SCAN_BUSY_RETRY_DELAY, and a final busy state is
+    //   abandoned with an explicit warning.
     // - Crash window (query → trigger): terminal changes are absorbed by the
     //   active-status re-check; non-terminal changes (already evaluated in
     //   this process) by the D-4 record gate in triggerEvaluation/afterIdle.
@@ -688,12 +698,50 @@ const serviceLayer = Layer.effect(
     //   session never kills the rest of the scan; the whole scan is forked,
     //   so a failure can never kill init.
     const scanForActiveGoals = Effect.fnUntraced(function* (snapshot: ReadonlyArray<SessionID>) {
+      const deferred: SessionID[] = []
       for (const sessionID of snapshot) {
         const current = yield* status.get(sessionID)
-        if (current.type !== "idle") continue
+        if (current.type !== "idle") {
+          // GOAL-04: never skip silently. Pre-fix this was a bare `continue`
+          // — no log, no retry obligation — leaving the goal persistently
+          // active but dormant with nothing to diagnose. Record the session
+          // for the bounded retry below.
+          deferred.push(sessionID)
+          continue
+        }
         yield* triggerEvaluation(sessionID, true).pipe(
           Effect.catchCause((cause) =>
             Effect.logWarning("goal startup scan failed for session", {
+              sessionID,
+              cause: Cause.pretty(cause),
+            }),
+          ),
+        )
+      }
+      if (deferred.length === 0) return
+      yield* Effect.logInfo("goal startup scan deferred busy sessions", {
+        sessions: deferred.join(","),
+      })
+      // GOAL-04 retry obligation: one bounded re-check in this same scan
+      // fiber (already forked + supervised, so the sleep can never kill
+      // init). Sessions still busy after the window are left to their own
+      // turn-end idle event — the idle subscription is armed and drives them
+      // then; a session whose turn never emits idle is a runner defect
+      // outside the goal module, but the warning makes the abandonment
+      // visible instead of silent.
+      yield* Effect.sleep(SCAN_BUSY_RETRY_DELAY)
+      for (const sessionID of deferred) {
+        const current = yield* status.get(sessionID)
+        if (current.type !== "idle") {
+          yield* Effect.logWarning(
+            "goal startup scan gave up on busy session — its own idle event remains the driver",
+            { sessionID, status: current.type },
+          )
+          continue
+        }
+        yield* triggerEvaluation(sessionID, true).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("goal startup scan retry failed for session", {
               sessionID,
               cause: Cause.pretty(cause),
             }),

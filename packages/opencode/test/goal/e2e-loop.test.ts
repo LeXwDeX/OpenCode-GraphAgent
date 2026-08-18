@@ -1377,6 +1377,19 @@ describe("GoalLoop — startup scan resumes pre-boot active goals (GOAL-FP-01-04
       expect(a?.status).toBe("active")
       expect(Number(a?.turns_used)).toBe(0)
 
+      // GOAL-04: the busy skip must be VISIBLE — the scan logs the deferral
+      // with the session id (previously a bare `continue`: no log, no retry
+      // obligation, a silently dormant goal).
+      yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const logs = JSON.stringify(yield* logLines)
+          return logs.includes("goal startup scan deferred busy sessions") ? (true as const) : undefined
+        }),
+        "busy session skip was never logged (GOAL-04)",
+        "5 seconds",
+      )
+      expect(JSON.stringify(yield* logLines)).toContain(String(sidA))
+
       // When the busy session finishes, its own idle event drives the goal.
       yield* status.set(sidA, { type: "idle" })
       yield* pollWithTimeout(
