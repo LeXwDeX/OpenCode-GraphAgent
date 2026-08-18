@@ -3,7 +3,7 @@ export * as Memory from "./memory"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { ProjectV2 } from "@opencode-ai/core/project"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
-import { Context, Effect, Layer, Option, Ref, Schema, Scope, Semaphore } from "effect"
+import { Cause, Context, Deferred, Effect, Exit, Layer, Option, Ref, Schema, Scope, Semaphore } from "effect"
 import { stringify } from "yaml"
 import { Config } from "@/config/config"
 import { Provider } from "@/provider/provider"
@@ -93,7 +93,23 @@ export const layer: Layer.Layer<
     const state = yield* InstanceState.make(() => Effect.succeed({ sessions: new Map<SessionID, SessionCache>() }))
     const scope = yield* Scope.Scope
     const maintenanceInFlight = yield* Ref.make(new Set<ProjectV2.ID>())
-
+    // MEM-02: per-(session,turn,key) in-flight matcher registrations — the
+    // turn origin (messageID) in the key keeps coalescing turn-scoped, so a
+    // new turn's identical query re-runs instead of riding a previous turn's
+    // result that could never populate its cache. Replaces the old "hold the
+    // fence/lock across the model call so the second caller blocks and
+    // re-reads the cache" coalescing: the second identical query now awaits
+    // the first one's Deferred instead — same observable semantics (reused:
+    // true, no extra query slot) without a model call under the fence/lock.
+    // The runner brackets EVERYTHING after registration in an exit guard
+    // (onExit), so a failed or interrupted first call wakes its coalesced
+    // awaiter (degraded to "failed") instead of parking it forever.
+    // Process-local by design (the fence is the cross-process seam, and it
+    // now covers only the markMatched commit).
+    type MatchRun = { count: number; rendered: string[] }
+    const matchInFlight = yield* Ref.make(
+      new Map<string, Deferred.Deferred<Exit.Exit<MatchRun | undefined, unknown>>>(),
+    )
     const availableModels = Effect.fn("Memory.availableModels")(function* () {
       const providers = yield* provider.list()
       return new Set(
@@ -283,7 +299,12 @@ export const layer: Layer.Layer<
     // Serialize the identity-liveness recheck and the per-project lock around
     // the store write only; the model calls that produce the update run
     // outside the fence/lock so a long reasoning call cannot wedge or leak it.
-    const applyUpdate = (projectID: ProjectV2.ID, update: (topics: MemorySchema.Topic[]) => MemoryStore.Update<undefined>) =>
+    // The update callback's result is passed through, so a commit like
+    // markMatched can hand the caller the post-commit topics to render.
+    const applyUpdate = <A>(
+      projectID: ProjectV2.ID,
+      update: (topics: MemorySchema.Topic[]) => MemoryStore.Update<A>,
+    ) =>
       fence.withLiveIdentity(
         projectID,
         lock.withProject(projectID)(store.updateTopics(projectID, update)),
@@ -328,6 +349,9 @@ export const layer: Layer.Layer<
       return decoded.value.actions
     })
 
+    // MEM-01/02: the matcher model call runs OUTSIDE the fence/lock; only the
+    // markMatched commit acquires them (applyUpdate). The matched topics come
+    // back from the commit for rendering.
     const select = Effect.fn("Memory.select")(function* (input: {
       model: Provider.Model
       config: MemorySchema.Config
@@ -336,11 +360,20 @@ export const layer: Layer.Layer<
       projectID: Project.Info["id"]
     }) {
       const topicIDs = yield* match(input)
-      const matched = yield* store.updateTopics(input.projectID, (topics) => ({
-        applied: MemoryStore.markMatched(topics, topicIDs),
-        result: undefined,
-      }))
-      const byID = new Map(matched.topics.map((topic) => [topic.id, topic]))
+      const committed = yield* applyUpdate(input.projectID, (topics) => {
+        // Re-filter against the post-read topics: the matcher filtered on the
+        // snapshot it saw; a topic deleted since then must not resurrect.
+        const live = new Set(topics.map((topic) => topic.id))
+        return {
+          applied: MemoryStore.markMatched(topics, topicIDs.filter((id) => live.has(id))),
+          result: undefined,
+        }
+      })
+      // Identity retired between the model call and the commit: nothing was
+      // written; there is no matched set to render.
+      if (Option.isNone(committed)) return undefined
+      const matched = committed.value.topics
+      const byID = new Map(matched.map((topic) => [topic.id, topic]))
       const selected = topicIDs.flatMap((id) => {
         const topic = byID.get(id)
         return topic ? [topic] : []
@@ -470,32 +503,27 @@ export const layer: Layer.Layer<
         return
       }
 
-      // The fence and the project lock cover the topic read plus the bounded
-      // first-turn matcher (declared tradeoff, see CONTEXT.md). Due maintenance
-      // is kicked AFTER the fence releases, so a long reasoning call never
-      // holds it: this turn renders the pre-maintenance topics and the
-      // committed update surfaces on a later prepare.
-      const live = yield* fence.withLiveIdentity(
-        current.project.id,
-        lock.withProject(current.project.id)(
-          Effect.gen(function* () {
-            const topics = yield* store.readTopics(current.project.id)
-            const rendered = (yield* select({
-              model: current.model,
-              config: current.loaded.config,
-              topics,
-              text: user.text,
-              projectID: current.project.id,
-            })).rendered
-            const entry = data.sessions.get(input.sessionID)
-            if (entry?.turn.messageID !== user.info.id) return
-            entry.turn = { ...entry.turn, completedTurns: turns, rendered }
-          }),
-        ),
-      )
-      if (Option.isNone(live)) {
+      // MEM-01: the first-turn matcher runs OUTSIDE the fence/lock; only its
+      // markMatched commit acquires them (inside select → applyUpdate). An
+      // identity retired mid-call surfaces as select === undefined — fail
+      // closed by dropping the cached session state. Due maintenance is
+      // kicked AFTERwards, so a long reasoning call never holds the fence:
+      // this turn renders the pre-maintenance topics and the committed update
+      // surfaces on a later prepare.
+      const selected = yield* select({
+        model: current.model,
+        config: current.loaded.config,
+        topics: yield* store.readTopics(current.project.id),
+        text: user.text,
+        projectID: current.project.id,
+      })
+      if (!selected) {
         yield* clearSession(input.sessionID)
         return
+      }
+      const entry = data.sessions.get(input.sessionID)
+      if (entry?.turn.messageID === user.info.id) {
+        entry.turn = { ...entry.turn, completedTurns: turns, rendered: selected.rendered }
       }
       if (!due) return
       if (Option.isNone(yield* kickMaintenance(maintenance))) yield* clearSession(input.sessionID)
@@ -559,51 +587,123 @@ export const layer: Layer.Layer<
       }
       const origin = user.info.id
 
-      // Declared tradeoff (issue #324, see CONTEXT.md): unlike maintenance, the
-      // matcher model call runs INSIDE the fence/lock. That serialization is
-      // what coalesces concurrent identical queries — the second caller blocks,
-      // re-reads `queries` under the lock, and reuses the first result instead
-      // of spending another model call. The lock also covers markMatched.
-      const live = yield* fence.withLiveIdentity(
-        current.project.id,
+      // MEM-02 (issue #324 acceptance): the matcher model call runs OUTSIDE
+      // the fence/lock. Concurrent identical queries coalesce through the
+      // per-(session,turn,key) in-flight Deferred instead of lock-blocking:
+      // the second caller re-checks the cache under a SHORT project-lock
+      // critical section (stale/cache/limit check + registration), awaits
+      // the first caller's result, and reports reused without spending
+      // another model call or query slot. Only the markMatched commit
+      // (inside select → applyUpdate) acquires the fence.
+      const inFlightKey = `${input.sessionID}\0${origin}\0${key}`
+      const deferred = yield* Deferred.make<Exit.Exit<MatchRun | undefined, unknown>>()
+
+      const releaseIfOwner = Effect.fnUntraced(function* () {
+        yield* Ref.update(matchInFlight, (map) => {
+          if (map.get(inFlightKey) !== deferred) return map
+          const next = new Map(map)
+          next.delete(inFlightKey)
+          return next
+        })
+      })
+
+      const outcome = yield* lock.withProject(current.project.id)(
         Effect.gen(function* () {
-          return yield* lock.withProject(current.project.id)(
-            Effect.gen(function* () {
-              const activeTurn = data.sessions.get(input.sessionID)?.turn
-              if (activeTurn?.messageID !== origin) return { status: "stale" as const }
-              const repeated = activeTurn.queries.get(key)
-              if (repeated) {
-                activeTurn.rendered = repeated.rendered
-                return repeated.count > 0
-                  ? { status: "attached" as const, count: repeated.count, reused: true }
-                  : { status: "empty" as const, reused: true }
-              }
-              if (activeTurn.queryCount >= 2) return { status: "limit" as const }
-              activeTurn.queryCount++
-              const topics = yield* store.readTopics(current.project.id)
-              const selected = yield* select({
-                model: current.model,
-                config: current.loaded.config,
-                topics,
-                text: query,
-                projectID: current.project.id,
-              })
-              const latest = data.sessions.get(input.sessionID)?.turn
-              if (latest?.messageID !== origin) return { status: "stale" as const }
-              latest.queries.set(key, selected)
-              latest.rendered = selected.rendered
-              return selected.count > 0
-                ? { status: "attached" as const, count: selected.count, reused: false }
-                : { status: "empty" as const, reused: false }
-            }),
-          )
+          const activeTurn = data.sessions.get(input.sessionID)?.turn
+          if (activeTurn?.messageID !== origin) return { status: "stale" as const }
+          const repeated = activeTurn.queries.get(key)
+          if (repeated) {
+            activeTurn.rendered = repeated.rendered
+            return repeated.count > 0
+              ? { status: "attached" as const, count: repeated.count, reused: true }
+              : { status: "empty" as const, reused: true }
+          }
+          if (activeTurn.queryCount >= 2) return { status: "limit" as const }
+          const running = yield* Ref.modify(matchInFlight, (map) => {
+            const existing = map.get(inFlightKey)
+            if (existing) return [existing, map] as const
+            return [deferred, new Map(map).set(inFlightKey, deferred)] as const
+          })
+          if (running !== deferred) return { kind: "await-first" as const, first: running }
+          activeTurn.queryCount++
+          return { kind: "run" as const }
         }),
       )
-      if (Option.isNone(live)) {
-        yield* clearSession(input.sessionID)
-        return { status: "unavailable" as const }
+      if ("kind" in outcome) {
+        if (outcome.kind === "await-first") {
+          // The awaiter rides the runner's exit: the runner's exit bracket
+          // packs every outcome — success, failure, interrupt, retired —
+          // into the deferred payload, so the await always wakes. Failures
+          // surface as this caller's "failed" (returned directly here);
+          // the runner's interrupt cause is re-raised via failCause so the
+          // wrapper's log carries it — the awaiter itself still completes
+          // with "failed". Never a permanent park.
+          const first = yield* Deferred.await(outcome.first)
+          if (Exit.isFailure(first)) {
+            if (Cause.hasInterrupts(first.cause)) return yield* Effect.failCause(first.cause)
+            return { status: "failed" as const }
+          }
+          const selected = first.value
+          if (!selected) return { status: "unavailable" as const }
+          const latest = data.sessions.get(input.sessionID)?.turn
+          if (latest?.messageID !== origin) return { status: "stale" as const }
+          return selected.count > 0
+            ? { status: "attached" as const, count: selected.count, reused: true }
+            : { status: "empty" as const, reused: true }
+        }
+        // This caller owns the matcher run. EVERYTHING after registration —
+        // the topics read and the select pipeline (model call, fenced
+        // markMatched commit) — runs inside one exit bracket: onExit fires
+        // on success, failure, interrupt, and identity-retired alike,
+        // deregistering the map entry and packing the real exit into the
+        // deferred so a coalesced awaiter wakes instead of parking forever
+        // (kickMaintenance's slot discipline, applied from the moment the
+        // entry exists — an interrupt during the topics read would otherwise
+        // unwind before the bracket attaches and wedge the (turn,key)
+        // forever). The deferred itself never fails — the Exit payload is
+        // the whole message.
+        const runExit = yield* Effect.gen(function* () {
+          return yield* select({
+            model: current.model,
+            config: current.loaded.config,
+            topics: yield* store.readTopics(current.project.id),
+            text: query,
+            projectID: current.project.id,
+          })
+        }).pipe(
+          Effect.tap((selected) => {
+            // Publish the cache entry BEFORE the in-flight deregistration in
+            // onExit: a third identical caller entering between the two
+            // would otherwise miss both the cache and the in-flight entry
+            // and burn a second model call + query slot where the old
+            // lock-blocking design guaranteed reuse. Stale-origin runs skip
+            // the write; the stale check below still governs the response.
+            if (!selected) return Effect.void
+            const latest = data.sessions.get(input.sessionID)?.turn
+            if (latest?.messageID !== origin) return Effect.void
+            latest.queries.set(key, selected)
+            latest.rendered = selected.rendered
+            return Effect.void
+          }),
+          Effect.onExit((exit) => releaseIfOwner().pipe(Effect.andThen(Deferred.succeed(deferred, exit)))),
+          Effect.exit,
+        )
+        if (Exit.isFailure(runExit)) return yield* Effect.failCause(runExit.cause)
+        const selected = runExit.value
+        // Identity retired between model call and commit — fail closed. The
+        // deferred already carries the same (succeeded-undefined) exit, so a
+        // coalesced awaiter degrades to "unavailable" rather than hanging.
+        if (!selected) {
+          yield* clearSession(input.sessionID)
+          return { status: "unavailable" as const }
+        }
+        const latest = data.sessions.get(input.sessionID)?.turn
+        if (latest?.messageID !== origin) return { status: "stale" as const }
+        return selected.count > 0
+          ? { status: "attached" as const, count: selected.count, reused: false }
+          : { status: "empty" as const, reused: false }
       }
-      return live.value
+      return outcome
     })
 
     const search: Interface["search"] = Effect.fn("Memory.search")((input) =>
@@ -627,22 +727,18 @@ export const layer: Layer.Layer<
         return []
       }
       const user = latestRealUser(input.messages)
-      const live = yield* fence.withLiveIdentity(
-        current.project.id,
-        lock.withProject(current.project.id)(
-          Effect.gen(function* () {
-            const topics = yield* store.readTopics(current.project.id)
-            return (yield* select({
-              model: current.model,
-              config: current.loaded.config,
-              topics,
-              text: user?.text ?? "",
-              projectID: current.project.id,
-            })).rendered
-          }),
-        ),
-      )
-      if (Option.isNone(live)) {
+      // MEM-01: the render matcher runs OUTSIDE the fence/lock; its
+      // markMatched commit is fenced inside select → applyUpdate. An identity
+      // retired mid-call (select === undefined) fails closed to an empty
+      // render, same as the retired-fence outcome before.
+      const selected = yield* select({
+        model: current.model,
+        config: current.loaded.config,
+        topics: yield* store.readTopics(current.project.id),
+        text: user?.text ?? "",
+        projectID: current.project.id,
+      })
+      if (!selected) {
         yield* clearSession(input.sessionID)
         return []
       }
@@ -657,7 +753,7 @@ export const layer: Layer.Layer<
         projectID: current.project.id,
       })
       if (Option.isNone(kicked)) yield* clearSession(input.sessionID)
-      return live.value
+      return selected.rendered
     })
 
     const checkpoint: Interface["checkpoint"] = Effect.fn("Memory.checkpoint")((input) =>
