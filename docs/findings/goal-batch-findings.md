@@ -40,4 +40,12 @@
 - 结论：第 1 个干净轮。按收敛判据需连续两轮零 findings → 进入 Round 3。
 
 ### Round 3
+- Spec 镜：**PASS，no findings**。
+- Standards 镜：**PASS**（verdict），3 条 INFO（非阻塞），处置如下：
+  - R3-INFO-1（goal.ts pauseForUserCancel）：成功 no-op（ESC 落在已暂停/已清除目标上，如 auto-pause 提交与 mark 之间的窗口）被误报为 retry-exhaustion ERROR。→ **已修复**（commit 5dd5a3037）：以 `lastCause` 区分三态——成功 pause（清 mark+unregister）、真实耗尽（保留 mark+ERROR）、成功 no-op（静默清除陈旧 mark）；新增回归测试 `cancel on an already-paused goal is a silent no-op that retires a stale mark`。
+  - R3-INFO-2（loop.ts scan 级 catchCause）：GOAL-04 新增 2s 重试放大了 dispose 中断窗口，正常关停会被记成 "goal startup scan failed"。→ **已修复**（commit 5dd5a3037）：与同文件 triggerEvaluation 相同的 F1 纪律——`Cause.hasInterrupts` 静默，真实失败才告警。无独立红测试：dispose-期间中断无法在当前 harness 内确定性触发而不耦合 instance 内部；以同文件既有 F1 模式一致性为准。
+  - R3-INFO-3（分支含 3 个非 goal 文件）：审计文档/findings register/workflow 规格随 GOAL PR 落地是 workflow 规格的设计决定（audit-fix-loop.md §0：审计文档必须先于两个 run 进 dev），**非缺陷，按设计关闭**。
+- 结论：非干净轮（Round 2 的连续干净计数重置）。修复后进入 Round 4。
+
+### Round 4
 - 未开始
