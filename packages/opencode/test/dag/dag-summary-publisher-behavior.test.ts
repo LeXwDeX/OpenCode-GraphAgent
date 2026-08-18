@@ -1,7 +1,8 @@
 import { describe, expect } from "bun:test"
-import { DateTime, Deferred, Effect, Layer } from "effect"
+import { Cause, DateTime, Deferred, Effect, Layer } from "effect"
 import { DagStore, type WorkflowRow, type WorkflowSummary } from "@opencode-ai/core/dag/store"
 import { DagEvent } from "@opencode-ai/schema/dag-event"
+import { logLines } from "effect/testing/TestConsole"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { DagSummaryPublisher } from "@/dag/runtime/summary-publisher"
 import { GlobalBus } from "@/bus/global"
@@ -19,6 +20,9 @@ interface SummaryEmission {
 interface StoreControl {
   failures: number
   failuresAfterGate: number
+  /** DAG-04: fail the summary read with an interrupt cause (the shape a
+   * scoped disposal delivers mid-publish). */
+  interruptRead?: boolean
   readGate?: {
     started: Deferred.Deferred<void>
     release: Deferred.Deferred<void>
@@ -91,6 +95,11 @@ function runtime(state: StoreControl, bus: EventControl) {
     getWorkflowSummaries: (sessionID) =>
       Effect.gen(function* () {
         state.reads.set(sessionID, (state.reads.get(sessionID) ?? 0) + 1)
+        if (state.interruptRead) {
+          // The defined fiber id matters: Cause.interruptors() only collects
+          // defined ids (the F1 shape pinned by the goal e2e interrupt tests).
+          return yield* Effect.failCause(Cause.interrupt(0))
+        }
         if (state.failures > 0) {
           state.failures -= 1
           throw new Error("simulated summary read failure")
@@ -507,5 +516,32 @@ describe("DagSummaryPublisher behavior", () => {
         expect(collector.emissions[0].summaries[0].runningNodes).toBe(1)
       }),
     ).pipe(Effect.provide(runtime(state, bus)))
+  })
+})
+
+// DAG-04 (#316): the coalescer deliberately rethrows interrupt causes (a
+// scoped disposal mid-publish must unwind, not be mistaken for a failure).
+// The outer listener boundary must preserve that: pre-fix its catchCause
+// swallowed the interrupt and logged a spurious "failed to publish
+// summaries" on every normal shutdown. F1 discipline, same as spawn.ts.
+describe("DagSummaryPublisher interrupt discipline (DAG-04)", () => {
+  it.instance("an interrupt cause from the read path is rethrown, not reported as a publish failure", () => {
+    const state = control()
+    const bus = {} satisfies EventControl
+    state.interruptRead = true
+    state.sessions.set("dag-interrupt", "ses-interrupt")
+    state.summaries.set("ses-interrupt", [summary("dag-interrupt", 1)])
+
+    return Effect.gen(function* () {
+      yield* (yield* DagSummaryPublisher.Service).init()
+      yield* publishNodeEvents(bus, "dag-interrupt", 1)
+      // Wait for the coalesce window to run the (interrupted) read.
+      yield* pollWithTimeout(
+        Effect.sync(() => (state.reads.get("ses-interrupt") === 1 ? true : undefined)),
+        "interrupted summary read never ran",
+      )
+      yield* Effect.sleep("150 millis")
+      expect(JSON.stringify(yield* logLines)).not.toContain("failed to publish summaries")
+    }).pipe(Effect.provide(runtime(state, bus)))
   })
 })

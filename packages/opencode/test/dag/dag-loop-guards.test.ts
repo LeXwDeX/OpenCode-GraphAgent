@@ -84,6 +84,8 @@ function guardLayer(input: {
   readonly cancels: string[]
   /** Injected one-shot defects for DagStore.getWorkflow (P1 survival test). */
   readonly failGetWorkflow?: { remaining: number }
+  /** Injected Dag.pause failures (typed or defect) for the DAG-03 gate test. */
+  readonly failPause?: { remaining: number; defect?: boolean }
 }) {
   const database = Database.layerFromPath(":memory:")
   const events = EventV2.layer.pipe(Layer.provide(database))
@@ -113,10 +115,31 @@ function guardLayer(input: {
     Layer.provide(events),
     Layer.provide(database),
   )
-  const dag = Dag.layer.pipe(
+  const realDag = Dag.layer.pipe(
     Layer.provide(bridge),
     Layer.provide(store),
   )
+  const dag = input.failPause
+    ? Layer.effect(
+        Dag.Service,
+        Effect.gen(function* () {
+          const real = yield* Dag.Service
+          return Dag.Service.of({
+            ...real,
+            pause: (id) =>
+              Effect.suspend(() => {
+                if (input.failPause!.remaining > 0) {
+                  input.failPause!.remaining--
+                  return input.failPause!.defect
+                    ? Effect.die(new Error("injected pause defect"))
+                    : Effect.fail(new Error("injected pause failure"))
+                }
+                return real.pause(id)
+              }),
+          })
+        }),
+      ).pipe(Layer.provide(realDag))
+    : realDag
   const base = Layer.mergeAll(database, events, bridge, store, projector, dag, status)
   const childTitles = new Map<string, string>()
   const created: string[] = []
@@ -176,6 +199,7 @@ function runGuardTest<A>(
     /** Project the current instance belongs to. */
     readonly instanceProject: string
     readonly failGetWorkflow?: { remaining: number }
+    readonly failPause?: { remaining: number; defect?: boolean }
   },
   test: (services: {
     readonly dag: Dag.Interface
@@ -214,7 +238,7 @@ function runGuardTest<A>(
       yield* loop.init()
       return yield* test({ dag, loop, store, childPrompts, cancels })
     }).pipe(
-      Effect.provide(guardLayer({ childPrompts, cancels, failGetWorkflow: options.failGetWorkflow })),
+      Effect.provide(guardLayer({ childPrompts, cancels, failGetWorkflow: options.failGetWorkflow, failPause: options.failPause })),
       Effect.provideService(InstanceRef, {
         directory: process.cwd(),
         worktree: process.cwd(),
@@ -482,6 +506,290 @@ describe("DagLoop replan verdict gate (issue #322)", () => {
           )
           expect((yield* store.getNode(dagID, "downstream"))?.status).toBe("pending")
         }),
+      ),
+    )
+  })
+})
+
+// DAG-01 (runtime half): a schema-less reporting checkpoint completes with a
+// RAW STRING output. Pre-fix the condition evaluator resolved
+// `gate.output.<field>` on that string to undefined, so an equality gate was
+// permanently false: every gated dependent skipped (condition_false), the
+// orphan cascade terminalized the subtree, and checkCompletion marked the
+// workflow COMPLETED with skipReviewGate — half the graph never ran, with
+// no error anywhere. The fix normalizes string outputs through the same
+// parseJsonOption the replan-verdict gate already uses.
+describe("DagLoop equality gates on schema-less string outputs (DAG-01)", () => {
+  it("evaluates a .output.<field> condition against a JSON-string checkpoint output", async () => {
+    await Effect.runPromise(
+      runGuardTest({ instanceProject: "project-1" }, ({ dag, store, childPrompts }) =>
+        Effect.gen(function* () {
+          const dagID = yield* dag.create({
+            projectID: "project-1",
+            sessionID: "ses_project-1",
+            title: "String equality gate",
+            config: {
+              name: "string-equality-gate",
+              nodes: [
+                node({ id: "gate", name: "gate", required: true, report_to_parent: true }),
+                node({
+                  id: "downstream",
+                  name: "downstream",
+                  required: false,
+                  depends_on: ["gate"],
+                  condition: 'gate.output.verdict == "continue"',
+                }),
+              ],
+            },
+          })
+          const gateChild = yield* takeWithin(childPrompts, "gate node did not start")
+          expect(gateChild.title).toBe("gate")
+          yield* dag.nodeCompleted(dagID, "gate", JSON.stringify({ verdict: "continue", findings: "confirmed" }))
+          // The report_to_parent wake and the downstream spawn can land in
+          // either order; accept the downstream prompt whichever comes second.
+          const first = yield* takeWithin(childPrompts, "no prompt after continue verdict — gate evaluated false on the string output")
+          const downstreamChild = first.title === "downstream"
+            ? first
+            : yield* takeWithin(childPrompts, "downstream was silently skipped — string output never normalized (DAG-01)")
+          expect(downstreamChild.title).toBe("downstream")
+          expect((yield* store.getNode(dagID, "downstream"))?.status).not.toBe("skipped")
+          yield* Deferred.succeed(downstreamChild.release, "done")
+        }),
+      ),
+    )
+  })
+
+  it("keeps a non-JSON string output gate false without the subtree silently vanishing", async () => {
+    await Effect.runPromise(
+      runGuardTest({ instanceProject: "project-1" }, ({ dag, store, childPrompts }) =>
+        Effect.gen(function* () {
+          const dagID = yield* dag.create({
+            projectID: "project-1",
+            sessionID: "ses_project-1",
+            title: "Prose gate",
+            config: {
+              name: "prose-gate",
+              nodes: [
+                node({ id: "gate", name: "gate", required: true, report_to_parent: true }),
+                node({
+                  id: "downstream",
+                  name: "downstream",
+                  required: false,
+                  depends_on: ["gate"],
+                  condition: 'gate.output.verdict == "continue"',
+                }),
+              ],
+            },
+          })
+          const gateChild = yield* takeWithin(childPrompts, "gate node did not start")
+          expect(gateChild.title).toBe("gate")
+          // Prose (non-JSON) output: normalization falls back to the raw
+          // string, the field path resolves undefined, the equality gate is
+          // false — the documented skip, not a crash.
+          yield* dag.nodeCompleted(dagID, "gate", "All good, shipping it.")
+          yield* pollWithTimeout(
+            Effect.gen(function* () {
+              const downstream = yield* store.getNode(dagID, "downstream")
+              return downstream?.status === "skipped" ? (true as const) : undefined
+            }),
+            "prose-output gate did not settle to condition_false",
+          )
+        }),
+      ),
+    )
+  })
+})
+
+// DAG-02 (runtime half): the checkpoint gate must also police the MERGED
+// graph at replan/extend — a fragment may attach a new dependent to an
+// existing reporting checkpoint, which the fragment-scoped authoring check
+// cannot see. Pre-fix replanStructuralDiagnostics never ran
+// checkpointGateDiagnostics, so the engine spawned the dependent the moment
+// the checkpoint completed, before the parent could read the verdict.
+describe("Dag.replan merged-graph checkpoint gate (DAG-02)", () => {
+  it("rejects a replan fragment that attaches an ungated dependent to an existing reporting checkpoint", async () => {
+    await Effect.runPromise(
+      runGuardTest({ instanceProject: "project-1" }, ({ dag, store, childPrompts }) =>
+        Effect.gen(function* () {
+          const dagID = yield* dag.create({
+            projectID: "project-1",
+            sessionID: "ses_project-1",
+            title: "Merged gate",
+            config: {
+              name: "merged-gate",
+              nodes: [
+                node({ id: "gate", name: "gate", required: true, report_to_parent: true, output_schema: { type: "object" } }),
+                node({
+                  id: "downstream",
+                  name: "downstream",
+                  required: false,
+                  depends_on: ["gate"],
+                  condition: 'gate.output.verdict == "continue"',
+                }),
+              ],
+            },
+          })
+          const gateChild = yield* takeWithin(childPrompts, "gate node did not start")
+          expect(gateChild.title).toBe("gate")
+          // Fragment adds a dependent on the existing checkpoint WITHOUT a
+          // condition — the merged graph must reject it.
+          const attempt = yield* dag
+            .replan(dagID, { nodes: [node({ id: "late", name: "late", depends_on: ["gate"] })] })
+            .pipe(
+              Effect.match({
+                onFailure: (error) => ({ ok: false as const, message: String(error) }),
+                onSuccess: () => ({ ok: true as const, message: "" }),
+              }),
+            )
+          expect(attempt.ok).toBe(false)
+          expect(attempt.message.includes('"gate"') && attempt.message.includes('"late"')).toBe(true)
+          expect((yield* store.getNode(dagID, "late"))).toBeUndefined()
+          yield* Deferred.succeed(gateChild.release, "done")
+        }),
+      ),
+    )
+  })
+})
+
+// DAG-03: the replan-verdict gate must FAIL CLOSED. The checkpoint vetoed
+// the direction; if the durable pause cannot be persisted (both attempts
+// fail/defect and the row still reads non-paused), the in-memory scheduler
+// must still HOLD — pre-fix it returned `wf?.status === "paused"`
+// (fail-OPEN) and explicitly un-paused the runtime, so the very next
+// stimulus that calls spawnReady (here: a NodeFailed handler) spawned the
+// vetoed dependent. Defects from dag.pause must also fold into the retry
+// path: pre-fix `Effect.catch` only covered the error channel, a defect
+// escaped to guarded() and dropped the whole NodeCompleted handler (no
+// pause, no gate log).
+describe("DagLoop replan verdict gate fail-closed (DAG-03)", () => {
+  function vetoedGateGraph(title: string, name: string) {
+    return {
+      projectID: "project-1",
+      sessionID: "ses_project-1",
+      title,
+      config: {
+        name,
+        nodes: [
+          node({ id: "gate", name: "gate", required: true, report_to_parent: true, output_schema: { type: "object" } }),
+          node({ id: "downstream", name: "downstream", required: false, depends_on: ["gate"] }),
+          node({ id: "probe", name: "probe", required: false }),
+        ],
+      },
+    }
+  }
+
+  // Create the graph; gate and probe are both ready at boot, so take both
+  // prompts and index them by title (order is racy).
+  function takeBootPrompts(childPrompts: Queue.Queue<PromptGate>) {
+    return Effect.gen(function* () {
+      const first = yield* takeWithin(childPrompts, "first boot prompt did not arrive")
+      const second = yield* takeWithin(childPrompts, "second boot prompt did not arrive")
+      const byTitle = new Map([[first.title, first], [second.title, second]])
+      const gate = byTitle.get("gate")
+      const probe = byTitle.get("probe")
+      if (!gate || !probe) return yield* Effect.fail(new Error(`expected gate+probe, got ${first.title}/${second.title}`))
+      return { gate, probe }
+    })
+  }
+
+  it("holds the in-memory pause when the durable pause exhausts its retries", async () => {
+    await Effect.runPromise(
+      runGuardTest(
+        { instanceProject: "project-1", failPause: { remaining: 99 } },
+        ({ dag, store, childPrompts }) =>
+          Effect.gen(function* () {
+            const dagID = yield* dag.create(vetoedGateGraph("Fail-closed gate", "fail-closed-gate"))
+            const { gate } = yield* takeBootPrompts(childPrompts)
+            expect(gate.title).toBe("gate")
+            yield* dag.nodeCompleted(dagID, "gate", { verdict: "replan", findings: "vetoed" })
+            // The durable pause never landed
+            expect((yield* store.getWorkflow(dagID))?.status).toBe("running")
+            // Post-veto stimulus on an unrelated node.
+            yield* dag.nodeFailed(dagID, "probe", "probe exploded", "exec_failed")
+            yield* Effect.sleep("300 millis")
+            // Fail-closed: the vetoed dependent was NOT spawned by the
+            // post-veto stimulus.
+            expect((yield* store.getNode(dagID, "downstream"))?.status).toBe("pending")
+          }),
+      ),
+    )
+  })
+
+  it("holds the in-memory pause when the pause attempts defect", async () => {
+    await Effect.runPromise(
+      runGuardTest(
+        { instanceProject: "project-1", failPause: { remaining: 99, defect: true } },
+        ({ dag, store, childPrompts }) =>
+          Effect.gen(function* () {
+            const dagID = yield* dag.create(vetoedGateGraph("Defect gate", "defect-gate"))
+            const { gate } = yield* takeBootPrompts(childPrompts)
+            expect(gate.title).toBe("gate")
+            yield* dag.nodeCompleted(dagID, "gate", { verdict: "replan", findings: "vetoed" })
+            expect((yield* store.getWorkflow(dagID))?.status).toBe("running")
+            yield* dag.nodeFailed(dagID, "probe", "probe exploded", "exec_failed")
+            yield* Effect.sleep("300 millis")
+            expect((yield* store.getNode(dagID, "downstream"))?.status).toBe("pending")
+          }),
+      ),
+    )
+  })
+
+  // Review F2 (R1): the hold must SURVIVE the durable-row re-sync that the
+  // next node terminal event performs, and it must be RELEASED by an explicit
+  // parent control action (replan/resume/step) — otherwise the fail-closed
+  // hold was lifted by any subsequent NodeCompleted/NodeSkipped/stepped
+  // stimulus and spawnReady ran on the vetoed direction before the parent
+  // ever adjudicated the verdict.
+  it("the veto hold survives a terminal-event flag re-sync (DAG-03 / F2)", async () => {
+    await Effect.runPromise(
+      runGuardTest(
+        { instanceProject: "project-1", failPause: { remaining: 99 } },
+        ({ dag, store, childPrompts }) =>
+          Effect.gen(function* () {
+            const dagID = yield* dag.create(vetoedGateGraph("Resync hold", "resync-hold"))
+            const { gate } = yield* takeBootPrompts(childPrompts)
+            expect(gate.title).toBe("gate")
+            yield* dag.nodeCompleted(dagID, "gate", { verdict: "replan", findings: "vetoed" })
+            expect((yield* store.getWorkflow(dagID))?.status).toBe("running")
+            // Completing the unrelated probe lands in the NodeCompleted
+            // handler, whose prologue re-syncs paused from the DURABLE row
+            // ("running") and then calls spawnReady — the re-sync must not
+            // lift the veto hold.
+            yield* dag.nodeCompleted(dagID, "probe", "probe done")
+            yield* Effect.sleep("300 millis")
+            expect((yield* store.getNode(dagID, "downstream"))?.status).toBe("pending")
+          }),
+      ),
+    )
+  })
+
+  it("a parent replan releases the hold and the corrective path spawns (DAG-03 / F2)", async () => {
+    await Effect.runPromise(
+      runGuardTest(
+        { instanceProject: "project-1", failPause: { remaining: 99 } },
+        ({ dag, store, childPrompts }) =>
+          Effect.gen(function* () {
+            const dagID = yield* dag.create(vetoedGateGraph("Replan release", "replan-release"))
+            const { gate } = yield* takeBootPrompts(childPrompts)
+            expect(gate.title).toBe("gate")
+            yield* dag.nodeCompleted(dagID, "gate", { verdict: "replan", findings: "vetoed" })
+            expect((yield* store.getWorkflow(dagID))?.status).toBe("running")
+            // Parent disposition: replan adds a corrective node off the
+            // (terminal) checkpoint — exempt from the merged checkpoint gate.
+            yield* dag.replan(dagID, { nodes: [node({ id: "corrective", name: "corrective", depends_on: ["gate"] })] })
+            // The WorkflowReplanned handler releases the hold and re-syncs
+            // flags from the durable row, so the corrective node spawns. The
+            // wake prompt may interleave; drain until the corrective prompt.
+            const corrective = yield* Effect.gen(function* () {
+              for (let i = 0; i < 4; i++) {
+                const next = yield* takeWithin(childPrompts, `prompt ${i} after replan never arrived`)
+                if (next.title === "corrective") return next
+              }
+              return yield* Effect.fail(new Error("corrective node did not spawn after the releasing replan"))
+            })
+            expect(corrective.title).toBe("corrective")
+            yield* Deferred.succeed(corrective.release, "fixed")
+          }),
       ),
     )
   })

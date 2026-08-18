@@ -397,9 +397,11 @@ describe("DagLoop replan vs stale NodeFailed", () => {
           expect(gateB.title).toBe("b")
 
           // Restart b mid-flight, rewiring its dependency from a → c (new node).
+          // DAG-02: c is a fresh reporting checkpoint, so the rewired dependent
+          // must gate on its output (the merged checkpoint check at replan).
           const plan = yield* dag.replan(dagID, {
             nodes: [
-              { ...node("b", ["c"]), restart: true },
+              { ...node("b", ["c"]), restart: true, condition: 'c.output == "done"' },
               node("c"),
             ],
           })

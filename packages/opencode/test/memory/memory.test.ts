@@ -29,7 +29,7 @@ import { MCP } from "@/mcp"
 import { Skill } from "@/skill"
 import { SystemPrompt } from "@/session/system"
 import { tmpdirScoped } from "../fixture/fixture"
-import { pollWithTimeout, testEffect } from "../lib/effect"
+import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
 import { ProviderTest } from "../fake/provider"
 
 const config = {
@@ -317,6 +317,9 @@ function recallFixture() {
     config: MemorySchema.Config
     projectInitialized: number
     matcher?: (query: string) => Effect.Effect<unknown>
+    maintenanceHook?: () => Effect.Effect<unknown>
+    /** Parks the runner's pre-select topics read (interrupt-window probe). */
+    parkReads?: { started: Deferred.Deferred<void>; release: Deferred.Deferred<void> }
   } = {
     queries: [],
     reads: 0,
@@ -367,6 +370,7 @@ function recallFixture() {
                 return { topic_ids: query.includes("架构") ? [state.topics[0]?.id] : [] }
               }
               state.maintenance++
+              if (state.maintenanceHook) return yield* state.maintenanceHook()
               return { actions: [{ type: "no_change" }] }
             }),
         }),
@@ -374,8 +378,12 @@ function recallFixture() {
         MemoryLock.defaultLayer,
         Layer.mock(MemoryStore.Service, {
           readTopics: () =>
-            Effect.sync(() => {
+            Effect.gen(function* () {
               state.reads++
+              if (state.parkReads) {
+                yield* Deferred.succeed(state.parkReads.started, undefined)
+                yield* Deferred.await(state.parkReads.release)
+              }
               return state.topics
             }),
           updateTopics: (_projectID, update) =>
@@ -410,6 +418,8 @@ function recallFixture() {
       state.config = config
       state.projectInitialized = 1
       state.matcher = undefined
+      state.maintenanceHook = undefined
+      state.parkReads = undefined
     },
     it: testEffect(layer),
     systemIt: testEffect(systemLayer),
@@ -1268,9 +1278,66 @@ describe("memory turn-scoped retrieval", () => {
         ]
         yield* memory.prepare({ sessionID, messages })
 
-        expect(recall.state.maintenance).toBe(1)
+        // Maintenance runs in the background after the render fence (issue
+        // #324): polling stands in for the old synchronous completion.
+        yield* pollWithTimeout(
+          Effect.sync(() => (recall.state.maintenance === 1 ? true : undefined)),
+          "due maintenance never ran in the background",
+        )
         expect(recall.state.queries).not.toContain("再次讨论架构边界")
         expect(yield* memory.context(sessionID)).toEqual([])
+      }),
+    { git: true },
+  )
+
+  recall.it.instance(
+    "keeps the fence and project lock free while background maintenance streams",
+    () =>
+      Effect.gen(function* () {
+        recall.reset()
+        recall.state.config = { ...config, turn_interval: 1 }
+        const memory = yield* Memory.Service
+        const sessionID = SessionID.make("ses_memory_maintenance_lock_free")
+        const firstID = MessageID.ascending()
+        const first = user(firstID, sessionID, "继续之前确认的架构边界")
+
+        yield* memory.prepare({ sessionID, messages: [first] })
+        const messages = [
+          first,
+          {
+            info: assistant(firstID, sessionID, ProviderV2.ID.make("test"), ModelV2.ID.make("test-model"), "end_turn"),
+            parts: [],
+          },
+          user(MessageID.ascending(), sessionID, "第二次架构讨论"),
+        ]
+
+        const release = yield* Deferred.make<void>()
+        recall.state.maintenanceHook = () =>
+          Effect.gen(function* () {
+            yield* Deferred.await(release)
+            return { actions: [{ type: "no_change" }] }
+          })
+
+        const pending = yield* memory.prepare({ sessionID, messages }).pipe(Effect.forkChild)
+        yield* pollWithTimeout(
+          Effect.sync(() => (recall.state.maintenance >= 1 ? true : undefined)),
+          "due maintenance never reached the model call",
+        )
+
+        // The maintenance model call is in flight. Because prepare kicked it
+        // outside the fence (issue #324), a concurrent checkpoint — whose
+        // render select needs the same identity fence and project lock — is
+        // not starved; under the old inline shape it would wait on the fence
+        // until the streaming call finished.
+        const rendered = yield* awaitWithTimeout(
+          memory.checkpoint({ sessionID, messages }),
+          "checkpoint starved by background maintenance",
+        )
+        expect(rendered.length).toBeGreaterThan(0)
+
+        yield* Deferred.succeed(release, undefined)
+        yield* Fiber.join(pending)
+        expect(recall.state.maintenance).toBe(1)
       }),
     { git: true },
   )
@@ -1319,6 +1386,179 @@ describe("memory turn-scoped retrieval", () => {
         expect(yield* Fiber.join(pending)).toEqual({ status: "stale" })
         yield* Fiber.join(advanced)
         expect(yield* memory.context(sessionID)).toEqual([])
+      }),
+    { git: true },
+  )
+
+  // MEM-02 follow-up (acceptance): the cross-process identity fence must not
+  // be held across the SEARCH matcher model call — only the markMatched
+  // commit is fenced. While the matcher is parked mid-call, a concurrent
+  // checkpoint (whose render select needs the same identity fence) must not
+  // starve. Under the old shape the fence wrapped the whole lock block, so
+  // the checkpoint waited on the streaming matcher.
+  recall.it.instance(
+    "keeps the identity fence free while the search matcher streams",
+    () =>
+      Effect.gen(function* () {
+        recall.reset()
+        const started = yield* Deferred.make<void>()
+        const release = yield* Deferred.make<void>()
+        // Only the SLOW search query parks; the checkpoint's own render match
+        // must sail through — that is the assertion.
+        recall.state.matcher = (query) =>
+          query === "慢架构查询"
+            ? Effect.gen(function* () {
+                yield* Deferred.succeed(started, undefined)
+                yield* Deferred.await(release)
+                return { topic_ids: [recall.state.topics[0]?.id ?? ""] }
+              })
+            : Effect.succeed({ topic_ids: [recall.state.topics[0]?.id ?? ""] })
+        const memory = yield* Memory.Service
+        const sessionID = SessionID.make("ses_memory_search_fence_free")
+        const messages = [
+          user(MessageID.ascending(), sessionID, "先处理当前问题"),
+          user(MessageID.ascending(), sessionID, "召回相关历史"),
+        ]
+
+        const pending = yield* memory.search({ sessionID, messages, query: "慢架构查询" }).pipe(Effect.forkChild)
+        yield* Deferred.await(started)
+
+        const rendered = yield* awaitWithTimeout(
+          memory.checkpoint({ sessionID, messages }),
+          "checkpoint starved by the search matcher — fence held across the model call (MEM-02)",
+        )
+        expect(rendered.length).toBeGreaterThan(0)
+
+        yield* Deferred.succeed(release, undefined)
+        expect(yield* Fiber.join(pending)).toEqual({ status: "attached", count: 1, reused: false })
+      }),
+    { git: true },
+  )
+
+  // MEM-01 follow-up (acceptance): same discipline for the prepare
+  // first-turn (shouldMatch) branch — the bounded matcher moved out of the
+  // fence/lock, so a parked first-turn matcher cannot starve the fence.
+  recall.it.instance(
+    "keeps the identity fence free while the first-turn prepare matcher streams",
+    () =>
+      Effect.gen(function* () {
+        recall.reset()
+        const started = yield* Deferred.make<void>()
+        const release = yield* Deferred.make<void>()
+        // Only the FIRST matcher call (the first-turn prepare) parks; the
+        // concurrent checkpoint's render match — same text, so query-based
+        // discrimination is impossible — must sail through on its own call.
+        let matcherCalls = 0
+        recall.state.matcher = () =>
+          Effect.gen(function* () {
+            matcherCalls++
+            if (matcherCalls > 1) return { topic_ids: [recall.state.topics[0]?.id ?? ""] }
+            yield* Deferred.succeed(started, undefined)
+            yield* Deferred.await(release)
+            return { topic_ids: [recall.state.topics[0]?.id ?? ""] }
+          })
+        const memory = yield* Memory.Service
+        const sessionID = SessionID.make("ses_memory_prepare_fence_free")
+        const messages = [user(MessageID.ascending(), sessionID, "首次真实用户输入关于架构")]
+
+        const pending = yield* memory.prepare({ sessionID, messages }).pipe(Effect.forkChild)
+        yield* Deferred.await(started)
+
+        const rendered = yield* awaitWithTimeout(
+          memory.checkpoint({ sessionID, messages }),
+          "checkpoint starved by the first-turn prepare matcher — fence held across the model call (MEM-01)",
+        )
+        expect(rendered.length).toBeGreaterThan(0)
+
+        yield* Deferred.succeed(release, undefined)
+        yield* Fiber.join(pending)
+        // Both the first-turn prepare and the concurrent checkpoint render
+        // matched the same text; each recorded exactly its own call.
+        expect(recall.state.queries).toEqual(["首次真实用户输入关于架构", "首次真实用户输入关于架构"])
+      }),
+    { git: true },
+  )
+
+  // Review R-1: the runner must complete the in-flight deferred on EVERY
+  // exit. A failed first matcher call must not wedge the (session,key): a
+  // coalesced awaiter wakes (degraded) and a later identical query re-runs
+  // the matcher instead of parking on a leaked in-flight entry.
+  recall.it.instance(
+    "a failed first query never wedges the session key or its coalesced awaiter",
+    () =>
+      Effect.gen(function* () {
+        recall.reset()
+        const started = yield* Deferred.make<void>()
+        let matcherCalls = 0
+        recall.state.matcher = () =>
+          Effect.gen(function* () {
+            matcherCalls++
+            if (matcherCalls === 1) {
+              yield* Deferred.succeed(started, undefined)
+              throw new Error("matcher exploded")
+            }
+            return { topic_ids: [recall.state.topics[0]?.id ?? ""] }
+          })
+        const memory = yield* Memory.Service
+        const sessionID = SessionID.make("ses_memory_failed_first")
+        const messages = [
+          user(MessageID.ascending(), sessionID, "先处理当前问题"),
+          user(MessageID.ascending(), sessionID, "召回相关历史"),
+        ]
+
+        const failing = yield* memory.search({ sessionID, messages, query: "易碎查询" }).pipe(Effect.forkChild)
+        yield* Deferred.await(started)
+        // Concurrent identical query — either it coalesced onto the failing
+        // run (wakes degraded to "failed") or it raced past the in-flight
+        // window and re-runs (attached). Both are non-hang outcomes; a
+        // parked-forever awaiter or a wedged key fails the bounded waits.
+        const coalesced = yield* memory.search({ sessionID, messages, query: "易碎查询" }).pipe(Effect.forkChild)
+        const failingResult = yield* awaitWithTimeout(Fiber.join(failing), "failing query hung")
+        const coalescedResult = yield* awaitWithTimeout(Fiber.join(coalesced), "coalesced awaiter hung on the failing run")
+        expect(failingResult).toEqual({ status: "failed" })
+        expect(["failed", "attached", "empty"]).toContain(coalescedResult.status)
+        // The (session,key) is NOT wedged: the next identical query resolves
+        // within the bounded window (fresh run or cached reuse from the
+        // coalesced fiber's successful re-run — either proves liveness).
+        expect(yield* awaitWithTimeout(memory.search({ sessionID, messages, query: "易碎查询" }), "later identical query wedged on the leaked in-flight entry")).toMatchObject({
+          status: "attached",
+        })
+      }),
+    { git: true },
+  )
+
+  // Review R2 issue 1: the exit bracket must start at REGISTRATION, not at
+  // the select pipeline — an interrupt during the runner's pre-select topics
+  // read (a real async fs suspension in production) previously unwound
+  // before onExit attached, leaking the in-flight entry and wedging the
+  // (turn,key) forever.
+  recall.it.instance(
+    "an interrupted topics read releases the in-flight entry and never wedges the key",
+    () =>
+      Effect.gen(function* () {
+        recall.reset()
+        const memory = yield* Memory.Service
+        const sessionID = SessionID.make("ses_memory_interrupted_read")
+        const messages = [
+          user(MessageID.ascending(), sessionID, "先处理当前问题"),
+          user(MessageID.ascending(), sessionID, "召回相关历史"),
+        ]
+        const started = yield* Deferred.make<void>()
+        const release = yield* Deferred.make<void>()
+        recall.state.parkReads = { started, release }
+
+        const runner = yield* memory.search({ sessionID, messages, query: "可中断查询" }).pipe(Effect.forkChild)
+        yield* Deferred.await(started)
+        yield* Fiber.interrupt(runner).pipe(Effect.ignore)
+
+        // The entry must be released despite the interrupt landing before
+        // the select pipeline attached its bracket: a later identical query
+        // resolves within the bounded window instead of parking forever
+        // (empty: the query text matches no topic — liveness is the point).
+        yield* Deferred.succeed(release, undefined)
+        expect(yield* awaitWithTimeout(memory.search({ sessionID, messages, query: "可中断查询" }), "later identical query wedged on the entry leaked by the interrupted read")).toMatchObject({
+          status: "empty",
+        })
       }),
     { git: true },
   )
