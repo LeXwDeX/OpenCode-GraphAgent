@@ -273,21 +273,28 @@ const serviceLayer = Layer.effect(
           Effect.ignore,
         )
         turnDriven.delete(sessionID)
-      } else {
-        // GOAL-02: the pause could not be persisted — the durable row is
-        // still "active" and the lease registration is still in place, so the
-        // process-local mark must AGREE with both: keep it. Pre-fix it was
-        // deleted unconditionally, which disagreed with the durable
-        // authorities (goal still owns the session as active) and lost the
-        // ESC provenance on the resurrected turn — the user's second ESC
-        // would no longer route through this goal-pause fast path, because
-        // SessionPrompt.cancel maps ESC to a goal pause only for marked
-        // turns. With the mark retained, every repeat ESC retries the pause
-        // until the store recovers.
+      } else if (lastCause) {
+        // GOAL-02: genuine retry exhaustion — the pause could not be
+        // persisted, the durable row is still "active" and the lease
+        // registration is still in place, so the process-local mark must
+        // AGREE with both: keep it. Pre-fix it was deleted unconditionally,
+        // which disagreed with the durable authorities (goal still owns the
+        // session as active) and lost the ESC provenance on the resurrected
+        // turn — the user's second ESC would no longer route through this
+        // goal-pause fast path, because SessionPrompt.cancel maps ESC to a
+        // goal pause only for marked turns. With the mark retained, every
+        // repeat ESC retries the pause until the store recovers.
         yield* Effect.logError(
           "goal pause on cancel failed after retries — goal stays active and turn-driven; a repeat ESC retries the pause",
-          { sessionID, cause: lastCause ? Cause.pretty(lastCause) : "unknown" },
+          { sessionID, cause: Cause.pretty(lastCause) },
         )
+      } else {
+        // Successful NO-OP: pauseAndPublish found no active goal (row absent
+        // or already paused/cleared — e.g. an auto-pause committed between
+        // the mark and this ESC). No durable authority claims the goal as
+        // active, so there is nothing to retain the mark for and no failure
+        // to report — retire the stale mark silently.
+        turnDriven.delete(sessionID)
       }
       return paused
     })

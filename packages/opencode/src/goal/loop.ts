@@ -215,7 +215,12 @@ const serviceLayer = Layer.effect(
         // init.
         yield* scanForActiveGoals(snapshot).pipe(
           Effect.catchCause((cause) =>
-            Effect.logWarning("goal startup scan failed", { cause: Cause.pretty(cause) }),
+            // GOAL-04: instance disposal interrupts this forked scan fiber —
+            // the bounded retry sleep widened that window. Same F1 discipline
+            // as triggerEvaluation: interrupts stay silent, real failures log.
+            Cause.hasInterrupts(cause)
+              ? Effect.void
+              : Effect.logWarning("goal startup scan failed", { cause: Cause.pretty(cause) }),
           ),
           Effect.forkScoped,
         )

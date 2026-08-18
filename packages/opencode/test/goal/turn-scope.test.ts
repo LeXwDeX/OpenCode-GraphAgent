@@ -146,6 +146,27 @@ describe("Goal turn-scope — pauseForUserCancel (ESC semantics)", () => {
     }),
   )
 
+  // Review R3-INFO-1: a successful NO-OP (goal already paused/cleared when ESC
+  // lands) must not be reported as a retry-exhaustion failure — no durable
+  // authority claims the goal as active, so the stale mark is retired
+  // silently.
+  it.live("cancel on an already-paused goal is a silent no-op that retires a stale mark", () =>
+    Effect.gen(function* () {
+      const goal = yield* Goal.Service
+      const sid = SessionID.descending()
+      yield* goal.set(sid, "test goal", 5)
+      yield* goal.markTurnDriven(sid)
+      yield* goal.pause(sid, "auto-paused")
+
+      const paused = yield* goal.pauseForUserCancel(sid, "用户中断（ESC）")
+      expect(paused).toBeUndefined()
+      expect(yield* goal.isTurnDriven(sid)).toBe(false)
+      const state = yield* goal.load(sid)
+      expect(state?.status).toBe("paused")
+      expect(state?.paused_reason).toBe("auto-paused")
+    }),
+  )
+
   it.live("terminal transitions clear the mark (markDone)", () =>
     Effect.gen(function* () {
       const goal = yield* Goal.Service
