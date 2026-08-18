@@ -91,7 +91,9 @@ export interface Interface {
     /** issue #285: the assistant message ID judged for this evaluation.
      * Persisted on continue commits as the DURABLE crash-recovery gate — the
      * boot scan skips a window still ending on this boundary (the
-     * process-local evaluatedRevisions map cannot survive a crash). */
+     * process-local evaluatedRevisions map cannot survive a crash).
+     * GOAL-03: never persisted when `parseFailed` — a judge that produced no
+     * verdict judged no boundary. */
     judged?: string,
   ) => Effect.Effect<
     | {
@@ -161,6 +163,13 @@ export interface Interface {
      * seam so SessionPrompt.cancel stays free of lease plumbing. No-op (returns
      * undefined) when the goal is not active. Never fails: pause failures are
      * logged and swallowed so a cancel path can always proceed.
+     *
+     * GOAL-02: when the pause exhausts its retries, durable row and lease
+     * both still say "active" — the turn mark is RETAINED so the three
+     * authorities agree and a repeat ESC retries the pause. The mark is
+     * cleared on a successfully persisted pause; a successful NO-OP (goal
+     * already paused/cleared when ESC lands) silently retires the stale mark
+     * — no durable authority claims the goal as active.
      */
     readonly pauseForUserCancel: (sessionID: SessionID, reason: string) => Effect.Effect<GoalState.Info | undefined>
     /** True when the session's current turn is goal-driven. */
@@ -203,9 +212,13 @@ const serviceLayer = Layer.effect(
     // GOAL-TURN-SCOPE: process-local provenance of the CURRENT goal-driven
     // turn. Keyed by session; set at every goal dispatch (kick in prompt.ts,
     // continuation in loop.ts), cleared at turn end (afterIdle entry) and at
-    // every terminal transition (pause/clear/markDone) plus ESC-cancel. A stale
-    // mark is harmless: goalTurnMaxSteps re-validates against the durable goal
-    // row before reporting a ceiling.
+    // every terminal transition (pause/clear/markDone). On ESC-cancel the
+    // clear happens when the pause persisted OR the cancel is a successful
+    // no-op (goal already inactive — nothing claims it as active); only if
+    // the pause exhausts its retries is the mark RETAINED so it agrees with
+    // the still-active durable row and lease (GOAL-02). A stale mark is
+    // harmless: goalTurnMaxSteps re-validates against the durable goal row
+    // before reporting a ceiling.
     const turnDriven = new Set<SessionID>()
 
     const markTurnDriven = Effect.fnUntraced(function* (sessionID: SessionID) {
@@ -243,6 +256,9 @@ const serviceLayer = Layer.effect(
     // (shouldPreempt cannot catch it: ESC adds no user message). Retry the
     // pause twice with a short backoff; if it still fails, log LOUDLY — the
     // goal may resurrect, but it will never do so invisibly.
+    // GOAL-02: an exhausted failure path keeps durable row, lease, and the
+    // turn mark consistent (all still "active/owned/driven") — see the
+    // failure branch below.
     const pauseForUserCancel = Effect.fnUntraced(function* (sessionID: SessionID, reason: string) {
       let paused: GoalState.Info | undefined
       let lastCause: Cause.Cause<never> | undefined
@@ -250,6 +266,11 @@ const serviceLayer = Layer.effect(
         const exit = yield* pauseAndPublish(sessionID, reason).pipe(Effect.exit)
         if (Exit.isSuccess(exit)) {
           paused = exit.value
+          // Classify by the FINAL attempt: an early transient failure followed
+          // by a successful outcome (e.g. a concurrent pauser lands between
+          // retries) is a success/no-op, not retry exhaustion — drop the
+          // stale cause so the branches below read the real outcome.
+          lastCause = undefined
           break
         }
         lastCause = exit.cause
@@ -259,13 +280,30 @@ const serviceLayer = Layer.effect(
         yield* automation.unregister(sessionID, { kind: "goal", id: paused.goal_id ?? "legacy" }).pipe(
           Effect.ignore,
         )
-      } else {
+        turnDriven.delete(sessionID)
+      } else if (lastCause) {
+        // GOAL-02: genuine retry exhaustion — the pause could not be
+        // persisted, the durable row is still "active" and the lease
+        // registration is still in place, so the process-local mark must
+        // AGREE with both: keep it. Pre-fix it was deleted unconditionally,
+        // which disagreed with the durable authorities (goal still owns the
+        // session as active) and lost the ESC provenance on the resurrected
+        // turn — the user's second ESC would no longer route through this
+        // goal-pause fast path, because SessionPrompt.cancel maps ESC to a
+        // goal pause only for marked turns. With the mark retained, every
+        // repeat ESC retries the pause until the store recovers.
         yield* Effect.logError(
-          "goal pause on cancel failed after retries — goal may resurrect on next idle",
-          { sessionID, cause: lastCause ? Cause.pretty(lastCause) : "unknown" },
+          "goal pause on cancel failed after retries — goal stays active and turn-driven; a repeat ESC retries the pause",
+          { sessionID, cause: Cause.pretty(lastCause) },
         )
+      } else {
+        // Successful NO-OP: pauseAndPublish found no active goal (row absent
+        // or already paused/cleared — e.g. an auto-pause committed between
+        // the mark and this ESC). No durable authority claims the goal as
+        // active, so there is nothing to retain the mark for and no failure
+        // to report — retire the stale mark silently.
+        turnDriven.delete(sessionID)
       }
-      turnDriven.delete(sessionID)
       return paused
     })
 
@@ -730,7 +768,17 @@ const serviceLayer = Layer.effect(
           }
         }
 
-        const turnsUsed = GoalState.nni(state.turns_used + 1)
+        // GOAL-03: a judge that never produced a verdict (transport error or
+        // unparseable output) evaluated no turn — budget-neutral: it must not
+        // consume one of the user's max_turns, and it must not stamp
+        // last_judged_msg (the boundary was never judged; a crash after this
+        // commit must re-judge the same boundary, and that re-judgment — not
+        // this failed attempt — may consume the budget slot). Pre-fix a flaky
+        // judge burned budget on unevaluated turns while intermittent
+        // successes kept the parse-failure counter resetting. The counter
+        // itself still climbs here, so MAX_CONSECUTIVE_PARSE_FAILURES
+        // auto-pause is unaffected.
+        const turnsUsed = parseFailed ? state.turns_used : GoalState.nni(state.turns_used + 1)
         const pauseReason =
           newParseFailures >= GoalPrompts.MAX_CONSECUTIVE_PARSE_FAILURES
             ? "judge 模型未返回有效 JSON 判定。请检查模型配置或换用更可靠的模型，然后 /goal resume。"
@@ -746,7 +794,9 @@ const serviceLayer = Layer.effect(
           paused_reason: pauseReason,
           consecutive_parse_failures: GoalState.nni(newParseFailures),
           // issue #285: record the judged boundary for the durable scan gate.
-          ...(judged !== undefined ? { last_judged_msg: judged } : {}),
+          // GOAL-03: only a judge that actually returned a verdict judged the
+          // boundary (see turnsUsed above).
+          ...(judged !== undefined && !parseFailed ? { last_judged_msg: judged } : {}),
         })
         return {
           tag: "save",

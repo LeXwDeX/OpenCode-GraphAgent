@@ -100,6 +100,13 @@ export function isStaleZombie(
   )
 }
 
+// GOAL-04: the startup scan's single retry window for sessions busy at scan
+// time. Short by design: a genuinely running turn ends with its own idle
+// event, which the (already armed) idle subscription drives — the retry only
+// covers the bootstrap→scan status race and gives the skip a visible,
+// bounded end instead of a silent drop.
+const SCAN_BUSY_RETRY_DELAY = "2 seconds"
+
 const serviceLayer = Layer.effect(
   Service,
   Effect.gen(function* () {
@@ -208,7 +215,12 @@ const serviceLayer = Layer.effect(
         // init.
         yield* scanForActiveGoals(snapshot).pipe(
           Effect.catchCause((cause) =>
-            Effect.logWarning("goal startup scan failed", { cause: Cause.pretty(cause) }),
+            // GOAL-04: instance disposal interrupts this forked scan fiber —
+            // the bounded retry sleep widened that window. Same F1 discipline
+            // as triggerEvaluation: interrupts stay silent, real failures log.
+            Cause.hasInterrupts(cause)
+              ? Effect.void
+              : Effect.logWarning("goal startup scan failed", { cause: Cause.pretty(cause) }),
           ),
           Effect.forkScoped,
         )
@@ -217,11 +229,14 @@ const serviceLayer = Layer.effect(
     )
 
     // D-4 (GOAL-FP-01-04 follow-up): per-process record of which goal
-    // revision this process already evaluated. Written by afterIdle on every
-    // successful updateAfterJudge commit; consulted ONLY by the startup-scan
+    // revision this process already evaluated. Written by afterIdle at TWO
+    // sites: every successful updateAfterJudge commit, and the GOAL-01
+    // boundary-gate hit (where the drive is restored WITHOUT a commit — the
+    // map then marks the revision as drive-restored, so a duplicate scan
+    // trigger on the same revision skips). Consulted ONLY by the startup-scan
     // path (scanResume) — the idle path must keep re-evaluating the same
     // revision across new turn boundaries, so the gate never applies to it.
-    // Lifecycle mirrors the fibers map: overwritten by every commit, deleted
+    // Lifecycle mirrors the fibers map: overwritten by every write, deleted
     // at the same terminal points where afterIdle unregisters the goal
     // automation.
     const evaluatedRevisions = new Map<SessionID, number>()
@@ -247,10 +262,24 @@ const serviceLayer = Layer.effect(
       // process; the goal row's last_judged_msg is the crash-surviving record
       // of which boundary was already judged and committed. While the session
       // window still ends on that same message, no new progress has landed —
-      // re-judging would inflate turns_used and dispatch a duplicate
-      // continuation. Live idle events are never gated here: every dispatched
-      // continuation produces a fresh assistant message, so the live path
-      // always judges a new boundary.
+      // re-judging would inflate turns_used. Live idle events are never gated
+      // here: every dispatched continuation produces a fresh assistant
+      // message, so the live path always judges a new boundary.
+      //
+      // GOAL-01: the gate suppresses RE-JUDGMENT, never the drive. The old
+      // behavior `return`ed here, which permanently stranded goals whose
+      // committed continue evaluation lost its continuation to a crash
+      // (process died after the commit, before the next assistant message):
+      // every boot scan re-hit this gate, nothing ever dispatched another
+      // turn, and last_judged_msg (only written by judge commits) never
+      // advanced. Now the gate sets suppressJudge and falls through — the
+      // judge call and its updateAfterJudge commit below are skipped (the
+      // boundary is already judged; re-judging is what would inflate
+      // turns_used), but the shared continuation dispatch still runs and
+      // restores the driver. A second crash repeats this safely: a fresh
+      // process starts with an empty evaluatedRevisions map and an unchanged
+      // last_judged_msg, so the gate fires and re-dispatches again.
+      let suppressJudge = false
       if (scanResume && goalState.last_judged_msg) {
         const win = yield* sessions
           .messages({ sessionID, limit: 20 })
@@ -260,7 +289,7 @@ const serviceLayer = Layer.effect(
             ),
           )
         const lastSeen = [...win].reverse().find((m) => m.info.role === "assistant")
-        if (lastSeen && lastSeen.info.id === goalState.last_judged_msg) return
+        if (lastSeen && lastSeen.info.id === goalState.last_judged_msg) suppressJudge = true
       }
       const goalOwner = { kind: "goal" as const, id: goalState.goal_id ?? "legacy" }
       yield* automation.register(sessionID, goalOwner)
@@ -324,139 +353,156 @@ const serviceLayer = Layer.effect(
         yield* promptSvc.prompt({ sessionID, noReply: true, parts: [{ type: "text", text: `⏸ 目标已暂停 — ${pauseMsg}` }] }).pipe(Effect.ignore)
         return
       }
-      const responseText = lastAssistant.parts
-        .filter((p): p is Extract<(typeof lastAssistant.parts)[number], { type: "text" }> => p.type === "text")
-        .map((p) => p.text)
-        .join("\n")
-        .slice(-4000)
-      // When the last assistant turn produced no text (pure tool calls,
-      // reasoning-only, or a submit_result with no prose), the goal should
-      // NOT silently stall — the agent is making progress via tools. Skip
-      // the judge (there is nothing to classify) and continue directly,
-      // using a synthetic "continue" verdict so the loop dispatches the
-      // next turn. Previously this was a bare `return` that left the goal
-      // permanently "active" with no continuation — the agent appeared to
-      // stop working on its own.
-      const callLLM = Option.getOrUndefined(yield* Effect.serviceOption(GoalLoopJudgeLLM))
-      const verdict = responseText
-        ? yield* GoalJudge.run(
-            goalState.goal,
-            responseText,
-            goalState.subgoals ?? [],
-            // Judge LLM call: prefer the test-injected callable so e2e tests
-            // can script verdicts without Provider/network; otherwise build the
-            // production Provider → generateText path.
-            callLLM?.call ??
-              ((opts) =>
-                Effect.gen(function* () {
-                  const defaultM = yield* provider.defaultModel()
-                  const small = yield* provider.getSmallModel(defaultM.providerID)
-                  const model = small ?? (yield* provider.getModel(defaultM.providerID, defaultM.modelID))
-                  const language = yield* provider.getLanguage(model)
-                  const result = yield* Effect.tryPromise({
-                    try: (signal) =>
-                      generateText({
-                        model: language,
-                        system: opts.system,
-                        prompt: opts.user,
-                        temperature: opts.temperature,
-                        maxOutputTokens: opts.maxTokens,
-                        abortSignal: signal,
-                      }),
-                    catch: (e) => new Error(`judge LLM call failed: ${String(e)}`),
-                  }).pipe(Effect.timeout(`${opts.timeout} seconds`))
-                  if (!result) return ""
-                  return result.text
-                })),
-          )
-        : { verdict: "continue" as const, reason: "上一轮无文本输出（纯工具调用），跳过判定直接继续", parseFailed: false }
+      // GOAL-01: on a boundary-gate hit the judge call and its commit are
+      // skipped wholesale (see suppressJudge above) — execution falls through
+      // to the shared continuation dispatch below.
+      if (!suppressJudge) {
+        const responseText = lastAssistant.parts
+          .filter((p): p is Extract<(typeof lastAssistant.parts)[number], { type: "text" }> => p.type === "text")
+          .map((p) => p.text)
+          .join("\n")
+          .slice(-4000)
+        // When the last assistant turn produced no text (pure tool calls,
+        // reasoning-only, or a submit_result with no prose), the goal should
+        // NOT silently stall — the agent is making progress via tools. Skip
+        // the judge (there is nothing to classify) and continue directly,
+        // using a synthetic "continue" verdict so the loop dispatches the
+        // next turn. Previously this was a bare `return` that left the goal
+        // permanently "active" with no continuation — the agent appeared to
+        // stop working on its own.
+        const callLLM = Option.getOrUndefined(yield* Effect.serviceOption(GoalLoopJudgeLLM))
+        const verdict = responseText
+          ? yield* GoalJudge.run(
+              goalState.goal,
+              responseText,
+              goalState.subgoals ?? [],
+              // Judge LLM call: prefer the test-injected callable so e2e tests
+              // can script verdicts without Provider/network; otherwise build the
+              // production Provider → generateText path.
+              callLLM?.call ??
+                ((opts) =>
+                  Effect.gen(function* () {
+                    const defaultM = yield* provider.defaultModel()
+                    const small = yield* provider.getSmallModel(defaultM.providerID)
+                    const model = small ?? (yield* provider.getModel(defaultM.providerID, defaultM.modelID))
+                    const language = yield* provider.getLanguage(model)
+                    const result = yield* Effect.tryPromise({
+                      try: (signal) =>
+                        generateText({
+                          model: language,
+                          system: opts.system,
+                          prompt: opts.user,
+                          temperature: opts.temperature,
+                          maxOutputTokens: opts.maxTokens,
+                          abortSignal: signal,
+                        }),
+                      catch: (e) => new Error(`judge LLM call failed: ${String(e)}`),
+                    }).pipe(Effect.timeout(`${opts.timeout} seconds`))
+                    if (!result) return ""
+                    return result.text
+                  })),
+            )
+          : { verdict: "continue" as const, reason: "上一轮无文本输出（纯工具调用），跳过判定直接继续", parseFailed: false }
 
-      const updateResult = Option.getOrUndefined(
-        yield* automation.use(
-          observedLease,
-          goal.updateAfterJudge(
-            sessionID,
-            verdict.verdict,
-            verdict.reason,
-            verdict.parseFailed,
-            {
-              goalID: goalState.goal_id ?? "legacy",
-              revision: goalState.revision ?? 0,
-            },
-            lastAssistant.info.id,
+        const updateResult = Option.getOrUndefined(
+          yield* automation.use(
+            observedLease,
+            goal.updateAfterJudge(
+              sessionID,
+              verdict.verdict,
+              verdict.reason,
+              verdict.parseFailed,
+              {
+                goalID: goalState.goal_id ?? "legacy",
+                revision: goalState.revision ?? 0,
+              },
+              lastAssistant.info.id,
+            ),
           ),
-        ),
-      )
-      if (!updateResult) return
+        )
+        if (!updateResult) return
 
-      // D-4: record the committed revision as evaluated-by-this-process
-      // (every verdict — continue, done, blocked — is a completed
-      // evaluation of the pre-commit state).
-      evaluatedRevisions.set(sessionID, updateResult.state.revision ?? 0)
+        // D-4: record the committed revision as evaluated-by-this-process
+        // (every verdict — continue, done, blocked — is a completed
+        // evaluation of the pre-commit state).
+        evaluatedRevisions.set(sessionID, updateResult.state.revision ?? 0)
 
-      if (!updateResult.shouldContinue) {
-        yield* automation.unregister(sessionID, goalOwner)
-        evaluatedRevisions.delete(sessionID)
-        if (verdict.verdict === "done") {
-          // GOAL-FP-01-15: the done transition has already committed when this
-          // prompt runs (durable state leads presentation — the row is gone
-          // and goal.updated(done)/goal.cleared are published), so a failure
-          // here loses only the transcript line, never the state. Never
-          // swallow it silently — log it so a lost confirmation is
-          // diagnosable. No retry: a retried prompt could re-inject a "done"
-          // line after the goal was re-created.
-          yield* promptSvc.prompt({
-            sessionID,
-            noReply: true,
-            parts: [{ type: "text", text: updateResult.message }],
-          }).pipe(
-            Effect.catchCause((cause) =>
-              Effect.logWarning("goal done message delivery failed", {
-                sessionID,
-                cause: Cause.pretty(cause),
-              }),
-            ),
-          )
-        } else {
-          // Auto-pause branch: updateAfterJudge paused the goal due to
-          // judge-parse-failure or budget exhaustion (verdict.verdict is
-          // still "continue"). Without surfacing the message here, these
-          // automatic pauses would be invisible to the user — updateAfterJudge
-          // already saved the paused state and published goal.updated, but
-          // nothing rendered the "⏸ 目标已暂停 — …" line into the transcript.
-          // Emit it as a noReply part so it shows up without spawning a new
-          // agent turn; the fiber then naturally terminates (no clearFiber
-          // needed, see updateAfterJudge).
-          yield* promptSvc.prompt({
-            sessionID,
-            noReply: true,
-            parts: [{ type: "text", text: updateResult.message }],
-          }).pipe(
-            Effect.catchCause((cause) =>
-              Effect.logWarning("goal pause message delivery failed", {
-                sessionID,
-                cause: Cause.pretty(cause),
-              }),
-            ),
-          )
+        if (!updateResult.shouldContinue) {
+          yield* automation.unregister(sessionID, goalOwner)
+          evaluatedRevisions.delete(sessionID)
+          if (verdict.verdict === "done") {
+            // GOAL-FP-01-15: the done transition has already committed when this
+            // prompt runs (durable state leads presentation — the row is gone
+            // and goal.updated(done)/goal.cleared are published), so a failure
+            // here loses only the transcript line, never the state. Never
+            // swallow it silently — log it so a lost confirmation is
+            // diagnosable. No retry: a retried prompt could re-inject a "done"
+            // line after the goal was re-created.
+            yield* promptSvc.prompt({
+              sessionID,
+              noReply: true,
+              parts: [{ type: "text", text: updateResult.message }],
+            }).pipe(
+              Effect.catchCause((cause) =>
+                Effect.logWarning("goal done message delivery failed", {
+                  sessionID,
+                  cause: Cause.pretty(cause),
+                }),
+              ),
+            )
+          } else {
+            // Auto-pause branch: updateAfterJudge paused the goal due to
+            // judge-parse-failure or budget exhaustion (verdict.verdict is
+            // still "continue"). Without surfacing the message here, these
+            // automatic pauses would be invisible to the user — updateAfterJudge
+            // already saved the paused state and published goal.updated, but
+            // nothing rendered the "⏸ 目标已暂停 — …" line into the transcript.
+            // Emit it as a noReply part so it shows up without spawning a new
+            // agent turn; the fiber then naturally terminates (no clearFiber
+            // needed, see updateAfterJudge).
+            yield* promptSvc.prompt({
+              sessionID,
+              noReply: true,
+              parts: [{ type: "text", text: updateResult.message }],
+            }).pipe(
+              Effect.catchCause((cause) =>
+                Effect.logWarning("goal pause message delivery failed", {
+                  sessionID,
+                  cause: Cause.pretty(cause),
+                }),
+              ),
+            )
+          }
+          return
         }
-        return
+      } else {
+        // GOAL-01 gate hit: mark the current revision as drive-restored so a
+        // duplicate scan trigger on the SAME revision is skipped by the D-4
+        // gate above (at most one continuation per revision per process).
+        evaluatedRevisions.set(sessionID, goalState.revision ?? 0)
       }
 
       const currentStatus = yield* status.get(sessionID)
       if (currentStatus.type !== "idle") {
-        // Session is no longer idle after the judge call (5-30s latency).
+        // Session is no longer idle by the time dispatch resumes — it flipped
+        // during the judge call (5-30s latency), or between the gate and here
+        // on the GOAL-01 judge-less fall-through.
         // Previously this was a bare `return` that left the goal silently
         // "active" with no continuation. Pause with a visible reason so the
         // user knows the loop was interrupted by a status change.
-        const pauseMsg = `judge 期间会话状态变化（${currentStatus.type}），目标已暂停`
+        // Neutral wording on purpose: this pause is reachable both after a
+        // real judge call AND via the GOAL-01 gate-hit fall-through, where
+        // the judge was suppressed — the user-visible reason must not claim
+        // a judge was running.
+        const pauseMsg = `会话状态变化（${currentStatus.type}），目标已暂停`
         yield* pauseGoal(sessionID, pauseMsg).pipe(Effect.ignore)
         yield* promptSvc.prompt({ sessionID, noReply: true, parts: [{ type: "text", text: `⏸ 目标已暂停 — ${pauseMsg}` }] }).pipe(Effect.ignore)
         return
       }
 
-      // Reload messages after judge LLM call — the snapshot from before judge
-      // may be stale if user sent messages during the 5-30s judge latency.
+      // Reload messages before dispatch — the pre-judge snapshot may be stale
+      // (the user can send messages during the 5-30s judge latency, or during
+      // the GOAL-01 judge-less fall-through).
       // Same vanished-session tolerance as the pre-judge window: NotFoundError
       // becomes an empty window (shouldPreempt is defensively false for it),
       // never a typed failure escaping the fork.
@@ -657,6 +703,9 @@ const serviceLayer = Layer.effect(
     //   will be driven by its own turn-end idle event. At startup the status
     //   map is empty (get defaults to idle), so this only filters sessions
     //   that genuinely flipped busy between bootstrap and the scan.
+    //   GOAL-04: the skip is never silent — deferred sessions are logged and
+    //   retried once after SCAN_BUSY_RETRY_DELAY, and a final busy state is
+    //   abandoned with an explicit warning.
     // - Crash window (query → trigger): terminal changes are absorbed by the
     //   active-status re-check; non-terminal changes (already evaluated in
     //   this process) by the D-4 record gate in triggerEvaluation/afterIdle.
@@ -664,15 +713,59 @@ const serviceLayer = Layer.effect(
     //   session never kills the rest of the scan; the whole scan is forked,
     //   so a failure can never kill init.
     const scanForActiveGoals = Effect.fnUntraced(function* (snapshot: ReadonlyArray<SessionID>) {
+      const deferred: SessionID[] = []
       for (const sessionID of snapshot) {
         const current = yield* status.get(sessionID)
-        if (current.type !== "idle") continue
+        if (current.type !== "idle") {
+          // GOAL-04: never skip silently. Pre-fix this was a bare `continue`
+          // — no log, no retry obligation — leaving the goal persistently
+          // active but dormant with nothing to diagnose. Record the session
+          // for the bounded retry below.
+          deferred.push(sessionID)
+          continue
+        }
         yield* triggerEvaluation(sessionID, true).pipe(
           Effect.catchCause((cause) =>
-            Effect.logWarning("goal startup scan failed for session", {
-              sessionID,
-              cause: Cause.pretty(cause),
-            }),
+            // F1 discipline (same as the outer scan handler): instance
+            // disposal interrupts these per-session effects silently.
+            Cause.hasInterrupts(cause)
+              ? Effect.void
+              : Effect.logWarning("goal startup scan failed for session", {
+                  sessionID,
+                  cause: Cause.pretty(cause),
+                }),
+          ),
+        )
+      }
+      if (deferred.length === 0) return
+      yield* Effect.logInfo("goal startup scan deferred busy sessions", {
+        sessions: deferred.join(","),
+      })
+      // GOAL-04 retry obligation: one bounded re-check in this same scan
+      // fiber (already forked + supervised, so the sleep can never kill
+      // init). Sessions still busy after the window are left to their own
+      // turn-end idle event — the idle subscription is armed and drives them
+      // then; a session whose turn never emits idle is a runner defect
+      // outside the goal module, but the warning makes the abandonment
+      // visible instead of silent.
+      yield* Effect.sleep(SCAN_BUSY_RETRY_DELAY)
+      for (const sessionID of deferred) {
+        const current = yield* status.get(sessionID)
+        if (current.type !== "idle") {
+          yield* Effect.logWarning(
+            "goal startup scan gave up on busy session — its own idle event remains the driver",
+            { sessionID, status: current.type },
+          )
+          continue
+        }
+        yield* triggerEvaluation(sessionID, true).pipe(
+          Effect.catchCause((cause) =>
+            Cause.hasInterrupts(cause)
+              ? Effect.void
+              : Effect.logWarning("goal startup scan retry failed for session", {
+                  sessionID,
+                  cause: Cause.pretty(cause),
+                }),
           ),
         )
       }
