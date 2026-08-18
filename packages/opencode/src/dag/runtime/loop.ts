@@ -57,6 +57,18 @@ interface WorkflowEntry {
   config: WorkflowConfig | undefined
   fibers: Map<string, Fiber.Fiber<unknown, unknown>>
   watchers: Map<string, Fiber.Fiber<unknown, unknown>>
+  /** DAG-03/F2: a replan-verdict veto whose durable pause could not be
+   * persisted. While set, the in-memory paused flag survives the durable-row
+   * re-syncs performed by node terminal events and refreshControlFlags, so
+   * no stimulus spawns the vetoed direction before the parent acts. Released
+   * by the parent's explicit control events — replan and step are reachable
+   * from every hold state; resume only when the durable row is not running
+   * (paused/stepping — a held row reads "running" and resume is an invalid
+   * transition there until a durable pause lands; control(replan) is the
+   * disposition the verdict asked for). Process-local: a restart while the
+   * durable pause never landed rebuilds the flags from the durable row (the
+   * audit's DAG-03 scope was the in-process fail-open, which this closes). */
+  vetoHold: boolean
 }
 
 const serviceLayer = Layer.effect(
@@ -142,7 +154,25 @@ const serviceLayer = Layer.effect(
               const outputs: Record<string, unknown> = {}
               for (const dep of node.dependsOn) {
                 const depNode = nodesSnapshot.find((n) => n.id === dep)
-                if (depNode) outputs[dep] = { output: depNode.output }
+                if (!depNode) continue
+                // DAG-01: a schema-less checkpoint completes with a raw
+                // string output. Normalize JSON strings before condition
+                // evaluation so `.output.<field>` gates read the parsed
+                // structure instead of resolving undefined — pre-fix the
+                // equality gate was permanently false, every gated dependent
+                // was skipped as condition_false, and checkCompletion still
+                // reported the workflow COMPLETED (silent half-graph loss).
+                // Mirrors the replan-verdict gate's parseJsonOption
+                // normalization in the NodeCompleted handler below (issue
+                // #322). Non-JSON strings fall back to the raw value:
+                // whole-output equality still works, field paths stay
+                // undefined (documented condition_false), and numeric
+                // comparisons keep their loud failure.
+                outputs[dep] = {
+                  output: typeof depNode.output === "string"
+                    ? Option.getOrElse(parseJsonOption(depNode.output), () => depNode.output)
+                    : depNode.output,
+                }
               }
               const condResult = evaluateCondition(nodeConfig.condition, outputs)
               if (!condResult.ok) {
@@ -439,7 +469,7 @@ const serviceLayer = Layer.effect(
             const isStepping = wf.status === "stepping"
             if (isPaused) runtime.setPaused(true)
             if (isStepping) runtime.setStepMode(true)
-            const entry: WorkflowEntry = { runtime, semaphore, evalLock: Semaphore.makeUnsafe(1), parentSessionID: wf.sessionId, config, fibers: new Map(), watchers: new Map() }
+            const entry: WorkflowEntry = { runtime, semaphore, evalLock: Semaphore.makeUnsafe(1), parentSessionID: wf.sessionId, config, fibers: new Map(), watchers: new Map(), vetoHold: false }
             // P2-E deletion-race re-check: the SessionV1.Event.Deleted sweep
             // only removes entries already published into `runtimes`. If the
             // FK cascade deleted this workflow's row while reconciliation ran,
@@ -568,7 +598,7 @@ const serviceLayer = Layer.effect(
                 const maxConcurrency = Math.max(1, config?.max_concurrency ?? Dag.DEFAULT_WORKFLOW_CONFIG.maxConcurrency)
                 const runtime = new WorkflowRuntime(toSchedulingNodes(nodes), maxConcurrency)
                 const semaphore = Semaphore.makeUnsafe(maxConcurrency)
-                const entry: WorkflowEntry = { runtime, semaphore, evalLock: Semaphore.makeUnsafe(1), parentSessionID: wf.sessionId, config, fibers: new Map(), watchers: new Map() }
+                const entry: WorkflowEntry = { runtime, semaphore, evalLock: Semaphore.makeUnsafe(1), parentSessionID: wf.sessionId, config, fibers: new Map(), watchers: new Map(), vetoHold: false }
                 // P2-E deletion-race re-check (same window as recoverWorkflow):
                 // the Deleted sweep only removes entries already in `runtimes`,
                 // and getNodes above is an awaited yield a deletion can slip
@@ -651,7 +681,9 @@ const serviceLayer = Layer.effect(
                       yield* Effect.logDebug("DagLoop dropped stale node terminal event", { dagID, nodeID, expected, dbStatus: node?.status ?? "missing" })
                     }
                     const workflow = yield* store.getWorkflow(dagID)
-                    entry.runtime.setPaused(workflow?.status === "paused")
+                    // F2: honor the veto hold — a durable "running" row must
+                    // not lift the fail-closed pause a verdict gate set.
+                    entry.runtime.setPaused(workflow?.status === "paused" || entry.vetoHold)
                     entry.runtime.setStepMode(workflow?.status === "stepping")
                     // Guard against stale events: a node already cancelled
                     // (markUnsatisfied) or already satisfied must not be flipped
@@ -679,20 +711,42 @@ const serviceLayer = Layer.effect(
                         // corrective nodes — a paused workflow resumes as part
                         // of replan (workflow tool) so corrections can run.
                         const paused = yield* Effect.gen(function* () {
-                          // Pause can fail transiently (e.g. the workflow lock is
-                          // held by a concurrent long replan); retry once before
-                          // falling back to the durable status, so the workflow
-                          // is never silently stranded.
+                          // DAG-03: the checkpoint VETOED this direction — the
+                          // pause must fail CLOSED. Pause can fail transiently
+                          // (e.g. the workflow lock is held by a concurrent
+                          // long replan); retry once, and if it still cannot
+                          // be persisted, HOLD the in-memory pause anyway.
+                          // Pre-fix this returned `wf?.status === "paused"` —
+                          // fail-OPEN: it explicitly un-paused the runtime, so
+                          // the next stimulus calling spawnReady (a NodeFailed
+                          // handler, a step, a resume) spawned the vetoed
+                          // direction with no gate, no pause, no diagnostic.
+                          // catchCause (not catch): a DEFECT from dag.pause
+                          // must fold into the same path — pre-fix it escaped
+                          // to guarded() and dropped this whole handler, so
+                          // the pause was never even attempted and the gate's
+                          // own warning was lost. Interrupts (scope disposal)
+                          // still propagate.
                           const attemptPause = dag.pause(dagID).pipe(
                             Effect.map(() => true),
-                            Effect.catch(() => Effect.succeed(false)),
+                            Effect.catchCause((cause) =>
+                              Cause.hasInterrupts(cause) ? Effect.failCause(cause) : Effect.succeed(false),
+                            ),
                           )
                           if (yield* attemptPause) return true
                           if (yield* attemptPause) return true
                           const wf = yield* store.getWorkflow(dagID).pipe(Effect.orDie)
-                          if (wf?.status !== "paused")
-                            yield* Effect.logWarning("DagLoop pause on replan verdict failed", { dagID, nodeID })
-                          return wf?.status === "paused"
+                          if (wf?.status !== "paused") {
+                            // F2: record the hold so the durable-row re-syncs
+                            // below (node terminal prologues, refreshControlFlags)
+                            // cannot lift it until the parent acts.
+                            entry.vetoHold = true
+                            yield* Effect.logError(
+                              "DagLoop pause on replan verdict failed — holding in-memory pause (fail-closed)",
+                              { dagID, nodeID, durableStatus: wf?.status ?? "missing" },
+                            )
+                          }
+                          return true
                         })
                         entry.runtime.setPaused(paused)
                         yield* Effect.logWarning("DagLoop paused workflow after gate verdict: replan", { dagID, nodeID })
@@ -820,7 +874,8 @@ const serviceLayer = Layer.effect(
         const refreshControlFlags = Effect.fnUntraced(function* (dagID: string, entry: WorkflowEntry) {
           const workflow = yield* store.getWorkflow(dagID)
           if (!workflow || isWorkflowTerminalStatus(workflow.status as never)) return undefined
-          entry.runtime.setPaused(workflow.status === "paused")
+          // F2: honor the veto hold — see WorkflowEntry.vetoHold.
+          entry.runtime.setPaused(workflow.status === "paused" || entry.vetoHold)
           entry.runtime.setStepMode(workflow.status === "stepping")
           return workflow
         })
@@ -847,6 +902,9 @@ const serviceLayer = Layer.effect(
               if (!entry) return
               yield* entry.evalLock.withPermits(1)(
                 Effect.gen(function* () {
+                  // F2 (DAG-03): resume/step is the parent's explicit control —
+                  // release the fail-closed veto hold before the flag re-sync.
+                  entry.vetoHold = false
                   const workflow = yield* refreshControlFlags(dagID, entry)
                   if (workflow?.status !== "stepping") return
                   // Dag.step validated "no in-flight node" on a DB snapshot
@@ -873,6 +931,9 @@ const serviceLayer = Layer.effect(
               if (!entry) return
               yield* entry.evalLock.withPermits(1)(
                 Effect.gen(function* () {
+                  // F2 (DAG-03): resume/step is the parent's explicit control —
+                  // release the fail-closed veto hold before the flag re-sync.
+                  entry.vetoHold = false
                   const workflow = yield* refreshControlFlags(dagID, entry)
                   if (workflow?.status === "running") yield* spawnReady(dagID)
                   // A workflow can be resumed with every node already settled
@@ -900,6 +961,15 @@ const serviceLayer = Layer.effect(
               yield* entry.evalLock.withPermits(1)(
                 Effect.gen(function* () {
                   const wf = yield* store.getWorkflow(dagID).pipe(Effect.orDie)
+                  // F2 (DAG-03): a replan is the parent's explicit disposition
+                  // of the verdict — release the fail-closed veto hold and
+                  // re-sync the control flags from the durable row (this
+                  // handler never refreshed them, so a hold set by the verdict
+                  // gate would otherwise silence the trailing spawnReady
+                  // forever and the corrective nodes would never run).
+                  entry.vetoHold = false
+                  entry.runtime.setPaused(wf?.status === "paused")
+                  entry.runtime.setStepMode(wf?.status === "stepping")
                   const oldConfig = entry.config
                   if (wf) entry.config = parseWorkflowConfig(wf.config)
                   // Rev-view (v1.0.15 Train A): THE aggregation filter point.

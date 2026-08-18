@@ -580,17 +580,35 @@ function conditionDiagnostics(nodes: readonly NodeConfig[]): Diagnostic[] {
  * checkpoint completes, so the checkpoint verdict can never act first.
  * Block-compiled graphs gate dependents on the verdict (issue #294
  * REJECT-checkpoint shape); hand-built node graphs must do the same or keep
- * the checkpoint as a reporting leaf. */
+ * the checkpoint as a reporting leaf.
+ *
+ * Options:
+ * - `exemptCheckpointIds` (DAG-02 runtime path): a checkpoint already
+ *   terminal in the durable graph is settled and immutable (terminal nodes
+ *   never re-run) — the ordering race the gate protects is in the past, so
+ *   additive waves / reopens may attach dependents without a condition.
+ *   Authoring never exempts: nothing is terminal there yet.
+ * - `requireOutputSchema` (default true; the runtime replan path passes
+ *   false): DAG-01's "gated checkpoints must declare output_schema" is an
+ *   AUTHORING obligation — runtime-created graphs deliberately bypass
+ *   authoring validation (CONTEXT.md), so the runtime gate polices the
+ *   ordering race only, not the schema declaration. */
 export function checkpointGateDiagnostics(
   nodes: readonly NodeConfig[],
   defaults?: { readonly report_to_parent?: boolean },
+  options?: {
+    readonly exemptCheckpointIds?: ReadonlySet<string>
+    readonly requireOutputSchema?: boolean
+  },
 ): Diagnostic[] {
   const reportsToParent = (node: NodeConfig) =>
     node.report_to_parent ?? defaults?.report_to_parent ?? DEFAULT_WORKFLOW_CONFIG.reportToParent
+  const requireOutputSchema = options?.requireOutputSchema ?? true
   return nodes.flatMap((checkpoint) => {
     if (!reportsToParent(checkpoint)) return []
-    return nodes
-      .filter((dependent) => dependent.depends_on.includes(checkpoint.id))
+    if (options?.exemptCheckpointIds?.has(checkpoint.id)) return []
+    const dependents = nodes.filter((dependent) => dependent.depends_on.includes(checkpoint.id))
+    const ungated = dependents
       .filter((dependent) => conditionReference(dependent.condition) !== checkpoint.id)
       .map((dependent) =>
         diagnostic({
@@ -600,10 +618,34 @@ export function checkpointGateDiagnostics(
             `reporting checkpoint "${checkpoint.id}" has dependent "${dependent.id}" that is not gated on its output`
             + ` — the engine spawns "${dependent.id}" as soon as "${checkpoint.id}" completes, so the checkpoint verdict cannot be acted on first`,
           hint:
-            `Gate "${dependent.id}" with condition: "${checkpoint.id}.output.<field> == ..." (e.g. on its verdict),`
+            `Gate "${dependent.id}" with condition: "${checkpoint.id}.output.<field> == ..." (e.g. on its verdict) and declare output_schema on "${checkpoint.id}" so the gate reads a schema-validated verdict,`
             + ` keep "${checkpoint.id}" a reporting leaf, or set report_to_parent: false on "${checkpoint.id}" if downstream must run unconditionally`,
         }),
       )
+    // DAG-01: a checkpoint whose output a gate reads must declare
+    // output_schema. Without a schema the child may complete with a raw
+    // string; the runtime normalizes JSON strings, but a prose reply
+    // resolves no fields, so the `.output.<field>` gate is permanently
+    // false and the gated subtree is silently skipped while the workflow
+    // still reports COMPLETED. Make the unsatisfiable gate an authoring
+    // error instead of a runtime trap.
+    const gatedDependents = dependents.some((dependent) => conditionReference(dependent.condition) === checkpoint.id)
+    const schemaRequired =
+      gatedDependents && requireOutputSchema && checkpoint.output_schema === undefined
+        ? [
+            diagnostic({
+              code: DIAGNOSTIC_CODES.dagInvalid,
+              path: `nodes[${checkpoint.id}].output_schema`,
+              message:
+                `reporting checkpoint "${checkpoint.id}" is gated on its output but declares no output_schema`
+                + ` — without a schema the child may complete with prose that resolves no fields, leaving the gate permanently false and silently skipping the gated subtree`,
+              hint:
+                `Declare output_schema on "${checkpoint.id}" (e.g. the verdict shape),`
+                + ` keep "${checkpoint.id}" a reporting leaf, or set report_to_parent: false if downstream must run unconditionally`,
+            }),
+          ]
+        : []
+    return [...ungated, ...schemaRequired]
   })
 }
 
@@ -771,8 +813,18 @@ export interface ReplanStructuralInput {
   existingNodeCount: number
   /** New node ids being added by this replan (toward the lifetime ceiling). */
   addCount: number
-  /** Merged config (existing + fragment) for review-lifecycle validation. */
-  merged: { name?: string; mode?: ExecutionMode; nodes: readonly NodeConfig[] }
+  /** Merged config (existing + fragment) for review-lifecycle and
+   * checkpoint-gate validation. */
+  merged: {
+    name?: string
+    mode?: ExecutionMode
+    nodes: readonly NodeConfig[]
+    node_defaults?: { readonly report_to_parent?: boolean }
+  }
+  /** Durable nodes already terminal before this replan. Their reporting
+   * verdicts are delivered — the checkpoint gate exempts them so additive
+   * waves/reopens can attach dependents without a condition (DAG-02). */
+  terminalNodeIds?: ReadonlySet<string>
   config: { mode?: ExecutionMode; max_total_nodes?: number }
 }
 
@@ -798,6 +850,19 @@ export function replanStructuralDiagnostics(input: ReplanStructuralInput): Diagn
     ...tagLegacyClass(review.warnings, 5),
     ...(duplicates.length === 0 ? topologyDiagnostics(input.rerunNodes) : []),
     ...tagLegacyClass(outputSchemaKeywordDiagnostics(input.rerunNodes), 8),
+    // DAG-02: the checkpoint gate must police the MERGED graph too — a
+    // fragment can attach a new dependent to an EXISTING reporting
+    // checkpoint, which the fragment-scoped authoring check cannot see.
+    // Pre-fix replan/extend skipped this gate entirely, so the dependent
+    // was spawned the moment the checkpoint completed, before the parent
+    // could read the verdict. Checkpoints already terminal in the durable
+    // graph are exempt: they are settled and immutable, the race is past. The
+    // output_schema obligation is authoring-only (requireOutputSchema:false)
+    // — runtime-created graphs deliberately bypass authoring validation.
+    ...checkpointGateDiagnostics(input.merged.nodes, input.merged.node_defaults, {
+      exemptCheckpointIds: input.terminalNodeIds,
+      requireOutputSchema: false,
+    }),
   ])
 }
 
@@ -971,17 +1036,21 @@ export function validatePostCompile(input: {
   structural?: boolean
 }): Effect.Effect<ValidationResult> {
   return Effect.gen(function* () {
-    const diagnostics =
-      input.structural === false
+    const diagnostics = [
+      ...(input.structural === false
         ? []
-        : [
-            ...structuralDiagnostics({
-              nodes: input.nodes,
-              mode: input.config.mode,
-              max_total_nodes: input.config.max_total_nodes,
-            }),
-            ...checkpointGateDiagnostics(input.nodes, input.config.node_defaults),
-          ]
+        : structuralDiagnostics({
+            nodes: input.nodes,
+            mode: input.config.mode,
+            max_total_nodes: input.config.max_total_nodes,
+          })),
+      // DAG-02: the checkpoint gate is NOT a whole-graph structural check —
+      // fragment actions (replan/extend) must satisfy it exactly like start.
+      // Pre-fix it was skipped together with `structural`, so a replan could
+      // attach an ungated dependent to a reporting checkpoint and the engine
+      // spawned it the moment the checkpoint completed.
+      ...checkpointGateDiagnostics(input.nodes, input.config.node_defaults),
+    ]
     if (input.profile === "portable") diagnostics.push(...nonportablePromptDiagnostics(input.nodes))
     if (input.profile === "environment") {
       diagnostics.push(

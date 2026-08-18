@@ -306,8 +306,15 @@ describe("Train A rev-view (durable data untouched, view = current revision only
           // Bypass C: new suffix E→G→H off B; D (pending) is dropped by the
           // fragment and cancels; C (terminal failed, absent from fragment) is
           // the replaced segment the view must hide.
+          // DAG-02: E/G are fresh reporting checkpoints, so their new
+          // dependents gate on their outputs (the merged checkpoint check);
+          // the E-on-B edge is exempt because B already completed.
           const plan = yield* dag.replan(dagID, {
-            nodes: [node("e", ["b"]), node("g", ["e"]), node("h", ["g"])],
+            nodes: [
+              node("e", ["b"]),
+              { ...node("g", ["e"]), condition: 'e.output == "e done"' },
+              { ...node("h", ["g"]), condition: 'g.output == "g done"' },
+            ],
           })
           expect(plan.cancel).toEqual(["d"])
           expect(plan.add.sort()).toEqual(["e", "g", "h"])

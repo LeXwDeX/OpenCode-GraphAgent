@@ -137,3 +137,108 @@ it.effect("flags a condition that gates a different dependency than the checkpoi
     expect(result.errors.some((d) => d.message.includes('"cp-design-decision"') && d.message.includes('"stage-development"'))).toBe(true)
   }),
 )
+
+// DAG-01 (authoring half): a checkpoint whose output a condition reads must
+// declare output_schema. Without it the child completes with a raw string;
+// even with the runtime's JSON normalization a prose reply resolves no
+// fields, so the `.output.<field>` gate would be permanently false and the
+// gated subtree silently skipped while the workflow reports COMPLETED.
+it.effect("rejects a gated reporting checkpoint without output_schema", () =>
+  Effect.gen(function* () {
+    const result = yield* validate(
+      spec({
+        name: "schemaless-gate",
+        nodes: [
+          { ...checkpoint("cp-decision"), output_schema: undefined },
+          stage("stage-next", ["cp-decision"], 'cp-decision.output.verdict == "continue"'),
+        ],
+      }),
+    )
+    expect(result.valid).toBe(false)
+    expect(result.errors.some((d) => d.message.includes('"cp-decision"') && d.message.includes("output_schema"))).toBe(true)
+  }),
+)
+
+it.effect("accepts a gated reporting checkpoint that declares output_schema", () =>
+  Effect.gen(function* () {
+    const result = yield* validate(
+      spec({
+        name: "schema-gate",
+        nodes: [
+          checkpoint("cp-decision"),
+          stage("stage-next", ["cp-decision"], 'cp-decision.output.verdict == "continue"'),
+        ],
+      }),
+    )
+    expect(result.errors.filter((d) => d.message.includes("output_schema"))).toEqual([])
+  }),
+)
+
+it.effect("does not require output_schema on a reporting leaf checkpoint", () =>
+  Effect.gen(function* () {
+    const result = yield* validate(
+      spec({
+        name: "schemaless-leaf",
+        nodes: [{ ...checkpoint("cp-final"), depends_on: [], output_schema: undefined }],
+      }),
+    )
+    expect(result.errors.filter((d) => d.message.includes("output_schema"))).toEqual([])
+  }),
+)
+
+// DAG-02: pre-fix authoring closed ALL structural diagnostics for non-start
+// actions (`structural: input.action === "start"`), so a replan/extend could
+// attach an ungated dependent to a reporting checkpoint and the engine would
+// spawn it the moment the checkpoint completes — the checkpoint gate must
+// apply to fragment actions too.
+function validateReplan(fragmentGraph: Record<string, unknown>) {
+  return WorkflowAuthoring.make().prepare({
+    action: "replan",
+    source: {
+      kind: "inline",
+      value: { fragment: fragmentGraph },
+      source: "<test>",
+    },
+  })
+}
+
+function validateExtend(value: unknown) {
+  return WorkflowAuthoring.make().prepare({
+    action: "extend",
+    source: { kind: "inline", value, source: "<test>" },
+  })
+}
+
+it.effect("rejects a replan fragment whose dependent is not gated on the fragment's reporting checkpoint", () =>
+  Effect.gen(function* () {
+    const result = yield* validateReplan({
+      name: "replan-ungated",
+      nodes: [checkpoint("cp-review"), stage("stage-fix", ["cp-review"])],
+    })
+    expect(result.valid).toBe(false)
+    expect(result.errors.some((d) => d.message.includes('"cp-review"') && d.message.includes('"stage-fix"'))).toBe(true)
+  }),
+)
+
+it.effect("rejects an extend fragment whose dependent is not gated on its reporting checkpoint", () =>
+  Effect.gen(function* () {
+    const result = yield* validateExtend({
+      nodes: [checkpoint("cp-review"), stage("stage-fix", ["cp-review"])],
+    })
+    expect(result.valid).toBe(false)
+    expect(result.errors.some((d) => d.message.includes('"cp-review"') && d.message.includes('"stage-fix"'))).toBe(true)
+  }),
+)
+
+it.effect("accepts a replan fragment that gates its dependent on the checkpoint output", () =>
+  Effect.gen(function* () {
+    const result = yield* validateReplan({
+      name: "replan-gated",
+      nodes: [
+        checkpoint("cp-review"),
+        stage("stage-fix", ["cp-review"], 'cp-review.output.verdict == "continue"'),
+      ],
+    })
+    expect(result.errors.filter((d) => d.message.includes("not gated"))).toEqual([])
+  }),
+)

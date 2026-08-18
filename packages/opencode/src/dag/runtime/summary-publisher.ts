@@ -160,8 +160,16 @@ export const layer = Layer.effect(
           ) return Effect.void
           const dagID = data.dagID
           return schedulePublishByDag(dagID, evt.location.workspaceID).pipe(
+            // DAG-04 (#316): interrupt causes are the normal disposal path —
+            // the inner coalescer deliberately rethrows them (a scoped
+            // shutdown mid-publish must unwind, not masquerade as a failure).
+            // Swallowing them here logged a spurious "failed to publish" on
+            // every normal shutdown; rethrow per F1 discipline (same shape as
+            // spawn.ts / loop.ts). Real failures still warn.
             Effect.catchCause((cause) =>
-              Effect.logWarning("DagSummaryPublisher: failed to publish summaries", { dagID, cause }),
+              Cause.hasInterrupts(cause)
+                ? Effect.failCause(cause)
+                : Effect.logWarning("DagSummaryPublisher: failed to publish summaries", { dagID, cause }),
             ),
             Effect.forkIn(scope),
             Effect.asVoid,
