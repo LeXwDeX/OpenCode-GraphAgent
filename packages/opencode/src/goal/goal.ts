@@ -161,6 +161,11 @@ export interface Interface {
      * seam so SessionPrompt.cancel stays free of lease plumbing. No-op (returns
      * undefined) when the goal is not active. Never fails: pause failures are
      * logged and swallowed so a cancel path can always proceed.
+     *
+     * GOAL-02: when the pause exhausts its retries, durable row and lease
+     * both still say "active" — the turn mark is RETAINED so the three
+     * authorities agree and a repeat ESC retries the pause. The mark is
+     * cleared only on a successfully persisted pause.
      */
     readonly pauseForUserCancel: (sessionID: SessionID, reason: string) => Effect.Effect<GoalState.Info | undefined>
     /** True when the session's current turn is goal-driven. */
@@ -243,6 +248,9 @@ const serviceLayer = Layer.effect(
     // (shouldPreempt cannot catch it: ESC adds no user message). Retry the
     // pause twice with a short backoff; if it still fails, log LOUDLY — the
     // goal may resurrect, but it will never do so invisibly.
+    // GOAL-02: an exhausted failure path keeps durable row, lease, and the
+    // turn mark consistent (all still "active/owned/driven") — see the
+    // failure branch below.
     const pauseForUserCancel = Effect.fnUntraced(function* (sessionID: SessionID, reason: string) {
       let paused: GoalState.Info | undefined
       let lastCause: Cause.Cause<never> | undefined
@@ -259,13 +267,23 @@ const serviceLayer = Layer.effect(
         yield* automation.unregister(sessionID, { kind: "goal", id: paused.goal_id ?? "legacy" }).pipe(
           Effect.ignore,
         )
+        turnDriven.delete(sessionID)
       } else {
+        // GOAL-02: the pause could not be persisted — the durable row is
+        // still "active" and the lease registration is still in place, so the
+        // process-local mark must AGREE with both: keep it. Pre-fix it was
+        // deleted unconditionally, which disagreed with the durable
+        // authorities (goal still owns the session as active) and lost the
+        // ESC provenance on the resurrected turn — the user's second ESC
+        // would no longer route through this goal-pause fast path, because
+        // SessionPrompt.cancel maps ESC to a goal pause only for marked
+        // turns. With the mark retained, every repeat ESC retries the pause
+        // until the store recovers.
         yield* Effect.logError(
-          "goal pause on cancel failed after retries — goal may resurrect on next idle",
+          "goal pause on cancel failed after retries — goal stays active and turn-driven; a repeat ESC retries the pause",
           { sessionID, cause: lastCause ? Cause.pretty(lastCause) : "unknown" },
         )
       }
-      turnDriven.delete(sessionID)
       return paused
     })
 
