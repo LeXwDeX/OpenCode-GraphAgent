@@ -37,4 +37,13 @@
 - 结论：修复后进入 Round 2。
 
 ### Round 2
+- Spec 镜：**BLOCKING**（Issue 1 P1 + Issue 2 INFO）；Standards 镜：**BLOCKING**（Issue 1 P1 同源 + 2/3/4 INFO）。处置：
+  - Issue 1（P1）：onExit 括号只覆盖 select 管道——注册后的 `store.readTopics` 挂起（生产为 flock 磁盘 IO）期间被中断/失败会在括号附着前 unwind → 泄漏条目 + wedge。→ **已修**：整个尾部（readTopics + select 管道）包进同一 `Effect.gen(...).pipe(tap, onExit, exit)` 括号；mock 的 `readTopics` 加 `parkReads` 挂起钩子；新增红绿测试「an interrupted topics read releases the in-flight entry and never wedges the key」+ 变异验证（readTopics 挪出括号 → 翻红）。
+  - Spec Issue 2（INFO）：in-flight key 无 turn 分量 → 新轮次的同文查询可能骑上一轮的 deferred，attached 但自身缓存不填充。→ **已修**：key 加入 turn origin（messageID）——合并严格 turn 内，跨轮重跑。
+  - Standards 2（INFO）：awaiter 注释的 interrupt 机制描述不准（failCause 重抛在 awaiter，failed 映射在 search wrapper）。→ 已改写。
+  - Standards 3（INFO）：测试注释宣称 interrupted 覆盖但原先无此测试。→ R2 新增的中断测试已补齐该覆盖。
+  - Standards 4（INFO）：`undefined as void` 多余 cast。→ 已删。
+- 结论：修复后进入 Round 3。
+
+### Round 3
 - 未开始
