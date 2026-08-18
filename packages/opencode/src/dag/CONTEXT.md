@@ -32,7 +32,7 @@ Workflow Orchestration turns one user objective into one durable DAG. Its model-
 - Model-facing graph actions expose only `spec_path`; graph fields live in YAML so provider tool-call serialization cannot turn a nested graph into a string.
 - Legacy YAML may be adapted at the file boundary without making legacy fields valid inline input.
 - Runtime Admission and Workflow Authoring Check have separate names, state, and responsibilities.
-- Dependents of a reporting checkpoint must be gated on its output; authoring rejects ungated shapes at start/validate (enforcement point: authoring boundary only, runtime create deliberately unchanged).
+- Dependents of a reporting checkpoint must be gated on its output; authoring rejects ungated shapes at start/validate AND at replan/extend fragment actions, and the runtime replan/extend mutation seam re-checks the merged graph (exempting checkpoints already terminal — their verdict was delivered; runtime create remains deliberately unchanged). A gated checkpoint must declare `output_schema` (authoring obligation).
 
 ## Boundaries
 

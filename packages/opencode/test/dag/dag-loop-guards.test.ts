@@ -486,3 +486,143 @@ describe("DagLoop replan verdict gate (issue #322)", () => {
     )
   })
 })
+
+// DAG-01 (runtime half): a schema-less reporting checkpoint completes with a
+// RAW STRING output. Pre-fix the condition evaluator resolved
+// `gate.output.<field>` on that string to undefined, so an equality gate was
+// permanently false: every gated dependent skipped (condition_false), the
+// orphan cascade terminalized the subtree, and checkCompletion marked the
+// workflow COMPLETED with skipReviewGate — half the graph never ran, with
+// no error anywhere. The fix normalizes string outputs through the same
+// parseJsonOption the replan-verdict gate already uses.
+describe("DagLoop equality gates on schema-less string outputs (DAG-01)", () => {
+  it("evaluates a .output.<field> condition against a JSON-string checkpoint output", async () => {
+    await Effect.runPromise(
+      runGuardTest({ instanceProject: "project-1" }, ({ dag, store, childPrompts }) =>
+        Effect.gen(function* () {
+          const dagID = yield* dag.create({
+            projectID: "project-1",
+            sessionID: "ses_project-1",
+            title: "String equality gate",
+            config: {
+              name: "string-equality-gate",
+              nodes: [
+                node({ id: "gate", name: "gate", required: true, report_to_parent: true }),
+                node({
+                  id: "downstream",
+                  name: "downstream",
+                  required: false,
+                  depends_on: ["gate"],
+                  condition: 'gate.output.verdict == "continue"',
+                }),
+              ],
+            },
+          })
+          const gateChild = yield* takeWithin(childPrompts, "gate node did not start")
+          expect(gateChild.title).toBe("gate")
+          yield* dag.nodeCompleted(dagID, "gate", JSON.stringify({ verdict: "continue", findings: "confirmed" }))
+          // The report_to_parent wake and the downstream spawn can land in
+          // either order; accept the downstream prompt whichever comes second.
+          const first = yield* takeWithin(childPrompts, "no prompt after continue verdict — gate evaluated false on the string output")
+          const downstreamChild = first.title === "downstream"
+            ? first
+            : yield* takeWithin(childPrompts, "downstream was silently skipped — string output never normalized (DAG-01)")
+          expect(downstreamChild.title).toBe("downstream")
+          expect((yield* store.getNode(dagID, "downstream"))?.status).not.toBe("skipped")
+          yield* Deferred.succeed(downstreamChild.release, "done")
+        }),
+      ),
+    )
+  })
+
+  it("keeps a non-JSON string output gate false without the subtree silently vanishing", async () => {
+    await Effect.runPromise(
+      runGuardTest({ instanceProject: "project-1" }, ({ dag, store, childPrompts }) =>
+        Effect.gen(function* () {
+          const dagID = yield* dag.create({
+            projectID: "project-1",
+            sessionID: "ses_project-1",
+            title: "Prose gate",
+            config: {
+              name: "prose-gate",
+              nodes: [
+                node({ id: "gate", name: "gate", required: true, report_to_parent: true }),
+                node({
+                  id: "downstream",
+                  name: "downstream",
+                  required: false,
+                  depends_on: ["gate"],
+                  condition: 'gate.output.verdict == "continue"',
+                }),
+              ],
+            },
+          })
+          const gateChild = yield* takeWithin(childPrompts, "gate node did not start")
+          expect(gateChild.title).toBe("gate")
+          // Prose (non-JSON) output: normalization falls back to the raw
+          // string, the field path resolves undefined, the equality gate is
+          // false — the documented skip, not a crash.
+          yield* dag.nodeCompleted(dagID, "gate", "All good, shipping it.")
+          yield* pollWithTimeout(
+            Effect.gen(function* () {
+              const downstream = yield* store.getNode(dagID, "downstream")
+              return downstream?.status === "skipped" ? (true as const) : undefined
+            }),
+            "prose-output gate did not settle to condition_false",
+          )
+        }),
+      ),
+    )
+  })
+})
+
+// DAG-02 (runtime half): the checkpoint gate must also police the MERGED
+// graph at replan/extend — a fragment may attach a new dependent to an
+// existing reporting checkpoint, which the fragment-scoped authoring check
+// cannot see. Pre-fix replanStructuralDiagnostics never ran
+// checkpointGateDiagnostics, so the engine spawned the dependent the moment
+// the checkpoint completed, before the parent could read the verdict.
+describe("Dag.replan merged-graph checkpoint gate (DAG-02)", () => {
+  it("rejects a replan fragment that attaches an ungated dependent to an existing reporting checkpoint", async () => {
+    await Effect.runPromise(
+      runGuardTest({ instanceProject: "project-1" }, ({ dag, store, childPrompts }) =>
+        Effect.gen(function* () {
+          const dagID = yield* dag.create({
+            projectID: "project-1",
+            sessionID: "ses_project-1",
+            title: "Merged gate",
+            config: {
+              name: "merged-gate",
+              nodes: [
+                node({ id: "gate", name: "gate", required: true, report_to_parent: true, output_schema: { type: "object" } }),
+                node({
+                  id: "downstream",
+                  name: "downstream",
+                  required: false,
+                  depends_on: ["gate"],
+                  condition: 'gate.output.verdict == "continue"',
+                }),
+              ],
+            },
+          })
+          const gateChild = yield* takeWithin(childPrompts, "gate node did not start")
+          expect(gateChild.title).toBe("gate")
+          // Fragment adds a dependent on the existing checkpoint WITHOUT a
+          // condition — the merged graph must reject it.
+          const attempt = yield* dag
+            .replan(dagID, { nodes: [node({ id: "late", name: "late", depends_on: ["gate"] })] })
+            .pipe(
+              Effect.match({
+                onFailure: (error) => ({ ok: false as const, message: String(error) }),
+                onSuccess: () => ({ ok: true as const, message: "" }),
+              }),
+            )
+          expect(attempt.ok).toBe(false)
+          expect(attempt.message.includes('"gate"') && attempt.message.includes('"late"')).toBe(true)
+          expect((yield* store.getNode(dagID, "late"))).toBeUndefined()
+          yield* Deferred.succeed(gateChild.release, "done")
+        }),
+      ),
+    )
+  })
+})

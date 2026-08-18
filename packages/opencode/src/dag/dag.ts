@@ -583,6 +583,9 @@ export const layer = Layer.effect(
         addCount: plan.add.length,
         merged: wfConfig ? computeMergedConfig(wfConfig, normalizedFragment, plan) : { nodes: normalizedFragment.nodes },
         config: { mode: wfConfig?.mode, max_total_nodes: wfConfig?.max_total_nodes },
+        terminalNodeIds: new Set(
+          nodes.filter((n) => isNodeTerminalStatus(n.status as NodeStatus)).map((n) => n.id),
+        ),
       })
       const replanErrors = DagValidation.sortLegacyStructural(replanDiagnostics.filter((d) => d.severity === "error"))
       for (const warning of replanDiagnostics.filter((d) => d.severity === "warning")) {
