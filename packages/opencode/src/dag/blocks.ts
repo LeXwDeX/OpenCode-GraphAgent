@@ -333,7 +333,7 @@ function node(input: {
   // production no-op because it re-read the parent's narrative instead of
   // the source. Upstream claims are hypotheses, not facts.
   const adversarial = input.reportToParent
-    ? "As a reporting checkpoint you adjudicate this direction: treat upstream and parent-supplied claims as hypotheses to verify, never facts to confirm. independently read the relevant source before endorsing the most load-bearing claims, cite what you actually inspected, and replan or reject the direction when a load-bearing claim does not survive inspection."
+    ? "As a reporting checkpoint you adjudicate this direction: treat upstream and parent-supplied claims as hypotheses to verify, never facts to confirm. Independently read the relevant source before endorsing, spot-check at least three of the most load-bearing claims (name the count you actually inspected), cite what you actually inspected, and replan or reject the direction when a load-bearing claim does not survive inspection."
     : ""
   return {
     id: input.id,

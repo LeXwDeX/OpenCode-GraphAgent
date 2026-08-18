@@ -62,7 +62,9 @@ describe("workflow blocks", () => {
     // Upstream claims are hypotheses to verify, not facts to confirm.
     expect(checkpoint?.prompt_template.inline).toContain("hypotheses to verify")
     // Independent source inspection is mandatory for load-bearing claims.
-    expect(checkpoint?.prompt_template.inline).toContain("independently read the relevant source")
+    expect(checkpoint?.prompt_template.inline).toContain("Independently read the relevant source")
+    // A quantified spot-check floor on the most load-bearing claims.
+    expect(checkpoint?.prompt_template.inline).toContain("at least three")
     // A claim that fails inspection must fail the direction, not pass it.
     expect(checkpoint?.prompt_template.inline).toContain("replan or reject")
   })
