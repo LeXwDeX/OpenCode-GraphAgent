@@ -485,7 +485,11 @@ const serviceLayer = Layer.effect(
         // Previously this was a bare `return` that left the goal silently
         // "active" with no continuation. Pause with a visible reason so the
         // user knows the loop was interrupted by a status change.
-        const pauseMsg = `judge 期间会话状态变化（${currentStatus.type}），目标已暂停`
+        // Neutral wording on purpose: this pause is reachable both after a
+        // real judge call AND via the GOAL-01 gate-hit fall-through, where
+        // the judge was suppressed — the user-visible reason must not claim
+        // a judge was running.
+        const pauseMsg = `会话状态变化（${currentStatus.type}），目标已暂停`
         yield* pauseGoal(sessionID, pauseMsg).pipe(Effect.ignore)
         yield* promptSvc.prompt({ sessionID, noReply: true, parts: [{ type: "text", text: `⏸ 目标已暂停 — ${pauseMsg}` }] }).pipe(Effect.ignore)
         return
@@ -716,10 +720,14 @@ const serviceLayer = Layer.effect(
         }
         yield* triggerEvaluation(sessionID, true).pipe(
           Effect.catchCause((cause) =>
-            Effect.logWarning("goal startup scan failed for session", {
-              sessionID,
-              cause: Cause.pretty(cause),
-            }),
+            // F1 discipline (same as the outer scan handler): instance
+            // disposal interrupts these per-session effects silently.
+            Cause.hasInterrupts(cause)
+              ? Effect.void
+              : Effect.logWarning("goal startup scan failed for session", {
+                  sessionID,
+                  cause: Cause.pretty(cause),
+                }),
           ),
         )
       }
@@ -746,10 +754,12 @@ const serviceLayer = Layer.effect(
         }
         yield* triggerEvaluation(sessionID, true).pipe(
           Effect.catchCause((cause) =>
-            Effect.logWarning("goal startup scan retry failed for session", {
-              sessionID,
-              cause: Cause.pretty(cause),
-            }),
+            Cause.hasInterrupts(cause)
+              ? Effect.void
+              : Effect.logWarning("goal startup scan retry failed for session", {
+                  sessionID,
+                  cause: Cause.pretty(cause),
+                }),
           ),
         )
       }

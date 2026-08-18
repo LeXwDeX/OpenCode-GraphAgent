@@ -167,7 +167,9 @@ export interface Interface {
      * GOAL-02: when the pause exhausts its retries, durable row and lease
      * both still say "active" — the turn mark is RETAINED so the three
      * authorities agree and a repeat ESC retries the pause. The mark is
-     * cleared only on a successfully persisted pause.
+     * cleared on a successfully persisted pause; a successful NO-OP (goal
+     * already paused/cleared when ESC lands) silently retires the stale mark
+     * — no durable authority claims the goal as active.
      */
     readonly pauseForUserCancel: (sessionID: SessionID, reason: string) => Effect.Effect<GoalState.Info | undefined>
     /** True when the session's current turn is goal-driven. */
@@ -211,11 +213,12 @@ const serviceLayer = Layer.effect(
     // turn. Keyed by session; set at every goal dispatch (kick in prompt.ts,
     // continuation in loop.ts), cleared at turn end (afterIdle entry) and at
     // every terminal transition (pause/clear/markDone). On ESC-cancel the
-    // clear happens ONLY when the pause persisted — if the pause exhausts its
-    // retries the mark is RETAINED so it agrees with the still-active
-    // durable row and lease (GOAL-02). A stale mark is harmless:
-    // goalTurnMaxSteps re-validates against the durable goal row before
-    // reporting a ceiling.
+    // clear happens when the pause persisted OR the cancel is a successful
+    // no-op (goal already inactive — nothing claims it as active); only if
+    // the pause exhausts its retries is the mark RETAINED so it agrees with
+    // the still-active durable row and lease (GOAL-02). A stale mark is
+    // harmless: goalTurnMaxSteps re-validates against the durable goal row
+    // before reporting a ceiling.
     const turnDriven = new Set<SessionID>()
 
     const markTurnDriven = Effect.fnUntraced(function* (sessionID: SessionID) {
@@ -263,6 +266,11 @@ const serviceLayer = Layer.effect(
         const exit = yield* pauseAndPublish(sessionID, reason).pipe(Effect.exit)
         if (Exit.isSuccess(exit)) {
           paused = exit.value
+          // Classify by the FINAL attempt: an early transient failure followed
+          // by a successful outcome (e.g. a concurrent pauser lands between
+          // retries) is a success/no-op, not retry exhaustion — drop the
+          // stale cause so the branches below read the real outcome.
+          lastCause = undefined
           break
         }
         lastCause = exit.cause

@@ -9,6 +9,7 @@ import { SessionStatus } from "@/session/status"
 import { Database } from "@opencode-ai/core/database/database"
 import { GoalStateTable } from "@opencode-ai/core/goal/sql"
 import { SessionID } from "@/session/schema"
+import { logLines } from "effect/testing/TestConsole"
 import { testEffect } from "../lib/effect"
 
 // GOAL-TURN-SCOPE regression tests: the turn-provenance mark (kick /
@@ -146,17 +147,21 @@ describe("Goal turn-scope — pauseForUserCancel (ESC semantics)", () => {
     }),
   )
 
-  // Review R3-INFO-1: a successful NO-OP (goal already paused/cleared when ESC
-  // lands) must not be reported as a retry-exhaustion failure — no durable
-  // authority claims the goal as active, so the stale mark is retired
-  // silently.
-  it.live("cancel on an already-paused goal is a silent no-op that retires a stale mark", () =>
+  // Review R3-INFO-1: a successful NO-OP (goal already paused/cleared when
+  // ESC lands) must not be reported as a retry-exhaustion failure — no
+  // durable authority claims the goal as active. Recreates the genuinely
+  // stale mark the way an auto-pause leaves it behind (updateAfterJudge
+  // pauses the row WITHOUT clearing the turn mark; loop.ts clears it at the
+  // next afterIdle entry), then asserts pauseForUserCancel retires it
+  // silently. Pre-fix this window logged a false "failed after retries"
+  // ERROR.
+  it.instance("cancel on an already-paused goal is a silent no-op that retires a stale mark", () =>
     Effect.gen(function* () {
       const goal = yield* Goal.Service
       const sid = SessionID.descending()
       yield* goal.set(sid, "test goal", 5)
-      yield* goal.markTurnDriven(sid)
       yield* goal.pause(sid, "auto-paused")
+      yield* goal.markTurnDriven(sid)
 
       const paused = yield* goal.pauseForUserCancel(sid, "用户中断（ESC）")
       expect(paused).toBeUndefined()
@@ -164,6 +169,7 @@ describe("Goal turn-scope — pauseForUserCancel (ESC semantics)", () => {
       const state = yield* goal.load(sid)
       expect(state?.status).toBe("paused")
       expect(state?.paused_reason).toBe("auto-paused")
+      expect(JSON.stringify(yield* logLines)).not.toContain("failed after retries")
     }),
   )
 

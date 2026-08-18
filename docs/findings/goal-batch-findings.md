@@ -48,4 +48,13 @@
 - 结论：非干净轮（Round 2 的连续干净计数重置）。修复后进入 Round 4。
 
 ### Round 4
+- Spec 镜：**PASS**，2 条 INFO；Standards 镜：**PASS**，4 条 INFO（其中 lastCause 混合结果一条与 Spec 镜重合）。处置：
+  - lastCause 分类按最终尝试结果（R4 共同项）：成功退出重试循环时 `lastCause = undefined`，杜绝「早期瞬态失败 + 后续成功 no-op」被误判为耗尽。→ 已修复。
+  - pause 文案「judge 期间会话状态变化」在 GOAL-01 gate-hit 路径失准：改为中性「会话状态变化（X），目标已暂停」（既有测试只断言 contains「状态变化」，不受影响）。→ 已修复。
+  - noop 回归测试未真正钉住（Goal.pause 本身清 mark，前置 mark 到不了 pauseForUserCancel）：重写为 pause 之后重新 markTurnDriven 造真实陈旧 mark，并断言 logLines 不含 "failed after retries"（旧代码必触发该日志 → 测试真正翻红可验证）。→ 已修复。
+  - 两处注释（Interface doc + GOAL-TURN-SCOPE 块）与第三分支（no-op 静默清 mark）矛盾：已改写一致。
+  - GOAL-04 重试环的 per-session catchCause 缺 interrupt 抑制（与外层 scan handler 不一致）：两处 per-session catchCause（首轮 + 重试环）均加 `Cause.hasInterrupts` F1 抑制。→ 已修复。
+- 结论：非干净轮。修复后进入 Round 5。
+
+### Round 5
 - 未开始
