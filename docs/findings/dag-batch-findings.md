@@ -63,4 +63,25 @@
 - 结论：非干净轮。修复后进入 Round 5。
 
 ### Round 5
-- 未开始
+- Spec 镜：**PASS，no findings**；Standards 镜：**PASS，no findings**（R4 hint 修复逐条复核为真）。
+- 结论：**干净轮 1/2**。
+
+### Round 6
+- Spec 镜：**PASS，no findings**（四缺陷 + F2 + 文档同步独立复核；附 process note：PR 前回填 R5 结果——本条即回填）。
+- Standards 镜：**PASS，no findings**（Effect v4 API 对照 effect-smol 源码逐一验证；注释真实性对照 transition table/replan.ts/spawn.ts 复核）。
+- 结论：**干净轮 2/2**。连续两轮零 findings → **DAG 模块收敛**。
+
+## 收敛结论
+
+R1（Spec 3 Low + Standards 6）→ R2（Spec 3 + Standards 1）→ R3（Spec 0 + Standards 1）→ R4（Spec 0 + Standards 1）→ **R5+R6 连续两轮双镜零 findings**。全部 findings 关闭，findings 衰减轨迹清晰（Medium 实装 → Low 措辞 → 零）。
+
+## 模块门禁（终态）
+
+- 切片级：dag 测试簇绿（579/579 含新增 19 条回归）+ 包内 `bun typecheck` 绿 + 每切片变异翻红验证。
+- 全量套件：4157 tests / 342 files，仅 2 失败均为 GOAL run 期间已在干净基线 detached 复跑证实的 darwin 环境既有失败（help-snapshots、project-copy；pty 本轮通过），与本批无因果；DAG/GOAL 相关零失败。
+
+## 交付
+
+- 分支：`fix/dag-batch`（基于 origin/dev 1d087ffe9）
+- 提交链：43fd72bbd（audit 文档）→ 71ab1bdf6（DAG-01/02）→ 1c4f1ad7a（DAG-03）→ db626d4ba（DAG-04）→ 337814648 / ff1f8dab5 / 85df04311 / 5128f0958（审阅轮修复）
+- PR → dev（Typecheck 门禁），合入由用户授权执行
