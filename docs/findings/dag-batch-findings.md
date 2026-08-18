@@ -58,4 +58,9 @@
 - 结论：非干净轮。修复后进入 Round 4。
 
 ### Round 4
+- Spec 镜：**PASS，no findings**。
+- Standards 镜：**PASS**，1 条 INFO：R4-1——ungated 诊断的 hint 把「declare output_schema」列为独立替代项，但单独声明 schema 不能解除 ungated 错误（须与 gating 条件组合）。→ 已改写为「Gate … with condition … and declare output_schema …」组合句式。
+- 结论：非干净轮。修复后进入 Round 5。
+
+### Round 5
 - 未开始

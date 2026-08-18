@@ -618,8 +618,7 @@ export function checkpointGateDiagnostics(
             `reporting checkpoint "${checkpoint.id}" has dependent "${dependent.id}" that is not gated on its output`
             + ` — the engine spawns "${dependent.id}" as soon as "${checkpoint.id}" completes, so the checkpoint verdict cannot be acted on first`,
           hint:
-            `Gate "${dependent.id}" with condition: "${checkpoint.id}.output.<field> == ..." (e.g. on its verdict),`
-            + ` declare output_schema on "${checkpoint.id}" so the gate reads a schema-validated verdict,`
+            `Gate "${dependent.id}" with condition: "${checkpoint.id}.output.<field> == ..." (e.g. on its verdict) and declare output_schema on "${checkpoint.id}" so the gate reads a schema-validated verdict,`
             + ` keep "${checkpoint.id}" a reporting leaf, or set report_to_parent: false on "${checkpoint.id}" if downstream must run unconditionally`,
         }),
       )
