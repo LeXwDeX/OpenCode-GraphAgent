@@ -82,7 +82,7 @@ R1 有 2 Low → 修复；R2 干净（因 R3 有 findings 计数重置）；R3 �
 - **PR**：https://github.com/LeXwDeX/OpenCode-GraphAgent/pull/334 → `dev`（门禁 Typecheck；CI run 32113882464 进行中）
 - 提交链：bcad76ebf（audit 文档）→ ed7185a0f（GOAL-01）→ 551b8f78a（GOAL-02）→ 9fc67e8e7（GOAL-03）→ f0e727865（GOAL-04）→ 429e58815 / 5dd5a3037 / ce87f84bd / db44487c7 / 58b56b490 / 5e6ab11fe（审阅轮修复与记账）
 - 终态门禁：goal 测试簇 108/108 绿；`bun typecheck`（packages/opencode）绿；全量 4142 tests 除 3 项基线既有 darwin 环境性失败外全绿（已在干净基线 detached 复跑证实非本批引入）。
-- 已知本地环境既有问题（与本批无关，已证实）：根 turbo typecheck 的 `@opencode-ai/app` 子路径解析、project-copy / help-snapshots / pty 三个测试。
+- 已知本地环境既有失败（与本批无关，已在干净基线 detached 复跑证实）：全量测试中 project-copy / help-snapshots / pty 三项（darwin 环境/计时性）。根 turbo typecheck 曾一次命中 `@opencode-ai/app` 的瞬时缓存失败，随后（pre-push 钩子）29/29 全绿自愈。
 
 ## 下一 run
 
