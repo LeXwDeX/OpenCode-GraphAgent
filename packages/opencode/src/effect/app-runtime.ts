@@ -60,6 +60,7 @@ import { Dag } from "@/dag/dag"
 import { DagStore } from "@opencode-ai/core/dag/store"
 import { DagLoop } from "@/dag/runtime/loop"
 import { DagSummaryPublisher } from "@/dag/runtime/summary-publisher"
+import { DagSupervisionSweep } from "@/dag/runtime/supervision-sweep"
 import { Memory } from "@/memory/memory"
 
 export const AppLayer = Layer.mergeAll(
@@ -132,6 +133,11 @@ export const AppLayer = Layer.mergeAll(
   Layer.provideMerge(GoalLoop.defaultLayer),
   Layer.provideMerge(DagLoop.defaultLayer),
   Layer.provideMerge(DagSummaryPublisher.defaultLayer),
+  // Host-level deadline-supervision sweep (production incident 2026-08-18):
+  // forks its repeating fiber at construction into the LAYER scope — unlike
+  // DagLoop it must NOT die with a per-directory instance teardown, or a
+  // `running` node with dead supervision would rot forever.
+  Layer.provideMerge(DagSupervisionSweep.defaultLayer),
   Layer.provideMerge(SettingsHook.defaultLayer),
 )
 
