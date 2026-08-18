@@ -60,8 +60,14 @@ interface WorkflowEntry {
   /** DAG-03/F2: a replan-verdict veto whose durable pause could not be
    * persisted. While set, the in-memory paused flag survives the durable-row
    * re-syncs performed by node terminal events and refreshControlFlags, so
-   * no stimulus spawns the vetoed direction before the parent acts. Cleared
-   * by the parent's explicit control events (replan/resume/step). */
+   * no stimulus spawns the vetoed direction before the parent acts. Released
+   * by the parent's explicit control events — replan and step are reachable
+   * from every hold state; resume only when the durable row is
+   * stepping/pending (a held row reads "running" and resume would be an
+   * invalid transition there — control(replan) is the disposition the
+   * verdict asked for). Process-local: a restart while the durable pause
+   * never landed rebuilds the flags from the durable row (the audit's
+   * DAG-03 scope was the in-process fail-open, which this closes). */
   vetoHold: boolean
 }
 

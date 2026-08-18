@@ -705,7 +705,6 @@ describe("DagLoop replan verdict gate fail-closed (DAG-03)", () => {
             // The durable pause never landed
             expect((yield* store.getWorkflow(dagID))?.status).toBe("running")
             // Post-veto stimulus on an unrelated node.
-            const probe = (yield* store.getNode(dagID, "probe"))!
             yield* dag.nodeFailed(dagID, "probe", "probe exploded", "exec_failed")
             yield* Effect.sleep("300 millis")
             // Fail-closed: the vetoed dependent was NOT spawned by the

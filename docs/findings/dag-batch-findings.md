@@ -45,4 +45,12 @@
 - 结论：非干净轮。修复后进入 Round 2。
 
 ### Round 2
+- Spec 镜：**PASS**，3 条 INFO；Standards 镜：**PASS**，1 条 INFO。处置：
+  - R2-1（INFO）：vetoHold 注释宣称「replan/resume/step 均可释放」不精确——hold 态持久行是 running，resume 对 running 是非法迁移（InvalidTransitionError），resume 释放仅在 stepping/pending 态可达。→ 已改写字段注释：replan/step 任何 hold 态可达；resume 仅 stepping/pending；control(replan) 正是 verdict 所求的处置路径。
+  - R2-2（INFO）：hold 为进程内状态，重启后从持久行重建（审计 DAG-03 的范围就是进程内 fail-open）。→ 已在字段注释记录该边界。
+  - R2-3（INFO）：timeoutOption 的切断发生在第一个可中断点——uninterruptible finalizer 区域内的 wedge 可越过上限（硬切断需 Effect.disconnect，刻意不取，与 exerciser 的 Promise.race 同残差）。→ 已在 global-lifecycle 注释精确化。
+  - Standards INFO-1：dag-loop-guards.test.ts 未用的 `probe` 变量。→ 已删。
+- 结论：非干净轮（4 INFO）。修复后进入 Round 3。
+
+### Round 3
 - 未开始

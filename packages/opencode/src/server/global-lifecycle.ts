@@ -21,6 +21,10 @@ export const emitGlobalDisposed = Effect.sync(() =>
 // timeoutOption represents the timeout as Option.none (never as an error), so
 // a genuine disposal failure still propagates for callers that do not swallow,
 // while a hang is always cut off and the Disposed event below always lands.
+// The cut lands at the disposal's first interruptible point: a wedge inside
+// an uninterruptible finalizer region can outlast the cap (a hard sever would
+// need Effect.disconnect, deliberately not taken — same residual the
+// exerciser's Promise.race guard carries).
 const DISPOSE_ALL_TIMEOUT = "10 seconds"
 
 export const disposeAllInstancesAndEmitGlobalDisposed = Effect.fn("Server.disposeAllInstancesAndEmitGlobalDisposed")(
