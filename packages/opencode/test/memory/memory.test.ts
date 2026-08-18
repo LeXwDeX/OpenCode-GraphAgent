@@ -1382,6 +1382,95 @@ describe("memory turn-scoped retrieval", () => {
       }),
     { git: true },
   )
+
+  // MEM-02 follow-up (acceptance): the cross-process identity fence must not
+  // be held across the SEARCH matcher model call — only the markMatched
+  // commit is fenced. While the matcher is parked mid-call, a concurrent
+  // checkpoint (whose render select needs the same identity fence) must not
+  // starve. Under the old shape the fence wrapped the whole lock block, so
+  // the checkpoint waited on the streaming matcher.
+  recall.it.instance(
+    "keeps the identity fence free while the search matcher streams",
+    () =>
+      Effect.gen(function* () {
+        recall.reset()
+        const started = yield* Deferred.make<void>()
+        const release = yield* Deferred.make<void>()
+        // Only the SLOW search query parks; the checkpoint's own render match
+        // must sail through — that is the assertion.
+        recall.state.matcher = (query) =>
+          query === "慢架构查询"
+            ? Effect.gen(function* () {
+                yield* Deferred.succeed(started, undefined)
+                yield* Deferred.await(release)
+                return { topic_ids: [recall.state.topics[0]?.id ?? ""] }
+              })
+            : Effect.succeed({ topic_ids: [recall.state.topics[0]?.id ?? ""] })
+        const memory = yield* Memory.Service
+        const sessionID = SessionID.make("ses_memory_search_fence_free")
+        const messages = [
+          user(MessageID.ascending(), sessionID, "先处理当前问题"),
+          user(MessageID.ascending(), sessionID, "召回相关历史"),
+        ]
+
+        const pending = yield* memory.search({ sessionID, messages, query: "慢架构查询" }).pipe(Effect.forkChild)
+        yield* Deferred.await(started)
+
+        const rendered = yield* awaitWithTimeout(
+          memory.checkpoint({ sessionID, messages }),
+          "checkpoint starved by the search matcher — fence held across the model call (MEM-02)",
+        )
+        expect(rendered.length).toBeGreaterThan(0)
+
+        yield* Deferred.succeed(release, undefined)
+        expect(yield* Fiber.join(pending)).toEqual({ status: "attached", count: 1, reused: false })
+      }),
+    { git: true },
+  )
+
+  // MEM-01 follow-up (acceptance): same discipline for the prepare
+  // first-turn (shouldMatch) branch — the bounded matcher moved out of the
+  // fence/lock, so a parked first-turn matcher cannot starve the fence.
+  recall.it.instance(
+    "keeps the identity fence free while the first-turn prepare matcher streams",
+    () =>
+      Effect.gen(function* () {
+        recall.reset()
+        const started = yield* Deferred.make<void>()
+        const release = yield* Deferred.make<void>()
+        // Only the FIRST matcher call (the first-turn prepare) parks; the
+        // concurrent checkpoint's render match — same text, so query-based
+        // discrimination is impossible — must sail through on its own call.
+        let matcherCalls = 0
+        recall.state.matcher = () =>
+          Effect.gen(function* () {
+            matcherCalls++
+            if (matcherCalls > 1) return { topic_ids: [recall.state.topics[0]?.id ?? ""] }
+            yield* Deferred.succeed(started, undefined)
+            yield* Deferred.await(release)
+            return { topic_ids: [recall.state.topics[0]?.id ?? ""] }
+          })
+        const memory = yield* Memory.Service
+        const sessionID = SessionID.make("ses_memory_prepare_fence_free")
+        const messages = [user(MessageID.ascending(), sessionID, "首次真实用户输入关于架构")]
+
+        const pending = yield* memory.prepare({ sessionID, messages }).pipe(Effect.forkChild)
+        yield* Deferred.await(started)
+
+        const rendered = yield* awaitWithTimeout(
+          memory.checkpoint({ sessionID, messages }),
+          "checkpoint starved by the first-turn prepare matcher — fence held across the model call (MEM-01)",
+        )
+        expect(rendered.length).toBeGreaterThan(0)
+
+        yield* Deferred.succeed(release, undefined)
+        yield* Fiber.join(pending)
+        // Both the first-turn prepare and the concurrent checkpoint render
+        // matched the same text; each recorded exactly its own call.
+        expect(recall.state.queries).toEqual(["首次真实用户输入关于架构", "首次真实用户输入关于架构"])
+      }),
+    { git: true },
+  )
 })
 
 describe("memory project config Git exclusions", () => {

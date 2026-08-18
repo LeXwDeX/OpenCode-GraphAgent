@@ -3,7 +3,7 @@ export * as Memory from "./memory"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { ProjectV2 } from "@opencode-ai/core/project"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
-import { Context, Effect, Layer, Option, Ref, Schema, Scope, Semaphore } from "effect"
+import { Context, Deferred, Effect, Layer, Option, Ref, Schema, Scope, Semaphore } from "effect"
 import { stringify } from "yaml"
 import { Config } from "@/config/config"
 import { Provider } from "@/provider/provider"
@@ -93,6 +93,16 @@ export const layer: Layer.Layer<
     const state = yield* InstanceState.make(() => Effect.succeed({ sessions: new Map<SessionID, SessionCache>() }))
     const scope = yield* Scope.Scope
     const maintenanceInFlight = yield* Ref.make(new Set<ProjectV2.ID>())
+    // MEM-02: per-(session,key) in-flight matcher registrations. Replaces the
+    // old "hold the fence/lock across the model call so the second caller
+    // blocks and re-reads the cache" coalescing: the second identical query
+    // now awaits the first one's Deferred instead — same observable semantics
+    // (reused: true, no extra query slot) without a model call under the
+    // fence/lock. Process-local by design (the fence is the cross-process
+    // seam, and it now covers only the markMatched commit).
+    const matchInFlight = yield* Ref.make(
+      new Map<string, Deferred.Deferred<{ count: number; rendered: string[] }>>(),
+    )
 
     const availableModels = Effect.fn("Memory.availableModels")(function* () {
       const providers = yield* provider.list()
@@ -283,7 +293,12 @@ export const layer: Layer.Layer<
     // Serialize the identity-liveness recheck and the per-project lock around
     // the store write only; the model calls that produce the update run
     // outside the fence/lock so a long reasoning call cannot wedge or leak it.
-    const applyUpdate = (projectID: ProjectV2.ID, update: (topics: MemorySchema.Topic[]) => MemoryStore.Update<undefined>) =>
+    // The update callback's result is passed through, so a commit like
+    // markMatched can hand the caller the post-commit topics to render.
+    const applyUpdate = <A>(
+      projectID: ProjectV2.ID,
+      update: (topics: MemorySchema.Topic[]) => MemoryStore.Update<A>,
+    ) =>
       fence.withLiveIdentity(
         projectID,
         lock.withProject(projectID)(store.updateTopics(projectID, update)),
@@ -328,6 +343,9 @@ export const layer: Layer.Layer<
       return decoded.value.actions
     })
 
+    // MEM-01/02: the matcher model call runs OUTSIDE the fence/lock; only the
+    // markMatched commit acquires them (applyUpdate). The matched topics come
+    // back from the commit for rendering.
     const select = Effect.fn("Memory.select")(function* (input: {
       model: Provider.Model
       config: MemorySchema.Config
@@ -336,11 +354,20 @@ export const layer: Layer.Layer<
       projectID: Project.Info["id"]
     }) {
       const topicIDs = yield* match(input)
-      const matched = yield* store.updateTopics(input.projectID, (topics) => ({
-        applied: MemoryStore.markMatched(topics, topicIDs),
-        result: undefined,
-      }))
-      const byID = new Map(matched.topics.map((topic) => [topic.id, topic]))
+      const committed = yield* applyUpdate(input.projectID, (topics) => {
+        // Re-filter against the post-read topics: the matcher filtered on the
+        // snapshot it saw; a topic deleted since then must not resurrect.
+        const live = new Set(topics.map((topic) => topic.id))
+        return {
+          applied: MemoryStore.markMatched(topics, topicIDs.filter((id) => live.has(id))),
+          result: undefined as void,
+        }
+      })
+      // Identity retired between the model call and the commit: nothing was
+      // written; there is no matched set to render.
+      if (Option.isNone(committed)) return undefined
+      const matched = committed.value.topics
+      const byID = new Map(matched.map((topic) => [topic.id, topic]))
       const selected = topicIDs.flatMap((id) => {
         const topic = byID.get(id)
         return topic ? [topic] : []
@@ -470,32 +497,29 @@ export const layer: Layer.Layer<
         return
       }
 
-      // The fence and the project lock cover the topic read plus the bounded
-      // first-turn matcher (declared tradeoff, see CONTEXT.md). Due maintenance
-      // is kicked AFTER the fence releases, so a long reasoning call never
-      // holds it: this turn renders the pre-maintenance topics and the
-      // committed update surfaces on a later prepare.
-      const live = yield* fence.withLiveIdentity(
-        current.project.id,
-        lock.withProject(current.project.id)(
-          Effect.gen(function* () {
-            const topics = yield* store.readTopics(current.project.id)
-            const rendered = (yield* select({
-              model: current.model,
-              config: current.loaded.config,
-              topics,
-              text: user.text,
-              projectID: current.project.id,
-            })).rendered
-            const entry = data.sessions.get(input.sessionID)
-            if (entry?.turn.messageID !== user.info.id) return
-            entry.turn = { ...entry.turn, completedTurns: turns, rendered }
-          }),
-        ),
-      )
-      if (Option.isNone(live)) {
+      // MEM-01: the first-turn matcher runs OUTSIDE the fence/lock; only its
+      // markMatched commit acquires them (inside select → applyUpdate). An
+      // identity retired mid-call surfaces as select === undefined — fail
+      // closed by dropping the cached session state. Due maintenance is
+      // kicked AFTERwards, so a long reasoning call never holds the fence:
+      // this turn renders the pre-maintenance topics and the committed update
+      // surfaces on a later prepare.
+      const rendered = yield* select({
+        model: current.model,
+        config: current.loaded.config,
+        topics: yield* store.readTopics(current.project.id),
+        text: user.text,
+        projectID: current.project.id,
+      })
+      if (!rendered) {
         yield* clearSession(input.sessionID)
         return
+      }
+      {
+        const entry = data.sessions.get(input.sessionID)
+        if (entry?.turn.messageID === user.info.id) {
+          entry.turn = { ...entry.turn, completedTurns: turns, rendered: rendered.rendered }
+        }
       }
       if (!due) return
       if (Option.isNone(yield* kickMaintenance(maintenance))) yield* clearSession(input.sessionID)
@@ -559,51 +583,78 @@ export const layer: Layer.Layer<
       }
       const origin = user.info.id
 
-      // Declared tradeoff (issue #324, see CONTEXT.md): unlike maintenance, the
-      // matcher model call runs INSIDE the fence/lock. That serialization is
-      // what coalesces concurrent identical queries — the second caller blocks,
-      // re-reads `queries` under the lock, and reuses the first result instead
-      // of spending another model call. The lock also covers markMatched.
-      const live = yield* fence.withLiveIdentity(
-        current.project.id,
+      // MEM-02 (issue #324 acceptance): the matcher model call runs OUTSIDE
+      // the fence/lock. Concurrent identical queries coalesce through the
+      // per-(session,key) in-flight Deferred instead of lock-blocking: the
+      // second caller re-checks the cache under a SHORT project-lock
+      // critical section, awaits the first caller's result, and reports
+      // reused without spending another model call or query slot. Only the
+      // markMatched commit (inside select → applyUpdate) acquires the
+      // fence/lock.
+      const inFlightKey = `${input.sessionID}\0${key}`
+      const deferred = yield* Deferred.make<{ count: number; rendered: string[] }>()
+
+      const outcome = yield* lock.withProject(current.project.id)(
         Effect.gen(function* () {
-          return yield* lock.withProject(current.project.id)(
-            Effect.gen(function* () {
-              const activeTurn = data.sessions.get(input.sessionID)?.turn
-              if (activeTurn?.messageID !== origin) return { status: "stale" as const }
-              const repeated = activeTurn.queries.get(key)
-              if (repeated) {
-                activeTurn.rendered = repeated.rendered
-                return repeated.count > 0
-                  ? { status: "attached" as const, count: repeated.count, reused: true }
-                  : { status: "empty" as const, reused: true }
-              }
-              if (activeTurn.queryCount >= 2) return { status: "limit" as const }
-              activeTurn.queryCount++
-              const topics = yield* store.readTopics(current.project.id)
-              const selected = yield* select({
-                model: current.model,
-                config: current.loaded.config,
-                topics,
-                text: query,
-                projectID: current.project.id,
-              })
-              const latest = data.sessions.get(input.sessionID)?.turn
-              if (latest?.messageID !== origin) return { status: "stale" as const }
-              latest.queries.set(key, selected)
-              latest.rendered = selected.rendered
-              return selected.count > 0
-                ? { status: "attached" as const, count: selected.count, reused: false }
-                : { status: "empty" as const, reused: false }
-            }),
+          const activeTurn = data.sessions.get(input.sessionID)?.turn
+          if (activeTurn?.messageID !== origin) return { status: "stale" as const }
+          const repeated = activeTurn.queries.get(key)
+          if (repeated) {
+            activeTurn.rendered = repeated.rendered
+            return repeated.count > 0
+              ? { status: "attached" as const, count: repeated.count, reused: true }
+              : { status: "empty" as const, reused: true }
+          }
+          if (activeTurn.queryCount >= 2) return { status: "limit" as const }
+          const running = yield* Ref.modify(matchInFlight, (map) =>
+            map.has(inFlightKey)
+              ? ([map.get(inFlightKey)!, map] as const)
+              : ([deferred, new Map(map).set(inFlightKey, deferred)] as const),
           )
+          if (running !== deferred) return { kind: "await-first" as const, first: running }
+          activeTurn.queryCount++
+          return { kind: "run" as const }
         }),
       )
-      if (Option.isNone(live)) {
-        yield* clearSession(input.sessionID)
-        return { status: "unavailable" as const }
+      if ("kind" in outcome) {
+        if (outcome.kind === "await-first") {
+          const first = yield* Deferred.await(outcome.first)
+          const latest = data.sessions.get(input.sessionID)?.turn
+          if (latest?.messageID !== origin) return { status: "stale" as const }
+          return first.count > 0
+            ? { status: "attached" as const, count: first.count, reused: true }
+            : { status: "empty" as const, reused: true }
+        }
+        // This caller owns the matcher run: model call outside every
+        // fence/lock, then the fenced markMatched commit, then publish.
+        const selected = yield* select({
+          model: current.model,
+          config: current.loaded.config,
+          topics: yield* store.readTopics(current.project.id),
+          text: query,
+          projectID: current.project.id,
+        })
+        yield* Ref.update(matchInFlight, (map) => {
+          if (map.get(inFlightKey) !== deferred) return map
+          const next = new Map(map)
+          next.delete(inFlightKey)
+          return next
+        })
+        // Identity retired between model call and commit — fail closed.
+        if (!selected) {
+          yield* clearSession(input.sessionID)
+          return { status: "unavailable" as const }
+        }
+        yield* Deferred.succeed(deferred, selected)
+        const latest = data.sessions.get(input.sessionID)?.turn
+        if (latest?.messageID !== origin) return { status: "stale" as const }
+        latest.queries.set(key, selected)
+        latest.rendered = selected.rendered
+        return selected.count > 0
+          ? { status: "attached" as const, count: selected.count, reused: false }
+          : { status: "empty" as const, reused: false }
       }
-      return live.value
+      return outcome
     })
 
     const search: Interface["search"] = Effect.fn("Memory.search")((input) =>
@@ -627,22 +678,18 @@ export const layer: Layer.Layer<
         return []
       }
       const user = latestRealUser(input.messages)
-      const live = yield* fence.withLiveIdentity(
-        current.project.id,
-        lock.withProject(current.project.id)(
-          Effect.gen(function* () {
-            const topics = yield* store.readTopics(current.project.id)
-            return (yield* select({
-              model: current.model,
-              config: current.loaded.config,
-              topics,
-              text: user?.text ?? "",
-              projectID: current.project.id,
-            })).rendered
-          }),
-        ),
-      )
-      if (Option.isNone(live)) {
+      // MEM-01: the render matcher runs OUTSIDE the fence/lock; its
+      // markMatched commit is fenced inside select → applyUpdate. An identity
+      // retired mid-call (select === undefined) fails closed to an empty
+      // render, same as the retired-fence outcome before.
+      const selected = yield* select({
+        model: current.model,
+        config: current.loaded.config,
+        topics: yield* store.readTopics(current.project.id),
+        text: user?.text ?? "",
+        projectID: current.project.id,
+      })
+      if (!selected) {
         yield* clearSession(input.sessionID)
         return []
       }
@@ -657,7 +704,7 @@ export const layer: Layer.Layer<
         projectID: current.project.id,
       })
       if (Option.isNone(kicked)) yield* clearSession(input.sessionID)
-      return live.value
+      return selected.rendered
     })
 
     const checkpoint: Interface["checkpoint"] = Effect.fn("Memory.checkpoint")((input) =>
