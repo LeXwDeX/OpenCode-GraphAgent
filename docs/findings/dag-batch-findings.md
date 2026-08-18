@@ -53,4 +53,9 @@
 - 结论：非干净轮（4 INFO）。修复后进入 Round 3。
 
 ### Round 3
+- Spec 镜：**PASS，no findings**（干净轮候选）。
+- Standards 镜：**PASS**，1 条 INFO：R3-1——vetoHold 注释的 resume 枚举「stepping/pending」不完整：hold 之后父层仍可先持久 pause 再 resume（该路径释放有效），且 pending 对已启动工作流不可达。→ 已改为「resume only when the durable row is not running (paused/stepping)」并说明直至持久 pause 落地。
+- 结论：非干净轮。修复后进入 Round 4。
+
+### Round 4
 - 未开始
