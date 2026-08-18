@@ -44,6 +44,54 @@ describe("workflow blocks", () => {
     ])
   })
 
+  // issue #323: a reporting checkpoint adjudicates a direction — its prompt
+  // must demand adversarial independent verification, not self-confirmation
+  // of upstream claims. The production incident: cp-after-exploration
+  // confirmed a parent-supplied "defect" that was a production no-op because
+  // the gate re-read the parent's narrative instead of reading the source.
+  it("compiles reporting checkpoints with an adversarial verification clause", () => {
+    const nodes = DagBlocks.compileWorkflowBlocks({
+      objective: "Ship the feature",
+      blocks: [
+        { id: "cp-after-exploration", kind: "explore", report_to_parent: true },
+        { id: "stage", kind: "coding", depends_on: ["cp-after-exploration"] },
+      ],
+    })
+    const checkpoint = nodes.find((node) => node.id === "cp-after-exploration")
+    expect(checkpoint?.report_to_parent).toBe(true)
+    // Upstream claims are hypotheses to verify, not facts to confirm.
+    expect(checkpoint?.prompt_template.inline).toContain("hypotheses to verify")
+    // Independent source inspection is mandatory for load-bearing claims.
+    expect(checkpoint?.prompt_template.inline).toContain("independently read the relevant source")
+    // A claim that fails inspection must fail the direction, not pass it.
+    expect(checkpoint?.prompt_template.inline).toContain("replan or reject")
+  })
+
+  it("keeps the adversarial clause off non-reporting nodes", () => {
+    const nodes = DagBlocks.compileWorkflowBlocks({
+      objective: "Ship the feature",
+      blocks: [
+        { id: "map", kind: "explore" },
+        { id: "stage", kind: "coding", depends_on: ["map"] },
+      ],
+    })
+    // Only adjudicating checkpoints pay the adversarial cost; evidence
+    // producers (a plain explore) and executors (coding) do not.
+    for (const node of nodes) {
+      expect(node.report_to_parent).toBe(false)
+      expect(node.prompt_template.inline).not.toContain("hypotheses to verify")
+    }
+  })
+
+  it("gives default-reporting synthesize nodes the adversarial clause", () => {
+    const nodes = DagBlocks.compileWorkflowBlocks({
+      objective: "Ship the feature",
+      blocks: [{ id: "closing", kind: "synthesize" }],
+    })
+    expect(nodes[0]?.report_to_parent).toBe(true)
+    expect(nodes[0]?.prompt_template.inline).toContain("hypotheses to verify")
+  })
+
   it("composes configured design delivery capabilities without new lifecycle kinds", () => {
     const nodes = DagBlocks.compileWorkflowBlocks({
       objective: "Design, implement, and review project-owned memory",

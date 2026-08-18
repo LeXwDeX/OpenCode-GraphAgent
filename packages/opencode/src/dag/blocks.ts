@@ -327,6 +327,14 @@ function node(input: {
   outputSchema?: Record<string, unknown>
 }): NodeConfig {
   const instruction = input.instruction?.trim() ? "Block-specific instruction:\n{{instruction}}" : ""
+  // issue #323: a reporting checkpoint adjudicates a direction, so its
+  // prompt must demand adversarial independent verification. The production
+  // incident: a gate confirmed parent-supplied "defect evidence" that was a
+  // production no-op because it re-read the parent's narrative instead of
+  // the source. Upstream claims are hypotheses, not facts.
+  const adversarial = input.reportToParent
+    ? "As a reporting checkpoint you adjudicate this direction: treat upstream and parent-supplied claims as hypotheses to verify, never facts to confirm. independently read the relevant source before endorsing the most load-bearing claims, cite what you actually inspected, and replan or reject the direction when a load-bearing claim does not survive inspection."
+    : ""
   return {
     id: input.id,
     name: input.name,
@@ -339,6 +347,7 @@ function node(input: {
         "Workflow objective:\n{{objective}}",
         instruction,
         input.contract,
+        adversarial,
         "Use dependency outputs as evidence and return a concise artifact that downstream blocks can consume. Do not ask the user questions from this child session.",
       ]
         .filter(Boolean)
