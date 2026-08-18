@@ -634,10 +634,10 @@ export const layer: Layer.Layer<
           // The awaiter rides the runner's exit: the runner's exit bracket
           // packs every outcome — success, failure, interrupt, retired —
           // into the deferred payload, so the await always wakes. Failures
-          // surface as this caller's "failed" (mapped by the search
-          // wrapper's catchCause); the runner's interrupt cause is re-raised
-          // via failCause so the wrapper's log carries it — the awaiter
-          // itself still completes with "failed". Never a permanent park.
+          // surface as this caller's "failed" (returned directly here);
+          // the runner's interrupt cause is re-raised via failCause so the
+          // wrapper's log carries it — the awaiter itself still completes
+          // with "failed". Never a permanent park.
           const first = yield* Deferred.await(outcome.first)
           if (Exit.isFailure(first)) {
             if (Cause.hasInterrupts(first.cause)) return yield* Effect.failCause(first.cause)

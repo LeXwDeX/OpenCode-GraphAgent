@@ -1529,9 +1529,9 @@ describe("memory turn-scoped retrieval", () => {
 
   // Review R2 issue 1: the exit bracket must start at REGISTRATION, not at
   // the select pipeline — an interrupt during the runner's pre-select topics
-  // read (a real suspension in production, flock'd disk I/O) previously
-  // unwound before onExit attached, leaking the in-flight entry and wedging
-  // the (turn,key) forever.
+  // read (a real async fs suspension in production) previously unwound
+  // before onExit attached, leaking the in-flight entry and wedging the
+  // (turn,key) forever.
   recall.it.instance(
     "an interrupted topics read releases the in-flight entry and never wedges the key",
     () =>

@@ -53,4 +53,9 @@
 - 结论：非干净轮（INFO）。修复后进入 Round 4。
 
 ### Round 4
+- Spec 镜：**PASS，no findings**（干净轮候选）。
+- Standards 镜：**PASS**，2 条 INFO：R4-1 awaiter 注释把非中断失败的映射错归 wrapper catchCause（实际直接返回 failed）；R4-2 测试注释「flock'd disk I/O」不准（readTopics 无 flock，是 async fs）。→ 均已改写。
+- 结论：非干净轮。修复后进入 Round 5。
+
+### Round 5
 - 未开始
