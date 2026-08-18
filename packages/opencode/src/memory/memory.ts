@@ -328,27 +328,6 @@ export const layer: Layer.Layer<
       return decoded.value.actions
     })
 
-    const maintain = Effect.fn("Memory.maintain")(function* (input: {
-      model: Provider.Model
-      config: MemorySchema.Config
-      topics: MemorySchema.Topic[]
-      messages: SessionV1.WithParts[]
-      projectID: Project.Info["id"]
-    }) {
-      const actions = yield* proposeMaintenance(input)
-      if (!actions) return input.topics
-      return yield* store
-        .updateTopics(input.projectID, (topics) => ({
-          applied: MemoryStore.applyActions({
-            topics,
-            actions,
-            topicLimit: input.config.topic_limit,
-          }),
-          result: undefined,
-        }))
-        .pipe(Effect.map((updated) => updated.topics))
-    })
-
     const select = Effect.fn("Memory.select")(function* (input: {
       model: Provider.Model
       config: MemorySchema.Config
@@ -373,12 +352,13 @@ export const layer: Layer.Layer<
     // matcher and maintenance model run OUTSIDE the fence/lock, and only the
     // topic commit acquires them (applyUpdate), so a long reasoning call
     // cannot wedge the lock, leak it on interruption, or block the caller.
-    const backgroundMaintain = Effect.fn("Memory.backgroundMaintain")(function* (input: {
+    type MaintenanceInput = {
       model: Provider.Model
       config: MemorySchema.Config
       messages: SessionV1.WithParts[]
       projectID: ProjectV2.ID
-    }) {
+    }
+    const backgroundMaintain = Effect.fn("Memory.backgroundMaintain")(function* (input: MaintenanceInput) {
       const topics = yield* store.readTopics(input.projectID)
       const actions = yield* proposeMaintenance({
         model: input.model,
@@ -405,37 +385,40 @@ export const layer: Layer.Layer<
         return next
       })
 
-    const kickMaintenance = Effect.fn("Memory.kickMaintenance")(function* (input: {
-      model: Provider.Model
-      config: MemorySchema.Config
-      messages: SessionV1.WithParts[]
-      projectID: ProjectV2.ID
-    }) {
+    const kickMaintenance = Effect.fn("Memory.kickMaintenance")(function* (input: MaintenanceInput) {
       const job = backgroundMaintain(input).pipe(
         Effect.catchCause((cause) => Effect.logWarning("background MEMORY maintenance failed", { cause })),
         Effect.ensuring(releaseMaintenanceSlot(input.projectID)),
       )
-      // Reserve and fork atomically: an interruption between the two would
-      // leak the in-flight slot and silently skip every later maintenance for
-      // this process; a fork into a closing scope must hand the slot back.
-      yield* Effect.uninterruptible(
-        Effect.gen(function* () {
-          const reserved = yield* Ref.modify(maintenanceInFlight, (set) =>
-            set.has(input.projectID)
-              ? ([false, set] as const)
-              : ([true, new Set(set).add(input.projectID)] as const),
-          )
-          if (!reserved) return
-          yield* job.pipe(
-            Effect.forkIn(scope),
-            Effect.catchCause((cause) =>
-              Effect.gen(function* () {
-                yield* releaseMaintenanceSlot(input.projectID)
-                yield* Effect.logWarning("background MEMORY maintenance fork failed", { cause })
-              }),
-            ),
-          )
-        }),
+      // The single definition of the kickoff rule: the identity fence gates
+      // the fork, so a retired identity never burns a maintenance model call.
+      // Callers must NOT already hold the fence (it is not reentrant) and must
+      // treat None as "identity retired" — dropping their cached session state
+      // is the whole cost, because the commit inside applyUpdate is fenced too.
+      return yield* fence.withLiveIdentity(
+        input.projectID,
+        // Reserve and fork atomically: an interruption between the two would
+        // leak the in-flight slot and silently skip every later maintenance for
+        // this process; a fork into a closing scope must hand the slot back.
+        Effect.uninterruptible(
+          Effect.gen(function* () {
+            const reserved = yield* Ref.modify(maintenanceInFlight, (set) =>
+              set.has(input.projectID)
+                ? ([false, set] as const)
+                : ([true, new Set(set).add(input.projectID)] as const),
+            )
+            if (!reserved) return
+            yield* job.pipe(
+              Effect.forkIn(scope),
+              Effect.catchCause((cause) =>
+                Effect.gen(function* () {
+                  yield* releaseMaintenanceSlot(input.projectID)
+                  yield* Effect.logWarning("background MEMORY maintenance fork failed", { cause })
+                }),
+              ),
+            )
+          }),
+        ),
       )
     })
 
@@ -470,50 +453,52 @@ export const layer: Layer.Layer<
       session.firstTurnAttempted = true
       if (!due && !shouldMatch) return
 
-      // Cross-process identity guard (see checkpointUnsafe): MemoryIdentityFence
-      // re-checks identity liveness under the identity lock before writing.
+      const maintenance = {
+        model: current.model,
+        config: current.loaded.config,
+        messages: input.messages,
+        projectID: current.project.id,
+      }
+
+      if (!shouldMatch) {
+        // Due-only turns reuse the cached injection: no project lock, no store
+        // read, and the cadence bookkeeping is a process-local map write. The
+        // kick carries the identity gate (see kickMaintenance).
+        const entry = data.sessions.get(input.sessionID)
+        if (entry?.turn.messageID === user.info.id) entry.turn = { ...entry.turn, completedTurns: turns }
+        if (Option.isNone(yield* kickMaintenance(maintenance))) yield* clearSession(input.sessionID)
+        return
+      }
+
+      // The fence and the project lock cover the topic read plus the bounded
+      // first-turn matcher (declared tradeoff, see CONTEXT.md). Due maintenance
+      // is kicked AFTER the fence releases, so a long reasoning call never
+      // holds it: this turn renders the pre-maintenance topics and the
+      // committed update surfaces on a later prepare.
       const live = yield* fence.withLiveIdentity(
         current.project.id,
-        Effect.gen(function* () {
-          yield* lock.withProject(current.project.id)(
-            Effect.gen(function* () {
-              const topics = yield* store.readTopics(current.project.id)
-              const maintained = due
-                ? yield* maintain({
-                    model: current.model,
-                    config: current.loaded.config,
-                    topics,
-                    messages: input.messages,
-                    projectID: current.project.id,
-                  }).pipe(
-                    Effect.catchCause((cause) =>
-                      Effect.gen(function* () {
-                        yield* Effect.logWarning("periodic MEMORY maintenance failed", { cause })
-                        return topics
-                      }),
-                    ),
-                  )
-                : topics
-              const rendered = shouldMatch
-                ? (yield* select({
-                    model: current.model,
-                    config: current.loaded.config,
-                    topics: maintained,
-                    text: user.text,
-                    projectID: current.project.id,
-                  })).rendered
-                : (data.sessions.get(input.sessionID)?.turn.rendered ?? [])
-              const entry = data.sessions.get(input.sessionID)
-              if (entry?.turn.messageID !== user.info.id) return
-              entry.turn = { ...entry.turn, completedTurns: turns, rendered }
-            }),
-          )
-        }),
+        lock.withProject(current.project.id)(
+          Effect.gen(function* () {
+            const topics = yield* store.readTopics(current.project.id)
+            const rendered = (yield* select({
+              model: current.model,
+              config: current.loaded.config,
+              topics,
+              text: user.text,
+              projectID: current.project.id,
+            })).rendered
+            const entry = data.sessions.get(input.sessionID)
+            if (entry?.turn.messageID !== user.info.id) return
+            entry.turn = { ...entry.turn, completedTurns: turns, rendered }
+          }),
+        ),
       )
       if (Option.isNone(live)) {
         yield* clearSession(input.sessionID)
         return
       }
+      if (!due) return
+      if (Option.isNone(yield* kickMaintenance(maintenance))) yield* clearSession(input.sessionID)
     })
 
     const prepare: Interface["prepare"] = Effect.fn("Memory.prepare")((input) =>
@@ -574,8 +559,11 @@ export const layer: Layer.Layer<
       }
       const origin = user.info.id
 
-      // Cross-process identity guard (see checkpointUnsafe): MemoryIdentityFence
-      // re-checks identity liveness under the identity lock before matching/writing.
+      // Declared tradeoff (issue #324, see CONTEXT.md): unlike maintenance, the
+      // matcher model call runs INSIDE the fence/lock. That serialization is
+      // what coalesces concurrent identical queries — the second caller blocks,
+      // re-reads `queries` under the lock, and reuses the first result instead
+      // of spending another model call. The lock also covers markMatched.
       const live = yield* fence.withLiveIdentity(
         current.project.id,
         Effect.gen(function* () {
@@ -658,16 +646,17 @@ export const layer: Layer.Layer<
         yield* clearSession(input.sessionID)
         return []
       }
-      // Maintenance runs in the background AFTER the identity fence: compaction
-      // must not wait on a long reasoning call, a retired identity never burns
-      // model calls, and the injection above rendered the pre-maintenance
-      // topics. At most one job per project is in flight.
-      yield* kickMaintenance({
+      // Maintenance is kicked AFTER the identity fence releases: compaction must
+      // not wait on a long reasoning call, and the injection above rendered the
+      // pre-maintenance topics. The kick carries the identity gate and the
+      // one-job-per-project reservation (see kickMaintenance).
+      const kicked = yield* kickMaintenance({
         model: current.model,
         config: current.loaded.config,
         messages: input.messages,
         projectID: current.project.id,
       })
+      if (Option.isNone(kicked)) yield* clearSession(input.sessionID)
       return live.value
     })
 
