@@ -460,10 +460,16 @@ describe("Goal.resume — preserves turns_used (no fresh budget), resets parse f
       const sessionID = SessionID.descending()
 
       const state = yield* goal.set(sessionID, "build feature X", 10)
-      // One continuation dispatch with a parse failure → turns_used=1, cpf=1
-      yield* goal.updateAfterJudge(sessionID, "continue", "more steps", true, {
+      // One SUCCESSFUL continue judgment → turns_used=1 (real budget spent).
+      const s1 = yield* goal.updateAfterJudge(sessionID, "continue", "real verdict", false, {
         goalID: state.goal_id ?? "legacy",
         revision: state.revision ?? 0,
+      })
+      // Then one parse-failure judgment → cpf=1 while turns_used stays 1
+      // (GOAL-03 budget-neutrality: a failed judge spends no turn).
+      yield* goal.updateAfterJudge(sessionID, "continue", "more steps", true, {
+        goalID: s1?.state.goal_id ?? "legacy",
+        revision: s1?.state.revision ?? 0,
       })
       const beforePause = yield* goal.load(sessionID)
       expect(Number(beforePause?.turns_used)).toBe(1)
@@ -725,6 +731,52 @@ describe("Goal.updateAfterJudge — transport failures trigger auto-pause (D5)",
 
       state = yield* goal.load(sessionID)
       expect(state?.status).toBe("paused")
+    }),
+  )
+
+  // GOAL-03: a judge that never produced a verdict (transport error or
+  // unparseable output) evaluated no turn — it must not consume one of the
+  // user's max_turns and must not stamp last_judged_msg (the boundary was
+  // never judged; a crash after this commit must re-judge the same boundary,
+  // and that re-judgment — not this failed attempt — may consume the budget
+  // slot). The parse-failure counter still climbs, so an unreliable judge
+  // still auto-pauses after MAX_CONSECUTIVE_PARSE_FAILURES.
+  it.live("a failed judge is budget-neutral: no turns_used increment, no last_judged_msg stamp", () =>
+    Effect.gen(function* () {
+      const goal = yield* Goal.Service
+      const sessionID = SessionID.descending()
+      const seeded = yield* goal.set(sessionID, "build feature X", 10)
+
+      const failed = yield* goal.updateAfterJudge(
+        sessionID,
+        "continue",
+        "judge transport error (timeout or network) — counting toward pause budget",
+        true,
+        { goalID: seeded.goal_id ?? "legacy", revision: seeded.revision ?? 0 },
+        "msg_boundary_failed",
+      )
+      expect(failed?.shouldContinue).toBe(true)
+
+      const state = yield* goal.load(sessionID)
+      expect(Number(state?.turns_used)).toBe(0)
+      expect(state?.last_judged_msg).toBeUndefined()
+      expect(Number(state?.consecutive_parse_failures)).toBe(1)
+
+      // A successful judge afterwards consumes exactly one budget slot and
+      // stamps the boundary it actually judged.
+      const ok = yield* goal.updateAfterJudge(
+        sessionID,
+        "continue",
+        "real verdict",
+        false,
+        { goalID: state?.goal_id ?? "legacy", revision: state?.revision ?? 0 },
+        "msg_boundary_real",
+      )
+      expect(ok?.shouldContinue).toBe(true)
+      const after = yield* goal.load(sessionID)
+      expect(Number(after?.turns_used)).toBe(1)
+      expect(after?.last_judged_msg).toBe("msg_boundary_real")
+      expect(Number(after?.consecutive_parse_failures)).toBe(0)
     }),
   )
 })

@@ -1731,7 +1731,9 @@ describe("GoalLoop — NotFoundError on the post-judge reload must not stall (GO
 // resolution → getLanguage → generateText) can defect (config orDie, payload
 // decode throws); a defect escaping into the fork was the invisible 0-turn
 // stall class. catchCause folds it into the parseFailed budget so the loop
-// commits the turn and auto-pauses after MAX_CONSECUTIVE_PARSE_FAILURES.
+// commits the parse failure and auto-pauses after
+// MAX_CONSECUTIVE_PARSE_FAILURES (GOAL-03: budget-neutrally — a failed judge
+// consumed no turn, so turns_used and the boundary stamp are untouched).
 describe("GoalLoop — judge-chain defect degrades into the parse budget (GOAL-FP-01-18b)", () => {
   let judgeCalls = 0
   const sessionMock = Layer.mock(Session.Service, {
@@ -1763,7 +1765,11 @@ describe("GoalLoop — judge-chain defect degrades into the parse budget (GOAL-F
   )
   const it = testEffect(defectLayer)
 
-  it.instance("a defecting judge commits the turn and counts a parse failure", () =>
+  // GOAL-03: the commit still lands (the parse-failure counter advances so
+  // the auto-pause safety valve keeps working), but the failed judge is
+  // budget-neutral — it evaluated no turn, so turns_used stays 0 and the
+  // boundary is not stamped as judged.
+  it.instance("a defecting judge commits a parse failure without consuming budget", () =>
     Effect.gen(function* () {
       judgeCalls = 0
       const loop = yield* GoalLoop.Service
@@ -1780,14 +1786,15 @@ describe("GoalLoop — judge-chain defect degrades into the parse budget (GOAL-F
       const committed = yield* pollWithTimeout(
         Effect.gen(function* () {
           const g = yield* goal.load(sid)
-          return g && g.turns_used >= 1 ? g : undefined
+          return g && g.consecutive_parse_failures >= 1 ? g : undefined
         }),
-        "turn never committed — the judge defect escaped the fork",
+        "parse failure never committed — the judge defect escaped the fork",
         "5 seconds",
       )
       expect(judgeCalls).toBe(1)
-      expect(committed.turns_used).toBe(1)
+      expect(committed.turns_used).toBe(0)
       expect(committed.consecutive_parse_failures).toBe(1)
+      expect(committed.last_judged_msg).toBeUndefined()
       // First defect is a blip: verdict stays continue, goal keeps running.
       expect(committed.status).toBe("active")
     }),

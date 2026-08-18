@@ -91,7 +91,9 @@ export interface Interface {
     /** issue #285: the assistant message ID judged for this evaluation.
      * Persisted on continue commits as the DURABLE crash-recovery gate — the
      * boot scan skips a window still ending on this boundary (the
-     * process-local evaluatedRevisions map cannot survive a crash). */
+     * process-local evaluatedRevisions map cannot survive a crash).
+     * GOAL-03: never persisted when `parseFailed` — a judge that produced no
+     * verdict judged no boundary. */
     judged?: string,
   ) => Effect.Effect<
     | {
@@ -748,7 +750,17 @@ const serviceLayer = Layer.effect(
           }
         }
 
-        const turnsUsed = GoalState.nni(state.turns_used + 1)
+        // GOAL-03: a judge that never produced a verdict (transport error or
+        // unparseable output) evaluated no turn — budget-neutral: it must not
+        // consume one of the user's max_turns, and it must not stamp
+        // last_judged_msg (the boundary was never judged; a crash after this
+        // commit must re-judge the same boundary, and that re-judgment — not
+        // this failed attempt — may consume the budget slot). Pre-fix a flaky
+        // judge burned budget on unevaluated turns while intermittent
+        // successes kept the parse-failure counter resetting. The counter
+        // itself still climbs here, so MAX_CONSECUTIVE_PARSE_FAILURES
+        // auto-pause is unaffected.
+        const turnsUsed = parseFailed ? state.turns_used : GoalState.nni(state.turns_used + 1)
         const pauseReason =
           newParseFailures >= GoalPrompts.MAX_CONSECUTIVE_PARSE_FAILURES
             ? "judge 模型未返回有效 JSON 判定。请检查模型配置或换用更可靠的模型，然后 /goal resume。"
@@ -764,7 +776,9 @@ const serviceLayer = Layer.effect(
           paused_reason: pauseReason,
           consecutive_parse_failures: GoalState.nni(newParseFailures),
           // issue #285: record the judged boundary for the durable scan gate.
-          ...(judged !== undefined ? { last_judged_msg: judged } : {}),
+          // GOAL-03: only a judge that actually returned a verdict judged the
+          // boundary (see turnsUsed above).
+          ...(judged !== undefined && !parseFailed ? { last_judged_msg: judged } : {}),
         })
         return {
           tag: "save",
