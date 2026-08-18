@@ -1794,14 +1794,18 @@ describe("GoalLoop — judge-chain defect degrades into the parse budget (GOAL-F
   )
 })
 
-// issue #285 / GOAL-FP-01-21: the boot scan must not re-judge a boundary the
-// crashed process already judged and committed. The process-local
-// evaluatedRevisions map dies with the process, so the DURABLE gate is the
-// goal row's last_judged_msg: updateAfterJudge records the judged assistant
-// message ID on every continue commit, and the scan path skips evaluation
-// while the session window still ends on that same message. Live idle events
-// are never gated (each dispatched continuation produces a fresh assistant
-// message, so the live path always sees a new boundary).
+// issue #285 / GOAL-FP-01-21 / GOAL-01: the boot scan must not re-judge a
+// boundary the crashed process already judged and committed, but it MUST
+// still restore the drive. The process-local evaluatedRevisions map dies
+// with the process, so the DURABLE gate is the goal row's last_judged_msg:
+// updateAfterJudge records the judged assistant message ID on every continue
+// commit, and while the session window still ends on that same message the
+// scan path suppresses RE-JUDGMENT only — a plain skip stranded goals whose
+// committed continuation was lost to the crash (nothing left to drive them,
+// GOAL-01). On a gate hit the judge and its commit are skipped, but the
+// continuation dispatch still runs. Live idle events are never gated (each
+// dispatched continuation produces a fresh assistant message, so the live
+// path always sees a new boundary).
 describe("GoalLoop — boot scan must not re-evaluate an already-judged boundary (issue #285)", () => {
   let judgeCalls = 0
   let continuationCalls = 0
@@ -1887,7 +1891,11 @@ describe("GoalLoop — boot scan must not re-evaluate an already-judged boundary
       return result?.state
     })
 
-  it.instance("scan with an unchanged boundary skips re-evaluation (no inflation)", () =>
+  // GOAL-01: the gate suppresses RE-JUDGMENT, never the drive. The crashed
+  // continuation must be re-dispatched (the goal would otherwise sit
+  // permanently active with nothing driving it), while the judge call and
+  // the turns_used increment stay suppressed (no inflation).
+  it.instance("scan with an unchanged boundary skips re-judgment but still dispatches the continuation", () =>
     Effect.gen(function* () {
       reset()
       const loop = yield* GoalLoop.Service
@@ -1899,11 +1907,15 @@ describe("GoalLoop — boot scan must not re-evaluate an already-judged boundary
       yield* commitPriorBoundary(sid)
 
       yield* loop.init()
-      // Negative assertion: the scan runs in a forked fiber with no readiness
-      // signal on the skip path, so a bounded wait stands in for polling.
-      yield* Effect.sleep("300 millis")
+      // The gate-hit path dispatches the continuation synchronously enough to
+      // poll on its admission signal instead of a bounded sleep.
+      yield* pollWithTimeout(
+        Effect.sync(() => (continuationCalls >= 1 ? true : undefined)),
+        "gate-hit scan never dispatched the crashed continuation",
+        "5 seconds",
+      )
       expect(judgeCalls).toBe(0)
-      expect(continuationCalls).toBe(0)
+      expect(continuationCalls).toBe(1)
       const g = yield* goal.load(sid)
       expect(g?.turns_used).toBe(1)
     }),
