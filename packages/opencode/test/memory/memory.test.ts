@@ -29,7 +29,7 @@ import { MCP } from "@/mcp"
 import { Skill } from "@/skill"
 import { SystemPrompt } from "@/session/system"
 import { tmpdirScoped } from "../fixture/fixture"
-import { pollWithTimeout, testEffect } from "../lib/effect"
+import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
 import { ProviderTest } from "../fake/provider"
 
 const config = {
@@ -317,6 +317,7 @@ function recallFixture() {
     config: MemorySchema.Config
     projectInitialized: number
     matcher?: (query: string) => Effect.Effect<unknown>
+    maintenanceHook?: () => Effect.Effect<unknown>
   } = {
     queries: [],
     reads: 0,
@@ -367,6 +368,7 @@ function recallFixture() {
                 return { topic_ids: query.includes("架构") ? [state.topics[0]?.id] : [] }
               }
               state.maintenance++
+              if (state.maintenanceHook) return yield* state.maintenanceHook()
               return { actions: [{ type: "no_change" }] }
             }),
         }),
@@ -410,6 +412,7 @@ function recallFixture() {
       state.config = config
       state.projectInitialized = 1
       state.matcher = undefined
+      state.maintenanceHook = undefined
     },
     it: testEffect(layer),
     systemIt: testEffect(systemLayer),
@@ -1268,9 +1271,66 @@ describe("memory turn-scoped retrieval", () => {
         ]
         yield* memory.prepare({ sessionID, messages })
 
-        expect(recall.state.maintenance).toBe(1)
+        // Maintenance runs in the background after the render fence (issue
+        // #324): polling stands in for the old synchronous completion.
+        yield* pollWithTimeout(
+          Effect.sync(() => (recall.state.maintenance === 1 ? true : undefined)),
+          "due maintenance never ran in the background",
+        )
         expect(recall.state.queries).not.toContain("再次讨论架构边界")
         expect(yield* memory.context(sessionID)).toEqual([])
+      }),
+    { git: true },
+  )
+
+  recall.it.instance(
+    "keeps the fence and project lock free while background maintenance streams",
+    () =>
+      Effect.gen(function* () {
+        recall.reset()
+        recall.state.config = { ...config, turn_interval: 1 }
+        const memory = yield* Memory.Service
+        const sessionID = SessionID.make("ses_memory_maintenance_lock_free")
+        const firstID = MessageID.ascending()
+        const first = user(firstID, sessionID, "继续之前确认的架构边界")
+
+        yield* memory.prepare({ sessionID, messages: [first] })
+        const messages = [
+          first,
+          {
+            info: assistant(firstID, sessionID, ProviderV2.ID.make("test"), ModelV2.ID.make("test-model"), "end_turn"),
+            parts: [],
+          },
+          user(MessageID.ascending(), sessionID, "第二次架构讨论"),
+        ]
+
+        const release = yield* Deferred.make<void>()
+        recall.state.maintenanceHook = () =>
+          Effect.gen(function* () {
+            yield* Deferred.await(release)
+            return { actions: [{ type: "no_change" }] }
+          })
+
+        const pending = yield* memory.prepare({ sessionID, messages }).pipe(Effect.forkChild)
+        yield* pollWithTimeout(
+          Effect.sync(() => (recall.state.maintenance >= 1 ? true : undefined)),
+          "due maintenance never reached the model call",
+        )
+
+        // The maintenance model call is in flight. Because prepare kicked it
+        // outside the fence (issue #324), a concurrent checkpoint — whose
+        // render select needs the same identity fence and project lock — is
+        // not starved; under the old inline shape it would wait on the fence
+        // until the streaming call finished.
+        const rendered = yield* awaitWithTimeout(
+          memory.checkpoint({ sessionID, messages }),
+          "checkpoint starved by background maintenance",
+        )
+        expect(rendered.length).toBeGreaterThan(0)
+
+        yield* Deferred.succeed(release, undefined)
+        yield* Fiber.join(pending)
+        expect(recall.state.maintenance).toBe(1)
       }),
     { git: true },
   )

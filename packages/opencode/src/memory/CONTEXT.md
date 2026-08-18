@@ -51,6 +51,8 @@ The domain runs on the existing seams; the elaborate `ProjectMemoryAuthority` re
 - Worktree `remove`/`reset` reconcile legacy memory fail-closed against the **complete** directory snapshot (primary + every registered sandbox) and always invalidate the admission cache before rescanning; they never trust a cached clean result.
 - Legacy files are re-read and compared immediately before deletion; content that changed after the scan is preserved and surfaced as a conflict.
 - Every writer of a MEMORY config file serializes on the file's cross-process lock; byte-atomicity is not undermined by whole-document last-writer-wins.
+- Maintenance model calls never run under the identity fence or the project lock: prepare and checkpoint render the pre-maintenance snapshot, then kick maintenance in the background, gated on identity liveness so a retired identity never starts a job (one job in flight per project, the commit-only write back under the fence).
+- Bounded matcher calls deliberately hold the fence across one model call: the search matcher to coalesce concurrent identical queries, the prepare and checkpoint matchers because their match result feeds an atomic read-match-write under the project lock. Only unbounded-class work (maintenance) is excluded from the fence; a bounded matcher is at most one call per fence acquisition.
 
 ## Boundaries
 
