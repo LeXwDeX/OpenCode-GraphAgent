@@ -210,9 +210,12 @@ const serviceLayer = Layer.effect(
     // GOAL-TURN-SCOPE: process-local provenance of the CURRENT goal-driven
     // turn. Keyed by session; set at every goal dispatch (kick in prompt.ts,
     // continuation in loop.ts), cleared at turn end (afterIdle entry) and at
-    // every terminal transition (pause/clear/markDone) plus ESC-cancel. A stale
-    // mark is harmless: goalTurnMaxSteps re-validates against the durable goal
-    // row before reporting a ceiling.
+    // every terminal transition (pause/clear/markDone). On ESC-cancel the
+    // clear happens ONLY when the pause persisted — if the pause exhausts its
+    // retries the mark is RETAINED so it agrees with the still-active
+    // durable row and lease (GOAL-02). A stale mark is harmless:
+    // goalTurnMaxSteps re-validates against the durable goal row before
+    // reporting a ceiling.
     const turnDriven = new Set<SessionID>()
 
     const markTurnDriven = Effect.fnUntraced(function* (sessionID: SessionID) {

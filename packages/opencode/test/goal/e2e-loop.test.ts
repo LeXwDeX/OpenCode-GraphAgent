@@ -1348,7 +1348,7 @@ describe("GoalLoop — startup scan resumes pre-boot active goals (GOAL-FP-01-04
     }),
   )
 
-  it.instance("a busy session is not force-evaluated by the scan; its own idle event drives it", () =>
+  it.instance("a busy session is not force-evaluated by the scan; its own idle event (or the bounded scan retry) drives it", () =>
     Effect.gen(function* () {
       reset()
       const loop = yield* GoalLoop.Service
@@ -1391,6 +1391,9 @@ describe("GoalLoop — startup scan resumes pre-boot active goals (GOAL-FP-01-04
       expect(JSON.stringify(yield* logLines)).toContain(String(sidA))
 
       // When the busy session finishes, its own idle event drives the goal.
+      // (The GOAL-04 bounded scan retry may also re-trigger it if the flip to
+      // idle happens within the retry window — the revision fence keeps the
+      // commit exactly-once either way.)
       yield* status.set(sidA, { type: "idle" })
       yield* pollWithTimeout(
         Effect.sync(() => (judgeCalls >= 2 ? true : undefined)),
