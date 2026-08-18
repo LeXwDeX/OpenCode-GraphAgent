@@ -58,4 +58,22 @@
 - 结论：非干净轮。修复后进入 Round 5。
 
 ### Round 5
-- 未开始
+- Spec 镜：**PASS，no findings**；Standards 镜：**PASS，no findings**（R4 两处措辞独立复核为准确）。
+- 结论：**干净轮 2/2**。连续两轮零 findings → **MEMORY 验收遗留批次收敛**。
+
+## 收敛结论
+
+R1（双镜 BLOCKING：in-flight 泄漏 P1）→ R2（双镜 BLOCKING：括号窗口 P1 + turn 作用域）→ R3（双 PASS，3 INFO 措辞）→ R4（Spec 干净 + Standards 2 INFO 措辞）→ **R4+R5 连续两轮零 findings**。findings 轨迹：两轮 P1 并发缺陷（实装修复+回归测试）→ 纯措辞 → 零。
+
+## 模块门禁（终态）
+
+- memory 测试簇 95/95 绿（新增 5 条回归：fence-free ×2、failed-wedge、interrupted-read-wedge、原 coalescing 保持）
+- `bun typecheck` + pre-push turbo 29/29 绿
+- 全量套件 4164 tests：仅 2 失败为历次批次已在干净基线证实的 darwin 环境既有失败（help-snapshots、project-copy），与本批无因果
+- 变异验证：fence 回置翻红 ×2（search/prepare）、onExit 移除翻红 ×2（wedge + coalescing）、readTopics 出括号翻红 ×1
+
+## 交付
+
+- 分支：`fix/memory-fence-scope`（基于 origin/dev 11cfafe9c）
+- 提交链：70291fbe4（MEM-01/02 主体）→ f08548d6d（R1 exit-safe）→ ef8d6b8d1（R2 整尾括号 + turn key）→ 9094abcaa/04385af79/0c1919465（记账与措辞）
+- PR → dev（Typecheck 门禁）
