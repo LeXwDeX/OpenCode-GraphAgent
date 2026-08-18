@@ -158,10 +158,17 @@ const serviceLayer = Layer.effect(
         // settle the node. The nodeFailed guard under the workflow lock
         // serializes any race with a live watcher or another host's sweep.
         if (row.childSessionId) {
+          // Best-effort cancel, recovered at CAUSE level: the sweep's layer
+          // context has no ambient InstanceRef, so a real SessionPrompt.cancel
+          // dies at InstanceState.context ("InstanceRef not provided") — and
+          // cancel's channel is E=never, where Effect.ignore recovers nothing.
+          // In the incident shape (instance disposed) the child fiber died
+          // with the scope, so a skipped cancel is also the correct outcome;
+          // the durable settle below is the source of truth either way.
           // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion -- the durable column is typed string|null; the cancel seam brands SessionID.
-          yield* promptSvc.cancel(row.childSessionId as never).pipe(Effect.ignore)
+          yield* promptSvc.cancel(row.childSessionId as never).pipe(Effect.catchCause(() => Effect.void))
         }
-        yield* dag
+        const settled = yield* dag
           .nodeFailed(
             row.workflowId,
             row.nodeId,
@@ -169,14 +176,21 @@ const serviceLayer = Layer.effect(
             "timeout",
           )
           .pipe(
+            Effect.as(true),
             Effect.catchCause((cause) =>
-              Effect.logWarning("DagSupervisionSweep nodeFailed failed", {
-                dagID: row.workflowId,
-                nodeID: row.nodeId,
-                cause,
+              Effect.gen(function* () {
+                yield* Effect.logWarning("DagSupervisionSweep nodeFailed failed — retrying next tick", {
+                  dagID: row.workflowId,
+                  nodeID: row.nodeId,
+                  cause,
+                })
+                return false
               }),
             ),
           )
+        // On a failed settle keep the streak so the next tick retries
+        // immediately instead of deferring by a full freeze window.
+        if (!settled) continue
         yield* Effect.logWarning("DagSupervisionSweep settled a node with dead deadline supervision", {
           dagID: row.workflowId,
           nodeID: row.nodeId,

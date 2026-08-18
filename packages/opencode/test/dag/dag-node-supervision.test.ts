@@ -82,6 +82,7 @@ function reply(sessionID: string, text: string): SessionV1.WithParts {
 function supervisionLayer(input: {
   readonly childPrompts: Queue.Queue<PromptGate>
   readonly cancels: string[]
+  readonly cancelDefect?: boolean
 }) {
   const database = Database.layerFromPath(":memory:")
   const events = EventV2.layer.pipe(Layer.provide(database))
@@ -116,10 +117,15 @@ function supervisionLayer(input: {
   const prompt = Layer.mock(
     SessionPrompt.Service,
     withIdleAdmission({
-      cancel: (sessionID: string) =>
-        Effect.sync(() => {
-          input.cancels.push(sessionID)
-        }),
+      // cancelDefect simulates the production sweep context: the layer-scoped
+      // fiber has no ambient InstanceRef, so a REAL SessionPrompt.cancel dies
+      // at InstanceState.context with exactly this defect.
+      cancel: input.cancelDefect
+        ? () => Effect.die(new Error("InstanceRef not provided"))
+        : (sessionID: string) =>
+            Effect.sync(() => {
+              input.cancels.push(sessionID)
+            }),
       prompt: (value: SessionPrompt.PromptInput) => deliver(value),
       promptIfIdle: (value: SessionPrompt.PromptInput) => deliver(value).pipe(Effect.map(Option.some)),
     }),
@@ -152,7 +158,10 @@ interface SupervisionServices {
   readonly cancels: string[]
   readonly database: Database.Interface
 }
-function runSupervisionTest<A>(options: { readonly instanceProject: string }, test: (services: SupervisionServices) => Effect.Effect<A, Error>) {
+function runSupervisionTest<A>(
+  options: { readonly instanceProject: string; readonly cancelDefect?: boolean },
+  test: (services: SupervisionServices) => Effect.Effect<A, Error>,
+) {
   return Effect.gen(function* () {
     const childPrompts = yield* Queue.unbounded<PromptGate>()
     const cancels: string[] = []
@@ -184,7 +193,7 @@ function runSupervisionTest<A>(options: { readonly instanceProject: string }, te
       yield* loop.init()
       return yield* test({ dag, loop, store, sweep, childPrompts, cancels, database })
     }).pipe(
-      Effect.provide(supervisionLayer({ childPrompts, cancels })),
+      Effect.provide(supervisionLayer({ childPrompts, cancels, cancelDefect: options.cancelDefect })),
       Effect.provideService(InstanceRef, {
         directory: process.cwd(),
         worktree: process.cwd(),
@@ -326,6 +335,49 @@ describe("DAG node supervision — deadline enforcement (production incident)", 
             "5 seconds",
           )
           expect(swept?.errorClass).toBe("timeout")
+        }),
+      ),
+    )
+  })
+
+  // Review R4 issue 1 (P0): the sweep's layer-scoped fiber has no ambient
+  // InstanceRef, so a real SessionPrompt.cancel DIES at
+  // InstanceState.context — and cancel's channel is E=never, where
+  // Effect.ignore recovers nothing. A cause-level recovery on that seam is
+  // what keeps the durable settle reachable in production. Simulated here by
+  // mocking cancel to the exact production defect.
+  it("cancel-defect: a dying cancel seam (production: no ambient InstanceRef) never blocks the settle", async () => {
+    await Effect.runPromise(
+      runSupervisionTest({ instanceProject: "project-1", cancelDefect: true }, ({ dag, store, sweep, childPrompts }) =>
+        Effect.gen(function* () {
+          const dagID = yield* dag.create(incidentGraph)
+          const child = yield* takeWithin(childPrompts, "worker did not start")
+          void child
+          yield* pollWithTimeout(
+            supervisionProgress(store, dagID, "worker"),
+            "watcher never escalated before dispose",
+            "8 seconds",
+          )
+          yield* Effect.promise(() => disposeInstance(process.cwd()))
+          yield* Effect.sleep("4 seconds")
+          // Deadline passed, watcher dead: every settle-attempt pass hits the
+          // dying cancel seam first. Pre-fix, the defect aborts sweepOnce
+          // before nodeFailed; post-fix the settle still lands.
+          const needed = DagSupervisionSweep.frozenTicksNeeded(2_000)
+          for (let tick = 0; tick <= needed; tick++) {
+            yield* sweep.sweepOnce()
+            yield* Effect.sleep("50 millis")
+          }
+          const swept = yield* pollWithTimeout(
+            Effect.gen(function* () {
+              const settled = yield* store.getNode(dagID, "worker")
+              return settled && settled.status !== "running" ? settled : undefined
+            }),
+            "sweep never settled past a dying cancel seam",
+            "5 seconds",
+          )
+          expect(swept?.errorClass).toBe("timeout")
+          expect(swept?.errorReason).toContain("swept")
         }),
       ),
     )
