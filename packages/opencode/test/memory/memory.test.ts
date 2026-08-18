@@ -318,6 +318,8 @@ function recallFixture() {
     projectInitialized: number
     matcher?: (query: string) => Effect.Effect<unknown>
     maintenanceHook?: () => Effect.Effect<unknown>
+    /** Parks the runner's pre-select topics read (interrupt-window probe). */
+    parkReads?: { started: Deferred.Deferred<void>; release: Deferred.Deferred<void> }
   } = {
     queries: [],
     reads: 0,
@@ -376,8 +378,12 @@ function recallFixture() {
         MemoryLock.defaultLayer,
         Layer.mock(MemoryStore.Service, {
           readTopics: () =>
-            Effect.sync(() => {
+            Effect.gen(function* () {
               state.reads++
+              if (state.parkReads) {
+                yield* Deferred.succeed(state.parkReads.started, undefined)
+                yield* Deferred.await(state.parkReads.release)
+              }
               return state.topics
             }),
           updateTopics: (_projectID, update) =>
@@ -413,6 +419,7 @@ function recallFixture() {
       state.projectInitialized = 1
       state.matcher = undefined
       state.maintenanceHook = undefined
+      state.parkReads = undefined
     },
     it: testEffect(layer),
     systemIt: testEffect(systemLayer),
@@ -1515,6 +1522,42 @@ describe("memory turn-scoped retrieval", () => {
         // coalesced fiber's successful re-run — either proves liveness).
         expect(yield* awaitWithTimeout(memory.search({ sessionID, messages, query: "易碎查询" }), "later identical query wedged on the leaked in-flight entry")).toMatchObject({
           status: "attached",
+        })
+      }),
+    { git: true },
+  )
+
+  // Review R2 issue 1: the exit bracket must start at REGISTRATION, not at
+  // the select pipeline — an interrupt during the runner's pre-select topics
+  // read (a real suspension in production, flock'd disk I/O) previously
+  // unwound before onExit attached, leaking the in-flight entry and wedging
+  // the (turn,key) forever.
+  recall.it.instance(
+    "an interrupted topics read releases the in-flight entry and never wedges the key",
+    () =>
+      Effect.gen(function* () {
+        recall.reset()
+        const memory = yield* Memory.Service
+        const sessionID = SessionID.make("ses_memory_interrupted_read")
+        const messages = [
+          user(MessageID.ascending(), sessionID, "先处理当前问题"),
+          user(MessageID.ascending(), sessionID, "召回相关历史"),
+        ]
+        const started = yield* Deferred.make<void>()
+        const release = yield* Deferred.make<void>()
+        recall.state.parkReads = { started, release }
+
+        const runner = yield* memory.search({ sessionID, messages, query: "可中断查询" }).pipe(Effect.forkChild)
+        yield* Deferred.await(started)
+        yield* Fiber.interrupt(runner).pipe(Effect.ignore)
+
+        // The entry must be released despite the interrupt landing before
+        // the select pipeline attached its bracket: a later identical query
+        // resolves within the bounded window instead of parking forever
+        // (empty: the query text matches no topic — liveness is the point).
+        yield* Deferred.succeed(release, undefined)
+        expect(yield* awaitWithTimeout(memory.search({ sessionID, messages, query: "可中断查询" }), "later identical query wedged on the entry leaked by the interrupted read")).toMatchObject({
+          status: "empty",
         })
       }),
     { git: true },
