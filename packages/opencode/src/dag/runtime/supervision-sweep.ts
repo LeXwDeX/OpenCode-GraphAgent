@@ -9,8 +9,7 @@ import { Database } from "@opencode-ai/core/database/database"
 import { DagStore } from "@opencode-ai/core/dag/store"
 import { WorkflowNodeTable } from "@opencode-ai/core/dag/sql"
 import { and, eq, sql } from "drizzle-orm"
-import { Dag } from "@/dag/dag"
-import { parseWorkflowConfig } from "@/dag/dag"
+import { Dag, parseWorkflowConfig } from "@/dag/dag"
 import { SessionPrompt } from "@/session/prompt"
 
 /**
