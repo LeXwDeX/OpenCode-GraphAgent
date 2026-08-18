@@ -3,7 +3,7 @@ export * as Memory from "./memory"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { ProjectV2 } from "@opencode-ai/core/project"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
-import { Context, Deferred, Effect, Layer, Option, Ref, Schema, Scope, Semaphore } from "effect"
+import { Cause, Context, Deferred, Effect, Exit, Layer, Option, Ref, Schema, Scope, Semaphore } from "effect"
 import { stringify } from "yaml"
 import { Config } from "@/config/config"
 import { Provider } from "@/provider/provider"
@@ -98,12 +98,15 @@ export const layer: Layer.Layer<
     // blocks and re-reads the cache" coalescing: the second identical query
     // now awaits the first one's Deferred instead — same observable semantics
     // (reused: true, no extra query slot) without a model call under the
-    // fence/lock. Process-local by design (the fence is the cross-process
-    // seam, and it now covers only the markMatched commit).
+    // fence/lock. The runner completes the deferred on EVERY exit (onExit),
+    // so a failed or interrupted first call wakes its coalesced awaiter
+    // (degraded to "failed") instead of parking it forever. Process-local by
+    // design (the fence is the cross-process seam, and it now covers only
+    // the markMatched commit).
+    type MatchRun = { count: number; rendered: string[] }
     const matchInFlight = yield* Ref.make(
-      new Map<string, Deferred.Deferred<{ count: number; rendered: string[] }>>(),
+      new Map<string, Deferred.Deferred<Exit.Exit<MatchRun | undefined, unknown>>>(),
     )
-
     const availableModels = Effect.fn("Memory.availableModels")(function* () {
       const providers = yield* provider.list()
       return new Set(
@@ -504,22 +507,20 @@ export const layer: Layer.Layer<
       // kicked AFTERwards, so a long reasoning call never holds the fence:
       // this turn renders the pre-maintenance topics and the committed update
       // surfaces on a later prepare.
-      const rendered = yield* select({
+      const selected = yield* select({
         model: current.model,
         config: current.loaded.config,
         topics: yield* store.readTopics(current.project.id),
         text: user.text,
         projectID: current.project.id,
       })
-      if (!rendered) {
+      if (!selected) {
         yield* clearSession(input.sessionID)
         return
       }
-      {
-        const entry = data.sessions.get(input.sessionID)
-        if (entry?.turn.messageID === user.info.id) {
-          entry.turn = { ...entry.turn, completedTurns: turns, rendered: rendered.rendered }
-        }
+      const entry = data.sessions.get(input.sessionID)
+      if (entry?.turn.messageID === user.info.id) {
+        entry.turn = { ...entry.turn, completedTurns: turns, rendered: selected.rendered }
       }
       if (!due) return
       if (Option.isNone(yield* kickMaintenance(maintenance))) yield* clearSession(input.sessionID)
@@ -587,12 +588,21 @@ export const layer: Layer.Layer<
       // the fence/lock. Concurrent identical queries coalesce through the
       // per-(session,key) in-flight Deferred instead of lock-blocking: the
       // second caller re-checks the cache under a SHORT project-lock
-      // critical section, awaits the first caller's result, and reports
-      // reused without spending another model call or query slot. Only the
-      // markMatched commit (inside select → applyUpdate) acquires the
-      // fence/lock.
+      // critical section (stale/cache/limit check + registration), awaits
+      // the first caller's result, and reports reused without spending
+      // another model call or query slot. Only the markMatched commit
+      // (inside select → applyUpdate) acquires the fence.
       const inFlightKey = `${input.sessionID}\0${key}`
-      const deferred = yield* Deferred.make<{ count: number; rendered: string[] }>()
+      const deferred = yield* Deferred.make<Exit.Exit<MatchRun | undefined, unknown>>()
+
+      const releaseIfOwner = Effect.fnUntraced(function* () {
+        yield* Ref.update(matchInFlight, (map) => {
+          if (map.get(inFlightKey) !== deferred) return map
+          const next = new Map(map)
+          next.delete(inFlightKey)
+          return next
+        })
+      })
 
       const outcome = yield* lock.withProject(current.project.id)(
         Effect.gen(function* () {
@@ -606,11 +616,11 @@ export const layer: Layer.Layer<
               : { status: "empty" as const, reused: true }
           }
           if (activeTurn.queryCount >= 2) return { status: "limit" as const }
-          const running = yield* Ref.modify(matchInFlight, (map) =>
-            map.has(inFlightKey)
-              ? ([map.get(inFlightKey)!, map] as const)
-              : ([deferred, new Map(map).set(inFlightKey, deferred)] as const),
-          )
+          const running = yield* Ref.modify(matchInFlight, (map) => {
+            const existing = map.get(inFlightKey)
+            if (existing) return [existing, map] as const
+            return [deferred, new Map(map).set(inFlightKey, deferred)] as const
+          })
           if (running !== deferred) return { kind: "await-first" as const, first: running }
           activeTurn.queryCount++
           return { kind: "run" as const }
@@ -618,38 +628,67 @@ export const layer: Layer.Layer<
       )
       if ("kind" in outcome) {
         if (outcome.kind === "await-first") {
+          // The awaiter rides the runner's exit: the runner completes the
+          // deferred on EVERY exit (onExit below packs the exit — success,
+          // failure, interrupt, retired — into the payload), so the await
+          // always wakes. Failure/interrupt degrades to "failed", never a
+          // permanent park on a doomed deferred.
           const first = yield* Deferred.await(outcome.first)
+          if (Exit.isFailure(first)) {
+            if (Cause.hasInterrupts(first.cause)) return yield* Effect.failCause(first.cause)
+            return { status: "failed" as const }
+          }
+          const selected = first.value
+          if (!selected) return { status: "unavailable" as const }
           const latest = data.sessions.get(input.sessionID)?.turn
           if (latest?.messageID !== origin) return { status: "stale" as const }
-          return first.count > 0
-            ? { status: "attached" as const, count: first.count, reused: true }
+          return selected.count > 0
+            ? { status: "attached" as const, count: selected.count, reused: true }
             : { status: "empty" as const, reused: true }
         }
         // This caller owns the matcher run: model call outside every
         // fence/lock, then the fenced markMatched commit, then publish.
-        const selected = yield* select({
+        // onExit mirrors kickMaintenance's slot discipline (its comment: "an
+        // interruption between the two would leak the in-flight slot"):
+        // every exit deregisters the map entry AND packs the real outcome
+        // into the deferred, so a coalesced awaiter wakes instead of parking
+        // forever. The deferred itself never fails — the Exit payload is the
+        // whole message.
+        const runExit = yield* select({
           model: current.model,
           config: current.loaded.config,
           topics: yield* store.readTopics(current.project.id),
           text: query,
           projectID: current.project.id,
-        })
-        yield* Ref.update(matchInFlight, (map) => {
-          if (map.get(inFlightKey) !== deferred) return map
-          const next = new Map(map)
-          next.delete(inFlightKey)
-          return next
-        })
-        // Identity retired between model call and commit — fail closed.
+        }).pipe(
+          Effect.tap((selected) => {
+            // Publish the cache entry BEFORE the in-flight deregistration in
+            // onExit: a third identical caller entering between the two
+            // would otherwise miss both the cache and the in-flight entry
+            // and burn a second model call + query slot where the old
+            // lock-blocking design guaranteed reuse. Stale-origin runs skip
+            // the write; the stale check below still governs the response.
+            if (!selected) return Effect.void
+            const latest = data.sessions.get(input.sessionID)?.turn
+            if (latest?.messageID !== origin) return Effect.void
+            latest.queries.set(key, selected)
+            latest.rendered = selected.rendered
+            return Effect.void
+          }),
+          Effect.onExit((exit) => releaseIfOwner().pipe(Effect.andThen(Deferred.succeed(deferred, exit)))),
+          Effect.exit,
+        )
+        if (Exit.isFailure(runExit)) return yield* Effect.failCause(runExit.cause)
+        const selected = runExit.value
+        // Identity retired between model call and commit — fail closed. The
+        // deferred already carries the same (succeeded-undefined) exit, so a
+        // coalesced awaiter degrades to "unavailable" rather than hanging.
         if (!selected) {
           yield* clearSession(input.sessionID)
           return { status: "unavailable" as const }
         }
-        yield* Deferred.succeed(deferred, selected)
         const latest = data.sessions.get(input.sessionID)?.turn
         if (latest?.messageID !== origin) return { status: "stale" as const }
-        latest.queries.set(key, selected)
-        latest.rendered = selected.rendered
         return selected.count > 0
           ? { status: "attached" as const, count: selected.count, reused: false }
           : { status: "empty" as const, reused: false }

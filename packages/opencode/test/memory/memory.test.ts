@@ -1471,6 +1471,54 @@ describe("memory turn-scoped retrieval", () => {
       }),
     { git: true },
   )
+
+  // Review R-1: the runner must complete the in-flight deferred on EVERY
+  // exit. A failed first matcher call must not wedge the (session,key): a
+  // coalesced awaiter wakes (degraded) and a later identical query re-runs
+  // the matcher instead of parking on a leaked in-flight entry.
+  recall.it.instance(
+    "a failed first query never wedges the session key or its coalesced awaiter",
+    () =>
+      Effect.gen(function* () {
+        recall.reset()
+        const started = yield* Deferred.make<void>()
+        let matcherCalls = 0
+        recall.state.matcher = () =>
+          Effect.gen(function* () {
+            matcherCalls++
+            if (matcherCalls === 1) {
+              yield* Deferred.succeed(started, undefined)
+              throw new Error("matcher exploded")
+            }
+            return { topic_ids: [recall.state.topics[0]?.id ?? ""] }
+          })
+        const memory = yield* Memory.Service
+        const sessionID = SessionID.make("ses_memory_failed_first")
+        const messages = [
+          user(MessageID.ascending(), sessionID, "先处理当前问题"),
+          user(MessageID.ascending(), sessionID, "召回相关历史"),
+        ]
+
+        const failing = yield* memory.search({ sessionID, messages, query: "易碎查询" }).pipe(Effect.forkChild)
+        yield* Deferred.await(started)
+        // Concurrent identical query — either it coalesced onto the failing
+        // run (wakes degraded to "failed") or it raced past the in-flight
+        // window and re-runs (attached). Both are non-hang outcomes; a
+        // parked-forever awaiter or a wedged key fails the bounded waits.
+        const coalesced = yield* memory.search({ sessionID, messages, query: "易碎查询" }).pipe(Effect.forkChild)
+        const failingResult = yield* awaitWithTimeout(Fiber.join(failing), "failing query hung")
+        const coalescedResult = yield* awaitWithTimeout(Fiber.join(coalesced), "coalesced awaiter hung on the failing run")
+        expect(failingResult).toEqual({ status: "failed" })
+        expect(["failed", "attached", "empty"]).toContain(coalescedResult.status)
+        // The (session,key) is NOT wedged: the next identical query resolves
+        // within the bounded window (fresh run or cached reuse from the
+        // coalesced fiber's successful re-run — either proves liveness).
+        expect(yield* awaitWithTimeout(memory.search({ sessionID, messages, query: "易碎查询" }), "later identical query wedged on the leaked in-flight entry")).toMatchObject({
+          status: "attached",
+        })
+      }),
+    { git: true },
+  )
 })
 
 describe("memory project config Git exclusions", () => {

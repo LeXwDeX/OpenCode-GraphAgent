@@ -28,4 +28,13 @@
 ## 审阅轮次
 
 ### Round 1
+- Spec 镜：**BLOCKING**（R-1 P1 + R-2/R-3 INFO）；Standards 镜：**BLOCKING**（F1 P1 与 R-1 同源 + F2-F5 INFO）。处置：
+  - R-1/F1（P1）：in-flight 泄漏——失败/中断/retired 路径 deferred 永不完成 → coalesced awaiter 永久挂起、(session,key) 进程级 wedge。→ **已修**：runner 分支 `Effect.onExit`（对齐 kickMaintenance 槽位纪律）——每个退出路径先 `releaseIfOwner` 再把真实 Exit 打包进 deferred（deferred 永不失败，Exit 载荷即全部消息）；awaiter 按 Exit 分支：失败→`failed`、interrupt→failCause 传播、retired→`unavailable`。新增红绿测试「a failed first query never wedges the session key or its coalesced awaiter」（有界等待断言无挂起、无 wedge）+ 变异验证（去掉 onExit → 新测试与旧 coalescing 测试双红）。
+  - R-2（INFO）：dereg→缓存写入窗口内第三个同查询会多耗一次调用。→ 已修：缓存写入提前到 `Effect.tap`（releaseIfOwner 之前），窗口闭合。
+  - R-3（INFO）：等价声明只覆盖 happy path。→ CONTEXT.md 措辞已含失败路径降级语义。
+  - F2（INFO）：CONTEXT.md「outside every fence/lock」对短注册临界区不真。→ 已改为「outside every fence + SHORT project-lock critical section (registration)」。
+  - F3/F4/F5（INFO）：裸块、`!` 断言、命名不一致。→ 已修（裸块展开、get-then-check、统一 `selected`）。
+- 结论：修复后进入 Round 2。
+
+### Round 2
 - 未开始
