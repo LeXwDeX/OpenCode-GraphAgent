@@ -76,3 +76,14 @@
 ## 收敛结论
 
 R1 有 2 Low → 修复；R2 干净（因 R3 有 findings 计数重置）；R3 有 3 INFO → 修复；R4 有 5 INFO → 修复；R5 有 2 INFO → 修复；**R6+R7 连续两轮双镜零 findings**。全部 findings 已关闭，模块具备发 PR 资格。
+
+## 交付
+
+- **PR**：https://github.com/LeXwDeX/OpenCode-GraphAgent/pull/334 → `dev`（门禁 Typecheck；CI run 32113882464 进行中）
+- 提交链：bcad76ebf（audit 文档）→ ed7185a0f（GOAL-01）→ 551b8f78a（GOAL-02）→ 9fc67e8e7（GOAL-03）→ f0e727865（GOAL-04）→ 429e58815 / 5dd5a3037 / ce87f84bd / db44487c7 / 58b56b490 / 5e6ab11fe（审阅轮修复与记账）
+- 终态门禁：goal 测试簇 108/108 绿；`bun typecheck`（packages/opencode）绿；全量 4142 tests 除 3 项基线既有 darwin 环境性失败外全绿（已在干净基线 detached 复跑证实非本批引入）。
+- 已知本地环境既有问题（与本批无关，已证实）：根 turbo typecheck 的 `@opencode-ai/app` 子路径解析、project-copy / help-snapshots / pty 三个测试。
+
+## 下一 run
+
+DAG 批次（DAG-01..04）：事件触发 = 本 PR 合入 dev 后从新基线切 `fix/dag-batch`。
