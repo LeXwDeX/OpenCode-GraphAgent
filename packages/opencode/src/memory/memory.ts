@@ -589,8 +589,8 @@ export const layer: Layer.Layer<
 
       // MEM-02 (issue #324 acceptance): the matcher model call runs OUTSIDE
       // the fence/lock. Concurrent identical queries coalesce through the
-      // per-(session,key) in-flight Deferred instead of lock-blocking: the
-      // second caller re-checks the cache under a SHORT project-lock
+      // per-(session,turn,key) in-flight Deferred instead of lock-blocking:
+      // the second caller re-checks the cache under a SHORT project-lock
       // critical section (stale/cache/limit check + registration), awaits
       // the first caller's result, and reports reused without spending
       // another model call or query slot. Only the markMatched commit
@@ -635,9 +635,9 @@ export const layer: Layer.Layer<
           // packs every outcome — success, failure, interrupt, retired —
           // into the deferred payload, so the await always wakes. Failures
           // surface as this caller's "failed" (mapped by the search
-          // wrapper's catchCause); the runner's interrupt is re-raised here
-          // via failCause (the awaiter shares the cancellation); a retired
-          // identity degrades to "unavailable". Never a permanent park.
+          // wrapper's catchCause); the runner's interrupt cause is re-raised
+          // via failCause so the wrapper's log carries it — the awaiter
+          // itself still completes with "failed". Never a permanent park.
           const first = yield* Deferred.await(outcome.first)
           if (Exit.isFailure(first)) {
             if (Cause.hasInterrupts(first.cause)) return yield* Effect.failCause(first.cause)

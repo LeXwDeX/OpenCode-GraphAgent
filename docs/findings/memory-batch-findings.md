@@ -9,8 +9,8 @@
 
 | ID | 来源 | 处置 | 状态 | 提交 |
 |---|---|---|---|---|
-| MEM-01 后半（P1） | 审计 + 验收 (a)2 | prepareUnsafe `shouldMatch` 分支的 select matcher 移出 fence/lock：matcher 无锁跑，markMatched 经 `applyUpdate`（fence+lock 只包提交） | 完成（红-绿-变异通过） | 待提交 |
-| MEM-02（P2） | 审计 + 验收 (a)1 | `search` 的 identity fence 缩到 markMatched 提交；同查询合并从「持锁阻塞后来者」改为 per-key in-flight coalescing（进程内 Deferred），语义等价（后来者 reused:true、不耗 slot）且不再跨模型调用持 fence/lock | 完成（红-绿-变异通过；旧 coalescing 回归保持绿） | 待提交 |
+| MEM-01 后半（P1） | 审计 + 验收 (a)2 | prepareUnsafe `shouldMatch` 分支的 select matcher 移出 fence/lock：matcher 无锁跑，markMatched 经 `applyUpdate`（fence+lock 只包提交） | 完成（红-绿-变异通过） | 70291fbe4 |
+| MEM-02（P2） | 审计 + 验收 (a)1 | `search` 的 identity fence 缩到 markMatched 提交；同查询合并从「持锁阻塞后来者」改为 turn 内 per-(session,turn,key) in-flight coalescing（进程内 Deferred），语义等价（后来者 reused:true、不耗 slot；失败/中断/retired 时唤醒降级而非挂起）且不再跨模型调用持 fence/lock | 完成（红-绿-变异通过；旧 coalescing 回归保持绿） | 70291fbe4 + f08548d6d + ef8d6b8d1 |
 | MEM-03（P3） | 验收 (a)3 | 处置记录：已被 PR #333 的 MEM-01 重构结构性抵消——维护恒为后台（kickMaintenance），失败折入其 catchCause，维护前渲染是已声明设计（CONTEXT.md「render the pre-maintenance snapshot」）。旧的「维护前快照渲染注入」窗口随 inline maintain 一起消失。本行即处置记录。 | 已记录 | — |
 
 ## 设计要点
@@ -46,4 +46,11 @@
 - 结论：修复后进入 Round 3。
 
 ### Round 3
+- Spec 镜：**PASS**，1 条 INFO；Standards 镜：**PASS**，2 条 INFO。处置：
+  - R3-1（INFO）：CONTEXT.md 与 searchUnsafe 注释仍写 per-(session,key)，key 已 turn-scoped。→ 两处已改为 per-(session,turn,key)。
+  - R3-2（INFO）：awaiter 注释「shares the cancellation」不符合 v4 语义（failCause 重抛由 wrapper catchCause 吸收，awaiter 仍以 failed 完成）。→ 已改写为准确机制。
+  - register「待提交」歧义。→ 已改为实际提交哈希。
+- 结论：非干净轮（INFO）。修复后进入 Round 4。
+
+### Round 4
 - 未开始
