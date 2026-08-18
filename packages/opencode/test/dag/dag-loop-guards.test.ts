@@ -734,4 +734,64 @@ describe("DagLoop replan verdict gate fail-closed (DAG-03)", () => {
       ),
     )
   })
+
+  // Review F2 (R1): the hold must SURVIVE the durable-row re-sync that the
+  // next node terminal event performs, and it must be RELEASED by an explicit
+  // parent control action (replan/resume/step) — otherwise the fail-closed
+  // hold was lifted by any subsequent NodeCompleted/NodeSkipped/stepped
+  // stimulus and spawnReady ran on the vetoed direction before the parent
+  // ever adjudicated the verdict.
+  it("the veto hold survives a terminal-event flag re-sync (DAG-03 / F2)", async () => {
+    await Effect.runPromise(
+      runGuardTest(
+        { instanceProject: "project-1", failPause: { remaining: 99 } },
+        ({ dag, store, childPrompts }) =>
+          Effect.gen(function* () {
+            const dagID = yield* dag.create(vetoedGateGraph("Resync hold", "resync-hold"))
+            const { gate } = yield* takeBootPrompts(childPrompts)
+            expect(gate.title).toBe("gate")
+            yield* dag.nodeCompleted(dagID, "gate", { verdict: "replan", findings: "vetoed" })
+            expect((yield* store.getWorkflow(dagID))?.status).toBe("running")
+            // Completing the unrelated probe lands in the NodeCompleted
+            // handler, whose prologue re-syncs paused from the DURABLE row
+            // ("running") and then calls spawnReady — the re-sync must not
+            // lift the veto hold.
+            yield* dag.nodeCompleted(dagID, "probe", "probe done")
+            yield* Effect.sleep("300 millis")
+            expect((yield* store.getNode(dagID, "downstream"))?.status).toBe("pending")
+          }),
+      ),
+    )
+  })
+
+  it("a parent replan releases the hold and the corrective path spawns (DAG-03 / F2)", async () => {
+    await Effect.runPromise(
+      runGuardTest(
+        { instanceProject: "project-1", failPause: { remaining: 99 } },
+        ({ dag, store, childPrompts }) =>
+          Effect.gen(function* () {
+            const dagID = yield* dag.create(vetoedGateGraph("Replan release", "replan-release"))
+            const { gate } = yield* takeBootPrompts(childPrompts)
+            expect(gate.title).toBe("gate")
+            yield* dag.nodeCompleted(dagID, "gate", { verdict: "replan", findings: "vetoed" })
+            expect((yield* store.getWorkflow(dagID))?.status).toBe("running")
+            // Parent disposition: replan adds a corrective node off the
+            // (terminal) checkpoint — exempt from the merged checkpoint gate.
+            yield* dag.replan(dagID, { nodes: [node({ id: "corrective", name: "corrective", depends_on: ["gate"] })] })
+            // The WorkflowReplanned handler releases the hold and re-syncs
+            // flags from the durable row, so the corrective node spawns. The
+            // wake prompt may interleave; drain until the corrective prompt.
+            const corrective = yield* Effect.gen(function* () {
+              for (let i = 0; i < 4; i++) {
+                const next = yield* takeWithin(childPrompts, `prompt ${i} after replan never arrived`)
+                if (next.title === "corrective") return next
+              }
+              return yield* Effect.fail(new Error("corrective node did not spawn after the releasing replan"))
+            })
+            expect(corrective.title).toBe("corrective")
+            yield* Deferred.succeed(corrective.release, "fixed")
+          }),
+      ),
+    )
+  })
 })

@@ -584,10 +584,10 @@ function conditionDiagnostics(nodes: readonly NodeConfig[]): Diagnostic[] {
  *
  * Options:
  * - `exemptCheckpointIds` (DAG-02 runtime path): a checkpoint already
- *   terminal in the durable graph has delivered its verdict — the ordering
- *   race the gate protects is in the past, so additive waves / reopens may
- *   attach dependents without a condition. Authoring never exempts: nothing
- *   is terminal there yet.
+ *   terminal in the durable graph is settled and immutable (terminal nodes
+ *   never re-run) — the ordering race the gate protects is in the past, so
+ *   additive waves / reopens may attach dependents without a condition.
+ *   Authoring never exempts: nothing is terminal there yet.
  * - `requireOutputSchema` (default true; the runtime replan path passes
  *   false): DAG-01's "gated checkpoints must declare output_schema" is an
  *   AUTHORING obligation — runtime-created graphs deliberately bypass
@@ -857,7 +857,7 @@ export function replanStructuralDiagnostics(input: ReplanStructuralInput): Diagn
     // Pre-fix replan/extend skipped this gate entirely, so the dependent
     // was spawned the moment the checkpoint completed, before the parent
     // could read the verdict. Checkpoints already terminal in the durable
-    // graph are exempt: their verdict was delivered, the race is past. The
+    // graph are exempt: they are settled and immutable, the race is past. The
     // output_schema obligation is authoring-only (requireOutputSchema:false)
     // — runtime-created graphs deliberately bypass authoring validation.
     ...checkpointGateDiagnostics(input.merged.nodes, input.merged.node_defaults, {

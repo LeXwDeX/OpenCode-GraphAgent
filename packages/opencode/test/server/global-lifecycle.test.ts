@@ -1,5 +1,5 @@
 import { describe, expect } from "bun:test"
-import { Effect, Exit, Fiber, Layer, Option } from "effect"
+import { Effect, Exit, Fiber, Layer } from "effect"
 import * as TestClock from "effect/testing/TestClock"
 import { logLines } from "effect/testing/TestConsole"
 import { InstanceStore } from "@/project/instance-store"
