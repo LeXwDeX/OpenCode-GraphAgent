@@ -308,11 +308,11 @@ describe("DAG node supervision — deadline enforcement (production incident)", 
           // The fallback-retry contract (production fix): the HOST-LEVEL
           // supervision sweep — whose fiber lives in the layer scope and
           // survives the instance teardown — settles the frozen node once
-          // its counter has stayed flat for FROZEN_TICKS_NEEDED ticks
-          // (dead supervision; a live watcher always moves the counter
-          // inside the window).
-          const { FROZEN_TICKS_NEEDED } = DagSupervisionSweep
-          for (let tick = 0; tick <= FROZEN_TICKS_NEEDED; tick++) {
+          // its counter has stayed flat for frozenTicksNeeded(2s) = 2 ticks
+          // (dead supervision; a live 2s-cadence watcher always moves the
+          // counter inside the window).
+          const needed = DagSupervisionSweep.frozenTicksNeeded(2_000)
+          for (let tick = 0; tick <= needed; tick++) {
             yield* sweep.sweepOnce()
             yield* Effect.sleep("50 millis")
           }
@@ -353,12 +353,16 @@ describe("DAG node supervision — deadline enforcement (production incident)", 
             "watcher never escalated before the streak test",
             "8 seconds",
           )
-          const { FROZEN_TICKS_NEEDED } = DagSupervisionSweep
-          // Run more sweep passes than the freeze window alongside the live
-          // watcher: its 2s escalation cadence resets the streak every time,
-          // so the sweep must never fire.
-          for (let tick = 0; tick < FROZEN_TICKS_NEEDED + 2; tick++) {
-            yield* Effect.sleep("300 millis")
+          const needed = DagSupervisionSweep.frozenTicksNeeded(2_000)
+          // Sweep passes at the PRODUCTION cadence relationship: each pass is
+          // spaced just past the node's 2s escalate interval, so the live
+          // watcher moves the counter between every pass and the streak can
+          // never reach `needed`. (Spacing the passes closer than the
+          // escalate interval would defeat the window's math — a live
+          // watcher's counter is legitimately flat for up to one full
+          // interval.)
+          for (let tick = 0; tick < needed + 2; tick++) {
+            yield* Effect.sleep("2.3 seconds")
             yield* sweep.sweepOnce()
           }
           const row = yield* store.getNode(dagID, "worker")

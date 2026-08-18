@@ -6,6 +6,7 @@ export * as DagSupervisionSweep from "./supervision-sweep"
 import { Context, Effect, Fiber, Layer, Scope } from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Database } from "@opencode-ai/core/database/database"
+import { DagStore } from "@opencode-ai/core/dag/store"
 import { WorkflowNodeTable } from "@opencode-ai/core/dag/sql"
 import { and, eq, sql } from "drizzle-orm"
 import { Dag } from "@/dag/dag"
@@ -57,21 +58,28 @@ export interface Interface {
 export class Service extends Context.Service<Service, Interface>()("@opencode/DagSupervisionSweep") {}
 
 export const SWEEP_INTERVAL = "60 seconds"
+const SWEEP_INTERVAL_MS = 60_000
 
 /**
- * Ticks a flat timeout_extensions counter must persist across before the
- * sweep declares supervision dead: ceil(escalateInterval / sweepInterval) + 1,
- * evaluated against the DEFAULT node timeout (10 min) — the widest cadence a
- * live watcher can legitimately sleep. Nodes configured with shorter
- * timeouts escalate faster, so they are only ever settled later than
- * strictly necessary, never sooner.
+ * Flat ticks before declaring supervision dead, derived from the node's own
+ * escalation cadence: a LIVE watcher escalates every
+ * escalateIntervalMs == max(1s, timeout_ms ?? 10min) and never moves
+ * deadline_ms, so its counter can legitimately stay flat for up to one full
+ * interval. Requiring ceil(interval / sweep interval) + 1 consecutive flat
+ * ticks means a live watcher — at ANY configured timeout, including the
+ * doc-recommended 30-minute verifier timeouts — always moves the counter
+ * inside the window, while a dead one (the incident shape: hours frozen) is
+ * settled in bounded time. The config lookup happens once a node has been
+ * overdue-flat for at least one tick, so healthy graphs pay nothing.
  */
-export const FROZEN_TICKS_NEEDED = 11
+export const frozenTicksNeeded = (escalateIntervalMs: number) =>
+  Math.ceil(Math.max(escalateIntervalMs, 1_000) / SWEEP_INTERVAL_MS) + 1
 
 const serviceLayer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const { db } = yield* Database.Service
+    const store = yield* DagStore.Service
     const dag = yield* Dag.Service
     const promptSvc = yield* SessionPrompt.Service
     const scope = yield* Scope.Scope
@@ -81,6 +89,20 @@ const serviceLayer = Layer.effect(
     // running and overdue. Reset on any counter movement, terminal status, or
     // disappearance from the query.
     const flatStreak = new Map<string, { extensions: number; flatTicks: number }>()
+
+    // The node's escalation cadence, from the workflow's persisted config —
+    // the same source spawn.ts derived the watcher's escalateIntervalMs from.
+    // Cached per workflow id for the tick; a config read failure degrades to
+    // the DEFAULT cadence (the widest guaranteed-safe window).
+    const escalateIntervalFor = Effect.fnUntraced(function* (workflowId: string, nodeId: string) {
+      const wf = yield* store.getWorkflow(workflowId).pipe(
+        Effect.catchCause(() => Effect.succeed(undefined)),
+      )
+      if (!wf) return Dag.DEFAULT_WORKFLOW_CONFIG.nodeTimeoutMs
+      const node = JSON.parse(wf.config).nodes?.find?.((n: { id: string }) => n.id === nodeId)
+      const timeoutMs = node?.worker_config?.timeout_ms
+      return Math.max(1_000, typeof timeoutMs === "number" ? timeoutMs : Dag.DEFAULT_WORKFLOW_CONFIG.nodeTimeoutMs)
+    })
 
     const sweepOnce = Effect.fn("DagSupervisionSweep.sweepOnce")(function* () {
       const rows = yield* db
@@ -116,7 +138,10 @@ const serviceLayer = Layer.effect(
         const prior = flatStreak.get(key)
         const flatTicks = prior && prior.extensions === row.extensions ? prior.flatTicks + 1 : 0
         observed.set(key, { extensions: row.extensions, flatTicks })
-        if (flatTicks < FROZEN_TICKS_NEEDED) continue
+        // Only nodes already flat for a tick pay the config lookup.
+        if (flatTicks < 1) continue
+        const escalateIntervalMs = yield* escalateIntervalFor(row.workflowId, row.nodeId)
+        if (flatTicks < frozenTicksNeeded(escalateIntervalMs)) continue
         // Frozen across the full window: cancel the (possibly dead) child and
         // settle the node. The nodeFailed guard under the workflow lock
         // serializes any race with a live watcher or another host's sweep.
@@ -128,7 +153,7 @@ const serviceLayer = Layer.effect(
           .nodeFailed(
             row.workflowId,
             row.nodeId,
-            `deadline supervision lost (no escalation progress across ${FROZEN_TICKS_NEEDED} sweep ticks) — swept, extensions ${row.extensions}`,
+            `deadline supervision lost (no escalation progress across ${flatTicks} sweep ticks, escalate cadence ${escalateIntervalMs}ms) — swept, extensions ${row.extensions}`,
             "timeout",
           )
           .pipe(
@@ -184,10 +209,11 @@ export const layerWithoutDeps = serviceLayer
 
 export const layer = serviceLayer.pipe(
   Layer.provide(Database.defaultLayer),
+  Layer.provide(DagStore.defaultLayer),
   Layer.provide(Dag.defaultLayer),
   Layer.provide(SessionPrompt.defaultLayer),
 )
 
 export const defaultLayer = layer
 
-export const node = LayerNode.make(serviceLayer, [Database.node, Dag.node, SessionPrompt.node])
+export const node = LayerNode.make(serviceLayer, [Database.node, DagStore.node, Dag.node, SessionPrompt.node])
