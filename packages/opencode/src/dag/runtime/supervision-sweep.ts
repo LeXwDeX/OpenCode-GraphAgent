@@ -3,7 +3,7 @@
 
 export * as DagSupervisionSweep from "./supervision-sweep"
 
-import { Context, Effect, Fiber, Layer, Scope } from "effect"
+import { Cause, Context, Effect, Fiber, Layer, Scope } from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Database } from "@opencode-ai/core/database/database"
 import { DagStore } from "@opencode-ai/core/dag/store"
@@ -33,9 +33,11 @@ import { SessionPrompt } from "@/session/prompt"
  * never depend on ambient per-instance context (InstanceRef) — its fiber's
  * context is the layer-build context, which has none. Ownership is decided
  * from the durable rows alone: this process's Database owns every workflow
- * row it can read, and the nodeFailed guard under the workflow lock
- * serializes any race with another writer (including a second host sharing
- * the DB — double settles collapse to one).
+ * row it can read. Same-host races (a live watcher, the DagLoop) are
+ * serialized by the workflow's in-process lock; a second host sharing the
+ * DB is handled by the durable guardNode status read plus the projector's
+ * conditional UPDATE (only the first NodeFailed folds a non-terminal row) —
+ * double settles collapse to one.
  *
  * False-positive safety: a LIVE watcher escalates on
  * escalateIntervalMs == max(1s, timeout_ms ?? 10min) and nodeTimeoutEscalated
@@ -111,7 +113,7 @@ const serviceLayer = Layer.effect(
     // window).
     const escalateIntervalFor = Effect.fnUntraced(function* (workflowId: string, nodeId: string) {
       const wf = yield* store.getWorkflow(workflowId).pipe(
-        Effect.catchCause(() => Effect.succeed(undefined)),
+        Effect.catchCause((cause) => (Cause.hasInterrupts(cause) ? Effect.interrupt : Effect.succeed(undefined))),
       )
       return escalateIntervalFromConfig(wf?.config, nodeId)
     })
@@ -136,11 +138,15 @@ const serviceLayer = Layer.effect(
           // A store defect must not kill the sweep — the same silent-death
           // class this service exists to eliminate. Degrade to an empty
           // pass and retry next tick (mirror of spawn.ts's R13 hardening).
+          // Interrupts (scope disposal) still propagate — the repo's
+          // background-loop discipline.
           Effect.catchCause((cause) =>
-            Effect.gen(function* () {
-              yield* Effect.logWarning("DagSupervisionSweep store query failed — skipping tick", { cause })
-              return []
-            }),
+            Cause.hasInterrupts(cause)
+              ? Effect.interrupt
+              : Effect.gen(function* () {
+                  yield* Effect.logWarning("DagSupervisionSweep store query failed — skipping tick", { cause })
+                  return []
+                }),
           ),
         )
 
@@ -155,8 +161,10 @@ const serviceLayer = Layer.effect(
         const escalateIntervalMs = yield* escalateIntervalFor(row.workflowId, row.nodeId)
         if (flatTicks < frozenTicksNeeded(escalateIntervalMs)) continue
         // Frozen across the full window: cancel the (possibly dead) child and
-        // settle the node. The nodeFailed guard under the workflow lock
-        // serializes any race with a live watcher or another host's sweep.
+        // settle the node. Same-host races (a live watcher) are serialized by
+        // the workflow's in-process lock; another host's sweep is collapsed
+        // by the durable terminal-status guard — either way at most one
+        // settle lands.
         if (row.childSessionId) {
           // Best-effort cancel, recovered at CAUSE level: the sweep's layer
           // context has no ambient InstanceRef, so a real SessionPrompt.cancel
@@ -166,7 +174,9 @@ const serviceLayer = Layer.effect(
           // with the scope, so a skipped cancel is also the correct outcome;
           // the durable settle below is the source of truth either way.
           // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion -- the durable column is typed string|null; the cancel seam brands SessionID.
-          yield* promptSvc.cancel(row.childSessionId as never).pipe(Effect.catchCause(() => Effect.void))
+          yield* promptSvc.cancel(row.childSessionId as never).pipe(
+            Effect.catchCause((cause) => (Cause.hasInterrupts(cause) ? Effect.interrupt : Effect.void)),
+          )
         }
         const settled = yield* dag
           .nodeFailed(
@@ -178,14 +188,16 @@ const serviceLayer = Layer.effect(
           .pipe(
             Effect.as(true),
             Effect.catchCause((cause) =>
-              Effect.gen(function* () {
-                yield* Effect.logWarning("DagSupervisionSweep nodeFailed failed — retrying next tick", {
-                  dagID: row.workflowId,
-                  nodeID: row.nodeId,
-                  cause,
-                })
-                return false
-              }),
+              Cause.hasInterrupts(cause)
+                ? Effect.interrupt
+                : Effect.gen(function* () {
+                    yield* Effect.logWarning("DagSupervisionSweep nodeFailed failed — retrying next tick", {
+                      dagID: row.workflowId,
+                      nodeID: row.nodeId,
+                      cause,
+                    })
+                    return false
+                  }),
             ),
           )
         // On a failed settle keep the streak so the next tick retries
@@ -214,8 +226,11 @@ const serviceLayer = Layer.effect(
           yield* sweepOnce().pipe(
             // Per-tick guard: any residual defect inside a tick degrades to
             // a logged skip — the loop itself must outlive every failure.
+            // Interrupts (scope disposal) still exit the loop.
             Effect.catchCause((cause) =>
-              Effect.logWarning("DagSupervisionSweep tick failed — retrying next interval", { cause }),
+              Cause.hasInterrupts(cause)
+                ? Effect.interrupt
+                : Effect.logWarning("DagSupervisionSweep tick failed — retrying next interval", { cause }),
             ),
           )
         }
