@@ -696,20 +696,37 @@ const serviceLayer = Layer.effect(
                         // corrective nodes — a paused workflow resumes as part
                         // of replan (workflow tool) so corrections can run.
                         const paused = yield* Effect.gen(function* () {
-                          // Pause can fail transiently (e.g. the workflow lock is
-                          // held by a concurrent long replan); retry once before
-                          // falling back to the durable status, so the workflow
-                          // is never silently stranded.
+                          // DAG-03: the checkpoint VETOED this direction — the
+                          // pause must fail CLOSED. Pause can fail transiently
+                          // (e.g. the workflow lock is held by a concurrent
+                          // long replan); retry once, and if it still cannot
+                          // be persisted, HOLD the in-memory pause anyway.
+                          // Pre-fix this returned `wf?.status === "paused"` —
+                          // fail-OPEN: it explicitly un-paused the runtime, so
+                          // the next stimulus calling spawnReady (a NodeFailed
+                          // handler, a step, a resume) spawned the vetoed
+                          // direction with no gate, no pause, no diagnostic.
+                          // catchCause (not catch): a DEFECT from dag.pause
+                          // must fold into the same path — pre-fix it escaped
+                          // to guarded() and dropped this whole handler, so
+                          // the pause was never even attempted and the gate's
+                          // own warning was lost. Interrupts (scope disposal)
+                          // still propagate.
                           const attemptPause = dag.pause(dagID).pipe(
                             Effect.map(() => true),
-                            Effect.catch(() => Effect.succeed(false)),
+                            Effect.catchCause((cause) =>
+                              Cause.hasInterrupts(cause) ? Effect.failCause(cause) : Effect.succeed(false),
+                            ),
                           )
                           if (yield* attemptPause) return true
                           if (yield* attemptPause) return true
                           const wf = yield* store.getWorkflow(dagID).pipe(Effect.orDie)
                           if (wf?.status !== "paused")
-                            yield* Effect.logWarning("DagLoop pause on replan verdict failed", { dagID, nodeID })
-                          return wf?.status === "paused"
+                            yield* Effect.logError(
+                              "DagLoop pause on replan verdict failed — holding in-memory pause (fail-closed)",
+                              { dagID, nodeID, durableStatus: wf?.status ?? "missing" },
+                            )
+                          return true
                         })
                         entry.runtime.setPaused(paused)
                         yield* Effect.logWarning("DagLoop paused workflow after gate verdict: replan", { dagID, nodeID })
