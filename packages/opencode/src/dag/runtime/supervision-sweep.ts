@@ -10,6 +10,7 @@ import { DagStore } from "@opencode-ai/core/dag/store"
 import { WorkflowNodeTable } from "@opencode-ai/core/dag/sql"
 import { and, eq, sql } from "drizzle-orm"
 import { Dag } from "@/dag/dag"
+import { parseWorkflowConfig } from "@/dag/dag"
 import { SessionPrompt } from "@/session/prompt"
 
 /**
@@ -75,6 +76,19 @@ const SWEEP_INTERVAL_MS = 60_000
 export const frozenTicksNeeded = (escalateIntervalMs: number) =>
   Math.ceil(Math.max(escalateIntervalMs, 1_000) / SWEEP_INTERVAL_MS) + 1
 
+/**
+ * The node's escalation cadence derived from a persisted config row. Pure —
+ * exported for unit tests. parseWorkflowConfig is the repo's defensive
+ * parser: malformed JSON or shape-divergent rows return undefined instead of
+ * throwing, and every degrade path lands on the DEFAULT cadence (the widest
+ * guaranteed-safe window) — a single corrupt row must never defect the sweep.
+ */
+export const escalateIntervalFromConfig = (raw: string | undefined, nodeId: string) => {
+  const node = raw === undefined ? undefined : parseWorkflowConfig(raw)?.nodes.find((n) => n.id === nodeId)
+  const timeoutMs = node?.worker_config?.timeout_ms
+  return Math.max(1_000, typeof timeoutMs === "number" ? timeoutMs : Dag.DEFAULT_WORKFLOW_CONFIG.nodeTimeoutMs)
+}
+
 const serviceLayer = Layer.effect(
   Service,
   Effect.gen(function* () {
@@ -92,16 +106,14 @@ const serviceLayer = Layer.effect(
 
     // The node's escalation cadence, from the workflow's persisted config —
     // the same source spawn.ts derived the watcher's escalateIntervalMs from.
-    // Cached per workflow id for the tick; a config read failure degrades to
-    // the DEFAULT cadence (the widest guaranteed-safe window).
+    // Only nodes already flat for a tick pay this lookup; a store read
+    // failure degrades to the DEFAULT cadence (the widest guaranteed-safe
+    // window).
     const escalateIntervalFor = Effect.fnUntraced(function* (workflowId: string, nodeId: string) {
       const wf = yield* store.getWorkflow(workflowId).pipe(
         Effect.catchCause(() => Effect.succeed(undefined)),
       )
-      if (!wf) return Dag.DEFAULT_WORKFLOW_CONFIG.nodeTimeoutMs
-      const node = JSON.parse(wf.config).nodes?.find?.((n: { id: string }) => n.id === nodeId)
-      const timeoutMs = node?.worker_config?.timeout_ms
-      return Math.max(1_000, typeof timeoutMs === "number" ? timeoutMs : Dag.DEFAULT_WORKFLOW_CONFIG.nodeTimeoutMs)
+      return escalateIntervalFromConfig(wf?.config, nodeId)
     })
 
     const sweepOnce = Effect.fn("DagSupervisionSweep.sweepOnce")(function* () {

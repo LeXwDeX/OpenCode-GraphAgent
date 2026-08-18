@@ -239,8 +239,9 @@ describe("DAG node supervision — deadline enforcement (production incident)", 
             "watcher never escalated a node past its deadline (healthy control)",
             "8 seconds",
           )
-          // Cap enforcement: max extensions default is 3 — after enough
-          // escalations the watcher cancels the child and fails the node.
+          // Cap enforcement: this graph pins max_timeout_extensions to 1 —
+          // after one escalation the watcher cancels the child and fails the
+          // node.
           yield* pollWithTimeout(
             Effect.gen(function* () {
               const row = yield* store.getNode(dagID, "worker")
@@ -376,5 +377,45 @@ describe("DAG node supervision — deadline enforcement (production incident)", 
         }),
       ),
     )
+  })
+})
+
+describe("DagSupervisionSweep cadence derivation (pure)", () => {
+  it("derives the cadence from the node's persisted timeout_ms", () => {
+    const config = JSON.stringify({ nodes: [{ id: "worker", depends_on: [], worker_config: { timeout_ms: 30_000 } }] })
+    expect(DagSupervisionSweep.escalateIntervalFromConfig(config, "worker")).toBe(30_000)
+  })
+
+  it("floors sub-second timeouts to the watcher's 1s minimum", () => {
+    const config = JSON.stringify({ nodes: [{ id: "worker", depends_on: [], worker_config: { timeout_ms: 10 } }] })
+    expect(DagSupervisionSweep.escalateIntervalFromConfig(config, "worker")).toBe(1_000)
+  })
+
+  it("degrades to the DEFAULT cadence on absent row, malformed JSON, shape-divergent rows, or missing node", () => {
+    const expected = Dag.DEFAULT_WORKFLOW_CONFIG.nodeTimeoutMs
+    // No workflow row at all.
+    expect(DagSupervisionSweep.escalateIntervalFromConfig(undefined, "worker")).toBe(expected)
+    // Corrupt JSON string, and JSON whose root is not a record.
+    expect(DagSupervisionSweep.escalateIntervalFromConfig("{not json", "worker")).toBe(expected)
+    expect(DagSupervisionSweep.escalateIntervalFromConfig("null", "worker")).toBe(expected)
+    // Shape-divergent rows: nodes not an array / null entries.
+    expect(DagSupervisionSweep.escalateIntervalFromConfig(JSON.stringify({ nodes: null }), "worker")).toBe(expected)
+    expect(DagSupervisionSweep.escalateIntervalFromConfig(JSON.stringify({ nodes: [null] }), "worker")).toBe(expected)
+    // Node absent from the config, or present without worker_config.timeout_ms.
+    const other = JSON.stringify({ nodes: [{ id: "other", depends_on: [], worker_config: { timeout_ms: 30_000 } }] })
+    expect(DagSupervisionSweep.escalateIntervalFromConfig(other, "worker")).toBe(expected)
+    const bare = JSON.stringify({ nodes: [{ id: "worker", depends_on: [] }] })
+    expect(DagSupervisionSweep.escalateIntervalFromConfig(bare, "worker")).toBe(expected)
+  })
+
+  it("freeze window boundaries: one interval of flat plus one tick, at every configured timeout", () => {
+    expect(DagSupervisionSweep.frozenTicksNeeded(1)).toBe(2)
+    expect(DagSupervisionSweep.frozenTicksNeeded(60_000)).toBe(2)
+    expect(DagSupervisionSweep.frozenTicksNeeded(60_001)).toBe(3)
+    // The default 10-minute cadence and the doc-recommended 30-minute
+    // verifier timeout — a live watcher at each cadence always moves the
+    // counter inside the window.
+    expect(DagSupervisionSweep.frozenTicksNeeded(Dag.DEFAULT_WORKFLOW_CONFIG.nodeTimeoutMs)).toBe(11)
+    expect(DagSupervisionSweep.frozenTicksNeeded(1_800_000)).toBe(31)
   })
 })
