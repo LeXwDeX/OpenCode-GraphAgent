@@ -222,9 +222,8 @@ const supervisionProgress = (store: DagStore.Interface, dagID: string, nodeID: s
     return undefined
   })
 
-// bun's default per-test timeout is 5s; the healthy cap-enforcement path
-// needs ~8s at a 2s deadline — run this file with --timeout 30000 (the CI
-// suite default) or keep each body under the limit.
+// bun's default per-test timeout is 5s; several bodies here need 8-40s at a
+// 2s deadline — run this file with --timeout 30000 (the CI suite default).
 describe("DAG node supervision — deadline enforcement (production incident)", () => {
   it("healthy: a node past its deadline gets escalated by the watcher", async () => {
     await Effect.runPromise(
@@ -308,11 +307,15 @@ describe("DAG node supervision — deadline enforcement (production incident)", 
 
           // The fallback-retry contract (production fix): the HOST-LEVEL
           // supervision sweep — whose fiber lives in the layer scope and
-          // survives the instance teardown — settles the frozen node on its
-          // second tick (frozen counter across ticks = dead supervision).
-          yield* sweep.sweepOnce()
-          yield* Effect.sleep("200 millis")
-          yield* sweep.sweepOnce()
+          // survives the instance teardown — settles the frozen node once
+          // its counter has stayed flat for FROZEN_TICKS_NEEDED ticks
+          // (dead supervision; a live watcher always moves the counter
+          // inside the window).
+          const { FROZEN_TICKS_NEEDED } = DagSupervisionSweep
+          for (let tick = 0; tick <= FROZEN_TICKS_NEEDED; tick++) {
+            yield* sweep.sweepOnce()
+            yield* Effect.sleep("50 millis")
+          }
           const swept = yield* pollWithTimeout(
             Effect.gen(function* () {
               const settled = yield* store.getNode(dagID, "worker")
@@ -322,6 +325,50 @@ describe("DAG node supervision — deadline enforcement (production incident)", 
             "5 seconds",
           )
           expect(swept?.errorClass).toBe("timeout")
+        }),
+      ),
+    )
+  })
+
+  // Review R1 issue 2 (false-positive kill): a LIVE watcher on a node whose
+  // escalation cadence spans multiple sweep intervals must never be swept —
+  // the counter legitimately stays flat between escalations. The graph keeps
+  // the default cap (20) so the watcher's ladder is the intended path; the
+  // sweep passes run alongside a live watcher for well over the freeze
+  // window, and the settle that eventually lands must carry the WATCHER's
+  // own cap reason, never the sweep's.
+  it("freeze window: a live watcher is never swept — only its own cap enforcement ends the node", async () => {
+    await Effect.runPromise(
+      runSupervisionTest({ instanceProject: "project-1" }, ({ dag, store, sweep, childPrompts }) =>
+        Effect.gen(function* () {
+          const dagID = yield* dag.create({
+            ...incidentGraph,
+            config: { ...incidentGraph.config, max_timeout_extensions: 3 },
+          })
+          const child = yield* takeWithin(childPrompts, "worker did not start")
+          void child
+          // Supervision alive: the watcher escalates on its 2s cadence.
+          yield* pollWithTimeout(
+            supervisionProgress(store, dagID, "worker"),
+            "watcher never escalated before the streak test",
+            "8 seconds",
+          )
+          const { FROZEN_TICKS_NEEDED } = DagSupervisionSweep
+          // Run more sweep passes than the freeze window alongside the live
+          // watcher: its 2s escalation cadence resets the streak every time,
+          // so the sweep must never fire.
+          for (let tick = 0; tick < FROZEN_TICKS_NEEDED + 2; tick++) {
+            yield* Effect.sleep("300 millis")
+            yield* sweep.sweepOnce()
+          }
+          const row = yield* store.getNode(dagID, "worker")
+          // Either still running (ladder ongoing) or terminalized by the
+          // watcher's OWN cap — never by the sweep.
+          if (row?.status === "failed") {
+            expect(row?.errorReason).toContain("timeout extensions exhausted")
+          } else {
+            expect(row?.status).toBe("running")
+          }
         }),
       ),
     )
