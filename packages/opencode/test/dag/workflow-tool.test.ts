@@ -1258,6 +1258,37 @@ describe("workflow tool execution", () => {
     }),
   )
 
+  runtime.effect("extending a paused workflow resumes it so added nodes can run (#381)", () =>
+    Effect.gen(function* () {
+      published.length = 0
+      const info = yield* WorkflowTool
+      const workflow = yield* info.init()
+      const spec_path = yield* writeWorkflowSpec("paused-extend", {
+        nodes: [
+          {
+            id: "added-while-paused",
+            name: "Added while paused",
+            worker_type: "general",
+            depends_on: [],
+            prompt_template: { inline: "work" },
+          },
+        ],
+      })
+      const result = yield* workflow.execute(
+        Schema.decodeUnknownSync(Parameters)({ params: {
+          action: "extend",
+          workflow_id: "dag_paused",
+          spec_path,
+        }}),
+        toolContext(),
+      )
+
+      expect(result.title).toContain("Workflow extended: 1 nodes added")
+      expect(result.output).toContain("has been resumed")
+      expect(published.some((event) => event.type === DagEvent.WorkflowResumed.type)).toBe(true)
+    }),
+  )
+
   runtime.effect("rejects inline or missing spec sources before side effects", () =>
     Effect.gen(function* () {
       const info = yield* WorkflowTool
