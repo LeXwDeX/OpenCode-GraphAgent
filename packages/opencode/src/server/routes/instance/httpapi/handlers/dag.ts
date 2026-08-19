@@ -6,6 +6,7 @@ import { HttpApiBuilder } from "effect/unstable/httpapi"
 import { InstanceHttpApi } from "../api"
 import { InvalidRequestError, ConflictError, notFound } from "../errors"
 import { Dag } from "@/dag/dag"
+import { DagValidation } from "@/dag/validation"
 import { WorkflowAuthoring } from "@/dag/authoring"
 import { DagEnvironmentCatalogs } from "@/dag/environment-catalogs"
 import { createAdmissionRecord } from "@/dag/admission"
@@ -177,12 +178,22 @@ export const dagHandlers = HttpApiBuilder.group(InstanceHttpApi, "dag", (handler
         environment: { directory: session.directory, parent: session.model ?? undefined },
       })
       if (result.prepared?.action !== "start" || result.errors.length > 0) {
-        const diagnostics = result.errors
-          .map((diagnostic) => `- [${diagnostic.code}] ${diagnostic.path}: ${diagnostic.message}${diagnostic.hint ? ` (${diagnostic.hint})` : ""}`)
-          .join("\n")
-        return yield* Effect.fail(
-          new InvalidRequestError({ message: `start rejected by workflow validation:\n${diagnostics || "no prepared graph"}` }),
+        // Parity with the workflow tool's start action: model resolution is
+        // advisory over HTTP — the tool asks a question (no model configured
+        // yet), an API caller has no such interaction; the spawn path fails
+        // loudly (failWithoutFiber) at execution time if a model never
+        // resolves. Every other diagnostic class stays blocking.
+        const blocking = result.errors.filter(
+          (diagnostic) => diagnostic.code !== DagValidation.DIAGNOSTIC_CODES.modelUnavailable,
         )
+        if (result.prepared?.action !== "start" || blocking.length > 0) {
+          const diagnostics = blocking
+            .map((diagnostic) => `- [${diagnostic.code}] ${diagnostic.path}: ${diagnostic.message}${diagnostic.hint ? ` (${diagnostic.hint})` : ""}`)
+            .join("\n")
+          return yield* Effect.fail(
+            new InvalidRequestError({ message: `start rejected by workflow validation:\n${diagnostics || "no prepared graph"}` }),
+          )
+        }
       }
       const prepared = result.prepared
       const dagID = yield* dag
