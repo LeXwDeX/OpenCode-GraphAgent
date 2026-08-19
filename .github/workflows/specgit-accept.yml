@@ -71,7 +71,9 @@ jobs:
             const retried = [...byName.keys()].find((k) => k.startsWith(name + ' ('));
             return retried !== undefined && terminal.has(byName.get(retried));
           };
-          const deadline = Date.now() + 15 * 60 * 1000;
+          // Must outlast the slowest required sibling (Unit Tests (linux)
+          // runs ~28min on PRs); the job timeout above bounds this too.
+          const deadline = Date.now() + 40 * 60 * 1000;
           while (Date.now() < deadline) {
             const res = await fetch(url, { headers });
             if (!res.ok) throw new Error('check-runs API ' + res.status);
