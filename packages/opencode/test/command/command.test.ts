@@ -72,6 +72,20 @@ describe("legacy command registry", () => {
     }),
   )
 
+  it.instance("registers the canonical dag-template-update command", () =>
+    Effect.gen(function* () {
+      const commands = yield* Command.Service
+
+      expect(yield* commands.get("dag-template-update")).toMatchObject({
+        name: "dag-template-update",
+        description: CommandPlugin.DagTemplateUpdateDescription,
+        source: "command",
+        template: CommandPlugin.DagTemplateUpdateContent,
+        hints: ["$ARGUMENTS"],
+      })
+    }),
+  )
+
   it.instance("registers the canonical dag-init and dag-auto commands", () =>
     Effect.gen(function* () {
       const commands = yield* Command.Service
