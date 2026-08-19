@@ -278,3 +278,13 @@ verified on its own evidence, split it before binding.
 - `--json` is the only parse surface: stdout is exactly one JSON
   document; never scrape human-readable output.
 <!-- specgit:block:end -->
+
+## Tool-call discipline (hard rules)
+
+- Never fan out duplicate or near-duplicate queries. One question, one
+  tool call; if the answer is already in context, make zero calls.
+- Parallel tool batches must contain distinct, independently justified
+  calls. Before sending a batch, verify no two calls answer the same
+  question. A repeated identical call is a bug regardless of intent.
+- Long CI waits use `sleep N && <single check>`, never repeated watches
+  of the same resource. One watch command, one result.

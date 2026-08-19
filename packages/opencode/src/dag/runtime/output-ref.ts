@@ -45,6 +45,10 @@ const SUMMARY_CHARS = 200
 // The summary only needs the leading chars; decoding a bounded prefix keeps a
 // giant report from being copied twice (once for the digest, once for text).
 const SUMMARY_DECODE_BYTES = 4096
+// #349/CAP-02: whole-file capture bound — a giant or sparse referenced file
+// must not spike memory; larger files fall back to the inline path
+// (returning undefined here is the designed degradation).
+const FILE_REF_MAX_BYTES = 64 * 1024 * 1024
 const MAX_PATH_CHARS = 4096
 
 export const REPORT_AREA = path.join(".opencode", "workflow-reports")
@@ -88,6 +92,9 @@ export function captureOutputFileRef(rawText: string): Effect.Effect<OutputFileR
   return Effect.gen(function* () {
     const info = yield* Effect.promise(() => stat(candidate).catch(() => undefined))
     if (!info || !info.isFile() || info.size === 0) return undefined
+    // #349/CAP-02: refuse oversized refs — stat already told us the size, so
+    // the read never happens for a pathological file.
+    if (info.size > FILE_REF_MAX_BYTES) return undefined
     const bytes = yield* Effect.promise(() =>
       Bun.file(candidate)
         .arrayBuffer()

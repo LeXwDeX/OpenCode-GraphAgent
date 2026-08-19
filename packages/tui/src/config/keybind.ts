@@ -87,6 +87,10 @@ export const Definitions = {
   dag_resume: keybind("none", "Resume selected DAG workflow"),
   dag_step: keybind("none", "Step selected DAG workflow (run one node)"),
   dag_cancel: keybind("none", "Cancel selected DAG workflow"),
+  // #349/F6: plugin-level palette command — without a Definitions/CommandMap
+  // entry it is not rebindable and never appears in the keybind config
+  // schema.
+  dag_cancel_active: keybind("none", "Cancel the session's active DAG workflow"),
 
   editor_open: keybind("<leader>e", "Open external editor"),
   theme_list: keybind("<leader>t", "List available themes"),
@@ -306,6 +310,7 @@ export const CommandMap = {
   dag_resume: "dag.resume",
   dag_step: "dag.step",
   dag_cancel: "dag.cancel",
+  dag_cancel_active: "dag.cancel.active",
   editor_open: "prompt.editor",
   theme_list: "theme.switch",
   theme_switch_mode: "theme.switch_mode",

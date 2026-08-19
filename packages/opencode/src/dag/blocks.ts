@@ -263,10 +263,28 @@ function compileBlock(
         required: true,
         reportToParent: false,
         inputMapping: Object.fromEntries(
-          aggregation.writerIDs.flatMap((writerID: string) => [
-            [`${writerID.replace(/-/g, "_")}_changed_files`, `${writerID}.output.changed_files`],
-            [`${writerID.replace(/-/g, "_")}_summary`, `${writerID}.output.summary`],
-          ]),
+          (() => {
+            // #349/BLK-02: writer ids may mix hyphens and underscores
+            // ("foo-bar" vs "foo_bar") whose -→_ normalization collides on
+            // the same mapping key — Object.fromEntries would silently drop
+            // one writer's evidence (and its files escape the aggregator's
+            // overlap detection). Reject the shape at compile time.
+            const seen = new Map<string, string>()
+            for (const writerID of aggregation.writerIDs) {
+              const key = writerID.replace(/-/g, "_")
+              const prior = seen.get(key)
+              if (prior !== undefined) {
+                throw new Error(
+                  `Parallel implementation writers "${prior}" and "${writerID}" normalize to the same input-mapping key "${key}" — their aggregator evidence keys would collide. Rename one of the writers so the ids differ beyond hyphens vs underscores`,
+                )
+              }
+              seen.set(key, writerID)
+            }
+            return aggregation.writerIDs.flatMap((writerID: string) => [
+              [`${writerID.replace(/-/g, "_")}_changed_files`, `${writerID}.output.changed_files`],
+              [`${writerID.replace(/-/g, "_")}_summary`, `${writerID}.output.summary`],
+            ])
+          })(),
         ),
         outputSchema: IMPLEMENTATION_SCHEMA,
       }),
@@ -276,6 +294,17 @@ function compileBlock(
 
   const verifyAggregatorIDs = verifyAggregators.get(block.id)
   const verifyAggregator = verifyAggregatorIDs && verifyAggregatorIDs.length > 0 ? verifyAggregatorIDs[0] : undefined
+  // #349/BLK-3: one verify node serving two parallel-writer review routes
+  // would be rewired onto two aggregators, but the verify contract binds ONE
+  // implementation reference and ONE fingerprint — mapping only the first
+  // (the old silent behavior) lets the second route's write-set escape the
+  // review binding. Reject the shape instead: fan the routes together
+  // first, exactly like multi-review-gate dependencies.
+  if (verifyAggregatorIDs && verifyAggregatorIDs.length > 1) {
+    throw new Error(
+      `Verify block "${block.id}" serves multiple parallel-writer review routes (${verifyAggregatorIDs.join(", ")}) — the verification contract binds a single implementation fingerprint. Fan the routes into one review block first, or give each route its own verify block`,
+    )
+  }
   // A synthesize that follows a review is the route's final gate: it must map
   // the review output so unresolvedReviewOutcomes/finalReviewGates recognize
   // an ACCEPTed review as resolved (issue #304) — the same binding contract

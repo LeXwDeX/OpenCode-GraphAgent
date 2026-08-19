@@ -622,12 +622,37 @@ export const {
       ).then(() => undefined)
     }
 
+    // #349/F3: goal.updated/goal.cleared are ephemeral (not in the durable
+    // replay set), so a goal.cleared missed during a disconnect would leave
+    // a stale goal in the sidebar indefinitely — the reconnect hook must
+    // refresh goals too, symmetric with refreshDagSummaries. Only sessions
+    // with a stored goal can go stale; a missing goal has nothing to clear.
+    let goalReconnectInFlight = false
+    const refreshGoals = (): Promise<void> => {
+      const sessionIDs = Object.keys(store.goal)
+      if (sessionIDs.length === 0) return Promise.resolve()
+      return Promise.all(
+        sessionIDs.map((sessionID) =>
+          sdk.client.session.goal({ sessionID }, { throwOnError: false })
+            .then((response) => {
+              setStore("goal", sessionID, response.data ?? undefined)
+            })
+            .catch(() => {}),
+        ),
+      ).then(() => undefined)
+    }
+
     let dagReconnectInFlight = false
     const unsubscribeReconnect = sdk.event.on("reconnected", () => {
       if (dagReconnectInFlight) return
       dagReconnectInFlight = true
       refreshDagSummaries().finally(() => {
         dagReconnectInFlight = false
+      })
+      if (goalReconnectInFlight) return
+      goalReconnectInFlight = true
+      void refreshGoals().finally(() => {
+        goalReconnectInFlight = false
       })
     })
 

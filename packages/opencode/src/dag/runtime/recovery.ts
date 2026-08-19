@@ -69,7 +69,19 @@ export function reconcileWorkflow(
       // never revisit it if the workflow is about to become terminal.
       if (node.status === "pending" || node.status === "queued") {
         if (node.childSessionId && cancelSession) {
-          yield* cancelSession(node.childSessionId)
+          // #349/REC-1: same hardening as the running-node branch below — a
+          // persistent cancel failure must not abort the whole reconcile
+          // (this workflow would then never be adopted by this process).
+          yield* cancelSession(node.childSessionId).pipe(
+            Effect.catchCause((cause) =>
+              Effect.logWarning("DAG recovery failed to cancel stale child session", {
+                dagID,
+                nodeID: node.id,
+                childSessionID: node.childSessionId,
+                cause,
+              }),
+            ),
+          )
         }
         continue
       }

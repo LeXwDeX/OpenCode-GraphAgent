@@ -87,6 +87,15 @@ export function validateAgainstSchema(value: unknown, schema: Record<string, unk
     if (typeof maxItems === "number" && value.length > maxItems)
       return { ok: false, error: `expected maxItems ${maxItems}, got ${value.length}` }
     if (schema["uniqueItems"] === true) {
+      // #349/CAP-02: the pairwise deepEqual scan is O(n²); model outputs
+      // with more items than this are pathological — fail loudly instead of
+      // burning the validation path.
+      if (value.length > UNIQUE_ITEMS_MAX) {
+        return {
+          ok: false,
+          error: `uniqueItems validation is capped at ${UNIQUE_ITEMS_MAX} items, got ${value.length}`,
+        }
+      }
       const duplicate = value.findIndex((item, index) => value.slice(0, index).some((prev) => deepEqual(prev, item)))
       if (duplicate !== -1)
         return { ok: false, error: `expected uniqueItems, found duplicate at index ${duplicate}` }
@@ -245,9 +254,15 @@ function describeType(value: unknown): string {
 
 // Schema patterns come from workflow config; a malformed regex must not crash
 // validation, it just fails the constraint.
+// #349/CAP-02: patterns may also be PATHOLOGICAL (the draft action lets a
+// model author them) — cap the tested span so catastrophic backtracking
+// against an unbounded model output cannot hang submit_result validation.
+const REGEX_TEST_MAX_CHARS = 100_000
+// #349/CAP-02: bound for the O(n²) uniqueItems pairwise scan.
+const UNIQUE_ITEMS_MAX = 1_000
 function safeRegexTest(pattern: string, value: string): boolean {
   try {
-    return new RegExp(pattern).test(value)
+    return new RegExp(pattern).test(value.slice(0, REGEX_TEST_MAX_CHARS))
   } catch {
     return false
   }
