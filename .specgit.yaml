@@ -1,0 +1,7 @@
+version: 1
+delivery: fix-opencode-auto
+context:
+  kind: branch
+  branch: feat/351-fix-opencode-auto
+issues:
+  - 351
