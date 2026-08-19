@@ -5,3 +5,4 @@ context:
   branch: feat/375-issue375
 issues:
   - 375
+pr: 375
