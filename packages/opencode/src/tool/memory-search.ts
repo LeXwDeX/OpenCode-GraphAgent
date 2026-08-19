@@ -33,11 +33,23 @@ export const MemorySearchTool = Tool.define<typeof Parameters, Metadata, never>(
 
         const memory = Option.getOrUndefined(yield* Effect.serviceOption(Memory.Service))
         const sessions = Option.getOrUndefined(yield* Effect.serviceOption(Session.Service))
-        if (!memory || !sessions) return unavailable()
+        // #350: when the service exists but Memory is inert, say why instead
+        // of a bare "unavailable" — the reason tells the user what to do
+        // (e.g. run /init, then /memory on).
+        if (!memory) return unavailable()
+        if (!sessions) return unavailable()
         const current = yield* sessions.get(ctx.sessionID).pipe(Effect.option)
         if (Option.isNone(current) || current.value.parentID) return unavailable()
 
-        return response(yield* memory.search({ sessionID: ctx.sessionID, messages: ctx.messages, query }))
+        const result = yield* memory.search({ sessionID: ctx.sessionID, messages: ctx.messages, query })
+        // #350: an inert Memory answers "unavailable" with no field to carry
+        // why — surface the actionable reason (init stamp, git identity)
+        // instead of leaving the caller to guess.
+        if (result.status === "unavailable") {
+          const reason = yield* memory.statusReason()
+          if (reason) return unavailable(reason)
+        }
+        return response(result)
       }),
   } satisfies Tool.DefWithoutID<typeof Parameters, Metadata>),
 )
@@ -81,10 +93,10 @@ function response(result: Memory.SearchResult): Tool.ExecuteResult<Metadata> {
   return unavailable()
 }
 
-function unavailable(): Tool.ExecuteResult<Metadata> {
+function unavailable(reason?: string): Tool.ExecuteResult<Metadata> {
   return {
     title: "memory unavailable",
-    output: "Memory search is unavailable for this session",
+    output: reason ?? "Memory search is unavailable for this session",
     metadata: { status: "unavailable" },
   }
 }
