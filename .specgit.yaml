@@ -1,7 +1,8 @@
 version: 1
-delivery: fix-opencode-auto
+delivery: chore-specgit-enable
 context:
   kind: branch
-  branch: feat/351-fix-opencode-auto
+  branch: feat/353-chore-specgit-enable
 issues:
-  - 351
+  - 353
+pr: 354

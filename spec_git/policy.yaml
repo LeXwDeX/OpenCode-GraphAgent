@@ -1,0 +1,3 @@
+version: 1
+required_checks:
+  - Typecheck
