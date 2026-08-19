@@ -2,7 +2,7 @@
 # 🧪 CI · Test
 # ----------------------------------------------------------------------------
 # Purpose : Run unit + Playwright e2e tests across Linux & Windows
-# Trigger : Push to `main`/`dev`, PRs targeting `main`, manual dispatch
+# Trigger : Push to `main`/`dev`, PRs targeting `main` and `dev`, manual dispatch
 # Jobs    : unit  — `bun turbo test` + config_assistant Go tests on linux
 #                    only (windows dropped — see
 #                    unit-tests matrix comment; free windows-latest runners
@@ -10,8 +10,10 @@
 #           e2e   — Playwright chromium on linux + windows (matrix)
 # Gate    : Required status check on the `main` ruleset — full suite gates
 #           dev → main PRs. Pushes to `dev` also get a full run (dev is the
-#           integration/testing branch), but feat/fix → dev PRs are gated by
-#           typecheck only (see ci-typecheck.yml) to keep CI budget sane.
+#           integration/testing branch). feat/fix → dev PRs run the unit
+#           matrix as a required check (#370: the Typecheck-only gate let an
+#           assertion-level regression merge and keep dev red for 75min);
+#           E2E stays push-on-dev + dev→main only to keep CI budget sane.
 # Notes   : `cancel-in-progress: false` — every main/dev push gets a full run
 #           No trigger on feat/* or fix/* (frequent changes).
 # ============================================================================
@@ -26,6 +28,7 @@ on:
   pull_request:
     branches:
       - main
+      - dev
   workflow_dispatch:
 
 concurrency:
