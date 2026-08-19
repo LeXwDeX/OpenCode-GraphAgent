@@ -31,9 +31,12 @@ jobs:
           node-version: '22'
 
       # This repo is a bun workspace and does not vendor the SpecGit CLI;
-      # install the published CLI instead of building from source.
+      # install the published CLI instead of building from source. Pinned
+      # with a caret floor (#366): the CLI releases multiple times a day and
+      # an unpinned install would let an unnoticed upstream change flip CI
+      # acceptance verdicts repo-wide.
       - name: Install specgit CLI
-        run: npm install -g specgit
+        run: npm install -g specgit@^0.5.0
 
       - name: Wait for sibling checks
         # The verdict must see the OTHER required checks in a terminal
