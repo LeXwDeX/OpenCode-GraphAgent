@@ -199,6 +199,30 @@ describe("resolveTemplate", () => {
     await fs.rm(tmpDir, { recursive: true })
   })
 
+  it("resolves a global template from a redirected OPENCODE_CONFIG_DIR", async () => {
+    // #380: the global dag-prompts lookup must honor the same
+    // OPENCODE_CONFIG_DIR redirect the Global service applies, not a
+    // hardcoded ~/.config/opencode path.
+    const globalDir = await fs.mkdtemp(path.join(os.tmpdir(), "dag-global-"))
+    const promptsDir = path.join(globalDir, "dag-prompts")
+    await fs.mkdir(promptsDir, { recursive: true })
+    await fs.writeFile(path.join(promptsDir, "redirected-tmpl.md"), "Global {{scope}} template!", "utf-8")
+    const previous = process.env.OPENCODE_CONFIG_DIR
+    process.env.OPENCODE_CONFIG_DIR = globalDir
+    try {
+      const projectDir = await fs.mkdtemp(path.join(os.tmpdir(), "dag-proj-"))
+      const result = await Effect.runPromise(
+        resolveTemplate({ id: "redirected-tmpl", input: { scope: "redirected" } }, projectDir),
+      )
+      expect(result).toBe("Global redirected template!")
+      await fs.rm(projectDir, { recursive: true })
+    } finally {
+      if (previous === undefined) delete process.env.OPENCODE_CONFIG_DIR
+      else process.env.OPENCODE_CONFIG_DIR = previous
+      await fs.rm(globalDir, { recursive: true })
+    }
+  })
+
   it("fails for non-existent template id", async () => {
     const program = resolveTemplate({ id: "non-existent-template" }, "/tmp")
     await expect(Effect.runPromise(program)).rejects.toThrow("not found")
