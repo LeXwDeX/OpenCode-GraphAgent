@@ -22,6 +22,7 @@ import { disposeInstance } from "@/effect/instance-registry"
 import { DagSupervisionSweep } from "@/dag/runtime/supervision-sweep"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { SessionPrompt } from "@/session/prompt"
+import { SessionAutomationLease } from "@/session/automation-lease"
 import { MessageID } from "@/session/schema"
 import { Session } from "@/session/session"
 import { SessionStatus } from "@/session/status"
@@ -145,7 +146,14 @@ function supervisionLayer(input: {
       }),
   })
   const loop = DagLoop.layer.pipe(Layer.provide(base), Layer.provide(session), Layer.provide(prompt), Layer.provide(agent))
-  const sweep = DagSupervisionSweep.layerWithoutDeps.pipe(Layer.provide(base), Layer.provide(prompt))
+  // #343: the sweep terminalizes workflows and releases their automation
+  // lease after a host-level settle — give it the real (process-level) lease
+  // registry so the unregister path is exercised, not a silent mock no-op.
+  const sweep = DagSupervisionSweep.layerWithoutDeps.pipe(
+    Layer.provide(base),
+    Layer.provide(prompt),
+    Layer.provide(SessionAutomationLease.defaultLayer),
+  )
   return Layer.merge(Layer.merge(base, loop), sweep)
 }
 
@@ -335,6 +343,13 @@ describe("DAG node supervision — deadline enforcement (production incident)", 
             "5 seconds",
           )
           expect(swept?.errorClass).toBe("timeout")
+          // #343 (workflow rot): with the owning instance gone, the sweep —
+          // not a dead DagLoop's checkCompletion — must land the workflow's
+          // terminal transition once every current-revision node is terminal.
+          // The incident graph is a single required worker, so its failure is
+          // a workflow FAILURE.
+          const wf = yield* store.getWorkflow(dagID)
+          expect(wf?.status).toBe("failed")
         }),
       ),
     )
