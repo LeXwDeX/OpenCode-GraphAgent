@@ -405,11 +405,14 @@ function requireValidBlockGraph(graph: WorkflowBlockGraph, options: WorkflowBloc
 }
 
 // Injected between parallel implementation writers and their verification
-// gate: mechanically detects declared write-set overlap (loud node failure)
-// and publishes the union with one fingerprint computed at the convergence
-// point, so diff review binds to a single post-merge state.
+// gate: an explore-type worker enforcing the contract below. Detection is a
+// behavioral contract, not an engine guarantee (#347) — the engine computes
+// no intersection or union itself. The contract makes the worker reconcile
+// the declared write-sets against the workspace's actual git status so
+// undeclared edits fail loudly instead of escaping the union+fingerprint
+// review binding, and computes the fingerprint over the actually-changed set.
 const AGGREGATOR_CONTRACT =
-  "Collect the supplied changed-file lists and summaries from each parallel implementation writer. If any file path appears in more than one list, do not submit; fail the node naming the exact overlapping paths. Otherwise submit the union of all changed files and one stable fingerprint computed at this convergence point (for example a sha256 over the sorted union of current file contents, reporting the exact commands used). Do not modify any file."
+  "Collect the supplied changed-file lists and summaries from each parallel implementation writer. Run git status --porcelain in the workspace to observe the actually-changed set. If any file path appears in more than one declared list, do not submit; fail the node naming the exact overlapping paths. If the actually-changed set contains paths no writer declared, do not submit; fail the node naming the undeclared paths — undeclared edits must not slip past the review binding. Otherwise submit the union of the actually-changed set and one stable fingerprint computed at this convergence point over exactly that set (for example a sha256 over the sorted union of current file contents, reporting the exact commands used). Do not modify any file."
 
 interface WriterAggregation {
   aggregatorID: string
