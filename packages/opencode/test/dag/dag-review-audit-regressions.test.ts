@@ -86,6 +86,46 @@ describe("H1: validateAgainstSchema with JSON Schema type arrays", () => {
 })
 
 // ============================================================================
+// #346 — object-semantic keywords without `type: "object"` used to let any
+// non-object value pass silently (ok:true), hiding the DAG-01 consequence
+// inside a legal schema spelling.
+// ============================================================================
+describe("#346: object-semantic keywords imply an object value", () => {
+  it("rejects a string when the schema has required/properties but no type", () => {
+    const schema = { required: ["verdict"], properties: { verdict: { type: "string" } } }
+    expect(validateAgainstSchema("accepted", schema).ok).toBe(false)
+  })
+
+  it("rejects a number for a properties-only schema", () => {
+    expect(validateAgainstSchema(42, { properties: { verdict: { type: "string" } } }).ok).toBe(false)
+  })
+
+  it("still accepts a conforming object for the same schema", () => {
+    const schema = { required: ["verdict"], properties: { verdict: { type: "string" } } }
+    expect(validateAgainstSchema({ verdict: "replan" }, schema).ok).toBe(true)
+  })
+
+  it("still rejects a missing required field on a conforming-typed object", () => {
+    const schema = { required: ["verdict"], properties: { verdict: { type: "string" } } }
+    expect(validateAgainstSchema({}, schema).ok).toBe(false)
+  })
+
+  it("additionalProperties:false fences keys even without a properties block", () => {
+    expect(validateAgainstSchema({ rogue: 1 }, { type: "object", additionalProperties: false }).ok).toBe(false)
+    expect(validateAgainstSchema({}, { type: "object", additionalProperties: false }).ok).toBe(true)
+  })
+
+  it("additionalProperties as a keyword implies an object value", () => {
+    expect(validateAgainstSchema("str", { additionalProperties: false }).ok).toBe(false)
+  })
+
+  it("an unknown type name fails instead of permissively passing", () => {
+    expect(validateAgainstSchema("x", { type: "strng" }).ok).toBe(false)
+    expect(validateAgainstSchema(42, { type: "strng" }).ok).toBe(false)
+  })
+})
+
+// ============================================================================
 // B1 — recovery path completes review nodes without validateReviewResult
 // ============================================================================
 describe("B1: reconcileWorkflow review-contract gap", () => {
