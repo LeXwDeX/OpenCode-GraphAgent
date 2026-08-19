@@ -1919,7 +1919,7 @@ const scenarios: Scenario[] = [
       // node -> tier -> agent -> parent(session.model); the exerciser's fake
       // provider only exists under withLlm, and the parent chain needs the
       // session to carry the fake model explicitly.
-      ctx.session({ title: "DAG start owner", model: { providerID: "test", modelID: "test-model" } }),
+      ctx.session({ title: "DAG start owner", model: { providerID: "test", id: "test-model" } }),
     )
     .at((ctx) => ({
       path: "/dag",
