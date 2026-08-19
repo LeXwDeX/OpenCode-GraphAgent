@@ -90,6 +90,36 @@ export const escalateIntervalFromConfig = (raw: string | undefined, nodeId: stri
   return Math.max(1_000, typeof timeoutMs === "number" ? timeoutMs : Dag.DEFAULT_WORKFLOW_CONFIG.nodeTimeoutMs)
 }
 
+/**
+ * An upper bound on the cadence the LIVE watcher actually runs at,
+ * back-derived from durable columns. deadline_ms is only ever written as
+ * `grant time + timeout_ms` — at spawn (started_at + T0) and at each
+ * deadline extension (now + Ti) — while escalations move only the counter,
+ * never the deadline. The granted total (deadline − started_at) is therefore
+ * the sum of the initial grant plus every extension grant, which is always
+ * ≥ the LAST grant, and the last grant's timeout IS the live watcher's
+ * cadence (a re-time replaces the watcher at the new timeout). Issue #342:
+ * replan can lower a running node's persisted timeout_ms while the A1/Q2
+ * re-time gate deliberately keeps the old watcher on its old (longer)
+ * cadence — a config-only window would then be shorter than the live
+ * watcher's cycle and sweep a healthy node. Taking the max with the config
+ * cadence covers both shapes: re-timed watchers match the config (the
+ * durable value merely over-estimates by the accumulated grants, delaying —
+ * never causing — a settle), gate-skipped ones are caught by the durable
+ * bound. Returns 0 when the columns are missing (legacy rows) so the config
+ * value decides alone.
+ */
+export const escalateIntervalDurable = (
+  deadlineMs: number | null | undefined,
+  startedAt: number | null | undefined,
+) => {
+  if (deadlineMs == null || startedAt == null) return 0
+  if (!Number.isFinite(deadlineMs) || !Number.isFinite(startedAt)) return 0
+  const granted = deadlineMs - startedAt
+  if (granted <= 0) return 0
+  return Math.max(1_000, granted)
+}
+
 const serviceLayer = Layer.effect(
   Service,
   Effect.gen(function* () {
@@ -124,6 +154,8 @@ const serviceLayer = Layer.effect(
           nodeId: WorkflowNodeTable.id,
           childSessionId: WorkflowNodeTable.child_session_id,
           extensions: WorkflowNodeTable.timeout_extensions,
+          deadlineMs: WorkflowNodeTable.deadline_ms,
+          startedAt: WorkflowNodeTable.started_at,
         })
         .from(WorkflowNodeTable)
         .where(
@@ -158,7 +190,14 @@ const serviceLayer = Layer.effect(
         // Only nodes already flat for a tick pay the config lookup.
         if (flatTicks < 1) continue
         const escalateIntervalMs = yield* escalateIntervalFor(row.workflowId, row.nodeId)
-        if (flatTicks < frozenTicksNeeded(escalateIntervalMs)) continue
+        // #342: the window must cover the LIVE watcher's actual cadence, not
+        // just the current config's — replan may have lowered the persisted
+        // timeout while the re-time gate kept the old watcher.
+        const windowIntervalMs = Math.max(
+          escalateIntervalMs,
+          escalateIntervalDurable(row.deadlineMs, row.startedAt),
+        )
+        if (flatTicks < frozenTicksNeeded(windowIntervalMs)) continue
         // Frozen across the full window: cancel the (possibly dead) child and
         // settle the node. Same-host races (a live watcher) are serialized by
         // the workflow's in-process lock; another host's sweep is collapsed
