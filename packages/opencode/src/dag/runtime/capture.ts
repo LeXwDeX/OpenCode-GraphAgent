@@ -93,6 +93,26 @@ export function validateAgainstSchema(value: unknown, schema: Record<string, unk
     }
   }
 
+  // #346: object-semantic keywords imply an object value even without an
+  // explicit `type: "object"` — `{required, properties}` without a type is a
+  // fully legal, common JSON Schema spelling, and a non-object value used to
+  // skip the whole group silently (ok:true). A bare string could then slip
+  // past a gated checkpoint's declared schema and resolve no fields
+  // downstream (the DAG-01 consequence hiding inside the schema spelling).
+  const hasRequired = Array.isArray(schema["required"])
+  const hasProperties = isSchemaObject(schema["properties"])
+  const hasAdditionalProperties =
+    "additionalProperties" in schema
+    && (typeof schema["additionalProperties"] === "boolean" || isSchemaObject(schema["additionalProperties"]))
+  if ((hasRequired || hasProperties || hasAdditionalProperties) && !isSchemaObject(value)) {
+    const keywords = [
+      hasRequired && "required",
+      hasProperties && "properties",
+      hasAdditionalProperties && "additionalProperties",
+    ].filter(Boolean).join("/")
+    return { ok: false, error: `schema constrains object fields (${keywords}) but the value is ${describeType(value)}` }
+  }
+
   const required = schema["required"]
   if (Array.isArray(required) && isSchemaObject(value)) {
     for (const field of required) {
@@ -102,18 +122,25 @@ export function validateAgainstSchema(value: unknown, schema: Record<string, unk
   }
 
   const properties = schema["properties"]
-  if (isSchemaObject(properties) && isSchemaObject(value)) {
-    for (const [key, propSchema] of Object.entries(properties)) {
+  const narrowedProperties = isSchemaObject(properties) ? properties : undefined
+  if (narrowedProperties !== undefined && isSchemaObject(value)) {
+    for (const [key, propSchema] of Object.entries(narrowedProperties)) {
       if (key in value && isSchemaObject(propSchema)) {
         const result = validateAgainstSchema(value[key], propSchema)
         if (!result.ok) return { ok: false, error: `field "${key}": ${result.error}` }
       }
     }
-    if (schema["additionalProperties"] === false) {
-      const extra = Object.keys(value).find((key) => !(key in properties))
-      if (extra !== undefined)
-        return { ok: false, error: `unexpected additional property: "${extra}"` }
-    }
+  }
+
+  // #346: `additionalProperties: false` fences the value's keys against the
+  // declared properties even when `properties` itself is absent (an empty
+  // allowed set) — previously the check was nested inside the properties
+  // branch and never ran for this spelling.
+  if (schema["additionalProperties"] === false && isSchemaObject(value)) {
+    const allowed: Record<string, unknown> = narrowedProperties ?? {}
+    const extra = Object.keys(value).find((key) => !(key in allowed))
+    if (extra !== undefined)
+      return { ok: false, error: `unexpected additional property: "${extra}"` }
   }
 
   const items = schema["items"]
@@ -204,8 +231,9 @@ function matchesScalarType(value: unknown, type: string): boolean {
   if (type === "integer") return typeof value === "number" && Number.isInteger(value)
   if (type === "boolean") return typeof value === "boolean"
   if (type === "null") return value === null
-  // Unknown type name: permissive, consistent with subset semantics.
-  return true
+  // #346: an unrecognized type name is a schema authoring error (e.g. a
+  // misspelled "strng") — the old permissive pass accepted ANY value for it.
+  return false
 }
 
 function describeType(value: unknown): string {
