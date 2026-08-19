@@ -663,9 +663,33 @@ export const WorkflowTool = Tool.define<
                 dag.extend(params.workflow_id, result.prepared.nodes),
                 "Terminal workflows are immutable except for the additive-extend reopen, which requires the workflow to have completed naturally at a wake-eligible reporting checkpoint (fragment adds new node ids; no early control(complete); no executed node beyond the checkpoint — condition-skipped dependents are fine). When the reopen does not apply, recover by starting a NEW workflow spec that reuses this workflow's completed outputs as static input.",
               ).pipe(Effect.orDie)
+              // #381: extend shares replan's resume contract — a paused
+              // workflow must resume for the added nodes to ever run (pause
+              // admits nothing and no wake path prompts a resume), and the
+              // extend intent is "the graph grew, proceed". Resume races with
+              // concurrent control ops are tolerated: the extend already
+              // landed, so never die on them.
+              const wfAfterExtend = yield* dag.store.getWorkflow(params.workflow_id).pipe(Effect.orDie)
+              const resumedFromPause = wfAfterExtend?.status === "paused"
+              const resumedOk = resumedFromPause
+                ? yield* dag.resume(params.workflow_id).pipe(
+                    Effect.map(() => true),
+                    Effect.catch((error) =>
+                      Effect.gen(function* () {
+                        yield* Effect.logWarning("Workflow resume after extend failed", { wfId: params.workflow_id, error })
+                        return false
+                      }),
+                    ),
+                  )
+                : false
+              const pauseNote = !resumedFromPause
+                ? ""
+                : resumedOk
+                  ? "\nWorkflow was paused and has been resumed — added nodes are now schedulable."
+                  : "\nWorkflow was paused; automatic resume raced with another control op — check status and issue control(resume) if still paused."
               return {
                 title: `Workflow extended: ${r.add.length} nodes added`,
-                output: `<workflow id="${params.workflow_id}" action="extend">\nAdded: ${r.add.join(", ")}\n</workflow>`,
+                output: `<workflow id="${params.workflow_id}" action="extend">\nAdded: ${r.add.join(", ")}${pauseNote}\n</workflow>`,
                 metadata: { workflowId: params.workflow_id, added: r.add } as Metadata,
               }
             }
