@@ -8,11 +8,13 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Database } from "@opencode-ai/core/database/database"
 import { DagStore } from "@opencode-ai/core/dag/store"
 import { WorkflowNodeTable } from "@opencode-ai/core/dag/sql"
+import { ProjectTable } from "@opencode-ai/core/project/sql"
 import { isNodeTerminalStatus, isTransitionRejection, isWorkflowTerminalStatus } from "@opencode-ai/core/dag/core/types"
 import { and, eq, sql } from "drizzle-orm"
 import { Dag, parseWorkflowConfig } from "@/dag/dag"
 import { SessionPrompt } from "@/session/prompt"
 import { SessionAutomationLease } from "@/session/automation-lease"
+import { InstanceRef } from "@/effect/instance-ref"
 
 /**
  * Host-level deadline-supervision sweep — the fallback retry for the
@@ -150,6 +152,37 @@ const serviceLayer = Layer.effect(
       return escalateIntervalFromConfig(wf?.config, nodeId)
     })
 
+    // #349/SW-L1: publish-side location stamping. The sweep's layer context
+    // has no ambient InstanceRef, so its durable events used to carry an
+    // empty location — live instances' summary publishers filter by
+    // directory, so the TUI never got a summary push for a swept settle
+    // (bootstrap refetch only). Providing a reference derived from the
+    // workflow's own durable row (directory + project) stamps the events so
+    // the owning directory's consumers see them. Falls back to unstamped
+    // when the row cannot be resolved — same visibility as before, never
+    // worse.
+    const withWorkflowLocation = Effect.fnUntraced(function* (workflowId: string, body: Effect.Effect<void, Error>) {
+      const wf = yield* store.getWorkflow(workflowId).pipe(
+        Effect.catchCause((cause) => (Cause.hasInterrupts(cause) ? Effect.interrupt : Effect.succeed(undefined))),
+      )
+      if (!wf?.directory) return yield* body
+      const project = yield* db
+        .select()
+        .from(ProjectTable)
+        // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion -- the durable column is typed string; ProjectTable.id is branded.
+        .where(eq(ProjectTable.id, wf.projectId as never))
+        .get()
+        .pipe(Effect.catchCause((cause) => (Cause.hasInterrupts(cause) ? Effect.interrupt : Effect.succeed(undefined))))
+      yield* body.pipe(
+        // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion -- partial InstanceContext: only directory/worktree/project.id are read by the publish-side location stamp.
+        Effect.provideService(InstanceRef, {
+          directory: wf.directory,
+          worktree: project?.worktree ?? wf.directory,
+          project: { id: wf.projectId },
+        } as never),
+      )
+    })
+
     const sweepOnce = Effect.fn("DagSupervisionSweep.sweepOnce")(function* () {
       const rows = yield* db
         .select({
@@ -219,28 +252,31 @@ const serviceLayer = Layer.effect(
             Effect.catchCause((cause) => (Cause.hasInterrupts(cause) ? Effect.interrupt : Effect.void)),
           )
         }
-        const settled = yield* dag
-          .nodeFailed(
-            row.workflowId,
-            row.nodeId,
-            `deadline supervision lost (no escalation progress across ${flatTicks} sweep ticks, escalate cadence ${escalateIntervalMs}ms) — swept, extensions ${row.extensions}`,
-            "timeout",
-          )
-          .pipe(
-            Effect.as(true),
-            Effect.catchCause((cause) =>
-              Cause.hasInterrupts(cause)
-                ? Effect.interrupt
-                : Effect.gen(function* () {
-                    yield* Effect.logWarning("DagSupervisionSweep nodeFailed failed — retrying next tick", {
-                      dagID: row.workflowId,
-                      nodeID: row.nodeId,
-                      cause,
-                    })
-                    return false
-                  }),
-            ),
-          )
+        const settled = yield* withWorkflowLocation(
+          row.workflowId,
+          dag
+            .nodeFailed(
+              row.workflowId,
+              row.nodeId,
+              `deadline supervision lost (no escalation progress across ${flatTicks} sweep ticks, escalate cadence ${escalateIntervalMs}ms) — swept, extensions ${row.extensions}`,
+              "timeout",
+            )
+            .pipe(Effect.asVoid),
+        ).pipe(
+          Effect.as(true),
+          Effect.catchCause((cause) =>
+            Cause.hasInterrupts(cause)
+              ? Effect.interrupt
+              : Effect.gen(function* () {
+                  yield* Effect.logWarning("DagSupervisionSweep nodeFailed failed — retrying next tick", {
+                    dagID: row.workflowId,
+                    nodeID: row.nodeId,
+                    cause,
+                  })
+                  return false
+                }),
+          ),
+        )
         // On a failed settle keep the streak so the next tick retries
         // immediately instead of deferring by a full freeze window.
         if (!settled) continue
@@ -260,7 +296,7 @@ const serviceLayer = Layer.effect(
         // load. A live DagLoop racing this is serialized by the same
         // workflow lock and its terminal-status guards — double settles
         // collapse to one.
-        yield* settleWorkflowIfComplete(row.workflowId).pipe(
+        yield* withWorkflowLocation(row.workflowId, settleWorkflowIfComplete(row.workflowId)).pipe(
           Effect.catchCause((cause) => (Cause.hasInterrupts(cause) ? Effect.interrupt : Effect.void)),
         )
       }
