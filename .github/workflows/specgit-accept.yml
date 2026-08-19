@@ -2,9 +2,12 @@ name: SpecGit Acceptance
 
 on:
   pull_request:
-    # Delivery PRs target dev (fast-integration layer); dev→main promotion
-    # stays governed by the protect-main Ruleset's four required checks.
-    branches: [dev]
+    # Delivery PRs target dev (fast-integration layer) and are promoted to
+    # main via the release PR — main's legacy branch protection also requires
+    # the SpecGit Acceptance check, so the verdict must run on both targets.
+    # dev→main promotion stays governed by the protect-main Ruleset's four
+    # required checks.
+    branches: [dev, main]
 
 permissions:
   contents: read
