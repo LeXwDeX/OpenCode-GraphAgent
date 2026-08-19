@@ -27,15 +27,15 @@ Workflow Orchestration turns one user objective into one durable DAG. Its model-
 - Parsing, file-only compatibility, strict action decoding, Block compilation, and profile diagnostics are not reimplemented by callers.
 - `portable` validation does not load user environment catalogs. `environment` validation reads current catalogs and verifies actual model availability.
 - No workflow event or durable mutation occurs before a valid Prepared Workflow Graph exists.
-
-## Conventions
-
-- One user objective has at most one live DAG; route expansion stays inside that DAG (issue #348: a modeling convention enforced by orchestrator guidance — workflow-routing and orchestration-policy — not by the engine; `dag.create` and the workflow tool's start accept a session with a live workflow. The runtime tolerates the violation with bounded consequences: the wake model aggregates across workflows and a goal is blocked by any DAG lease. When two live DAGs share one workspace, the plan block's disjoint-write-set discipline does NOT carry across workflows — authors must keep concurrent workflows on disjoint worktrees or serialize them).
 - The model-facing schema contains fields the model owns. Session/Project identity, admission audit state, model assignment, and other runtime-derived fields remain hidden.
 - Model-facing graph actions expose only `spec_path`; graph fields live in YAML so provider tool-call serialization cannot turn a nested graph into a string.
 - Legacy YAML may be adapted at the file boundary without making legacy fields valid inline input.
 - Runtime Admission and Workflow Authoring Check have separate names, state, and responsibilities.
 - Dependents of a reporting checkpoint must be gated on its output; authoring rejects ungated shapes at start/validate AND at replan/extend fragment actions, and the runtime replan/extend mutation seam re-checks the merged graph (exempting checkpoints already terminal in the durable graph — they are settled and immutable, the spawn-before-verdict race is past; runtime create remains deliberately unchanged). A gated checkpoint must declare `output_schema` (authoring obligation).
+
+## Conventions
+
+- One user objective has at most one live DAG; route expansion stays inside that DAG (issue #348: a modeling convention enforced by orchestrator guidance — workflow-routing and orchestration-policy — not by the engine; `dag.create` and the workflow tool's start accept a session with a live workflow. The runtime tolerates the violation with bounded consequences: the wake model aggregates across workflows and a goal is blocked by any DAG lease. When two live DAGs share one workspace, the plan block's disjoint-write-set discipline does NOT carry across workflows — authors must keep concurrent workflows on disjoint worktrees or serialize them).
 
 ## Boundaries
 

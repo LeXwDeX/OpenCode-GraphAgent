@@ -33,11 +33,7 @@ export const MemorySearchTool = Tool.define<typeof Parameters, Metadata, never>(
 
         const memory = Option.getOrUndefined(yield* Effect.serviceOption(Memory.Service))
         const sessions = Option.getOrUndefined(yield* Effect.serviceOption(Session.Service))
-        // #350: when the service exists but Memory is inert, say why instead
-        // of a bare "unavailable" — the reason tells the user what to do
-        // (e.g. run /init, then /memory on).
-        if (!memory) return unavailable()
-        if (!sessions) return unavailable()
+        if (!memory || !sessions) return unavailable()
         const current = yield* sessions.get(ctx.sessionID).pipe(Effect.option)
         if (Option.isNone(current) || current.value.parentID) return unavailable()
 
