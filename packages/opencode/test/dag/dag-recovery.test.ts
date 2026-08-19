@@ -171,22 +171,24 @@ describe("reconcileWorkflow", () => {
     expect(result).toEqual({ reconciled: 0, ownershipLost: 0 })
   })
 
-  it("aborts recovery when a stale restart-orphan session cannot be cancelled", async () => {
+  // #349/REC-1: a persistent stale-child cancel failure no longer aborts
+  // the whole reconcile — that made the workflow unadoptable in this process
+  // (its running nodes would never be scheduled until a restart). The
+  // failure is logged and the reconcile continues; this test pinned the old
+  // abort behavior.
+  it("survives a stale restart-orphan cancel failure and continues the reconcile", async () => {
     const events: TrackedEvent[] = []
     const nodes = [makeNodeRow({ id: "n1", status: "queued", childSessionId: "ses_stale" })]
     const dagLayer = makeDagLayer(nodes, events)
     const checkStatus = () => Effect.succeed("active" as const)
     const cancelSession = () => Effect.fail(new Error("cancel unavailable"))
 
-    const exit = await Effect.runPromise(
-      reconcileWorkflow("wf-1", checkStatus, cancelSession).pipe(
-        Effect.provide(dagLayer),
-        Effect.exit,
-      ),
+    const result = await Effect.runPromise(
+      reconcileWorkflow("wf-1", checkStatus, cancelSession).pipe(Effect.provide(dagLayer)),
     )
 
-    expect(Exit.isFailure(exit)).toBe(true)
     expect(events).toEqual([])
+    expect(result).toEqual({ reconciled: 0, ownershipLost: 0 })
   })
 
   it("cancels and fails a zero-message child classified as unknown exactly once", async () => {
