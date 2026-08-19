@@ -48,6 +48,7 @@ import { Discovery } from "@/skill/discovery"
 import { Snapshot } from "@/snapshot"
 import { Storage } from "@/storage/storage"
 import { Goal } from "@/goal/goal"
+import { GoalLoop } from "@/goal/loop"
 import { SettingsHook } from "@/hook/settings"
 import { HookRewakeLive } from "@/hook/rewake-live"
 import { SessionHooks } from "@/hook/session-hooks"
@@ -297,6 +298,14 @@ export const app = LayerNode.group([
   // here, so live sessions silently degraded to "Memory remains off" /
   // "Memory search is unavailable for this session" (issue #311).
   Memory.node,
+  // GoalLoop: same failure class again (issue #340) — the only consumer is
+  // InstanceBootstrap's `serviceOption(GoalLoop.Service).init()` (idle-event
+  // subscription + startup goal scan), which runs in the request fiber's
+  // ambient context. GoalLoop.node was listed only in AppLayer
+  // (app-runtime.ts provideMerge), so headless serve/web, the desktop
+  // sidecar, and non-CWD TUI directories never armed goal continuation or
+  // the crash-recovery scan: standing goals stalled after their first turn.
+  GoalLoop.node,
 ])
 
 export function createRoutes(
