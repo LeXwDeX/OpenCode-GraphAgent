@@ -25,20 +25,15 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Setup pnpm
-        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
-
       - name: Setup Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: '20.19.0'
-          cache: 'pnpm'
+          node-version: '22'
 
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
-
-      - name: Build CLI
-        run: pnpm run build
+      # This repo is a bun workspace and does not vendor the SpecGit CLI;
+      # install the published CLI instead of building from source.
+      - name: Install specgit CLI
+        run: npm install -g specgit
 
       - name: Wait for sibling checks
         # The verdict must see the OTHER required checks in a terminal
@@ -53,9 +48,11 @@ jobs:
         run: |
           node --input-type=module <<'EOF'
           import { readFileSync } from 'node:fs';
-          import { parse } from 'yaml';
-          const policy = parse(readFileSync('spec_git/policy.yaml', 'utf8'));
-          const required = policy.required_checks ?? [];
+          // Minimal parse of policy.yaml's required_checks block list —
+          // avoids a yaml dependency in this bun-based repo.
+          const policy = readFileSync('spec_git/policy.yaml', 'utf8');
+          const section = policy.slice(policy.indexOf('required_checks:'));
+          const required = [...section.matchAll(/^\s*-\s*(.+)$/gm)].map((m) => m[1].trim());
           const headers = {
             authorization: 'Bearer ' + process.env.GH_TOKEN,
             accept: 'application/vnd.github+json',
@@ -87,6 +84,6 @@ jobs:
           EOF
 
       - name: specgit finish
-        run: node bin/specgit.js finish --json
+        run: specgit finish --json
         env:
           GH_TOKEN: ${{ github.token }}
