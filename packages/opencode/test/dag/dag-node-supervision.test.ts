@@ -470,4 +470,46 @@ describe("DagSupervisionSweep cadence derivation (pure)", () => {
     expect(DagSupervisionSweep.frozenTicksNeeded(Dag.DEFAULT_WORKFLOW_CONFIG.nodeTimeoutMs)).toBe(11)
     expect(DagSupervisionSweep.frozenTicksNeeded(1_800_000)).toBe(31)
   })
+
+  it("#342: back-derives a safe cadence bound from durable columns", () => {
+    // Spawned at a 30-minute timeout, no extensions: granted total is
+    // exactly one cadence.
+    expect(DagSupervisionSweep.escalateIntervalDurable(1_800_000, 0)).toBe(1_800_000)
+    // Escalations move only the counter, never the deadline — after three
+    // escalations with no extension the granted total is still one cadence
+    // (NOT the average; dividing would under-estimate and un-safety the
+    // window).
+    expect(DagSupervisionSweep.escalateIntervalDurable(1_800_000, 0)).toBe(1_800_000)
+    // An extension grants another timeout: the total over-estimates the
+    // current cadence, which delays (never causes) a settle — safe.
+    expect(DagSupervisionSweep.escalateIntervalDurable(3_600_000, 0)).toBe(3_600_000)
+    // Sub-second derivation floors to the watcher's 1s minimum.
+    expect(DagSupervisionSweep.escalateIntervalDurable(500, 0)).toBe(1_000)
+    // Legacy/edge rows are not derivable: 0 lets the config value decide.
+    expect(DagSupervisionSweep.escalateIntervalDurable(undefined, 0)).toBe(0)
+    expect(DagSupervisionSweep.escalateIntervalDurable(1_800_000, undefined)).toBe(0)
+    expect(DagSupervisionSweep.escalateIntervalDurable(null, null)).toBe(0)
+    expect(DagSupervisionSweep.escalateIntervalDurable(0, 1_800_000)).toBe(0)
+  })
+
+  it("#342: a replan-lowered config never shortens the window below the live watcher's cadence", () => {
+    // The incident shape: spawned at a 30-minute cadence, replan lowers the
+    // persisted timeout to 10 minutes, the A1/Q2 re-time gate keeps the old
+    // watcher. The config alone would give an 11-tick window (~11 minutes)
+    // and prematurely sweep a healthy node; the durable bound recovers the
+    // 30-minute cadence and the window stays 31 ticks.
+    const configInterval = DagSupervisionSweep.escalateIntervalFromConfig(
+      JSON.stringify({ nodes: [{ id: "worker", depends_on: [], worker_config: { timeout_ms: 600_000 } }] }),
+      "worker",
+    )
+    const durableInterval = DagSupervisionSweep.escalateIntervalDurable(1_800_000, 0)
+    const windowInterval = Math.max(configInterval, durableInterval)
+    expect(configInterval).toBe(600_000)
+    expect(durableInterval).toBe(1_800_000)
+    expect(DagSupervisionSweep.frozenTicksNeeded(windowInterval)).toBe(31)
+    // Re-timed watcher (watcher matches the lowered config): the config
+    // decides, the durable over-estimate only delays detection.
+    const reTimedWindow = Math.max(600_000, DagSupervisionSweep.escalateIntervalDurable(600_000, 0))
+    expect(DagSupervisionSweep.frozenTicksNeeded(reTimedWindow)).toBe(11)
+  })
 })
