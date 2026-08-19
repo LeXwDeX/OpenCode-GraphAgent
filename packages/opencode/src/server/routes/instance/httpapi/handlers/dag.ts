@@ -6,6 +6,11 @@ import { HttpApiBuilder } from "effect/unstable/httpapi"
 import { InstanceHttpApi } from "../api"
 import { InvalidRequestError, ConflictError, notFound } from "../errors"
 import { Dag } from "@/dag/dag"
+import { WorkflowAuthoring } from "@/dag/authoring"
+import { DagEnvironmentCatalogs } from "@/dag/environment-catalogs"
+import { createAdmissionRecord } from "@/dag/admission"
+import { Agent } from "@/agent/agent"
+import { Provider } from "@/provider/provider"
 import { Session } from "@/session/session"
 import { SessionID } from "@/session/schema"
 import { InstanceState } from "@/effect/instance-state"
@@ -37,6 +42,11 @@ export const dagHandlers = HttpApiBuilder.group(InstanceHttpApi, "dag", (handler
   Effect.gen(function* () {
     const dag = yield* Dag.Service
     const sessions = yield* Session.Service
+    const agents = yield* Agent.Service
+    const provider = yield* Provider.Service
+    const authoring = WorkflowAuthoring.make({
+      loadEnvironment: DagEnvironmentCatalogs.makeCatalogLoader(agents, provider),
+    })
 
     const wf = (r: DagStore.WorkflowRow) => ({
       id: r.id,
@@ -150,18 +160,44 @@ export const dagHandlers = HttpApiBuilder.group(InstanceHttpApi, "dag", (handler
         return yield* Effect.fail(new InvalidRequestError({ message: "start requires 'config' with a 'nodes' array" }))
       }
       const session = yield* requireSession(ctx.payload.session_id)
-      const cfg = config as Dag.WorkflowConfig
-      // Same code path as the workflow tool's start action — create validates
-      // the config (duplicate ids / dangling deps / condition refs / ceiling)
-      // and fail-fast errors surface as 400, not 500 defects.
-      const dagID = yield* dag.create({
-        projectID: session.projectID,
-        sessionID: session.id,
-        title: ctx.payload.title ?? cfg.name,
-        config: cfg,
-      }).pipe(
-        Effect.catch((error) => Effect.fail(new InvalidRequestError({ message: error.message }))),
-      )
+      // #344: same authority as the workflow tool's start action — every start
+      // passes Workflow Authoring (environment profile): checkpoint gating,
+      // output_schema obligations on gated checkpoints, worker/model/prompt
+      // asset resolution, and server-side minting of the deep-mode admission
+      // record. dag.create alone runs only structural checks, which is safe
+      // only when authoring has already vetted the graph.
+      const result = yield* authoring.prepare({
+        action: "start",
+        source: {
+          kind: "inline",
+          value: { title: ctx.payload.title, config },
+          source: "httpapi:dag.start",
+        },
+        profile: "environment",
+        environment: { directory: session.directory, parent: session.model ?? undefined },
+      })
+      if (result.prepared?.action !== "start" || result.errors.length > 0) {
+        const diagnostics = result.errors
+          .map((diagnostic) => `- [${diagnostic.code}] ${diagnostic.path}: ${diagnostic.message}${diagnostic.hint ? ` (${diagnostic.hint})` : ""}`)
+          .join("\n")
+        return yield* Effect.fail(
+          new InvalidRequestError({ message: `start rejected by workflow validation:\n${diagnostics || "no prepared graph"}` }),
+        )
+      }
+      const prepared = result.prepared
+      const dagID = yield* dag
+        .create({
+          projectID: session.projectID,
+          sessionID: session.id,
+          title: ctx.payload.title ?? prepared.title,
+          config: {
+            ...prepared.config,
+            ...(prepared.admission ? { admission: createAdmissionRecord(prepared.admission) } : {}),
+          },
+        })
+        .pipe(
+          Effect.catch((error) => Effect.fail(new InvalidRequestError({ message: error.message }))),
+        )
       const row = yield* dag.store.getWorkflow(dagID).pipe(Effect.orDie)
       if (!row) return yield* Effect.die(new Error(`created workflow missing from store: ${dagID}`))
       return wf(row)
