@@ -1,3 +1,8 @@
+// oxlint-disable typescript-eslint/no-unsafe-type-assertion -- Mirrors the
+// dag-structured-output.test.ts harness idiom (and dag-location-guards.test.ts
+// suppression precedent): mocked Agent/Session/prompt layers and the typed
+// reply fixture use type-only shims for branded IDs — converting them would
+// fork the shared harness shape without changing behavior.
 import { describe, expect, it } from "bun:test"
 import { Effect, Layer, Semaphore, Fiber } from "effect"
 import type { SessionV1 } from "@opencode-ai/core/v1/session"
