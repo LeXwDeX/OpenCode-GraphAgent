@@ -240,3 +240,41 @@ Triage uses the five canonical labels `needs-triage`, `needs-info`, `ready-for-a
 ### Domain docs
 
 This repository uses a multi-context domain-document layout rooted at `CONTEXT-MAP.md`. See `docs/agents/domain.md`.
+
+<!-- specgit:block:start -->
+## SpecGit delivery harness
+
+Managed by `specgit init`. Everything between the markers is rewritten on
+re-init; keep manual guidance outside them.
+
+### The delivery story
+
+- Start with `specgit issue <title-or-number>...`: it creates or reuses
+  the issues, branches, opens the draft pull request that closes every
+  bound issue, and writes `.specgit.yaml`. Re-running resumes; it is
+  idempotent.
+- Finish with `specgit finish`: the verdict, derived from real git, PR,
+  and CI evidence. Exit code 0 is the only "done".
+
+### Repair and diagnostics
+
+- `specgit pr` repairs the pull-request binding: with no arguments it
+  auto-discovers the pull request for this head branch, errors with a fix
+  when none is found, and refuses with a list when several match.
+- `specgit status` shows local evidence only: record, state, drift,
+  origin. `specgit doctor` probes git, repository, origin, gh, and
+  policy.
+
+### Issue granularity
+
+One issue = one independently verifiable WHY. If a deliverable cannot be
+verified on its own evidence, split it before binding.
+
+### Iron rules
+
+- `specgit finish` exit code other than 0: never request merge. Fix the
+  delivery, not the gate.
+- Never weaken `spec_git/policy.yaml` to make a verdict pass.
+- `--json` is the only parse surface: stdout is exactly one JSON
+  document; never scrape human-readable output.
+<!-- specgit:block:end -->

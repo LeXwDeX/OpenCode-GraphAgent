@@ -1,0 +1,90 @@
+name: SpecGit Acceptance
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  specgit-acceptance:
+    name: SpecGit Acceptance
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Check out the PR head branch by name so HEAD is on the branch
+          # (not the detached merge ref): the execution context gate reads
+          # live git. Falls back to the default ref on non-PR events.
+          ref: ${{ github.head_ref || github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '20.19.0'
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build CLI
+        run: pnpm run build
+
+      - name: Wait for sibling checks
+        # The verdict must see the OTHER required checks in a terminal
+        # state. Sibling jobs start in parallel AND may not have registered
+        # their check-runs yet, so an empty poll is not "done": wait until
+        # every name in spec_git/policy.yaml is present with a terminal
+        # conclusion. This job is not in the policy, so no self-deadlock.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WAIT_REPO: ${{ github.repository }}
+          WAIT_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          node --input-type=module <<'EOF'
+          import { readFileSync } from 'node:fs';
+          import { parse } from 'yaml';
+          const policy = parse(readFileSync('spec_git/policy.yaml', 'utf8'));
+          const required = policy.required_checks ?? [];
+          const headers = {
+            authorization: 'Bearer ' + process.env.GH_TOKEN,
+            accept: 'application/vnd.github+json',
+          };
+          const url = 'https://api.github.com/repos/' + process.env.WAIT_REPO
+            + '/commits/' + process.env.WAIT_SHA + '/check-runs?per_page=100';
+          const terminal = new Set(['completed']);
+          const terminalHas = (byName, name) => {
+            if (byName.has(name)) return terminal.has(byName.get(name));
+            const retried = [...byName.keys()].find((k) => k.startsWith(name + ' ('));
+            return retried !== undefined && terminal.has(byName.get(retried));
+          };
+          const deadline = Date.now() + 15 * 60 * 1000;
+          while (Date.now() < deadline) {
+            const res = await fetch(url, { headers });
+            if (!res.ok) throw new Error('check-runs API ' + res.status);
+            const payload = await res.json();
+            const byName = new Map(payload.check_runs.map((r) => [r.name, r.status]));
+            const missing = required.filter((n) => !terminalHas(byName, n));
+            if (missing.length === 0) {
+              console.log('All required checks are in a terminal state.');
+              process.exit(0);
+            }
+            console.log('Waiting for: ' + missing.join(', '));
+            await new Promise((r) => setTimeout(r, 10000));
+          }
+          console.error('Timed out waiting for sibling checks.');
+          process.exit(1);
+          EOF
+
+      - name: specgit finish
+        run: node bin/specgit.js finish --json
+        env:
+          GH_TOKEN: ${{ github.token }}
