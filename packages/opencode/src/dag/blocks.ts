@@ -262,30 +262,7 @@ function compileBlock(
         contract: AGGREGATOR_CONTRACT,
         required: true,
         reportToParent: false,
-        inputMapping: Object.fromEntries(
-          (() => {
-            // #349/BLK-02: writer ids may mix hyphens and underscores
-            // ("foo-bar" vs "foo_bar") whose -→_ normalization collides on
-            // the same mapping key — Object.fromEntries would silently drop
-            // one writer's evidence (and its files escape the aggregator's
-            // overlap detection). Reject the shape at compile time.
-            const seen = new Map<string, string>()
-            for (const writerID of aggregation.writerIDs) {
-              const key = writerID.replace(/-/g, "_")
-              const prior = seen.get(key)
-              if (prior !== undefined) {
-                throw new Error(
-                  `Parallel implementation writers "${prior}" and "${writerID}" normalize to the same input-mapping key "${key}" — their aggregator evidence keys would collide. Rename one of the writers so the ids differ beyond hyphens vs underscores`,
-                )
-              }
-              seen.set(key, writerID)
-            }
-            return aggregation.writerIDs.flatMap((writerID: string) => [
-              [`${writerID.replace(/-/g, "_")}_changed_files`, `${writerID}.output.changed_files`],
-              [`${writerID.replace(/-/g, "_")}_summary`, `${writerID}.output.summary`],
-            ])
-          })(),
-        ),
+        inputMapping: aggregatorEvidenceMapping(aggregation.writerIDs),
         outputSchema: IMPLEMENTATION_SCHEMA,
       }),
       ...lanes,
@@ -447,6 +424,33 @@ interface WriterAggregation {
   aggregatorID: string
   writerIDs: string[]
   verificationID: string
+}
+
+/**
+ * The aggregator's per-writer evidence mapping. #349/BLK-02: writer ids may
+ * mix hyphens and underscores ("foo-bar" vs "foo_bar") whose -→_ normalization
+ * collides on the same mapping key — Object.fromEntries would silently drop
+ * one writer's evidence (and its files escape the aggregator's overlap
+ * detection), so the shape is rejected at compile time.
+ */
+function aggregatorEvidenceMapping(writerIDs: string[]): Record<string, string> {
+  const seen = new Map<string, string>()
+  for (const writerID of writerIDs) {
+    const key = writerID.replace(/-/g, "_")
+    const prior = seen.get(key)
+    if (prior !== undefined) {
+      throw new Error(
+        `Parallel implementation writers "${prior}" and "${writerID}" normalize to the same input-mapping key "${key}" — their aggregator evidence keys would collide. Rename one of the writers so the ids differ beyond hyphens vs underscores`,
+      )
+    }
+    seen.set(key, writerID)
+  }
+  return Object.fromEntries(
+    writerIDs.flatMap((writerID: string) => [
+      [`${writerID.replace(/-/g, "_")}_changed_files`, `${writerID}.output.changed_files`],
+      [`${writerID.replace(/-/g, "_")}_summary`, `${writerID}.output.summary`],
+    ]),
+  )
 }
 
 function aggregateParallelWriters(blocks: WorkflowBlock[]) {

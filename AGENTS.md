@@ -4,22 +4,22 @@
 ## Git Workflow (铁律)
 
 ```
-feat/**, fix/** ──PR(Typecheck 门禁)──▶ dev ──push 触发全量测试──▶
+feat/**, fix/** ──PR(Typecheck + Unit Tests 门禁)──▶ dev ──push 触发全量测试──▶
     dev ──手动 release-fork──▶ prerelease 测试版
     dev ──PR(全量测试门禁)──▶ main ──手动 release-fork──▶ 正式版
 ```
 
-**分层门禁**：`dev` 是快速集成层（仅 Typecheck），`main` 是正式质量门禁（Typecheck + 全量 Unit Tests + E2E）。所有改动通过 PR 流转，禁止直推 `main` 和 `dev`（由 GitHub Rulesets 强制）。
+**分层门禁**：`dev` 是快速集成层（Typecheck + Unit Tests (linux)；E2E 不阻塞），`main` 是正式质量门禁（Typecheck + 全量 Unit Tests + E2E）。所有改动通过 PR 流转，禁止直推 `main` 和 `dev`（由 GitHub Rulesets 强制）。
 
 | Branch | 直推 | PR 门禁 | CI 触发 | Purpose |
 |--------|------|---------|---------|---------|
 | `{type}/**` | ✅ 允许 | — | ❌ 不跑 | 开发分支，频繁变更 |
-| `dev` | ❌ 禁止 | PR 必须通过 **Typecheck** | ✅ push 触发 Typecheck + 全量测试 | 快速集成层 |
+| `dev` | ❌ 禁止 | PR 必须通过 **Typecheck + Unit Tests (linux)** | ✅ push 触发 Typecheck + 全量测试 | 快速集成层 |
 | `main` | ❌ 禁止 | PR 必须通过 **Typecheck + Unit Tests + E2E (linux + windows)** | ✅ push 触发全量 | 正式质量门禁 + 发版 |
 
 **流程**：
 1. 从 `main` 切出 `feat/**` 或 `fix/**` 分支开发
-2. PR → `dev`（Typecheck 门禁，快速合并）
+2. PR → `dev`（Typecheck + Unit Tests (linux) 门禁，快速合并）
 3. push 到 `dev` 自动触发全量测试验证
 4. 从 `dev` 手动 `release-fork` → 产出 **prerelease** 测试版
 5. PR `dev` → `main`（全量测试门禁：Typecheck + Unit Tests + E2E）
