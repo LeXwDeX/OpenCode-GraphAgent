@@ -40,7 +40,13 @@ describe("parallel workspace writers (issue #293)", () => {
       slice_c_changed_files: "slice-c.output.changed_files",
       slice_c_summary: "slice-c.output.summary",
     })
+    // #347: the contract must make the worker reconcile the declared
+    // write-sets against the workspace's actual git status — undeclared
+    // edits fail loudly instead of escaping the union+fingerprint binding,
+    // and the fingerprint covers the actually-changed set.
     expect(aggregate?.prompt_template.inline).toContain("overlapping paths")
+    expect(aggregate?.prompt_template.inline).toContain("git status --porcelain")
+    expect(aggregate?.prompt_template.inline).toContain("undeclared paths")
 
     expect(byID.get("gates")?.depends_on).toEqual(["decision--aggregate"])
     const decision = byID.get("decision")
