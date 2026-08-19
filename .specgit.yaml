@@ -1,8 +1,8 @@
 version: 1
-delivery: docs-audit-add
+delivery: issue340
 context:
   kind: branch
-  branch: feat/355-docs-audit-add
+  branch: feat/340-issue340
 issues:
-  - 355
-pr: 356
+  - 340
+pr: 357
