@@ -1935,6 +1935,38 @@ const scenarios: Scenario[] = [
       }),
     ),
 
+  // #344: dag.start must pass Workflow Authoring — a reporting checkpoint
+  // gated on its output without declaring output_schema (the DAG-01 danger
+  // shape: an unsatisfiable gate silently skips the subtree while the
+  // workflow reports COMPLETED) is an authoring error, not a creatable graph.
+  http.protected
+    .post("/dag", "dag.start.schemaless-gate")
+    .mutating()
+    .seeded((ctx) => ctx.session({ title: "DAG start gate owner" }))
+    .at((ctx) => ({
+      path: "/dag",
+      headers: ctx.headers(),
+      body: {
+        session_id: ctx.state.id,
+        config: {
+          name: "schemaless-gate",
+          nodes: [
+            { id: "cp", name: "CP", worker_type: "general", depends_on: [], required: true, report_to_parent: true, prompt_template: { inline: "noop" } },
+            {
+              id: "after",
+              name: "After",
+              worker_type: "general",
+              depends_on: ["cp"],
+              required: true,
+              condition: "cp.output.verdict == \"accept\"",
+              prompt_template: { inline: "noop" },
+            },
+          ],
+        },
+      },
+    }))
+    .status(400),
+
   http.protected
     .post("/dag/{dagID}/control", "dag.control")
     .mutating()
