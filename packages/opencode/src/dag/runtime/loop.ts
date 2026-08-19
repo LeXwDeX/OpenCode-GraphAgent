@@ -34,7 +34,7 @@ import { sanitizeInput } from "../templates/sanitize"
 import { DagConfig } from "../config"
 import { spawnNode, makeDeadlineWatcher } from "./spawn"
 import { evaluateCondition, resolveInputMapping } from "./eval"
-import { reconcileWorkflow, makeSessionStatusChecker } from "./recovery"
+import { reconcileWorkflow, makeSessionStatusChecker, makeLastAssistantTextReader } from "./recovery"
 
 // A reporting checkpoint's replan verdict vetoes the current direction: the
 // workflow pauses durably before any downstream spawn (see NodeCompleted
@@ -369,6 +369,9 @@ const serviceLayer = Layer.effect(
         })
 
         const checkSessionStatus = makeSessionStatusChecker(sessionSvc)
+        // #345: schemaless recovered nodes settle with the child's last
+        // assistant text, mirroring the live spawn path.
+        const lastAssistantText = makeLastAssistantTextReader(sessionSvc)
 
         // Best-effort abort of a durable child session, independent of whether
         // a local wrapper fiber still exists.  Used at every replacement,
@@ -414,7 +417,10 @@ const serviceLayer = Layer.effect(
               dagID,
               checkSessionStatus,
               (sid) => promptSvc.cancel(sid as never),
-              config,
+              // null (not undefined) marks an unparseable row so recovery
+              // fails such nodes loudly instead of undefined-completing them.
+              config ?? null,
+              lastAssistantText,
             ).pipe(
               Effect.provideService(Dag.Service, dag),
             )
