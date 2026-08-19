@@ -1913,7 +1913,14 @@ const scenarios: Scenario[] = [
   http.protected
     .post("/dag", "dag.start")
     .mutating()
-    .seeded((ctx) => ctx.session({ title: "DAG start owner" }))
+    .withLlm()
+    .seeded((ctx) =>
+      // environment-profile authoring resolves each node's model through
+      // node -> tier -> agent -> parent(session.model); the exerciser's fake
+      // provider only exists under withLlm, and the parent chain needs the
+      // session to carry the fake model explicitly.
+      ctx.session({ title: "DAG start owner", model: { providerID: "test", modelID: "test-model" } }),
+    )
     .at((ctx) => ({
       path: "/dag",
       headers: ctx.headers(),
