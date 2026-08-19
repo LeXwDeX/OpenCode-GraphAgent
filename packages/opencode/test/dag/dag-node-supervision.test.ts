@@ -240,7 +240,9 @@ const supervisionProgress = (store: DagStore.Interface, dagID: string, nodeID: s
   })
 
 // bun's default per-test timeout is 5s; several bodies here need 8-40s at a
-// 2s deadline — run this file with --timeout 30000 (the CI suite default).
+// 2s deadline — the long tests below declare their own per-test timeout
+// (it(..., 30000), matching the CI suite's --timeout 30000) so bare focused
+// invocations don't red-fail them.
 describe("DAG node supervision — deadline enforcement (production incident)", () => {
   it("healthy: a node past its deadline gets escalated by the watcher", async () => {
     await Effect.runPromise(
@@ -353,7 +355,7 @@ describe("DAG node supervision — deadline enforcement (production incident)", 
         }),
       ),
     )
-  })
+  }, 30_000)
 
   // Review R4 issue 1 (P0): the sweep's layer-scoped fiber has no ambient
   // InstanceRef, so a real SessionPrompt.cancel DIES at
@@ -396,7 +398,7 @@ describe("DAG node supervision — deadline enforcement (production incident)", 
         }),
       ),
     )
-  })
+  }, 30_000)
 
   // Review R1 issue 2 (false-positive kill): a LIVE watcher on a node whose
   // escalation cadence spans multiple sweep intervals must never be swept —
@@ -444,7 +446,7 @@ describe("DAG node supervision — deadline enforcement (production incident)", 
         }),
       ),
     )
-  })
+  }, 30_000)
 })
 
 describe("DagSupervisionSweep cadence derivation (pure)", () => {
