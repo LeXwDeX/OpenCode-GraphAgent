@@ -13,7 +13,10 @@ jobs:
   specgit-acceptance:
     name: SpecGit Acceptance
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # Must exceed the slowest required sibling (Unit Tests (linux) runs
+    # ~28min on PRs): the verdict waits for every policy check to reach a
+    # terminal state before evaluating.
+    timeout-minutes: 45
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
