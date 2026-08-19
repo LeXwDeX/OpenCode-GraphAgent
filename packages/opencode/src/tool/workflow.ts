@@ -6,11 +6,10 @@ import { CommandPlugin } from "@opencode-ai/core/plugin/command"
 import { Effect, Option, Schema } from "effect"
 import { Dag } from "@/dag/dag"
 import { DagReviewLifecycle } from "@/dag/review-lifecycle"
-import { DagConfig } from "@/dag/config"
 import { DagWorkflows } from "@/dag/workflows"
-import { DagModel } from "@/dag/model"
 import { DagValidation, type Diagnostic } from "@/dag/validation"
 import { WorkflowAuthoring } from "@/dag/authoring"
+import { DagEnvironmentCatalogs } from "@/dag/environment-catalogs"
 import { Agent } from "@/agent/agent"
 import { Question } from "@/question"
 import { Provider } from "@/provider/provider"
@@ -205,38 +204,7 @@ export const WorkflowTool = Tool.define<
       )
 
     const authoring = WorkflowAuthoring.make({
-      loadEnvironment: (context) =>
-        Effect.gen(function* () {
-          if (!context.directory) return {}
-          const agentCatalog = yield* agents.list().pipe(Effect.orDie)
-          const providerCatalog = yield* provider.list()
-          const config = yield* DagConfig.load(context.directory)
-          const agentsByName = new Map(agentCatalog.map((agent) => [agent.name, agent]))
-          const availableModels = new Set(
-            Object.values(providerCatalog).flatMap((info) =>
-              Object.values(info.models).map((model) => `${model.providerID}/${model.id}`),
-            ),
-          )
-          const resolveModel: NonNullable<DagValidation.EnvironmentCatalogs["resolveModel"]> = (node, defaults) =>
-            Effect.sync(() => {
-              const resolved = DagModel.resolve({
-                node: node.model ?? defaults?.model,
-                tier: DagConfig.tierModel(config, {
-                  required: node.required ?? defaults?.required ?? Dag.DEFAULT_WORKFLOW_CONFIG.nodeRequired,
-                  workerType: node.worker_type,
-                }),
-                agent: agentsByName.get(node.worker_type)?.model,
-                parent: context.parent
-                  ? { modelID: context.parent.id, providerID: context.parent.providerID }
-                  : undefined,
-              })
-              return Boolean(resolved && availableModels.has(`${resolved.providerID}/${resolved.modelID}`))
-            })
-          return {
-            worker_types: new Set(agentCatalog.map((agent) => agent.name)),
-            resolveModel,
-          }
-        }),
+      loadEnvironment: DagEnvironmentCatalogs.makeCatalogLoader(agents, provider),
     })
 
     const portableEntryCheck = (entry: DagWorkflows.Entry) =>

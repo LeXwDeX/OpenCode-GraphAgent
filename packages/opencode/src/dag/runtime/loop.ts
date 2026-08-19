@@ -34,7 +34,7 @@ import { sanitizeInput } from "../templates/sanitize"
 import { DagConfig } from "../config"
 import { spawnNode, makeDeadlineWatcher } from "./spawn"
 import { evaluateCondition, resolveInputMapping } from "./eval"
-import { reconcileWorkflow, makeSessionStatusChecker } from "./recovery"
+import { reconcileWorkflow, makeSessionStatusChecker, makeLastAssistantTextReader } from "./recovery"
 
 // A reporting checkpoint's replan verdict vetoes the current direction: the
 // workflow pauses durably before any downstream spawn (see NodeCompleted
@@ -321,7 +321,9 @@ const serviceLayer = Layer.effect(
               Effect.provideService(Session.Service, sessionSvc),
               Effect.provideService(SessionPrompt.Service, promptSvc),
               Effect.catchCause((cause) =>
-                dag.nodeFailed(dagID, nodeID, Cause.pretty(cause), "exec_failed"),
+                Cause.hasInterrupts(cause)
+                  ? Effect.failCause(cause)
+                  : dag.nodeFailed(dagID, nodeID, Cause.pretty(cause), "exec_failed"),
               ),
               Effect.ignore,
             )
@@ -369,6 +371,9 @@ const serviceLayer = Layer.effect(
         })
 
         const checkSessionStatus = makeSessionStatusChecker(sessionSvc)
+        // #345: schemaless recovered nodes settle with the child's last
+        // assistant text, mirroring the live spawn path.
+        const lastAssistantText = makeLastAssistantTextReader(sessionSvc)
 
         // Best-effort abort of a durable child session, independent of whether
         // a local wrapper fiber still exists.  Used at every replacement,
@@ -414,7 +419,10 @@ const serviceLayer = Layer.effect(
               dagID,
               checkSessionStatus,
               (sid) => promptSvc.cancel(sid as never),
-              config,
+              // null (not undefined) marks an unparseable row so recovery
+              // fails such nodes loudly instead of undefined-completing them.
+              config ?? null,
+              lastAssistantText,
             ).pipe(
               Effect.provideService(Dag.Service, dag),
             )
@@ -430,18 +438,33 @@ const serviceLayer = Layer.effect(
             // explicit workflow control.
             const pausedForRecovery = recovery.ownershipLost > 0 && wf.status === "running"
             if (pausedForRecovery) {
-              // A concurrent control op (cancel/fail) can terminalize the
-              // workflow while reconciliation runs — the pause guard then
-              // rejects. Abandon adoption instead of tracking a workflow this
-              // instance no longer controls.
-              const pauseAccepted = yield* dag.pause(dagID).pipe(
-                Effect.as(true),
-                Effect.catchCause((cause) =>
-                  Effect.logWarning("DagLoop recovery pause rejected — abandoning adoption", { dagID, cause }).pipe(
-                    Effect.as(false),
+              // #349/NEW-2: a pause rejected by a CONCURRENT TERMINAL control
+              // op means this instance no longer controls the workflow —
+              // abandoning adoption is correct. But a lock-timeout or store
+              // defect used to take the same silent path: the invented
+              // NodeFailed rows were persisted with no runtime entry, events
+              // filtered by runtimes.has, wake boundaries requiring an entry —
+              // the workflow stalled until a process restart. Mirror the
+              // replan-verdict gate: retry twice, fold defects in, and only
+              // abandon when the durable row is genuinely terminal.
+              const pauseAccepted = yield* Effect.gen(function* () {
+                const attemptPause = dag.pause(dagID).pipe(
+                  Effect.map(() => true),
+                  Effect.catchCause((cause) =>
+                    Cause.hasInterrupts(cause) ? Effect.failCause(cause) : Effect.succeed(false),
                   ),
-                ),
-              )
+                )
+                if (yield* attemptPause) return true
+                if (yield* attemptPause) return true
+                const row = yield* store.getWorkflow(dagID).pipe(Effect.orDie)
+                if (row && row.status !== "paused") {
+                  yield* Effect.logError(
+                    "DagLoop recovery pause failed after retries — workflow stays unadopted; it will be re-adopted on the next instance load",
+                    { dagID, status: row.status },
+                  )
+                }
+                return row?.status === "paused"
+              })
               if (!pauseAccepted) return
               yield* Effect.logWarning("DagLoop paused workflow after recovery invented node failures", {
                 dagID,

@@ -37,7 +37,8 @@ export function reconcileWorkflow(
   dagID: string,
   checkSessionStatus: (childSessionID: string) => Effect.Effect<"active" | "completed" | "failed" | "unknown", Error>,
   cancelSession?: (sessionID: string) => Effect.Effect<void, Error>,
-  workflowConfig?: { nodes: Pick<NodeConfig, "id" | "output_schema" | "review" | "input_mapping">[] } | undefined,
+  workflowConfig?: { nodes: Pick<NodeConfig, "id" | "output_schema" | "review" | "input_mapping">[] } | null,
+  lastAssistantText?: (childSessionID: string) => Effect.Effect<string | undefined, Error>,
 ): Effect.Effect<{ reconciled: number; ownershipLost: number }, Error, Dag.Service> {
   return Effect.gen(function* () {
     const dag = yield* Dag.Service
@@ -68,7 +69,19 @@ export function reconcileWorkflow(
       // never revisit it if the workflow is about to become terminal.
       if (node.status === "pending" || node.status === "queued") {
         if (node.childSessionId && cancelSession) {
-          yield* cancelSession(node.childSessionId)
+          // #349/REC-1: same hardening as the running-node branch below — a
+          // persistent cancel failure must not abort the whole reconcile
+          // (this workflow would then never be adopted by this process).
+          yield* cancelSession(node.childSessionId).pipe(
+            Effect.catchCause((cause) =>
+              Effect.logWarning("DAG recovery failed to cancel stale child session", {
+                dagID,
+                nodeID: node.id,
+                childSessionID: node.childSessionId,
+                cause,
+              }),
+            ),
+          )
         }
         continue
       }
@@ -90,6 +103,24 @@ export function reconcileWorkflow(
       const sessionStatus = yield* checkSessionStatus(node.childSessionId)
 
       if (sessionStatus === "completed") {
+        // #345 parity with the live path: an unparseable workflow row must
+        // not degrade into the schemaless completion below — a schema-
+        // carrying node would bypass settleCapturedOutput and land as an
+        // undefined output. Fail loudly instead of inventing a settlement.
+        if (workflowConfig === null) {
+          ownershipLost++
+          yield* settle(
+            node.id,
+            dag.nodeFailed(
+              dagID,
+              node.id,
+              "child session completed but the workflow config is unparseable on recovery — cannot settle safely",
+              "exec_failed",
+            ),
+          )
+          reconciled++
+          continue
+        }
         const nodeConfig = workflowConfig?.nodes.find((n) => n.id === node.id)
         if (nodeConfig?.output_schema) {
           // Same settlement decision as spawn's completion gate — recovery
@@ -102,7 +133,17 @@ export function reconcileWorkflow(
               : dag.nodeFailed(dagID, node.id, settlement.reason, "verdict_fail"),
           )
         } else {
-          yield* settle(node.id, dag.nodeCompleted(dagID, node.id, undefined))
+          // #345: the live path (spawn.ts) completes a schemaless node with
+          // the child's last assistant text; recovery must mirror it instead
+          // of completing with undefined — a schemaless checkpoint's string
+          // verdict (e.g. a bare {"verdict":"replan"} reply) would silently
+          // vanish after a crash otherwise: no pause, no warning, and gated
+          // dependents resolve no fields. Callers that inject no reader keep
+          // the legacy undefined settlement.
+          const rawText = lastAssistantText
+            ? (yield* lastAssistantText(node.childSessionId)) ?? ""
+            : undefined
+          yield* settle(node.id, dag.nodeCompleted(dagID, node.id, rawText))
         }
         reconciled++
       } else if (sessionStatus === "failed") {
@@ -215,5 +256,23 @@ export function makeSessionStatusChecker(
       if (finish === "error" || finish === "content-filter") return "failed" as const
       // stop, length, and any other terminal finish → completed
       return "completed" as const
+    })
+}
+
+/**
+ * #345: the schemaless-node completion mirror of the live path — the child's
+ * last assistant text part, the exact value spawn.ts settles a schemaless
+ * node with. Recovery reads it so a crash cannot erase a string verdict.
+ */
+export function makeLastAssistantTextReader(
+  sessions: Session.Interface,
+): (childSessionID: string) => Effect.Effect<string | undefined, Error> {
+  return (childSessionID) =>
+    Effect.gen(function* () {
+      const msgs = yield* sessions
+        .messages({ sessionID: SessionID.make(childSessionID), limit: 20 })
+        .pipe(Effect.catchTag("NotFoundError", () => Effect.succeed([] as SessionV1.WithParts[])))
+      const last = [...msgs].reverse().find((msg) => msg.info.role === "assistant")
+      return last?.parts.findLast((part): part is Extract<typeof part, { type: "text" }> => part.type === "text")?.text
     })
 }

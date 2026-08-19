@@ -48,6 +48,8 @@ import { Discovery } from "@/skill/discovery"
 import { Snapshot } from "@/snapshot"
 import { Storage } from "@/storage/storage"
 import { Goal } from "@/goal/goal"
+import { GoalLoop } from "@/goal/loop"
+import { DagSupervisionSweep } from "@/dag/runtime/supervision-sweep"
 import { SettingsHook } from "@/hook/settings"
 import { HookRewakeLive } from "@/hook/rewake-live"
 import { SessionHooks } from "@/hook/session-hooks"
@@ -297,6 +299,25 @@ export const app = LayerNode.group([
   // here, so live sessions silently degraded to "Memory remains off" /
   // "Memory search is unavailable for this session" (issue #311).
   Memory.node,
+  // GoalLoop: same failure class again (issue #340) — the only consumer is
+  // InstanceBootstrap's `serviceOption(GoalLoop.Service).init()` (idle-event
+  // subscription + startup goal scan), which runs in the request fiber's
+  // ambient context. GoalLoop.node was listed only in AppLayer
+  // (app-runtime.ts provideMerge), so headless serve/web, the desktop
+  // sidecar, and non-CWD TUI directories never armed goal continuation or
+  // the crash-recovery scan: standing goals stalled after their first turn.
+  GoalLoop.node,
+  // DagSupervisionSweep: host-level deadline supervision (2026-08-18
+  // orphaned-nodes incident) was constructed only in AppLayer, but the
+  // desktop sidecar (packages/desktop/src/main/sidecar.ts) calls
+  // Server.listen without effectCmd, so AppLayer never existed there and
+  // the sweep never ran on the desktop default path (issue #341). Listing
+  // it here makes every serving process build it with the listener scope.
+  // Processes that also build AppLayer (serve/web via AppRuntime) get a
+  // second instance; settle is convergent (withWorkflowLock + guardNode +
+  // conditional projector UPDATE), so the duplicate is safe — see the sweep
+  // header's multi-host convergence notes.
+  DagSupervisionSweep.node,
 ])
 
 export function createRoutes(

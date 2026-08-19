@@ -31,8 +31,11 @@ compiler injects one aggregation node per review route:
 - The aggregator depends on every writer of the route, runs read-only with
   shell access, is required, and reuses the implementation output schema.
 - It receives each writer's declared `changed_files` and fails its node
-  loudly on any non-empty write-set intersection; otherwise it publishes the
-  union plus one fingerprint computed at the convergence point.
+  loudly on any non-empty declared write-set intersection. It also observes
+  the workspace's actual `git status --porcelain` output: any
+  actually-changed path no writer declared fails the node (undeclared edits
+  must not escape the review binding), and the published union plus the
+  convergence-point fingerprint are computed over the actually-changed set.
 - The verify block's writer dependencies are re-pointed to the aggregator,
   the diff review's implementation reference points at the aggregator, and
   the verify node receives the implementation fingerprint binding.
@@ -44,9 +47,12 @@ check.
 
 Author discipline for parallel writers is the triple-disjoint rule — source
 files, generated artifacts, and lockfiles disjoint, and no shared build —
-owned by the plan block's work packages. Mechanical enforcement is the
-aggregator's changed-file intersection check; shared-cache and lock-contention
-races remain plan discipline.
+owned by the plan block's work packages. Enforcement is the aggregator
+worker's behavioral contract (declared-set intersection plus the git-status
+reconciliation of actual workspace changes); the engine itself computes no
+intersection or union, so the contract is only as strong as the worker's
+compliance with it. Shared-cache and lock-contention races remain plan
+discipline.
 
 ## Consequences
 

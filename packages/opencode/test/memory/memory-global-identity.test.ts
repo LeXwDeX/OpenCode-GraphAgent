@@ -204,7 +204,10 @@ describe("MEM-PR01-R1-03: memory is inert once the identity row is retired", () 
               Effect.gen(function* () {
                 const retired = yield* memory.search({ sessionID, messages: [userMessage(sessionID)], query: "任意查询" })
                 expect(retired.status).toBe("unavailable")
-                expect(yield* memory.setEnabled(true)).toBe("Memory remains off")
+                // #350: a /memory on that cannot activate says WHY instead of
+                // the bare "remains off" (retired identity / global identity
+                // are actionable reasons).
+                expect(yield* memory.setEnabled(true)).toContain("unavailable")
               }),
             )
           }),
@@ -369,7 +372,9 @@ describe("MEM-PR01-00: memory is inert under the shared global identity", () => 
             yield* project.setInitialized(info.id)
             yield* configStore.writeGlobal(baseConfig)
 
-            expect(yield* memory.setEnabled(true)).toBe("Memory remains off")
+            // #350: says WHY (commit-less repo under the shared global
+            // identity) instead of the bare "remains off".
+            expect(yield* memory.setEnabled(true)).toContain("unavailable")
             expect(fs.existsSync(path.join(dir, ".opencode", "memory.jsonc"))).toBe(false)
           }),
         ).pipe(Effect.provide(testInstanceStoreLayer))
@@ -403,6 +408,36 @@ describe("MEM-PR01-00: memory is inert under the shared global identity", () => 
             // Active (model calls are stubbed to fail, so search cannot succeed —
             // but it must get PAST the activation gate, i.e. not "unavailable").
             expect(result.status).not.toBe("unavailable")
+          }),
+        ).pipe(Effect.provide(testInstanceStoreLayer))
+      }),
+    { timeout: 30_000 },
+  )
+
+  // #350: the inert gates must be self-explanatory — /memory on and
+  // memory_search surface the actionable reason instead of a bare "off".
+  it.live(
+    "statusReason names the missing /init stamp, and /memory on carries it",
+    () =>
+      Effect.gen(function* () {
+        const dir = yield* tmpdirScoped({ git: true })
+        yield* provideInstance(dir)(
+          Effect.gen(function* () {
+            const project = yield* Project.Service
+            const memory = yield* Memory.Service
+
+            const { project: info } = yield* project.fromDirectory(dir)
+            expect(info.id).not.toBe(ProjectV2.ID.global)
+            // NOT setInitialized: a real git identity without the /init stamp
+            // is the exact shape that used to fail silently.
+            expect(yield* memory.statusReason()).toContain("/init")
+
+            const turningOn = yield* memory.setEnabled(true)
+            expect(turningOn).toContain("/init")
+            expect(turningOn).not.toBe("Memory remains off")
+
+            yield* project.setInitialized(info.id)
+            expect(yield* memory.statusReason()).toBeUndefined()
           }),
         ).pipe(Effect.provide(testInstanceStoreLayer))
       }),

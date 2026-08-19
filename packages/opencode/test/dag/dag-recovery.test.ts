@@ -171,22 +171,24 @@ describe("reconcileWorkflow", () => {
     expect(result).toEqual({ reconciled: 0, ownershipLost: 0 })
   })
 
-  it("aborts recovery when a stale restart-orphan session cannot be cancelled", async () => {
+  // #349/REC-1: a persistent stale-child cancel failure no longer aborts
+  // the whole reconcile — that made the workflow unadoptable in this process
+  // (its running nodes would never be scheduled until a restart). The
+  // failure is logged and the reconcile continues; this test pinned the old
+  // abort behavior.
+  it("survives a stale restart-orphan cancel failure and continues the reconcile", async () => {
     const events: TrackedEvent[] = []
     const nodes = [makeNodeRow({ id: "n1", status: "queued", childSessionId: "ses_stale" })]
     const dagLayer = makeDagLayer(nodes, events)
     const checkStatus = () => Effect.succeed("active" as const)
     const cancelSession = () => Effect.fail(new Error("cancel unavailable"))
 
-    const exit = await Effect.runPromise(
-      reconcileWorkflow("wf-1", checkStatus, cancelSession).pipe(
-        Effect.provide(dagLayer),
-        Effect.exit,
-      ),
+    const result = await Effect.runPromise(
+      reconcileWorkflow("wf-1", checkStatus, cancelSession).pipe(Effect.provide(dagLayer)),
     )
 
-    expect(Exit.isFailure(exit)).toBe(true)
     expect(events).toEqual([])
+    expect(result).toEqual({ reconciled: 0, ownershipLost: 0 })
   })
 
   it("cancels and fails a zero-message child classified as unknown exactly once", async () => {
@@ -428,5 +430,84 @@ describe("rehydration via toSchedulingNodes", () => {
     rt.setPaused(true)
     expect(rt.isPaused()).toBe(true)
     expect(rt.getReadyNodes()).toEqual([])
+  })
+
+  // #345: the live path (spawn.ts) settles a schemaless node with the child's
+  // last assistant text; recovery must mirror it — a crash between the child's
+  // final reply and the NodeCompleted publish must not erase a string verdict
+  // (a bare {"verdict":"replan"} checkpoint reply would otherwise vanish).
+  it("settles a completed schemaless node with the child's last assistant text", async () => {
+    const events: TrackedEvent[] = []
+    const nodes = [makeNodeRow({ id: "cp", status: "running", childSessionId: "ses_1" })]
+    const dagLayer = makeDagLayer(nodes, events)
+    const checkStatus = () => Effect.succeed<"active" | "completed" | "failed" | "unknown">("completed")
+    const verdict = '{"verdict":"replan","reason":"wrong file"}'
+
+    await Effect.runPromise(
+      reconcileWorkflow(
+        "wf-1",
+        checkStatus,
+        undefined,
+        { nodes: [{ id: "cp" }] },
+        () => Effect.succeed(verdict),
+      ).pipe(Effect.provide(dagLayer)),
+    )
+
+    expect(events).toContainEqual({ type: "nodeCompleted", nodeID: "cp", output: verdict })
+    expect(events).not.toContainEqual({ type: "nodeFailed", nodeID: "cp" })
+  })
+
+  it("floors a missing text part to the live path's empty string, not undefined", async () => {
+    const events: TrackedEvent[] = []
+    const nodes = [makeNodeRow({ id: "n1", status: "running", childSessionId: "ses_1" })]
+    const dagLayer = makeDagLayer(nodes, events)
+    const checkStatus = () => Effect.succeed<"active" | "completed" | "failed" | "unknown">("completed")
+
+    await Effect.runPromise(
+      reconcileWorkflow("wf-1", checkStatus, undefined, { nodes: [{ id: "n1" }] }, () => Effect.succeed(undefined)).pipe(
+        Effect.provide(dagLayer),
+      ),
+    )
+
+    expect(events).toContainEqual({ type: "nodeCompleted", nodeID: "n1", output: "" })
+  })
+
+  // #345 degenerate branch: an unparseable workflow row (explicit null) must
+  // fail loudly — undefined-completing a schema-carrying node would bypass
+  // settleCapturedOutput's review contract.
+  it("fails a completed node whose workflow config is unparseable (null), not undefined-complete", async () => {
+    const events: TrackedEvent[] = []
+    const nodes = [makeNodeRow({ id: "n1", status: "running", childSessionId: "ses_1" })]
+    const dagLayer = makeDagLayer(nodes, events)
+    const checkStatus = () => Effect.succeed<"active" | "completed" | "failed" | "unknown">("completed")
+
+    const result = await Effect.runPromise(
+      reconcileWorkflow("wf-1", checkStatus, undefined, null, () => Effect.succeed("text")).pipe(
+        Effect.provide(dagLayer),
+      ),
+    )
+
+    expect(events).toContainEqual({
+      type: "nodeFailed",
+      nodeID: "n1",
+      reason: expect.stringContaining("unparseable"),
+      trigger: "exec_failed",
+    })
+    expect(events).not.toContainEqual({ type: "nodeCompleted", nodeID: "n1" })
+    expect(result.ownershipLost).toBe(1)
+  })
+
+  // Legacy callers that inject no reader keep the undefined settlement.
+  it("keeps the legacy undefined settlement when no text reader is injected", async () => {
+    const events: TrackedEvent[] = []
+    const nodes = [makeNodeRow({ id: "n1", status: "running", childSessionId: "ses_1" })]
+    const dagLayer = makeDagLayer(nodes, events)
+    const checkStatus = () => Effect.succeed<"active" | "completed" | "failed" | "unknown">("completed")
+
+    await Effect.runPromise(
+      reconcileWorkflow("wf-1", checkStatus, undefined, { nodes: [{ id: "n1" }] }).pipe(Effect.provide(dagLayer)),
+    )
+
+    expect(events).toContainEqual({ type: "nodeCompleted", nodeID: "n1" })
   })
 })
