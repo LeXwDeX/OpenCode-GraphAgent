@@ -5,49 +5,22 @@ import { Installation } from "@/installation"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import { GlobalBus } from "@/bus/global"
 
+// This fork never auto-updates: it only checks the fork's GitHub releases and
+// notifies. `autoupdate: false` (or OPENCODE_DISABLE_AUTOUPDATE) silences the
+// notification entirely.
 export async function upgrade() {
   const config = await AppRuntime.runPromise(Config.Service.use((cfg) => cfg.getGlobal()))
   if (config.autoupdate === false || Flag.OPENCODE_DISABLE_AUTOUPDATE) return
-  const method = await Installation.method()
-  const latest = await Installation.latest(method).catch(() => {})
+  const latest = await Installation.latest().catch(() => {})
   if (!latest) return
 
-  if (Flag.OPENCODE_ALWAYS_NOTIFY_UPDATE) {
-    GlobalBus.emit("event", {
-      directory: "global",
-      payload: {
-        type: Installation.Event.UpdateAvailable.type,
-        properties: { version: latest },
-      },
-    })
-    return
-  }
+  if (!Flag.OPENCODE_ALWAYS_NOTIFY_UPDATE && InstallationVersion === latest) return
 
-  if (InstallationVersion === latest) return
-
-  const kind = Installation.getReleaseType(InstallationVersion, latest)
-
-  if (config.autoupdate === "notify" || kind !== "patch") {
-    GlobalBus.emit("event", {
-      directory: "global",
-      payload: {
-        type: Installation.Event.UpdateAvailable.type,
-        properties: { version: latest },
-      },
-    })
-    return
-  }
-
-  if (method === "unknown") return
-  await Installation.upgrade(method, latest)
-    .then(() =>
-      GlobalBus.emit("event", {
-        directory: "global",
-        payload: {
-          type: Installation.Event.Updated.type,
-          properties: { version: latest },
-        },
-      }),
-    )
-    .catch(() => {})
+  GlobalBus.emit("event", {
+    directory: "global",
+    payload: {
+      type: Installation.Event.UpdateAvailable.type,
+      properties: { version: latest },
+    },
+  })
 }

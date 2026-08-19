@@ -41,7 +41,7 @@ export class Info extends Schema.Class<Info>("Config.Info")({
   autoupdate: Schema.Union([Schema.Boolean, Schema.Literal("notify")])
     .pipe(Schema.optional)
     .annotate({
-      description: "Automatically update or notify when a new version is available",
+      description: "Notify when a new fork version is available on GitHub releases. Automatic updates are disabled; set to false to disable the notification",
     }),
   share: Schema.Literals(["manual", "auto", "disabled"]).pipe(Schema.optional).annotate({
     description: "Control whether sessions may be shared manually, automatically, or not at all",
