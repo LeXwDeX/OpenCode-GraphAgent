@@ -216,3 +216,80 @@ describe("TodoReminders.apply (issue #389)", () => {
     }),
   )
 })
+
+// The run-loop structural guarantees called out by the PR #391 review (O3):
+// apply runs once per model step BEFORE tool resolution — never once per
+// tool — and its mutation lives only in that step's in-memory request.
+describe("TodoReminders run-loop guarantees (issue #389 review)", () => {
+  runtime.effect("parallel tools in one step still see exactly one reminder", () =>
+    Effect.gen(function* () {
+      // The rejected PreToolUse design would have injected once per tool
+      // call; the run-loop seam injects once per step, so a fan-out of N
+      // completed tools (none a fresh todowrite) yields ONE reminder.
+      const messages = [
+        userMessage("work"),
+        assistantMessage([
+          { name: "read", status: "completed" },
+          { name: "grep", status: "completed" },
+          { name: "bash", status: "completed" },
+        ], "ran three tools"),
+      ]
+      const result = yield* TodoReminders.apply({
+        messages,
+        sessionID: SessionID.make("ses_1"),
+      }).pipe(
+        Effect.provide(makeTodoLayer([
+          { content: "a", status: "pending", priority: "high" },
+        ])),
+      )
+      const last = lastUser(result)
+      expect(last?.parts).toHaveLength(2)
+      expect(last?.parts.filter((part) => (part as never as { text?: string }).text?.startsWith("[todo reminder]"))).toHaveLength(1)
+    }),
+  )
+
+  runtime.effect("consecutive steps with fresh per-step reads never accumulate reminders", () =>
+    Effect.gen(function* () {
+      // The run loop re-derives msgs from the database each step, so the
+      // synthetic part never persists and never stacks across steps.
+      const todoLayer = makeTodoLayer([{ content: "a", status: "pending", priority: "high" }])
+      const durableBase = [userMessage("work")]
+
+      const step1 = structuredClone(durableBase)
+      const result1 = yield* TodoReminders.apply({ messages: step1, sessionID: SessionID.make("ses_1") }).pipe(
+        Effect.provide(todoLayer),
+      )
+      expect(lastUser(result1)?.parts).toHaveLength(2)
+
+      const step2 = structuredClone(durableBase)
+      const result2 = yield* TodoReminders.apply({ messages: step2, sessionID: SessionID.make("ses_1") }).pipe(
+        Effect.provide(todoLayer),
+      )
+      expect(lastUser(result2)?.parts).toHaveLength(2)
+
+      // The durable base stays pristine — the injection is per-request only.
+      expect(lastUser(durableBase)?.parts).toHaveLength(1)
+    }),
+  )
+
+  runtime.effect("a compacted transcript still receives the reminder", () =>
+    Effect.gen(function* () {
+      // Compaction runs before apply on the per-step fresh read: the
+      // filtered transcript still ends in a user message, and with no
+      // assistant carrying a fresh todowrite the reminder must survive.
+      const messages = [userMessage("compacted summary: prior turns elided, work continues")]
+      const result = yield* TodoReminders.apply({
+        messages,
+        sessionID: SessionID.make("ses_1"),
+      }).pipe(
+        Effect.provide(makeTodoLayer([
+          { content: "a", status: "pending", priority: "high" },
+        ])),
+      )
+      expect(lastUser(result)?.parts).toHaveLength(2)
+      const reminder = lastUser(result)?.parts.at(-1) as never as { text: string; synthetic?: boolean }
+      expect(reminder.synthetic).toBe(true)
+      expect(reminder.text).toContain("[todo reminder]")
+    }),
+  )
+})
