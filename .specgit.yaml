@@ -1,8 +1,10 @@
 version: 1
-delivery: issue389
+delivery: memory-topic-creation
 context:
   kind: branch
-  branch: feat/todo-step-reminders
+  branch: fix/395-memory-topic-creation
 issues:
-  - 389
-pr: 394
+  - 395
+  - 396
+  - 397
+pr: 398
