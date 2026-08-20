@@ -265,6 +265,19 @@ re-init; keep manual guidance outside them.
   origin. `specgit doctor` probes git, repository, origin, gh, and
   policy.
 
+### Before creating an issue, check for duplicates
+
+- Before running `specgit issue` with a new title, search the tracker for
+  similar open work: `gh issue list` with keywords from the title
+  (state, labels, and search terms via `gh search issues`).
+- Open and read every plausible candidate (`gh issue view <n>`) — compare
+  the WHY, not just the wording.
+- If a candidate covers the same WHY, continue that issue instead of
+  creating a new one; if it is close but different, say how they differ.
+- When unsure, ask the requester to decide between continuing the existing
+  issue and creating a duplicate. The team ships one line of work per WHY,
+  never two.
+
 ### Issue granularity
 
 One issue = one independently verifiable WHY. If a deliverable cannot be
