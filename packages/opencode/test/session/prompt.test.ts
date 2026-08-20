@@ -248,6 +248,8 @@ function makePrompt(input?: PromptLayerOptions) {
     context: () => Effect.succeed(input?.memoryContext ?? []),
     checkpoint: () => Effect.succeed(input?.memoryContext ?? []),
     setEnabled: (enabled) => Effect.succeed(enabled ? ("Memory on" as const) : ("Memory off" as const)),
+    statusReason: () => Effect.succeed(undefined),
+    status: () => Effect.succeed("Memory on"),
   })
   const deps = Layer.mergeAll(
     hookRecorderLayer,
@@ -2372,12 +2374,15 @@ it.instance("stores the slash invocation as visible text and hides the expanded 
   }),
 )
 
-noLLMServer.instance("dispatches /memory on and off without running a model turn", () =>
+noLLMServer.instance("dispatches /memory on, off, and status without running a model turn", () =>
   Effect.gen(function* () {
     const { prompt, sessions, chat } = yield* boot()
 
     const off = yield* prompt.command({ sessionID: chat.id, command: "memory", arguments: "off" })
     const on = yield* prompt.command({ sessionID: chat.id, command: "memory", arguments: "on" })
+    // #396: a non-on/off argument is a status query — the reply must reflect
+    // the service's true state instead of the old hardcoded "remains off".
+    const status = yield* prompt.command({ sessionID: chat.id, command: "memory", arguments: "" })
     const unsupported = yield* prompt.command({ sessionID: chat.id, command: "memory", arguments: "topic 20" })
 
     expect(off.parts.filter((part) => part.type === "text").map((part) => part.text)).toEqual([
@@ -2388,9 +2393,13 @@ noLLMServer.instance("dispatches /memory on and off without running a model turn
       "/memory on",
       "Memory on",
     ])
+    expect(status.parts.filter((part) => part.type === "text").map((part) => part.text)).toEqual([
+      "/memory",
+      "Memory on",
+    ])
     expect(unsupported.parts.filter((part) => part.type === "text").map((part) => part.text)).toEqual([
       "/memory topic 20",
-      "Memory remains off",
+      "Memory on",
     ])
     expect((yield* sessions.messages({ sessionID: chat.id })).every((message) => message.info.role === "user")).toBe(true)
   }),

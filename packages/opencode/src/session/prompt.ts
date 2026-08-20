@@ -1887,12 +1887,14 @@ export const layer = Layer.effect(
       if (input.command === "memory") {
         const memory = Option.getOrUndefined(yield* Effect.serviceOption(Memory.Service))
         const argument = input.arguments.trim()
+        // #396: anything that is not an exact on/off is a status query —
+        // report the true state instead of a hardcoded "remains off".
         const result = memory
           ? argument === "on"
             ? yield* memory.setEnabled(true)
             : argument === "off"
               ? yield* memory.setEnabled(false)
-              : "Memory remains off"
+              : yield* memory.status()
           : "Memory remains off"
         const model = yield* currentModel(input.sessionID)
         const agentName = input.agent ?? (yield* agents.defaultAgent())

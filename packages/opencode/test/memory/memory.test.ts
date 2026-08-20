@@ -2128,6 +2128,113 @@ describe("memory enablement", () => {
   )
 })
 
+function statusFixture() {
+  const replacement = ProviderTest.model({
+    providerID: ProviderV2.ID.make("test"),
+    id: ModelV2.ID.make("replacement"),
+  })
+  const state: { config: MemorySchema.Config; available: boolean } = {
+    config: { ...config, enabled: true, model: "removed/model" },
+    available: true,
+  }
+  const providerLayer = Layer.mock(Provider.Service, {
+    list: () =>
+      Effect.succeed(
+        state.available
+          ? { [replacement.providerID]: ProviderTest.info({ id: replacement.providerID, models: { [replacement.id]: replacement } }) }
+          : {},
+      ),
+    getModel: (providerID, modelID) =>
+      Effect.succeed(
+        ProviderTest.model({
+          providerID,
+          id: modelID,
+        }),
+      ),
+  })
+  const layer = Memory.layer.pipe(
+    Layer.provide(
+      Layer.mergeAll(
+        emptyConfigLayer,
+        EffectFlock.defaultLayer,
+        MemoryHome.defaultLayer,
+        MemoryIdentityFence.defaultLayer,
+        providerLayer,
+        Layer.mock(Project.Service, {
+          get: (id) =>
+            Effect.succeed({
+              id,
+              worktree: "/unused",
+              vcs: "git" as const,
+              time: { created: 0, updated: 0, initialized: 1 },
+              sandboxes: [],
+            }),
+        }),
+        Layer.mock(MemoryConfig.Service, {
+          load: (directory) =>
+            Effect.succeed({ config: state.config, path: directory, level: "project" as const }),
+          loadGlobal: () => Effect.succeed(undefined),
+          writeGlobal: () => Effect.succeed(true),
+          writeProject: () => Effect.void,
+        }),
+        readyAdmissionLayer,
+        MemoryLock.defaultLayer,
+        Layer.mock(MemoryModel.Service, {
+          generate: () => Effect.die(new Error("status surfaces must not call a model")),
+        }),
+        Layer.mock(MemoryStore.Service, {
+          readTopics: () => Effect.succeed([]),
+        }),
+      ),
+    ),
+  )
+  return { state, it: testEffect(layer) }
+}
+
+describe("memory status truthfulness (issues #396 #397)", () => {
+  const status = statusFixture()
+
+  status.it.instance(
+    "reports why an enabled config is inert when its model is gone",
+    () =>
+      Effect.gen(function* () {
+        const memory = yield* Memory.Service
+        const reason = yield* memory.statusReason()
+        if (reason === undefined) return yield* Effect.fail(new Error("expected a model-unavailability reason"))
+        expect(reason).toContain("model is unavailable")
+        expect(yield* memory.status()).toBe(reason)
+        expect(yield* memory.setEnabled(true)).toContain("model is unavailable")
+      }),
+    { git: true },
+  )
+
+  status.it.instance(
+    "reports the true on/off state once the model resolves",
+    () =>
+      Effect.gen(function* () {
+        const memory = yield* Memory.Service
+        status.state.config = { ...config, enabled: true, model: "test/replacement" }
+        expect(yield* memory.statusReason()).toBeUndefined()
+        expect(yield* memory.status()).toBe("Memory on")
+        status.state.config = { ...config, enabled: false, model: "test/replacement" }
+        expect(yield* memory.status()).toBe("Memory remains off")
+      }),
+    { git: true },
+  )
+
+  status.it.instance(
+    "surfaces the model reason when /memory on cannot reselect any model",
+    () =>
+      Effect.gen(function* () {
+        status.state.config = { ...config, enabled: true, model: "removed/model" }
+        status.state.available = false
+        const memory = yield* Memory.Service
+        expect(yield* memory.setEnabled(true)).toContain("model is unavailable")
+      }),
+    { git: true },
+  )
+})
+
 function assistant(
   parentID: MessageID,
   sessionID: SessionID,
