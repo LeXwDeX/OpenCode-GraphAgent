@@ -7,7 +7,8 @@ import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { Effect, Exit, Layer } from "effect"
-import { reconcileWorkflow } from "@/dag/runtime/recovery"
+import type { SessionV1 } from "@opencode-ai/core/v1/session"
+import { reconcileWorkflow, makeLastAssistantTextReader } from "@/dag/runtime/recovery"
 import { Dag } from "@/dag/dag"
 import type { DagStore } from "@opencode-ai/core/dag/store"
 import { WorkflowRuntime, toSchedulingNodes } from "@opencode-ai/core/dag/core/scheduling"
@@ -33,13 +34,16 @@ function makeDagLayer(
   trackedEvents: TrackedEvent[],
   actions?: string[],
   capturedWrites?: { sid: string; payload: unknown }[],
+  opts?: { capturedFail?: boolean },
 ) {
   return Layer.mock(Dag.Service, {
     store: {
       getNodes: () => Effect.succeed(nodes),
       getNode: (id: string) => Effect.succeed(nodes.find((n) => n.id === id)),
       setCapturedOutput: (sid: string, payload: unknown) =>
-        Effect.sync(() => capturedWrites?.push({ sid, payload })),
+        opts?.capturedFail
+          ? Effect.fail(new Error("captured output persistence boom"))
+          : Effect.sync(() => capturedWrites?.push({ sid, payload })),
     } as unknown as DagStore.Interface,
     nodeCompleted: Effect.fn("stub.nodeCompleted")((dagID: string, nodeID: string, output: unknown) =>
       Effect.sync(() => trackedEvents.push({
@@ -600,5 +604,64 @@ describe("reconcileWorkflow output file refs (issue #388)", () => {
     expect(captured).toEqual([])
     const completed = events.find((event) => event.type === "nodeCompleted")
     expect(completed?.output).toMatch(/^Report written to /)
+  })
+
+  // #388 best-effort contract: a captured-output persistence failure logs a
+  // warning and NEVER fails the node — the inline completion survives.
+  it("completes inline even when output-ref persistence fails (issue #388)", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "dag-recovery-refboom-"))
+    tmpRoots.push(dir)
+    const reportPath = path.join(dir, "report.md")
+    await Bun.write(reportPath, "doomed receipt")
+    const events: TrackedEvent[] = []
+    const nodes = [makeNodeRow({ id: "n1", status: "running", childSessionId: "ses_1" })]
+    const dagLayer = makeDagLayer(nodes, events, undefined, undefined, { capturedFail: true })
+    const checkStatus = () => Effect.succeed<"active" | "completed" | "failed" | "unknown">("completed")
+
+    await Effect.runPromise(
+      reconcileWorkflow(
+        "wf-1",
+        checkStatus,
+        undefined,
+        { nodes: [{ id: "n1" }] },
+        () => Effect.succeed(reportPath),
+        dir,
+      ).pipe(Effect.provide(dagLayer)),
+    )
+
+    expect(events).toContainEqual({ type: "nodeCompleted", nodeID: "n1", output: reportPath })
+    expect(events).not.toContainEqual({ type: "nodeFailed", nodeID: "n1" })
+  })
+})
+
+// #345: the schemaless completion mirror — recovery reads the child's last
+// assistant text exactly as spawn settles it. Direct reader contract.
+describe("makeLastAssistantTextReader (#345)", () => {
+  function assistantText(text: string): SessionV1.WithParts {
+    return {
+      info: {
+        id: "m1",
+        role: "assistant",
+        sessionID: "ses_1",
+        time: { created: 0 },
+        agent: "build",
+        model: { providerID: "p", modelID: "m" },
+      },
+      parts: [{ type: "text", text }],
+    } as never
+  }
+
+  it("returns the last assistant text part from the child transcript", async () => {
+    const reader = makeLastAssistantTextReader({
+      messages: () => Effect.succeed([assistantText("attempt one"), assistantText("final verdict: GO")]),
+    } as never)
+    expect(await Effect.runPromise(reader("ses_1"))).toBe("final verdict: GO")
+  })
+
+  it("treats a missing child session as no text instead of failing recovery", async () => {
+    const reader = makeLastAssistantTextReader({
+      messages: () => Effect.fail({ _tag: "NotFoundError", message: "session gone" } as never),
+    } as never)
+    expect(await Effect.runPromise(reader("ses_ghost"))).toBeUndefined()
   })
 })
