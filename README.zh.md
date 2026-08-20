@@ -37,7 +37,7 @@ GraphAgent 是本项目对外的产品名；仓库以 **OpenCode-GraphAgent** �
 
 - 可组合块（`explore`、`plan`、`prototype`、`debug`、`coding`、`verify`、`review`、`synthesize`）编译成节点图；块表达不了的还有低级节点字段兜底。
 - `workflow(action="draft")` 通过工具参数传结构化图，harness 渲染并校验出 YAML spec——字段写错在 provider 侧就被拒，不用等到校验才发现。
-- 三级作用域的工作流库（项目 / 全局 / 内嵌），按名字启动；`/dag-flow` 命令挑选合适的参考拓扑并注入当前任务。
+- 三级作用域的工作流库（项目 / 全局 / 内嵌），按名字启动；`/dag-auto` 命令把需求路由到合适的参考拓扑并注入当前任务。
 - `dag.jsonc` 的模型分层把决策和跑量分开：关键节点用 `advanced` 模型，扇出跑量用 `standard`。
 
 **可靠性**
@@ -60,7 +60,7 @@ GraphAgent 是本项目对外的产品名；仓库以 **OpenCode-GraphAgent** �
 
 ## 工作流怎么用
 
-不配置也能直接试：给它一件有阶段、有可并行部分、或者中间需要一道审查门禁的活（`/dag-flow <任务>`），智能体自己会建图并跑起来。想把它变成你自己的一套固定流程，有三件事：
+不配置也能直接试：给它一件有阶段、有可并行部分、或者中间需要一道审查门禁的活（`/dag-auto <任务>`），智能体自己会建图并跑起来。想把它变成你自己的一套固定流程，有三件事：
 
 ### 1. 选定模型分层 —— `.opencode/dag.jsonc`
 
@@ -90,7 +90,7 @@ GraphAgent 是本项目对外的产品名；仓库以 **OpenCode-GraphAgent** �
 | 全局级 | `<opencode 配置目录>/workflows/<name>.yaml` | 本机所有项目 |
 | 内嵌级 | 编译进正式版二进制 | 每个正式版安装——兜底解析层 |
 
-解析按此顺序取第一个命中的名字：项目级遮蔽同名的全局级，二者都遮蔽内嵌级。全局作用域由 [`opencode-dag-config`](https://github.com/LeXwDeX/opencode-dag-config) 仓库维护，`/dag-template-update` 命令负责同步（预览新增/变更/不变清单，覆盖前备份，QA 决策门禁）。一个最小的 spec：
+解析按此顺序取第一个命中的名字：项目级遮蔽同名的全局级，二者都遮蔽内嵌级。全局作用域由 [`opencode-dag-config`](https://github.com/LeXwDeX/opencode-dag-config) 仓库维护（直接 `git clone`/`git pull` 到配置目录即可同步）。一个最小的 spec：
 
 ```yaml
 title: Dependency audit
