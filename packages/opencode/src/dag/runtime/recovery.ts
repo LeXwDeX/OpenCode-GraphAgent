@@ -32,6 +32,7 @@ import { reviewImplementationFingerprint } from "../review-lifecycle"
 import { resolveInputMapping } from "./eval"
 import { settleCapturedOutput } from "./capture"
 import type { CapturedSettlement } from "./capture"
+import { captureOutputFileRef, ensureReportAreaGitignore } from "./output-ref"
 
 export function reconcileWorkflow(
   dagID: string,
@@ -39,6 +40,7 @@ export function reconcileWorkflow(
   cancelSession?: (sessionID: string) => Effect.Effect<void, Error>,
   workflowConfig?: { nodes: Pick<NodeConfig, "id" | "output_schema" | "review" | "input_mapping">[] } | null,
   lastAssistantText?: (childSessionID: string) => Effect.Effect<string | undefined, Error>,
+  directory?: string,
 ): Effect.Effect<{ reconciled: number; ownershipLost: number }, Error, Dag.Service> {
   return Effect.gen(function* () {
     const dag = yield* Dag.Service
@@ -143,6 +145,27 @@ export function reconcileWorkflow(
           const rawText = lastAssistantText
             ? (yield* lastAssistantText(node.childSessionId)) ?? ""
             : undefined
+          // #388 parity with the live path: when the recovered reply IS one
+          // existing absolute file path, capture the same {content_ref, size,
+          // sha256, summary} receipt submit-time detection records, so live
+          // and recovered settlement produce identical durable output
+          // metadata. Best-effort like the live path — any anomaly keeps the
+          // plain inline completion and never fails the node.
+          if (rawText) {
+            const fileRef = yield* captureOutputFileRef(rawText)
+            if (fileRef) {
+              yield* dag.store.setCapturedOutput(node.childSessionId, fileRef).pipe(
+                Effect.catchCause((cause) =>
+                  Effect.logWarning("DAG recovery output-ref capture persistence failed — inline output preserved", {
+                    dagID,
+                    nodeID: node.id,
+                    cause,
+                  }),
+                ),
+              )
+              if (directory) yield* ensureReportAreaGitignore(directory, fileRef.path)
+            }
+          }
           yield* settle(node.id, dag.nodeCompleted(dagID, node.id, rawText))
         }
         reconciled++

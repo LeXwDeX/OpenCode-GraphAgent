@@ -1,4 +1,8 @@
-import { describe, expect, it } from "bun:test"
+import { describe, expect, it, afterAll } from "bun:test"
+import { createHash } from "node:crypto"
+import fs from "node:fs/promises"
+import os from "node:os"
+import path from "node:path"
 import { Effect, Exit, Layer } from "effect"
 import { reconcileWorkflow } from "@/dag/runtime/recovery"
 import { Dag } from "@/dag/dag"
@@ -6,6 +10,12 @@ import type { DagStore } from "@opencode-ai/core/dag/store"
 import { WorkflowRuntime, toSchedulingNodes } from "@opencode-ai/core/dag/core/scheduling"
 import { TerminalViolationError } from "@opencode-ai/core/dag/core/types"
 import { makeNodeRow } from "./fixtures"
+
+const tmpRoots: string[] = []
+
+afterAll(async () => {
+  for (const dir of tmpRoots) await fs.rm(dir, { recursive: true, force: true })
+})
 
 type TrackedEvent = {
   type: string
@@ -15,11 +25,18 @@ type TrackedEvent = {
   trigger?: string
 }
 
-function makeDagLayer(nodes: DagStore.NodeRow[], trackedEvents: TrackedEvent[], actions?: string[]) {
+function makeDagLayer(
+  nodes: DagStore.NodeRow[],
+  trackedEvents: TrackedEvent[],
+  actions?: string[],
+  capturedWrites?: { sid: string; payload: unknown }[],
+) {
   return Layer.mock(Dag.Service, {
     store: {
       getNodes: () => Effect.succeed(nodes),
       getNode: (id: string) => Effect.succeed(nodes.find((n) => n.id === id)),
+      setCapturedOutput: (sid: string, payload: unknown) =>
+        Effect.sync(() => capturedWrites?.push({ sid, payload })),
     } as unknown as DagStore.Interface,
     nodeCompleted: Effect.fn("stub.nodeCompleted")((dagID: string, nodeID: string, output: unknown) =>
       Effect.sync(() => trackedEvents.push({
@@ -509,5 +526,72 @@ describe("rehydration via toSchedulingNodes", () => {
     )
 
     expect(events).toContainEqual({ type: "nodeCompleted", nodeID: "n1" })
+  })
+})
+
+// issue #388: the live path captures {content_ref, size, sha256, summary}
+// when a schemaless node's final reply IS one existing absolute file path
+// (spawn.ts → output-ref.ts). Recovery must produce the same durable receipt
+// for the same reply instead of diverging by crash timing.
+describe("reconcileWorkflow output file refs (issue #388)", () => {
+  it("captures the same file_ref receipt as the live path for an absolute-path reply", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "dag-recovery-ref-"))
+    tmpRoots.push(dir)
+    const reportPath = path.join(dir, "report.md")
+    const content = "recovered report body"
+    await Bun.write(reportPath, content)
+
+    const events: TrackedEvent[] = []
+    const captured: { sid: string; payload: unknown }[] = []
+    const nodes = [makeNodeRow({ id: "n1", status: "running", childSessionId: "ses_1" })]
+    const dagLayer = makeDagLayer(nodes, events, undefined, captured)
+    const checkStatus = () => Effect.succeed<"active" | "completed" | "failed" | "unknown">("completed")
+
+    await Effect.runPromise(
+      reconcileWorkflow(
+        "wf-1",
+        checkStatus,
+        undefined,
+        { nodes: [{ id: "n1" }] },
+        () => Effect.succeed(reportPath),
+        dir,
+      ).pipe(Effect.provide(dagLayer)),
+    )
+
+    expect(events).toContainEqual({ type: "nodeCompleted", nodeID: "n1", output: reportPath })
+    expect(captured).toEqual([{
+      sid: "ses_1",
+      payload: {
+        kind: "file_ref",
+        content_ref: reportPath,
+        path: reportPath,
+        size: Buffer.byteLength(content),
+        sha256: createHash("sha256").update(content).digest("hex"),
+        summary: content,
+      },
+    }])
+  })
+
+  it("keeps the inline settlement and captures nothing when the reply is not an existing path", async () => {
+    const events: TrackedEvent[] = []
+    const captured: { sid: string; payload: unknown }[] = []
+    const nodes = [makeNodeRow({ id: "n1", status: "running", childSessionId: "ses_1" })]
+    const dagLayer = makeDagLayer(nodes, events, undefined, captured)
+    const checkStatus = () => Effect.succeed<"active" | "completed" | "failed" | "unknown">("completed")
+
+    await Effect.runPromise(
+      reconcileWorkflow(
+        "wf-1",
+        checkStatus,
+        undefined,
+        { nodes: [{ id: "n1" }] },
+        () => Effect.succeed(`Report written to ${path.join(os.tmpdir(), "dag-recovery-ghost.md")}`),
+        process.cwd(),
+      ).pipe(Effect.provide(dagLayer)),
+    )
+
+    expect(captured).toEqual([])
+    const completed = events.find((event) => event.type === "nodeCompleted")
+    expect(completed?.output).toMatch(/^Report written to /)
   })
 })

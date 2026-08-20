@@ -423,6 +423,7 @@ const serviceLayer = Layer.effect(
               // fails such nodes loudly instead of undefined-completing them.
               config ?? null,
               lastAssistantText,
+              ctx.directory,
             ).pipe(
               Effect.provideService(Dag.Service, dag),
             )
