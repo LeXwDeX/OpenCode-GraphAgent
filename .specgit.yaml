@@ -1,8 +1,8 @@
 version: 1
-delivery: reduce-dag-auto
+delivery: issue389
 context:
   kind: branch
-  branch: refactor/392-reduce-dag-auto
+  branch: feat/todo-step-reminders
 issues:
-  - 392
-pr: 393
+  - 389
+pr: 394
