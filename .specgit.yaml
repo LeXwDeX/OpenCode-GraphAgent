@@ -1,9 +1,8 @@
 version: 1
-delivery: release-train-remediation
+delivery: headless-init-does
 context:
   kind: branch
-  branch: fix/401-release-train-remediation
+  branch: fix/404-headless-init-does
 issues:
-  - 401
-  - 402
-pr: 403
+  - 404
+pr: 405

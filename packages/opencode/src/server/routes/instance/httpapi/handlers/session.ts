@@ -48,11 +48,33 @@ const tryParseJson = (text: string) =>
     catch: () => new HttpApiError.BadRequest({}),
   })
 
+// #404: headless clients (`opencode run "/init"`, SDK text prompts) deliver
+// slash commands as plain text parts to POST /session/:id/message. The TUI
+// routes them client-side before calling /command, but nothing server-side
+// did, so SessionPrompt.command never ran and Command.Event.Executed never
+// fired (project.time_initialized stayed NULL). Mirror the TUI's parse —
+// first line carries /command + args, later lines join the arguments — and
+// only ever route single-text-part prompts.
+function parseCommandPayload(payload: typeof PromptPayload.Type) {
+  const part = payload.parts.length === 1 ? payload.parts[0] : undefined
+  const text = part?.type === "text" && part.text.startsWith("/") ? part.text : undefined
+  if (!text) return undefined
+  const firstLineEnd = text.indexOf("\n")
+  const firstLine = firstLineEnd === -1 ? text : text.slice(0, firstLineEnd)
+  const [token, ...firstLineArgs] = firstLine.split(" ")
+  const rest = firstLineEnd === -1 ? "" : text.slice(firstLineEnd + 1)
+  return {
+    command: token.slice(1),
+    arguments: firstLineArgs.join(" ") + (rest ? "\n" + rest : ""),
+  }
+}
+
 export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", (handlers) =>
   Effect.gen(function* () {
     const session = yield* Session.Service
     const shareSvc = yield* SessionShare.Service
     const promptSvc = yield* SessionPrompt.Service
+    const commands = yield* Command.Service
     const revertSvc = yield* SessionRevert.Service
     const compactSvc = yield* SessionCompaction.Service
     const runState = yield* SessionRunState.Service
@@ -314,17 +336,36 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       return true
     })
 
+    // Text that names a registered command routes through SessionPrompt.command
+    // so headless entrypoints get the same Command.Event.Executed lifecycle
+    // (incl. project init stamping) as the TUI; a registry miss falls through
+    // to a plain prompt turn, preserving existing text-prompt semantics.
+    const promptOrCommand = Effect.fn("SessionHttpApi.promptOrCommand")(function* (ctx: {
+      params: { sessionID: SessionID }
+      payload: typeof PromptPayload.Type
+    }) {
+      const parsed = parseCommandPayload(ctx.payload)
+      const cmd = parsed ? yield* commands.get(parsed.command) : undefined
+      if (parsed && cmd) {
+        return yield* promptSvc.command({
+          sessionID: ctx.params.sessionID,
+          command: parsed.command,
+          arguments: parsed.arguments,
+          messageID: ctx.payload.messageID,
+          agent: ctx.payload.agent,
+          variant: ctx.payload.variant,
+          ...(ctx.payload.model ? { model: `${ctx.payload.model.providerID}/${ctx.payload.model.modelID}` } : {}),
+        })
+      }
+      return yield* promptSvc.prompt({ ...ctx.payload, sessionID: ctx.params.sessionID })
+    })
+
     const prompt = Effect.fn("SessionHttpApi.prompt")(function* (ctx: {
       params: { sessionID: SessionID }
       payload: typeof PromptPayload.Type
     }) {
       yield* requireSession(ctx.params.sessionID)
-      const message = yield* promptSvc
-        .prompt({
-          ...ctx.payload,
-          sessionID: ctx.params.sessionID,
-        })
-        .pipe(Effect.mapError(() => new HttpApiError.BadRequest({})))
+      const message = yield* promptOrCommand(ctx).pipe(Effect.mapError(() => new HttpApiError.BadRequest({})))
       return HttpServerResponse.stream(Stream.make(JSON.stringify(message)).pipe(Stream.encodeText), {
         contentType: "application/json",
       })
@@ -335,7 +376,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       payload: typeof PromptPayload.Type
     }) {
       yield* requireSession(ctx.params.sessionID)
-      yield* promptSvc.prompt({ ...ctx.payload, sessionID: ctx.params.sessionID }).pipe(
+      yield* promptOrCommand(ctx).pipe(
         Effect.catchCause((cause) =>
           Effect.gen(function* () {
             yield* Effect.logError("prompt_async failed", { sessionID: ctx.params.sessionID, cause })
