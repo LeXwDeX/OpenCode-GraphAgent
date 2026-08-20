@@ -27,7 +27,7 @@ const runtime = testEffect(Layer.empty)
 
 function makeTodoLayer(todos: Todo.Info[]) {
   return Layer.mock(Todo.Service, {
-    get: (sessionID: SessionID) => Effect.succeed(todos.length > 0 ? todos.filter(() => sessionID === sessionID) : []),
+    get: () => Effect.succeed(todos),
   })
 }
 

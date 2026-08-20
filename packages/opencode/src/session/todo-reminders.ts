@@ -8,14 +8,16 @@
  * completed work stays pending and stale items linger. While a session holds
  * uncompleted todos, every model step appends ONE synthetic text part with the
  * current uncompleted items to the last user message — model-visible, never
- * persisted (same in-memory convention as SessionReminders' plan-mode parts).
+ * persisted (same in-memory convention as SessionReminders' non-plan-mode
+ * parts; its plan-mode branch persists instead, which is NOT the pattern
+ * here).
  *
  * Skip conditions:
  *   - no todos for the session, or nothing uncompleted (completed and
  *     cancelled both count as settled)
- *   - freshness guard: the current turn's last assistant message already
- *     contains a successful todowrite call — the model just updated the list
- *     itself, so this step's request does not nag about it
+ *   - freshness guard: the session's last assistant message already contains
+ *     a successful todowrite call — the model just updated the list itself,
+ *     so this step's request does not nag about it
  */
 import { Effect } from "effect"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
