@@ -17,8 +17,8 @@ export const canonicalHeadings: readonly string[] = [
   "### 🔍 Verification",
 ]
 const changeHeadings = canonicalHeadings.slice(0, 5)
-const testSummaryHeading = canonicalHeadings[5]!
-const verificationHeading = canonicalHeadings[6]!
+const testSummaryHeading = canonicalHeadings[5]
+const verificationHeading = canonicalHeadings[6]
 
 export type ReleaseNotesInput = {
   version: string
@@ -39,7 +39,7 @@ export class ReleaseNotesError extends Error {
 export function seriesFor(version: string): string {
   const match = versionPattern.exec(version)
   if (!match) throw new ReleaseNotesError(`malformed version "${version}" (expected X.Y.Z or X.Y.Z-dev.N)`)
-  return match[1]!
+  return match[1]
 }
 
 export function seriesFileFor(version: string): string {
@@ -182,8 +182,8 @@ function quote(value: string | undefined) {
 function readArgs(argv: readonly string[]) {
   const args: Record<string, string> = {}
   for (let i = 0; i < argv.length; i += 2) {
-    const key = argv[i]!
-    if (!key.startsWith("--")) throw new ReleaseNotesError(`unexpected argument "${key}" (expected --key value pairs)`)
+    const key = argv[i]
+    if (key === undefined || !key.startsWith("--")) throw new ReleaseNotesError(`unexpected argument "${key}" (expected --key value pairs)`)
     const value = argv[i + 1]
     if (value === undefined) throw new ReleaseNotesError(`missing value for ${key}`)
     args[key.slice(2)] = value
