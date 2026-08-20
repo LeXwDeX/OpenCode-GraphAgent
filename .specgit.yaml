@@ -1,10 +1,8 @@
 version: 1
-delivery: memory-topic-creation
+delivery: release-train-remediation
 context:
   kind: branch
-  branch: fix/395-memory-topic-creation
+  branch: fix/401-release-train-remediation
 issues:
-  - 395
-  - 396
-  - 397
-pr: 398
+  - 401
+  - 402
