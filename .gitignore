@@ -21,6 +21,10 @@ ts-dist
 refs
 Session.vim
 /opencode.json
+
+# opencodeg runtime config (contains apiKey - never commit)
+/opencodeg.json
+/opencodeg.jsonc
 a.out
 target
 .scripts
