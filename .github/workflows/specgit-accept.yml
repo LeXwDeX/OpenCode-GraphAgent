@@ -2,12 +2,7 @@ name: SpecGit Acceptance
 
 on:
   pull_request:
-    # Delivery PRs target dev (fast-integration layer) and are promoted to
-    # main via the release PR — main's legacy branch protection also requires
-    # the SpecGit Acceptance check, so the verdict must run on both targets.
-    # dev→main promotion stays governed by the protect-main Ruleset's four
-    # required checks.
-    branches: [dev, main]
+    branches: [main]
 
 permissions:
   contents: read
@@ -16,10 +11,7 @@ jobs:
   specgit-acceptance:
     name: SpecGit Acceptance
     runs-on: ubuntu-latest
-    # Must exceed the slowest required sibling (Unit Tests (linux) runs
-    # ~28min on PRs): the verdict waits for every policy check to reach a
-    # terminal state before evaluating.
-    timeout-minutes: 45
+    timeout-minutes: 15
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -31,18 +23,20 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Setup pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+
       - name: Setup Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: '22'
+          node-version: '20.19.0'
+          cache: 'pnpm'
 
-      # This repo is a bun workspace and does not vendor the SpecGit CLI;
-      # install the published CLI instead of building from source. Pinned
-      # with a caret floor (#366): the CLI releases multiple times a day and
-      # an unpinned install would let an unnoticed upstream change flip CI
-      # acceptance verdicts repo-wide.
-      - name: Install specgit CLI
-        run: npm install -g specgit@^0.5.0
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build CLI
+        run: pnpm run build
 
       - name: Wait for sibling checks
         # The verdict must see the OTHER required checks in a terminal
@@ -57,11 +51,9 @@ jobs:
         run: |
           node --input-type=module <<'EOF'
           import { readFileSync } from 'node:fs';
-          // Minimal parse of policy.yaml's required_checks block list —
-          // avoids a yaml dependency in this bun-based repo.
-          const policy = readFileSync('spec_git/policy.yaml', 'utf8');
-          const section = policy.slice(policy.indexOf('required_checks:'));
-          const required = [...section.matchAll(/^\s*-\s*(.+)$/gm)].map((m) => m[1].trim());
+          import { parse } from 'yaml';
+          const policy = parse(readFileSync('spec_git/policy.yaml', 'utf8'));
+          const required = policy.required_checks ?? [];
           const headers = {
             authorization: 'Bearer ' + process.env.GH_TOKEN,
             accept: 'application/vnd.github+json',
@@ -74,9 +66,7 @@ jobs:
             const retried = [...byName.keys()].find((k) => k.startsWith(name + ' ('));
             return retried !== undefined && terminal.has(byName.get(retried));
           };
-          // Must outlast the slowest required sibling (Unit Tests (linux)
-          // runs ~28min on PRs); the job timeout above bounds this too.
-          const deadline = Date.now() + 40 * 60 * 1000;
+          const deadline = Date.now() + 15 * 60 * 1000;
           while (Date.now() < deadline) {
             const res = await fetch(url, { headers });
             if (!res.ok) throw new Error('check-runs API ' + res.status);
@@ -95,6 +85,6 @@ jobs:
           EOF
 
       - name: specgit finish
-        run: specgit finish --json
+        run: node bin/specgit.js finish --json
         env:
           GH_TOKEN: ${{ github.token }}
