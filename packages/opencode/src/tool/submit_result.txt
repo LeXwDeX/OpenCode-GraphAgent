@@ -4,4 +4,6 @@ This tool is only relevant when you are running as a child session of a DAG work
 
 If the payload does not match the schema, the tool returns a validation error — correct the payload and call again within the same session. The result is not final until this tool succeeds.
 
+The payload is the single authoritative report: put the full result, including any summary, inside the payload itself. Do not duplicate the payload in your message text. Once submit_result succeeds, end your turn without restating the result.
+
 If you are not in a DAG workflow child session, this tool has no effect.
