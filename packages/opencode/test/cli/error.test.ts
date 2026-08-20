@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test"
+import { commandName } from "../../src/command-name"
 import { AccountTransportError } from "../../src/account/schema"
 import { FormatError } from "../../src/cli/error"
 import { UI } from "../../src/cli/ui"
@@ -73,7 +74,7 @@ describe("cli.error", () => {
     const expected = [
       "Model not found: anthropic/claude-sonet-4",
       "Did you mean: claude-sonnet-4",
-      "Try: `opencode models` to list available models",
+      `Try: \`${commandName()} models\` to list available models`,
       "Or check your config (opencode.json) provider/model names",
     ].join("\n")
 
@@ -91,5 +92,23 @@ describe("cli.error", () => {
 
   test("formats cancelled UI errors as empty output", () => {
     expect(FormatError(new UI.CancelledError())).toBe("")
+  })
+
+  describe("remote auth", () => {
+    test("ConfigRemoteAuthError hint uses dynamic command name", () => {
+      const formatted = FormatError({
+        name: "ConfigRemoteAuthError",
+        data: { url: "https://sso.example.com", remote: "default" },
+      })
+      expect(formatted).toContain(`Run \`${commandName()} auth login https://sso.example.com\` to re-authenticate.`)
+      expect(formatted).not.toContain("opencode auth login")
+      expect(formatted).not.toContain("`opencode auth")
+    })
+
+    test("ConfigRemoteAuthError without url omits the run hint", () => {
+      const formatted = FormatError({ name: "ConfigRemoteAuthError", data: { remote: "default" } })
+      expect(formatted).not.toContain("auth login")
+      expect(formatted).toContain("Failed to load remote config")
+    })
   })
 })

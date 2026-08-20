@@ -18,6 +18,7 @@ import {
   type ScrollbackWriter,
 } from "@opentui/core"
 import * as Locale from "@/util/locale"
+import { commandName } from "@/command-name"
 import { go } from "@/cli/logo"
 import type { RunSplashTheme } from "./theme"
 
@@ -234,7 +235,7 @@ function build(input: SplashWriterInput, kind: "entry" | "exit", ctx: Scrollback
       lines,
       body_left + label.length,
       top + 1,
-      `opencode --mini -s ${meta.session_id}`,
+      `${commandName()} --mini -s ${meta.session_id}`,
       right,
       undefined,
       TextAttributes.BOLD,

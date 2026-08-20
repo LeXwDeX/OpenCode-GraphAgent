@@ -1,4 +1,5 @@
 import { NamedError } from "@opencode-ai/core/util/error"
+import { commandName } from "@/command-name"
 import { errorFormat } from "@/util/error"
 import { isRecord } from "@/util/record"
 
@@ -64,7 +65,7 @@ export function FormatError(input: unknown): string | undefined {
     return [
       `Model not found: ${stringField(providerModelNotFound, "providerID")}/${stringField(providerModelNotFound, "modelID")}`,
       ...(suggestions.length ? ["Did you mean: " + suggestions.join(", ")] : []),
-      `Try: \`opencode models\` to list available models`,
+      `Try: \`${commandName()} models\` to list available models`,
       `Or check your config (opencode.json) provider/model names`,
     ].join("\n")
   }
@@ -102,7 +103,7 @@ export function FormatError(input: unknown): string | undefined {
     return [
       `Failed to load remote config${remote ? ` from ${remote}` : ""}: the server returned a login page instead of JSON.`,
       `Authentication is missing or has expired (the endpoint is likely behind an SSO or identity-aware proxy).`,
-      ...(url ? [`Run \`opencode auth login ${url}\` to re-authenticate.`] : []),
+      ...(url ? [`Run \`${commandName()} auth login ${url}\` to re-authenticate.`] : []),
     ].join("\n")
   }
 

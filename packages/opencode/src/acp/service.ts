@@ -43,6 +43,7 @@ import { ACPProfile } from "./profile"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { Provider } from "@/provider/provider"
+import { commandName } from "@/command-name"
 import type { Command } from "@/command"
 
 export const AuthMethodID = "opencode-login"
@@ -91,7 +92,7 @@ export function make(input: {
   const initialize = Effect.fn("ACP.initialize")(function* (params: InitializeRequest) {
     const started = performance.now()
     const authMethod: AuthMethod = {
-      description: "Run `opencode auth login` in the terminal",
+      description: `Run \`${commandName()} auth login\` in the terminal`,
       name: "Login with opencode",
       id: AuthMethodID,
     }
@@ -99,7 +100,7 @@ export function make(input: {
     if (params.clientCapabilities?._meta?.["terminal-auth"] === true) {
       authMethod._meta = {
         "terminal-auth": {
-          command: "opencode",
+          command: commandName(),
           args: ["auth", "login"],
           label: "OpenCode Login",
         },
