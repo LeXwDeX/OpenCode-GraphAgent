@@ -1913,7 +1913,14 @@ const scenarios: Scenario[] = [
   http.protected
     .post("/dag", "dag.start")
     .mutating()
-    .seeded((ctx) => ctx.session({ title: "DAG start owner" }))
+    .withLlm()
+    .seeded((ctx) =>
+      // environment-profile authoring resolves each node's model through
+      // node -> tier -> agent -> parent(session.model); the exerciser's fake
+      // provider only exists under withLlm, and the parent chain needs the
+      // session to carry the fake model explicitly.
+      ctx.session({ title: "DAG start owner", model: { providerID: "test", id: "test-model" } }),
+    )
     .at((ctx) => ({
       path: "/dag",
       headers: ctx.headers(),
@@ -1934,6 +1941,38 @@ const scenarios: Scenario[] = [
         check(typeof body.status === "string", "start should return the workflow status")
       }),
     ),
+
+  // #344: dag.start must pass Workflow Authoring — a reporting checkpoint
+  // gated on its output without declaring output_schema (the DAG-01 danger
+  // shape: an unsatisfiable gate silently skips the subtree while the
+  // workflow reports COMPLETED) is an authoring error, not a creatable graph.
+  http.protected
+    .post("/dag", "dag.start.schemaless-gate")
+    .mutating()
+    .seeded((ctx) => ctx.session({ title: "DAG start gate owner" }))
+    .at((ctx) => ({
+      path: "/dag",
+      headers: ctx.headers(),
+      body: {
+        session_id: ctx.state.id,
+        config: {
+          name: "schemaless-gate",
+          nodes: [
+            { id: "cp", name: "CP", worker_type: "general", depends_on: [], required: true, report_to_parent: true, prompt_template: { inline: "noop" } },
+            {
+              id: "after",
+              name: "After",
+              worker_type: "general",
+              depends_on: ["cp"],
+              required: true,
+              condition: "cp.output.verdict == \"accept\"",
+              prompt_template: { inline: "noop" },
+            },
+          ],
+        },
+      },
+    }))
+    .status(400),
 
   http.protected
     .post("/dag/{dagID}/control", "dag.control")

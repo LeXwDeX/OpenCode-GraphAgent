@@ -1,0 +1,56 @@
+// SPDX-FileCopyrightText: 2026 LeXwDeX
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+export * as DagEnvironmentCatalogs from "./environment-catalogs"
+
+import { Effect } from "effect"
+import type { Agent } from "@/agent/agent"
+import type { Provider } from "@/provider/provider"
+import { Dag } from "./dag"
+import { DagConfig } from "./config"
+import { DagModel } from "./model"
+import { DagValidation } from "./validation"
+
+/**
+ * The environment-profile catalog loader shared by the workflow tool and the
+ * httpapi dag.start handler (#344): agent names, model availability, and
+ * tier resolution from the project's dag.jsonc. Passing the services in
+ * keeps this module layer-free — callers resolve Agent/Provider from their
+ * own composition context.
+ */
+export const makeCatalogLoader = (
+  agents: Agent.Interface,
+  provider: Provider.Interface,
+): ((context: { directory?: string; parent?: { id: string; providerID: string } }) => Effect.Effect<DagValidation.EnvironmentCatalogs>) =>
+  (context) =>
+    Effect.gen(function* () {
+      if (!context.directory) return {}
+      const agentCatalog = yield* agents.list().pipe(Effect.orDie)
+      const providerCatalog = yield* provider.list()
+      const config = yield* DagConfig.load(context.directory)
+      const agentsByName = new Map(agentCatalog.map((agent) => [agent.name, agent]))
+      const availableModels = new Set(
+        Object.values(providerCatalog).flatMap((info) =>
+          Object.values(info.models).map((model) => `${model.providerID}/${model.id}`),
+        ),
+      )
+      const resolveModel: NonNullable<DagValidation.EnvironmentCatalogs["resolveModel"]> = (node, defaults) =>
+        Effect.sync(() => {
+          const resolved = DagModel.resolve({
+            node: node.model ?? defaults?.model,
+            tier: DagConfig.tierModel(config, {
+              required: node.required ?? defaults?.required ?? Dag.DEFAULT_WORKFLOW_CONFIG.nodeRequired,
+              workerType: node.worker_type,
+            }),
+            agent: agentsByName.get(node.worker_type)?.model,
+            parent: context.parent
+              ? { modelID: context.parent.id, providerID: context.parent.providerID }
+              : undefined,
+          })
+          return Boolean(resolved && availableModels.has(`${resolved.providerID}/${resolved.modelID}`))
+        })
+      return {
+        worker_types: new Set(agentCatalog.map((agent) => agent.name)),
+        resolveModel,
+      }
+    })

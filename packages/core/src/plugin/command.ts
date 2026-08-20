@@ -29,6 +29,7 @@ export const OrchestrationPolicyContent = orchestrationPolicy
 export const OrchestrationDomainsContent = orchestrationDomains
 export const WorkflowContent = workflowRouting
 export const DagFlowContent = DAG_FLOW_PROMPT
+export const DagTemplateUpdateContent = DAG_TEMPLATE_UPDATE_PROMPT
 export const DagInitContent = DAG_INIT_PROMPT
 export const DagAutoContent = DAG_AUTO_PROMPT
 

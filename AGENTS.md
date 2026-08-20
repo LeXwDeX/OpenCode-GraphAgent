@@ -4,22 +4,22 @@
 ## Git Workflow (铁律)
 
 ```
-feat/**, fix/** ──PR(Typecheck 门禁)──▶ dev ──push 触发全量测试──▶
+feat/**, fix/** ──PR(Typecheck + Unit Tests 门禁)──▶ dev ──push 触发全量测试──▶
     dev ──手动 release-fork──▶ prerelease 测试版
     dev ──PR(全量测试门禁)──▶ main ──手动 release-fork──▶ 正式版
 ```
 
-**分层门禁**：`dev` 是快速集成层（仅 Typecheck），`main` 是正式质量门禁（Typecheck + 全量 Unit Tests + E2E）。所有改动通过 PR 流转，禁止直推 `main` 和 `dev`（由 GitHub Rulesets 强制）。
+**分层门禁**：`dev` 是快速集成层（Typecheck + Unit Tests (linux)；E2E 不阻塞），`main` 是正式质量门禁（Typecheck + 全量 Unit Tests + E2E）。所有改动通过 PR 流转，禁止直推 `main` 和 `dev`（由 GitHub Rulesets 强制）。
 
 | Branch | 直推 | PR 门禁 | CI 触发 | Purpose |
 |--------|------|---------|---------|---------|
 | `{type}/**` | ✅ 允许 | — | ❌ 不跑 | 开发分支，频繁变更 |
-| `dev` | ❌ 禁止 | PR 必须通过 **Typecheck** | ✅ push 触发 Typecheck + 全量测试 | 快速集成层 |
+| `dev` | ❌ 禁止 | PR 必须通过 **Typecheck + Unit Tests (linux)** | ✅ push 触发 Typecheck + 全量测试 | 快速集成层 |
 | `main` | ❌ 禁止 | PR 必须通过 **Typecheck + Unit Tests + E2E (linux + windows)** | ✅ push 触发全量 | 正式质量门禁 + 发版 |
 
 **流程**：
 1. 从 `main` 切出 `feat/**` 或 `fix/**` 分支开发
-2. PR → `dev`（Typecheck 门禁，快速合并）
+2. PR → `dev`（Typecheck + Unit Tests (linux) 门禁，快速合并）
 3. push 到 `dev` 自动触发全量测试验证
 4. 从 `dev` 手动 `release-fork` → 产出 **prerelease** 测试版
 5. PR `dev` → `main`（全量测试门禁：Typecheck + Unit Tests + E2E）
@@ -240,3 +240,51 @@ Triage uses the five canonical labels `needs-triage`, `needs-info`, `ready-for-a
 ### Domain docs
 
 This repository uses a multi-context domain-document layout rooted at `CONTEXT-MAP.md`. See `docs/agents/domain.md`.
+
+<!-- specgit:block:start -->
+## SpecGit delivery harness
+
+Managed by `specgit init`. Everything between the markers is rewritten on
+re-init; keep manual guidance outside them.
+
+### The delivery story
+
+- Start with `specgit issue <title-or-number>...`: it creates or reuses
+  the issues, branches, opens the draft pull request that closes every
+  bound issue, and writes `.specgit.yaml`. Re-running resumes; it is
+  idempotent.
+- Finish with `specgit finish`: the verdict, derived from real git, PR,
+  and CI evidence. Exit code 0 is the only "done".
+
+### Repair and diagnostics
+
+- `specgit pr` repairs the pull-request binding: with no arguments it
+  auto-discovers the pull request for this head branch, errors with a fix
+  when none is found, and refuses with a list when several match.
+- `specgit status` shows local evidence only: record, state, drift,
+  origin. `specgit doctor` probes git, repository, origin, gh, and
+  policy.
+
+### Issue granularity
+
+One issue = one independently verifiable WHY. If a deliverable cannot be
+verified on its own evidence, split it before binding.
+
+### Iron rules
+
+- `specgit finish` exit code other than 0: never request merge. Fix the
+  delivery, not the gate.
+- Never weaken `spec_git/policy.yaml` to make a verdict pass.
+- `--json` is the only parse surface: stdout is exactly one JSON
+  document; never scrape human-readable output.
+<!-- specgit:block:end -->
+
+## Tool-call discipline (hard rules)
+
+- Never fan out duplicate or near-duplicate queries. One question, one
+  tool call; if the answer is already in context, make zero calls.
+- Parallel tool batches must contain distinct, independently justified
+  calls. Before sending a batch, verify no two calls answer the same
+  question. A repeated identical call is a bug regardless of intent.
+- Long CI waits use `sleep N && <single check>`, never repeated watches
+  of the same resource. One watch command, one result.

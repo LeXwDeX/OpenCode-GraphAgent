@@ -1,0 +1,100 @@
+name: SpecGit Acceptance
+
+on:
+  pull_request:
+    # Delivery PRs target dev (fast-integration layer) and are promoted to
+    # main via the release PR — main's legacy branch protection also requires
+    # the SpecGit Acceptance check, so the verdict must run on both targets.
+    # dev→main promotion stays governed by the protect-main Ruleset's four
+    # required checks.
+    branches: [dev, main]
+
+permissions:
+  contents: read
+
+jobs:
+  specgit-acceptance:
+    name: SpecGit Acceptance
+    runs-on: ubuntu-latest
+    # Must exceed the slowest required sibling (Unit Tests (linux) runs
+    # ~28min on PRs): the verdict waits for every policy check to reach a
+    # terminal state before evaluating.
+    timeout-minutes: 45
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Check out the PR head branch by name so HEAD is on the branch
+          # (not the detached merge ref): the execution context gate reads
+          # live git. Falls back to the default ref on non-PR events.
+          ref: ${{ github.head_ref || github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+
+      # This repo is a bun workspace and does not vendor the SpecGit CLI;
+      # install the published CLI instead of building from source. Pinned
+      # with a caret floor (#366): the CLI releases multiple times a day and
+      # an unpinned install would let an unnoticed upstream change flip CI
+      # acceptance verdicts repo-wide.
+      - name: Install specgit CLI
+        run: npm install -g specgit@^0.5.0
+
+      - name: Wait for sibling checks
+        # The verdict must see the OTHER required checks in a terminal
+        # state. Sibling jobs start in parallel AND may not have registered
+        # their check-runs yet, so an empty poll is not "done": wait until
+        # every name in spec_git/policy.yaml is present with a terminal
+        # conclusion. This job is not in the policy, so no self-deadlock.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WAIT_REPO: ${{ github.repository }}
+          WAIT_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          node --input-type=module <<'EOF'
+          import { readFileSync } from 'node:fs';
+          // Minimal parse of policy.yaml's required_checks block list —
+          // avoids a yaml dependency in this bun-based repo.
+          const policy = readFileSync('spec_git/policy.yaml', 'utf8');
+          const section = policy.slice(policy.indexOf('required_checks:'));
+          const required = [...section.matchAll(/^\s*-\s*(.+)$/gm)].map((m) => m[1].trim());
+          const headers = {
+            authorization: 'Bearer ' + process.env.GH_TOKEN,
+            accept: 'application/vnd.github+json',
+          };
+          const url = 'https://api.github.com/repos/' + process.env.WAIT_REPO
+            + '/commits/' + process.env.WAIT_SHA + '/check-runs?per_page=100';
+          const terminal = new Set(['completed']);
+          const terminalHas = (byName, name) => {
+            if (byName.has(name)) return terminal.has(byName.get(name));
+            const retried = [...byName.keys()].find((k) => k.startsWith(name + ' ('));
+            return retried !== undefined && terminal.has(byName.get(retried));
+          };
+          // Must outlast the slowest required sibling (Unit Tests (linux)
+          // runs ~28min on PRs); the job timeout above bounds this too.
+          const deadline = Date.now() + 40 * 60 * 1000;
+          while (Date.now() < deadline) {
+            const res = await fetch(url, { headers });
+            if (!res.ok) throw new Error('check-runs API ' + res.status);
+            const payload = await res.json();
+            const byName = new Map(payload.check_runs.map((r) => [r.name, r.status]));
+            const missing = required.filter((n) => !terminalHas(byName, n));
+            if (missing.length === 0) {
+              console.log('All required checks are in a terminal state.');
+              process.exit(0);
+            }
+            console.log('Waiting for: ' + missing.join(', '));
+            await new Promise((r) => setTimeout(r, 10000));
+          }
+          console.error('Timed out waiting for sibling checks.');
+          process.exit(1);
+          EOF
+
+      - name: specgit finish
+        run: specgit finish --json
+        env:
+          GH_TOKEN: ${{ github.token }}

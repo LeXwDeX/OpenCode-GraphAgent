@@ -55,7 +55,11 @@ export interface Interface {
     query: string
   }) => Effect.Effect<SearchResult>
   readonly checkpoint: (input: { sessionID: SessionID; messages: SessionV1.WithParts[] }) => Effect.Effect<string[]>
-  readonly setEnabled: (enabled: boolean) => Effect.Effect<"Memory on" | "Memory off" | "Memory remains off">
+  readonly setEnabled: (enabled: boolean) => Effect.Effect<string>
+  /** #350: why Memory is inert for the current project — undefined when the
+   * project passes every activation gate. Surface this wherever a silent
+   * "remains off" would leave the user guessing (e.g. /memory on). */
+  readonly statusReason: () => Effect.Effect<string | undefined>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Memory") {}
@@ -767,9 +771,32 @@ export const layer: Layer.Layer<
       ),
     )
 
+    // #350: the why-is-Memory-inert companion of configuration()'s fail-closed
+    // gates. Mirrors their order; only the gates a user can act on produce a
+    // reason (identity retirement and admission repair stay log-only — they
+    // are operator concerns, not /memory on guidance).
+    const statusReason = Effect.fn("Memory.statusReason")(function* () {
+      const ctx = yield* InstanceState.context
+      const current = yield* project.get(ctx.project.id)
+      if (!current) return "Memory is unavailable for this project: its identity is retired or unregistered."
+      if (current.id === ProjectV2.ID.global)
+        return "Memory is unavailable until this repository has a real identity: commit once or add a remote, then run /init."
+      if (current.vcs !== "git") return "Memory requires a git repository."
+      if (!current.time.initialized)
+        return "Memory is unavailable until the project is initialized — run /init first, then /memory on."
+      return undefined
+    })
+
     const setEnabledUnsafe = Effect.fn("Memory.setEnabledUnsafe")(function* (enabled: boolean) {
       const initial = yield* configuration()
-      if (!initial) return "Memory remains off" as const
+      if (!initial) {
+        if (!enabled) return "Memory remains off"
+        // #350: a /memory on that cannot activate must say WHY — the bare
+        // "remains off" sent users to guess (real case: an initialized git
+        // project whose /init stamp was missing looked identical to a
+        // disabled Memory).
+        return (yield* statusReason()) ?? "Memory remains off"
+      }
       const value = initial.loaded
         ? initial
         : yield* Effect.gen(function* () {
@@ -800,13 +827,13 @@ export const layer: Layer.Layer<
         Effect.catchCause((cause) =>
           Effect.gen(function* () {
             yield* Effect.logWarning("MEMORY command failed", { cause })
-            return "Memory remains off" as const
+            return "Memory remains off"
           }),
         ),
       ),
     )
 
-    return Service.of({ init, prepare, context, search, checkpoint, setEnabled })
+    return Service.of({ init, prepare, context, search, checkpoint, setEnabled, statusReason })
   }),
 )
 

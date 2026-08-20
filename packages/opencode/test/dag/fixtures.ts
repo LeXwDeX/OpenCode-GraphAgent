@@ -1,5 +1,25 @@
 import type { DagStore } from "@opencode-ai/core/dag/store"
 
+export function makeWorkflowRow(overrides: Partial<DagStore.WorkflowRow> = {}): DagStore.WorkflowRow {
+  return {
+    id: "wf-1",
+    projectId: "proj-1",
+    sessionId: "ses_parent",
+    directory: null,
+    title: "Test Workflow",
+    status: "running",
+    config: "{}",
+    seq: 1,
+    wakeReported: false,
+    graphRev: 1,
+    startedAt: null,
+    completedAt: null,
+    timeCreated: 1,
+    timeUpdated: 1,
+    ...overrides,
+  }
+}
+
 export function makeNodeRow(overrides: Partial<DagStore.NodeRow> = {}): DagStore.NodeRow {
   return {
     id: "node-1",

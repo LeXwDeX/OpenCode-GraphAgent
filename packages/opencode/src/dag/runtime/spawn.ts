@@ -407,6 +407,31 @@ export function spawnNode(
           return
         }
         try {
+          // #379 pause fence: scheduler admission is the only pause gate, so a
+          // node queued before control(pause) still holds a spawn fiber that
+          // would materialize its child session the moment a permit frees —
+          // contradicting the documented pause contract ("prevents new nodes
+          // from spawning"). Hold the fiber here while the durable workflow
+          // row reads `paused`: the node stays queued (never terminalized) and
+          // the fiber proceeds on control(resume). A workflow that was deleted
+          // or terminalized during the wait falls through to the adoption
+          // fence / nodeStarted guard below, which already no-op dead targets.
+          // The status read fails open (unreadable ⇒ treat as not paused):
+          // the adoption fence below is the authoritative revalidation, so a
+          // transient store blip must not kill the spawn fiber here.
+          // Effect.suspend defers the call so even a store facade lacking the
+          // method surfaces as a captured defect instead of a synchronous throw.
+          const readPauseStatus = Effect.exit(Effect.suspend(() => dag.store.getWorkflow(input.dagID))).pipe(
+            Effect.map((outcome) => (Exit.isSuccess(outcome) ? outcome.value?.status : undefined)),
+          )
+          if ((yield* readPauseStatus) === "paused") {
+            yield* Effect.logWarning(
+              `Workflow ${input.dagID} paused while node ${input.nodeID} was queued — holding spawn until resume`,
+            )
+            while ((yield* readPauseStatus) === "paused") {
+              yield* Effect.sleep(250)
+            }
+          }
           // #270 window-2 spawn-admission fence (C4): the node was durably
           // admitted (nodeQueued above) but the child session is about to
           // materialize — a deletion cascade (Session.remove → FK) committed in

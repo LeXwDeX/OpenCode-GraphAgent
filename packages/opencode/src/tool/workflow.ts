@@ -6,11 +6,10 @@ import { CommandPlugin } from "@opencode-ai/core/plugin/command"
 import { Effect, Option, Schema } from "effect"
 import { Dag } from "@/dag/dag"
 import { DagReviewLifecycle } from "@/dag/review-lifecycle"
-import { DagConfig } from "@/dag/config"
 import { DagWorkflows } from "@/dag/workflows"
-import { DagModel } from "@/dag/model"
 import { DagValidation, type Diagnostic } from "@/dag/validation"
 import { WorkflowAuthoring } from "@/dag/authoring"
+import { DagEnvironmentCatalogs } from "@/dag/environment-catalogs"
 import { Agent } from "@/agent/agent"
 import { Question } from "@/question"
 import { Provider } from "@/provider/provider"
@@ -205,38 +204,7 @@ export const WorkflowTool = Tool.define<
       )
 
     const authoring = WorkflowAuthoring.make({
-      loadEnvironment: (context) =>
-        Effect.gen(function* () {
-          if (!context.directory) return {}
-          const agentCatalog = yield* agents.list().pipe(Effect.orDie)
-          const providerCatalog = yield* provider.list()
-          const config = yield* DagConfig.load(context.directory)
-          const agentsByName = new Map(agentCatalog.map((agent) => [agent.name, agent]))
-          const availableModels = new Set(
-            Object.values(providerCatalog).flatMap((info) =>
-              Object.values(info.models).map((model) => `${model.providerID}/${model.id}`),
-            ),
-          )
-          const resolveModel: NonNullable<DagValidation.EnvironmentCatalogs["resolveModel"]> = (node, defaults) =>
-            Effect.sync(() => {
-              const resolved = DagModel.resolve({
-                node: node.model ?? defaults?.model,
-                tier: DagConfig.tierModel(config, {
-                  required: node.required ?? defaults?.required ?? Dag.DEFAULT_WORKFLOW_CONFIG.nodeRequired,
-                  workerType: node.worker_type,
-                }),
-                agent: agentsByName.get(node.worker_type)?.model,
-                parent: context.parent
-                  ? { modelID: context.parent.id, providerID: context.parent.providerID }
-                  : undefined,
-              })
-              return Boolean(resolved && availableModels.has(`${resolved.providerID}/${resolved.modelID}`))
-            })
-          return {
-            worker_types: new Set(agentCatalog.map((agent) => agent.name)),
-            resolveModel,
-          }
-        }),
+      loadEnvironment: DagEnvironmentCatalogs.makeCatalogLoader(agents, provider),
     })
 
     const portableEntryCheck = (entry: DagWorkflows.Entry) =>
@@ -695,9 +663,33 @@ export const WorkflowTool = Tool.define<
                 dag.extend(params.workflow_id, result.prepared.nodes),
                 "Terminal workflows are immutable except for the additive-extend reopen, which requires the workflow to have completed naturally at a wake-eligible reporting checkpoint (fragment adds new node ids; no early control(complete); no executed node beyond the checkpoint — condition-skipped dependents are fine). When the reopen does not apply, recover by starting a NEW workflow spec that reuses this workflow's completed outputs as static input.",
               ).pipe(Effect.orDie)
+              // #381: extend shares replan's resume contract — a paused
+              // workflow must resume for the added nodes to ever run (pause
+              // admits nothing and no wake path prompts a resume), and the
+              // extend intent is "the graph grew, proceed". Resume races with
+              // concurrent control ops are tolerated: the extend already
+              // landed, so never die on them.
+              const wfAfterExtend = yield* dag.store.getWorkflow(params.workflow_id).pipe(Effect.orDie)
+              const resumedFromPause = wfAfterExtend?.status === "paused"
+              const resumedOk = resumedFromPause
+                ? yield* dag.resume(params.workflow_id).pipe(
+                    Effect.map(() => true),
+                    Effect.catch((error) =>
+                      Effect.gen(function* () {
+                        yield* Effect.logWarning("Workflow resume after extend failed", { wfId: params.workflow_id, error })
+                        return false
+                      }),
+                    ),
+                  )
+                : false
+              const pauseNote = !resumedFromPause
+                ? ""
+                : resumedOk
+                  ? "\nWorkflow was paused and has been resumed — added nodes are now schedulable."
+                  : "\nWorkflow was paused; automatic resume raced with another control op — check status and issue control(resume) if still paused."
               return {
                 title: `Workflow extended: ${r.add.length} nodes added`,
-                output: `<workflow id="${params.workflow_id}" action="extend">\nAdded: ${r.add.join(", ")}\n</workflow>`,
+                output: `<workflow id="${params.workflow_id}" action="extend">\nAdded: ${r.add.join(", ")}${pauseNote}\n</workflow>`,
                 metadata: { workflowId: params.workflow_id, added: r.add } as Metadata,
               }
             }

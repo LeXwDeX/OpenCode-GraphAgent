@@ -93,6 +93,9 @@ function readById(id: string, projectDir: string): Effect.Effect<string, Error> 
       return yield* Effect.fail(new Error(`Invalid template id: ${id}`))
     }
     const projectPath = path.join(projectDir, ".opencode", "dag-prompts", `${id}.md`)
+    // Same OPENCODE_CONFIG_DIR redirect the Global service applies (siblings:
+    // dag/workflows.ts, dag/config.ts) so redirected setups resolve their
+    // globally installed prompts.
     const globalPath = path.join(Flag.OPENCODE_CONFIG_DIR ?? Global.Path.config, "dag-prompts", `${id}.md`)
 
     // Try project first (overrides global), then global
