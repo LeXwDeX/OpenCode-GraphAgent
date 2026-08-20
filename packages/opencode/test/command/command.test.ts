@@ -35,8 +35,8 @@ function commandLayer(commands: Record<string, { template: string; description?:
 const it = testEffect(commandLayer())
 const overridden = testEffect(
   commandLayer({
-    "dag-flow": {
-      description: "Custom DAG flow",
+    "dag-auto": {
+      description: "Custom DAG auto",
       template: "Custom task:\n$ARGUMENTS",
     },
   }),
@@ -56,62 +56,37 @@ describe("legacy command registry", () => {
     }),
   )
 
-  it.instance("registers the canonical dag-flow command without a built-in workflow fallback", () =>
+  it.instance("registers the canonical dag-auto command", () =>
     Effect.gen(function* () {
       const commands = yield* Command.Service
-      const command = yield* commands.get("dag-flow")
+      const command = yield* commands.get("dag-auto")
 
       expect(command).toMatchObject({
-        name: "dag-flow",
-        description: CommandPlugin.DagFlowDescription,
-        source: "command",
-        template: CommandPlugin.DagFlowContent,
-        hints: ["$ARGUMENTS"],
-      })
-      expect(yield* commands.get("workflow")).toBeUndefined()
-    }),
-  )
-
-  it.instance("registers the canonical dag-template-update command", () =>
-    Effect.gen(function* () {
-      const commands = yield* Command.Service
-
-      expect(yield* commands.get("dag-template-update")).toMatchObject({
-        name: "dag-template-update",
-        description: CommandPlugin.DagTemplateUpdateDescription,
-        source: "command",
-        template: CommandPlugin.DagTemplateUpdateContent,
-        hints: ["$ARGUMENTS"],
-      })
-    }),
-  )
-
-  it.instance("registers the canonical dag-init and dag-auto commands", () =>
-    Effect.gen(function* () {
-      const commands = yield* Command.Service
-
-      expect(yield* commands.get("dag-init")).toMatchObject({
-        name: "dag-init",
-        description: CommandPlugin.DagInitDescription,
-        source: "command",
-        template: CommandPlugin.DagInitContent,
-        hints: ["$ARGUMENTS"],
-      })
-      expect(yield* commands.get("dag-auto")).toMatchObject({
         name: "dag-auto",
         description: CommandPlugin.DagAutoDescription,
         source: "command",
         template: CommandPlugin.DagAutoContent,
         hints: ["$ARGUMENTS"],
       })
+      expect(yield* commands.get("workflow")).toBeUndefined()
     }),
   )
 
-  overridden.instance("allows configured dag-flow commands to override the built-in", () =>
+  it.instance("retires the platform-delivery commands", () =>
     Effect.gen(function* () {
       const commands = yield* Command.Service
-      expect(yield* commands.get("dag-flow")).toMatchObject({
-        description: "Custom DAG flow",
+
+      expect(yield* commands.get("dag-init")).toBeUndefined()
+      expect(yield* commands.get("dag-flow")).toBeUndefined()
+      expect(yield* commands.get("dag-template-update")).toBeUndefined()
+    }),
+  )
+
+  overridden.instance("allows configured dag-auto commands to override the built-in", () =>
+    Effect.gen(function* () {
+      const commands = yield* Command.Service
+      expect(yield* commands.get("dag-auto")).toMatchObject({
+        description: "Custom DAG auto",
         template: "Custom task:\n$ARGUMENTS",
       })
     }),
@@ -120,47 +95,35 @@ describe("legacy command registry", () => {
   it.effect("preserves complete multi-line command arguments", () =>
     Effect.sync(() => {
       const input = "Investigate auth\nThen run the focused tests"
-      const expanded = SessionPrompt.expandCommandTemplate(CommandPlugin.DagFlowContent, input)
+      const expanded = SessionPrompt.expandCommandTemplate(CommandPlugin.DagAutoContent, input)
 
-      expect(expanded).toContain(`<dag-flow-task>\n${input}\n</dag-flow-task>`)
+      expect(expanded).toContain(`Arguments: ${input}`)
       expect(expanded).not.toContain("$ARGUMENTS")
     }),
   )
 
-  it.effect("returns after starting a DAG instead of polling its status", () =>
-    Effect.sync(() => {
-      const expanded = SessionPrompt.expandCommandTemplate(CommandPlugin.DagFlowContent, "Run two parallel workers")
-
-      expect(expanded).toContain("Do not poll")
-      expect(expanded).toContain("and end the response")
-    }),
-  )
-
-  it.effect("requires router-driven compilation without dropping task constraints", () =>
+  it.effect("routes template-first and never mentions platform delivery", () =>
     Effect.sync(() => {
       const expanded = SessionPrompt.expandCommandTemplate(
-        CommandPlugin.DagFlowContent,
+        CommandPlugin.DagAutoContent,
         "Use @security-reviewer to review this project. Do not modify files.",
       )
 
-      expect(expanded).toContain("resident Orchestration Router")
-      expect(expanded).not.toContain('workflow(action="list")')
-      expect(expanded).not.toContain('workflow(action="read"')
-      expect(expanded).toMatch(/Preserve\s+the task,\s+user constraints/)
-      expect(expanded).toContain("worker types or model IDs")
-      expect(expanded).toContain("configured capability or model")
-      expect(expanded).toContain("real error")
-      expect(expanded).toContain("final synthesis block must contain the requested result")
+      expect(expanded).toContain("workflow(action=\"list\")")
+      expect(expanded).toContain("never ask the user to pick a route")
+      expect(expanded).toContain("ultra-flow-route")
+      expect(expanded).not.toContain("dag-init")
+      expect(expanded).not.toContain("`gh ")
+      expect(expanded).not.toContain("Ordered merge")
     }),
   )
 
-  it.effect("keeps the blank-task guard when dag-flow has no arguments", () =>
+  it.effect("keeps the blank-arguments form valid", () =>
     Effect.sync(() => {
-      const expanded = SessionPrompt.expandCommandTemplate(CommandPlugin.DagFlowContent, "   ")
+      const expanded = SessionPrompt.expandCommandTemplate(CommandPlugin.DagAutoContent, "")
 
-      expect(expanded).toContain("<dag-flow-task>\n   \n</dag-flow-task>")
-      expect(expanded).toContain("empty or contains only whitespace")
-      expect(expanded).toContain("do not start a workflow")
+      expect(expanded).toContain("Arguments:")
+      expect(expanded).not.toContain("$ARGUMENTS")
     }),
   )
 })

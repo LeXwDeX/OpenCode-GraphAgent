@@ -43,28 +43,6 @@ describe("CommandPlugin.Plugin", () => {
         description: "review changes [commit|branch|pr], defaults to uncommitted",
         subtask: true,
       })
-      expect(yield* command.get("dag-flow")).toMatchObject({
-        name: "dag-flow",
-        description: CommandPlugin.DagFlowDescription,
-        template: CommandPlugin.DagFlowContent,
-      })
-      expect(CommandPlugin.DagFlowContent).toContain("$ARGUMENTS")
-      expect(CommandPlugin.DagFlowContent).toContain("`action=start`")
-      expect(CommandPlugin.DagFlowContent).toContain("exact Workflow ID")
-      expect(CommandPlugin.DagFlowContent).toContain("run `/dag`")
-      expect(CommandPlugin.DagFlowContent).toContain("resident Orchestration Router")
-      expect(CommandPlugin.DagFlowContent).toContain("Decision Checkpoint")
-      expect(yield* command.get("dag-init")).toMatchObject({
-        name: "dag-init",
-        description: CommandPlugin.DagInitDescription,
-        template: CommandPlugin.DagInitContent,
-      })
-      expect(CommandPlugin.DagInitContent).toContain("$ARGUMENTS")
-      expect(CommandPlugin.DagInitContent).toContain("unsupported platform: only GitHub and GitLab")
-      expect(CommandPlugin.DagInitContent).toContain("401 is POSITIVE")
-      expect(CommandPlugin.DagInitContent).toContain("re-verify with `glab api version`")
-      expect(CommandPlugin.DagInitContent).toContain(".opencode/dag-init.json")
-      expect(CommandPlugin.DagInitContent).toContain("merge_policy")
       expect(yield* command.get("dag-auto")).toMatchObject({
         name: "dag-auto",
         description: CommandPlugin.DagAutoDescription,
@@ -73,9 +51,47 @@ describe("CommandPlugin.Plugin", () => {
       expect(CommandPlugin.DagAutoContent).toContain("$ARGUMENTS")
       expect(CommandPlugin.DagAutoContent).toContain("ultra-flow-route")
       expect(CommandPlugin.DagAutoContent).toContain("continue|replan")
-      expect(CommandPlugin.DagAutoContent).toContain("issue IS the atom")
-      expect(CommandPlugin.DagAutoContent).toContain("full-auto")
-      expect(CommandPlugin.DagAutoContent).toContain("Ordered merge")
+      expect(CommandPlugin.DagAutoContent).toContain("3 back-edges")
+      expect(CommandPlugin.DagAutoContent).toContain("Product decision checkpoint")
+    }),
+  )
+
+  it.effect("retires the platform-delivery commands", () =>
+    Effect.gen(function* () {
+      const command = yield* CommandV2.Service
+      yield* CommandPlugin.Plugin.effect(
+        host({
+          command: { transform: command.transform, reload: command.reload },
+        }),
+      ).pipe(
+        Effect.provideService(
+          Location.Service,
+          Location.Service.of(location({ directory }, { projectDirectory: project })),
+        ),
+      )
+
+      expect(yield* command.get("dag-init")).toBeUndefined()
+      expect(yield* command.get("dag-flow")).toBeUndefined()
+      expect(yield* command.get("dag-template-update")).toBeUndefined()
+    }),
+  )
+
+  it.effect("keeps /dag-auto free of platform-delivery vocabulary", () =>
+    Effect.sync(() => {
+      const content = CommandPlugin.DagAutoContent
+      expect(content).not.toContain("dag-init")
+      // The intro/Rules name the boundary in the negative ("no issues, no
+      // PRs"); actionable delivery mechanics must stay absent.
+      expect(content).not.toContain("issue number")
+      expect(content).not.toContain("gh pr")
+      expect(content).not.toContain("pr checks")
+      expect(content).not.toContain("Ordered merge")
+      expect(content).not.toContain("rebase")
+      expect(content).not.toContain("release brief")
+      expect(content).toContain("routing and workflow-composition")
+      expect(content).toContain("workflow(action=\"list\")")
+      expect(content).toContain("workflow(action=\"validate\")")
+      expect(content).toContain("workflow(action=\"start\")")
     }),
   )
 
@@ -91,7 +107,7 @@ describe("CommandPlugin.Plugin", () => {
       expect(CommandPlugin.WorkflowFactsContent).not.toContain("## When to start a workflow")
       expect(CommandPlugin.WorkflowFactsContent).not.toContain("when ANY")
       expect(CommandPlugin.WorkflowFactsContent).not.toContain("- **Multi-model**:")
-      expect(CommandPlugin.DagFlowContent).toContain("`action=start`")
+      expect(CommandPlugin.DagAutoContent).toContain('workflow(action="start")')
     }),
   )
 
@@ -157,7 +173,7 @@ describe("CommandPlugin.Plugin", () => {
       expect(CommandPlugin.OrchestrationPolicyContent).toContain("only the user's delivery standard")
       expect(CommandPlugin.WorkflowContent).toContain("One `task` child")
       expect(CommandPlugin.WorkflowContent).toContain("One `workflow` DAG")
-      expect(CommandPlugin.DagFlowContent).toMatch(/one consolidated\s+graph/)
+      expect(CommandPlugin.DagAutoContent).toContain("ONE consolidated summary")
     }),
   )
 
@@ -175,8 +191,8 @@ describe("CommandPlugin.Plugin", () => {
       expect(CommandPlugin.WorkflowFactsContent).not.toContain('spec_path: "code-review"')
       expect(CommandPlugin.WorkflowFactsContent).toMatch(/Retarget its\s+objective and block instructions/)
       expect(CommandPlugin.WorkflowFactsContent).not.toContain("pass `spec` inline")
-      expect(CommandPlugin.DagFlowContent).toContain("task-local YAML file")
-      expect(CommandPlugin.DagFlowContent).toContain("`spec_path`")
+      expect(CommandPlugin.DagAutoContent).toContain(".opencode/.dag-specs/")
+      expect(CommandPlugin.DagAutoContent).toContain("retarget")
     }),
   )
 
@@ -481,7 +497,6 @@ describe("CommandPlugin.Plugin", () => {
       // continuation node keeps non-ACCEPT verdicts from dead-ending the graph.
       expect(reviewExample).toContain("condition: 'arbitrate.output.verdict != \"ACCEPT\"'")
       expect(CommandPlugin.WorkflowFactsContent).toContain("an early\n`control(complete)` workflow remains terminal")
-      expect(CommandPlugin.DagFlowContent).toContain("must contain the requested result")
       expect(CommandPlugin.WorkflowFactsContent).toContain("project, global, and builtin scopes")
       expect(CommandPlugin.WorkflowFactsContent).toContain("bounded objectives")
       expect(CommandPlugin.WorkflowFactsContent).toContain("validation status")

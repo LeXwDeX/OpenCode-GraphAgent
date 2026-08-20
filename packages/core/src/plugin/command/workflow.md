@@ -1,5 +1,5 @@
 <!--
-  Shared workflow-tool guidance. The /dag-flow command prepends its launch
+  Shared workflow-tool guidance. The /dag-auto command prepends its routing
   contract, while the workflow tool uses this neutral reference directly.
 -->
 
@@ -575,4 +575,4 @@ omitted content from its preview.
 
 - No `node_complete` action — completion is automatic
 - No `history` action — inspect a known workflow with `status`; browsing running workflows remains TUI-only (`list` shows saved specs, not running workflows)
-- No runtime-side magical topology selection — `/dag-flow` selects and adapts saved reference graphs in the parent agent; the workflow runtime executes the resulting validated spec
+- No runtime-side magical topology selection — the routing command (`/dag-auto`) selects and adapts saved reference graphs in the parent agent; the workflow runtime executes the resulting validated spec

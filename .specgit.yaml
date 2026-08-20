@@ -1,10 +1,8 @@
 version: 1
-delivery: end-structured-output
+delivery: reduce-dag-auto
 context:
   kind: branch
-  branch: fix/386-end-structured-output
+  branch: refactor/392-reduce-dag-auto
 issues:
-  - 386
-  - 387
-  - 388
-pr: 390
+  - 392
+pr: 393
