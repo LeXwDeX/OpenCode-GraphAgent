@@ -13,12 +13,13 @@ export function resolveReleaseVersion(input: { branch: string; tags: string[] })
   const latest = input.tags
     .flatMap((tag) => {
       const version = parseStableTag(tag)
-      return version ? [version] : []
+      return version ? [{ tag, version }] : []
     })
-    .toSorted(compareVersion)
+    .toSorted((left, right) => compareVersion(left.version, right.version))
     .at(-1)
-  const target = nextVersion(latest)
+  const target = nextVersion(latest?.version)
   const base = target.join(".")
+  const previousTag = latest?.tag ?? ""
 
   if (channel === "main") {
     return {
@@ -27,6 +28,7 @@ export function resolveReleaseVersion(input: { branch: string; tags: string[] })
       tag: `${tagPrefix}${base}`,
       prerelease: false,
       latest: true,
+      previous_tag: previousTag,
     }
   }
 
@@ -45,6 +47,7 @@ export function resolveReleaseVersion(input: { branch: string; tags: string[] })
     tag: `${tagPrefix}${version}`,
     prerelease: true,
     latest: false,
+    previous_tag: previousTag,
   }
 }
 
@@ -107,6 +110,7 @@ async function main() {
       `tag=${release.tag}`,
       `prerelease=${release.prerelease}`,
       `latest=${release.latest}`,
+      `previous_tag=${release.previous_tag}`,
       "",
     ].join("\n"),
   )

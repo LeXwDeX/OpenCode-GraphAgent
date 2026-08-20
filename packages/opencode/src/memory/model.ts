@@ -5,11 +5,13 @@ import { Context, Duration, Effect, Layer, Schema } from "effect"
 import { streamObject } from "ai"
 import { Provider } from "@/provider/provider"
 
-// Liveness is judged per-chunk, never by a whole-call wall clock: a stream
-// that keeps delivering parts is alive, however long the reasoning runs.
-// CONNECT_TIMEOUT bounds the wait for the FIRST part; IDLE_TIMEOUT bounds the
-// silence BETWEEN parts and is re-armed by every arriving part. Generation
-// still terminates on its own via max_output_tokens / a natural stop.
+// Liveness is judged per-part, never by a whole-call wall clock: a stream
+// that keeps delivering parts is alive, however long the call runs. Two
+// caveats: streamObject's fullStream DROPS reasoning-only parts (the ai SDK
+// forwards text-delta/finish/error only), so a model that reasons silently
+// past these windows still trips the timers — and CONNECT_TIMEOUT bounds the
+// wait for the FIRST part while IDLE_TIMEOUT bounds the silence BETWEEN
+// parts, re-armed by every arriving part.
 const CONNECT_TIMEOUT = Duration.seconds(60)
 const IDLE_TIMEOUT = Duration.seconds(60)
 
@@ -37,7 +39,10 @@ export class GenerateError extends Schema.TaggedErrorClass<GenerateError>()("Mem
   cause: Schema.Defect(),
 }) {
   override get message() {
-    return `MEMORY model call failed: ${String(this.cause)}`
+    // openai-compatible flattens a provider SSE error event to its bare
+    // message string, which can be empty — keep the failure identifiable.
+    const cause = String(this.cause)
+    return `MEMORY model call failed: ${cause === "" ? "(provider stream error with an empty message)" : cause}`
   }
 }
 
@@ -76,8 +81,9 @@ function requireJsonToken(request: Request): Request {
 // Signals that the stream went silent past the liveness window.
 export class Stalled extends Error {}
 
-// Drains `parts`, re-arming the idle watchdog on EVERY part (so a live stream
-// that keeps delivering — reasoning deltas included — never trips the timer).
+// Drains `parts`, re-arming the idle watchdog on every part the consumer
+// sees. NOTE: for streamObject that excludes reasoning-only parts (they are
+// filtered out upstream), so silent reasoning does NOT count as liveness.
 // Arms `connectTimeout` until the first part and `idleTimeout` between parts;
 // a silent window invokes `onStall` (abort the request) and fails with
 // `Stalled`, while an `errorOf` hit fails with that part's error.
@@ -123,6 +129,48 @@ export const drainWithLiveness = <T>(input: {
     })()
   })
 
+// Providers without structured-outputs support (every openai-compatible model
+// today) downgrade response_format to bare {"type":"json_object"} and never
+// see the schema passed to streamObject — the model then free-styles a
+// different shape every call and client-side validation always rejects
+// (issue #395). The schema therefore rides in the system prompt: the draft-07
+// document with every $ref inlined, since "#/definitions/..." pointers are
+// meaningless to the model. Optional fields arrive as anyOf [T, null]; the
+// null arm is dropped so the schema reads "provide T or omit the key",
+// matching what the decoder actually accepts.
+function jsonSchemaText(schema: Schema.Decoder<unknown>) {
+  const root = Schema.toStandardJSONSchemaV1(schema)["~standard"].jsonSchema.input({ target: "draft-07" })
+  const defs = { ...recordOf(root.definitions), ...recordOf(root.$defs) }
+  const walk = (node: unknown, refs: ReadonlySet<string>): unknown => {
+    if (Array.isArray(node)) return node.map((item) => walk(item, refs))
+    if (!isRecord(node)) return node
+    const ref = typeof node.$ref === "string" ? /^#\/(?:\$defs|definitions)\/(.+)$/.exec(node.$ref)?.[1] : undefined
+    if (ref !== undefined) {
+      if (refs.has(ref)) return {}
+      return walk(defs[ref] ?? {}, new Set([...refs, ref]))
+    }
+    if (Array.isArray(node.anyOf) && Object.keys(node).length === 1) {
+      const kept = node.anyOf.filter(isRecord).filter((arm) => arm.type !== "null")
+      if (kept.length === 1) return walk(kept[0], refs)
+    }
+    const out: Record<string, unknown> = {}
+    for (const [key, value] of Object.entries(node)) {
+      if (key === "definitions" || key === "$defs" || key === "$id" || key === "$schema") continue
+      out[key] = walk(value, refs)
+    }
+    return out
+  }
+  return JSON.stringify(walk(root, new Set()))
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+function recordOf(value: unknown): Record<string, unknown> {
+  return isRecord(value) ? value : {}
+}
+
 const streamGenerate = (input: {
   language: Parameters<typeof streamObject>[0]["model"]
   system: string
@@ -132,8 +180,9 @@ const streamGenerate = (input: {
   maxOutputTokens: number
   connectTimeout: Duration.Duration
   idleTimeout: Duration.Duration
-}) =>
-  Effect.tryPromise({
+}): Effect.Effect<unknown, TimeoutError | GenerateError> => {
+  const system = `${input.system}\n\nThe response must be a single JSON object that validates against this JSON Schema:\n${jsonSchemaText(input.schema)}`
+  return Effect.tryPromise({
     try: (signal) =>
       (async () => {
         const controller = new AbortController()
@@ -142,7 +191,7 @@ const streamGenerate = (input: {
         try {
           const result = streamObject({
             model: input.language,
-            system: input.system,
+            system,
             prompt: input.prompt,
             schema: Object.assign(
               Schema.toStandardSchemaV1(input.schema),
@@ -167,6 +216,7 @@ const streamGenerate = (input: {
       })(),
     catch: (cause) => (cause instanceof Stalled ? new TimeoutError() : new GenerateError({ cause })),
   })
+}
 
 export const layer = Layer.effect(
   Service,

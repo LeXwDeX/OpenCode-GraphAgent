@@ -2,8 +2,7 @@
  * Directory-level template validator (change repair-workflow-authoring-validation, §4.3).
  *
  * Reuses the runtime source-to-graph authority (WorkflowAuthoring) so
- * config-repo CI, release packaging, and /dag-template-update all enforce the
- * same portable contract. Emits machine-readable diagnostics plus the runtime,
+ * config-repo CI and release packaging enforce the same portable contract. Emits machine-readable diagnostics plus the runtime,
  * template, and compatibility commit identifiers, and exits non-zero when any
  * template is invalid.
  *

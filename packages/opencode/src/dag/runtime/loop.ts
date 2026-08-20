@@ -278,7 +278,7 @@ const serviceLayer = Layer.effect(
             if (nodeConfig?.output_schema) {
               promptParts.push({
                 type: "text",
-                text: `\n\nYou MUST call the submit_result tool with a JSON payload matching this schema before ending your turn:\n${JSON.stringify(nodeConfig.output_schema, null, 2)}`,
+                text: `\n\nYou MUST call the submit_result tool with a JSON payload matching this schema before ending your turn:\n${JSON.stringify(nodeConfig.output_schema, null, 2)}\nPut your full summary inside the payload. Do not repeat the payload in your message text. After submit_result succeeds, end your turn without restating the result.`,
               })
             }
 
@@ -423,6 +423,7 @@ const serviceLayer = Layer.effect(
               // fails such nodes loudly instead of undefined-completing them.
               config ?? null,
               lastAssistantText,
+              ctx.directory,
             ).pipe(
               Effect.provideService(Dag.Service, dag),
             )

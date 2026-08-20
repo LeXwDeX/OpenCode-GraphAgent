@@ -456,4 +456,47 @@ describe("workflow blocks", () => {
       }),
     ).toThrow("depends on multiple review gates")
   })
+
+  // issue #387: an instruction that duplicates the objective (after
+  // trim/line-ending normalization) must not be emitted twice in the single
+  // child prompt — the objective section already carries the content.
+  it("drops an instruction that duplicates the objective (issue #387)", () => {
+    const duplicated = DagBlocks.compileWorkflowBlocks({
+      objective: "Ship the memory feature",
+      blocks: [{ id: "map", kind: "explore", instruction: "Ship the memory feature" }],
+    })
+    expect(duplicated[0]?.prompt_template.inline).not.toContain("Block-specific instruction")
+    expect(duplicated[0]?.prompt_template.input).not.toHaveProperty("instruction")
+
+    const whitespaceEquivalent = DagBlocks.compileWorkflowBlocks({
+      objective: "Ship the memory feature",
+      blocks: [{ id: "map", kind: "explore", instruction: "  Ship the memory feature\r\n" }],
+    })
+    expect(whitespaceEquivalent[0]?.prompt_template.inline).not.toContain("Block-specific instruction")
+    expect(whitespaceEquivalent[0]?.prompt_template.input).not.toHaveProperty("instruction")
+  })
+
+  // Equivalence is exact, not fuzzy: block-specific instructions survive —
+  // both a fully distinct one and one that carries the objective plus
+  // additional detail — ordered after the objective.
+  it("keeps block-specific instructions that extend the objective (issue #387)", () => {
+    const distinct = DagBlocks.compileWorkflowBlocks({
+      objective: "Ship the memory feature",
+      blocks: [{ id: "map", kind: "explore", instruction: "Focus on the persistence seam" }],
+    })
+    const distinctInline = distinct[0]?.prompt_template.inline ?? ""
+    expect(distinctInline).toContain("Block-specific instruction:\n{{instruction}}")
+    expect(distinct[0]?.prompt_template.input).toMatchObject({ instruction: "Focus on the persistence seam" })
+
+    const extended = DagBlocks.compileWorkflowBlocks({
+      objective: "Ship the memory feature",
+      blocks: [{ id: "map", kind: "explore", instruction: "Ship the memory feature, then profile the persistence seam" }],
+    })
+    const extendedInline = extended[0]?.prompt_template.inline ?? ""
+    expect(extendedInline).toContain("Block-specific instruction:\n{{instruction}}")
+    expect(extended[0]?.prompt_template.input).toMatchObject({
+      instruction: "Ship the memory feature, then profile the persistence seam",
+    })
+    expect(extendedInline.indexOf("Workflow objective")).toBeLessThan(extendedInline.indexOf("Block-specific instruction"))
+  })
 })

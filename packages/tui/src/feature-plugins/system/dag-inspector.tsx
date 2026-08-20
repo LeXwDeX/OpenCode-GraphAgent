@@ -519,7 +519,7 @@ function DagInspector(props: { api: TuiPluginApi }) {
                 <text fg={theme().text}>No workflows for this session</text>
                 <box marginTop={1}>
                   <text fg={theme().textMuted}>
-                    {"Run /dag-flow <task> inside a session to start an orchestration"}
+                    {"Run /dag-auto <task> inside a session to start an orchestration"}
                   </text>
                 </box>
               </Match>

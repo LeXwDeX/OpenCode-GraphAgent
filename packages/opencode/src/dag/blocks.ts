@@ -332,7 +332,15 @@ function node(input: {
   review?: NodeConfig["review"]
   outputSchema?: Record<string, unknown>
 }): NodeConfig {
-  const instruction = input.instruction?.trim() ? "Block-specific instruction:\n{{instruction}}" : ""
+  // issue #387: an instruction equal to the objective (after trim and
+  // line-ending normalization) would render the same content twice in the
+  // single child prompt — the objective section already carries it, so the
+  // instruction is dropped instead of duplicated. Equivalence is exact, not
+  // fuzzy: an instruction carrying the objective plus additional detail stays.
+  const equivalent = (a: string, b: string) => a.trim().replace(/\r\n/g, "\n") === b.trim().replace(/\r\n/g, "\n")
+  const instructionText = input.instruction?.trim() ?? ""
+  const hasInstruction = instructionText !== "" && !equivalent(instructionText, input.objective)
+  const instruction = hasInstruction ? "Block-specific instruction:\n{{instruction}}" : ""
   // issue #323: a reporting checkpoint adjudicates a direction, so its
   // prompt must demand adversarial independent verification. The production
   // incident: a gate confirmed parent-supplied "defect evidence" that was a
@@ -360,7 +368,7 @@ function node(input: {
         .join("\n\n"),
       input: {
         objective: input.objective,
-        ...(input.instruction?.trim() ? { instruction: input.instruction.trim() } : {}),
+        ...(hasInstruction ? { instruction: instructionText } : {}),
       },
     },
     ...(input.condition ? { condition: input.condition } : {}),
@@ -521,7 +529,7 @@ function reviewWriterTopology(block: WorkflowBlock, blocks: WorkflowBlock[]): Re
       `Implementation review "${block.id}" requires exactly one verification ancestor; found ${verifications.length}`,
     )
   }
-  const verification = verifications[0]!
+  const verification = verifications[0]
   const verifiedImplementations = implementations.filter((candidate) =>
     dependsTransitively(blocks, verification.id, candidate.id),
   )

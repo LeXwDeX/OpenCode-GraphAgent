@@ -215,7 +215,7 @@ This repository owns the DAG schema, compiler, validator, runtime, and release i
 
 ## DAG command family
 
-- Built-in commands ship compiled into the binary: `/dag-flow` (resident orchestration router), `/dag-init` (platform handshake → writes `.opencode/dag-init.json`), `/dag-auto` (six-block ultra-flow driver), `/dag-template-update` (template refresh without git). User command files shadow built-ins by name; register new built-ins through `packages/core/src/plugin/command.ts` + `packages/opencode/src/command/index.ts` (`Default` registry).
+- Built-in commands ship compiled into the binary: `/dag-auto` (requirement → workflow routing: classify, match a saved DAG route, retarget, validate, start). Platform delivery (issues, PRs, CI, merge, release) is specgit's job — never part of `/dag-*`. User command files shadow built-ins by name; register new built-ins through `packages/core/src/plugin/command.ts` + `packages/opencode/src/command/index.ts` (`Default` registry).
 - Templates come from `opencode-dag-config`: 7 domains × `full`/`lite` plus cross-domain routes (`ultra-flow-route`, `release-route`). Precedence: project `.opencode/workflows/` > global config dir > builtin snapshot (the release pipeline compiles the config repo into the binary via `DAG_TEMPLATES_DIR`).
 - `dag.jsonc` supplies DAG node model tiers: `advanced` for `required: true` and review nodes, `standard` otherwise. Never pin `model` inside saved workflow specs.
 
@@ -264,6 +264,19 @@ re-init; keep manual guidance outside them.
 - `specgit status` shows local evidence only: record, state, drift,
   origin. `specgit doctor` probes git, repository, origin, gh, and
   policy.
+
+### Before creating an issue, check for duplicates
+
+- Before running `specgit issue` with a new title, search the tracker for
+  similar open work: `gh issue list` with keywords from the title
+  (state, labels, and search terms via `gh search issues`).
+- Open and read every plausible candidate (`gh issue view <n>`) — compare
+  the WHY, not just the wording.
+- If a candidate covers the same WHY, continue that issue instead of
+  creating a new one; if it is close but different, say how they differ.
+- When unsure, ask the requester to decide between continuing the existing
+  issue and creating a duplicate. The team ships one line of work per WHY,
+  never two.
 
 ### Issue granularity
 

@@ -52,3 +52,10 @@ tsconfig.tsbuildinfo
 .opencode/commands/
 .opencode/skills
 .qoder
+.opencode/workflow-reports/
+
+# opencode local workflow state
+.opencode/.dag-specs/
+.opencode/dag-init.json
+.opencode/workflow-drafts/
+.opencode/workflow-reports/

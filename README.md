@@ -43,7 +43,7 @@ Three terms worth knowing:
 
 - Composable blocks (`explore`, `plan`, `prototype`, `debug`, `coding`, `verify`, `review`, `synthesize`) compile into the node graph; low-level node fields remain available for anything blocks cannot express.
 - `workflow(action="draft")` renders a structured graph through the tool schema into a validated YAML spec — field-name mistakes are rejected by the provider, not discovered at validation time.
-- Saved workflow libraries at three scopes (project / global / builtin), startable by name; the `/dag-flow` command picks a curated reference topology and retargets it to the task at hand.
+- Saved workflow libraries at three scopes (project / global / builtin), startable by name; the `/dag-auto` command routes a requirement to a curated reference topology and retargets it to the task at hand.
 - Model tiers in `dag.jsonc` separate decisions from volume: critical nodes on the `advanced` model, fan-out work on `standard`.
 
 **Reliability**
@@ -67,7 +67,7 @@ Three terms worth knowing:
 ## Using workflows
 
 Nothing has to be configured to try it: ask for work that has stages, parallel
-parts, or a review gate in the middle (`/dag-flow <task>`), and the agent
+parts, or a review gate in the middle (`/dag-auto <task>`), and the agent
 designs a graph and runs it. Three things turn that into a repeatable setup of
 your own.
 
@@ -108,8 +108,8 @@ directory and it gains a **name**:
 Resolution takes the first match in that order, so a project file shadows a
 global one with the same name, and both shadow the builtin tier. The global
 scope is maintained by the [`opencode-dag-config`](https://github.com/LeXwDeX/opencode-dag-config)
-repository; the `/dag-template-update` command syncs it (preview of
-new/changed/unchanged files, backup before overwrite, QA decision gate). A minimal spec:
+repository (sync it with a plain `git clone`/`git pull` into your config
+dir). A minimal spec:
 
 ```yaml
 title: Dependency audit

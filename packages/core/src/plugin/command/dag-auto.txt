@@ -1,25 +1,11 @@
-You are running `/dag-auto`. Its essence: the user says "finish this thing"
-once, and you drive a composed ultra-flow to completion — all the way from
-exploration through design, development, test and acceptance, build and
-release, to the summary, without the user ever typing "continue". The flow
-is audited and debugged BY DESIGN: direction checkpoints run between every
-two blocks, repair goes through bounded replan, and delivery counts only
-when CI is green and the ordered merge lands.
-
-**The stage classifier is a methodology embedded in this command, not a
-skill or external router.** Three disciplines: (1) classify the disposition
-of the current state before acting, (2) template-first — match a saved DAG
-route before inventing a graph, (3) routing decisions stay in this parent
-conversation; children receive concrete work. You apply these yourself at
-every boundary wake.
+You are running `/dag-auto`: the routing and workflow-composition driver of
+the `/dag-*` command family. Its essence: classify the request, match a
+saved DAG route, retarget it to the real task, validate, and start it.
+Routing decisions stay in this parent conversation; children receive
+concrete work. That is ALL this command does — it never touches platform
+delivery: no issues, no PRs, no CI watching, no merge or release mechanics.
 
 Arguments: $ARGUMENTS
-
-## Phase 0 — Gate
-
-Read `.opencode/dag-init.json`. Missing → STOP and tell the user to run
-`/dag-init` first: auto cannot execute without a verified platform
-connection, issue/PR permissions, and template availability.
 
 ## Phase 1 — Entry classification
 
@@ -31,41 +17,32 @@ Classify the request; never ask the user to pick a route:
   `stage-release` (+ its checkpoint) when the project has no release
   mechanics, write the retargeted YAML to `.opencode/.dag-specs/<task>.yaml`,
   then `workflow(action="validate")` and `workflow(action="start")`.
-- **Narrow single-block request** ("review this PR", "grill this plan",
+- **Narrow single-block request** ("review this diff", "grill this plan",
   "decide X", "只做设计阶段") → run ONLY the matching domain route
   (`product-planning`, `technical-design`, `project-development`,
   `code-review`, `debug-repair`, `security-audit`, `performance-audit` —
   full/lite by risk) or the single ultra-flow stage, and end on its report.
 
 Template-first for every route: `workflow(action="list")` → `read` →
-retarget → start; create from scratch only when nothing fits.
+retarget → validate → start; create from scratch only when nothing fits.
 
-## Phase 2 — Driving the ultra-flow
+## Phase 2 — Driving the graph
 
 **Auto contract.** Drive each stage/checkpoint wake to completion and
 advance automatically. Do not pause to ask "shall I continue". The ONLY
-interruptions allowed are user-owned decisions: the spec confirmation gate,
-a product decision checkpoint, the release human gate, a merge gate the
-rulesets reserve for a human, or a cap exceeded (retries / replan loops).
-Everything else advances on its own.
+interruptions allowed are user-owned decisions (the product decision
+checkpoint below) or a cap exceeded (retries / replan loops). Everything
+else advances on its own.
 
 **Checkpoint wakes.** Every checkpoint node carries a verdict
 `{verdict: continue|replan, findings, target?}` reporting direction
 correctness:
 - `continue` → do nothing; the graph already advances by itself.
 - `replan` → use the findings + target to add correction nodes via
-  `workflow(action="control", operation="replan")` (never restart the
-  ultra-flow from scratch). The loop is bounded: at most **3 back-edges**;
-  on the third, stop and hand the user ONE decision point with the complete
-  state (findings, attempts, diffs).
-
-**Spec confirmation gate.** Before the design stage creates the platform
-issue, present the spec draft (title + body) in chat and wait for ONE
-confirmation; create the issue only after it. Spec content = issue body
-(label `dag-spec`), the issue IS the atom — no X.Y task fragmentation.
-Multiple specs in one plan → one tracking issue listing the spec issues IN
-PLAN ORDER (that list is the merge order contract). Skip the gate only when
-the user said `full-auto`.
+  `workflow(action="control", operation="replan")` (never restart the flow
+  from scratch). The loop is bounded: at most **3 back-edges**; on the
+  third, stop and hand the user ONE decision point with the complete state
+  (findings, attempts, diffs).
 
 **Product decision checkpoint.** Force a user decision when the flow hits:
 a new external dependency, a breaking change, a public API change, or an
@@ -74,45 +51,18 @@ materially changes behavior, scope, or acceptance. Present the recommended
 answer and wait for one combined confirmation; write the result into the
 retargeted objective/instructions, never into child prompts.
 
-## Phase 3 — Platform delivery rules
+## Phase 3 — Completion report
 
-1. **Auto CI/CD + TDD watching.** After push, run `gh pr checks <n> --watch
-   --fail-fast` as a background task so the session wakes when checks
-   settle. TDD evidence is double: the development stage ran behavior checks
-   at public seams locally, remote CI re-runs them. CI failure → scoped
-   repair pass, re-push; cap 3 auto-fix retries, then hand back with failing
-   checks and logs.
-2. **Ordered merge.** Strictly in plan order: PR-N merges only after PR-(N-1)
-   is confirmed merged. Before each merge gate, rebase the branch on the
-   advanced base, push, and re-watch CI. Merge acceptance = CI green +
-   review verdict, never "checkbox done". Respect rulesets from
-   `/dag-init`; when merge requires a human actor or approval, stop at the
-   gate and say exactly what to click.
-3. **Release human gate.** The release stage defaults to HOLD: execute the
-   publish only after the user confirms the release brief (mechanism,
-   version derived from latest tag + commit types, changelog). Argument
-   `release-auto` overrides.
-4. **Monitoring scope.** Nothing watches spec files or task boxes
-   mid-process. Watched milestones only: issue-closed, PR-merged, CI checks.
-5. **Remote truth.** Single source of truth is the platform: every re-entry
-   reconciles from `gh issue view` / `gh pr list --state all --json` /
-   `gh pr checks`. Interrupted runs resume by re-querying — the ultra-flow
-   survives session restarts by finding its stage from remote state plus the
-   durable workflow graph.
-
-## Phase 4 — Completion report
-
-End with ONE consolidated summary: stages executed (incl. skipped with
-reason), checkpoint verdicts and replan passes used, issue number(s), PR
-URL(s), CI status, merge position in the plan, release outcome (or
-documented skip), and any gate waiting on the human.
+End with ONE consolidated summary: the route chosen (saved template name or
+task-local graph), stages executed (incl. skipped with reason), checkpoint
+verdicts and replan passes used, the exact Workflow ID, and any gate
+waiting on the user.
 
 ## Rules
 
-- Never create issues/PRs before the `/dag-init` config is verified.
-- Never write workflow state to local files; local persistence is only the
-  retargeted spec YAML under `.opencode/.dag-specs/` and
-  `.opencode/dag-init.json`.
 - Routing decisions live in this conversation; child nodes get concrete
   work, not routing questions.
-- Supported platforms: GitHub and GitLab (self-hosted included) only.
+- Never write workflow state to local files; local persistence is only the
+  retargeted spec YAML under `.opencode/.dag-specs/`.
+- Platform delivery (issues, PRs, CI, merge, release) is out of scope for
+  this command; if the user asks for it, name the boundary and stop.

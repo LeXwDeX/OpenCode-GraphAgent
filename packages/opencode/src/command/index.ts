@@ -51,9 +51,6 @@ export const Default = {
   GOAL: "goal",
   SUBGOAL: "subgoal",
   MEMORY: "memory",
-  DAG_FLOW: "dag-flow",
-  DAG_TEMPLATE_UPDATE: "dag-template-update",
-  DAG_INIT: "dag-init",
   DAG_AUTO: "dag-auto",
   IMPORT_HOOKS: "import-claude-hooks",
   CREATE_HOOK: "create-hook",
@@ -117,27 +114,6 @@ export const layer = Layer.effect(
         source: "command",
         template: "",
         hints: ["$ARGUMENTS"],
-      }
-      commands[Default.DAG_FLOW] = {
-        name: Default.DAG_FLOW,
-        description: CommandPlugin.DagFlowDescription,
-        source: "command",
-        template: CommandPlugin.DagFlowContent,
-        hints: hints(CommandPlugin.DagFlowContent),
-      }
-      commands[Default.DAG_TEMPLATE_UPDATE] = {
-        name: Default.DAG_TEMPLATE_UPDATE,
-        description: CommandPlugin.DagTemplateUpdateDescription,
-        source: "command",
-        template: CommandPlugin.DagTemplateUpdateContent,
-        hints: hints(CommandPlugin.DagTemplateUpdateContent),
-      }
-      commands[Default.DAG_INIT] = {
-        name: Default.DAG_INIT,
-        description: CommandPlugin.DagInitDescription,
-        source: "command",
-        template: CommandPlugin.DagInitContent,
-        hints: hints(CommandPlugin.DagInitContent),
       }
       commands[Default.DAG_AUTO] = {
         name: Default.DAG_AUTO,

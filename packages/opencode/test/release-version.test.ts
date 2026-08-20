@@ -9,6 +9,7 @@ describe("GraphAgent release versions", () => {
       tag: "graphagent-v1.0.0",
       prerelease: false,
       latest: true,
+      previous_tag: "",
     })
   })
 
@@ -24,6 +25,7 @@ describe("GraphAgent release versions", () => {
       tag: "graphagent-v1.0.0-dev.1",
       prerelease: true,
       latest: false,
+      previous_tag: "",
     })
   })
 
@@ -53,6 +55,26 @@ describe("GraphAgent release versions", () => {
     )
   })
 
+  test("seeds previous_tag from the latest stable tag for both channels", () => {
+    expect(resolveReleaseVersion({ branch: "dev", tags: ["graphagent-v1.0.8", "graphagent-v1.0.9"] })).toEqual({
+      channel: "dev",
+      version: "1.0.10-dev.1",
+      tag: "graphagent-v1.0.10-dev.1",
+      prerelease: true,
+      latest: false,
+      previous_tag: "graphagent-v1.0.9",
+    })
+    expect(
+      resolveReleaseVersion({ branch: "main", tags: ["graphagent-v1.0.8", "graphagent-v1.0.9"] }).previous_tag,
+    ).toBe("graphagent-v1.0.9")
+  })
+
+  test("keeps previous_tag on the last stable across the dev series", () => {
+    expect(
+      resolveReleaseVersion({ branch: "dev", tags: ["graphagent-v1.0.9", "graphagent-v1.0.10-dev.2"] }).previous_tag,
+    ).toBe("graphagent-v1.0.9")
+  })
+
   test("wires one resolved version into both the build and GitHub Release", async () => {
     const workflow = await Bun.file(new URL("../../../.github/workflows/release-fork.yml", import.meta.url)).text()
 
@@ -62,5 +84,7 @@ describe("GraphAgent release versions", () => {
     expect(workflow).toContain("OPENCODE_VERSION: ${{ needs.version.outputs.version }}")
     expect(workflow).toContain('gh release create "${{ needs.version.outputs.tag }}"')
     expect(workflow).toContain("--prerelease --latest=false")
+    expect(workflow).toContain("previous_tag: ${{ steps.release-version.outputs.previous_tag }}")
+    expect(workflow).toContain("needs.version.outputs.previous_tag")
   })
 })

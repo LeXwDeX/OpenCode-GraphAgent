@@ -60,6 +60,10 @@ export interface Interface {
    * project passes every activation gate. Surface this wherever a silent
    * "remains off" would leave the user guessing (e.g. /memory on). */
   readonly statusReason: () => Effect.Effect<string | undefined>
+  /** Truthful one-line state for /memory status surfaces: the statusReason
+   * blocker when a gate (identity, init, model availability) holds Memory
+   * inert, else the actual on/off state. */
+  readonly status: () => Effect.Effect<string>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Memory") {}
@@ -774,7 +778,9 @@ export const layer: Layer.Layer<
     // #350: the why-is-Memory-inert companion of configuration()'s fail-closed
     // gates. Mirrors their order; only the gates a user can act on produce a
     // reason (identity retirement and admission repair stay log-only — they
-    // are operator concerns, not /memory on guidance).
+    // are operator concerns, not /memory on guidance). #397: an enabled
+    // config whose model no longer resolves is equally inert — active() gates
+    // on resolveModel() — so it gets its own actionable reason.
     const statusReason = Effect.fn("Memory.statusReason")(function* () {
       const ctx = yield* InstanceState.context
       const current = yield* project.get(ctx.project.id)
@@ -784,7 +790,27 @@ export const layer: Layer.Layer<
       if (current.vcs !== "git") return "Memory requires a git repository."
       if (!current.time.initialized)
         return "Memory is unavailable until the project is initialized — run /init first, then /memory on."
+      // An unreadable config/store answers "cannot determine" rather than
+      // failing the status surface.
+      const optioned = yield* Effect.option(configuration())
+      const loaded = Option.isSome(optioned) ? optioned.value?.loaded : undefined
+      if (loaded?.config.enabled) {
+        // resolveModel answers undefined (not a failure) when the model is
+        // absent from the provider list; Effect.option only catches the
+        // torn-read ModelNotFoundError edge — both mean unavailable here.
+        const model = yield* Effect.option(resolveModel(loaded.config))
+        if (!Option.isSome(model) || model.value === undefined)
+          return "Memory is enabled but its configured model is unavailable — run /memory on to reselect a replacement, or set `model` in .opencode/memory.jsonc to an installed provider/model."
+      }
       return undefined
+    })
+
+    const status: Interface["status"] = Effect.fn("Memory.status")(function* () {
+      const reason = yield* statusReason()
+      if (reason) return reason
+      const optioned = yield* Effect.option(configuration())
+      const loaded = Option.isSome(optioned) ? optioned.value?.loaded : undefined
+      return loaded?.config.enabled ? "Memory on" : "Memory remains off"
     })
 
     const setEnabledUnsafe = Effect.fn("Memory.setEnabledUnsafe")(function* (enabled: boolean) {
@@ -827,13 +853,16 @@ export const layer: Layer.Layer<
         Effect.catchCause((cause) =>
           Effect.gen(function* () {
             yield* Effect.logWarning("MEMORY command failed", { cause })
-            return "Memory remains off"
+            // #397: a failure that statusReason can explain (e.g. no
+            // installed model to reselect) surfaces the actionable reason
+            // instead of a bare "remains off".
+            return (yield* statusReason()) ?? "Memory remains off"
           }),
         ),
       ),
     )
 
-    return Service.of({ init, prepare, context, search, checkpoint, setEnabled, statusReason })
+    return Service.of({ init, prepare, context, search, checkpoint, setEnabled, statusReason, status })
   }),
 )
 
