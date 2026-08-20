@@ -455,5 +455,33 @@ describe("workflow blocks", () => {
         ],
       }),
     ).toThrow("depends on multiple review gates")
+
+    // issue #387: an instruction that duplicates the objective (after
+    // trim/line-ending normalization) must not be emitted twice in the single
+    // child prompt — the objective section already carries the content.
+    const duplicated = DagBlocks.compileWorkflowBlocks({
+      objective: "Ship the memory feature",
+      blocks: [{ id: "map", kind: "explore", instruction: "Ship the memory feature" }],
+    })
+    const inline = duplicated[0]?.prompt_template.inline ?? ""
+    expect(inline).not.toContain("Block-specific instruction")
+    expect(duplicated[0]?.prompt_template.input).not.toHaveProperty("instruction")
+
+    const whitespaceEquivalent = DagBlocks.compileWorkflowBlocks({
+      objective: "Ship the memory feature",
+      blocks: [{ id: "map", kind: "explore", instruction: "  Ship the memory feature\r\n" }],
+    })
+    expect(whitespaceEquivalent[0]?.prompt_template.inline).not.toContain("Block-specific instruction")
+    expect(whitespaceEquivalent[0]?.prompt_template.input).not.toHaveProperty("instruction")
+
+    // A genuinely block-specific instruction stays, ordered after the objective.
+    const distinct = DagBlocks.compileWorkflowBlocks({
+      objective: "Ship the memory feature",
+      blocks: [{ id: "map", kind: "explore", instruction: "Focus on the persistence seam" }],
+    })
+    const distinctInline = distinct[0]?.prompt_template.inline ?? ""
+    expect(distinctInline).toContain("Block-specific instruction:\n{{instruction}}")
+    expect(distinct[0]?.prompt_template.input).toMatchObject({ instruction: "Focus on the persistence seam" })
+    expect(distinctInline.indexOf("Workflow objective")).toBeLessThan(distinctInline.indexOf("Block-specific instruction"))
   })
 })

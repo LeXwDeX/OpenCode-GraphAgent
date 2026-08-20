@@ -332,7 +332,13 @@ function node(input: {
   review?: NodeConfig["review"]
   outputSchema?: Record<string, unknown>
 }): NodeConfig {
-  const instruction = input.instruction?.trim() ? "Block-specific instruction:\n{{instruction}}" : ""
+  // issue #387: an instruction equal to the objective (after trim and
+  // line-ending normalization) would render the same content twice in the
+  // single child prompt — the objective section already carries it, so the
+  // instruction is dropped instead of duplicated.
+  const equivalent = (a: string, b: string) => a.trim().replace(/\r\n/g, "\n") === b.trim().replace(/\r\n/g, "\n")
+  const hasInstruction = input.instruction?.trim() && !equivalent(input.instruction, input.objective)
+  const instruction = hasInstruction ? "Block-specific instruction:\n{{instruction}}" : ""
   // issue #323: a reporting checkpoint adjudicates a direction, so its
   // prompt must demand adversarial independent verification. The production
   // incident: a gate confirmed parent-supplied "defect evidence" that was a
@@ -360,7 +366,7 @@ function node(input: {
         .join("\n\n"),
       input: {
         objective: input.objective,
-        ...(input.instruction?.trim() ? { instruction: input.instruction.trim() } : {}),
+        ...(hasInstruction ? { instruction: input.instruction!.trim() } : {}),
       },
     },
     ...(input.condition ? { condition: input.condition } : {}),
