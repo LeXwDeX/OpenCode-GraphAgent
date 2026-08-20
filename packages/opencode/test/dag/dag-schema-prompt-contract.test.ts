@@ -33,10 +33,8 @@ import { SessionPrompt } from "@/session/prompt"
 import { MessageID } from "@/session/schema"
 import { Session } from "@/session/session"
 import { SessionStatus } from "@/session/status"
-import { testEffect } from "../lib/effect"
+import { pollWithTimeout } from "../lib/effect"
 import { withIdleAdmission } from "../lib/session-prompt"
-
-const integration = testEffect(Layer.empty)
 
 interface PromptGate {
   readonly input: SessionPrompt.PromptInput
@@ -130,6 +128,7 @@ function contractLayer(childPrompts: Queue.Queue<PromptGate>) {
 function runContractTest(test: (services: {
   readonly dag: Dag.Interface
   readonly loop: DagLoop.Interface
+  readonly store: DagStore.Interface
   readonly childPrompts: Queue.Queue<PromptGate>
 }) => Effect.Effect<void, Error>) {
   return Effect.gen(function* () {
@@ -137,6 +136,7 @@ function runContractTest(test: (services: {
     return yield* Effect.gen(function* () {
       const dag = yield* Dag.Service
       const loop = yield* DagLoop.Service
+      const store = yield* DagStore.Service
       const database = yield* Database.Service
       yield* database.db.insert(ProjectTable).values({
         id: "project-1" as never,
@@ -152,7 +152,7 @@ function runContractTest(test: (services: {
         version: "test",
       }).run().pipe(Effect.orDie)
       yield* loop.init()
-      return yield* test({ dag, loop, childPrompts })
+      return yield* test({ dag, loop, store, childPrompts })
     }).pipe(
       Effect.provide(contractLayer(childPrompts)),
       Effect.provideService(InstanceRef, {
@@ -193,6 +193,39 @@ describe("DAG schema prompt contract (issue #386)", () => {
           // A successful submission ends the turn.
           expect(prompt).toContain("end your turn without restating the result")
           yield* Deferred.succeed(gate.release, "done")
+        }),
+      ),
+    )
+  })
+
+  // The issue-#386 acceptance chain does not stop at prompt construction:
+  // the child submits through submit_result, the capture lands durably, and
+  // the node settles with the payload as its durable output — prose plays no
+  // part in settlement. The gate replays exactly the durable write the real
+  // tool performs (store.setCapturedOutput); spawn's completion gate
+  // (settleCapturedOutput) runs unmocked below it.
+  it("settles the node from the submit_result payload as the durable output", async () => {
+    await Effect.runPromise(
+      runContractTest(({ dag, store, childPrompts }) =>
+        Effect.gen(function* () {
+          const dagID = yield* dag.create({
+            projectID: "project-1",
+            sessionID: "ses_parent",
+            title: "Schema prompt contract",
+            config: { name: "schema-prompt-contract", nodes: [schemaNode()] },
+          })
+          const gate = yield* Queue.take(childPrompts)
+          const payload = { summary: "Delivered through submit_result only." }
+          yield* store.setCapturedOutput(gate.input.sessionID as string, payload)
+          // The contract-compliant reply: no payload duplication in prose.
+          yield* Deferred.succeed(gate.release, "Submitted.")
+          const node = yield* pollWithTimeout(
+            store.getNode(dagID, "report").pipe(
+              Effect.map((row) => row?.status === "completed" ? row : undefined),
+            ),
+            "schema node did not complete from the submitted payload",
+          )
+          expect(node.output).toEqual(payload)
         }),
       ),
     )

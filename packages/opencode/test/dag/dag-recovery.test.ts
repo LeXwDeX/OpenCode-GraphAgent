@@ -1,3 +1,6 @@
+// oxlint-disable typescript-eslint/no-unsafe-type-assertion -- mock dag
+// layers and row fixtures use `as unknown as DagStore.Interface` shims that
+// implement only the interface slice each scenario exercises.
 import { describe, expect, it, afterAll } from "bun:test"
 import { createHash } from "node:crypto"
 import fs from "node:fs/promises"
@@ -532,7 +535,11 @@ describe("rehydration via toSchedulingNodes", () => {
 // issue #388: the live path captures {content_ref, size, sha256, summary}
 // when a schemaless node's final reply IS one existing absolute file path
 // (spawn.ts → output-ref.ts). Recovery must produce the same durable receipt
-// for the same reply instead of diverging by crash timing.
+// for the same reply instead of diverging by crash timing. Behavioral
+// lockstep with the live path is asserted side-by-side in
+// dag-wake-integration.test.ts "captures a file_ref receipt when a
+// schemaless reply is one absolute path (issue #388)" — keep both green or
+// neither ships.
 describe("reconcileWorkflow output file refs (issue #388)", () => {
   it("captures the same file_ref receipt as the live path for an absolute-path reply", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "dag-recovery-ref-"))

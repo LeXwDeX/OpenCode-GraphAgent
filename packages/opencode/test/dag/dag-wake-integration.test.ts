@@ -1,5 +1,7 @@
 import { describe, expect, it } from "bun:test"
+import { createHash } from "node:crypto"
 import * as fs from "node:fs/promises"
+import * as os from "node:os"
 import * as path from "node:path"
 import { Deferred, Effect, Fiber, Layer, Option, Queue } from "effect"
 import type { SessionV1 } from "@opencode-ai/core/v1/session"
@@ -557,6 +559,53 @@ describe("DagLoop atomic wake integration", () => {
         }),
       ),
     )
+  })
+
+  // issue #388 live path: when a schemaless node's final reply IS one
+  // existing absolute file path, submit-time detection records the durable
+  // {content_ref, size, sha256, summary} receipt while the settlement stays
+  // the raw path. Keep in lockstep with dag-recovery.test.ts
+  // "reconcileWorkflow output file refs (issue #388)" — live and recovery
+  // must produce identical durable effects for the same reply.
+  it("captures a file_ref receipt when a schemaless reply is one absolute path (issue #388)", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "dag-live-ref-"))
+    const reportPath = path.join(dir, "report.md")
+    const content = "live report body"
+    await fs.writeFile(reportPath, content)
+    try {
+      await Effect.runPromise(
+        runWakeTest(({ dag, store, childPrompts }) =>
+          Effect.gen(function* () {
+            const dagID = yield* dag.create({
+              projectID: "project-1",
+              sessionID: "ses_parent",
+              title: "File-ref live capture",
+              config: { name: "file-ref-live-capture", nodes: [node("file-report")] },
+            })
+
+            const report = yield* takeWithin(childPrompts, "file-report did not start")
+            yield* Deferred.succeed(report.release, reportPath)
+            const row = yield* pollWithTimeout(
+              store.getNode(dagID, "file-report").pipe(
+                Effect.map((item) => item?.status === "completed" ? item : undefined),
+              ),
+              "file-ref node did not complete",
+            )
+            expect(row.output).toBe(reportPath)
+            expect(row.capturedOutput).toEqual({
+              kind: "file_ref",
+              content_ref: reportPath,
+              path: reportPath,
+              size: Buffer.byteLength(content),
+              sha256: createHash("sha256").update(content).digest("hex"),
+              summary: content,
+            })
+          }),
+        ),
+      )
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true })
+    }
   })
 
   integration.live("runs an additive wave after a terminal checkpoint wake", () =>
