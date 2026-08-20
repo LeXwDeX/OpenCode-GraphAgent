@@ -70,6 +70,8 @@ jobs:
       tag: ${{ steps.release-version.outputs.tag }}
       prerelease: ${{ steps.release-version.outputs.prerelease }}
       latest: ${{ steps.release-version.outputs.latest }}
+      previous_tag: ${{ steps.release-version.outputs.previous_tag }}
+
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -270,6 +272,29 @@ jobs:
           echo "--- SHA256SUMS ---"
           cat SHA256SUMS
 
+      - name: Setup Bun
+        uses: ./.github/actions/setup-bun
+        with:
+          save-cache: false
+
+      # Render + validate the per-series notes file (.github/releases/vX.Y.Z.md)
+      # BEFORE creating the release. Fail closed: a missing or invalid series
+      # file stops the job here, so a release can never ship with placeholder
+      # notes. The script derives the series filename from --version; the
+      # workflow passes only primitives. Rendered notes go to RUNNER_TEMP and
+      # are never attached as a release asset.
+      - name: Render Release Notes (fail closed)
+        run: |
+          bun run ./packages/opencode/script/release-notes.ts \
+            --notes-dir ".github/releases" \
+            --version "${{ needs.version.outputs.version }}" \
+            --channel "${{ needs.version.outputs.channel }}" \
+            --branch "${{ github.ref_name }}" \
+            --tag "${{ needs.version.outputs.tag }}" \
+            --previous-tag "${{ needs.version.outputs.previous_tag }}" \
+            --repo "${{ github.repository }}" \
+            --out "$RUNNER_TEMP/RELEASE_NOTES.md"
+
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -284,7 +309,7 @@ jobs:
           fi
           gh release create "${{ needs.version.outputs.tag }}" \
             --title "OpenCode GraphAgent v${{ needs.version.outputs.version }}" \
-            --notes "GraphAgent release from branch ${{ github.ref_name }}" \
+            --notes-file "$RUNNER_TEMP/RELEASE_NOTES.md" \
             --target "${{ github.sha }}" \
             "${EXTRA_FLAGS[@]}" \
             release-assets/*
