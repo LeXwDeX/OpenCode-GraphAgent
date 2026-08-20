@@ -1,8 +1,9 @@
 version: 1
-delivery: issue384
+delivery: end-structured-output
 context:
   kind: branch
-  branch: feat/384-issue384
+  branch: fix/386-end-structured-output
 issues:
-  - 384
-pr: 385
+  - 386
+  - 387
+  - 388
