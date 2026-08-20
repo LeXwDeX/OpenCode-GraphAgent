@@ -139,33 +139,36 @@ export const drainWithLiveness = <T>(input: {
 // null arm is dropped so the schema reads "provide T or omit the key",
 // matching what the decoder actually accepts.
 function jsonSchemaText(schema: Schema.Decoder<unknown>) {
-  const doc = (Schema.toStandardJSONSchemaV1(schema as never) as Record<string, unknown>)["~standard"] as {
-    readonly jsonSchema: { readonly input: (options: { readonly target: "draft-07" }) => unknown }
-  }
-  const root = doc.jsonSchema.input({ target: "draft-07" }) as Record<string, unknown>
-  const defs = { ...(root.definitions as Record<string, unknown>), ...(root.$defs as Record<string, unknown>) }
+  const root = Schema.toStandardJSONSchemaV1(schema)["~standard"].jsonSchema.input({ target: "draft-07" })
+  const defs = { ...recordOf(root.definitions), ...recordOf(root.$defs) }
   const walk = (node: unknown, refs: ReadonlySet<string>): unknown => {
     if (Array.isArray(node)) return node.map((item) => walk(item, refs))
-    if (node === null || typeof node !== "object") return node
-    const record = node as Record<string, unknown>
-    const ref = typeof record.$ref === "string" ? /^#\/(?:\$defs|definitions)\/(.+)$/.exec(record.$ref)?.[1] : undefined
+    if (!isRecord(node)) return node
+    const ref = typeof node.$ref === "string" ? /^#\/(?:\$defs|definitions)\/(.+)$/.exec(node.$ref)?.[1] : undefined
     if (ref !== undefined) {
       if (refs.has(ref)) return {}
-      const target = defs[ref] ?? {}
-      return walk(target, new Set([...refs, ref]))
+      return walk(defs[ref] ?? {}, new Set([...refs, ref]))
     }
-    if (Array.isArray(record.anyOf) && Object.keys(record).length === 1) {
-      const kept = (record.anyOf as Record<string, unknown>[]).filter((arm) => arm.type !== "null")
+    if (Array.isArray(node.anyOf) && Object.keys(node).length === 1) {
+      const kept = node.anyOf.filter(isRecord).filter((arm) => arm.type !== "null")
       if (kept.length === 1) return walk(kept[0], refs)
     }
     const out: Record<string, unknown> = {}
-    for (const [key, value] of Object.entries(record)) {
+    for (const [key, value] of Object.entries(node)) {
       if (key === "definitions" || key === "$defs" || key === "$id" || key === "$schema") continue
       out[key] = walk(value, refs)
     }
     return out
   }
   return JSON.stringify(walk(root, new Set()))
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+function recordOf(value: unknown): Record<string, unknown> {
+  return isRecord(value) ? value : {}
 }
 
 const streamGenerate = (input: {
