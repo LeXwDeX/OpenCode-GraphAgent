@@ -58,6 +58,8 @@ import * as DateTime from "effect/DateTime"
 import { eq } from "drizzle-orm"
 import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionReminders } from "./reminders"
+import { Todo } from "./todo"
+import { TodoReminders } from "./todo-reminders"
 import { SessionTools } from "./tools"
 import { LLMEvent } from "@opencode-ai/llm"
 import { SettingsHook, HOOK_REWAKE_SENTINEL, type TriggerResult } from "@/hook/settings"
@@ -149,6 +151,7 @@ export const layer = Layer.effect(
     const registry = yield* ToolRegistry.Service
     const truncate = yield* Truncate.Service
     const image = yield* Image.Service
+    const todoSvc = yield* Todo.Service
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner
     const scope = yield* Scope.Scope
     const instruction = yield* Instruction.Service
@@ -1684,6 +1687,12 @@ export const layer = Layer.effect(
             Effect.provideService(FSUtil.Service, fsys),
             Effect.provideService(Session.Service, sessions),
           )
+          // Issue #389: re-surface uncompleted todos once per model step
+          // (in-memory synthetic part, skipped when all settled or when the
+          // turn just updated the list via todowrite).
+          msgs = yield* TodoReminders.apply({ messages: msgs, sessionID }).pipe(
+            Effect.provideService(Todo.Service, todoSvc),
+          )
 
           const msg: SessionV1.Assistant = {
             id: MessageID.ascending(),
@@ -2183,6 +2192,7 @@ export const defaultLayer = Layer.suspend(() =>
         RuntimeFlags.defaultLayer,
         EventV2Bridge.defaultLayer,
         HookStartContext.defaultLayer,
+        Todo.defaultLayer,
       ),
     ),
   ),
@@ -2338,6 +2348,7 @@ export const node = LayerNode.make(layer, [
   RuntimeFlags.node,
   Database.node,
   Memory.node,
+  Todo.node,
   HookStartContext.node, SettingsHook.node, Goal.node,
 ])
 
