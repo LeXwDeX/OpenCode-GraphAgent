@@ -33,8 +33,19 @@ feat/**, fix/** ──PR(Typecheck + Unit Tests 门禁)──▶ dev ──push 
 **CI 配置**：
 - `ci-typecheck.yml`：push 到 `main`/`dev` + PR → `main`/`dev` 时触发；除 lint + typecheck 外还跑 `test:dag-core` DAG 核心行为/覆盖率门禁（10min 超时）
 - `ci-test.yml`：push 到 `main`/`dev` + PR → `main`/`dev` 时触发全量测试（`cancel-in-progress: false` 保证跑完）；Linux unit-tests job 额外校验生成物新鲜度（`packages/client` 与 `packages/sdk/js` 的 `check:generated`）并跑 HttpAPI 契约门禁（`test:httpapi:ci`）
-- `specgit-accept.yml`：仅 PR → `main` 时触发；安装 `specgit@^0.5.0`，等 `spec_git/policy.yaml` `required_checks`（Typecheck、Unit Tests (linux)）全部到终态后运行 `specgit finish --json` 产出 SpecGit Acceptance 裁决
+- `specgit-accept.yml`：仅 PR → `main` 时触发；安装 pinned `specgit@1.0.1`，等 `spec_git/policy.yaml` `required_checks` 全部到终态后运行 `specgit finish --json` 产出 SpecGit Acceptance 裁决
 - `release-fork.yml`：手动 `workflow_dispatch` 是唯一真实构建路径（push 到 `main`/`dev` 仅注册不构建）；从 `dev` 发布自动产出 `X.Y.Z-dev.N` prerelease，从 `main` 发布 `X.Y.Z` 并标 Latest
+
+## Standard Delivery Workflow (标准交付流程)
+
+新功能开发、Debug 等一切交付范畴恒定走此循环；后续所有工作必须遵守该方案，不得另起流程：
+
+1. **确立条目**：明确条目的内容、范围、类型（`feat`/`fix`/…）。一个 issue = 一个可独立验证的 WHY，无法独立验证的先拆分再立项。
+2. **SpecGit 立项**：`specgit issue <title-or-number>` 创建/复用 issues 批次，确立交付分支与草稿 PR 脚手架（`.specgit.yaml` 绑定）；立项前先查重，避免同一 WHY 双开。
+3. **超流执行**：安排 DAG workflow（超流）承载实现——并行开发 + 多角度 Review + 复合（synthesize），其产出作为交付证据基线。
+4. **PR 过门禁**：SpecGit 发起/推进 PR，过 TDD 与 CI 门禁（Typecheck、Unit Tests、DAG gate；`specgit finish` exit 0 是唯一 "done"）。
+5. **修复门禁问题**：门禁失败在交付分支修代码/测试，永远不削弱门禁本身。
+6. **合并收尾**：完成 PR 合并（目标分支遵循 Git Workflow，dev 为集成层），PR 正文 `Closes #n` 自动关闭绑定 issues；版本确立与发布按 release train 既有节奏推进。
 
 ## Branch Names
 
