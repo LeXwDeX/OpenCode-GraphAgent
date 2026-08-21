@@ -3,7 +3,13 @@ name: SpecGit Acceptance
 on:
   pull_request:
     branches: [main]
-  workflow_dispatch:
+  # Local specialization (repo-only deviation from the specgit template):
+  # no workflow_dispatch trigger. Dispatch is the privileged context that
+  # made CodeQL's cache-poisoning taint rule fire on the head_ref checkout;
+  # it also evaluated the wrong tree here (head_ref is empty on dispatch,
+  # so the verdict would run against the default branch). This repo's
+  # delivery flow always goes through a PR, so dispatch has no use.
+  # Re-apply this deletion after every `specgit init --force`.
 
 permissions:
   contents: read
