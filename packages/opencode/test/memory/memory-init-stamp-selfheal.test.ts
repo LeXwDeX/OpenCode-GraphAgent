@@ -1,6 +1,7 @@
-import { describe, expect } from "bun:test"
+import { describe, expect, afterAll, beforeAll } from "bun:test"
 import { Effect, Layer } from "effect"
 import fs from "node:fs"
+import os from "node:os"
 import path from "node:path"
 import { Config } from "@/config/config"
 import { Project } from "@/project/project"
@@ -21,6 +22,23 @@ import { MemoryModel } from "@/memory/model"
 import { ProviderTest } from "../fake/provider"
 import { provideInstance, testInstanceStoreLayer, tmpdirScoped } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
+
+// bun test runs all files in one process, sequentially, sharing one
+// XDG_CONFIG_HOME — a test file that runs before this one can leave an
+// enabled global memory.jsonc whose model this file's fake provider does not
+// know, turning the post-heal statusReason into a model-unavailable blocker.
+// Pin a private config dir per file so the global file can never be
+// contaminated by earlier files.
+const pinnedConfigDir = path.join(os.tmpdir(), `opencode-memory-selfheal-${process.pid}`)
+const previousConfigDir = process.env.OPENCODE_CONFIG_DIR
+beforeAll(() => {
+  fs.mkdirSync(pinnedConfigDir, { recursive: true })
+  process.env.OPENCODE_CONFIG_DIR = pinnedConfigDir
+})
+afterAll(() => {
+  if (previousConfigDir === undefined) delete process.env.OPENCODE_CONFIG_DIR
+  else process.env.OPENCODE_CONFIG_DIR = previousConfigDir
+})
 
 // #415: the /init stamp is written by a Command.Event.Executed listener that can
 // lose the race with the command itself, leaving time_initialized NULL forever.
