@@ -17,7 +17,10 @@ import { Model } from "./model"
 // Branded IDs
 // ============================================================================
 
-export const DagID = Schema.String.check(Schema.isStartsWith("dag")).pipe(
+// Fully anchored pattern: llama.cpp's tool-schema conversion rejects any
+// `pattern` that doesn't start with '^' and end with '$'. `^dag.*$` keeps the
+// exact starts-with("dag") semantics of the previous isStartsWith filter.
+export const DagID = Schema.String.check(Schema.isPattern(/^dag.*$/)).pipe(
   Schema.brand("DagID"),
   withStatics((schema) => {
     const create = () => schema.make("dag_" + descending())

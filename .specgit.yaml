@@ -1,8 +1,8 @@
 version: 1
-delivery: headless-init-does
+delivery: init-stamp-is
 context:
   kind: branch
-  branch: fix/404-headless-init-does
+  branch: fix/415-init-stamp-is
 issues:
-  - 404
-pr: 405
+  - 415
+pr: 416

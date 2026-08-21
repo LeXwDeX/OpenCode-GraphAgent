@@ -485,7 +485,7 @@ exports[`tool parameters JSON Schema (wire shape) workflow 1`] = `
             },
             "workflow_id": {
               "description": "Target workflow ID",
-              "pattern": "^dag",
+              "pattern": "^dag.*$",
               "type": "string",
             },
           },
@@ -518,7 +518,7 @@ exports[`tool parameters JSON Schema (wire shape) workflow 1`] = `
             },
             "workflow_id": {
               "description": "Target workflow ID",
-              "pattern": "^dag",
+              "pattern": "^dag.*$",
               "type": "string",
             },
           },
@@ -552,7 +552,7 @@ exports[`tool parameters JSON Schema (wire shape) workflow 1`] = `
             },
             "workflow_id": {
               "description": "Target workflow ID",
-              "pattern": "^dag",
+              "pattern": "^dag.*$",
               "type": "string",
             },
           },
@@ -574,7 +574,7 @@ exports[`tool parameters JSON Schema (wire shape) workflow 1`] = `
             },
             "workflow_id": {
               "description": "Target workflow ID",
-              "pattern": "^dag",
+              "pattern": "^dag.*$",
               "type": "string",
             },
           },
@@ -609,7 +609,7 @@ exports[`tool parameters JSON Schema (wire shape) workflow 1`] = `
             },
             "workflow_id": {
               "description": "Target workflow ID",
-              "pattern": "^dag",
+              "pattern": "^dag.*$",
               "type": "string",
             },
           },
