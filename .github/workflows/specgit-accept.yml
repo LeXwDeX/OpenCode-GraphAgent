@@ -21,12 +21,11 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # Check out the event-pinned immutable head SHA, never a branch
-          # name: same commit the verdict evaluates, immune to
-          # branch-name taint (CodeQL cache-poisoning rule) and to the
-          # ref moving mid-run. Falls back to the event SHA on non-PR
-          # events.
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          # Check out the PR head branch by name so HEAD is on the branch
+          # (not the detached merge ref): the execution context gate reads
+          # live git. Falls back to the default ref on non-PR events.
+          ref: ${{ github.head_ref || github.ref }}
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Setup Node.js
