@@ -1,8 +1,7 @@
 version: 1
-delivery: headless-init-does
+delivery: dagid-schema-pattern
 context:
   kind: branch
-  branch: fix/404-headless-init-does
+  branch: fix/412-dagid-schema-pattern
 issues:
-  - 404
-pr: 405
+  - 412
