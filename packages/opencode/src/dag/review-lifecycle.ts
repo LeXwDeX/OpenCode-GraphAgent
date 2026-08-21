@@ -133,7 +133,7 @@ export function validateReviewResult(output: unknown, currentFingerprint: string
       : ["review result verdict must be ACCEPT or REJECT"]),
     ...(reviewedFingerprint.trim() === ""
       ? ["review result must include implementation_fingerprint"]
-      : reviewedFingerprint === currentFingerprint
+      : reviewedFingerprint.trim() === currentFingerprint.trim()
         ? []
         : [`review result fingerprint ${reviewedFingerprint} does not match current implementation ${currentFingerprint}`]),
   ]

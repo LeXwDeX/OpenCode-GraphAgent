@@ -365,6 +365,38 @@ describe("DAG review lifecycle", () => {
     })
   })
 
+  it("accepts fingerprints that match after trimming surrounding whitespace (issue #410)", () => {
+    expect(validateReviewResult({
+      verdict: "ACCEPT",
+      implementation_fingerprint: "\n  sha256:revision-2\n",
+    }, "sha256:revision-2")).toEqual({
+      valid: true,
+      action: "proceed",
+      reviewed_fingerprint: "\n  sha256:revision-2\n",
+      errors: [],
+    })
+    expect(validateReviewResult({
+      verdict: "ACCEPT",
+      implementation_fingerprint: "sha256:revision-2",
+    }, "\n  sha256:revision-2\n")).toEqual({
+      valid: true,
+      action: "proceed",
+      reviewed_fingerprint: "sha256:revision-2",
+      errors: [],
+    })
+    expect(validateReviewResult({
+      verdict: "ACCEPT",
+      implementation_fingerprint: "sha256:revision 2",
+    }, "sha256:revision-2")).toEqual({
+      valid: false,
+      action: "invalidate",
+      reviewed_fingerprint: "sha256:revision 2",
+      errors: [
+        "review result fingerprint sha256:revision 2 does not match current implementation sha256:revision-2",
+      ],
+    })
+  })
+
   it("keeps a deep workflow from succeeding with an unresolved review outcome", () => {
     const rejected = workflow("deep", validDiffFlow())
     expect(unresolvedReviewOutcomes(rejected, [

@@ -1,8 +1,8 @@
 version: 1
-delivery: issue409
+delivery: issue410
 context:
   kind: branch
-  branch: feat/409-issue409
+  branch: feat/410-issue410
 issues:
-  - 409
-pr: 411
+  - 410
+pr: 422
