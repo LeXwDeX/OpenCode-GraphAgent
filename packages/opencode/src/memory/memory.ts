@@ -1,9 +1,11 @@
 export * as Memory from "./memory"
 
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { FSUtil } from "@opencode-ai/core/fs-util"
 import { ProjectV2 } from "@opencode-ai/core/project"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Cause, Context, Deferred, Effect, Exit, Layer, Option, Ref, Schema, Scope, Semaphore } from "effect"
+import path from "node:path"
 import { stringify } from "yaml"
 import { Config } from "@/config/config"
 import { Provider } from "@/provider/provider"
@@ -788,8 +790,32 @@ export const layer: Layer.Layer<
       if (current.id === ProjectV2.ID.global)
         return "Memory is unavailable until this repository has a real identity: commit once or add a remote, then run /init."
       if (current.vcs !== "git") return "Memory requires a git repository."
-      if (!current.time.initialized)
-        return "Memory is unavailable until the project is initialized — run /init first, then /memory on."
+      if (!current.time.initialized) {
+        // #415: the stamp is written by a Command.Event.Executed listener that
+        // can lose the race with /init itself. The artifact /init leaves behind
+        // (a non-empty AGENTS.md) is durable evidence the project WAS
+        // initialized, so heal the row instead of sending the user to re-run
+        // /init into the same race.
+        const agentsMd = path.join(current.worktree, "AGENTS.md")
+        // Non-empty AGENTS.md is the durable artifact /init leaves behind.
+        // FSUtil rides MemoryConfig's layer (optional access keeps this layer
+        // lightweight — a missing wire degrades to no-heal, not a crash).
+        const healed = yield* Effect
+          .serviceOption(FSUtil.Service)
+          .pipe(
+            Effect.flatMap((option) =>
+              Option.isSome(option)
+                ? option.value.readFileStringSafe(agentsMd).pipe(Effect.map((content) => (content?.trim().length ?? 0) > 0))
+                : Effect.succeed(false),
+            ),
+            Effect.catch(() => Effect.succeed(false)),
+          )
+        if (healed) {
+          yield* project.setInitialized(current.id)
+        } else {
+          return `Memory is unavailable until the project is initialized — run /init first, then /memory on. (db: time_initialized=NULL, worktree=${current.worktree}, sandboxes=${current.sandboxes.join(", ") || "none"})`
+        }
+      }
       // An unreadable config/store answers "cannot determine" rather than
       // failing the status surface.
       const optioned = yield* Effect.option(configuration())
