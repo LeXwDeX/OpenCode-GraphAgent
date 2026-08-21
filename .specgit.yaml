@@ -1,8 +1,7 @@
 version: 1
-delivery: headless-init-does
+delivery: issue409
 context:
   kind: branch
-  branch: fix/404-headless-init-does
+  branch: feat/409-issue409
 issues:
-  - 404
-pr: 405
+  - 409
