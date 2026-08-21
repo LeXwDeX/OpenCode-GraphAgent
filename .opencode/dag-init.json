@@ -1,0 +1,13 @@
+{
+  "platform": "github",
+  "repo": "znewyear/OpenCode-GraphAgent",
+  "remote": "origin",
+  "base_branch": "main",
+  "cli": "gh",
+  "can_push": true,
+  "has_ci": false,
+  "has_rulesets": false,
+  "has_templates": true,
+  "merge_policy": "ordered",
+  "checked_at": "2026-08-21T04:00:00Z"
+}

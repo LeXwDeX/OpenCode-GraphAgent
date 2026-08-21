@@ -1,0 +1,424 @@
+{
+  "nodes": [
+    {
+      "id": "req-opencodeg-install",
+      "type": "Requirement",
+      "domain": "需求论",
+      "properties": {
+        "title": "OpenCode-GraphAgent 源码安装",
+        "description": "从源码构建 GraphAgent fork，产物命令名 opencodeg，配置目录隔离，与现有 opencode 1.17.18 共存",
+        "priority": "P0",
+        "status": "implemented"
+      },
+      "weight": 3.0,
+      "created_at": "2026-08-17T08:30:00Z",
+      "last_accessed": "2026-08-17T11:00:00Z"
+    },
+    {
+      "id": "pattern-bun-windows-shim",
+      "type": "Pattern",
+      "domain": "经验论",
+      "properties": {
+        "title": "WSL 下 npm 安装的 bun 是 Windows shim",
+        "description": "npm 全局安装的 bun 是 shim 脚本转发到 bun.exe（process.platform=win32），构建 Linux 目标必须用真 Linux bun 前置 PATH",
+        "status": "validated"
+      },
+      "weight": 2.5,
+      "created_at": "2026-08-17T10:08:00Z",
+      "last_accessed": "2026-08-17T11:00:00Z"
+    },
+    {
+      "id": "lesson-test-sync-app-rename",
+      "type": "Lesson",
+      "domain": "经验论",
+      "properties": {
+        "title": "改名 app 常量必须同步所有断言",
+        "description": "global.ts app 名改为 opencodeg 后，断言旧值 opencode 的测试必然 FAIL，需全局搜索受影响测试同步",
+        "status": "validated"
+      },
+      "weight": 2.0,
+      "created_at": "2026-08-17T09:55:00Z",
+      "last_accessed": "2026-08-17T11:00:00Z"
+    },
+    {
+      "id": "lesson-config-dir-unified-derive",
+      "type": "Lesson",
+      "domain": "经验论",
+      "properties": {
+        "title": "全局目录解析必须统一走 Global.Path.* 派生",
+        "description": "源码内任何硬编码 ~/.config/opencode 都是隔离缺口（如 dag-prompts），必须用 Flag.OPENCODE_CONFIG_DIR ?? Global.Path.config",
+        "status": "validated"
+      },
+      "weight": 2.5,
+      "created_at": "2026-08-17T10:35:00Z",
+      "last_accessed": "2026-08-17T11:00:00Z"
+    },
+    {
+      "id": "tech-bun-1.3.14",
+      "type": "Technology",
+      "domain": "技术栈论",
+      "properties": {
+        "title": "Bun 1.3.14",
+        "description": "构建脚本版本检查要求 bun ^1.3.14；Linux bun 用于构建 Linux 目标",
+        "status": "active"
+      },
+      "weight": 2.0,
+      "created_at": "2026-08-17T09:25:00Z",
+      "last_accessed": "2026-08-17T11:00:00Z"
+    },
+    {
+      "id": "module-opencodeg-binary",
+      "type": "Module",
+      "domain": "架构论",
+      "properties": {
+        "title": "opencodeg 二进制",
+        "description": "GraphAgent fork 编译产物，144MB ELF，安装于 ~/.local/bin/opencodeg，version 1.0.25-opencodeg（与上游 graphagent-v1.0.25 对齐），配置目录 ~/.config/opencodeg",
+        "status": "implemented"
+      },
+      "weight": 3.0,
+      "created_at": "2026-08-17T10:48:00Z",
+      "last_accessed": "2026-08-18T01:50:00Z"
+    },
+    {
+      "id": "fix-dag-prompts-isolation",
+      "type": "Fix",
+      "domain": "错误论",
+      "properties": {
+        "title": "dag-prompts 隔离缺口修复",
+        "description": "resolve.ts:95 硬编码 ~/.config/opencode/dag-prompts 改为 Flag.OPENCODE_CONFIG_DIR ?? Global.Path.config 派生",
+        "status": "fixed"
+      },
+      "weight": 2.5,
+      "created_at": "2026-08-17T10:35:00Z",
+      "last_accessed": "2026-08-17T11:00:00Z"
+    },
+    {
+      "id": "cli-opencodeg",
+      "type": "CLITool",
+      "domain": "工具论",
+      "properties": {
+        "title": "opencodeg",
+        "description": "安装于 ~/.local/bin/opencodeg 的 CLI，基于上游 v1.0.25（基线 25a711b40），本地改动保留 5a51b8b8d，与 opencode 1.17.18 命名隔离、配置隔离共存",
+        "version": "1.0.25-opencodeg",
+        "baseline": "25a711b40",
+        "status": "adopted"
+      },
+      "weight": 2.5,
+      "created_at": "2026-08-17T10:48:00Z",
+      "last_accessed": "2026-08-18T02:20:00Z"
+    },
+    {
+      "id": "auto-update-system",
+      "type": "CLITool",
+      "domain": "工具论",
+      "properties": {
+        "title": "自动更新体系",
+        "description": "~/.local/bin/opencodeg-update（133 行 bash）：fetch→比对→编译/跳过，保留会话+日志；P003 完成，2026-08-17",
+        "purpose": "自动更新 opencodeg（拉取→版本比对→重编译/跳过）",
+        "command": "~/.local/bin/opencodeg-update",
+        "status": "adopted"
+      },
+      "weight": 2.5,
+      "created_at": "2026-08-17T12:42:00Z",
+      "last_accessed": "2026-08-17T12:42:00Z"
+    },
+    {
+      "id": "bestpractice-update-sop",
+      "type": "BestPractice",
+      "domain": "经验论",
+      "properties": {
+        "title": "更新 SOP",
+        "description": "fetch→rebase→install→Linux bun 重建→安装→三层验证→记录，含 bun.lock 保护红线；由自动更新脚本实现（P003）",
+        "category": "运维流程",
+        "status": "validated"
+      },
+      "weight": 2.0,
+      "created_at": "2026-08-17T11:45:00Z",
+      "last_accessed": "2026-08-17T12:42:00Z"
+    },
+    {
+      "id": "bestpractice-version-alignment",
+      "type": "BestPractice",
+      "domain": "经验论",
+      "properties": {
+        "title": "版本号对齐",
+        "description": "双 env 钉死 CHANNEL 保会话 + 版本提取模式（fetch --tags + UPSTREAM_VER 从 tag 提取）+ || true 防回退死代码；产物版本号与上游 tag 对齐",
+        "category": "构建发布",
+        "status": "validated"
+      },
+      "weight": 2.0,
+      "created_at": "2026-08-18T02:20:00Z",
+      "last_accessed": "2026-08-18T02:20:00Z"
+    },
+    {
+      "id": "req-r11-opencodeg-fix",
+      "type": "Requirement",
+      "domain": "需求论",
+      "properties": {
+        "title": "R11 修复 opencodeg 三问题+建同步机制",
+        "description": "修复无模型可用/导入的 opencode 配置不存在/Skill 面板看不到 dag 内置 skill，并建立永久隔离+幂等同步机制",
+        "priority": "P0",
+        "status": "implemented"
+      },
+      "weight": 3.0,
+      "created_at": "2026-08-18T02:30:00Z",
+      "last_accessed": "2026-08-18T03:10:00Z"
+    },
+    {
+      "id": "bestpractice-isolated-config-sync",
+      "type": "BestPractice",
+      "domain": "经验论",
+      "properties": {
+        "title": "隔离配置同步机制",
+        "description": "fork 隔离配置目录 + 幂等同步脚本：整体复制 + 条件改写链（坏模型改写、plugin ~ 归一化绝对路径、default_agent 存在性改写、MCP npx→bunx），重跑 diff 验证幂等",
+        "category": "运维配置",
+        "status": "validated"
+      },
+      "weight": 2.5,
+      "created_at": "2026-08-18T02:40:00Z",
+      "last_accessed": "2026-08-18T03:10:00Z"
+    },
+    {
+      "id": "lesson-model-unconfigured",
+      "type": "Lesson",
+      "domain": "经验论",
+      "properties": {
+        "title": "默认模型指向未声明模型则无模型可用",
+        "description": "model 指向 provider 未声明的模型（glm-5.2）→ 'No configured text models for MEMORY'；同步必须校验 model 指向已声明模型（本环境改 deepseek-v4-flash）",
+        "severity": "high"
+      },
+      "weight": 2.5,
+      "created_at": "2026-08-18T02:30:00Z",
+      "last_accessed": "2026-08-18T03:10:00Z"
+    },
+    {
+      "id": "lesson-upstream-default-agent-rename",
+      "type": "Lesson",
+      "domain": "经验论",
+      "properties": {
+        "title": "上游默认 agent 已改名 main→build",
+        "description": "opencode 上游默认 agent 改名 build，旧配置 default_agent=main 无效（run 模式报 not found，TUI 可用）；fork 用 default_agent=leader 有效",
+        "severity": "medium"
+      },
+      "weight": 2.0,
+      "created_at": "2026-08-18T02:40:00Z",
+      "last_accessed": "2026-08-18T03:10:00Z"
+    },
+    {
+      "id": "fix-zod-node-modules",
+      "type": "Fix",
+      "domain": "错误论",
+      "properties": {
+        "title": "node_modules 部分提取损坏修复",
+        "description": ".opencode/node_modules zod/effect 只有子目录缺 package.json → MODULE_NOT_FOUND；本地拷贝 opencodeg 侧完整包（zod 4.1.8/effect 4.0.0-beta.83 精确匹配）修复",
+        "verified": true
+      },
+      "weight": 2.0,
+      "created_at": "2026-08-18T02:50:00Z",
+      "last_accessed": "2026-08-18T03:10:00Z"
+    },
+    {
+      "id": "cli-opencodeg-sync-config",
+      "type": "CLITool",
+      "domain": "工具论",
+      "properties": {
+        "title": "opencodeg 配置同步脚本",
+        "description": "~/.local/bin/opencodeg-sync-config（bash）：opencodeg.jsonc 整体复制 + model/default_agent/plugin/browser 条件改写 + auth 600 重拷 + pgrep 检测 + .bak 一次性快照，幂等",
+        "purpose": "将 opencode 配置单向同步到 opencodeg 并适配差异",
+        "command": "~/.local/bin/opencodeg-sync-config",
+        "status": "adopted"
+      },
+      "weight": 2.5,
+      "created_at": "2026-08-18T02:40:00Z",
+      "last_accessed": "2026-08-18T03:10:00Z"
+    },
+    {
+      "id": "skill-dag-create-workflow",
+      "type": "Skill",
+      "domain": "工具论",
+      "properties": {
+        "title": "create-dag-workflow 内置 skill 面板可见",
+        "description": "dag 系列唯一内置 skill（编译进二进制，skill.all() 无条件注册），Skill 面板经 app.skills()→GET /skill 链路可见；37 项 skill 含它",
+        "name": "create-dag-workflow",
+        "status": "adopted"
+      },
+      "weight": 2.0,
+      "created_at": "2026-08-18T03:00:00Z",
+      "last_accessed": "2026-08-18T03:10:00Z"
+    },
+    {
+      "id": "req-r12-dag-flow",
+      "type": "Requirement",
+      "domain": "需求论",
+      "properties": {
+        "title": "R12 补齐 opencodeg DAG 流程化内容",
+        "description": "安装 DAG 模板库（16 模板→全局层）+ 配置 dag.jsonc standard 层 + /dag-flow 端到端验证 + /dag-init 降级指引；完成杆=/dag-flow 可用",
+        "priority": "P0",
+        "status": "implemented"
+      },
+      "weight": 3.0,
+      "created_at": "2026-08-18T10:00:00Z",
+      "last_accessed": "2026-08-18T10:55:00Z"
+    },
+    {
+      "id": "lesson-dag-template-3-scope",
+      "type": "Lesson",
+      "domain": "经验论",
+      "properties": {
+        "title": "DAG 模板三层作用域且二进制无内置模板",
+        "description": "项目 .opencode/workflows/ > 全局 <config>/workflows/ > 内置；opencodeg 二进制 strings 验证无内置模板正文，必须装全局层否则 list 返回 No saved workflows",
+        "severity": "high"
+      },
+      "weight": 2.5,
+      "created_at": "2026-08-18T10:30:00Z",
+      "last_accessed": "2026-08-18T10:55:00Z"
+    },
+    {
+      "id": "lesson-dag-flow-vs-auto",
+      "type": "Lesson",
+      "domain": "经验论",
+      "properties": {
+        "title": "/dag-flow 不依赖 dag-init.json 而 /dag-auto 硬依赖",
+        "description": "/dag-flow 对话式入口走 Orchestration Router，配好模板+模型即可用；/dag-auto 缺 .opencode/dag-init.json 直接 STOP；故先跑通 /dag-flow 是低门槛验收",
+        "severity": "medium"
+      },
+      "weight": 2.0,
+      "created_at": "2026-08-18T10:50:00Z",
+      "last_accessed": "2026-08-18T10:55:00Z"
+    },
+    {
+      "id": "lesson-dag-init-fail-step1",
+      "type": "Lesson",
+      "domain": "经验论",
+      "properties": {
+        "title": "/dag-init 失败于 step1 平台检测（remote host 非 github.com）",
+        "description": "git remote host=ghfast.top → 探测 /api/v4/version 403 → STOP unsupported platform，发生在 gh 检查之前；必须先改 remote 再装 gh/auth；dag-init 内置提示旧路径 ~/.config/opencode/workflows 对 opencodeg 是错的",
+        "severity": "high"
+      },
+      "weight": 2.5,
+      "created_at": "2026-08-18T10:40:00Z",
+      "last_accessed": "2026-08-18T10:55:00Z"
+    },
+    {
+      "id": "skill-dag-workflow-tool",
+      "type": "Skill",
+      "domain": "工具论",
+      "properties": {
+        "title": "workflow 工具（list/read/draft/validate/start/control）",
+        "description": "DAG 编排工具族；list 枚举模板、read 读结构、draft 生成、validate 校验（environment profile 含模型解析）、start 启动返回 Workflow ID、control cancel 收尾；/dag-flow 对话式入口自动走此链路",
+        "name": "workflow",
+        "status": "adopted"
+      },
+      "weight": 2.0,
+      "created_at": "2026-08-18T10:50:00Z",
+      "last_accessed": "2026-08-18T10:55:00Z"
+    }
+  ],
+  "edges": [
+    {
+      "source": "req-opencodeg-install",
+      "target": "module-opencodeg-binary",
+      "relation": "IMPLEMENTS",
+      "weight": 1.0,
+      "created_at": "2026-08-17T11:00:00Z"
+    },
+    {
+      "source": "pattern-bun-windows-shim",
+      "target": "tech-bun-1.3.14",
+      "relation": "APPLIES_TO",
+      "weight": 1.0,
+      "created_at": "2026-08-17T11:00:00Z"
+    },
+    {
+      "source": "lesson-config-dir-unified-derive",
+      "target": "fix-dag-prompts-isolation",
+      "relation": "PREVENTS",
+      "weight": 1.0,
+      "created_at": "2026-08-17T11:00:00Z"
+    },
+    {
+      "source": "module-opencodeg-binary",
+      "target": "cli-opencodeg",
+      "relation": "CONFIGURES",
+      "weight": 1.0,
+      "created_at": "2026-08-17T11:00:00Z"
+    },
+    {
+      "source": "fix-dag-prompts-isolation",
+      "target": "lesson-test-sync-app-rename",
+      "relation": "APPLIES_TO",
+      "weight": 0.5,
+      "created_at": "2026-08-17T11:00:00Z"
+    },
+    {
+      "source": "auto-update-system",
+      "target": "req-opencodeg-install",
+      "relation": "MAINTAINS",
+      "weight": 1.0,
+      "created_at": "2026-08-17T12:42:00Z"
+    },
+    {
+      "source": "auto-update-system",
+      "target": "bestpractice-update-sop",
+      "relation": "IMPLEMENTS",
+      "weight": 1.0,
+      "created_at": "2026-08-17T12:42:00Z"
+    },
+    {
+      "source": "bestpractice-version-alignment",
+      "target": "auto-update-system",
+      "relation": "REFINES",
+      "weight": 1.0,
+      "created_at": "2026-08-18T02:20:00Z"
+    },
+    {
+      "source": "req-r11-opencodeg-fix",
+      "target": "req-opencodeg-install",
+      "relation": "DEPENDS_ON",
+      "weight": 1.0,
+      "created_at": "2026-08-18T03:10:00Z"
+    },
+    {
+      "source": "cli-opencodeg-sync-config",
+      "target": "req-r11-opencodeg-fix",
+      "relation": "IMPLEMENTS",
+      "weight": 1.0,
+      "created_at": "2026-08-18T03:10:00Z"
+    },
+    {
+      "source": "bestpractice-isolated-config-sync",
+      "target": "cli-opencodeg-sync-config",
+      "relation": "REFINES",
+      "weight": 1.0,
+      "created_at": "2026-08-18T03:10:00Z"
+    },
+    {
+      "source": "req-r12-dag-flow",
+      "target": "req-opencodeg-install",
+      "relation": "DEPENDS_ON",
+      "weight": 1.0,
+      "created_at": "2026-08-18T10:55:00Z"
+    },
+    {
+      "source": "lesson-dag-template-3-scope",
+      "target": "skill-dag-workflow-tool",
+      "relation": "APPLIES_TO",
+      "weight": 1.0,
+      "created_at": "2026-08-18T10:55:00Z"
+    },
+    {
+      "source": "lesson-dag-flow-vs-auto",
+      "target": "skill-dag-workflow-tool",
+      "relation": "APPLIES_TO",
+      "weight": 1.0,
+      "created_at": "2026-08-18T10:55:00Z"
+    },
+    {
+      "source": "lesson-dag-init-fail-step1",
+      "target": "req-r12-dag-flow",
+      "relation": "APPLIES_TO",
+      "weight": 1.0,
+      "created_at": "2026-08-18T10:55:00Z"
+    }
+  ]
+}

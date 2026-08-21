@@ -56,3 +56,4 @@ tsconfig.tsbuildinfo
 .opencode/commands/
 .opencode/skills
 .qoder
+.opencode/workflow-reports/

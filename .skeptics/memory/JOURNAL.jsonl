@@ -1,0 +1,45 @@
+{"ts":"2026-08-17T08:30:00Z","tags":["requirement","confirmed"],"text":"需求 R1-R7 确认：OpenCode-GraphAgent 源码安装 opencodeg，命名隔离+配置隔离+共存 opencode 1.17.18"}
+{"ts":"2026-08-17T08:45:00Z","tags":["approval","passed"],"text":"Approval 审视需求理解通过（覆盖度7/7，无必改项，建议P2全局搜残留）"}
+{"ts":"2026-08-17T09:00:00Z","tags":["task","status-change"],"text":"任务规划完成 T001-T005，Approval 审视通过"}
+{"ts":"2026-08-17T09:20:00Z","tags":["task","completed"],"text":"T001 源码落地完成：git clone ghfast.top 镜像，HEAD=e62a875a，6198 文件"}
+{"ts":"2026-08-17T09:25:00Z","tags":["task","completed"],"text":"T002 bun 升级完成：1.3.6→1.3.14（npm 通道 npmmirror）"}
+{"ts":"2026-08-17T09:40:00Z","tags":["task","completed"],"text":"T003 命名改动完成：package.json bin 键 + build.ts outfile/path + global.ts app = opencodeg"}
+{"ts":"2026-08-17T09:50:00Z","tags":["approval","rejected"],"text":"T003 Reviewer 首次不通过：2 BLOCKER（global.test.ts:9、cli-process.ts:204 测试断言未同步 opencodeg）"}
+{"ts":"2026-08-17T09:55:00Z","tags":["task","completed"],"text":"T003-FIX 修复 2 测试断言，global.test.ts 2 pass + cli-process.ts 7 pass，复审 PASS"}
+{"ts":"2026-08-17T10:00:00Z","tags":["error","diagnosed"],"text":"错误诊断：系统 bun 是 Windows shim（process.platform=win32），构建会产出 win32 目标且子进程卡死"}
+{"ts":"2026-08-17T10:08:00Z","tags":["breakthrough"],"text":"突破 T004：Linux bun 1.3.14 shim 前置 PATH + tmux 会话 + MODELS_DEV_API_JSON fixture，构建成功，产物 144MB ELF，version 0.0.0-main-202608171003"}
+{"ts":"2026-08-17T10:20:00Z","tags":["task","completed"],"text":"T005 安装完成：~/.local/bin/opencodeg，三层验收（功能/命名隔离/配置隔离）+ TUI 冒烟全过"}
+{"ts":"2026-08-17T10:30:00Z","tags":["scope","expanded"],"text":"最终审查 CONDITIONAL_PASS 发现 P1 隔离缺口：resolve.ts:95 dag-prompts 硬编码 ~/.config/opencode，opencodeg 会读 opencode 模板"}
+{"ts":"2026-08-17T10:35:00Z","tags":["task","completed"],"text":"T003-FIX2 修复 resolve.ts 改为 Flag/Global 派生，与 workflows.ts 一致，17/17 测试过"}
+{"ts":"2026-08-17T10:48:00Z","tags":["breakthrough"],"text":"T006 重建重装：version 0.0.0-main-202608171045，strings 验证 0 残留，opencode 1.17.18 共存无污染，bun.lock 保持最小 diff"}
+{"ts":"2026-08-17T11:00:00Z","tags":["approval","passed"],"text":"Reviewer 最终裁决通过（7 维度全过，T001-T006 全链路完结），Approval 终审自查通过"}
+{"ts":"2026-08-17T11:10:00Z","tags":["decision","made"],"text":"决策：bun.lock 回滚 npmmirror URL 重写仅保留 bin 键一行（可移植性优先，避免固化第三方镜像）"}
+{"ts":"2026-08-17T11:30:00Z","tags":["requirement","confirmed"],"text":"需求 R8 确认：上游更新重编译流程（触发式），用户选择本地分支+rebase 保留策略 D4"}
+{"ts":"2026-08-17T11:35:00Z","tags":["decision","made"],"text":"决策 D4：本地改动固化到 feat/opencodeg-local 分支（commit 1426fc2ee，7 文件），更新时 rebase origin/main"}
+{"ts":"2026-08-17T11:40:00Z","tags":["error","diagnosed"],"text":"环境缺陷诊断：oxlint extensionless ESM bin 在 Windows Node v20 无法加载（ERR_UNKNOWN_FILE_EXTENSION），husky pre-commit 必失败；Linux bun 验证 0 errors 后 --no-verify 提交"}
+{"ts":"2026-08-17T11:45:00Z","tags":["breakthrough"],"text":"沉淀 R8 更新 SOP：fetch→rebase→install→Linux bun 重建→安装→三层验证→记录，含 bun.lock 保护红线"}
+{"ts":"2026-08-17T12:10:00Z","tags":["task","completed"],"text":"T101 完成：~/.local/bin/opencodeg-update 落地（133 行 bash），fetch→比对→编译/跳过，保留会话+日志（D5/D6/D7）"}
+{"ts":"2026-08-17T12:18:00Z","tags":["approval","rejected"],"text":"T101 Reviewer 首轮不通过：B1 编译失败不回滚、B2 构建无超时 → T101-FIX（失败分支统一回滚 OLD_HEAD + timeout 1200 包构建）复审通过"}
+{"ts":"2026-08-17T12:25:00Z","tags":["error","diagnosed"],"text":"Subagent 静默失败 3 次（T101-FIX/Approval/DocKeeper 首派空返回），重派后成功；经验：派发后须自查产物，空返回须重派"}
+{"ts":"2026-08-17T12:33:00Z","tags":["approval","rejected"],"text":"Approval 终审发现 Reviewer 盲区：ensure_bun 缺 mkdir -p（/tmp 被清后 bun 自愈重建必失败→更新永久静默跳过）→ T101-HARDEN 落地 H1-H4"}
+{"ts":"2026-08-17T12:42:00Z","tags":["task","completed"],"text":"P003 全链路完成（T101/T101-FIX/T101-HARDEN/T102）：Tester 两轮 16/16，跳过路径 exit 0、会话 md5 不变、双二进制未覆盖，三重 Loop 验收通过"}
+{"ts":"2026-08-18T01:35:00Z","tags":["error","diagnosed"],"text":"环境处理：unzip 缺失导致 opencodeg-update 首次运行被前置拦截，用户级 python zipfile 包装 ~/.local/bin/unzip 解决根因"}
+{"ts":"2026-08-18T01:40:00Z","tags":["task","completed"],"text":"T103 完成：opencodeg-update 更新到上游 v1.0.25（基线 25a711b40），落后 14 提交，rebase 零冲突，本地改动保留 5a51b8b8d"}
+{"ts":"2026-08-18T01:50:00Z","tags":["task","completed"],"text":"T104 验证通过：新版本 0.0.0-feat/opencodeg-local-202608180142，三层隔离，会话保留 D7，opencode 1.17.18 共存"}
+{"ts":"2026-08-18T02:00:00Z","tags":["task","completed"],"text":"T201 完成：opencodeg-update 实现版本号对齐——fetch --tags + UPSTREAM_VER 从 tag 提取 + 双 env（VERSION/CHANNEL）写入构建"}
+{"ts":"2026-08-18T02:10:00Z","tags":["approval","rejected","passed"],"text":"Approval 三轮审视：捕获 DB 会话阻断（仅设 VERSION→CHANNEL 漂移 latest→会话 DB 漂移）与回退死代码（|| true）→ 修正后通过，三重 Loop 全过"}
+{"ts":"2026-08-18T02:20:00Z","tags":["task","completed"],"text":"T202 验证通过：产物 1.0.25-opencodeg = 上游 graphagent-v1.0.25，版本对齐成立，会话 DB 保留"}
+{"ts":"2026-08-18T02:30:00Z","tags":["requirement","confirmed"],"text":"R11 需求确认（D10-D15 用户裁决）：opencodeg 配置永久隔离+幂等同步脚本+完全对齐；默认模型指 yc-proxy-gpt/deepseek-v4-flash；default_agent=leader；原 opencode 1.17.18 零改动；models.dev 冷启动 23s 接受为已知限制"}
+{"ts":"2026-08-18T02:40:00Z","tags":["task","completed"],"text":"T301 完成：opencodeg-sync-config 幂等同步脚本（整体复制+model/plugin/default_agent/browser 条件改写链），3 次重跑 sha256 字节级一致，.bak 一次性快照"}
+{"ts":"2026-08-18T02:50:00Z","tags":["task","completed"],"text":"T302 完成：模型可用——opencodeg models 7 模型、默认 deepseek-v4-flash、无参 run 出 leader pong EXIT 0；修复 zod/effect 缺 package.json（本地拷贝）+ default_agent=leader + browser MCP 改 bunx；Tester 14/14 PASS"}
+{"ts":"2026-08-18T03:00:00Z","tags":["task","completed"],"text":"T303 完成：create-dag-workflow 面板可见三层实证——数据层 GET /skill 含它、功能层 run 枚举含它、展示层 TUI /skills 实拍列出；Reviewer 通过 + Tester 11/11 PASS"}
+{"ts":"2026-08-18T03:10:00Z","tags":["approval","passed"],"text":"R11 Approval 终审通过：独立复验 GET /skill 200 含 create-dag-workflow + dialog-skill.tsx 零过滤，推断充分；B1/B2/B3 全闭环；残留建议——opencodeg.json 已入 .gitignore、task.md/progress.md 已更新；R11 全流程验收，进入总结报告"}
+{"ts":"2026-08-18T10:00:00Z","tags":["requirement","confirmed"],"text":"R12 需求确认（D16-D18 用户裁决）：补齐 opencodeg DAG 流程化内容，完成杆=/dag-flow 可用；模板全局层 ~/.config/opencodeg/workflows/、仅配 standard 层=deepseek-v4-flash、/dag-init 降级为记录失败+交付认证指引"}
+{"ts":"2026-08-18T10:30:00Z","tags":["task","completed"],"text":"T401 完成：16 个 DAG 模板（7域×full/lite + ultra-flow-route + release-route）经 ghfast.top 代理 clone opencode-dag-config 装入 ~/.config/opencodeg/workflows/；workflow list 枚举 16 个 [global]"}
+{"ts":"2026-08-18T10:35:00Z","tags":["task","completed"],"text":"T402 完成：dag.jsonc 配置 standard=yc-proxy-gpt/deepseek-v4-flash（单 tier 统一默认）；DAG 子会话实测解析 model.id=deepseek-v4-flash"}
+{"ts":"2026-08-18T10:40:00Z","tags":["task","completed"],"text":"T403 完成：/dag-init 预期失败记录（step1 ghfast.top unsupported platform，gh 未装）+ 认证指引 .skeptics/docs/dag-init-guidance.md 交付（步骤 A-D + 路径陷阱警告）"}
+{"ts":"2026-08-18T10:50:00Z","tags":["task","completed"],"text":"T404 完成：/dag-flow 端到端验证 list→read→draft→validate→start 全通，Workflow ID=dag_fe5febc3b2fc29ClonywRfb3tA state=running，cancel 收尾干净"}
+{"ts":"2026-08-18T10:55:00Z","tags":["approval","passed"],"text":"R12 Approval 终审通过：T404 证据链 DB+日志独立实证、T401 必要性坐实（二进制无内置模板）、T403 降级诚实、R12-1~6 + D16-D18 全闭环；完成杆=/dag-flow 可用达成，进入总结报告"}
+{"ts":"2026-08-19T01:40:00Z","tags":["task","completed"],"text":"T406 完成：/dag-init 平台握手成功——用户已完成 gh 认证（znewyear ssh），git remote 改 ssh（origin=git@github.com + ghfast 镜像保留），探测全通（github/gh/main/CI7/rulesets3/模板16）但 can_push=false（对作者仓库只读）"}
+{"ts":"2026-08-19T01:42:00Z","tags":["decision","made"],"text":"决策：can_push=false 限制——用户裁决接受现状，/dag-auto 为增强项，未来在有写权限的项目重跑 /dag-init 使用；本仓库 /dag-flow 已可用（R12 完成杆达成）"}
+{"ts":"2026-08-19T12:45:00+08:00","type":"progress","summary":"R13 完成：opencodeg-update 依赖自动解决(T501)+DAG智能同步(T502,6轮FIX)+集成真实回归(T503)","detail":"真实更新 1.0.25→1.0.26-opencodeg 全绿；bun.lock变化才install生效；sync-dag git status --porcelain 判定自定义(untracked安全)+cmp幂等+timeout120；build.ts内置install会重写bun.lock需还原；文档 task/progress/learned/requirement 已更新","artifacts":["~/.local/bin/opencodeg-sync-dag","opencodeg-update ⑥.5段"],"status":"DONE"}

@@ -1,0 +1,43 @@
+{
+  "domains": ["需求论", "经验论", "错误论", "技术栈论", "架构论", "工具论"],
+  "node_types": {
+    "Requirement":     { "domain": "需求论", "properties": ["title","description","priority","status"], "lifecycle": ["proposed","confirmed","implemented","deprecated"] },
+    "Feature":         { "domain": "需求论", "properties": ["title","description","status"], "lifecycle": ["proposed","confirmed","implemented","deprecated"] },
+    "Constraint":      { "domain": "需求论", "properties": ["description","type"], "lifecycle": ["proposed","confirmed","deprecated"] },
+    "Pattern":         { "domain": "经验论", "properties": ["title","description","category"], "lifecycle": ["observed","validated","established","archived"] },
+    "Lesson":          { "domain": "经验论", "properties": ["description","severity"], "lifecycle": ["observed","validated","established","archived"] },
+    "BestPractice":    { "domain": "经验论", "properties": ["title","description","category"], "lifecycle": ["observed","validated","established","archived"] },
+    "Error":           { "domain": "错误论", "properties": ["message","severity","frequency"], "lifecycle": ["detected","diagnosed","fixed","monitored"] },
+    "RootCause":       { "domain": "错误论", "properties": ["description","category"], "lifecycle": ["detected","diagnosed","fixed","monitored"] },
+    "Fix":             { "domain": "错误论", "properties": ["description","verified"], "lifecycle": ["detected","diagnosed","fixed","monitored"] },
+    "Technology":      { "domain": "技术栈论", "properties": ["name","version","purpose"], "lifecycle": ["introduced","active","deprecated","removed"] },
+    "Dependency":      { "domain": "技术栈论", "properties": ["name","version","type"], "lifecycle": ["introduced","active","deprecated","removed"] },
+    "Config":          { "domain": "技术栈论", "properties": ["key","value","scope"], "lifecycle": ["introduced","active","deprecated","removed"] },
+    "Module":          { "domain": "架构论", "properties": ["name","purpose","layer"], "lifecycle": ["designed","implemented","refactored","removed"] },
+    "Interface":       { "domain": "架构论", "properties": ["name","protocol","version"], "lifecycle": ["designed","implemented","refactored","removed"] },
+    "DataFlow":        { "domain": "架构论", "properties": ["description","direction","format"], "lifecycle": ["designed","implemented","refactored","removed"] },
+    "MCPTool":         { "domain": "工具论", "properties": ["name","purpose","server"], "lifecycle": ["discovered","configured","adopted","archived"] },
+    "Skill":           { "domain": "工具论", "properties": ["name","purpose","plugin"], "lifecycle": ["discovered","configured","adopted","archived"] },
+    "CLITool":         { "domain": "工具论", "properties": ["name","purpose","command"], "lifecycle": ["discovered","configured","adopted","archived"] }
+  },
+  "relation_types": {
+    "DEPENDS_ON":       { "source_types": ["Requirement","Feature"], "target_types": ["Requirement","Feature"] },
+    "IMPLEMENTS":       { "source_types": ["Feature","Module","CLITool","BestPractice"], "target_types": ["Requirement","BestPractice"] },
+    "MAINTAINS":        { "source_types": ["CLITool","Module"], "target_types": ["Requirement","Module","CLITool","Technology"] },
+    "CONSTRAINS":       { "source_types": ["Constraint"], "target_types": ["Requirement","Feature"] },
+    "APPLIES_TO":       { "source_types": ["Pattern","Lesson","BestPractice"], "target_types": ["Module","Feature"] },
+    "PREVENTS":         { "source_types": ["Pattern","Lesson","BestPractice"], "target_types": ["Error"] },
+    "IMPROVES":         { "source_types": ["Pattern","BestPractice"], "target_types": ["Module","Interface"] },
+    "REFINES":          { "source_types": ["Pattern","BestPractice"], "target_types": ["CLITool","Module","BestPractice"] },
+    "CAUSED_BY":        { "source_types": ["Error"], "target_types": ["RootCause"] },
+    "FIXED_BY":         { "source_types": ["Error"], "target_types": ["Fix"] },
+    "COMPATIBLE_WITH":  { "source_types": ["Technology","Dependency"], "target_types": ["Technology","Dependency"] },
+    "REQUIRES":         { "source_types": ["Technology","Module"], "target_types": ["Dependency","Technology"] },
+    "CONFIGURES":       { "source_types": ["Config"], "target_types": ["Technology","Module"] },
+    "CONTAINS":         { "source_types": ["Module"], "target_types": ["Module","Interface","DataFlow"] },
+    "COMMUNICATES_WITH":{ "source_types": ["Module","Interface"], "target_types": ["Module","Interface"] },
+    "FLOWS":            { "source_types": ["DataFlow"], "target_types": ["Module","Interface"] },
+    "USED_FOR":         { "source_types": ["MCPTool","Skill","CLITool"], "target_types": ["Task","Feature"] },
+    "INTEGRATES_WITH":  { "source_types": ["MCPTool","Skill"], "target_types": ["MCPTool","Platform"] }
+  }
+}

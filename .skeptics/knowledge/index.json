@@ -1,0 +1,68 @@
+{
+  "high_weight_nodes": [
+    {
+      "id": "req-opencodeg-install",
+      "type": "Requirement",
+      "title": "OpenCode-GraphAgent 源码安装",
+      "weight": 3.0,
+      "status": "implemented",
+      "summary": "源码构建 GraphAgent fork，命令名 opencodeg，配置隔离，与 opencode 1.17.18 共存"
+    },
+    {
+      "id": "module-opencodeg-binary",
+      "type": "Module",
+      "title": "opencodeg 二进制",
+      "weight": 3.0,
+      "status": "implemented",
+      "summary": "144MB ELF，~/.local/bin/opencodeg，version 1.0.25-opencodeg（对齐上游 graphagent-v1.0.25），配置目录 ~/.config/opencodeg"
+    },
+    {
+      "id": "pattern-bun-windows-shim",
+      "type": "Pattern",
+      "title": "WSL 下 npm 安装的 bun 是 Windows shim",
+      "weight": 2.5,
+      "status": "validated",
+      "summary": "构建 Linux 目标必须用真 Linux bun 前置 PATH"
+    },
+    {
+      "id": "lesson-config-dir-unified-derive",
+      "type": "Lesson",
+      "title": "全局目录解析必须统一走 Global.Path.* 派生",
+      "weight": 2.5,
+      "status": "validated",
+      "summary": "任何硬编码 ~/.config/opencode 都是隔离缺口"
+    },
+    {
+      "id": "fix-dag-prompts-isolation",
+      "type": "Fix",
+      "title": "dag-prompts 隔离缺口修复",
+      "weight": 2.5,
+      "status": "fixed",
+      "summary": "resolve.ts 改 Flag/Global 派生"
+    },
+    {
+      "id": "auto-update-system",
+      "type": "CLITool",
+      "title": "自动更新体系",
+      "weight": 2.5,
+      "status": "adopted",
+      "summary": "~/.local/bin/opencodeg-update（133 行 bash），fetch→比对→编译/跳过，保留会话+日志，P003 完成"
+    },
+    {
+      "id": "req-r11-opencodeg-fix",
+      "type": "Requirement",
+      "title": "R11 修复 opencodeg 三问题+建同步机制",
+      "weight": 3.0,
+      "status": "implemented",
+      "summary": "无模型/无配置/dag skill 面板三问题已解决，幂等同步脚本 ~/.local/bin/opencodeg-sync-config 建立永久隔离机制"
+    },
+    {
+      "id": "req-r12-dag-flow",
+      "type": "Requirement",
+      "title": "R12 补齐 opencodeg DAG 流程化内容",
+      "weight": 3.0,
+      "status": "implemented",
+      "summary": "16 模板装入 ~/.config/opencodeg/workflows/，dag.jsonc standard=deepseek-v4-flash，/dag-flow 端到端验证通过"
+    }
+  ]
+}
