@@ -1878,6 +1878,16 @@ export const layer = Layer.effect(
       return yield* state.startShell(input.sessionID, lastAssistant(input.sessionID), shellImpl(input, ready), ready)
     })
 
+    // #409: early-return command dispatches (/memory, /trust, /goal non-kick)
+    // must still drive the busy→idle status transition — the run CLI exits its
+    // event loop on the idle event, which only the runner's onIdle publishes.
+    // startIfIdle keeps today's inline semantics while another turn is running
+    // (no queueing, no second idle); the in-flight turn re-emits idle itself.
+    const commandTurn = Effect.fnUntraced(function* (sessionID: SessionID, work: Effect.Effect<SessionV1.WithParts>) {
+      const handle = yield* state.startIfIdle(sessionID, lastAssistant(sessionID), work)
+      return yield* Option.getOrElse(handle, () => work)
+    })
+
     const command = Effect.fn("SessionPrompt.command")(function* (input: CommandInput) {
       yield* Effect.logInfo("command", {
         "session.id": input.sessionID,
@@ -1885,87 +1895,107 @@ export const layer = Layer.effect(
         agent: input.agent,
       })
       if (input.command === "memory") {
-        const memory = Option.getOrUndefined(yield* Effect.serviceOption(Memory.Service))
-        const argument = input.arguments.trim()
-        // #396: anything that is not an exact on/off is a status query —
-        // report the true state instead of a hardcoded "remains off".
-        const result = memory
-          ? argument === "on"
-            ? yield* memory.setEnabled(true)
-            : argument === "off"
-              ? yield* memory.setEnabled(false)
-              : yield* memory.status()
-          : "Memory remains off"
-        const model = yield* currentModel(input.sessionID)
-        const agentName = input.agent ?? (yield* agents.defaultAgent())
-        const userMsg: SessionV1.User = {
-          id: input.messageID ?? MessageID.ascending(),
-          role: "user",
-          sessionID: input.sessionID,
-          time: { created: Date.now() },
-          agent: agentName,
-          model: { providerID: model.providerID, modelID: model.modelID },
-        }
-        yield* sessions.updateMessage(userMsg)
-        const commandPart: SessionV1.TextPart = {
-          id: PartID.ascending(),
-          messageID: userMsg.id,
-          sessionID: input.sessionID,
-          type: "text",
-          text: `/memory ${input.arguments}`.trim(),
-        }
-        yield* sessions.updatePart(commandPart)
-        const responsePart: SessionV1.TextPart = {
-          id: PartID.ascending(),
-          messageID: userMsg.id,
-          sessionID: input.sessionID,
-          type: "text",
-          text: result,
-        }
-        yield* sessions.updatePart(responsePart)
-        yield* sessions.touch(input.sessionID)
-        return { info: userMsg, parts: [commandPart, responsePart] }
+        return yield* commandTurn(
+          input.sessionID,
+          Effect.gen(function* () {
+            const memory = Option.getOrUndefined(yield* Effect.serviceOption(Memory.Service))
+            const argument = input.arguments.trim()
+            // #396: anything that is not an exact on/off is a status query —
+            // report the true state instead of a hardcoded "remains off".
+            const result = memory
+              ? argument === "on"
+                ? yield* memory.setEnabled(true)
+                : argument === "off"
+                  ? yield* memory.setEnabled(false)
+                  : yield* memory.status()
+              : "Memory remains off"
+            const model = yield* currentModel(input.sessionID)
+            const agentName = input.agent ?? (yield* agents.defaultAgent())
+            const userMsg: SessionV1.User = {
+              id: input.messageID ?? MessageID.ascending(),
+              role: "user",
+              sessionID: input.sessionID,
+              time: { created: Date.now() },
+              agent: agentName,
+              model: { providerID: model.providerID, modelID: model.modelID },
+            }
+            yield* sessions.updateMessage(userMsg)
+            const commandPart: SessionV1.TextPart = {
+              id: PartID.ascending(),
+              messageID: userMsg.id,
+              sessionID: input.sessionID,
+              type: "text",
+              text: `/memory ${input.arguments}`.trim(),
+            }
+            yield* sessions.updatePart(commandPart)
+            const now = Date.now()
+            // time.end set so run-mode consumers print the response (run CLI
+            // only renders text parts once ended).
+            const responsePart: SessionV1.TextPart = {
+              id: PartID.ascending(),
+              messageID: userMsg.id,
+              sessionID: input.sessionID,
+              type: "text",
+              text: result,
+              time: { start: now, end: now },
+            }
+            yield* sessions.updatePart(responsePart)
+            yield* sessions.touch(input.sessionID)
+            return { info: userMsg, parts: [commandPart, responsePart] }
+          }),
+        )
       }
       // /trust command dispatch — early return BEFORE command registry lookup.
       // Trust writes are security-sensitive and MUST NOT be delegated to the
       // LLM-driven command template path; mirror /goal's early-return dispatch
       // (prompt.ts only wires + renders; the domain logic lives in workspace-trust.ts).
       if (input.command === "trust") {
-        const ctx = yield* InstanceState.context
-        const result = dispatchTrust(ctx.directory, input.arguments, ctx.worktree)
-        const m = yield* currentModel(input.sessionID)
-        const agentName = input.agent ?? (yield* agents.defaultAgent())
-        const userMsg: SessionV1.User = {
-          id: input.messageID ?? MessageID.ascending(),
-          role: "user",
-          sessionID: input.sessionID,
-          time: { created: Date.now() },
-          agent: agentName,
-          model: { providerID: m.providerID, modelID: m.modelID },
-        }
-        yield* sessions.updateMessage(userMsg)
-        const cmdText: SessionV1.TextPart = {
-          id: PartID.ascending(),
-          messageID: userMsg.id,
-          sessionID: input.sessionID,
-          type: "text",
-          text: `/trust ${input.arguments}`.trim(),
-        }
-        yield* sessions.updatePart(cmdText)
-        const responsePart: SessionV1.TextPart = {
-          id: PartID.ascending(),
-          messageID: userMsg.id,
-          sessionID: input.sessionID,
-          type: "text",
-          text: result.text,
-        }
-        yield* sessions.updatePart(responsePart)
-        yield* sessions.touch(input.sessionID)
-        return { info: userMsg, parts: [cmdText, responsePart] }
+        return yield* commandTurn(
+          input.sessionID,
+          Effect.gen(function* () {
+            const ctx = yield* InstanceState.context
+            const result = dispatchTrust(ctx.directory, input.arguments, ctx.worktree)
+            const m = yield* currentModel(input.sessionID)
+            const agentName = input.agent ?? (yield* agents.defaultAgent())
+            const userMsg: SessionV1.User = {
+              id: input.messageID ?? MessageID.ascending(),
+              role: "user",
+              sessionID: input.sessionID,
+              time: { created: Date.now() },
+              agent: agentName,
+              model: { providerID: m.providerID, modelID: m.modelID },
+            }
+            yield* sessions.updateMessage(userMsg)
+            const cmdText: SessionV1.TextPart = {
+              id: PartID.ascending(),
+              messageID: userMsg.id,
+              sessionID: input.sessionID,
+              type: "text",
+              text: `/trust ${input.arguments}`.trim(),
+            }
+            yield* sessions.updatePart(cmdText)
+            const now = Date.now()
+            // time.end set so run-mode consumers print the response (run CLI
+            // only renders text parts once ended).
+            const responsePart: SessionV1.TextPart = {
+              id: PartID.ascending(),
+              messageID: userMsg.id,
+              sessionID: input.sessionID,
+              type: "text",
+              text: result.text,
+              time: { start: now, end: now },
+            }
+            yield* sessions.updatePart(responsePart)
+            yield* sessions.touch(input.sessionID)
+            return { info: userMsg, parts: [cmdText, responsePart] }
+          }),
+        )
       }
       // Goal/Subgoal command dispatch — early return BEFORE command registry lookup
       if (goal && (input.command === "goal" || input.command === "subgoal")) {
         const dispatch = input.command === "goal" ? goal.dispatch : goal.dispatchSubgoal
+        // Dispatch runs OUTSIDE any runner turn: its busy guards read the true
+        // session status, which a commandTurn busy marker would corrupt.
         const dispatchResult = yield* dispatch(input.sessionID, input.arguments).pipe(
           Effect.catchCause((cause) =>
             Effect.gen(function* () {
@@ -1974,53 +2004,39 @@ export const layer = Layer.effect(
             }),
           ),
         )
-        const m = yield* currentModel(input.sessionID)
-        const agentName = input.agent ?? (yield* agents.defaultAgent())
-        const userMsg: SessionV1.User = {
-          id: input.messageID ?? MessageID.ascending(),
-          role: "user",
-          sessionID: input.sessionID,
-          time: { created: Date.now() },
-          agent: agentName,
-          model: { providerID: m.providerID, modelID: m.modelID },
-        }
-        yield* sessions.updateMessage(userMsg)
-        if (!dispatchResult) {
-          // Dispatch failed — return error message to user instead of silent fallthrough
-          const errorPart: SessionV1.TextPart = {
+        if (dispatchResult?.type === "kick" && input.command === "goal") {
+          const m = yield* currentModel(input.sessionID)
+          const agentName = input.agent ?? (yield* agents.defaultAgent())
+          const userMsg: SessionV1.User = {
+            id: input.messageID ?? MessageID.ascending(),
+            role: "user",
+            sessionID: input.sessionID,
+            time: { created: Date.now() },
+            agent: agentName,
+            model: { providerID: m.providerID, modelID: m.modelID },
+          }
+          yield* sessions.updateMessage(userMsg)
+          const dispatchText = dispatchResult.announce ?? dispatchResult.text
+          const cmdText: SessionV1.TextPart = {
             id: PartID.ascending(),
             messageID: userMsg.id,
             sessionID: input.sessionID,
             type: "text",
-            text: `⚠️ /${input.command} 执行失败，请检查日志。`,
-            synthetic: true,
+            text: `/${input.command} ${input.arguments}`.trim(),
           }
-          yield* sessions.updatePart(errorPart)
+          yield* sessions.updatePart(cmdText)
+          // Non-synthetic so UserMessage renders it — the command confirmation
+          // (e.g. "⏸ 目标已暂停") must be visible. Matches the goal "done" case
+          // (loop.ts), which emits visible goal messages as non-synthetic parts.
+          const responsePart: SessionV1.TextPart = {
+            id: PartID.ascending(),
+            messageID: userMsg.id,
+            sessionID: input.sessionID,
+            type: "text",
+            text: dispatchText,
+          }
+          yield* sessions.updatePart(responsePart)
           yield* sessions.touch(input.sessionID)
-          return { info: userMsg, parts: [errorPart] }
-        }
-        const dispatchText = dispatchResult.announce ?? dispatchResult.text
-        const cmdText: SessionV1.TextPart = {
-          id: PartID.ascending(),
-          messageID: userMsg.id,
-          sessionID: input.sessionID,
-          type: "text",
-          text: `/${input.command} ${input.arguments}`.trim(),
-        }
-        yield* sessions.updatePart(cmdText)
-        // Non-synthetic so UserMessage renders it — the command confirmation
-        // (e.g. "⏸ 目标已暂停") must be visible. Matches the goal "done" case
-        // (loop.ts), which emits visible goal messages as non-synthetic parts.
-        const responsePart: SessionV1.TextPart = {
-          id: PartID.ascending(),
-          messageID: userMsg.id,
-          sessionID: input.sessionID,
-          type: "text",
-          text: dispatchText,
-        }
-        yield* sessions.updatePart(responsePart)
-        yield* sessions.touch(input.sessionID)
-        if (dispatchResult.type === "kick" && input.command === "goal") {
           // GOAL-TURN-SCOPE: this loop() is a goal-driven turn (kick or
           // resume-kick) — mark it so the step ceiling applies and ESC maps to
           // a goal pause.
@@ -2041,7 +2057,66 @@ export const layer = Layer.effect(
           }
           return yield* loop({ sessionID: input.sessionID })
         }
-        return { info: userMsg, parts: [cmdText, responsePart] }
+        return yield* commandTurn(
+          input.sessionID,
+          Effect.gen(function* () {
+            const m = yield* currentModel(input.sessionID)
+            const agentName = input.agent ?? (yield* agents.defaultAgent())
+            const userMsg: SessionV1.User = {
+              id: input.messageID ?? MessageID.ascending(),
+              role: "user",
+              sessionID: input.sessionID,
+              time: { created: Date.now() },
+              agent: agentName,
+              model: { providerID: m.providerID, modelID: m.modelID },
+            }
+            yield* sessions.updateMessage(userMsg)
+            if (!dispatchResult) {
+              // Dispatch failed — return error message to user instead of silent fallthrough
+              const now = Date.now()
+              // time.end set so run-mode consumers print the response (run CLI
+              // only renders text parts once ended).
+              const errorPart: SessionV1.TextPart = {
+                id: PartID.ascending(),
+                messageID: userMsg.id,
+                sessionID: input.sessionID,
+                type: "text",
+                text: `⚠️ /${input.command} 执行失败，请检查日志。`,
+                synthetic: true,
+                time: { start: now, end: now },
+              }
+              yield* sessions.updatePart(errorPart)
+              yield* sessions.touch(input.sessionID)
+              return { info: userMsg, parts: [errorPart] }
+            }
+            const dispatchText = dispatchResult.announce ?? dispatchResult.text
+            const cmdText: SessionV1.TextPart = {
+              id: PartID.ascending(),
+              messageID: userMsg.id,
+              sessionID: input.sessionID,
+              type: "text",
+              text: `/${input.command} ${input.arguments}`.trim(),
+            }
+            yield* sessions.updatePart(cmdText)
+            // Non-synthetic so UserMessage renders it — the command confirmation
+            // (e.g. "⏸ 目标已暂停") must be visible. Matches the goal "done" case
+            // (loop.ts), which emits visible goal messages as non-synthetic parts.
+            const now = Date.now()
+            // time.end set so run-mode consumers print the response (run CLI
+            // only renders text parts once ended).
+            const responsePart: SessionV1.TextPart = {
+              id: PartID.ascending(),
+              messageID: userMsg.id,
+              sessionID: input.sessionID,
+              type: "text",
+              text: dispatchText,
+              time: { start: now, end: now },
+            }
+            yield* sessions.updatePart(responsePart)
+            yield* sessions.touch(input.sessionID)
+            return { info: userMsg, parts: [cmdText, responsePart] }
+          }),
+        )
       }
 
       const cmd = yield* commands.get(input.command)
