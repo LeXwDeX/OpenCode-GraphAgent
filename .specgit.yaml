@@ -1,8 +1,8 @@
 version: 1
-delivery: init-stamp-is
+delivery: issue410
 context:
   kind: branch
-  branch: fix/415-init-stamp-is
+  branch: feat/410-issue410
 issues:
-  - 415
-pr: 416
+  - 410
+pr: 422
