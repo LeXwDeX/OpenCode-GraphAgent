@@ -1,8 +1,8 @@
 version: 1
-delivery: init-stamp-is
+delivery: dag-inspector-shows
 context:
-  kind: branch
-  branch: fix/415-init-stamp-is
+  kind: worktree
+  label: opencode-dag-bugfix
+  branch: fix/427-dag-inspector-shows
 issues:
-  - 415
-pr: 416
+  - 427
