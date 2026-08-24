@@ -25,6 +25,9 @@ on:
       - dev
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   typecheck:
     name: Typecheck
