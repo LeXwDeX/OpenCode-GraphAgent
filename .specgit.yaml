@@ -1,8 +1,8 @@
 version: 1
-delivery: surface-todo-state
+delivery: shell-discipline-in
 context:
   kind: branch
-  branch: feat/429-surface-todo-state
+  branch: feat/431-shell-discipline-in
 issues:
-  - 429
-pr: 430
+  - 431
+pr: 432

@@ -6,6 +6,7 @@ import os from "os"
 import { SessionID, MessageID, PartID } from "./schema"
 import { MessageV2 } from "./message-v2"
 import { SessionRevert } from "./revert"
+import { SHELL_ABORT_NOTE } from "../tool/shell"
 import { Session } from "./session"
 import { Agent } from "../agent/agent"
 import { Provider } from "@/provider/provider"
@@ -639,7 +640,7 @@ export const layer = Layer.effect(
           const finish = Effect.uninterruptible(
             Effect.gen(function* () {
               if (aborted) {
-                output += "\n\n" + ["<metadata>", "User aborted the command", "</metadata>"].join("\n")
+                output += "\n\n" + ["<metadata>", SHELL_ABORT_NOTE, "</metadata>"].join("\n")
               }
               const completed = Date.now()
               if (flags.experimentalEventSystem) {
