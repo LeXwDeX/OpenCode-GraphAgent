@@ -18,6 +18,13 @@
  *   - freshness guard: the session's last assistant message already contains
  *     a successful todowrite call — the model just updated the list itself,
  *     so this step's request does not nag about it
+ *
+ * Second surfacing point (#429): before a non-todowrite tool call executes,
+ * the current uncompleted list is returned once per assistant turn so long
+ * multi-tool turns re-see it mid-flight. Turn-scoped dedup keeps parallel
+ * tool calls from repeating the same reminder N times — the original reason
+ * #389 refined this seam away; pure-reasoning steps stay covered by the
+ * per-step injection above.
  */
 import { Effect } from "effect"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
@@ -26,6 +33,14 @@ import { PartID } from "./schema"
 import { Todo } from "./todo"
 
 const TODO_WRITE_TOOL = "todowrite"
+
+// sessionID -> assistant messageID that already received the pre-tool-call
+// reminder this turn. One entry per live session, overwritten each turn.
+const remindedTurns = new Map<string, string>()
+
+function uncompletedOf(todos: Todo.Info[]): Todo.Info[] {
+  return todos.filter((item) => item.status !== "completed" && item.status !== "cancelled")
+}
 
 function turnJustUpdatedTodos(messages: SessionV1.WithParts[]): boolean {
   const lastAssistant = messages.findLast((msg) => msg.info.role === "assistant")
@@ -51,7 +66,7 @@ export const apply = Effect.fn("TodoReminders.apply")(function* (input: {
 }) {
   const todo = yield* Todo.Service
   const todos = yield* todo.get(input.sessionID)
-  const uncompleted = todos.filter((item) => item.status !== "completed" && item.status !== "cancelled")
+  const uncompleted = uncompletedOf(todos)
   if (uncompleted.length === 0) return input.messages
   const userMessage = input.messages.findLast((msg) => msg.info.role === "user")
   if (!userMessage) return input.messages
@@ -65,6 +80,26 @@ export const apply = Effect.fn("TodoReminders.apply")(function* (input: {
     synthetic: true,
   } satisfies SessionV1.TextPart)
   return input.messages
+})
+
+/**
+ * Reminder string for the pre-tool-call seam, or undefined when the call must
+ * stay clean: todowrite itself, a turn already surfaced this turn, or nothing
+ * uncompleted. Marks the turn only when a string is actually returned.
+ */
+export const preToolCall = Effect.fn("TodoReminders.preToolCall")(function* (input: {
+  sessionID: SessionID
+  messageID: string
+  tool: string
+}) {
+  if (input.tool === TODO_WRITE_TOOL) return undefined
+  if (remindedTurns.get(input.sessionID) === input.messageID) return undefined
+  const todo = yield* Todo.Service
+  const todos = yield* todo.get(input.sessionID)
+  const uncompleted = uncompletedOf(todos)
+  if (uncompleted.length === 0) return undefined
+  remindedTurns.set(input.sessionID, input.messageID)
+  return renderReminder(uncompleted)
 })
 
 export * as TodoReminders from "./todo-reminders"
