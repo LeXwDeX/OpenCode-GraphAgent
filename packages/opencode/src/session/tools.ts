@@ -22,6 +22,7 @@ import { MessageV2 } from "./message-v2"
 import { Session } from "./session"
 import { SessionProcessor } from "./processor"
 import { PartID } from "./schema"
+import { TodoReminders } from "./todo-reminders"
 import { EffectBridge } from "@/effect/bridge"
 import { SessionContext } from "@/effect/session-context"
 import { ProviderV2 } from "@opencode-ai/core/provider"
@@ -128,6 +129,13 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
             )
             // SettingsHook PreToolUse
             let preContexts: string[] = []
+            // Native todo surfacing (#429): once per assistant turn, before
+            // any non-todowrite tool result, re-show the uncompleted list.
+            const todoReminder = yield* TodoReminders.preToolCall({
+              sessionID: ctx.sessionID,
+              messageID: input.processor.message.id,
+              tool: item.id,
+            })
             if (settingsHook) {
               const preResult = yield* settingsHook
                 .trigger(
@@ -187,8 +195,9 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
             }
             // PreToolUse additionalContexts: prepend so the model sees any hook-injected
             // gate/reminder before the tool result (mirrors PostToolUse surfacing below).
-            if (preContexts.length) {
-              output.output = `${preContexts.join("\n\n")}\n\n${output.output ?? ""}`
+            const preLines = [todoReminder, ...preContexts].filter((line): line is string => Boolean(line))
+            if (preLines.length) {
+              output.output = `${preLines.join("\n\n")}\n\n${output.output ?? ""}`
             }
             yield* plugin.trigger(
               "tool.execute.after",
@@ -522,6 +531,12 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
           )
           // SettingsHook PreToolUse
           let preContexts: string[] = []
+          // Native todo surfacing (#429): same per-turn contract as native tools.
+          const mcpTodoReminder = yield* TodoReminders.preToolCall({
+            sessionID: ctx.sessionID,
+            messageID: input.processor.message.id,
+            tool: key,
+          })
           if (settingsHook) {
             const preResult = yield* settingsHook
               .trigger(
@@ -643,8 +658,9 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
           }
           // PreToolUse additionalContexts: prepend so the model sees any hook-injected
           // gate/reminder before the tool result (mirrors PostToolUse surfacing below).
-          if (preContexts.length) {
-            output.output = `${preContexts.join("\n\n")}\n\n${output.output ?? ""}`
+          const preLines = [mcpTodoReminder, ...preContexts].filter((line): line is string => Boolean(line))
+          if (preLines.length) {
+            output.output = `${preLines.join("\n\n")}\n\n${output.output ?? ""}`
           }
           // SettingsHook PostToolUse
           if (settingsHook) {
