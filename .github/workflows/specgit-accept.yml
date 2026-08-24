@@ -2,14 +2,11 @@ name: SpecGit Acceptance
 
 on:
   pull_request:
+    # Delivery PRs target dev (fast-integration layer); the acceptance
+    # verdict runs only on the dev→main promotion PR, where protect-main's
+    # checks apply. Keep the trigger main-only (d6ce53a83): running it on
+    # dev PRs duplicated the verdict against the lighter dev gate.
     branches: [main]
-  # Local specialization (repo-only deviation from the specgit template):
-  # no workflow_dispatch trigger. Dispatch is the privileged context that
-  # made CodeQL's cache-poisoning taint rule fire on the head_ref checkout;
-  # it also evaluated the wrong tree here (head_ref is empty on dispatch,
-  # so the verdict would run against the default branch). This repo's
-  # delivery flow always goes through a PR, so dispatch has no use.
-  # Re-apply this deletion after every `specgit init --force`.
 
 permissions:
   contents: read
@@ -17,12 +14,11 @@ permissions:
 jobs:
   specgit-acceptance:
     name: SpecGit Acceptance
-    # Portable gate for any adopting repository: the published CLI is
-    # installed at the exact version `specgit init` pinned. The adopting
-    # project's own toolchain (package manager, lockfile, build, layout)
-    # is never assumed and never invoked.
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # Must exceed the slowest required sibling (Unit Tests (linux) runs
+    # ~28min on PRs): the verdict waits for every policy check to reach a
+    # terminal state before evaluating.
+    timeout-minutes: 45
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -37,13 +33,15 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: '20.19'
+          node-version: '22'
 
-      - name: Install pinned SpecGit CLI
-        # Exact version on purpose (no ^): the gate must evaluate with the
-        # same CLI generation that wrote the binding; upgrades are a
-        # deliberate re-init. --no-save keeps the adopting tree clean.
-        run: npm install --no-save --no-audit --no-fund specgit@1.0.1
+      # This repo is a bun workspace and does not vendor the SpecGit CLI;
+      # install the published CLI instead of building from source. Pinned
+      # with a caret floor (#366): the CLI releases multiple times a day and
+      # an unpinned install would let an unnoticed upstream change flip CI
+      # acceptance verdicts repo-wide.
+      - name: Install specgit CLI
+        run: npm install -g specgit@^0.5.0
 
       - name: Wait for sibling checks
         # The verdict must see the OTHER required checks in a terminal
@@ -51,84 +49,51 @@ jobs:
         # their check-runs yet, so an empty poll is not "done": wait until
         # every name in spec_git/policy.yaml is present with a terminal
         # conclusion. This job is not in the policy, so no self-deadlock.
-        # All GitHub access goes through the authenticated gh CLI.
         env:
           GH_TOKEN: ${{ github.token }}
           WAIT_REPO: ${{ github.repository }}
-          WAIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          WAIT_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           node --input-type=module <<'EOF'
           import { readFileSync } from 'node:fs';
-          import { execFileSync } from 'node:child_process';
-          import { parse } from 'yaml';
-          const policy = parse(readFileSync('spec_git/policy.yaml', 'utf8'));
-          const required = policy.required_checks ?? [];
-          const listChecks = () =>
-            JSON.parse(
-              execFileSync(
-                'gh',
-                [
-                  'api',
-                  'repos/' + process.env.WAIT_REPO + '/commits/' + process.env.WAIT_SHA + '/check-runs?per_page=100',
-                ],
-                // gh.cmd needs a shell on Windows; POSIX execs the binary
-                // directly (shell stays off where it is not needed).
-                { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'], shell: process.platform === 'win32' }
-              )
-            );
+          // Minimal parse of policy.yaml's required_checks block list —
+          // avoids a yaml dependency in this bun-based repo.
+          const policy = readFileSync('spec_git/policy.yaml', 'utf8');
+          const section = policy.slice(policy.indexOf('required_checks:'));
+          const required = [...section.matchAll(/^\s*-\s*(.+)$/gm)].map((m) => m[1].trim());
+          const headers = {
+            authorization: 'Bearer ' + process.env.GH_TOKEN,
+            accept: 'application/vnd.github+json',
+          };
+          const url = 'https://api.github.com/repos/' + process.env.WAIT_REPO
+            + '/commits/' + process.env.WAIT_SHA + '/check-runs?per_page=100';
           const terminal = new Set(['completed']);
           const terminalHas = (byName, name) => {
             if (byName.has(name)) return terminal.has(byName.get(name));
             const retried = [...byName.keys()].find((k) => k.startsWith(name + ' ('));
             return retried !== undefined && terminal.has(byName.get(retried));
           };
-          // Transient API failures (5xx, 429, network) retry with bounded
-          // exponential backoff — a platform blip must not fail the gate.
-          const MAX_ATTEMPTS = 5;
-          const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-          const listChecksWithRetry = async () => {
-            for (let attempt = 1; ; attempt += 1) {
-              try {
-                return listChecks();
-              } catch (error) {
-                const text = String(error) + ' ' + String(error && error.stderr ? error.stderr : '');
-                const transient = /HTTP 5\d\d|HTTP 429|ETIMEDOUT|ECONNRESET|ENOTFOUND|timed out/i.test(text);
-                if (attempt >= MAX_ATTEMPTS || !transient) throw error;
-                const backoff = Math.min(30000, 2000 * 2 ** (attempt - 1));
-                console.log('Transient failure; retry ' + attempt + '/' + MAX_ATTEMPTS + ' in ' + backoff + 'ms');
-                await sleep(backoff);
-              }
-            }
-          };
-          const deadline = Date.now() + 15 * 60 * 1000;
+          // Must outlast the slowest required sibling (Unit Tests (linux)
+          // runs ~28min on PRs); the job timeout above bounds this too.
+          const deadline = Date.now() + 40 * 60 * 1000;
           while (Date.now() < deadline) {
-            const payload = await listChecksWithRetry();
-            // #119: re-runs keep every same-name run; terminality is
-            // decided on the truth run — latest started_at, ties broken
-            // by the higher check-run id (docs/reference.md) — never on
-            // response position.
-            const truth = new Map();
-            for (const r of payload.check_runs) {
-              const cur = truth.get(r.name);
-              const later = cur === undefined
-                || (r.started_at || '') > (cur.started_at || '')
-                || ((r.started_at || '') === (cur.started_at || '') && (r.id || 0) > (cur.id || 0));
-              if (later) truth.set(r.name, r);
-            }
-            const byName = new Map([...truth].map(([name, r]) => [name, r.status]));
+            const res = await fetch(url, { headers });
+            if (!res.ok) throw new Error('check-runs API ' + res.status);
+            const payload = await res.json();
+            const byName = new Map(payload.check_runs.map((r) => [r.name, r.status]));
             const missing = required.filter((n) => !terminalHas(byName, n));
             if (missing.length === 0) {
               console.log('All required checks are in a terminal state.');
               process.exit(0);
             }
             console.log('Waiting for: ' + missing.join(', '));
-            await sleep(10000);
+            await new Promise((r) => setTimeout(r, 10000));
           }
           console.error('Timed out waiting for sibling checks.');
           process.exit(1);
           EOF
 
       - name: specgit finish
-        run: npx --no-install specgit finish --json
+        run: specgit finish --json
         env:
           GH_TOKEN: ${{ github.token }}
