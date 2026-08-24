@@ -1,8 +1,7 @@
 version: 1
 delivery: worker-config-on
 context:
-  kind: worktree
-  label: opencode-dag-dx
+  kind: branch
   branch: fix/425-worker-config-on
 issues:
   - 425
