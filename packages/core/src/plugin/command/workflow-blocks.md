@@ -84,10 +84,13 @@ fragment:
 ```
 
 Every block accepts only `id`, `kind`, `depends_on`, `instruction`,
-`worker_type`, `required`, and `report_to_parent`. `id` and `kind` are required.
-Allowed `kind` values are `explore`, `plan`, `prototype`, `debug`, `coding`,
-`verify`, `review`, and `synthesize`. Omit `worker_type` unless the exact
-configured agent name is already known; never invent one.
+`worker_type`, `worker_config`, `required`, and `report_to_parent`. `id` and
+`kind` are required. Allowed `kind` values are `explore`, `plan`, `prototype`,
+`debug`, `coding`, `verify`, `review`, and `synthesize`. Omit `worker_type`
+unless the exact configured agent name is already known; never invent one. An
+optional block-level `worker_config` accepts only `timeout_ms` and applies to
+every node the block expands into; it overrides `node_defaults.worker_config`
+for that block.
 
 For optional `node_defaults`, the only fields are `required`,
 `report_to_parent`, and `worker_config`; `worker_config` accepts only

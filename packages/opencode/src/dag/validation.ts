@@ -354,6 +354,9 @@ const FIELD_DRIFT_HINTS: Record<string, string> = {
   worker: "worker_type",
   workers: "worker_type",
   agent: "worker_type",
+  timeout: "worker_config: { timeout_ms }",
+  timeouts: "worker_config: { timeout_ms }",
+  timeout_ms: "worker_config: { timeout_ms }",
   prompt: "instruction",
   task: "instruction",
   objective: "config.objective",
@@ -366,7 +369,7 @@ const FIELD_DRIFT_HINTS: Record<string, string> = {
 function driftHint(path: string, message: string) {
   for (const [wrong, right] of Object.entries(FIELD_DRIFT_HINTS)) {
     if (message.includes(`"${wrong}"`) || path.includes(`["${wrong}"]`)) {
-      return `Did you mean "${right}"? Every block field is one of id, kind, depends_on, instruction, worker_type, required, report_to_parent; objective lives inside config`
+      return `Did you mean "${right}"? Every block field is one of id, kind, depends_on, instruction, worker_type, worker_config, required, report_to_parent; objective lives inside config`
     }
   }
   return "Fix the field shape; blocks graphs need name+objective+blocks, nodes graphs need name+nodes"
