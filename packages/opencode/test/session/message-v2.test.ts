@@ -899,7 +899,7 @@ describe("session.message-v2.toModelMessage", () => {
       "4575",
       "",
       "<shell_metadata>",
-      "User aborted the command",
+      "aborted before completion",
       "</shell_metadata>",
     ].join("\n")
 
