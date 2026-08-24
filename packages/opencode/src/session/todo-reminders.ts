@@ -26,7 +26,7 @@
  * #389 refined this seam away; pure-reasoning steps stay covered by the
  * per-step injection above.
  */
-import { Effect } from "effect"
+import { Cause, Effect } from "effect"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import type { SessionID } from "./schema"
 import { PartID } from "./schema"
@@ -94,9 +94,17 @@ export const preToolCall = Effect.fn("TodoReminders.preToolCall")(function* (inp
 }) {
   if (input.tool === TODO_WRITE_TOOL) return undefined
   if (remindedTurns.get(input.sessionID) === input.messageID) return undefined
-  const todo = yield* Todo.Service
-  const todos = yield* todo.get(input.sessionID)
-  const uncompleted = uncompletedOf(todos)
+  // The reminder is decoration on top of tool execution: a missing or failing
+  // Todo service must degrade to "no reminder", never kill the tool call.
+  const uncompleted = yield* Effect.gen(function* () {
+    const todo = yield* Todo.Service
+    const todos = yield* todo.get(input.sessionID)
+    return uncompletedOf(todos)
+  }).pipe(
+    Effect.catchCause((cause) =>
+      Cause.hasInterrupts(cause) ? Effect.failCause(cause) : Effect.succeed([] as Todo.Info[]),
+    ),
+  )
   if (uncompleted.length === 0) return undefined
   remindedTurns.set(input.sessionID, input.messageID)
   return renderReminder(uncompleted)
