@@ -1,8 +1,8 @@
 version: 1
-delivery: issue410
+delivery: open-security-alerts
 context:
   kind: branch
-  branch: feat/410-issue410
+  branch: fix/423-open-security-alerts
 issues:
-  - 410
-pr: 422
+  - 423
+pr: 424
