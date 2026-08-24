@@ -36,6 +36,7 @@ type RenderOpts = {
   nodes?: DagNode[]
   initialRoute?: TuiRouteCurrent
   summary?: (sessionID: string) => Promise<{ data: DagWorkflowSummary[] }>
+  fetchTimeoutMs?: number
   width?: number
 }
 
@@ -67,6 +68,7 @@ async function renderDagInspector(opts: RenderOpts = {}) {
 
   // Trackable spies
   const nodesCalls: string[] = []
+  const summaryCalls: string[] = []
   const controlCalls: { dagID: string; operation: string }[] = []
   const commandCalls: unknown[] = []
   const navigations: { name: string; params?: Record<string, unknown> }[] = []
@@ -87,8 +89,10 @@ async function renderDagInspector(opts: RenderOpts = {}) {
       keymap,
       client: {
         dag: {
-          summary: async (input: { sessionID: string }) =>
-            opts.summary?.(input.sessionID) ?? { data: opts.serverWorkflows ?? workflowsState },
+          summary: async (input: { sessionID: string }) => {
+            summaryCalls.push(input.sessionID)
+            return opts.summary?.(input.sessionID) ?? { data: opts.serverWorkflows ?? workflowsState }
+          },
           nodes: async (input: { dagID: string }) => {
             nodesCalls.push(input.dagID)
             return { data: opts.nodes ?? [] }
@@ -119,6 +123,9 @@ async function renderDagInspector(opts: RenderOpts = {}) {
     })
     const api = {
       ...base,
+      ...(opts.fetchTimeoutMs !== undefined
+        ? { tuiConfig: { ...base.tuiConfig, dag_fetch_timeout_ms: opts.fetchTimeoutMs } }
+        : {}),
       route: {
         register(routes) {
           renderInspector = routes.find((route) => route.name === "dag")?.render
@@ -173,6 +180,7 @@ async function renderDagInspector(opts: RenderOpts = {}) {
     commandCalls: () => commandCalls,
     toasts: () => toasts,
     nodesCalls: () => nodesCalls,
+    summaryCalls: () => summaryCalls,
     controlCalls: () => controlCalls,
     setWorkflows: (wfs: DagWorkflowSummary[]) => {
       workflowsState = wfs
@@ -682,6 +690,32 @@ describe("DagInspector", () => {
       } finally {
         viewer.app.renderer.destroy()
       }
+    }
+  })
+
+  test("explains missing session context instead of pretending there are no workflows", async () => {
+    const viewer = await renderDagInspector({ initialRoute: { name: "dag" } })
+    try {
+      await viewer.app.waitForFrame((frame) => frame.includes("No session context"))
+      // The no-context branch is local-only; it must not touch the server.
+      expect(viewer.summaryCalls()).toEqual([])
+    } finally {
+      viewer.app.renderer.destroy()
+    }
+  })
+
+  test("retries when the initial summary fetch stalls", async () => {
+    const viewer = await renderDagInspector({
+      initialRoute: { name: "dag", params: { sessionID: SESSION_ID } },
+      summary: () => new Promise(() => {}),
+      fetchTimeoutMs: 60,
+    })
+    try {
+      // A stalled fetch must not leave the inspector stuck on its first
+      // attempt forever; the component re-attempts after its timeout.
+      await waitForCondition(() => viewer.summaryCalls().length >= 2, 3000)
+    } finally {
+      viewer.app.renderer.destroy()
     }
   })
 })

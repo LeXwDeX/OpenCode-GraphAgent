@@ -1,8 +1,8 @@
 version: 1
-delivery: shell-discipline-in
+delivery: dag-inspector-shows
 context:
   kind: branch
-  branch: feat/431-shell-discipline-in
+  branch: fix/427-dag-inspector-shows
 issues:
-  - 431
-pr: 432
+  - 427
+pr: 428

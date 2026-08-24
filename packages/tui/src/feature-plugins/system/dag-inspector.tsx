@@ -40,6 +40,24 @@ const NAV_WIDTH_SHARE = 0.3
 // detail block adds two padding rows on top; fixed so changing the selection
 // never moves the footer.
 const NODE_DETAIL_HEIGHT = 3
+// A stalled summary request must surface as an error (with one retry) instead
+// of pinning the route on its first attempt forever.
+const FETCH_TIMEOUT_MS_DEFAULT = 15_000
+const RETRY_DELAY_MS = 400
+
+function fetchTimeoutMs(api: TuiPluginApi) {
+  return api.tuiConfig.dag_fetch_timeout_ms ?? FETCH_TIMEOUT_MS_DEFAULT
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  return Promise.race([
+    promise,
+    new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error("DAG request timed out")), timeoutMs)
+    }),
+  ]).finally(() => clearTimeout(timer))
+}
 
 function scrollRowIntoView(scroll: ScrollBoxRenderable | undefined, index: number) {
   if (!scroll) return
@@ -130,28 +148,39 @@ function DagInspector(props: { api: TuiPluginApi }) {
   // missed event even though the workflow exists on the server.
   createEffect(() => {
     const sessionID = params()?.sessionID
-    if (!sessionID) {
-      setFetchedWorkflows([])
-      setWorkflowLoad("loaded")
-      return
-    }
     setFetchedWorkflows([])
     setSelectedWorkflow(undefined)
     setSelectedNode(undefined)
     setNodes([])
     setActionMessage(undefined)
+    if (!sessionID) {
+      setWorkflowLoad("loaded")
+      return
+    }
+    let disposed = false
+    let attemptsLeft = 1
+    onCleanup(() => {
+      disposed = true
+    })
+    const attempt = () => {
+      void withTimeout(props.api.client.dag.summary({ sessionID }), fetchTimeoutMs(props.api))
+        .then((response) => {
+          if (disposed || params()?.sessionID !== sessionID) return
+          setFetchedWorkflows(response.data ?? [])
+          setWorkflowLoad("loaded")
+        })
+        .catch(() => {
+          if (disposed || params()?.sessionID !== sessionID) return
+          if (attemptsLeft > 0) {
+            attemptsLeft -= 1
+            setTimeout(attempt, RETRY_DELAY_MS)
+            return
+          }
+          setWorkflowLoad("error")
+        })
+    }
     setWorkflowLoad("loading")
-    void props.api.client.dag
-      .summary({ sessionID })
-      .then((response) => {
-        if (params()?.sessionID !== sessionID) return
-        setFetchedWorkflows(response.data ?? [])
-        setWorkflowLoad("loaded")
-      })
-      .catch(() => {
-        if (params()?.sessionID !== sessionID) return
-        setWorkflowLoad("error")
-      })
+    attempt()
   })
 
   // Keep a valid workflow selected: adopt the first workflow when nothing is
@@ -514,6 +543,13 @@ function DagInspector(props: { api: TuiPluginApi }) {
               </Match>
               <Match when={workflowLoad() === "error" && workflows().length === 0}>
                 <text fg={theme().error}>Unable to load workflows</text>
+              </Match>
+              <Match when={!params()?.sessionID && workflows().length === 0}>
+                <box marginTop={1}>
+                  <text fg={theme().textMuted}>
+                    {"No session context — reopen /dag from within a conversation."}
+                  </text>
+                </box>
               </Match>
               <Match when={workflows().length === 0}>
                 <text fg={theme().text}>No workflows for this session</text>
