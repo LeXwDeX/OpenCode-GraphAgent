@@ -1,8 +1,7 @@
 version: 1
 delivery: dag-inspector-shows
 context:
-  kind: worktree
-  label: opencode-dag-bugfix
+  kind: branch
   branch: fix/427-dag-inspector-shows
 issues:
   - 427
