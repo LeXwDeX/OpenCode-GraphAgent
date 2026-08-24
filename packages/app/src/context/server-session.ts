@@ -256,8 +256,8 @@ export function createServerSession(client: OpencodeClient) {
         id: item.info.id,
         part: item.parts.filter((part) => !!part?.id).sort((a, b) => cmp(a.id, b.id)),
       })),
-      cursor: response.response.headers.get("x-next-cursor") ?? undefined,
-      complete: !response.response.headers.get("x-next-cursor"),
+      cursor: response.response?.headers.get("x-next-cursor") ?? undefined,
+      complete: !response.response?.headers.get("x-next-cursor"),
     }
   }
 

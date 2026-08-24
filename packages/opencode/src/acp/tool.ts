@@ -353,13 +353,17 @@ function readDisplayText(metadata: unknown) {
 }
 
 function dataUrlImage(attachment: ToolAttachment) {
-  const match = stringValue(attachment.url)?.match(/^data:([^;,]+)(?:;[^,]*)*;base64,(.*)$/)
-  const mime = match?.[1] ?? stringValue(attachment.mime)
+  const url = stringValue(attachment.url)
+  const comma = url !== undefined ? url.indexOf(",") : -1
+  const tokens = comma >= 0 ? url!.slice(0, comma).split(";") : undefined
+  // Head must be `data:<mime>[;params]*;base64`; the mime lives in the first
+  // ;-separated token after the `data:` prefix. Linear token checks replace the
+  // nested-quantifier regex: neither params nor base64 payloads contain commas.
+  const mime = tokens?.[0].slice("data:".length) ?? stringValue(attachment.mime)
   if (!mime?.startsWith("image/")) return undefined
 
-  const data = match?.[2]
-  if (data === undefined) return undefined
-  return { mimeType: mime, data }
+  if (!tokens || !tokens[0].startsWith("data:") || tokens[tokens.length - 1] !== "base64") return undefined
+  return { mimeType: mime, data: url!.slice(comma + 1) }
 }
 
 function stringValue(value: unknown) {

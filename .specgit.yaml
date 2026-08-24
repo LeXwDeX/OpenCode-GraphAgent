@@ -1,8 +1,8 @@
 version: 1
-delivery: worker-config-on
+delivery: open-security-alerts
 context:
   kind: branch
-  branch: fix/425-worker-config-on
+  branch: fix/423-open-security-alerts
 issues:
-  - 425
-pr: 426
+  - 423
+pr: 424
