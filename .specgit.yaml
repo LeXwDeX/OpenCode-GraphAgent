@@ -1,8 +1,8 @@
 version: 1
-delivery: init-stamp-is
+delivery: worker-config-on
 context:
   kind: branch
-  branch: fix/415-init-stamp-is
+  branch: fix/425-worker-config-on
 issues:
-  - 415
-pr: 416
+  - 425
+pr: 426

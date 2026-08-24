@@ -203,7 +203,10 @@ describe("CommandPlugin.Plugin", () => {
       expect(CommandPlugin.WorkflowBlocksContent).toContain("### Extend file")
       expect(CommandPlugin.WorkflowBlocksContent).toContain("### Replan file")
       expect(CommandPlugin.WorkflowBlocksContent).toMatch(
-        /`id`, `kind`, `depends_on`, `instruction`,\s+`worker_type`, `required`, and `report_to_parent`/,
+        /`id`, `kind`, `depends_on`, `instruction`,\s+`worker_type`, `worker_config`, `required`, and `report_to_parent`/,
+      )
+      expect(CommandPlugin.WorkflowBlocksContent).toContain(
+        "overrides `node_defaults.worker_config`",
       )
       expect(CommandPlugin.WorkflowBlocksContent).toMatch(
         /`action`, `workflow_id`, `operation`, and `spec_path` are tool-call fields/,

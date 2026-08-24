@@ -120,7 +120,7 @@ const Draft = Schema.Struct({
   title: Schema.optional(Schema.String).annotate({ description: "Optional workflow title" }),
   config: DagValidation.WorkflowGraphSchema.annotate({
     description:
-      'Exactly one graph shape: { name, objective, blocks: [{ id, kind, depends_on?, instruction?, worker_type?, required?, report_to_parent? }], node_defaults?, max_concurrency?, max_node_replan_attempts?, max_total_nodes? } or the low-level { name, nodes: [...] } form. Fields are exhaustive — no others exist',
+      'Exactly one graph shape: { name, objective, blocks: [{ id, kind, depends_on?, instruction?, worker_type?, worker_config?, required?, report_to_parent? }], node_defaults?, max_concurrency?, max_node_replan_attempts?, max_total_nodes? } or the low-level { name, nodes: [...] } form. A block-level worker_config { timeout_ms } overrides node_defaults.worker_config for that block. Fields are exhaustive — no others exist',
   }),
 })
 const ValidationProfile = Schema.optional(Schema.Literals(["portable", "environment"])).annotate({
