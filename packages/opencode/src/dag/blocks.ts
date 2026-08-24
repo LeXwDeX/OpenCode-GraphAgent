@@ -31,6 +31,13 @@ export class WorkflowBlock extends Schema.Class<WorkflowBlock>("WorkflowBlock")(
   worker_type: Schema.optional(Schema.String).annotate({
     description: "Optional configured agent override; defaults from the block kind",
   }),
+  worker_config: Schema.optional(
+    Schema.Struct({
+      timeout_ms: Schema.Number,
+    }),
+  ).annotate({
+    description: "{ timeout_ms } — bounds node execution; overrides config.node_defaults.worker_config",
+  }),
   required: Schema.optional(Schema.Boolean).annotate({
     description:
       "Whether failure is terminal. Decision and verification blocks default to true; volume blocks to false",
@@ -160,6 +167,7 @@ function compileBlock(
           "Reproduce or characterize the failure read-only where possible. Capture exact symptoms, commands, logs, boundaries, and the smallest falsifiable observations. Do not patch the code.",
         required: false,
         reportToParent: false,
+        workerConfig: block.worker_config,
         condition,
       }),
       node({
@@ -172,6 +180,7 @@ function compileBlock(
         contract: BLOCK_CONTRACTS.debug,
         required: block.required ?? true,
         reportToParent: block.report_to_parent ?? false,
+        workerConfig: block.worker_config,
       }),
     ]
   }
@@ -201,6 +210,7 @@ function compileBlock(
         contract: `${BLOCK_CONTRACTS.review} Focus on documented repository standards, architecture constraints, correctness, and verification evidence.`,
         required: false,
         reportToParent: false,
+        workerConfig: block.worker_config,
         condition: reviewCondition,
         inputMapping: reviewEvidence,
       }),
@@ -214,6 +224,7 @@ function compileBlock(
         contract: `${BLOCK_CONTRACTS.review} Focus on the confirmed goal, scope, acceptance criteria, and user-visible behavior.`,
         required: false,
         reportToParent: false,
+        workerConfig: block.worker_config,
         condition: reviewCondition,
         inputMapping: reviewEvidence,
       }),
@@ -233,6 +244,7 @@ function compileBlock(
         ].join(" "),
         required: block.required ?? true,
         reportToParent: block.report_to_parent ?? true,
+        workerConfig: block.worker_config,
         condition: reviewCondition,
         inputMapping: route
           ? {
@@ -262,6 +274,7 @@ function compileBlock(
         contract: AGGREGATOR_CONTRACT,
         required: true,
         reportToParent: false,
+        workerConfig: block.worker_config,
         inputMapping: aggregatorEvidenceMapping(aggregation.writerIDs),
         outputSchema: IMPLEMENTATION_SCHEMA,
       }),
@@ -301,6 +314,7 @@ function compileBlock(
       contract: BLOCK_CONTRACTS[block.kind],
       required,
       reportToParent: block.report_to_parent ?? block.kind === "synthesize",
+      workerConfig: block.worker_config,
       condition,
       inputMapping: verifyAggregator
         ? {
@@ -327,6 +341,7 @@ function node(input: {
   contract: string
   required: boolean
   reportToParent: boolean
+  workerConfig?: { timeout_ms: number }
   condition?: string
   inputMapping?: Record<string, string>
   review?: NodeConfig["review"]
@@ -371,6 +386,7 @@ function node(input: {
         ...(hasInstruction ? { instruction: instructionText } : {}),
       },
     },
+    ...(input.workerConfig ? { worker_config: input.workerConfig } : {}),
     ...(input.condition ? { condition: input.condition } : {}),
     ...(input.inputMapping ? { input_mapping: input.inputMapping } : {}),
     ...(input.review ? { review: input.review } : {}),
@@ -499,6 +515,7 @@ function aggregateParallelWriters(blocks: WorkflowBlock[]) {
       depends_on: replaced,
       instruction: block.instruction,
       worker_type: block.worker_type,
+      worker_config: block.worker_config,
       required: block.required,
       report_to_parent: block.report_to_parent,
     })
