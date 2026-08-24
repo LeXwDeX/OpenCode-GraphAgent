@@ -86,7 +86,7 @@
     "@solid-primitives/resize-observer": "2.1.3",
     "@shikijs/stream": "catalog:",
     "diff": "catalog:",
-    "dompurify": "3.4.11",
+    "dompurify": "3.4.13",
     "fuzzysort": "catalog:",
     "katex": "0.16.27",
     "luxon": "catalog:",

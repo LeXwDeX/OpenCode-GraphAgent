@@ -473,7 +473,7 @@ export const Terminal = (props: TerminalProps) => {
       const gone = () =>
         client.pty
           .get({ ptyID: id }, { throwOnError: false })
-          .then((result) => result.response.status === 404)
+          .then((result) => result.response?.status === 404)
           .catch((err) => {
             debugTerminal("failed to inspect terminal session", err)
             return false
@@ -493,11 +493,11 @@ export const Terminal = (props: TerminalProps) => {
             throw err
           })
         if (!result) return
-        if (result.response.status === 200 && result.data?.ticket) return result.data.ticket
-        if (result.response.status === 404 || result.response.status === 405) return
-        if (result.response.status === 403)
+        if (result.response?.status === 200 && result.data?.ticket) return result.data.ticket
+        if (result.response?.status === 404 || result.response?.status === 405) return
+        if (result.response?.status === 403)
           throw new Error("PTY connect ticket rejected by origin or CSRF checks. Check the server CORS config.")
-        throw new Error(`PTY connect ticket failed with ${result.response.status}`)
+        throw new Error(`PTY connect ticket failed with ${result.response?.status}`)
       }
 
       const retry = (err: unknown) => {
