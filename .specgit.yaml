@@ -1,8 +1,8 @@
 version: 1
-delivery: open-security-alerts
+delivery: surface-todo-state
 context:
   kind: branch
-  branch: fix/423-open-security-alerts
+  branch: feat/429-surface-todo-state
 issues:
-  - 423
-pr: 424
+  - 429
+pr: 430
