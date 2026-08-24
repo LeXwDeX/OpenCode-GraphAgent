@@ -652,7 +652,7 @@ describe("workflow tool schema (negative tests)", () => {
         name: "structured-draft",
         objective: "Validate the draft rendering path.",
         blocks: [
-          { id: "map", kind: "explore", instruction: "Map the seams." },
+          { id: "map", kind: "explore", instruction: "Map the seams.", worker_config: { timeout_ms: 4321 } },
           { id: "review", kind: "review", depends_on: ["map"] },
         ],
       },
@@ -661,6 +661,12 @@ describe("workflow tool schema (negative tests)", () => {
     // The high-frequency drift shapes die at the schema boundary.
     expect(() =>
       decode({ params: { action: "draft", config: { ...draft.config, blocks: [{ id: "x", kind: "coding", worker: "general" }] } } }),
+    ).toThrow()
+    expect(() =>
+      decode({ params: { action: "draft", config: { ...draft.config, blocks: [{ id: "x", kind: "coding", worker_timeout: 5000 }] } } }),
+    ).toThrow()
+    expect(() =>
+      decode({ params: { action: "draft", config: { ...draft.config, blocks: [{ id: "x", kind: "coding", worker_config: { foo: 1 } }] } } }),
     ).toThrow()
     expect(() => decode({ params: { action: "draft", objective: "top level" } })).toThrow()
     expect(() => decode({ params: { action: "draft" } })).toThrow()
@@ -2009,6 +2015,59 @@ config:
           worker_config: { timeout_ms: 4321 },
         }),
       )
+    }),
+  )
+
+  // issue #425: block-level worker_config rides through compilation onto the
+  // expanded nodes and beats node_defaults; omitted blocks still inherit.
+  runtime.effect("start resolves block worker_config over node_defaults", () =>
+    Effect.gen(function* () {
+      published.length = 0
+      const info = yield* WorkflowTool
+      const workflow = yield* info.init()
+      const specPath = yield* writeWorkflowSpec("block-worker-config", {
+        config: {
+          name: "block-worker-config",
+          objective: "Bound each block individually.",
+          node_defaults: {
+            worker_config: { timeout_ms: 1234 },
+          },
+          blocks: [
+            { id: "override", kind: "coding", worker_config: { timeout_ms: 4321 } },
+            { id: "inherit", kind: "verify", depends_on: ["override"] },
+            { id: "diag", kind: "debug", depends_on: ["inherit"], worker_config: { timeout_ms: 4321 } },
+          ],
+        },
+      })
+
+      yield* workflow.execute(
+        { params: {
+          action: "start",
+          spec_path: specPath,
+        }},
+        {
+          sessionID: SessionID.make("ses_workflow_parent"),
+          messageID: MessageID.ascending(),
+          agent: "build",
+          abort: new AbortController().signal,
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        } satisfies Tool.Context,
+      )
+
+      const created = published.find((event) => event.type === DagEvent.WorkflowCreated.type)?.data
+      const configJSON =
+        typeof created === "object" && created !== null && "config" in created && typeof created.config === "string"
+          ? created.config
+          : "{}"
+      const nodes: Array<{ id: string; worker_config?: { timeout_ms?: number } }> = JSON.parse(configJSON).nodes ?? []
+      expect(Object.fromEntries(nodes.map((node) => [node.id, node.worker_config?.timeout_ms]))).toEqual({
+        override: 4321,
+        inherit: 1234,
+        "diag--evidence": 4321,
+        diag: 4321,
+      })
     }),
   )
 

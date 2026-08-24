@@ -734,6 +734,18 @@ exports[`tool parameters JSON Schema (wire shape) workflow 1`] = `
                             "description": "Whether failure is terminal. Decision and verification blocks default to true; volume blocks to false",
                             "type": "boolean",
                           },
+                          "worker_config": {
+                            "description": "{ timeout_ms } — bounds node execution; overrides config.node_defaults.worker_config",
+                            "properties": {
+                              "timeout_ms": {
+                                "type": "number",
+                              },
+                            },
+                            "required": [
+                              "timeout_ms",
+                            ],
+                            "type": "object",
+                          },
                           "worker_type": {
                             "description": "Optional configured agent override; defaults from the block kind",
                             "type": "string",
@@ -973,7 +985,7 @@ exports[`tool parameters JSON Schema (wire shape) workflow 1`] = `
                   "type": "object",
                 },
               ],
-              "description": "Exactly one graph shape: { name, objective, blocks: [{ id, kind, depends_on?, instruction?, worker_type?, required?, report_to_parent? }], node_defaults?, max_concurrency?, max_node_replan_attempts?, max_total_nodes? } or the low-level { name, nodes: [...] } form. Fields are exhaustive — no others exist",
+              "description": "Exactly one graph shape: { name, objective, blocks: [{ id, kind, depends_on?, instruction?, worker_type?, worker_config?, required?, report_to_parent? }], node_defaults?, max_concurrency?, max_node_replan_attempts?, max_total_nodes? } or the low-level { name, nodes: [...] } form. A block-level worker_config { timeout_ms } overrides node_defaults.worker_config for that block. Fields are exhaustive — no others exist",
             },
             "title": {
               "description": "Optional workflow title",

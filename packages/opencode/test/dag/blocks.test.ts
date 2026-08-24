@@ -285,6 +285,45 @@ describe("workflow blocks", () => {
     expect(runtime.isComplete()).toBe(true)
   })
 
+  // issue #425: block-level worker_config must reach every node the block
+  // expands into — including the injected aggregator and the verify block
+  // rebuilt by parallel-writer rewiring — while blocks that omit it stay
+  // untouched for node_defaults to fill in.
+  it("threads block-level worker_config onto every expanded node", () => {
+    const nodes = DagBlocks.compileWorkflowBlocks({
+      objective: "Bound each block individually",
+      blocks: [
+        { id: "impl-a", kind: "coding" },
+        { id: "impl-b", kind: "prototype" },
+        {
+          id: "impl-verify",
+          kind: "verify",
+          depends_on: ["impl-a", "impl-b"],
+          worker_config: { timeout_ms: 4321 },
+        },
+        { id: "gate", kind: "review", depends_on: ["impl-verify"], worker_config: { timeout_ms: 4321 } },
+        { id: "diag", kind: "debug", depends_on: ["gate"], worker_config: { timeout_ms: 4321 } },
+        { id: "map", kind: "explore", depends_on: ["gate"], worker_config: { timeout_ms: 4321 } },
+      ],
+    })
+
+    expect(Object.fromEntries(nodes.map((node) => [node.id, node.worker_config]))).toEqual({
+      "impl-a": undefined,
+      "impl-b": undefined,
+      "impl-verify": { timeout_ms: 4321 },
+      "gate--aggregate": { timeout_ms: 4321 },
+      "gate--standards": { timeout_ms: 4321 },
+      "gate--intent": { timeout_ms: 4321 },
+      gate: { timeout_ms: 4321 },
+      "diag--evidence": { timeout_ms: 4321 },
+      diag: { timeout_ms: 4321 },
+      map: { timeout_ms: 4321 },
+    })
+    // The rewired verify block keeps its own timeout while its dependencies
+    // move onto the injected aggregator.
+    expect(nodes.find((node) => node.id === "impl-verify")?.depends_on).toEqual(["gate--aggregate"])
+  })
+
   it("rejects an implementation review without one verification gate", () => {
     expect(() =>
       DagBlocks.compileWorkflowBlocks({
