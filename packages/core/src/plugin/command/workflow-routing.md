@@ -105,8 +105,8 @@ config:
 
 Top level is `title`/`mode`/`admission` (optional) and `config` (required);
 `objective` lives INSIDE `config`; every block field is one of `id` (required),
-`kind` (required), `depends_on`, `instruction`, `worker_type`, `required`,
-`report_to_parent` — never `worker`, `prompt`, or `agent`.
+`kind` (required), `depends_on`, `instruction`, `worker_type`, `worker_config`,
+`required`, `report_to_parent` — never `worker`, `prompt`, or `agent`.
 
 A `report_to_parent` node with dependents is a reporting checkpoint: gate each
 dependent on its output via `condition`, keep it a reporting leaf, or drop
