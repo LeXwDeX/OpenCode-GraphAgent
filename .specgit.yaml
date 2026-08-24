@@ -1,8 +1,7 @@
 version: 1
 delivery: surface-todo-state
 context:
-  kind: worktree
-  label: opencode-dag-todoremind
+  kind: branch
   branch: feat/429-surface-todo-state
 issues:
   - 429
