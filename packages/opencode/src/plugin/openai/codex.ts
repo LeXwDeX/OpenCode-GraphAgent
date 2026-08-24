@@ -21,12 +21,23 @@ interface PkceCodes {
 }
 
 async function generatePKCE(): Promise<PkceCodes> {
-  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
-  const verifier = Array.from(crypto.getRandomValues(new Uint8Array(43)))
-    .map((b) => chars[b % chars.length])
-    .join("")
+  const verifier = generateRandomString(43)
   const challenge = base64UrlEncode(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier)))
   return { verifier, challenge }
+}
+
+function generateRandomString(length: number): string {
+  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
+  // 256 % chars.length != 0, so indexing by raw modulo biases the charset; reject
+  // out-of-range bytes to keep every character equally likely.
+  const limit = 256 - (256 % chars.length)
+  const picked: string[] = []
+  while (picked.length < length) {
+    for (const byte of crypto.getRandomValues(new Uint8Array(length))) {
+      if (byte < limit) picked.push(chars[byte % chars.length])
+    }
+  }
+  return picked.slice(0, length).join("")
 }
 
 function base64UrlEncode(buffer: ArrayBuffer): string {

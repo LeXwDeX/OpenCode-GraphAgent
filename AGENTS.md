@@ -13,9 +13,9 @@ feat/**, fix/** ──PR(Typecheck + Unit Tests 门禁)──▶ dev ──push 
 
 | Branch | 直推 | PR 门禁 | CI 触发 | Purpose |
 |--------|------|---------|---------|---------|
-| `{type}/**` | ✅ 允许 | — | ❌ 不跑 | 开发分支，频繁变更 |
+| `{type}/**` | ✅ 允许 | — | push 不触发；PR 触发目标分支门禁 | 开发分支，频繁变更 |
 | `dev` | ❌ 禁止 | PR 必须通过 **Typecheck + Unit Tests (linux)** | ✅ push 触发 Typecheck + 全量测试 | 快速集成层 |
-| `main` | ❌ 禁止 | PR 必须通过 **Typecheck + Unit Tests + E2E (linux + windows)** | ✅ push 触发全量 | 正式质量门禁 + 发版 |
+| `main` | ❌ 禁止 | PR 必须通过 **Typecheck + Unit Tests + E2E (linux + windows) + SpecGit Acceptance** | ✅ push 触发全量 | 正式质量门禁 + 发版 |
 
 **流程**：
 1. 从 `main` 切出 `feat/**` 或 `fix/**` 分支开发
@@ -26,14 +26,26 @@ feat/**, fix/** ──PR(Typecheck + Unit Tests 门禁)──▶ dev ──push 
 6. 合并到 `main` 后手动 `release-fork` → 产出**正式版**
 
 **Rulesets（GitHub Settings → Rules → Rulesets）**：
-- `protect-main`：禁止直推/删除/force-push；PR 需通过 4 项检查（Typecheck、Unit Tests (linux)、E2E Tests (linux)、E2E Tests (windows)）
+- `protect-main`：禁止直推/删除/force-push；PR 需通过 5 项检查（Typecheck、Unit Tests (linux)、E2E Tests (linux)、E2E Tests (windows)、SpecGit Acceptance）
 - `protect-dev`：禁止直推/删除/force-push；PR 需通过 Typecheck
 - `branch-naming`：只允许创建 `feat/**`、`fix/**`、`chore/**`、`docs/**`、`refactor/**`、`test/**`、`release/**`、`hotfix/**` 前缀的新分支
 
 **CI 配置**：
-- `ci-typecheck.yml`：push 到 `main`/`dev` + PR → `main`/`dev` 时触发（快速门禁）
-- `ci-test.yml`：push 到 `main`/`dev` + PR → `main` 时触发全量测试（`cancel-in-progress: false` 保证跑完）；Linux unit-tests job 额外校验生成物新鲜度（`packages/client` 与 `packages/sdk/js` 的 `check:generated`）并跑 HttpAPI 契约门禁
-- `release-fork.yml`：手动触发；从 `dev` 发布自动标记 `--prerelease`，从 `main` 发布正式版
+- `ci-typecheck.yml`：push 到 `main`/`dev` + PR → `main`/`dev` 时触发；除 lint + typecheck 外还跑 `test:dag-core` DAG 核心行为/覆盖率门禁（10min 超时）
+- `ci-test.yml`：push 到 `main`/`dev` + PR → `main`/`dev` 时触发全量测试（`cancel-in-progress: false` 保证跑完）；Linux unit-tests job 额外校验生成物新鲜度（`packages/client` 与 `packages/sdk/js` 的 `check:generated`）并跑 HttpAPI 契约门禁（`test:httpapi:ci`）
+- `specgit-accept.yml`：仅 PR → `main` 时触发；安装 pinned `specgit@1.0.1`，等 `spec_git/policy.yaml` `required_checks` 全部到终态后运行 `specgit finish --json` 产出 SpecGit Acceptance 裁决
+- `release-fork.yml`：手动 `workflow_dispatch` 是唯一真实构建路径（push 到 `main`/`dev` 仅注册不构建）；从 `dev` 发布自动产出 `X.Y.Z-dev.N` prerelease，从 `main` 发布 `X.Y.Z` 并标 Latest
+
+## Standard Delivery Workflow (标准交付流程)
+
+新功能开发、Debug 等一切交付范畴恒定走此循环；后续所有工作必须遵守该方案，不得另起流程：
+
+1. **确立条目**：明确条目的内容、范围、类型（`feat`/`fix`/…）。一个 issue = 一个可独立验证的 WHY，无法独立验证的先拆分再立项。
+2. **SpecGit 立项**：`specgit issue <title-or-number>` 创建/复用 issues 批次，确立交付分支与草稿 PR 脚手架（`.specgit.yaml` 绑定）；立项前先查重，避免同一 WHY 双开。
+3. **超流执行**：安排 DAG workflow（超流）承载实现——并行开发 + 多角度 Review + 复合（synthesize），其产出作为交付证据基线。
+4. **PR 过门禁**：SpecGit 发起/推进 PR，过 TDD 与 CI 门禁（Typecheck、Unit Tests、DAG gate；`specgit finish` exit 0 是唯一 "done"）。
+5. **修复门禁问题**：门禁失败在交付分支修代码/测试，永远不削弱门禁本身。
+6. **合并收尾**：完成 PR 合并（目标分支遵循 Git Workflow，dev 为集成层），PR 正文 `Closes #n` 自动关闭绑定 issues；版本确立与发布按 release train 既有节奏推进。
 
 ## Branch Names
 
@@ -174,11 +186,13 @@ const table = sqliteTable("session", {
 - Avoid mocks as much as possible, you shouldn't be using globalThis.\* at all unless it's the only option.
 - Test actual implementation, do not duplicate logic into tests
 - Tests cannot run from repo root (guard: `do-not-run-tests-from-root`); run from package dirs like `packages/opencode`.
+- `bun run test:dag-core`（在 `packages/opencode`）：DAG 核心行为与覆盖率门禁，随 ci-typecheck 对每个 PR 强制执行；改状态机/持久化先本地跑它。
 
 ## Type Checking
 
-- Always run `bun typecheck` from package directories (e.g., `packages/opencode`), never `tsc` directly.
+- Always run `bun typecheck` from package directories (e.g., `packages/opencode`), never `tsc` directly. Root `bun run typecheck` (turbo) covers all packages.
 - `bun run build` does not typecheck — esbuild transpiles only. A green build can still ship a missing import or a non-existent API, so it is not proof the code is sound. `bun typecheck` (`tsgo --noEmit`) is the commit gate.
+- `bun run lint`（仓库根）= `oxlint --max-warnings=4850` 警告数棘轮：任何新增 oxlint 警告都会撑破预算、炸掉 CI Typecheck job——修警告，永远不要抬上限。
 
 ## Extending the Codebase (二次开发)
 
@@ -199,7 +213,7 @@ Invariants for extending the SolidJS/opentui TUI. The DAG inspector (`src/featur
 - Server-driven shared state lives in `src/context/sync.tsx`: one store slice + one event reducer case per domain, plus an initial fetch during bootstrap as the safety net for events missed before the event stream subscribes. `SyncProvider` requires `ExitProvider` (plus Args/KV/SDK/Project providers); any test harness mounting it must wrap with all of them — see `test/cli/cmd/tui/sync-fixture.tsx`.
 - Every event type the TUI consumes must be defined with `define()` in `packages/schema` and included in `EventManifest.Definitions`, or the generated SDK event union won't contain it and the reducer case can't typecheck. Ephemeral push events (e.g. `dag.workflow.summary.updated`) stay OUT of the durable-event manifest: emit them via `GlobalBus`, never persist them, and design consumers to tolerate missed events (re-fetch on bootstrap).
 - Types shared between server and TUI come from the generated SDK (`@opencode-ai/sdk/v2`). Do not hand-duplicate response/summary interfaces in `packages/plugin/src/tui.ts` or TUI code — re-export the SDK type (`export type TuiSidebarDagItem = DagWorkflowSummary`), so a server schema change surfaces as a typecheck error instead of silent drift.
-- Prefer server-side aggregation for display data. The TUI renders `DagStore.getWorkflowSummaries` output verbatim; it never aggregates raw `dag.*` events client-side. Derived-view publishers (`src/dag/runtime/summary-publisher.ts`) must stay stateless: recompute from the store on every emission, no module-level caches.
+- Prefer server-side aggregation for display data. The TUI renders `DagStore.getWorkflowSummaries` output verbatim; it never aggregates raw `dag.*` events client-side. Derived-view publishers (server-side `packages/opencode/src/dag/runtime/summary-publisher.ts`) must stay stateless: recompute from the store on every emission, no module-level caches.
 - Extract non-trivial pure logic (topology layout, tree building) into a sibling `*-utils.ts` with unit tests, mirroring `diff-viewer-file-tree-utils.ts` / `dag-inspector-utils.ts`. Component files stay declarative.
 - Async fetches inside components must guard against stale responses (check the selection still matches before `setState`) and clean up event subscriptions with `onCleanup`.
 
@@ -217,15 +231,22 @@ This repository owns the DAG schema, compiler, validator, runtime, and release i
 
 - Built-in commands ship compiled into the binary: `/dag-auto` (requirement → workflow routing: classify, match a saved DAG route, retarget, validate, start). Platform delivery (issues, PRs, CI, merge, release) is specgit's job — never part of `/dag-*`. User command files shadow built-ins by name; register new built-ins through `packages/core/src/plugin/command.ts` + `packages/opencode/src/command/index.ts` (`Default` registry).
 - Templates come from `opencode-dag-config`: 7 domains × `full`/`lite` plus cross-domain routes (`ultra-flow-route`, `release-route`). Precedence: project `.opencode/workflows/` > global config dir > builtin snapshot (the release pipeline compiles the config repo into the binary via `DAG_TEMPLATES_DIR`).
-- `dag.jsonc` supplies DAG node model tiers: `advanced` for `required: true` and review nodes, `standard` otherwise. Never pin `model` inside saved workflow specs.
+- `~/.config/opencode/dag.jsonc`（全局用户配置，非仓库文件）supplies DAG node model tiers: `advanced` for `required: true` and review nodes, `standard` otherwise. Never pin `model` inside saved workflow specs.
 
 ## Project memory
 
 - Memory is fail-closed inert until the project is initialized: running `/init` stamps `project.time_initialized`, which `/memory on` and `memory_search` require. `/memory on` silently answering "Memory remains off" means the project never ran `/init` (or has no real git identity).
+- Model 与节奏配置在 `~/.config/opencode/memory.jsonc`（enabled、model、turn_interval、注入上限）。openai-compatible 供应商会把 JSON schema 渲染进 system prompt——schema-blind 模型也能产出合法 topic。写入验证看盘：`~/.local/share/opencode/memory/projects/<hash>/generations/*/topic-*.yaml`。
 
 ## Release notes
 
 Releases follow `.github/RELEASE_NOTES_TEMPLATE.md`: keep section order and emoji headers, omit empty sections, fill the test summary from the CI gates, and end with the `previous_tag...current_tag` changelog link.
+
+Mechanics（fail-closed，graphagent-v1.0.29 验证过）：
+
+- 版本由 `packages/opencode/script/release-version.ts` 机械推导：只认 `graphagent-v*` 标签，下一个 stable 恒为 patch+1（`graphagent-v1.0.28` → `1.0.29`），dev 通道为 `X.Y.Z-dev.N`；opencode 包版本号被忽略。
+- 系列文件 `.github/releases/v<推导版本>.md` 的文件名必须等于推导版本（命名错 = release job fail-closed 炸掉）；正文用 `{VERSION}`、`{Prerelease/Stable}`、`{branch}`、`{previous_tag}`、`{current_tag}` 占位符，由 `packages/opencode/script/release-notes.ts` 渲染并校验不变量。
+- 本地演练渲染：`bun run ./packages/opencode/script/release-notes.ts --notes-dir .github/releases --version <V> --channel main --branch main --tag graphagent-v<V> --previous-tag graphagent-v<P> --repo LeXwDeX/OpenCode-GraphAgent --out /tmp/notes.md`
 
 ## Agent skills
 
@@ -241,18 +262,31 @@ Triage uses the five canonical labels `needs-triage`, `needs-info`, `ready-for-a
 
 This repository uses a multi-context domain-document layout rooted at `CONTEXT-MAP.md`. See `docs/agents/domain.md`.
 
+### SpecGit harness local specializations
+
+Kept OUTSIDE the managed block so `specgit init`/`--force` never rewrites them; re-apply each deviation after every re-init:
+
+- `specgit-accept.yml` drops the template's `workflow_dispatch` trigger. Dispatch is the privileged context that fires CodeQL's cache-poisoning taint rule on the `head_ref` checkout (false positive: no cache use, read-only token, `persist-credentials: false`), and on dispatch events `head_ref` is empty so the verdict would evaluate the default branch — the wrong tree. Delivery here always goes through a PR. The head-ref checkout itself must NOT be replaced with a SHA: `specgit finish` requires HEAD on the delivery branch (detached_head otherwise).
+- `spec_git/policy.yaml` `required_checks` uses the template's canonical check IDs (`unit-tests`, `e2e-tests`), not display names.
+
 <!-- specgit:block:start -->
 ## SpecGit delivery harness
 
-Managed by `specgit init`. Everything between the markers is rewritten on
-re-init; keep manual guidance outside them.
+Managed by `specgit init`. Everything between the markers is regenerated
+whenever init writes the harness (a fresh init, or `--force` when a policy
+already exists); keep manual guidance outside them.
 
 ### The delivery story
 
 - Start with `specgit issue <title-or-number>...`: it creates or reuses
-  the issues, branches, opens the draft pull request that closes every
-  bound issue, and writes `.specgit.yaml`. Re-running resumes; it is
-  idempotent.
+  the issues, branches, opens the draft pull request pre-filled with a
+  deterministic scaffold (the `Closes #n` line for every bound issue,
+  then Why / What changed / Evidence / Checklist sections), and writes
+  `.specgit.yaml`. Re-running resumes; it is idempotent.
+- Fill in the scaffold sections as you deliver. Its placeholders are
+  advisory — the closing references are the only body gate. The PR body
+  is written once at creation; no SpecGit command edits an existing PR
+  body, and the repository's own pull-request template is never read.
 - Finish with `specgit finish`: the verdict, derived from real git, PR,
   and CI evidence. Exit code 0 is the only "done".
 
@@ -264,6 +298,15 @@ re-init; keep manual guidance outside them.
 - `specgit status` shows local evidence only: record, state, drift,
   origin. `specgit doctor` probes git, repository, origin, gh, and
   policy.
+
+### The command surface
+
+- Ten commands: `specgit init`, `specgit setup`, `specgit issue`,
+  `specgit pr`, `specgit finish`, `specgit bind`, `specgit unbind`,
+  `specgit status`, `specgit accept`, `specgit doctor`.
+- `specgit setup` installs the agent entry points (commands for opencode,
+  portable skills for other tools); `specgit bind`, `specgit unbind`,
+  and `specgit accept` are automation aliases for scripts and CI.
 
 ### Before creating an issue, check for duplicates
 
