@@ -104,18 +104,24 @@ const DIFF_REVIEW_SCHEMA = {
 
 const WRITER_KINDS = new Set<WorkflowBlockKind>(["coding", "prototype"])
 
+// Shared execution discipline for every block that runs shell commands. A
+// silent long command reads as hung and invites manual interrupts; keep the
+// rule in one place so all command-heavy contracts stay in sync.
+const SHELL_DISCIPLINE =
+  "Bound any long-running or potentially silent shell command with `timeout <seconds>`, and stream progress (`--reporter=dot`-style or write output to a file you tail); never pipe unbounded output through a silent buffer such as a bare `| tail`."
+
 const BLOCK_CONTRACTS: Record<WorkflowBlockKind, string> = {
   explore:
-    "Inspect the target read-only and prefer primary repository or runtime evidence. Separate confirmed facts, inferences, and unknowns; map ownership, constraints, conventions, and file references. Return an evidence map that downstream blocks can cite. Do not implement or hide unresolved uncertainty.",
+    `Inspect the target read-only and prefer primary repository or runtime evidence. Separate confirmed facts, inferences, and unknowns; map ownership, constraints, conventions, and file references. Return an evidence map that downstream blocks can cite. Do not implement or hide unresolved uncertainty. ${SHELL_DISCIPLINE}`,
   plan: "Produce a decision- or implementation-ready plan from repository evidence and dependency outputs. State the selected boundary, ordered options or work packages, dependencies, acceptance checks, falsifiers, and unresolved risks. Stop rather than inventing a user-owned product decision. Do not implement.",
   prototype:
     "Answer one falsifiable uncertainty with the smallest disposable experiment. State the hypothesis and success signal first, separate observations from inference, and do not integrate prototype code unless explicitly promoted by confirmed scope. Submit its changed-file list and a stable fingerprint so downstream verification and review bind to the exact experiment.",
   debug:
-    "Minimize the reproduced failure, rank falsifiable hypotheses, instrument the discriminating boundary, and identify the smallest causal explanation. Distinguish cause from symptom and correlated damage. Return the narrowest safe repair boundary and a regression check that would fail without that repair; stop if evidence does not establish a cause.",
+    `Minimize the reproduced failure, rank falsifiable hypotheses, instrument the discriminating boundary, and identify the smallest causal explanation. Distinguish cause from symptom and correlated damage. Return the narrowest safe repair boundary and a regression check that would fail without that repair; stop if evidence does not establish a cause. ${SHELL_DISCIPLINE}`,
   coding:
-    "Implement only the bounded production change and preserve unrelated work. When an observable automated seam exists, establish a failing check, make the smallest change that passes it, then refactor without breaking the check; otherwise record the evidence-backed reason before implementation. Run focused checks and stop on ownership or interface drift. Submit the aggregate changed-file list and a stable fingerprint of the actual implementation state.",
+    `Implement only the bounded production change and preserve unrelated work. When an observable automated seam exists, establish a failing check, make the smallest change that passes it, then refactor without breaking the check; otherwise record the evidence-backed reason before implementation. Run focused checks and stop on ownership or interface drift. Submit the aggregate changed-file list and a stable fingerprint of the actual implementation state. ${SHELL_DISCIPLINE}`,
   verify:
-    "Verify the supplied work against every acceptance criterion using deterministic checks where available. Bind evidence to the supplied implementation fingerprint and submit exact commands, results, and an explicit PASS or FAIL verdict. Missing evidence or any failed required check is FAIL; do not repair or hide failures in this block.",
+    `Verify the supplied work against every acceptance criterion using deterministic checks where available. Bind evidence to the supplied implementation fingerprint and submit exact commands, results, and an explicit PASS or FAIL verdict. Missing evidence or any failed required check is FAIL; do not repair or hide failures in this block. ${SHELL_DISCIPLINE}`,
   review:
     "Review independently against repository standards and the confirmed intent. Bind findings to the supplied implementation fingerprint, cite concrete evidence, separate required actions from suggestions, and reject stale, duplicated, or unsupported claims. Do not implement fixes inside the review lane.",
   synthesize:

@@ -2,6 +2,7 @@ import type { Hooks, PluginInput } from "@opencode-ai/plugin"
 import { OAUTH_DUMMY_KEY } from "../auth"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import { createServer } from "http"
+import { escapeHtml } from "@/util/html"
 import open from "open"
 
 const OAUTH_CLIENT_ID = "LOCAL_APPLICATION"
@@ -44,9 +45,16 @@ function normalizeAccount(input: string) {
 
 function generateRandomString(length: number) {
   const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
-  return Array.from(crypto.getRandomValues(new Uint8Array(length)))
-    .map((b) => chars[b % chars.length])
-    .join("")
+  // 256 % chars.length != 0, so indexing by raw modulo biases the charset; reject
+  // out-of-range bytes to keep every character equally likely.
+  const limit = 256 - (256 % chars.length)
+  const picked: string[] = []
+  while (picked.length < length) {
+    for (const byte of crypto.getRandomValues(new Uint8Array(length))) {
+      if (byte < limit) picked.push(chars[byte % chars.length])
+    }
+  }
+  return picked.slice(0, length).join("")
 }
 
 function base64UrlEncode(buffer: ArrayBuffer) {
@@ -174,7 +182,7 @@ const htmlError = (message: string) => `<!doctype html>
   <body style="font-family: system-ui; display:flex; align-items:center; justify-content:center; height:100vh; margin:0; background:#111; color:#eee;">
     <div style="text-align:center; max-width:48rem; padding:2rem;">
       <h1 style="color:#ff7b72;">Authorization Failed</h1>
-      <pre style="white-space:pre-wrap; color:#ffb3ad; background:#2a1210; padding:1rem; border-radius:.5rem;">${message}</pre>
+      <pre style="white-space:pre-wrap; color:#ffb3ad; background:#2a1210; padding:1rem; border-radius:.5rem;">${escapeHtml(message)}</pre>
     </div>
   </body>
 </html>`

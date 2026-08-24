@@ -787,6 +787,20 @@ export const githubRun = Effect.fn("Cli.github.run")(function* (args: { event?: 
         const start = m.index
         const filename = path.basename(url)
 
+        // SSRF guard: only fetch GitHub user-attachment assets over HTTPS
+        const attachmentUrl = URL.parse(url)
+        if (
+          !attachmentUrl ||
+          attachmentUrl.protocol !== "https:" ||
+          attachmentUrl.hostname !== "github.com" ||
+          !(
+            attachmentUrl.pathname.startsWith("/user-attachments/assets/") ||
+            attachmentUrl.pathname.startsWith("/user-attachments/files/")
+          )
+        ) {
+          continue
+        }
+
         // Download image
         const res = await fetch(url, {
           headers: {

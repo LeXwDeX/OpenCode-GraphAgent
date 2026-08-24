@@ -2573,7 +2573,7 @@ unixNoLLMServer(
           expect(exit.value.info.role).toBe("assistant")
           const tool = completedTool(exit.value.parts)
           if (tool) {
-            expect(tool.state.output).toContain("User aborted the command")
+            expect(tool.state.output).toContain("aborted before completion")
           }
         }
       }),
@@ -2617,7 +2617,7 @@ unixNoLLMServer(
           expect(exit.value.info.role).toBe("assistant")
           const tool = completedTool(exit.value.parts)
           if (tool) {
-            expect(tool.state.output).toContain("User aborted the command")
+            expect(tool.state.output).toContain("aborted before completion")
           }
         }
       }),
@@ -2700,7 +2700,7 @@ unixNoLLMServer(
       expect(Exit.isSuccess(exit)).toBe(true)
       if (Exit.isSuccess(exit)) {
         const tool = completedTool(exit.value.parts)
-        expect(tool?.state.output).toContain("User aborted the command")
+        expect(tool?.state.output).toContain("aborted before completion")
       }
 
       yield* Fiber.await(sh)
