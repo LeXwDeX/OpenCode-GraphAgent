@@ -28,3 +28,18 @@ export function formatPromptTooLargeError(files: { filename: string; content: st
       : ""
   return `PROMPT_TOO_LARGE: The prompt exceeds the model's context limit.${fileDetails}`
 }
+
+/**
+ * SSRF guard for attachment URLs parsed out of issue/PR bodies (issue #442):
+ * a request that carries the GitHub app token may only ever leave for
+ * github.com user-attachment paths over https. The handler fetches the
+ * validated URL object itself, never the raw string it was parsed from.
+ */
+export function isAllowedAttachmentUrl(url: URL | null): url is URL {
+  return (
+    url !== null &&
+    url.protocol === "https:" &&
+    url.hostname === "github.com" &&
+    (url.pathname.startsWith("/user-attachments/assets/") || url.pathname.startsWith("/user-attachments/files/"))
+  )
+}
