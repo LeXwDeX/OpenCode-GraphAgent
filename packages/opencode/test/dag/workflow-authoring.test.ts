@@ -49,6 +49,53 @@ describe("WorkflowAuthoring source-to-graph seam", () => {
     }),
   )
 
+  // issue #425: bare timeout vocabulary at block level must point at the
+  // worker_config wrapper instead of the generic fallback.
+  it.effect("hints bare block-level timeout fields toward worker_config", () =>
+    Effect.gen(function* () {
+      const authoring = WorkflowAuthoring.make()
+      for (const wrong of ["timeout: 100", "timeout_ms: 100"]) {
+        const result = yield* authoring.prepare({
+          action: "start",
+          source: {
+            kind: "yaml",
+            source: "drift.yaml",
+            content: ["config:", "  name: drift", "  objective: Timeout drift probe.", "  blocks:", "    - id: a", "      kind: coding", `      ${wrong}`].join("\n"),
+          },
+          profile: "portable",
+        })
+        expect(result.valid).toBe(false)
+        expect(result.errors.some((e) => e.hint.includes('Did you mean "worker_config: { timeout_ms }"?'))).toBe(true)
+      }
+    }),
+  )
+
+  it.effect("keeps block worker_config strict — unknown nested keys stay rejected", () =>
+    Effect.gen(function* () {
+      const authoring = WorkflowAuthoring.make()
+      const result = yield* authoring.prepare({
+        action: "start",
+        source: {
+          kind: "yaml",
+          source: "strict.yaml",
+          content: [
+            "config:",
+            "  name: strict",
+            "  objective: Strictness probe.",
+            "  blocks:",
+            "    - id: a",
+            "      kind: coding",
+            "      worker_config:",
+            "        foo: 1",
+          ].join("\n"),
+        },
+        profile: "portable",
+      })
+      expect(result.valid).toBe(false)
+      expect(result.errors.some((e) => e.code === DagValidation.DIAGNOSTIC_CODES.schemaInvalid)).toBe(true)
+    }),
+  )
+
   it.effect("keeps every block-guide YAML envelope executable", () =>
     Effect.gen(function* () {
       const guide = CommandPlugin.WorkflowBlocksContent

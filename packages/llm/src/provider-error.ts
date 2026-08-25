@@ -23,8 +23,12 @@ const patterns = [
   /model_context_window_exceeded/i,
 ]
 
-export const isContextOverflow = (message: string) =>
-  patterns.some((pattern) => pattern.test(message)) || /^4(00|13)\s*(status code)?\s*\(no body\)/i.test(message)
+export const isContextOverflow = (message: string) => {
+  // Provider-controlled text: bound the search space so unbounded .* patterns
+  // cannot backtrack polynomially on adversarial input.
+  const bounded = message.slice(0, 2000)
+  return patterns.some((pattern) => pattern.test(bounded)) || /^4(00|13)\s*(status code)?\s*\(no body\)/i.test(bounded)
+}
 
 export const isContextOverflowFailure = (failure: unknown) =>
   failure instanceof LLMError

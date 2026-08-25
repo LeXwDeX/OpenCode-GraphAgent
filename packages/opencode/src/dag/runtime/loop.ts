@@ -278,7 +278,7 @@ const serviceLayer = Layer.effect(
             if (nodeConfig?.output_schema) {
               promptParts.push({
                 type: "text",
-                text: `\n\nYou MUST call the submit_result tool with a JSON payload matching this schema before ending your turn:\n${JSON.stringify(nodeConfig.output_schema, null, 2)}\nPut your full summary inside the payload. Do not repeat the payload in your message text. After submit_result succeeds, end your turn without restating the result.`,
+                text: `\n\n[OUTPUT CONTRACT — this node's success depends on it] You MUST call the submit_result tool with a JSON payload matching this schema before ending your turn:\n${JSON.stringify(nodeConfig.output_schema, null, 2)}\nPut your full summary inside the payload. Do not repeat the payload in your message text. Writing the payload in message text does NOT count as submitting: if you end your turn without a successful submit_result call, this node FAILS and your work is discarded. After submit_result succeeds, end your turn without restating the result.`,
               })
             }
 

@@ -426,6 +426,7 @@ type TuiConfigView = Pick<PluginConfig, "$schema" | "theme" | "plugin"> &
     attention: TuiAttentionConfigView
     plugin_enabled?: Record<string, boolean>
     keybinds: TuiBindingLookupView
+    dag_fetch_timeout_ms?: number
   }
 
 export type TuiApp = {

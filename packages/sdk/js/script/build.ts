@@ -45,18 +45,20 @@ await createClient({
 // is the AsyncGenerator's TReturn slot. Iterator return values have nothing
 // to do with HTTP errors, and any consumer that calls `.return()` or returns
 // from a mock generator gets type-checked against the wrong shape. Drop the
-// arg so TReturn defaults to void.
+// arg so TReturn defaults to void. Fixed upstream in 0.97.x, which emits the
+// corrected signature directly — patch only when the bugged form is present.
 const sseTypesPath = "./src/v2/gen/client/types.gen.ts"
 const sseTypesFile = Bun.file(sseTypesPath)
 const sseTypesSource = await sseTypesFile.text()
-const sseTypesPatched = sseTypesSource.replace(
-  "=> Promise<ServerSentEventsResult<TData, TError>>",
-  "=> Promise<ServerSentEventsResult<TData>>",
-)
-if (sseTypesPatched === sseTypesSource) {
-  throw new Error(`SseFn patch did not apply; @hey-api/openapi-ts output may have changed (${sseTypesPath})`)
+const buggedSseSig = "=> Promise<ServerSentEventsResult<TData, TError>>"
+const fixedSseSig = "=> Promise<ServerSentEventsResult<TData>>"
+const sseTypesPatched = sseTypesSource.replace(buggedSseSig, fixedSseSig)
+if (sseTypesPatched === sseTypesSource && !sseTypesSource.includes(fixedSseSig)) {
+  throw new Error(`SseFn signature found in neither bugged nor fixed form; @hey-api/openapi-ts output may have changed (${sseTypesPath})`)
 }
-await Bun.write(sseTypesPath, sseTypesPatched)
+if (sseTypesPatched !== sseTypesSource) {
+  await Bun.write(sseTypesPath, sseTypesPatched)
+}
 
 await $`bun prettier --write src/gen`
 await $`bun prettier --write src/v2`

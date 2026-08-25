@@ -24,6 +24,9 @@ import { BashArity } from "@/permission/arity"
 
 export { Parameters } from "./shell/prompt"
 
+export const SHELL_ABORT_NOTE =
+  "The command was aborted before completion (client interrupt or session cancel). For long-running work, bound it with `timeout <seconds>` and stream progress instead of piping into a silent buffer."
+
 const MAX_METADATA_LENGTH = 30_000
 const CWD = new Set(["cd", "chdir", "popd", "pushd", "push-location", "set-location"])
 const FILES = new Set([
@@ -575,7 +578,7 @@ export const ShellTool = Tool.define(
           `shell tool terminated command after exceeding timeout ${input.timeout} ms. If this command is expected to take longer and is not waiting for interactive input, retry with a larger timeout value in milliseconds.`,
         )
       }
-      if (aborted) meta.push("User aborted the command")
+      if (aborted) meta.push(SHELL_ABORT_NOTE)
       const raw = list.map((item) => item.text).join("")
       const end = tail(raw, limits.maxLines, limits.maxBytes)
       if (end.cut) cut = true

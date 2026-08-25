@@ -33,7 +33,7 @@ import { setTimeout as sleep } from "node:timers/promises"
 import { Process } from "@/util/process"
 import { parseGitHubRemote } from "@/util/repository"
 import { Effect } from "effect"
-import { extractResponseText, formatPromptTooLargeError } from "./github.shared"
+import { extractResponseText, formatPromptTooLargeError, isAllowedAttachmentUrl } from "./github.shared"
 
 type GitHubAuthor = {
   login: string
@@ -787,8 +787,17 @@ export const githubRun = Effect.fn("Cli.github.run")(function* (args: { event?: 
         const start = m.index
         const filename = path.basename(url)
 
+        // SSRF guard (issue #442): only fetch GitHub user-attachment assets
+        // over HTTPS, and fetch the validated URL object — not the raw
+        // string it was parsed from — so the token-bearing request can only
+        // ever target what the guard approved.
+        const attachmentUrl = URL.parse(url)
+        if (!isAllowedAttachmentUrl(attachmentUrl)) {
+          continue
+        }
+
         // Download image
-        const res = await fetch(url, {
+        const res = await fetch(attachmentUrl, {
           headers: {
             Authorization: `Bearer ${appToken}`,
             Accept: "application/vnd.github.v3+json",
