@@ -20,6 +20,10 @@ export const Local = Schema.Struct({
   timeout: Schema.optional(PositiveInt).annotate({
     description: "Timeout in ms for MCP server requests. Defaults to 5000 (5 seconds) if not specified.",
   }),
+  protocol: Schema.optional(Schema.Literals(["auto", "legacy", "modern"])).annotate({
+    description:
+      "Protocol era negotiation: 'auto' probes server/discover and falls back to the 2025 initialize handshake, 'legacy' skips the probe and runs the 2025 initialize handshake, 'modern' speaks only 2026-07-28 with no fallback. Defaults to 'auto'.",
+  }),
 }).annotate({ identifier: "McpLocalConfig" })
 export type Local = Schema.Schema.Type<typeof Local>
 
@@ -55,6 +59,10 @@ export const Remote = Schema.Struct({
   }),
   timeout: Schema.optional(PositiveInt).annotate({
     description: "Timeout in ms for MCP server requests. Defaults to 5000 (5 seconds) if not specified.",
+  }),
+  protocol: Schema.optional(Schema.Literals(["auto", "legacy", "modern"])).annotate({
+    description:
+      "Protocol era negotiation: 'auto' probes server/discover and falls back to the 2025 initialize handshake, 'legacy' skips the probe and runs the 2025 initialize handshake, 'modern' speaks only 2026-07-28 with no fallback. Defaults to 'auto'.",
   }),
 }).annotate({ identifier: "McpRemoteConfig" })
 export type Remote = Schema.Schema.Type<typeof Remote>

@@ -4,13 +4,22 @@ import { testEffect } from "../lib/effect"
 
 // Track what options were passed to each transport constructor
 const transportCalls: Array<{
-  type: "streamable" | "sse"
+  type: "streamable"
   url: string
   options: { authProvider?: unknown; requestInit?: RequestInit }
 }> = []
 
-// Mock the transport constructors to capture their arguments
-void mock.module("@modelcontextprotocol/sdk/client/streamableHttp.js", () => ({
+class MockUnauthorizedError extends Error {
+  constructor() {
+    super("Unauthorized")
+    this.name = "UnauthorizedError"
+  }
+}
+
+// v2 packs Client, StreamableHTTPClientTransport, and UnauthorizedError into
+// the single package root, so one mock.module covers the whole surface. The
+// Client mock just bridges connect() into the (throwing) mock transport.
+void mock.module("@modelcontextprotocol/client", () => ({
   StreamableHTTPClientTransport: class MockStreamableHTTP {
     constructor(url: URL, options?: { authProvider?: unknown; requestInit?: RequestInit }) {
       transportCalls.push({
@@ -23,20 +32,13 @@ void mock.module("@modelcontextprotocol/sdk/client/streamableHttp.js", () => ({
       throw new Error("Mock transport cannot connect")
     }
   },
-}))
-
-void mock.module("@modelcontextprotocol/sdk/client/sse.js", () => ({
-  SSEClientTransport: class MockSSE {
-    constructor(url: URL, options?: { authProvider?: unknown; requestInit?: RequestInit }) {
-      transportCalls.push({
-        type: "sse",
-        url: url.toString(),
-        options: options ?? {},
-      })
+  UnauthorizedError: MockUnauthorizedError,
+  Client: class MockClient {
+    setRequestHandler() {}
+    async connect(transport: { start: () => Promise<void> }) {
+      await transport.start()
     }
-    async start() {
-      throw new Error("Mock transport cannot connect")
-    }
+    async close() {}
   },
 }))
 
@@ -63,7 +65,7 @@ describe("mcp.headers", () => {
         })
         .pipe(Effect.catch(() => Effect.void))
 
-      // Both transports should have been created with headers
+      // The transport should have been created with headers
       expect(transportCalls.length).toBeGreaterThanOrEqual(1)
 
       for (const call of transportCalls) {

@@ -36,13 +36,14 @@ class MockUnauthorizedError extends Error {
 
 // Track what options were passed to each transport constructor
 const transportCalls: Array<{
-  type: "streamable" | "sse"
+  type: "streamable"
   url: string
   options: { authProvider?: unknown; requestInit?: RequestInit }
 }> = []
 
-// Mock the transport constructors
-void mock.module("@modelcontextprotocol/sdk/client/streamableHttp.js", () => ({
+// v2 packs Client, StreamableHTTPClientTransport, and UnauthorizedError into
+// the single package root, so one mock.module covers the whole surface.
+void mock.module("@modelcontextprotocol/client", () => ({
   StreamableHTTPClientTransport: class MockStreamableHTTP {
     url: string
     authProvider: { redirectToAuthorization?: (url: URL) => Promise<void> } | undefined
@@ -69,25 +70,8 @@ void mock.module("@modelcontextprotocol/sdk/client/streamableHttp.js", () => ({
       // Mock successful auth completion
     }
   },
-}))
-
-void mock.module("@modelcontextprotocol/sdk/client/sse.js", () => ({
-  SSEClientTransport: class MockSSE {
-    constructor(url: URL) {
-      transportCalls.push({
-        type: "sse",
-        url: url.toString(),
-        options: {},
-      })
-    }
-    async start() {
-      throw new Error("Mock SSE transport cannot connect")
-    }
-  },
-}))
-
-// Mock the MCP SDK Client to trigger OAuth flow
-void mock.module("@modelcontextprotocol/sdk/client/index.js", () => ({
+  UnauthorizedError: MockUnauthorizedError,
+  // Mock the MCP SDK Client to trigger OAuth flow
   Client: class MockClient {
     setRequestHandler() {}
 
@@ -99,11 +83,6 @@ void mock.module("@modelcontextprotocol/sdk/client/index.js", () => ({
       return { tools: {} }
     }
   },
-}))
-
-// Mock UnauthorizedError in the auth module
-void mock.module("@modelcontextprotocol/sdk/client/auth.js", () => ({
-  UnauthorizedError: MockUnauthorizedError,
 }))
 
 beforeEach(() => {
