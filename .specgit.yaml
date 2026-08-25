@@ -1,12 +1,8 @@
 version: 1
-delivery: open-issues-batch
+delivery: upgrade-mcp-client
 context:
   kind: branch
-  branch: feat/434-open-issues-batch
+  branch: refactor/447-upgrade-mcp-client
 issues:
-  - 434
-  - 442
-  - 443
-  - 440
-  - 436
-pr: 444
+  - 447
+  - 448
