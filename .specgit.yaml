@@ -1,8 +1,7 @@
 version: 1
-delivery: issue410
+delivery: assemble-google-key
 context:
   kind: branch
-  branch: feat/410-issue410
+  branch: fix/440-assemble-google-key
 issues:
-  - 410
-pr: 422
+  - 440
