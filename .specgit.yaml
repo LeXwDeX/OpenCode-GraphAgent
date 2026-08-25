@@ -1,8 +1,11 @@
 version: 1
-delivery: dag-inspector-shows
+delivery: open-issues-batch
 context:
   kind: branch
-  branch: fix/427-dag-inspector-shows
+  branch: feat/434-open-issues-batch
 issues:
-  - 427
-pr: 428
+  - 434
+  - 442
+  - 443
+  - 440
+  - 436
