@@ -608,6 +608,7 @@
         "diff": "catalog:",
         "drizzle-orm": "catalog:",
         "effect": "catalog:",
+        "escape-html": "1.0.3",
         "fuzzysort": "3.1.0",
         "gitlab-ai-provider": "6.9.3",
         "glob": "13.0.5",
@@ -653,6 +654,7 @@
         "@types/babel__core": "7.20.5",
         "@types/bun": "catalog:",
         "@types/cross-spawn": "catalog:",
+        "@types/escape-html": "1.0.3",
         "@types/mime-types": "3.0.1",
         "@types/npm-package-arg": "6.1.4",
         "@types/semver": "^7.5.8",
@@ -2825,6 +2827,8 @@
     "@types/debug": ["@types/debug@4.1.13", "", { "dependencies": { "@types/ms": "*" } }, "sha512-KSVgmQmzMwPlmtljOomayoR89W4FynCAi3E8PPs7vmDVPe84hT+vGPKkJfThkmXs0x0jAaa9U8uW8bbfyS2fWw=="],
 
     "@types/deep-eql": ["@types/deep-eql@4.0.2", "", {}, "sha512-c9h9dVVMigMPc4bwTvC5dxqtqJZwQPePsWjPlpSOnojbor6pGqdk541lfA7AqFQr5pB1BRdq0juY9db81BwyFw=="],
+
+    "@types/escape-html": ["@types/escape-html@1.0.3", "", {}, "sha512-QbNxKa2IX2y/9eGiy4w8rrwk//ERHXA6zwYVRA3+ayA/D3pkz+/bLL4b5uSLA0L0kPuNX1Jbv9HyPzv9T4zbJQ=="],
 
     "@types/estree": ["@types/estree@1.0.8", "", {}, "sha512-dWHzHa2WqEXI/O1E9OjrocMTKJl2mSrEolh1Iomrv6U+JuNwaHXsXx9bLu5gG7BUWFIN0skIQJQ/L1rIex4X6w=="],
 

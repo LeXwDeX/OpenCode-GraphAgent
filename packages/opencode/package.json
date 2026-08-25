@@ -42,6 +42,7 @@
     "@types/bun": "catalog:",
     "@types/cross-spawn": "catalog:",
     "@types/mime-types": "3.0.1",
+    "@types/escape-html": "1.0.3",
     "@types/npm-package-arg": "6.1.4",
     "@types/semver": "^7.5.8",
     "@types/turndown": "5.0.5",
@@ -56,6 +57,7 @@
   "dependencies": {
     "@actions/core": "1.11.1",
     "@actions/github": "6.0.1",
+    "escape-html": "1.0.3",
     "@agentclientprotocol/sdk": "0.21.0",
     "@ai-sdk/alibaba": "1.0.17",
     "@ai-sdk/amazon-bedrock": "4.0.112",

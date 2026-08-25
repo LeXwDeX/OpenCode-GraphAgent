@@ -490,12 +490,43 @@ export function spawnNode(
             parts: input.promptParts,
           })
           if (input.outputSchema) {
+            const readSettlement = Effect.fn("DagRuntime.spawn.readSettlement")(function* () {
+              const updatedNode = yield* dag.store.getNode(input.dagID, input.nodeID).pipe(Effect.orDie)
+              const captured = updatedNode?.capturedOutput
+              return {
+                neverCalled: captured === undefined || captured === null,
+                // Single settlement authority shared with crash recovery
+                // (capture.ts settleCapturedOutput).
+                settlement: settleCapturedOutput(captured, input.reviewImplementationFingerprint),
+              }
+            })
             clearCaptureSlot(childSession.id)
-            const updatedNode = yield* dag.store.getNode(input.dagID, input.nodeID).pipe(Effect.orDie)
-            // Single settlement decision shared with crash recovery
-            // (capture.ts settleCapturedOutput) — the review-result contract
-            // must never be enforced in one path and not the other.
-            const settlement = settleCapturedOutput(updatedNode?.capturedOutput, input.reviewImplementationFingerprint)
+            let verdict = yield* readSettlement()
+            // Issue #436 minimal step: a child that ended its whole turn
+            // without ever calling submit_result gets exactly one nudge
+            // turn in the same session — the work is already done, only the
+            // structured hand-back is missing. A captured-but-invalid payload
+            // is NOT nudged: that is a deterministic contract violation and
+            // a retry would only re-bill the same mistake.
+            if (verdict.settlement.kind === "fail" && verdict.neverCalled) {
+              registerCaptureSlot(childSession.id, input.outputSchema)
+              yield* promptSvc.prompt({
+                messageID: MessageID.ascending(),
+                sessionID: childSession.id,
+                model,
+                agent: agent.name,
+                ...(input.variant ? { variant: input.variant } : {}),
+                parts: [
+                  {
+                    type: "text",
+                    text: `You ended your turn without calling the submit_result tool, so this node recorded no output and will FAIL. Do not redo the work. Call submit_result NOW with a JSON payload matching the schema from your instructions, containing your full result. If a previous submit_result call failed validation, fix the payload shape and call it again.`,
+                  },
+                ],
+              })
+              clearCaptureSlot(childSession.id)
+              verdict = yield* readSettlement()
+            }
+            const settlement = verdict.settlement
             yield* (settlement.kind === "complete"
               ? dag.nodeCompleted(input.dagID, input.nodeID, settlement.output)
               : dag.nodeFailed(input.dagID, input.nodeID, settlement.reason, "verdict_fail")
