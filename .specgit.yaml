@@ -1,9 +1,7 @@
 version: 1
-delivery: upgrade-mcp-client
+delivery: expose-negotiated-protocol
 context:
   kind: branch
-  branch: refactor/447-upgrade-mcp-client
+  branch: feat/450-expose-negotiated-protocol
 issues:
-  - 447
-  - 448
-pr: 449
+  - 450
