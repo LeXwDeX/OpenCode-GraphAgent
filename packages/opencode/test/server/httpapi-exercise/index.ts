@@ -372,7 +372,29 @@ const scenarios: Scenario[] = [
         }),
       "status",
     ),
-  http.protected.get("/mcp", "mcp.status").json(),
+  http.protected.get("/mcp", "mcp.status").json(
+    200,
+    (body) => {
+      object(body)
+      for (const entry of Object.values(body)) {
+        object(entry)
+        if (entry.status === "connected") {
+          check(
+            entry.era === undefined || entry.era === "modern" || entry.era === "legacy",
+            "connected MCP status era should be modern or legacy when present",
+          )
+          check(
+            entry.protocolVersion === undefined || typeof entry.protocolVersion === "string",
+            "connected MCP status protocolVersion should be a string when present",
+          )
+        } else {
+          check(entry.era === undefined, "MCP era field should only appear on connected statuses")
+          check(entry.protocolVersion === undefined, "MCP protocolVersion field should only appear on connected statuses")
+        }
+      }
+    },
+    "status",
+  ),
   http.protected
     .post("/mcp", "mcp.add")
     .mutating()

@@ -80,7 +80,26 @@ function createClient(directory: string, protocol?: "auto" | "legacy" | "modern"
   return client
 }
 
-const StatusConnected = Schema.Struct({ status: Schema.Literal("connected") }).annotate({
+// Protocol versions are ISO dates and sort lexicographically, so >= the
+// 2026-07-28 baseline (server/discover era) means modern.
+export function protocolEra(version: string): "modern" | "legacy" {
+  return version >= "2026-07-28" ? "modern" : "legacy"
+}
+
+// Connected status carries the negotiated protocol era/version when the client
+// reports one; test doubles without the getter get the plain shape.
+function connectedStatus(client: MCPClient): Status {
+  const protocolVersion =
+    typeof client.getNegotiatedProtocolVersion === "function" ? client.getNegotiatedProtocolVersion() : undefined
+  if (protocolVersion === undefined) return { status: "connected" }
+  return { status: "connected", era: protocolEra(protocolVersion), protocolVersion }
+}
+
+const StatusConnected = Schema.Struct({
+  status: Schema.Literal("connected"),
+  era: Schema.optional(Schema.Literals(["modern", "legacy"])),
+  protocolVersion: Schema.optional(Schema.String),
+}).annotate({
   identifier: "MCPStatusConnected",
 })
 const StatusDisabled = Schema.Struct({ status: Schema.Literal("disabled") }).annotate({
@@ -308,7 +327,7 @@ export const layer = Layer.effect(
           return Effect.void
         }),
       )
-      if (result) return { client: result, status: { status: "connected" } as Status }
+      if (result) return { client: result, status: connectedStatus(result) }
 
       return {
         client: undefined as MCPClient | undefined,
@@ -339,7 +358,7 @@ export const layer = Layer.effect(
       return yield* connectTransport(transport, connectTimeout, mcp.protocol).pipe(
         Effect.map((client): { client: MCPClient | undefined; status: Status } => ({
           client,
-          status: { status: "connected" },
+          status: connectedStatus(client),
         })),
         Effect.catch((error): Effect.Effect<{ client: MCPClient | undefined; status: Status }> => {
           const msg = error instanceof Error ? error.message : String(error)
@@ -561,7 +580,7 @@ export const layer = Layer.effect(
     ) {
       const bridge = yield* EffectBridge.make()
       const previous = s.clients[name]
-      s.status[name] = { status: "connected" }
+      s.status[name] = connectedStatus(client)
       s.clients[name] = client
       s.defs[name] = listed
       if (instructions) s.instructions[name] = instructions

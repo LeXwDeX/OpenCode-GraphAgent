@@ -139,7 +139,7 @@ export const McpListCommand = effectCmd({
         statusText = "not initialized"
       } else if (status.status === "connected") {
         statusIcon = "✓"
-        statusText = "connected"
+        statusText = `connected${status.era ? ` · ${status.era}` : ""}${status.protocolVersion ? ` (${status.protocolVersion})` : ""}`
         if (hasOAuth && hasStoredTokens) {
           hint = " (OAuth)"
         }
