@@ -1,8 +1,8 @@
 version: 1
-delivery: add-mcp-dual
+delivery: ad-hoc-sign
 context:
   kind: branch
-  branch: test/452-add-mcp-dual
+  branch: fix/454-ad-hoc-sign
 issues:
-  - 452
-pr: 453
+  - 454
+pr: 455
