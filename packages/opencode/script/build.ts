@@ -209,6 +209,11 @@ for (const item of targets) {
     },
   })
 
+  // macOS kills freshly compiled unsigned darwin binaries (SIGKILL 137) before they can run
+  if (process.platform === "darwin" && item.os === "darwin" && fs.existsSync("/usr/bin/codesign")) {
+    await $`codesign --force --sign - dist/${name}/bin/opencode`
+  }
+
   // Smoke test: only run if binary is for current platform
   if (item.os === process.platform && item.arch === process.arch && !item.abi) {
     const binaryPath = `dist/${name}/bin/opencode`
