@@ -2466,6 +2466,8 @@ export type FormatterStatus = {
 
 export type McpStatusConnected = {
   status: "connected"
+  era?: "modern" | "legacy"
+  protocolVersion?: string
 }
 
 export type McpStatusDisabled = {
