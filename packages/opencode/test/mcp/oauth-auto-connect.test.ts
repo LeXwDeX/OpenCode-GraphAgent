@@ -12,7 +12,7 @@ class MockUnauthorizedError extends Error {
 
 // Track what options were passed to each transport constructor
 const transportCalls: Array<{
-  type: "streamable" | "sse"
+  type: "streamable"
   url: string
   options: { authProvider?: unknown }
 }> = []
@@ -24,8 +24,10 @@ let connectSucceedsImmediately = false
 let serverCapabilities: { tools?: object; resources?: object } = { tools: {} }
 let listToolsCalls = 0
 
-// Mock the transport constructors to simulate OAuth auto-auth on 401
-void mock.module("@modelcontextprotocol/sdk/client/streamableHttp.js", () => ({
+// v2 packs Client, StreamableHTTPClientTransport, and UnauthorizedError into
+// the single package root, so one mock.module covers the whole surface. The
+// transport simulates OAuth auto-auth on 401 like the real SDK does.
+void mock.module("@modelcontextprotocol/client", () => ({
   StreamableHTTPClientTransport: class MockStreamableHTTP {
     authProvider:
       | {
@@ -67,25 +69,10 @@ void mock.module("@modelcontextprotocol/sdk/client/streamableHttp.js", () => ({
     }
     async finishAuth(_code: string) {}
   },
-}))
-
-void mock.module("@modelcontextprotocol/sdk/client/sse.js", () => ({
-  SSEClientTransport: class MockSSE {
-    constructor(url: URL, options?: { authProvider?: unknown }) {
-      transportCalls.push({
-        type: "sse",
-        url: url.toString(),
-        options: options ?? {},
-      })
-    }
-    async start() {
-      throw new Error("Mock SSE transport cannot connect")
-    }
-  },
-}))
-
-// Mock the MCP SDK Client
-void mock.module("@modelcontextprotocol/sdk/client/index.js", () => ({
+  // UnauthorizedError in the same module mock so src's instanceof check sees
+  // the same class the mock transport throws.
+  UnauthorizedError: MockUnauthorizedError,
+  // Mock the MCP SDK Client
   Client: class MockClient {
     setRequestHandler() {}
 
@@ -112,11 +99,6 @@ void mock.module("@modelcontextprotocol/sdk/client/index.js", () => ({
 
     async close() {}
   },
-}))
-
-// Mock UnauthorizedError in the auth module so instanceof checks work
-void mock.module("@modelcontextprotocol/sdk/client/auth.js", () => ({
-  UnauthorizedError: MockUnauthorizedError,
 }))
 
 beforeEach(() => {

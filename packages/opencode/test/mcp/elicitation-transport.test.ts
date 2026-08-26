@@ -1,17 +1,15 @@
 // Bypass Bun's process-global mock registry AND module cache. Sibling MCP
-// tests register `mock.module("@modelcontextprotocol/sdk/client/index.js", ...)`
+// tests register `mock.module("@modelcontextprotocol/client", ...)`
 // with reduced MockClient implementations (no transport, no `callTool`);
 // `mock.restore()` clears the registry, but Bun's module cache is keyed by
 // specifier and retains the previously-resolved *mock instance* for that path.
 // We therefore pull types from the public path via a type-only import, but at
-// runtime load Client from the dist/esm path — a different specifier → a
-// different cache entry → the real SDK Client with full callTool support.
+// runtime load Client from a cache-busted specifier — a different specifier →
+// a different cache entry → the real SDK Client with full callTool support.
 import { afterEach, beforeEach, describe, expect, mock } from "bun:test"
 import { Cause, Effect, Fiber, Layer, Exit } from "effect"
-import { Server } from "@modelcontextprotocol/sdk/server/index.js"
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js"
-import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js"
-import type { Client as ClientType } from "@modelcontextprotocol/sdk/client/index.js"
+import type { Client as ClientType } from "@modelcontextprotocol/client"
+import { Server, InMemoryTransport } from "@modelcontextprotocol/server"
 
 mock.restore()
 // Cache-bust the import: add a unique query string to force Bun to load a fresh
@@ -21,7 +19,7 @@ mock.restore()
 // any cached (mocked) module instances and get the real SDK Client with full
 // `callTool` support.
 const cacheBuster = `?bust=${Date.now()}`
-const { Client } = (await import(`@modelcontextprotocol/sdk/client${cacheBuster}`)) as unknown as {
+const { Client } = (await import(`@modelcontextprotocol/client${cacheBuster}`)) as unknown as {
   Client: typeof ClientType
 }
 import { Question } from "@/question"
@@ -100,12 +98,10 @@ const STALE_SESSION = "ses_elicitation_transport_stale"
  */
 function makeStubServer(): Server {
   const server = new Server({ name: "elicitation-stub", version: "1.0.0" }, { capabilities: { tools: {} } })
-  server.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: [
-      { name: "pick", description: "Elicit a color choice", inputSchema: { type: "object", properties: {} } },
-    ],
+  server.setRequestHandler("tools/list", async () => ({
+    tools: [{ name: "pick", description: "Elicit a color choice", inputSchema: { type: "object", properties: {} } }],
   }))
-  server.setRequestHandler(CallToolRequestSchema, async () => {
+  server.setRequestHandler("tools/call", async () => {
     const result = await server.elicitInput({
       message: "Pick a color",
       requestedSchema: {
@@ -170,7 +166,9 @@ describe("mcp elicitation — real transport round-trip (5.4)", () => {
       const staleCleanup = setActiveElicitationSession(STALE_SESSION)
       yield* Effect.addFinalizer(() => Effect.sync(staleCleanup))
       staleCleanup()
-      const callFiber = yield* Effect.promise(() => client.callTool({ name: "pick", arguments: {} })).pipe(Effect.forkScoped)
+      const callFiber = yield* Effect.promise(() => client.callTool({ name: "pick", arguments: {} })).pipe(
+        Effect.forkScoped,
+      )
 
       // The elicitation surfaces as a pending Question. Filter by this test's
       // SESSION so a pending question leaked from a prior file (bun runs the
@@ -191,14 +189,13 @@ describe("mcp elicitation — real transport round-trip (5.4)", () => {
         // separates a silent decline (resolved with `elicit decline`) from a
         // genuine hang (still pending), and the list snapshot shows whether
         // the Question surfaced at all.
-        Effect.catch(
-          () =>
-            Effect.fail(
-              new Error(
-                "elicitation never surfaced as a Question — " +
-                  `question.list()=${JSON.stringify(lastItems)}; callFiber: ${describeFiber(callFiber)}`,
-              ),
+        Effect.catch(() =>
+          Effect.fail(
+            new Error(
+              "elicitation never surfaced as a Question — " +
+                `question.list()=${JSON.stringify(lastItems)}; callFiber: ${describeFiber(callFiber)}`,
             ),
+          ),
         ),
       )
       expect(String(pending[0].sessionID)).toBe(SESSION)
@@ -217,7 +214,8 @@ describe("mcp elicitation — real transport round-trip (5.4)", () => {
       expect(events.filter((p) => p.event === "Elicitation")).toHaveLength(1)
       expect(
         events.filter(
-          (p) => p.event === "ElicitationResult" && JSON.stringify((p as { result?: unknown }).result).includes("green"),
+          (p) =>
+            p.event === "ElicitationResult" && JSON.stringify((p as { result?: unknown }).result).includes("green"),
         ),
       ).toHaveLength(1)
     }),

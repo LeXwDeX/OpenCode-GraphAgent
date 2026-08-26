@@ -2,10 +2,12 @@ import { cmd } from "./cmd"
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { effectCmd } from "../effect-cmd"
 import { Cause } from "effect"
-import { Client } from "@modelcontextprotocol/sdk/client/index.js"
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js"
-import { UnauthorizedError } from "@modelcontextprotocol/sdk/client/auth.js"
-import { LATEST_PROTOCOL_VERSION } from "@modelcontextprotocol/sdk/types.js"
+import {
+  Client,
+  StreamableHTTPClientTransport,
+  UnauthorizedError,
+  LATEST_PROTOCOL_VERSION,
+} from "@modelcontextprotocol/client"
 import * as prompts from "@clack/prompts"
 import { UI } from "../ui"
 import { MCP } from "../../mcp"
@@ -137,7 +139,7 @@ export const McpListCommand = effectCmd({
         statusText = "not initialized"
       } else if (status.status === "connected") {
         statusIcon = "✓"
-        statusText = "connected"
+        statusText = `connected${status.era ? ` · ${status.era}` : ""}${status.protocolVersion ? ` (${status.protocolVersion})` : ""}`
         if (hasOAuth && hasStoredTokens) {
           hint = " (OAuth)"
         }
@@ -787,10 +789,21 @@ export const McpDebugCommand = effectCmd({
           })
 
           try {
-            const client = new Client({
-              name: "opencode-debug",
-              version: InstallationVersion,
-            })
+            const client = new Client(
+              { name: "opencode-debug", version: InstallationVersion },
+              {
+                // Mirror createClient's per-server era mapping so diagnostics
+                // match the runtime connection behavior (#448).
+                versionNegotiation: {
+                  mode:
+                    serverConfig.protocol === "legacy"
+                      ? "legacy"
+                      : serverConfig.protocol === "modern"
+                        ? { pin: "2026-07-28" }
+                        : "auto",
+                },
+              },
+            )
             await client.connect(transport)
             prompts.log.success("Connection successful (already authenticated)")
             await client.close()

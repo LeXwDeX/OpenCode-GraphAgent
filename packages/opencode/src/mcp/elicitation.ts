@@ -19,8 +19,7 @@
  *   ─▶ respond to server
  */
 import { Effect, Option, Schema } from "effect"
-import type { Client } from "@modelcontextprotocol/sdk/client/index.js"
-import { ElicitRequestSchema } from "@modelcontextprotocol/sdk/types.js"
+import type { Client } from "@modelcontextprotocol/client"
 import { Question } from "@/question"
 import { SettingsHook, type TriggerResult } from "@/hook/settings"
 import { Notification } from "@/notification"
@@ -85,10 +84,7 @@ interface FieldSpec {
  * reason. MCP form-mode allows flat objects whose properties are primitive
  * string/number/integer/boolean, optionally with an enum.
  */
-export function classifyProperty(
-  name: string,
-  prop: unknown,
-): { field: FieldSpec } | { reject: string } {
+export function classifyProperty(name: string, prop: unknown): { field: FieldSpec } | { reject: string } {
   if (typeof prop !== "object" || prop === null || Array.isArray(prop))
     return { reject: `property "${name}" must be an object` }
   const p = prop as Record<string, unknown>
@@ -97,19 +93,34 @@ export function classifyProperty(
   if (Array.isArray(p.enum)) {
     const enumValues = p.enum.filter((v): v is string => typeof v === "string")
     if (enumValues.length !== p.enum.length) return { reject: `property "${name}" enum must be all strings` }
-    return { field: { name, description: typeof p.description === "string" ? p.description : undefined, kind: "enum", enumValues } }
+    return {
+      field: {
+        name,
+        description: typeof p.description === "string" ? p.description : undefined,
+        kind: "enum",
+        enumValues,
+      },
+    }
   }
   if (type === "boolean") {
-    return { field: { name, description: typeof p.description === "string" ? p.description : undefined, kind: "boolean" } }
+    return {
+      field: { name, description: typeof p.description === "string" ? p.description : undefined, kind: "boolean" },
+    }
   }
   if (type === "string") {
-    return { field: { name, description: typeof p.description === "string" ? p.description : undefined, kind: "string" } }
+    return {
+      field: { name, description: typeof p.description === "string" ? p.description : undefined, kind: "string" },
+    }
   }
   if (type === "number") {
-    return { field: { name, description: typeof p.description === "string" ? p.description : undefined, kind: "number" } }
+    return {
+      field: { name, description: typeof p.description === "string" ? p.description : undefined, kind: "number" },
+    }
   }
   if (type === "integer") {
-    return { field: { name, description: typeof p.description === "string" ? p.description : undefined, kind: "integer" } }
+    return {
+      field: { name, description: typeof p.description === "string" ? p.description : undefined, kind: "integer" },
+    }
   }
   return { reject: `property "${name}" type "${String(type)}" not supported (flat primitives only)` }
 }
@@ -276,13 +287,11 @@ export const handleElicitation = Effect.fn("MCP.elicitation.handle")(function* (
   // decline without surfacing the Question.
   if (settingsHook) {
     const hookResult = yield* settingsHook
-      .trigger(
-        { event: "Elicitation", prompt: input.message, schema: input.requestedSchema } as never,
-        { sessionID, transcriptPath: "" },
-      )
-      .pipe(
-        Effect.catch(() => Effect.succeed<TriggerResult>({ additionalContexts: [], systemMessages: [] })),
-      )
+      .trigger({ event: "Elicitation", prompt: input.message, schema: input.requestedSchema } as never, {
+        sessionID,
+        transcriptPath: "",
+      })
+      .pipe(Effect.catch(() => Effect.succeed<TriggerResult>({ additionalContexts: [], systemMessages: [] })))
     yield* SettingsHook.landSystemMessages(hookResult as TriggerResult, { sessionID })
     if ((hookResult as TriggerResult).blocked) {
       yield* Effect.logWarning("elicitation declined: hook blocked")
@@ -301,14 +310,12 @@ export const handleElicitation = Effect.fn("MCP.elicitation.handle")(function* (
   // rejection (user dismissed) both resolve to decline; only a validated reply
   // resolves to accept.
   const fields = fieldSpecsFromSchema(input.requestedSchema)
-  const validated = yield* question
-    .ask({ sessionID: SessionID.make(sessionID), questions: mapped.questions })
-    .pipe(
-      // timeoutOption returns None on timeout; timeoutOrElse would also work.
-      Effect.timeoutOption(ELICITATION_TIMEOUT_MS),
-      Effect.map((opt) => (Option.isNone(opt) ? undefined : validateAndCoerce(fields, opt.value))),
-      Effect.catch(() => Effect.succeed<undefined>(undefined)), // user reject (RejectedError) → decline
-    )
+  const validated = yield* question.ask({ sessionID: SessionID.make(sessionID), questions: mapped.questions }).pipe(
+    // timeoutOption returns None on timeout; timeoutOrElse would also work.
+    Effect.timeoutOption(ELICITATION_TIMEOUT_MS),
+    Effect.map((opt) => (Option.isNone(opt) ? undefined : validateAndCoerce(fields, opt.value))),
+    Effect.catch(() => Effect.succeed<undefined>(undefined)), // user reject (RejectedError) → decline
+  )
 
   // ElicitationResult hook fires on resolution (result on accept, cancelled otherwise).
   if (settingsHook) {
@@ -330,17 +337,11 @@ export const handleElicitation = Effect.fn("MCP.elicitation.handle")(function* (
  * Register the elicitation handler on a connected MCP client. The handler is a
  * plain async function (Promise-returning) that bridges into the Effect world.
  */
-export function registerElicitationHandler(
-  client: Client,
-  bridge: import("@/effect/bridge").EffectBridge.Shape,
-) {
-  // Dynamic import keeps the protocol schema lazy — the MCP SDK is only pulled
-  // in when elicitation is actually wired, not at module-eval time of callers.
+export function registerElicitationHandler(client: Client, bridge: import("@/effect/bridge").EffectBridge.Shape) {
   // The handler receives the full JSON-RPC request `{ method, params: {...} }`;
-  // the elicitation fields live under `params`.
-  const handler = async (request: {
-    params?: { message?: string; requestedSchema?: unknown; mode?: string }
-  }) => {
+  // the elicitation fields live under `params`. On 2026-era connections the
+  // client drives input_required retries through this same handler.
+  const handler = async (request: { params?: { message?: string; requestedSchema?: unknown; mode?: string } }) => {
     const params = request.params ?? {}
     const sessionID = SessionContext.sessionID ?? activeSession.at(-1)?.id
     const response = await bridge.promise(
@@ -353,7 +354,5 @@ export function registerElicitationHandler(
     )
     return response
   }
-  // The schema is imported eagerly at module load so registration is synchronous
-  // (a lazy dynamic import would race with the first incoming request).
-  client.setRequestHandler(ElicitRequestSchema, handler as never)
+  client.setRequestHandler("elicitation/create", handler as never)
 }

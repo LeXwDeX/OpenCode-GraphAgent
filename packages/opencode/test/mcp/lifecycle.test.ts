@@ -1,7 +1,6 @@
 import path from "node:path"
 import { pathToFileURL } from "node:url"
 import { expect, mock, beforeEach, afterAll } from "bun:test"
-import { ListRootsRequestSchema, ToolListChangedNotificationSchema } from "@modelcontextprotocol/sdk/types.js"
 import { Cause, Effect, Exit } from "effect"
 import type { MCP as MCPNS } from "../../src/mcp/index"
 import { testEffect } from "../lib/effect"
@@ -125,40 +124,25 @@ class MockStreamableHTTP {
   async finishAuth() {}
 }
 
-class MockSSE {
-  // oxlint-disable-next-line no-useless-constructor
-  constructor(_url: URL, _opts?: any) {}
-  async start() {
-    if (connectShouldHang) return new Promise<void>(() => {}) // never resolves
-    if (connectShouldFail) throw new Error(connectError)
-  }
-  async close() {
-    transportCloseCount++
+class MockUnauthorizedError extends Error {
+  constructor() {
+    super("Unauthorized")
+    this.name = "UnauthorizedError"
   }
 }
 
-void mock.module("@modelcontextprotocol/sdk/client/stdio.js", () => ({
+void mock.module("@modelcontextprotocol/client/stdio", () => ({
   StdioClientTransport: MockStdioTransport,
 }))
 
-void mock.module("@modelcontextprotocol/sdk/client/streamableHttp.js", () => ({
-  StreamableHTTPClientTransport: MockStreamableHTTP,
-}))
-
-void mock.module("@modelcontextprotocol/sdk/client/sse.js", () => ({
-  SSEClientTransport: MockSSE,
-}))
-
-void mock.module("@modelcontextprotocol/sdk/client/auth.js", () => ({
-  UnauthorizedError: class extends Error {
-    constructor() {
-      super("Unauthorized")
-    }
-  },
-}))
-
+// v2 packs Client, StreamableHTTPClientTransport, and UnauthorizedError into
+// the single package root, so one mock.module covers the whole surface src
+// imports. Every export src binds at runtime must be present — a missing
+// UnauthorizedError would make `instanceof` throw instead of classify.
 // Mock Client that delegates to per-name MockClientState
-void mock.module("@modelcontextprotocol/sdk/client/index.js", () => ({
+void mock.module("@modelcontextprotocol/client", () => ({
+  StreamableHTTPClientTransport: MockStreamableHTTP,
+  UnauthorizedError: MockUnauthorizedError,
   Client: class MockClient {
     _state!: MockClientState
     transport: any
@@ -302,7 +286,7 @@ it.instance(
         expect(state.clientOptions?.capabilities?.roots).toEqual({})
         expect(state.clientOptions?.capabilities?.roots?.listChanged).toBeUndefined()
 
-        const handler = state.requestHandlers.get(ListRootsRequestSchema)
+        const handler = state.requestHandlers.get("roots/list")
         expect(handler).toBeDefined()
         const result = yield* Effect.promise(() => handler?.() ?? Promise.reject(new Error("roots handler missing")))
         expect(result).toEqual({ roots: [{ uri: pathToFileURL(directory).href }] })
@@ -540,7 +524,7 @@ it.instance(
           { name: "next_tool", description: "next", inputSchema: { type: "object", properties: {} } },
         ]
 
-        const handler = serverState.notificationHandlers.get(ToolListChangedNotificationSchema)
+        const handler = serverState.notificationHandlers.get("notifications/tools/list_changed")
         expect(handler).toBeDefined()
         yield* Effect.promise(() => handler?.())
 
@@ -1280,11 +1264,11 @@ it.instance(
 )
 
 // ========================================================================
-// Test: transport leak — failed remote transports not closed (#19168)
+// Test: transport leak — failed remote transport not closed (#19168)
 // ========================================================================
 
 it.instance(
-  "failed remote transport is closed before trying next transport",
+  "failed remote transport is closed on connect failure",
   () =>
     MCP.Service.use((mcp: MCPNS.Interface) =>
       Effect.gen(function* () {
@@ -1302,8 +1286,8 @@ it.instance(
 
         const serverStatus = (addResult.status as any)["fail-remote"] ?? addResult.status
         expect(serverStatus.status).toBe("failed")
-        // Both StreamableHTTP and SSE transports should be closed
-        expect(transportCloseCount).toBeGreaterThanOrEqual(2)
+        // The StreamableHTTP transport should be closed (no SSE fallback in v2)
+        expect(transportCloseCount).toBeGreaterThanOrEqual(1)
       }),
     ),
   { config: { mcp: {} } },

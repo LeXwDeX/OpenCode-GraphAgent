@@ -1,12 +1,8 @@
 version: 1
-delivery: open-issues-batch
+delivery: expose-negotiated-protocol
 context:
   kind: branch
-  branch: feat/434-open-issues-batch
+  branch: feat/450-expose-negotiated-protocol
 issues:
-  - 434
-  - 442
-  - 443
-  - 440
-  - 436
-pr: 444
+  - 450
+pr: 451

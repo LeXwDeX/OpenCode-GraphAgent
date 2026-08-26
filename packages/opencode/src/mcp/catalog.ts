@@ -1,10 +1,6 @@
-import { Client } from "@modelcontextprotocol/sdk/client/index.js"
-import {
-  CallToolResultSchema,
-  ListToolsResultSchema,
-  ToolSchema,
-  type Tool as MCPToolDef,
-} from "@modelcontextprotocol/sdk/types.js"
+import { ListToolsResultSchema, ToolSchema } from "@modelcontextprotocol/core"
+import { Client } from "@modelcontextprotocol/client"
+import type { Tool as MCPToolDef } from "@modelcontextprotocol/client"
 import { dynamicTool, jsonSchema, type JSONSchema7, type Tool } from "ai"
 import { Effect } from "effect"
 
@@ -56,7 +52,6 @@ export function convertTool(mcpTool: MCPToolDef, client: Client, timeout?: numbe
           name: mcpTool.name,
           arguments: (args || {}) as Record<string, unknown>,
         },
-        CallToolResultSchema,
         {
           resetTimeoutOnProgress: true,
           signal: options.abortSignal,

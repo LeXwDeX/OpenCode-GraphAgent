@@ -1918,6 +1918,7 @@ export type McpLocalConfig = {
   }
   enabled?: boolean
   timeout?: number
+  protocol?: "auto" | "legacy" | "modern"
 }
 
 export type McpOAuthConfig = {
@@ -1946,6 +1947,7 @@ export type McpRemoteConfig = {
    */
   oauth?: McpOAuthConfig | false
   timeout?: number
+  protocol?: "auto" | "legacy" | "modern"
 }
 
 /**
@@ -2464,6 +2466,8 @@ export type FormatterStatus = {
 
 export type McpStatusConnected = {
   status: "connected"
+  era?: "modern" | "legacy"
+  protocolVersion?: string
 }
 
 export type McpStatusDisabled = {

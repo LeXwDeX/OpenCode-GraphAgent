@@ -1,9 +1,6 @@
-import { Client } from "@modelcontextprotocol/sdk/client/index.js"
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js"
-import { LATEST_PROTOCOL_VERSION } from "@modelcontextprotocol/sdk/types.js"
+import { Client, StreamableHTTPClientTransport, LATEST_PROTOCOL_VERSION } from "@modelcontextprotocol/client"
 
 const posts: Array<{ method: string; session: string | null }> = []
-let initializeCount = 0
 let pingCount = 0
 const server = Bun.serve({
   port: 0,
@@ -16,7 +13,6 @@ const server = Bun.serve({
     posts.push({ method: message.method, session })
 
     if (message.method === "initialize") {
-      initializeCount++
       return Response.json(
         {
           jsonrpc: "2.0",
@@ -27,7 +23,7 @@ const server = Bun.serve({
             serverInfo: { name: "test", version: "1" },
           },
         },
-        { headers: { "mcp-session-id": initializeCount === 1 ? "expired" : "replacement" } },
+        { headers: { "mcp-session-id": "expired" } },
       )
     }
 
@@ -40,11 +36,23 @@ const server = Bun.serve({
 })
 const client = new Client({ name: "test", version: "1" })
 
+let pingError: unknown
 try {
   await client.connect(new StreamableHTTPClientTransport(server.url))
   await client.ping()
-  process.stdout.write(JSON.stringify(posts))
+} catch (error) {
+  pingError = error
 } finally {
   await client.close()
   server.stop(true)
 }
+
+const shape =
+  typeof pingError === "object" &&
+  pingError !== null &&
+  "name" in pingError &&
+  "code" in pingError &&
+  "status" in pingError
+    ? { name: String(pingError.name), code: String(pingError.code), status: Number(pingError.status) }
+    : null
+process.stdout.write(JSON.stringify({ posts, error: shape }))

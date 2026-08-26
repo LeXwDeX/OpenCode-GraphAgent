@@ -4,18 +4,9 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { type Tool } from "ai"
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
-import { Client, type ClientOptions } from "@modelcontextprotocol/sdk/client/index.js"
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js"
-import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js"
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
-import { UnauthorizedError } from "@modelcontextprotocol/sdk/client/auth.js"
-import {
-  ListRootsRequestSchema,
-  type LoggingMessageNotification,
-  LoggingMessageNotificationSchema,
-  type Tool as MCPToolDef,
-  ToolListChangedNotificationSchema,
-} from "@modelcontextprotocol/sdk/types.js"
+import { StdioClientTransport } from "@modelcontextprotocol/client/stdio"
+import { Client, StreamableHTTPClientTransport, UnauthorizedError } from "@modelcontextprotocol/client"
+import type { ClientOptions, LoggingMessageNotification, Tool as MCPToolDef } from "@modelcontextprotocol/client"
 import { Config } from "@/config/config"
 import { ConfigMCPV1 } from "@opencode-ai/core/v1/config/mcp"
 import { NamedError } from "@opencode-ai/core/util/error"
@@ -75,15 +66,40 @@ export class NotFoundError extends Schema.TaggedErrorClass<NotFoundError>()("MCP
 
 type MCPClient = Client
 
-function createClient(directory: string) {
-  const client = new Client({ name: "opencode", version: InstallationVersion }, CLIENT_OPTIONS)
-  client.setRequestHandler(ListRootsRequestSchema, () =>
-    Promise.resolve({ roots: [{ uri: pathToFileURL(directory).href }] }),
-  )
+function createClient(directory: string, protocol?: "auto" | "legacy" | "modern") {
+  const client = new Client({ name: "opencode", version: InstallationVersion }, {
+    ...CLIENT_OPTIONS,
+    // Per-server protocol era (#448). Absent/'auto' probes server/discover with
+    // conservative fallback to the 2025 initialize handshake; 'legacy' skips the
+    // probe; 'modern' pins 2026-07-28 with no fallback.
+    versionNegotiation: {
+      mode: protocol === "legacy" ? "legacy" : protocol === "modern" ? { pin: "2026-07-28" } : "auto",
+    },
+  })
+  client.setRequestHandler("roots/list", () => Promise.resolve({ roots: [{ uri: pathToFileURL(directory).href }] }))
   return client
 }
 
-const StatusConnected = Schema.Struct({ status: Schema.Literal("connected") }).annotate({
+// Protocol versions are ISO dates and sort lexicographically, so >= the
+// 2026-07-28 baseline (server/discover era) means modern.
+export function protocolEra(version: string): "modern" | "legacy" {
+  return version >= "2026-07-28" ? "modern" : "legacy"
+}
+
+// Connected status carries the negotiated protocol era/version when the client
+// reports one; test doubles without the getter get the plain shape.
+function connectedStatus(client: MCPClient): Status {
+  const protocolVersion =
+    typeof client.getNegotiatedProtocolVersion === "function" ? client.getNegotiatedProtocolVersion() : undefined
+  if (protocolVersion === undefined) return { status: "connected" }
+  return { status: "connected", era: protocolEra(protocolVersion), protocolVersion }
+}
+
+const StatusConnected = Schema.Struct({
+  status: Schema.Literal("connected"),
+  era: Schema.optional(Schema.Literals(["modern", "legacy"])),
+  protocolVersion: Schema.optional(Schema.String),
+}).annotate({
   identifier: "MCPStatusConnected",
 })
 const StatusDisabled = Schema.Struct({ status: Schema.Literal("disabled") }).annotate({
@@ -110,8 +126,7 @@ export const Status = Schema.Union([
 export type Status = Schema.Schema.Type<typeof Status>
 
 // Store transports for OAuth servers to allow finishing auth
-type TransportWithAuth = StreamableHTTPClientTransport | SSEClientTransport
-const pendingOAuthTransports = new Map<string, TransportWithAuth>()
+const pendingOAuthTransports = new Map<string, StreamableHTTPClientTransport>()
 
 // Prompt cache types
 type PromptInfo = Awaited<ReturnType<MCPClient["listPrompts"]>>["prompts"][number]
@@ -203,20 +218,24 @@ export const layer = Layer.effect(
     const auth = yield* McpAuth.Service
     const events = yield* EventV2Bridge.Service
 
-    type Transport = StdioClientTransport | StreamableHTTPClientTransport | SSEClientTransport
+    type Transport = StdioClientTransport | StreamableHTTPClientTransport
 
     /**
      * Connect a client via the given transport with resource safety:
      * on failure the transport is closed; on success the caller owns it.
      */
-    const connectTransport = Effect.fn("MCP.connectTransport")(function* (transport: Transport, timeout: number) {
+    const connectTransport = Effect.fn("MCP.connectTransport")(function* (
+      transport: Transport,
+      timeout: number,
+      protocol?: "auto" | "legacy" | "modern",
+    ) {
       const directory = yield* InstanceState.directory
       return yield* Effect.acquireUseRelease(
         Effect.succeed(transport),
         (t) =>
           Effect.tryPromise({
             try: () => {
-              const client = createClient(directory)
+              const client = createClient(directory, protocol)
               return withTimeout(client.connect(t), timeout).then(() => client)
             },
             catch: (e) => (e instanceof Error ? e : new Error(String(e))),
@@ -260,70 +279,55 @@ export const layer = Layer.effect(
         )
       }
 
-      const transports: Array<{ name: string; transport: TransportWithAuth }> = [
-        {
-          name: "StreamableHTTP",
-          transport: new StreamableHTTPClientTransport(url, {
-            authProvider,
-            requestInit: mcp.headers ? { headers: mcp.headers } : undefined,
-          }),
-        },
-        {
-          name: "SSE",
-          transport: new SSEClientTransport(url, {
-            authProvider,
-            requestInit: mcp.headers ? { headers: mcp.headers } : undefined,
-          }),
-        },
-      ]
+      // The dual StreamableHTTP→SSE fallback was removed with the v2 migration:
+      // Streamable HTTP failure is terminal (SSE-only servers predate 2025-03-26).
+      const transport = new StreamableHTTPClientTransport(url, {
+        authProvider,
+        requestInit: mcp.headers ? { headers: mcp.headers } : undefined,
+      })
 
       const connectTimeout = mcp.timeout ?? DEFAULT_TIMEOUT
       let lastStatus: Status | undefined
 
-      for (const { name, transport } of transports) {
-        const result = yield* connectTransport(transport, connectTimeout).pipe(
-          Effect.map((client) => ({ client, transportName: name })),
-          Effect.catch((error) => {
-            const lastError = error instanceof Error ? error : new Error(String(error))
-            const isAuthError =
-              error instanceof UnauthorizedError || (authProvider && lastError.message.includes("OAuth"))
+      const result = yield* connectTransport(transport, connectTimeout, mcp.protocol).pipe(
+        Effect.catch((error) => {
+          const lastError = error instanceof Error ? error : new Error(String(error))
+          const isAuthError =
+            error instanceof UnauthorizedError || (authProvider && lastError.message.includes("OAuth"))
 
-            if (isAuthError) {
-              if (lastError.message.includes("registration") || lastError.message.includes("client_id")) {
-                lastStatus = {
-                  status: "needs_client_registration" as const,
-                  error: "Server does not support dynamic client registration. Please provide clientId in config.",
-                }
-                return events
-                  .publish(TuiEvent.ToastShow, {
-                    title: "MCP Authentication Required",
-                    message: `Server "${key}" requires a pre-registered client ID. Add clientId to your config.`,
-                    variant: "warning",
-                    duration: 8000,
-                  })
-                  .pipe(Effect.ignore, Effect.as(undefined))
-              } else {
-                pendingOAuthTransports.set(key, transport)
-                lastStatus = { status: "needs_auth" as const }
-                return events
-                  .publish(TuiEvent.ToastShow, {
-                    title: "MCP Authentication Required",
-                    message: `Server "${key}" requires authentication. Run: opencode mcp auth ${key}`,
-                    variant: "warning",
-                    duration: 8000,
-                  })
-                  .pipe(Effect.ignore, Effect.as(undefined))
+          if (isAuthError) {
+            if (lastError.message.includes("registration") || lastError.message.includes("client_id")) {
+              lastStatus = {
+                status: "needs_client_registration" as const,
+                error: "Server does not support dynamic client registration. Please provide clientId in config.",
               }
+              return events
+                .publish(TuiEvent.ToastShow, {
+                  title: "MCP Authentication Required",
+                  message: `Server "${key}" requires a pre-registered client ID. Add clientId to your config.`,
+                  variant: "warning",
+                  duration: 8000,
+                })
+                .pipe(Effect.ignore, Effect.as(undefined))
+            } else {
+              pendingOAuthTransports.set(key, transport)
+              lastStatus = { status: "needs_auth" as const }
+              return events
+                .publish(TuiEvent.ToastShow, {
+                  title: "MCP Authentication Required",
+                  message: `Server "${key}" requires authentication. Run: opencode mcp auth ${key}`,
+                  variant: "warning",
+                  duration: 8000,
+                })
+                .pipe(Effect.ignore, Effect.as(undefined))
             }
+          }
 
-            lastStatus = { status: "failed" as const, error: lastError.message }
-            return Effect.void
-          }),
-        )
-        if (result) return { client: result.client, status: { status: "connected" } as Status }
-        // If this was an auth error, stop trying other transports
-        if (lastStatus?.status === "needs_auth" || lastStatus?.status === "needs_client_registration") break
-      }
+          lastStatus = { status: "failed" as const, error: lastError.message }
+          return Effect.void
+        }),
+      )
+      if (result) return { client: result, status: connectedStatus(result) }
 
       return {
         client: undefined as MCPClient | undefined,
@@ -351,10 +355,10 @@ export const layer = Layer.effect(
       })
 
       const connectTimeout = mcp.timeout ?? DEFAULT_TIMEOUT
-      return yield* connectTransport(transport, connectTimeout).pipe(
+      return yield* connectTransport(transport, connectTimeout, mcp.protocol).pipe(
         Effect.map((client): { client: MCPClient | undefined; status: Status } => ({
           client,
-          status: { status: "connected" },
+          status: connectedStatus(client),
         })),
         Effect.catch((error): Effect.Effect<{ client: MCPClient | undefined; status: Status }> => {
           const msg = error instanceof Error ? error.message : String(error)
@@ -452,12 +456,12 @@ export const layer = Layer.effect(
         )
       }
 
-      client.setNotificationHandler(LoggingMessageNotificationSchema, (notification) =>
+      client.setNotificationHandler("notifications/message", (notification) =>
         bridge.promise(serverLog(name, notification.params)),
       )
 
       if (!client.getServerCapabilities()?.tools) return
-      client.setNotificationHandler(ToolListChangedNotificationSchema, async () => {
+      client.setNotificationHandler("notifications/tools/list_changed", async () => {
         if (s.clients[name] !== client || s.status[name]?.status !== "connected") return
 
         const listed = await bridge.promise(McpCatalog.defs(client, timeout))
@@ -576,7 +580,7 @@ export const layer = Layer.effect(
     ) {
       const bridge = yield* EffectBridge.make()
       const previous = s.clients[name]
-      s.status[name] = { status: "connected" }
+      s.status[name] = connectedStatus(client)
       s.clients[name] = client
       s.defs[name] = listed
       if (instructions) s.instructions[name] = instructions
@@ -850,7 +854,7 @@ export const layer = Layer.effect(
 
       return yield* Effect.tryPromise({
         try: () => {
-          const client = createClient(directory)
+          const client = createClient(directory, mcpConfig.protocol)
           return client
             .connect(transport)
             .then(() => ({ authorizationUrl: "", oauthState, client }) satisfies AuthResult)
