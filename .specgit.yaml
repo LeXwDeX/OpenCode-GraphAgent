@@ -1,9 +1,7 @@
 version: 1
-delivery: upgrade-mcp-client
+delivery: add-mcp-dual
 context:
   kind: branch
-  branch: refactor/447-upgrade-mcp-client
+  branch: test/452-add-mcp-dual
 issues:
-  - 447
-  - 448
-pr: 449
+  - 452
