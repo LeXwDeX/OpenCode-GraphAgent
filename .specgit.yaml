@@ -1,8 +1,8 @@
 version: 1
-delivery: expose-negotiated-protocol
+delivery: add-mcp-dual
 context:
   kind: branch
-  branch: feat/450-expose-negotiated-protocol
+  branch: test/452-add-mcp-dual
 issues:
-  - 450
-pr: 451
+  - 452
+pr: 453
