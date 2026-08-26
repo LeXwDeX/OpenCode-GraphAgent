@@ -1,9 +1,7 @@
 version: 1
-delivery: upgrade-mcp-client
+delivery: ad-hoc-sign
 context:
   kind: branch
-  branch: refactor/447-upgrade-mcp-client
+  branch: fix/454-ad-hoc-sign
 issues:
-  - 447
-  - 448
-pr: 449
+  - 454
