@@ -1,8 +1,11 @@
 version: 1
-delivery: giant-summary-guard
+delivery: release-notes-v1-0-35
 context:
   kind: branch
-  branch: feat/458-giant-summary-guard
+  branch: docs/460-release-notes-v1-0-35
 issues:
-  - 458
-pr: 459
+  - 460
+issueKinds:
+  - issue: 460
+    kind: kind::docs
+pr: 461
