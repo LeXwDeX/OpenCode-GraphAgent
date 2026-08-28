@@ -267,6 +267,7 @@ This repository uses a multi-context domain-document layout rooted at `CONTEXT-M
 Kept OUTSIDE the managed block so `specgit init`/`--force` never rewrites them; re-apply each deviation after every re-init:
 
 - `specgit-accept.yml` drops the template's `workflow_dispatch` trigger. Dispatch is the privileged context that fires CodeQL's cache-poisoning taint rule on the `head_ref` checkout (false positive: no cache use, read-only token, `persist-credentials: false`), and on dispatch events `head_ref` is empty so the verdict would evaluate the default branch — the wrong tree. Delivery here always goes through a PR. The head-ref checkout itself must NOT be replaced with a SHA: `specgit finish` requires HEAD on the delivery branch (detached_head otherwise).
+- `specgit-accept.yml` installs the CLI globally (`npm install -g specgit@^0.5.0`), NOT the template's `npm install --no-save specgit@X`: a workspace-local install reads this bun workspace's package.json and dies on the `catalog:` protocol (EUNSUPPORTEDPROTOCOL, #434, again on #459). Re-apply after every `specgit init --force`.
 - `spec_git/policy.yaml` `required_checks` uses the template's canonical check IDs (`unit-tests`, `e2e-tests`), not display names.
 
 <!-- specgit:block:start -->

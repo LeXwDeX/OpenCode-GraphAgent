@@ -46,11 +46,12 @@ jobs:
         with:
           node-version: '20.19'
 
-      - name: Install pinned SpecGit CLI
-        # Exact version on purpose (no ^): the gate must evaluate with the
-        # same CLI generation that wrote the binding; upgrades are a
-        # deliberate re-init. --no-save keeps the adopting tree clean.
-        run: npm install --no-save --no-audit --no-fund specgit@1.8.0
+      # Local specialization (survives specgit init --force): the template's
+      # "npm install --no-save specgit@X" reads this repo's package.json and
+      # dies on bun's "catalog:" protocol (EUNSUPPORTEDPROTOCOL, #434). Global
+      # install never touches the workspace manifest.
+      - name: Install specgit CLI
+        run: npm install -g specgit@^0.5.0
 
       - name: Wait for sibling checks
         # The verdict must see the OTHER required checks in a terminal
