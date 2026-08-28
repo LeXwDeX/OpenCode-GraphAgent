@@ -1,8 +1,7 @@
 version: 1
-delivery: ad-hoc-sign
+delivery: giant-summary-guard
 context:
   kind: branch
-  branch: fix/454-ad-hoc-sign
+  branch: feat/458-giant-summary-guard
 issues:
-  - 454
-pr: 455
+  - 458
