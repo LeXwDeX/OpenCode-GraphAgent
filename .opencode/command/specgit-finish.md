@@ -2,6 +2,8 @@
 description: Run the SpecGit evidence verdict and drive the fix loop to exit 0
 ---
 
+<!-- specgit-managed-entry-point -->
+
 # /specgit-finish
 
 Thin trigger for the acceptance verdict. The canonical behavior lives in the
