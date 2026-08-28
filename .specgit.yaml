@@ -1,8 +1,0 @@
-version: 1
-delivery: ad-hoc-sign
-context:
-  kind: branch
-  branch: fix/454-ad-hoc-sign
-issues:
-  - 454
-pr: 455
