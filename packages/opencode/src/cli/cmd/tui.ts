@@ -68,6 +68,19 @@ export function resolveThreadDirectory(project?: string, envPWD = process.env.PW
   return Filesystem.resolve(cwd)
 }
 
+async function needsTranspileReexec() {
+  // The compiled binary embeds its sources; the candidate tsconfig only
+  // exists for source-mode runs, which are the only ones Bun re-transpiles.
+  const candidate = fileURLToPath(new URL("../../../tsconfig.json", import.meta.url))
+  if (!(await Filesystem.exists(candidate))) return false
+  const local = path.join(process.cwd(), "tsconfig.json")
+  if (!(await Filesystem.exists(local))) return true
+  const raw = await Bun.file(local)
+    .text()
+    .catch(() => "")
+  return !raw.includes("@opentui/solid")
+}
+
 export const TuiThreadCommand = cmd({
   command: "$0 [project]",
   describe: "start opencode tui",
@@ -168,6 +181,24 @@ export const TuiThreadCommand = cmd({
       UI.error(`${unsupported} requires --mini`)
       process.exitCode = 1
       return
+    }
+
+    // Bun snapshots the JSX transpiler config from $cwd/tsconfig.json at
+    // startup. Booting the source CLI from a directory without an
+    // @opentui/solid jsxImportSource compiles the TUI's solid JSX against the
+    // react runtime and dies on the first component. Re-exec from the package
+    // directory, which owns a compatible tsconfig; the original directory
+    // still reaches the thread/worker via [project] resolution, so project
+    // keys stay on the user's directory.
+    if (await needsTranspileReexec()) {
+      const pkg = fileURLToPath(new URL("../../../", import.meta.url))
+      const child = Bun.spawn([process.execPath, ...process.execArgv, Bun.main, ...process.argv.slice(2)], {
+        cwd: pkg,
+        stdin: "inherit",
+        stdout: "inherit",
+        stderr: "inherit",
+      })
+      process.exit(await child.exited)
     }
 
     const unguard = win32InstallCtrlCGuard()
