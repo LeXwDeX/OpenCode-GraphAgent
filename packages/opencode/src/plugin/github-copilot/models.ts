@@ -84,6 +84,9 @@ function build(key: string, remote: SelectableItem, url: string, prev?: Model): 
   const image =
     (remote.capabilities.supports.vision ?? false) ||
     (remote.capabilities.limits.vision?.supported_media_types ?? []).some((item) => item.startsWith("image/"))
+  const pdf =
+    (remote.capabilities.supports.vision ?? false) &&
+    (remote.capabilities.limits.vision?.supported_media_types?.includes("application/pdf") ?? false)
 
   const isMsgApi = remote.supported_endpoints?.includes("/v1/messages")
   const prices = remote.billing?.token_prices
@@ -115,7 +118,7 @@ function build(key: string, remote: SelectableItem, url: string, prev?: Model): 
         audio: false,
         image,
         video: false,
-        pdf: false,
+        pdf,
       },
       output: {
         text: true,
