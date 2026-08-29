@@ -1,11 +1,11 @@
 version: 1
-delivery: release-notes-v1-0-35
+delivery: tui-crashes-on
 context:
   kind: branch
-  branch: docs/460-release-notes-v1-0-35
+  branch: fix/465-tui-crashes-on
 issues:
-  - 460
+  - 465
 issueKinds:
-  - issue: 460
-    kind: kind::docs
-pr: 461
+  - issue: 465
+    kind: kind::fix
+pr: 466

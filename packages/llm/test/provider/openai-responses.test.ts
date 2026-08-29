@@ -115,6 +115,7 @@ describe("OpenAI Responses route", () => {
           type: "function",
           name: "read",
           description: "Read a path or resource.",
+          strict: false,
           parameters: {
             type: "object",
             properties: {
@@ -770,6 +771,11 @@ describe("OpenAI Responses route", () => {
         { type: "text-end", id: "msg_1" },
         { type: "step-finish", index: 0, reason: "stop" },
         { type: "finish", reason: "stop" },
+      ])
+      expect(response.events.filter((event) => event.type === "finish")).toHaveLength(1)
+      expect(response.message.content).toEqual([
+        { type: "reasoning", text: "thinking" },
+        { type: "text", text: "Hello" },
       ])
     }),
   )

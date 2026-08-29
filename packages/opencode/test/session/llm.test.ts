@@ -27,6 +27,7 @@ import { LLMAISDK } from "@/session/llm/ai-sdk"
 import { Session as SessionNs } from "@/session/session"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
+import { ProviderError } from "@/provider/error"
 
 type ConfigModel = NonNullable<NonNullable<ConfigV1.Info["provider"]>[string]["models"]>[string]
 
@@ -754,6 +755,75 @@ function createEventResponse(chunks: unknown[], includeDone = false) {
 
 describe("session.llm.stream", () => {
   const vivgridFixture = { providerID: "vivgrid", modelID: "gemini-3.1-pro-preview" }
+  const opencodeFixture = { providerID: "opencode-test", modelID: vivgridFixture.modelID }
+
+  it.instance(
+    "sends the parent session header for opencode providers",
+    () =>
+      Effect.gen(function* () {
+        const fixture = loadFixture(vivgridFixture.providerID, vivgridFixture.modelID)
+        const request = waitRequest(
+          "/chat/completions",
+          new Response(createChatStream("Hello"), {
+            status: 200,
+            headers: { "Content-Type": "text/event-stream" },
+          }),
+        )
+        const resolved = yield* Provider.use.getModel(
+          ProviderV2.ID.make(opencodeFixture.providerID),
+          ModelV2.ID.make(opencodeFixture.modelID),
+        )
+        const sessionID = SessionID.make("session-child")
+        const parentSessionID = SessionID.make("session-parent")
+        const agent = {
+          name: "test",
+          mode: "primary",
+          options: {},
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        } satisfies Agent.Info
+        const user = {
+          id: MessageID.make("msg_user-parent-header"),
+          sessionID,
+          role: "user",
+          time: { created: Date.now() },
+          agent: agent.name,
+          model: {
+            providerID: ProviderV2.ID.make(opencodeFixture.providerID),
+            modelID: resolved.id,
+          },
+        } satisfies SessionV1.User
+
+        yield* drain({
+          user,
+          sessionID,
+          parentSessionID,
+          model: resolved,
+          agent,
+          system: ["You are a helpful assistant."],
+          messages: [{ role: "user", content: "Hello" }],
+          tools: {},
+        })
+
+        expect((yield* Effect.promise(() => request)).headers.get("x-parent-session-id")).toBe(parentSessionID)
+      }),
+    {
+      config: () => {
+        const fixture = loadFixture(vivgridFixture.providerID, vivgridFixture.modelID)
+        return {
+          enabled_providers: [opencodeFixture.providerID],
+          provider: {
+            [opencodeFixture.providerID]: {
+              name: "OpenCode Test",
+              npm: "@ai-sdk/openai-compatible",
+              models: { [fixture.model.id]: configModel(fixture.model) as ConfigModel },
+              options: { apiKey: "test-key", baseURL: `${state.server!.url.origin}/v1` },
+            },
+          },
+        }
+      },
+    },
+  )
+
   it.instance(
     "sends temperature, tokens, and reasoning options for openai-compatible models",
     () =>
@@ -820,6 +890,70 @@ describe("session.llm.stream", () => {
 
         const reasoning = (body.reasoningEffort as string | undefined) ?? (body.reasoning_effort as string | undefined)
         expect(reasoning).toBe("high")
+      }),
+    {
+      config: () => ({
+        enabled_providers: [vivgridFixture.providerID],
+        provider: {
+          [vivgridFixture.providerID]: {
+            options: { apiKey: "test-key", baseURL: `${state.server!.url.origin}/v1` },
+          },
+        },
+      }),
+    },
+  )
+
+  it.instance(
+    "surfaces network_error finish reasons as retryable stream failures",
+    () =>
+      Effect.gen(function* () {
+        const fixture = loadFixture(vivgridFixture.providerID, vivgridFixture.modelID)
+        const request = waitRequest(
+          "/chat/completions",
+          createEventResponse(
+            [
+              {
+                id: "chatcmpl-network-error",
+                object: "chat.completion.chunk",
+                choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: "network_error" }],
+              },
+            ],
+            true,
+          ),
+        )
+        const resolved = yield* Provider.use.getModel(
+          ProviderV2.ID.make(vivgridFixture.providerID),
+          ModelV2.ID.make(fixture.model.id),
+        )
+        const sessionID = SessionID.make("session-test-network-error")
+        const agent = {
+          name: "test",
+          mode: "primary",
+          options: {},
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        } satisfies Agent.Info
+        const user = {
+          id: MessageID.make("msg_user-network-error"),
+          sessionID,
+          role: "user",
+          time: { created: Date.now() },
+          agent: agent.name,
+          model: { providerID: ProviderV2.ID.make(vivgridFixture.providerID), modelID: resolved.id },
+        } satisfies SessionV1.User
+
+        const error = yield* drain({
+          user,
+          sessionID,
+          model: resolved,
+          agent,
+          system: ["You are a helpful assistant."],
+          messages: [{ role: "user", content: "Hello" }],
+          tools: {},
+        }).pipe(Effect.flip)
+        yield* Effect.promise(() => request)
+
+        if (!(error instanceof ProviderError.ResponseStreamError)) throw error
+        expect(error.message).toBe("Provider finish_reason: network_error")
       }),
     {
       config: () => ({
@@ -1314,6 +1448,7 @@ describe("session.llm.stream", () => {
             type: "function",
             name: "lookup",
             description: "Lookup data",
+            strict: false,
             parameters: {
               type: "object",
               properties: { query: { type: "string" } },
@@ -1402,6 +1537,7 @@ describe("session.llm.stream", () => {
             type: "function",
             name: "lookup",
             description: "Lookup data",
+            strict: false,
             parameters: {
               type: "object",
               properties: { query: { type: "string" } },
