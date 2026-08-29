@@ -1,5 +1,5 @@
 #!/bin/sh
-# SpecGit merge guard (managed by specgit init). Exit 2 = block with reason.
+# SpecGit guard (managed by specgit init): start gate + merge guard. Exit 2 = block with reason.
 GUARD_DIR=$(cd "$(dirname "$0")" && pwd)
 export GUARD_DIR
 # Hook payloads arrive as the first argument or on stdin; accept both.
@@ -8,6 +8,21 @@ if [ -n "$1" ]; then
 else
   payload=$(cat)
 fi
+tool=$(printf '%s' "$payload" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{try{const j=JSON.parse(s);process.stdout.write((j.tool_name)||'')}catch{process.stdout.write('')}})")
+case "$tool" in
+  edit|write|Edit|Write)
+    # Start gate (#335): mutating files requires the delivery binding on
+    # THIS branch. The record's context.branch is written by specgit and
+    # matched as a fixed WHOLE line — no YAML parsing, no prefix collision
+    # (branch "feat/1-a" must never satisfy a record for "feat/1-a2").
+    branch=$(git branch --show-current 2>/dev/null)
+    if [ -z "$branch" ] || [ ! -f .specgit.yaml ] || ! grep -qFx "  branch: $branch" .specgit.yaml; then
+      echo "specgit: start gate - this branch has no delivery binding. Start the delivery first: specgit issue \"<type>: <title>\", then fill each issue body from the discussion, then edit files." >&2
+      exit 2
+    fi
+    exit 0
+    ;;
+esac
 command=$(printf '%s' "$payload" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{try{const j=JSON.parse(s);process.stdout.write((j.tool_input&&j.tool_input.command)||'')}catch{process.stdout.write('')}})")
 
 case "$command" in

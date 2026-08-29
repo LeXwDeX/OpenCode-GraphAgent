@@ -64,6 +64,29 @@ export function isDefaultTitle(title: string) {
 
 type SessionRow = typeof SessionTable.$inferSelect
 
+export const MAX_SUMMARY_DIFF_BYTES = 256 * 1024
+
+// Byte accounting mirrors the JSON serialization: 2 bytes for the "[]" wrapper,
+// +1 per comma separator, so kept output never exceeds MAX_SUMMARY_DIFF_BYTES.
+export function truncateSummaryDiffs(diffs: Snapshot.FileDiff[] | undefined) {
+  if (!diffs) return undefined
+  let total = 2
+  const kept: Snapshot.FileDiff[] = []
+  for (const item of diffs) {
+    const size = Buffer.byteLength(JSON.stringify(item)) + (kept.length > 0 ? 1 : 0)
+    if (total + size > MAX_SUMMARY_DIFF_BYTES) break
+    total += size
+    kept.push(item)
+  }
+  return kept
+}
+
+function stripOversizedDiffs<T>(diffs: T[] | null | undefined) {
+  if (!diffs) return undefined
+  if (Buffer.byteLength(JSON.stringify(diffs)) > MAX_SUMMARY_DIFF_BYTES) return undefined
+  return diffs
+}
+
 export function fromRow(row: SessionRow): Info {
   const summary =
     row.summary_additions !== null || row.summary_deletions !== null || row.summary_files !== null
@@ -71,7 +94,7 @@ export function fromRow(row: SessionRow): Info {
           additions: row.summary_additions ?? 0,
           deletions: row.summary_deletions ?? 0,
           files: row.summary_files ?? 0,
-          diffs: row.summary_diffs ?? undefined,
+          diffs: stripOversizedDiffs(row.summary_diffs),
         }
       : undefined
   const share = row.share_url ? { url: row.share_url } : undefined
@@ -142,7 +165,7 @@ export function toRow(info: Info) {
     summary_additions: info.summary?.additions,
     summary_deletions: info.summary?.deletions,
     summary_files: info.summary?.files,
-    summary_diffs: info.summary?.diffs,
+    summary_diffs: truncateSummaryDiffs(info.summary?.diffs),
     metadata: info.metadata,
     cost: info.cost ?? 0,
     tokens_input: (info.tokens ?? EmptyTokens).input,

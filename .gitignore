@@ -59,6 +59,7 @@ tsconfig.tsbuildinfo
 .opencode/dag-init.json
 .opencode/workflow-drafts/
 .opencode/workflow-reports/
-
-# SpecGit delivery binding: local-only, never tracked
-.specgit.yaml
+# >>> specgit: local delivery assets (managed by specgit init) >>>
+/.specgit.yaml
+/spec_git/
+# <<< specgit: local delivery assets (managed by specgit init) <<<
