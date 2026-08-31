@@ -1853,6 +1853,10 @@ const scenarios: Scenario[] = [
         check(typeof summary.status === "string", "summary should have status")
         check(typeof summary.title === "string", "summary should have title")
         check(typeof summary.escalatedNodes === "number", "summary should have escalatedNodes")
+        // #468: graphRev is the topology invalidation token — an equal-count
+        // replan bumps it alone so TUI signatures can detect the change.
+        check(typeof summary.graphRev === "number", "summary should have graphRev")
+        check(summary.graphRev === 1, "fresh fixture workflow should carry graphRev 1")
       }),
     ),
 

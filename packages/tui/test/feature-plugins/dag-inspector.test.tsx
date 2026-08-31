@@ -20,6 +20,7 @@ const wfSummary = (overrides: Partial<DagWorkflowSummary> = {}): DagWorkflowSumm
   id: "wf-1",
   title: "Test workflow",
   status: "running",
+  graphRev: 1,
   nodeCount: 2,
   completedNodes: 0,
   runningNodes: 0,
@@ -65,6 +66,8 @@ async function renderDagInspector(opts: RenderOpts = {}) {
 
   // Updatable workflow state for change detection.
   let workflowsState = opts.workflows ?? []
+  // Updatable node state so a replan can serve a fresh node set.
+  let nodesState = opts.nodes ?? []
 
   // Trackable spies
   const nodesCalls: string[] = []
@@ -95,7 +98,7 @@ async function renderDagInspector(opts: RenderOpts = {}) {
           },
           nodes: async (input: { dagID: string }) => {
             nodesCalls.push(input.dagID)
-            return { data: opts.nodes ?? [] }
+            return { data: nodesState }
           },
           control: async (input: { dagID: string; operation: string }) => {
             controlCalls.push(input)
@@ -184,6 +187,9 @@ async function renderDagInspector(opts: RenderOpts = {}) {
     controlCalls: () => controlCalls,
     setWorkflows: (wfs: DagWorkflowSummary[]) => {
       workflowsState = wfs
+    },
+    setNodes: (nodes: DagNode[]) => {
+      nodesState = nodes
     },
     emitSummaryUpdate: (sessionID: string = SESSION_ID) => {
       eventHandlers.get("dag.workflow.summary.updated")?.({
@@ -363,6 +369,28 @@ describe("DagInspector", () => {
     }
   })
 
+  test("equal-count replan bumps graphRev alone and refetches exactly once with the replanned node set", async () => {
+    const viewer = await renderDagInspector({
+      workflows: [wfSummary({ id: "wf-1", nodeCount: 2, completedNodes: 0, graphRev: 1 })],
+      nodes: [dagNode({ id: "n-1", name: "build-old", status: "running" })],
+    })
+    try {
+      await viewer.app.waitForFrame((frame) => frame.includes("build-old"))
+      const before = viewer.nodesCalls().length
+      // Equal-count replan: identical counts/status, only the topology
+      // revision moved. The server now serves the replanned node set.
+      viewer.setNodes([dagNode({ id: "n-2", name: "build-new", status: "pending" })])
+      viewer.setWorkflows([wfSummary({ id: "wf-1", nodeCount: 2, completedNodes: 0, graphRev: 2 })])
+      viewer.emitSummaryUpdate()
+      await waitForCondition(() => viewer.nodesCalls().length === before + 1)
+      await Bun.sleep(50)
+      expect(viewer.nodesCalls().length).toBe(before + 1)
+      await viewer.app.waitForFrame((frame) => frame.includes("build-new") && !frame.includes("build-old"))
+    } finally {
+      viewer.app.renderer.destroy()
+    }
+  })
+
   test("summary for another session does not trigger a re-fetch", async () => {
     const viewer = await renderDagInspector({
       workflows: [wfSummary({ id: "wf-1", completedNodes: 0 })],
@@ -382,12 +410,18 @@ describe("DagInspector", () => {
 
   test("unchanged summary does not trigger a re-fetch", async () => {
     const viewer = await renderDagInspector({
-      workflows: [wfSummary({ id: "wf-1", completedNodes: 0 })],
+      workflows: [wfSummary({ id: "wf-1", completedNodes: 0, graphRev: 1 })],
       nodes: [dagNode({ id: "n-1", name: "build", status: "running" })],
     })
     try {
       const before = viewer.nodesCalls().length
-      // Don't change the workflow state — signature stays the same.
+      // Re-emit the exact same aggregates AND the same graphRev — a no-op
+      // summary event (server re-broadcasts identical state). Neither emit
+      // may refetch nodes.
+      viewer.setWorkflows([wfSummary({ id: "wf-1", completedNodes: 0, graphRev: 1 })])
+      viewer.emitSummaryUpdate()
+      await Bun.sleep(50)
+      expect(viewer.nodesCalls().length).toBe(before)
       viewer.emitSummaryUpdate()
       await Bun.sleep(50)
       expect(viewer.nodesCalls().length).toBe(before)
