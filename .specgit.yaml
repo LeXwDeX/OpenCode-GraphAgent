@@ -8,3 +8,4 @@ issues:
 issueKinds:
   - issue: 470
     kind: kind::docs
+pr: 471
