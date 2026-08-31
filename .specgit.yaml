@@ -1,8 +1,11 @@
 version: 1
-delivery: replan-topology-refresh
+delivery: release-v1-0-37-notes
 context:
   kind: branch
-  branch: feat/468-replan-topology-refresh
+  branch: docs/470-release-v1-0-37-notes
 issues:
-  - 468
-pr: 469
+  - 470
+issueKinds:
+  - issue: 470
+    kind: kind::docs
+pr: 471
