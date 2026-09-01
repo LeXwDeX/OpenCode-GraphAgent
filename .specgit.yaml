@@ -1,9 +1,8 @@
 version: 1
-delivery: issue472
+delivery: 477-remove-legacy-artifacts
 context:
   kind: worktree
-  label: fix-472
-  branch: feat/472-issue472
+  label: docs-477
+  branch: docs/477-remove-legacy-artifacts
 issues:
-  - 472
-pr: 487
+  - 477
