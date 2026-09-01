@@ -204,6 +204,7 @@ describe("mergeDagWorkflowSummaries", () => {
     skippedNodes: 0,
     queuedNodes: 0,
     escalatedNodes: 0,
+    graphRev: 1,
   })
 
   test("orders merged rows by the project list and keeps the list as source of truth", () => {

@@ -225,11 +225,32 @@ describeWatcher("Watcher", () => {
           const branch = `watch-${Math.random().toString(36).slice(2)}`
           yield* ready(directory)
           yield* Effect.promise(() => $`git branch ${branch}`.cwd(directory).quiet())
+          // Contract for an existing HEAD: once the backend stream has seen HEAD, an
+          // update publishes "change" and removal publishes "unlink". The first write
+          // to a pre-existing but stream-unseen HEAD is backend vocabulary (fs-events
+          // may flag ItemCreated, surfacing as "add" on macOS), so it is consumed only
+          // to record HEAD in the stream — its classification is deliberately not
+          // asserted, while the asserted "change" and "unlink" must match exactly.
+          yield* eventuallyUpdate(
+            (event) => event.file === head,
+            () => fs.writeFileString(head, `ref: refs/heads/${branch}\n`),
+          )
+          const renamed = `watch-${Math.random().toString(36).slice(2)}`
+          yield* Effect.promise(() => $`git branch ${renamed}`.cwd(directory).quiet())
           expect(
-            yield* nextUpdate((event) => event.file === head, fs.writeFileString(head, `ref: refs/heads/${branch}\n`)),
+            yield* nextUpdate(
+              (event) => event.file === head && event.event === "change",
+              fs.writeFileString(head, `ref: refs/heads/${renamed}\n`),
+            ),
           ).toEqual({
             file: head,
             event: "change",
+          })
+          expect(
+            yield* nextUpdate((event) => event.file === head && event.event === "unlink", fs.remove(head)),
+          ).toEqual({
+            file: head,
+            event: "unlink",
           })
         }),
       { git: true },
@@ -247,14 +268,27 @@ describeWatcher("Watcher", () => {
             yield* Effect.addFinalizer(() => Effect.promise(() => fs.rm(actual, { recursive: true, force: true })))
             yield* ready(directory)
             const head = path.join(directory, ".git", "HEAD")
+            const resolved = path.join(actual, "HEAD")
             const branch = `watch-${Math.random().toString(36).slice(2)}`
             yield* Effect.promise(() => $`git branch ${branch}`.cwd(directory).quiet())
+            // Same contract as the direct .git/HEAD case, observed through the symlink:
+            // events carry the realpath of the store, so both the update and the
+            // removal are asserted against actual/HEAD exactly.
+            yield* eventuallyUpdate(
+              (event) => event.file === resolved,
+              () => afs.writeFileString(head, `ref: refs/heads/${branch}\n`),
+            )
+            const renamed = `watch-${Math.random().toString(36).slice(2)}`
+            yield* Effect.promise(() => $`git branch ${renamed}`.cwd(directory).quiet())
             expect(
               yield* nextUpdate(
-                (event) => event.file === path.join(actual, "HEAD"),
-                afs.writeFileString(head, `ref: refs/heads/${branch}\n`),
+                (event) => event.file === resolved && event.event === "change",
+                afs.writeFileString(head, `ref: refs/heads/${renamed}\n`),
               ),
-            ).toEqual({ file: path.join(actual, "HEAD"), event: "change" })
+            ).toEqual({ file: resolved, event: "change" })
+            expect(
+              yield* nextUpdate((event) => event.file === resolved && event.event === "unlink", afs.remove(head)),
+            ).toEqual({ file: resolved, event: "unlink" })
           }),
         {
           git: true,

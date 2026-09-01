@@ -27,6 +27,11 @@ export { Parameters } from "./shell/prompt"
 export const SHELL_ABORT_NOTE =
   "The command was aborted before completion (client interrupt or session cancel). For long-running work, bound it with `timeout <seconds>` and stream progress instead of piping into a silent buffer."
 
+const DEFAULT_SILENCE_WARN_MS = 5 * 60 * 1000
+
+const shellSilenceNote = (ms: number) =>
+  `shell tool emitted an inactivity warning after ${ms} ms without output; the command was left running. If this command is expected to stay silent, pass expectedSilent: true to opt out.`
+
 const MAX_METADATA_LENGTH = 30_000
 const CWD = new Set(["cd", "chdir", "popd", "pushd", "push-location", "set-location"])
 const FILES = new Set([
@@ -352,6 +357,7 @@ export const ShellTool = Tool.define(
     const plugin = yield* Plugin.Service
     const flags = yield* RuntimeFlags.Service
     const defaultTimeoutMs = flags.bashDefaultTimeoutMs ?? 2 * 60 * 1000
+    const silenceWarnMs = flags.bashSilenceWarnMs ?? DEFAULT_SILENCE_WARN_MS
 
     const cygpath = Effect.fn("ShellTool.cygpath")(function* (shell: string, text: string) {
       const lines = yield* spawner
@@ -439,6 +445,7 @@ export const ShellTool = Tool.define(
         cwd: string
         env: NodeJS.ProcessEnv
         timeout: number
+        expectedSilent: boolean
       },
       ctx: Tool.Context,
     ) {
@@ -453,6 +460,9 @@ export const ShellTool = Tool.define(
       let cut = false
       let expired = false
       let aborted = false
+      let lastActivity = Date.now()
+      let silenceWarned = false
+      let silenceWarnings = 0
 
       const closeSink = Effect.fnUntraced(function* () {
         const stream = sink
@@ -492,6 +502,8 @@ export const ShellTool = Tool.define(
 
           const readerFiber = yield* Effect.forkScoped(
             Stream.runForEach(Stream.decodeText(handle.all), (chunk) => {
+              lastActivity = Date.now()
+              silenceWarned = false
               const size = Buffer.byteLength(chunk, "utf-8")
               list.push({ text: chunk, size })
               used += size
@@ -537,6 +549,27 @@ export const ShellTool = Tool.define(
             }),
           )
 
+          // Warn-only silence guard: lives on its own fiber and must never
+          // join the race below — a silence warning may not change exit.kind.
+          if (!input.expectedSilent) {
+            yield* Effect.forkScoped(
+              Effect.forever(
+                Effect.gen(function* () {
+                  const idle = Date.now() - lastActivity
+                  yield* Effect.sleep(`${idle < silenceWarnMs ? silenceWarnMs - idle : silenceWarnMs} millis`)
+                  if (silenceWarned || Date.now() - lastActivity < silenceWarnMs) return
+                  silenceWarned = true
+                  silenceWarnings++
+                  yield* ctx.metadata({
+                    metadata: {
+                      output: last + `\n\n${shellSilenceNote(silenceWarnMs)}`,
+                    },
+                  })
+                }),
+              ),
+            )
+          }
+
           const abort = Effect.callback<void>((resume) => {
             if (ctx.abort.aborted) return resume(Effect.void)
             const handler = () => resume(Effect.void)
@@ -579,6 +612,7 @@ export const ShellTool = Tool.define(
         )
       }
       if (aborted) meta.push(SHELL_ABORT_NOTE)
+      for (let i = 0; i < silenceWarnings; i++) meta.push(shellSilenceNote(silenceWarnMs))
       const raw = list.map((item) => item.text).join("")
       const end = tail(raw, limits.maxLines, limits.maxBytes)
       if (end.cut) cut = true
@@ -614,7 +648,7 @@ export const ShellTool = Tool.define(
         const shell = Shell.acceptable(cfg.shell)
         const name = Shell.name(shell)
         const limits = yield* trunc.limits()
-        const prompt = ShellPrompt.render(name, process.platform, limits, defaultTimeoutMs)
+        const prompt = ShellPrompt.render(name, process.platform, limits, defaultTimeoutMs, silenceWarnMs)
         yield* Effect.logInfo("shell tool using shell", { shell })
 
         return {
@@ -649,6 +683,7 @@ export const ShellTool = Tool.define(
                   cwd,
                   env: yield* shellEnv(ctx, cwd),
                   timeout,
+                  expectedSilent: params.expectedSilent === true,
                 },
                 ctx,
               )

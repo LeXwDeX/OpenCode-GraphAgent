@@ -124,6 +124,7 @@ export const dagHandlers = HttpApiBuilder.group(InstanceHttpApi, "dag", (handler
         id: s.id,
         title: s.title,
         status: s.status,
+        graphRev: s.graphRev,
         nodeCount: s.nodeCount,
         completedNodes: s.completedNodes,
         runningNodes: s.runningNodes,

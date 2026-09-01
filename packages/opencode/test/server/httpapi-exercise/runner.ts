@@ -290,7 +290,7 @@ const resetState = Effect.promise(async () => {
  */
 const CLEANUP_STEP_TIMEOUT_MS = 10_000
 
-async function bounded(label: string, work: () => Promise<unknown>, ms = CLEANUP_STEP_TIMEOUT_MS) {
+export async function bounded(label: string, work: () => Promise<unknown>, ms = CLEANUP_STEP_TIMEOUT_MS) {
   let timer: ReturnType<typeof setTimeout> | undefined
   const timeout = new Promise<"timeout">((resolve) => {
     timer = setTimeout(() => resolve("timeout"), ms)

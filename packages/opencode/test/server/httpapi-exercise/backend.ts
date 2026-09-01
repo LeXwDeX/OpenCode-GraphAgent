@@ -53,9 +53,9 @@ export function callAuthProbe(scenario: ActiveScenario, credentials: "missing" |
   })
 }
 
-type CachedApp = BackendApp & { readonly dispose: () => Promise<void> }
+export type CachedApp = BackendApp & { readonly dispose: () => Promise<void> }
 
-const appCache: Partial<Record<string, CachedApp>> = {}
+export const appCache: Partial<Record<string, CachedApp>> = {}
 
 export async function disposeApps(heartbeat?: (label: string) => void) {
   const apps = Object.values(appCache)

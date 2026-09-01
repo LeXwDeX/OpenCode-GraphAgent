@@ -274,7 +274,9 @@ function DagInspector(props: { api: TuiPluginApi }) {
   }
 
   // Per-workflow summary signature for change detection. Only re-fetch nodes
-  // when the selected workflow's node-level state actually changes.
+  // when the selected workflow's node-level state or topology revision
+  // (graphRev) changes — an equal-count replan bumps graphRev alone, so it
+  // must participate in the signature for the refresh to fire.
   let lastSignature = ""
 
   const signatureFor = (wfId: string): string => {
@@ -284,7 +286,7 @@ function DagInspector(props: { api: TuiPluginApi }) {
     const wf = (sid ? props.api.state.session.dag(sid) : []).find((w) => w.id === wfId) ??
       workflows().find((w) => w.id === wfId)
     if (!wf) return ""
-    return `${wf.nodeCount}:${wf.completedNodes}:${wf.runningNodes}:${wf.failedNodes}`
+    return `${wf.nodeCount}:${wf.completedNodes}:${wf.runningNodes}:${wf.failedNodes}:${wf.graphRev}`
   }
 
   createEffect(() => {

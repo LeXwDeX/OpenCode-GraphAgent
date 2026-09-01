@@ -24,6 +24,10 @@ exports[`tool parameters JSON Schema (wire shape) bash 1`] = `
       "description": "The command to execute",
       "type": "string",
     },
+    "expectedSilent": {
+      "description": "Set true when the command is expected to produce no output for long stretches (watchers, listeners, waits). Suppresses the warn-only shell inactivity warning.",
+      "type": "boolean",
+    },
     "timeout": {
       "description": "Optional timeout in milliseconds",
       "exclusiveMinimum": 0,
