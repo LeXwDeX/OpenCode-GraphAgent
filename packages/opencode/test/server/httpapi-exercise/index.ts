@@ -24,7 +24,6 @@ import path from "path"
 import { array, boolean, check, isRecord, message, object, stable } from "./assertions"
 import { controlledPtyInput, http, route } from "./dsl"
 import {
-  cleanupExercisePaths,
   exerciseConfigDirectory,
   exerciseDataDirectory,
   exerciseDatabasePath,
@@ -33,8 +32,8 @@ import {
 import { color, printHeader, printResults } from "./report"
 import { coverageResult, parseOptions, routeKey, routeKeys, selectedScenarios } from "./routing"
 import { runScenario } from "./runner"
-import { disposeApps } from "./backend"
 import { runtime } from "./runtime"
+import { runMainWithHardExit, teardown } from "./teardown"
 import { type Options, type Scenario } from "./types"
 import { startProgressWatchdog } from "./watchdog"
 
@@ -2216,13 +2215,7 @@ const llmScenarios = new Set([
 ])
 
 const main = Effect.gen(function* () {
-  yield* Effect.addFinalizer(() =>
-    Effect.promise(() => disposeApps(options.heartbeat)).pipe(
-      Effect.andThen(Effect.sync(() => options.heartbeat?.("teardown: cleanupExercisePaths"))),
-      Effect.andThen(cleanupExercisePaths),
-      Effect.andThen(Effect.sync(() => options.heartbeat?.("teardown: complete"))),
-    ),
-  )
+  yield* Effect.addFinalizer(() => Effect.promise(() => teardown(options)))
   const parsed = parseOptions(Bun.argv.slice(2))
   const options: Options = parsed.progress ? { ...parsed, heartbeat: startProgressWatchdog() } : parsed
   const modules = yield* Effect.promise(() => runtime())
@@ -2266,10 +2259,7 @@ const main = Effect.gen(function* () {
   return undefined
 })
 
-Effect.runPromise(main.pipe(Effect.provide(TestLLMServer.layer), Effect.scoped)).then(
-  () => process.exit(0),
-  (error: unknown) => {
-    console.error(`${color.red}${message(error)}${color.reset}`)
-    process.exit(1)
-  },
+runMainWithHardExit(
+  Effect.runPromise(main.pipe(Effect.provide(TestLLMServer.layer), Effect.scoped)),
+  (code) => process.exit(code),
 )

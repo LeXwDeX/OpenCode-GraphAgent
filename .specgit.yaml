@@ -1,9 +1,8 @@
 version: 1
-delivery: git-head-watcher
+delivery: issue472
 context:
   kind: worktree
-  label: fix-473
-  branch: test/git-head-watcher
+  label: fix-472
+  branch: feat/472-issue472
 issues:
-  - 473
-pr: 486
+  - 472
