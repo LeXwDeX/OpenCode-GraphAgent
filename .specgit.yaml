@@ -1,11 +1,8 @@
 version: 1
-delivery: tui-crashes-on
+delivery: stabilize-dirty-worktree
 context:
-  kind: branch
-  branch: fix/465-tui-crashes-on
+  kind: worktree
+  label: fix-474
+  branch: feat/474-stabilize-dirty-worktree
 issues:
-  - 465
-issueKinds:
-  - issue: 465
-    kind: kind::fix
-pr: 466
+  - 474
