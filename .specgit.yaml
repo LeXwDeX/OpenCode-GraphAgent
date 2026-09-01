@@ -6,3 +6,4 @@ context:
   branch: docs/477-remove-legacy-artifacts
 issues:
   - 477
+pr: 480
