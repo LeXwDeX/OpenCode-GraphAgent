@@ -3,7 +3,7 @@ delivery: git-head-watcher
 context:
   kind: worktree
   label: fix-473
-  branch: feat/473-git-head-watcher
+  branch: test/git-head-watcher
 issues:
   - 473
-pr: 484
+pr: 486
