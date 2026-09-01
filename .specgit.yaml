@@ -1,9 +1,9 @@
 version: 1
-delivery: stabilize-dirty-worktree
+delivery: git-head-watcher
 context:
   kind: worktree
-  label: fix-474
-  branch: fix/474-stabilize-dirty-worktree
+  label: fix-473
+  branch: test/git-head-watcher
 issues:
-  - 474
-pr: 482
+  - 473
+pr: 486
