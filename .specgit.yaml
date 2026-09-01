@@ -1,8 +1,7 @@
 version: 1
 delivery: shell-silence-guard
 context:
-  kind: worktree
-  label: issue-433-d1
+  kind: branch
   branch: feat/433-shell-silence-guard
 issues:
   - 433
