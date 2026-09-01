@@ -1,11 +1,11 @@
 version: 1
-delivery: tui-crashes-on
+delivery: refresh-specgit-harness
 context:
   kind: branch
-  branch: fix/465-tui-crashes-on
+  branch: chore/refresh-specgit-harness
 issues:
-  - 465
+  - 488
 issueKinds:
-  - issue: 465
-    kind: kind::fix
-pr: 466
+  - issue: 488
+    kind: kind::chore
+pr: 489
