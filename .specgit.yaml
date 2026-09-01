@@ -3,7 +3,7 @@ delivery: sync-main-to-dev-before-repair-wave
 context:
   kind: worktree
   label: sync-476
-  branch: feat/476-sync-main-to-dev-before-repair-wave
+  branch: chore/476-sync-main-to-dev-before-repair-wave
 issues:
   - 476
-pr: 478
+pr: 479
