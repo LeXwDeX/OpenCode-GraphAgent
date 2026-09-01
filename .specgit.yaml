@@ -1,8 +1,7 @@
 version: 1
-delivery: dag-project-discovery
+delivery: shell-silence-guard
 context:
   kind: branch
-  branch: feat/435-dag-project-discovery
+  branch: feat/433-shell-silence-guard
 issues:
-  - 435
-pr: 490
+  - 433
