@@ -1,11 +1,8 @@
 version: 1
-delivery: tui-crashes-on
+delivery: git-head-watcher
 context:
-  kind: branch
-  branch: fix/465-tui-crashes-on
+  kind: worktree
+  label: fix-473
+  branch: feat/473-git-head-watcher
 issues:
-  - 465
-issueKinds:
-  - issue: 465
-    kind: kind::fix
-pr: 466
+  - 473
