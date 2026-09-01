@@ -297,7 +297,10 @@ export const {
         // its visible progress. We just store it — no client-side aggregation.
         case "dag.workflow.summary.updated":
           if (workspace !== undefined && workspace !== project.workspace.current()) break
-          setStore("dag", event.properties.sessionID, event.properties.summaries)
+          // reconcile (like bootstrap/reconnect) so unchanged same-ID rows keep
+          // store-node identity: a no-op summary must not remount expanded
+          // sidebar rows and re-trigger their signature-guarded fetches.
+          setStore("dag", event.properties.sessionID, reconcile(event.properties.summaries))
           break
 
         case "session.diff":

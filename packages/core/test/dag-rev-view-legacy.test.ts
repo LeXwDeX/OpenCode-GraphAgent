@@ -104,6 +104,7 @@ describe("Train A rev-view — legacy rows render unchanged (A-p4 PIN)", () => {
           id: "wf-legacy",
           title: "Legacy",
           status: "running",
+          graphRev: 1,
           nodeCount: 4,
           completedNodes: 2,
           runningNodes: 0,
