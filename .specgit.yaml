@@ -3,7 +3,7 @@ delivery: stabilize-dirty-worktree
 context:
   kind: worktree
   label: fix-474
-  branch: feat/474-stabilize-dirty-worktree
+  branch: fix/474-stabilize-dirty-worktree
 issues:
   - 474
-pr: 481
+pr: 482
