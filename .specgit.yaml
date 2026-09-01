@@ -5,3 +5,5 @@ context:
   branch: docs/493-correct-v1-0
 issues:
   - 493
+  - 494
+pr: 495
