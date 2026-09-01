@@ -286,6 +286,35 @@ describe("RuntimeFlags", () => {
     { name: "absent", config: {}, expected: undefined },
     {
       name: "valid positive integer",
+      config: { OPENCODE_EXPERIMENTAL_BASH_SILENCE_WARN_MS: "1234" },
+      expected: 1234,
+    },
+    {
+      name: "invalid string",
+      config: { OPENCODE_EXPERIMENTAL_BASH_SILENCE_WARN_MS: "nope" },
+      expected: undefined,
+    },
+    { name: "zero", config: { OPENCODE_EXPERIMENTAL_BASH_SILENCE_WARN_MS: "0" }, expected: undefined },
+    { name: "negative", config: { OPENCODE_EXPERIMENTAL_BASH_SILENCE_WARN_MS: "-1" }, expected: undefined },
+    {
+      name: "non-integer",
+      config: { OPENCODE_EXPERIMENTAL_BASH_SILENCE_WARN_MS: "1.5" },
+      expected: undefined,
+    },
+  ]) {
+    it.effect(`parses bashSilenceWarnMs from config: ${input.name}`, () =>
+      Effect.gen(function* () {
+        const flags = yield* readFlags.pipe(Effect.provide(fromConfig(input.config)))
+
+        expect(flags.bashSilenceWarnMs).toBe(input.expected)
+      }),
+    )
+  }
+
+  for (const input of [
+    { name: "absent", config: {}, expected: undefined },
+    {
+      name: "valid positive integer",
       config: { OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX: "1234" },
       expected: 1234,
     },

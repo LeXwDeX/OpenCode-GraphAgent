@@ -26,7 +26,7 @@ esac
 command=$(printf '%s' "$payload" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{try{const j=JSON.parse(s);process.stdout.write((j.tool_input&&j.tool_input.command)||'')}catch{process.stdout.write('')}})")
 
 case "$command" in
-  gh\ pr\ merge*)
+  gh\ pr\ merge*|glab\ mr\ merge*)
     exec node -e '
       const { spawn } = require("child_process");
       const fs = require("fs");

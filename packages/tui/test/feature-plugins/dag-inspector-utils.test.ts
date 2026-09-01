@@ -8,11 +8,13 @@ import {
   dagNodeGlyph,
   dagNodeHistoryLabel,
   dagStatusColor,
+  dagWorkflowSessions,
   formatDagDeadline,
   formatDagDuration,
   formatDagError,
   formatDagOutputPreview,
   formatDagProgress,
+  mergeDagWorkflowSummaries,
   type DagNode,
 } from "../../src/feature-plugins/system/dag-inspector-utils"
 
@@ -175,5 +177,47 @@ describe("node detail formatting", () => {
   test("progress counts completed+skipped as settled (P2-9)", () => {
     expect(formatDagProgress({ nodeCount: 9, completedNodes: 3, skippedNodes: 4 })).toBe("7/9")
     expect(formatDagProgress({ nodeCount: 2, completedNodes: 0, skippedNodes: 0 })).toBe("0/2")
+  })
+})
+
+describe("dagWorkflowSessions", () => {
+  test("keeps first-seen order and drops duplicate owners", () => {
+    expect(
+      dagWorkflowSessions([{ session_id: "b" }, { session_id: "a" }, { session_id: "b" }]),
+    ).toEqual(["b", "a"])
+  })
+
+  test("empty list yields no sessions", () => {
+    expect(dagWorkflowSessions([])).toEqual([])
+  })
+})
+
+describe("mergeDagWorkflowSummaries", () => {
+  const summary = (id: string) => ({
+    id,
+    title: id,
+    status: "running",
+    nodeCount: 1,
+    completedNodes: 0,
+    runningNodes: 1,
+    failedNodes: 0,
+    skippedNodes: 0,
+    queuedNodes: 0,
+    escalatedNodes: 0,
+    graphRev: 1,
+  })
+
+  test("orders merged rows by the project list and keeps the list as source of truth", () => {
+    const merged = mergeDagWorkflowSummaries([{ id: "b" }, { id: "a" }], [[summary("b")], [summary("a")]])
+    expect(merged.map((row) => row.id)).toEqual(["b", "a"])
+  })
+
+  test("drops summaries for workflows the list no longer reports", () => {
+    const merged = mergeDagWorkflowSummaries([{ id: "a" }], [[summary("a"), summary("ghost")]])
+    expect(merged.map((row) => row.id)).toEqual(["a"])
+  })
+
+  test("empty discovery inputs merge to nothing", () => {
+    expect(mergeDagWorkflowSummaries([], [])).toEqual([])
   })
 })

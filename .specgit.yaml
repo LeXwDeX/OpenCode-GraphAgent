@@ -1,9 +1,8 @@
 version: 1
-delivery: 477-remove-legacy-artifacts
+delivery: shell-silence-guard
 context:
-  kind: worktree
-  label: docs-477
-  branch: docs/477-remove-legacy-artifacts
+  kind: branch
+  branch: feat/433-shell-silence-guard
 issues:
-  - 477
-pr: 480
+  - 433
+pr: 491

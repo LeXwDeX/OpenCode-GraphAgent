@@ -3,7 +3,7 @@ import { describe, expect, test } from "bun:test"
 import { createDefaultOpenTuiKeymap } from "@opentui/keymap/opentui"
 import { testRender, useRenderer } from "@opentui/solid"
 import type { TuiPluginApi, TuiRouteCurrent, TuiRouteDefinition } from "@opencode-ai/plugin/tui"
-import type { DagNode, DagWorkflowSummary } from "@opencode-ai/sdk/v2"
+import type { DagNode, DagWorkflow, DagWorkflowSummary } from "@opencode-ai/sdk/v2"
 import { KVProvider } from "../../src/context/kv"
 import { ThemeProvider } from "../../src/context/theme"
 import { TuiConfigProvider } from "../../src/config"
@@ -34,12 +34,24 @@ const wfSummary = (overrides: Partial<DagWorkflowSummary> = {}): DagWorkflowSumm
 type RenderOpts = {
   workflows?: DagWorkflowSummary[]
   serverWorkflows?: DagWorkflowSummary[]
+  projectWorkflows?: DagWorkflow[]
   nodes?: DagNode[]
   initialRoute?: TuiRouteCurrent
   summary?: (sessionID: string) => Promise<{ data: DagWorkflowSummary[] }>
   fetchTimeoutMs?: number
   width?: number
 }
+
+const projectWorkflow = (overrides: Partial<DagWorkflow> & { id: string; session_id: string }): DagWorkflow => ({
+  project_id: "proj_1",
+  title: `Workflow ${overrides.id}`,
+  status: "running",
+  config: "{}",
+  seq: 1,
+  time_created: 0,
+  time_updated: 0,
+  ...overrides,
+})
 
 function dagNode(overrides: Partial<DagNode> & { id: string }): DagNode {
   return {
@@ -72,6 +84,7 @@ async function renderDagInspector(opts: RenderOpts = {}) {
   // Trackable spies
   const nodesCalls: string[] = []
   const summaryCalls: string[] = []
+  let listCalls = 0
   const controlCalls: { dagID: string; operation: string }[] = []
   const commandCalls: unknown[] = []
   const navigations: { name: string; params?: Record<string, unknown> }[] = []
@@ -92,6 +105,10 @@ async function renderDagInspector(opts: RenderOpts = {}) {
       keymap,
       client: {
         dag: {
+          list: async () => {
+            listCalls += 1
+            return { data: opts.projectWorkflows ?? [] }
+          },
           summary: async (input: { sessionID: string }) => {
             summaryCalls.push(input.sessionID)
             return opts.summary?.(input.sessionID) ?? { data: opts.serverWorkflows ?? workflowsState }
@@ -184,6 +201,7 @@ async function renderDagInspector(opts: RenderOpts = {}) {
     toasts: () => toasts,
     nodesCalls: () => nodesCalls,
     summaryCalls: () => summaryCalls,
+    listCalls: () => listCalls,
     controlCalls: () => controlCalls,
     setWorkflows: (wfs: DagWorkflowSummary[]) => {
       workflowsState = wfs
@@ -727,11 +745,59 @@ describe("DagInspector", () => {
     }
   })
 
-  test("explains missing session context instead of pretending there are no workflows", async () => {
+  test("lists project workflows when the route has no session context", async () => {
+    const viewer = await renderDagInspector({
+      initialRoute: { name: "dag" },
+      projectWorkflows: [
+        projectWorkflow({ id: "wf-p1", session_id: "ses_a", title: "Orphan discovery", status: "running" }),
+        projectWorkflow({ id: "wf-p2", session_id: "ses_b", title: "Other session", status: "completed" }),
+      ],
+      summary: (sessionID) =>
+        Promise.resolve({
+          data:
+            sessionID === "ses_a"
+              ? [wfSummary({ id: "wf-p1", title: "Orphan discovery", status: "running" })]
+              : [],
+        }),
+    })
+    try {
+      // Discovery renders workflows from any session when the route carries
+      // no sessionID — the zero-request empty state is gone.
+      await viewer.app.waitForFrame((frame) => frame.includes("Orphan discovery"))
+      // Workflows group by owning session for the session-scoped summary; a
+      // dead session resolves empty without failing the whole discovery.
+      expect(viewer.summaryCalls()).toEqual(["ses_a", "ses_b"])
+    } finally {
+      viewer.app.renderer.destroy()
+    }
+  })
+
+  test("falls back to project discovery when the routed session has no workflows", async () => {
+    const viewer = await renderDagInspector({
+      projectWorkflows: [projectWorkflow({ id: "wf-p1", session_id: "ses_other" })],
+      summary: (sessionID) =>
+        Promise.resolve({
+          data:
+            sessionID === SESSION_ID
+              ? []
+              : [wfSummary({ id: "wf-p1", title: "Discovered elsewhere", status: "running" })],
+        }),
+    })
+    try {
+      await viewer.app.waitForFrame((frame) => frame.includes("Discovered elsewhere"))
+    } finally {
+      viewer.app.renderer.destroy()
+    }
+  })
+
+  test("without session context the empty state stays honest about what was consulted", async () => {
     const viewer = await renderDagInspector({ initialRoute: { name: "dag" } })
     try {
-      await viewer.app.waitForFrame((frame) => frame.includes("No session context"))
-      // The no-context branch is local-only; it must not touch the server.
+      await viewer.app.waitForFrame((frame) => frame.includes("No DAG workflows"))
+      // The project list is the discovery source that does not depend on the
+      // route's sessionID chain — it is consulted even without a session,
+      // while session summaries never run (an empty list has no sessions).
+      expect(viewer.listCalls()).toBe(1)
       expect(viewer.summaryCalls()).toEqual([])
     } finally {
       viewer.app.renderer.destroy()

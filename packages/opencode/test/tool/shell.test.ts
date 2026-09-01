@@ -1126,6 +1126,113 @@ describe("tool.shell abort", () => {
   )
 })
 
+describe("tool.shell silence guard", () => {
+  const collector = (warned: string[]) => ({
+    ...ctx,
+    metadata: (input: { title?: string; metadata?: { output?: string } }) =>
+      Effect.sync(() => {
+        const output = input.metadata?.output
+        if (output?.includes("inactivity warning after")) warned.push(output)
+      }),
+  })
+
+  it.live(
+    "warns once after bashSilenceWarnMs without output and leaves the command running",
+    () =>
+      runIn(
+        projectRoot,
+        Effect.gen(function* () {
+          const warned: string[] = []
+          const result = yield* run({ command: `sleep 1` }, collector(warned))
+          expect(result.metadata.exit).toBe(0)
+          expect(warned.length).toBe(1)
+          expect(result.output.match(/inactivity warning after/g)?.length).toBe(1)
+          expect(result.output).toContain("expectedSilent: true")
+        }),
+      ).pipe(Effect.provide(RuntimeFlags.layer({ bashSilenceWarnMs: 300 }))),
+    15_000,
+  )
+
+  it.live(
+    "expectedSilent suppresses the inactivity warning",
+    () =>
+      runIn(
+        projectRoot,
+        Effect.gen(function* () {
+          const warned: string[] = []
+          const result = yield* run({ command: `sleep 1`, expectedSilent: true }, collector(warned))
+          expect(result.metadata.exit).toBe(0)
+          expect(warned.length).toBe(0)
+          expect(result.output).not.toContain("inactivity warning after")
+        }),
+      ).pipe(Effect.provide(RuntimeFlags.layer({ bashSilenceWarnMs: 300 }))),
+    15_000,
+  )
+
+  it.live(
+    "resets the silence window when output resumes",
+    () =>
+      runIn(
+        projectRoot,
+        Effect.gen(function* () {
+          const warned: string[] = []
+          const result = yield* run(
+            { command: `sleep 1 && echo tick && sleep 1 && echo done` },
+            collector(warned),
+          )
+          expect(result.metadata.exit).toBe(0)
+          expect(result.output).toContain("tick")
+          expect(result.output).toContain("done")
+          expect(result.output.match(/inactivity warning after/g)?.length).toBe(2)
+        }),
+      ).pipe(Effect.provide(RuntimeFlags.layer({ bashSilenceWarnMs: 300 }))),
+    15_000,
+  )
+
+  it.live(
+    "keeps abort behavior when the silence guard is active",
+    () =>
+      runIn(
+        projectRoot,
+        Effect.gen(function* () {
+          const controller = new AbortController()
+          const res = yield* run(
+            { command: `echo before && sleep 30` },
+            {
+              ...ctx,
+              abort: controller.signal,
+              metadata: (input) =>
+                Effect.sync(() => {
+                  const output = input.metadata?.output
+                  if (output && output.includes("before") && !controller.signal.aborted) {
+                    controller.abort()
+                  }
+                }),
+            },
+          )
+          expect(res.output).toContain("before")
+          expect(res.output).toContain("aborted before completion")
+        }),
+      ).pipe(Effect.provide(RuntimeFlags.layer({ bashSilenceWarnMs: 300 }))),
+    15_000,
+  )
+
+  it.live(
+    "keeps timeout behavior when a silence warning was emitted",
+    () =>
+      runIn(
+        projectRoot,
+        Effect.gen(function* () {
+          const result = yield* run({ command: `sleep 60`, timeout: 2000 })
+          expect(result.output).toContain("shell tool terminated command after exceeding timeout")
+          expect(result.output).toContain("retry with a larger timeout value in milliseconds")
+          expect(result.output.match(/inactivity warning after/g)?.length).toBe(1)
+        }),
+      ).pipe(Effect.provide(RuntimeFlags.layer({ bashSilenceWarnMs: 100 }))),
+    15_000,
+  )
+})
+
 describe("tool.shell truncation", () => {
   it.live("truncates output exceeding line limit", () =>
     runIn(
