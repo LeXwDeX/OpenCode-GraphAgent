@@ -17,6 +17,7 @@ describe("DagSummaryPublisher contract (stateless derived view)", () => {
       id: "wf-1",
       title: "Test",
       status: "running",
+      graphRev: 1,
       nodeCount: 0,
       completedNodes: 0,
       runningNodes: 0,
@@ -26,7 +27,7 @@ describe("DagSummaryPublisher contract (stateless derived view)", () => {
       escalatedNodes: 0,
     }
     // If this compiles, the shape is correct. The keys must match the TUI type.
-    const keys: (keyof WorkflowSummary)[] = ["id", "title", "status", "nodeCount", "completedNodes", "runningNodes", "failedNodes", "skippedNodes", "queuedNodes", "escalatedNodes"]
+    const keys: (keyof WorkflowSummary)[] = ["id", "title", "status", "graphRev", "nodeCount", "completedNodes", "runningNodes", "failedNodes", "skippedNodes", "queuedNodes", "escalatedNodes"]
     expect(Object.keys(s).sort()).toEqual([...keys].sort())
   })
 

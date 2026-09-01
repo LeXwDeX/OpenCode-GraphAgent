@@ -678,6 +678,7 @@ export type DagWorkflowSummary = {
   id: string
   title: string
   status: string
+  graphRev: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
   nodeCount: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
   completedNodes: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
   runningNodes: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
@@ -2952,6 +2953,7 @@ export type DagWorkflowSummary1 = {
   id: string
   title: string
   status: string
+  graphRev: number | "NaN" | "Infinity" | "-Infinity"
   nodeCount: number | "NaN" | "Infinity" | "-Infinity"
   completedNodes: number | "NaN" | "Infinity" | "-Infinity"
   runningNodes: number | "NaN" | "Infinity" | "-Infinity"
