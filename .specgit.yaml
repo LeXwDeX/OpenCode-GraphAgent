@@ -1,11 +1,9 @@
 version: 1
-delivery: release-v1-0-37-notes
+delivery: sync-main-to-dev-before-repair-wave
 context:
-  kind: branch
-  branch: docs/470-release-v1-0-37-notes
+  kind: worktree
+  label: sync-476
+  branch: chore/476-sync-main-to-dev-before-repair-wave
 issues:
-  - 470
-issueKinds:
-  - issue: 470
-    kind: kind::docs
-pr: 471
+  - 476
+pr: 479
