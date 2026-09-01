@@ -3,7 +3,7 @@ delivery: sdk-openapi-race
 context:
   kind: worktree
   label: fix-475
-  branch: feat/475-sdk-openapi-race
+  branch: fix/475-sdk-openapi-race
 issues:
   - 475
-pr: 483
+pr: 485
