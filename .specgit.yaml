@@ -1,11 +1,8 @@
 version: 1
-delivery: refresh-specgit-harness
+delivery: dag-project-discovery
 context:
   kind: branch
-  branch: chore/refresh-specgit-harness
+  branch: feat/435-dag-project-discovery
 issues:
-  - 488
-issueKinds:
-  - issue: 488
-    kind: kind::chore
-pr: 489
+  - 435
+pr: 490
