@@ -6,3 +6,4 @@ context:
   branch: feat/473-git-head-watcher
 issues:
   - 473
+pr: 484
