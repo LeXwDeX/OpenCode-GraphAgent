@@ -7,7 +7,8 @@
   "scripts": {
     "typecheck": "tsgo --noEmit",
     "build": "bun ./script/build.ts",
-    "check:generated": "bun run build && git diff --exit-code -- src/v2/gen"
+    "check:generated": "bun run build && git diff --exit-code -- src/v2/gen",
+    "test:build-race": "bun ./script/build-race-stress.ts"
   },
   "exports": {
     ".": "./src/index.ts",

@@ -1,9 +1,9 @@
 version: 1
-delivery: sync-main-to-dev-before-repair-wave
+delivery: sdk-openapi-race
 context:
   kind: worktree
-  label: sync-476
-  branch: chore/476-sync-main-to-dev-before-repair-wave
+  label: fix-475
+  branch: fix/475-sdk-openapi-race
 issues:
-  - 476
-pr: 479
+  - 475
+pr: 485
