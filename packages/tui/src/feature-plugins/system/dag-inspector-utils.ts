@@ -4,7 +4,7 @@
 /** Pure topology helpers for the DAG inspector. Extracted for unit testing,
  * mirroring the diff-viewer-file-tree-utils pattern in this directory. */
 
-import type { DagNode } from "@opencode-ai/sdk/v2"
+import type { DagNode, DagWorkflowSummary } from "@opencode-ai/sdk/v2"
 
 export type { DagNode }
 
@@ -199,4 +199,42 @@ export function dagControlProgressMessage(operation: DagControlOperation) {
   if (operation === "resume") return "Resuming workflow..."
   if (operation === "step") return "Stepping workflow..."
   return "Cancelling workflow..."
+}
+
+/**
+ * Unique owning sessions of a project-level workflow list, preserving the
+ * list's order. The summary endpoint is session-scoped, so discovery groups
+ * the flat `GET /dag` rows by `session_id` before fetching summaries.
+ */
+export function dagWorkflowSessions(workflows: ReadonlyArray<{ session_id: string }>): string[] {
+  const seen = new Set<string>()
+  const sessions: string[] = []
+  for (const workflow of workflows) {
+    if (seen.has(workflow.session_id)) continue
+    seen.add(workflow.session_id)
+    sessions.push(workflow.session_id)
+  }
+  return sessions
+}
+
+/**
+ * Merge per-session summary lists into one row set ordered by the project
+ * list, dropping summaries for workflows the list no longer reports. Rows
+ * keep the list's identity as the source of truth — a session-scoped summary
+ * can legitimately lag a concurrent cancel.
+ */
+export function mergeDagWorkflowSummaries(
+  list: ReadonlyArray<{ id: string }>,
+  summaries: ReadonlyArray<ReadonlyArray<DagWorkflowSummary>>,
+): DagWorkflowSummary[] {
+  const byID = new Map<string, DagWorkflowSummary>()
+  for (const rows of summaries) {
+    for (const row of rows) byID.set(row.id, row)
+  }
+  const merged: DagWorkflowSummary[] = []
+  for (const workflow of list) {
+    const row = byID.get(workflow.id)
+    if (row) merged.push(row)
+  }
+  return merged
 }

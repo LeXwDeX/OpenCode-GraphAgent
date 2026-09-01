@@ -18,11 +18,13 @@ import {
   dagNodeGlyph,
   dagNodeHistoryLabel,
   dagStatusColor,
+  dagWorkflowSessions,
   formatDagDeadline,
   formatDagDuration,
   formatDagError,
   formatDagOutputPreview,
   formatDagProgress,
+  mergeDagWorkflowSummaries,
   dagEscalationLabel,
   type DagControlOperation,
   type DagNode,
@@ -111,6 +113,33 @@ function cancelActiveWorkflow(api: TuiPluginApi) {
     })
 }
 
+// Project-level discovery: the inspector's workflow list must not depend on
+// the route's sessionID chain, so a missing or stale link can never produce
+// a zero-request empty state. The flat project list groups by owning session
+// for the session-scoped summary endpoint; one dead session must not kill
+// the whole discovery.
+async function discoverProjectWorkflows(
+  api: TuiPluginApi,
+  timeoutMs: number,
+): Promise<{ summaries: DagWorkflowSummary[]; sessionByWorkflow: Map<string, string> }> {
+  const response = await withTimeout(api.client.dag.list(), timeoutMs)
+  const workflows = response.data ?? []
+  const grouped = await Promise.all(
+    dagWorkflowSessions(workflows).map(async (sessionID) => {
+      try {
+        const summaries = await withTimeout(api.client.dag.summary({ sessionID }), timeoutMs)
+        return summaries.data ?? []
+      } catch {
+        return []
+      }
+    }),
+  )
+  return {
+    summaries: mergeDagWorkflowSummaries(workflows, grouped),
+    sessionByWorkflow: new Map(workflows.map((workflow) => [workflow.id, workflow.session_id])),
+  }
+}
+
 function DagInspector(props: { api: TuiPluginApi }) {
   const theme = () => props.api.theme.current
   // The plugin-facing theme omits the resolver flags selectedForeground needs,
@@ -131,56 +160,94 @@ function DagInspector(props: { api: TuiPluginApi }) {
   const [selectedNode, setSelectedNode] = createSignal<string | undefined>(undefined)
   const [nodes, setNodes] = createSignal<DagNode[]>([])
   const [fetchedWorkflows, setFetchedWorkflows] = createSignal<ReadonlyArray<DagWorkflowSummary> | undefined>()
+  const [projectWorkflows, setProjectWorkflows] = createSignal<ReadonlyArray<DagWorkflowSummary>>([])
   const [workflowLoad, setWorkflowLoad] = createSignal<"loading" | "loaded" | "error">("loading")
   const [actionMessage, setActionMessage] = createSignal<string | undefined>()
+  // Owning session per discovered workflow — plain lookup for the summary
+  // event gate, which is scoped to the selected workflow's session, not the
+  // route's. Rebuilt on every discovery run.
+  const sessionByWorkflow = new Map<string, string>()
   let workflowScroll: ScrollBoxRenderable | undefined
   let nodeScroll: ScrollBoxRenderable | undefined
 
   const workflows = createMemo(() => {
+    // Session-scoped live data wins when the route names a session; the
+    // project-level discovery is the floor that keeps the list populated
+    // when that chain is broken, stale, or absent.
     const sid = params()?.sessionID
-    if (!sid) return []
-    const synced = props.api.state.session.dag(sid)
-    return synced.length > 0 ? synced : (fetchedWorkflows() ?? [])
+    if (sid) {
+      const synced = props.api.state.session.dag(sid)
+      if (synced.length > 0) return synced
+      const fetched = fetchedWorkflows()
+      if (fetched && fetched.length > 0) return fetched
+    }
+    return projectWorkflows()
   })
 
   // Refresh authoritative state when the inspector opens. Summary events are
   // ephemeral, so the shared sync slice can legitimately be empty after a
-  // missed event even though the workflow exists on the server.
+  // missed event even though the workflow exists on the server. Project
+  // discovery runs on every mount — it is the one source that does not
+  // depend on the route's sessionID.
   createEffect(() => {
     const sessionID = params()?.sessionID
     setFetchedWorkflows([])
+    setProjectWorkflows([])
+    sessionByWorkflow.clear()
     setSelectedWorkflow(undefined)
     setSelectedNode(undefined)
     setNodes([])
     setActionMessage(undefined)
-    if (!sessionID) {
-      setWorkflowLoad("loaded")
-      return
-    }
     let disposed = false
-    let attemptsLeft = 1
+    let pendingSources = sessionID ? 2 : 1
+    let anySourceLoaded = false
     onCleanup(() => {
       disposed = true
     })
-    const attempt = () => {
-      void withTimeout(props.api.client.dag.summary({ sessionID }), fetchTimeoutMs(props.api))
-        .then((response) => {
-          if (disposed || params()?.sessionID !== sessionID) return
-          setFetchedWorkflows(response.data ?? [])
-          setWorkflowLoad("loaded")
+    const settle = (loaded: boolean) => {
+      if (disposed) return
+      pendingSources -= 1
+      anySourceLoaded = anySourceLoaded || loaded
+      if (pendingSources === 0) setWorkflowLoad(anySourceLoaded ? "loaded" : "error")
+    }
+    const attemptDiscovery = (attemptsLeft: number) => {
+      void withTimeout(discoverProjectWorkflows(props.api, fetchTimeoutMs(props.api)), fetchTimeoutMs(props.api))
+        .then((discovered) => {
+          if (disposed) return
+          setProjectWorkflows(discovered.summaries)
+          for (const [workflowID, owner] of discovered.sessionByWorkflow) {
+            sessionByWorkflow.set(workflowID, owner)
+          }
+          settle(true)
         })
         .catch(() => {
-          if (disposed || params()?.sessionID !== sessionID) return
+          if (disposed) return
           if (attemptsLeft > 0) {
-            attemptsLeft -= 1
-            setTimeout(attempt, RETRY_DELAY_MS)
+            setTimeout(() => attemptDiscovery(attemptsLeft - 1), RETRY_DELAY_MS)
             return
           }
-          setWorkflowLoad("error")
+          settle(false)
+        })
+    }
+    const attemptSession = (session: string, attemptsLeft: number) => {
+      void withTimeout(props.api.client.dag.summary({ sessionID: session }), fetchTimeoutMs(props.api))
+        .then((response) => {
+          if (disposed || params()?.sessionID !== session) return
+          setFetchedWorkflows(response.data ?? [])
+          settle(true)
+        })
+        .catch(() => {
+          if (disposed || params()?.sessionID !== session) return
+          if (attemptsLeft > 0) {
+            setTimeout(() => attemptSession(session, attemptsLeft - 1), RETRY_DELAY_MS)
+            return
+          }
+          settle(false)
         })
     }
     setWorkflowLoad("loading")
-    attempt()
+    attemptDiscovery(1)
+    if (sessionID) attemptSession(sessionID, 1)
   })
 
   // Keep a valid workflow selected: adopt the first workflow when nothing is
@@ -211,10 +278,11 @@ function DagInspector(props: { api: TuiPluginApi }) {
   let lastSignature = ""
 
   const signatureFor = (wfId: string): string => {
+    // The sync slice is read directly — event handlers fire outside any
+    // reactive scope, so a memoized read could serve a stale signature.
     const sid = params()?.sessionID
-    if (!sid) return ""
-    const wfs = props.api.state.session.dag(sid)
-    const wf = wfs.find((w) => w.id === wfId)
+    const wf = (sid ? props.api.state.session.dag(sid) : []).find((w) => w.id === wfId) ??
+      workflows().find((w) => w.id === wfId)
     if (!wf) return ""
     return `${wf.nodeCount}:${wf.completedNodes}:${wf.runningNodes}:${wf.failedNodes}`
   }
@@ -230,12 +298,13 @@ function DagInspector(props: { api: TuiPluginApi }) {
     // open has something to compare against.
     lastSignature = signatureFor(wf)
     void fetchNodes(wf)
-    // Re-fetch nodes only when a summary event for THIS session indicates the
-    // selected workflow's node-level state changed. Summary events for other
-    // sessions and unchanged summaries do not trigger a fetch.
-    const sid = params()?.sessionID
+    // Re-fetch nodes only when a summary event for the selected workflow's
+    // owning session indicates the workflow's node-level state changed.
+    // Project discovery supplies the owning session when the route carries
+    // no sessionID; events for other sessions never trigger a fetch.
+    const owner = sessionByWorkflow.get(wf) ?? params()?.sessionID
     const off = props.api.event.on("dag.workflow.summary.updated", (event) => {
-      if (!sid || event.properties.sessionID !== sid) return
+      if (!owner || event.properties.sessionID !== owner) return
       const sig = signatureFor(wf)
       if (sig === lastSignature) return
       lastSignature = sig
@@ -547,7 +616,7 @@ function DagInspector(props: { api: TuiPluginApi }) {
               <Match when={!params()?.sessionID && workflows().length === 0}>
                 <box marginTop={1}>
                   <text fg={theme().textMuted}>
-                    {"No session context — reopen /dag from within a conversation."}
+                    {"No DAG workflows in this project — run /dag-auto <task> to start an orchestration."}
                   </text>
                 </box>
               </Match>
