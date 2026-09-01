@@ -1,11 +1,8 @@
 version: 1
-delivery: tui-crashes-on
+delivery: sync-main-to-dev-before-repair-wave
 context:
-  kind: branch
-  branch: fix/465-tui-crashes-on
+  kind: worktree
+  label: sync-476
+  branch: feat/476-sync-main-to-dev-before-repair-wave
 issues:
-  - 465
-issueKinds:
-  - issue: 465
-    kind: kind::fix
-pr: 466
+  - 476
