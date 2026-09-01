@@ -75,6 +75,8 @@ export interface WorkflowSummary {
   id: string
   title: string
   status: string
+  /** Topology invalidation token (#468): bumped by replan, so TUI refresh signatures can detect equal-count replans. */
+  graphRev: number
   nodeCount: number
   completedNodes: number
   runningNodes: number
@@ -323,6 +325,7 @@ export const layer = Layer.effect(
           id: wf.id,
           title: wf.title,
           status: wf.status,
+          graphRev: wf.graph_rev,
           ...(counts.get(wf.id) ?? { nodeCount: 0, completedNodes: 0, runningNodes: 0, failedNodes: 0, skippedNodes: 0, queuedNodes: 0 }),
           escalatedNodes: escalatedByWorkflow.get(wf.id) ?? 0,
         }))

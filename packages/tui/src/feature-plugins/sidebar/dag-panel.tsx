@@ -33,7 +33,10 @@ function WorkflowRow(props: {
   const failed = () => Number(props.summary.failedNodes)
   const queued = () => Number(props.summary.queuedNodes)
 
-  const signature = () => `${total()}:${completed()}:${running()}:${failed()}:${queued()}`
+  // graphRev (topology revision) participates so an equal-count replan still
+  // changes the signature and triggers exactly one authoritative re-fetch.
+  const signature = () =>
+    `${total()}:${completed()}:${running()}:${failed()}:${queued()}:${props.summary.graphRev}`
 
   const fetchNodes = async (dagID: string, sig: string) => {
     try {
@@ -49,8 +52,9 @@ function WorkflowRow(props: {
   }
 
   // Signature-triggered fetch: the signature memo only changes value when a
-  // node count actually changes, so this effect re-runs (and re-fetches) only
-  // on real state changes — never on a no-op summary event. No polling.
+  // node count or the topology revision (graphRev) actually changes, so this
+  // effect re-runs (and re-fetches) only on real state changes — never on a
+  // no-op summary event. No polling.
   createEffect(() => {
     const sig = signature()
     if (!props.expanded) {

@@ -9,6 +9,8 @@ export const WorkflowSummary = Schema.Struct({
   id: Schema.String,
   title: Schema.String,
   status: Schema.String,
+  // Topology invalidation token (#468): bumped by replan, so TUI refresh signatures can detect equal-count replans.
+  graphRev: Schema.Number,
   nodeCount: Schema.Number,
   completedNodes: Schema.Number,
   runningNodes: Schema.Number,

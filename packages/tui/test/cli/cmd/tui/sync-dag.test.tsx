@@ -26,6 +26,7 @@ function summary(completed: number, total: number, running = 0, failed = 0): Dag
     id: "wf-1",
     title: "Test workflow",
     status: "running",
+    graphRev: 1,
     nodeCount: total,
     completedNodes: completed,
     runningNodes: running,
@@ -50,7 +51,7 @@ describe("tui sync dag slice", () => {
 
       const stored = sync.data.dag[sid]
       expect(stored).toHaveLength(1)
-      expect(stored[0]).toMatchObject({ id: "wf-1", completedNodes: 2, nodeCount: 5, runningNodes: 1 })
+      expect(stored[0]).toMatchObject({ id: "wf-1", graphRev: 1, completedNodes: 2, nodeCount: 5, runningNodes: 1 })
     } finally {
       app.renderer.destroy()
     }

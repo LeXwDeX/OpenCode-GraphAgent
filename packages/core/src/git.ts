@@ -852,6 +852,13 @@ export const layer = Layer.effect(
       })
     })
 
+    // forceRequired must be derived from locale-stable porcelain state only:
+    // git's refusal prose is translated (e.g. zh_CN catalogs) and never matches reliably.
+    const worktreeDirty = Effect.fnUntraced(function* (directory: AbsolutePath) {
+      const status = yield* execute(directory, proc)(["status", "--porcelain"]).pipe(Effect.result)
+      return status._tag === "Success" && status.success.exitCode === 0 && status.success.text.trim() !== ""
+    })
+
     const worktreeRun = Effect.fnUntraced(function* (
       operation: "create" | "remove" | "list",
       repository: Repository,
@@ -872,7 +879,11 @@ export const layer = Layer.effect(
         operation,
         directory: worktreeDirectory,
         message,
-        forceRequired: operation === "remove" && /contains modified or untracked files|is dirty/i.test(message),
+        forceRequired:
+          operation === "remove" &&
+          result.exitCode === 128 &&
+          worktreeDirectory !== undefined &&
+          (yield* worktreeDirty(worktreeDirectory)),
       })
     })
 

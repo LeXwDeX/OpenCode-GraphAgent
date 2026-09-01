@@ -69,11 +69,12 @@ function workflow(id: string, sessionId: string, projectId: string): WorkflowRow
   }
 }
 
-function summary(id: string, completedNodes: number): WorkflowSummary {
+function summary(id: string, completedNodes: number, graphRev = 1): WorkflowSummary {
   return {
     id,
     title: id,
     status: "running",
+    graphRev,
     nodeCount: completedNodes,
     completedNodes,
     runningNodes: 0,
@@ -485,6 +486,37 @@ describe("DagSummaryPublisher behavior", () => {
           summaries: [summary("dag-workspace", 1)],
           workspace: "wrk-origin",
         })
+      }),
+    ).pipe(Effect.provide(runtime(state, bus)))
+  })
+
+  it.instance("an equal-count replan (graphRev-only change) still emits a fresh summary", () => {
+    const state = control()
+    const bus = {} satisfies EventControl
+    state.sessions.set("dag-replan", "ses-replan")
+    state.summaries.set("ses-replan", [summary("dag-replan", 3, 1)])
+
+    return withCollector((collector) =>
+      Effect.gen(function* () {
+        yield* (yield* DagSummaryPublisher.Service).init()
+        yield* publishNodeEvents(bus, "dag-replan", 1)
+        yield* pollWithTimeout(
+          Effect.sync(() => collector.emissions.length === 1 ? true : undefined),
+          "pre-replan summary was not emitted",
+        )
+
+        // Equal-count replan: node counts and statuses are identical, only the
+        // topology revision moved. The publisher must NOT content-dedupe — the
+        // TUI change signatures depend on seeing the new graphRev propagate.
+        state.summaries.set("ses-replan", [summary("dag-replan", 3, 2)])
+        yield* publishNodeEvents(bus, "dag-replan", 1)
+        yield* pollWithTimeout(
+          Effect.sync(() => (collector.emissions.at(-1)?.summaries[0]?.graphRev === 2 ? true : undefined)),
+          "graphRev-only replan change was not emitted",
+        )
+
+        expect(state.reads.get("ses-replan")).toBe(2)
+        expect(collector.emissions[1].summaries).toEqual([summary("dag-replan", 3, 2)])
       }),
     ).pipe(Effect.provide(runtime(state, bus)))
   })

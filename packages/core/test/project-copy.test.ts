@@ -192,6 +192,44 @@ describe("ProjectCopy", () => {
     }),
   )
 
+  it.live("requires force to remove a git worktree with tracked modifications", () =>
+    Effect.gen(function* () {
+      const input = yield* setup()
+      const copy = yield* ProjectCopy.Service
+      const temp = yield* Effect.promise(() => fs.realpath(path.dirname(input.root.path)))
+      const parent = abs(path.join(temp, path.basename(input.root.path) + "-copy-tracked"))
+      yield* Effect.addFinalizer(() =>
+        Effect.promise(() => fs.rm(parent, { recursive: true, force: true })).pipe(Effect.ignore),
+      )
+      yield* Effect.promise(() => Bun.write(path.join(input.sourceDirectory, "tracked.txt"), "base"))
+      yield* Effect.promise(() => $`git add tracked.txt`.cwd(input.sourceDirectory).quiet())
+      yield* Effect.promise(() => $`git commit -m tracked`.cwd(input.sourceDirectory).quiet())
+      const created = yield* copy.create({
+        projectID: input.projectID,
+        strategy: gitWorktree,
+        sourceDirectory: input.sourceDirectory,
+        directory: parent,
+        name: "copy",
+      })
+      yield* Effect.promise(() => Bun.write(path.join(created.directory, "tracked.txt"), "modified"))
+
+      const error = yield* copy
+        .remove({ projectID: input.projectID, directory: created.directory, force: false })
+        .pipe(Effect.flip)
+
+      expect(error).toBeInstanceOf(Git.WorktreeError)
+      if (error instanceof Git.WorktreeError) {
+        expect(error.operation).toBe("remove")
+        expect(error.forceRequired).toBe(true)
+      }
+      expect(yield* stored(input.projectID)).toContainEqual({ directory: created.directory, strategy: "git_worktree" })
+      expect(yield* Effect.promise(() => Bun.file(path.join(created.directory, "tracked.txt")).exists())).toBe(true)
+
+      yield* copy.remove({ projectID: input.projectID, directory: created.directory, force: true })
+      expect(yield* Effect.promise(() => Bun.file(created.directory).exists())).toBe(false)
+    }),
+  )
+
   it.live("preserves copies whose stored strategy is unavailable", () =>
     Effect.gen(function* () {
       const input = yield* setup()
