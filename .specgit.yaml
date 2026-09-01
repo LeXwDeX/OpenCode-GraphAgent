@@ -1,8 +1,7 @@
 version: 1
 delivery: dag-project-discovery
 context:
-  kind: worktree
-  label: issue-435-delivery
+  kind: branch
   branch: feat/435-dag-project-discovery
 issues:
   - 435
