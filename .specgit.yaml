@@ -1,8 +1,7 @@
 version: 1
-delivery: shell-silence-guard
+delivery: correct-v1-0
 context:
   kind: branch
-  branch: feat/433-shell-silence-guard
+  branch: docs/493-correct-v1-0
 issues:
-  - 433
-pr: 491
+  - 493
