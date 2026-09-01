@@ -1,9 +1,9 @@
 version: 1
-delivery: sdk-openapi-race
+delivery: stabilize-dirty-worktree
 context:
   kind: worktree
-  label: fix-475
-  branch: fix/475-sdk-openapi-race
+  label: fix-474
+  branch: fix/474-stabilize-dirty-worktree
 issues:
-  - 475
-pr: 485
+  - 474
+pr: 482
