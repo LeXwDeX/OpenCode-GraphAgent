@@ -1,23 +1,10 @@
 version: 1
-delivery: hook-command-grandchildren
+delivery: release-notes-v1-0-38
 context:
   kind: branch
-  branch: fix/500-hook-command-grandchildren
+  branch: docs/510-release-notes-v1-0-38
 issues:
-  - 500
-  - 501
-  - 502
-  - 503
-  - 504
+  - 510
 issueKinds:
-  - issue: 500
-    kind: kind::fix
-  - issue: 501
-    kind: kind::fix
-  - issue: 502
-    kind: kind::fix
-  - issue: 503
-    kind: kind::fix
-  - issue: 504
-    kind: kind::fix
-pr: 505
+  - issue: 510
+    kind: kind::docs
