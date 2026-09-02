@@ -20,3 +20,4 @@ issueKinds:
     kind: kind::fix
   - issue: 504
     kind: kind::fix
+pr: 505
