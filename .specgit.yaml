@@ -1,9 +1,16 @@
 version: 1
-delivery: correct-v1-0
+delivery: accept-builtin-spec
 context:
   kind: branch
-  branch: docs/493-correct-v1-0
+  branch: fix/506-accept-builtin-spec
 issues:
-  - 493
-  - 494
-pr: 495
+  - 506
+  - 507
+  - 508
+issueKinds:
+  - issue: 506
+    kind: kind::fix
+  - issue: 507
+    kind: kind::fix
+  - issue: 508
+    kind: kind::docs
