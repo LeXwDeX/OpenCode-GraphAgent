@@ -33,7 +33,7 @@ feat/**, fix/** ──PR(Typecheck + Unit Tests 门禁)──▶ dev ──push 
 **CI 配置**：
 - `ci-typecheck.yml`：push 到 `main`/`dev` + PR → `main`/`dev` 时触发；除 lint + typecheck 外还跑 `test:dag-core` DAG 核心行为/覆盖率门禁（10min 超时）
 - `ci-test.yml`：push 到 `main`/`dev` + PR → `main`/`dev` 时触发全量测试（`cancel-in-progress: false` 保证跑完）；Linux unit-tests job 额外校验生成物新鲜度（`packages/client` 与 `packages/sdk/js` 的 `check:generated`）并跑 HttpAPI 契约门禁（`test:httpapi:ci`）
-- `specgit-accept.yml`：仅 PR → `main` 时触发；全局安装 `specgit@^0.5.0`（`npm install -g`；workspace 内安装会因 bun `catalog:` 协议失败），等 `spec_git/policy.yaml` `required_checks` 全部到终态后运行 `specgit finish --json` 产出 SpecGit Acceptance 裁决
+- `specgit-accept.yml`：仅 PR → `main` 时触发；全局安装 `specgit@1.10.1`（`npm install -g`；workspace 内安装会因 bun `catalog:` 协议失败），等 `spec_git/policy.yaml` `required_checks` 全部到终态（等待脚本手工解析 YAML，不依赖 `yaml` 包）后运行 `specgit finish --json` 产出 SpecGit Acceptance 裁决
 - `release-fork.yml`：手动 `workflow_dispatch` 是唯一真实构建路径（push 到 `main`/`dev` 仅注册不构建）；从 `dev` 发布自动产出 `X.Y.Z-dev.N` prerelease，从 `main` 发布 `X.Y.Z` 并标 Latest
 
 ## Standard Delivery Workflow (标准交付流程)
@@ -267,7 +267,10 @@ This repository uses a multi-context domain-document layout rooted at `CONTEXT-M
 Kept OUTSIDE the managed block so `specgit init`/`--force` never rewrites them; re-apply each deviation after every re-init:
 
 - `specgit-accept.yml` drops the template's `workflow_dispatch` trigger. Dispatch is the privileged context that fires CodeQL's cache-poisoning taint rule on the `head_ref` checkout (false positive: no cache use, read-only token, `persist-credentials: false`), and on dispatch events `head_ref` is empty so the verdict would evaluate the default branch — the wrong tree. Delivery here always goes through a PR. The head-ref checkout itself must NOT be replaced with a SHA: `specgit finish` requires HEAD on the delivery branch (detached_head otherwise).
-- `specgit-accept.yml` installs the CLI globally (`npm install -g specgit@^0.5.0`), NOT the template's `npm install --no-save specgit@X`: a workspace-local install reads this bun workspace's package.json and dies on the `catalog:` protocol (EUNSUPPORTEDPROTOCOL, #434, again on #459). Re-apply after every `specgit init --force`.
+- `specgit-accept.yml` installs the CLI globally (`npm install -g specgit@1.10.1`), NOT the template's `npm install --no-save specgit@X`: a workspace-local install reads this bun workspace's package.json and dies on the `catalog:` protocol (EUNSUPPORTEDPROTOCOL, #434, again on #459). Re-apply after every `specgit init --force`.
+- `specgit-accept.yml` runs the job with `timeout-minutes: 45` while the wait script's own poll deadline is 40 minutes (`Date.now() + 40 * 60 * 1000`): the deadline must stay BELOW the job timeout so a lost race against a slow sibling check exits with its own diagnosis instead of being killed mid-line by the job timeout.
+- `specgit-accept.yml` pins `node-version: '22'` for the wait script and the CLI.
+- The wait script hand-parses `spec_git/policy.yaml` (minimal line-based parse) instead of importing the `yaml` package: no root-reachable `yaml` exists under workspace catalog isolation, so `import { parse } from 'yaml'` would fail to resolve on the runner.
 - `spec_git/policy.yaml` `required_checks` uses the template's canonical check IDs (`unit-tests`, `e2e-tests`), not display names.
 
 <!-- specgit:block:start -->
