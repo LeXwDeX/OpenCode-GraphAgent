@@ -1,20 +1,10 @@
 version: 1
-delivery: leftover-hardening
+delivery: sync-v1-0-39
 context:
   kind: branch
-  branch: test/512-leftover-hardening
+  branch: chore/517-sync-v1-0-39
 issues:
-  - 512
-  - 513
-  - 514
-  - 515
+  - 517
 issueKinds:
-  - issue: 512
-    kind: kind::test
-  - issue: 513
-    kind: kind::fix
-  - issue: 514
-    kind: kind::test
-  - issue: 515
-    kind: kind::refactor
-pr: 516
+  - issue: 517
+    kind: kind::chore
