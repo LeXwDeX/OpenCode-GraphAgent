@@ -7,7 +7,7 @@ import { AbsolutePath } from "@opencode-ai/core/schema"
 import { EffectFlock } from "@opencode-ai/core/util/effect-flock"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Effect, Exit, Fiber, Layer, Ref, Schema } from "effect"
-import * as nodefs from "node:fs/promises"
+import { chmod } from "node:fs/promises"
 import path from "node:path"
 import { MemoryConfig } from "@/memory/config"
 import { MemoryHome } from "@/memory/home"
@@ -834,7 +834,7 @@ describe("Project-owned MEMORY persistence", () => {
           // A read-only directory with a file inside cannot be removed; GC
           // fails while the commit that already landed must not.
           yield* Effect.acquireUseRelease(
-            Effect.promise(() => nodefs.chmod(oldestPath, 0o555)),
+            Effect.promise(() => chmod(oldestPath, 0o555)),
             () =>
               Effect.gen(function* () {
                 const exit = yield* Effect.exit(replaceTopics(store, projectID, [topic("第四版已确认架构边界")]))
@@ -847,7 +847,7 @@ describe("Project-owned MEMORY persistence", () => {
                 // is contained in GC, not the commit.
                 expect(yield* fs.exists(oldestPath)).toBe(true)
               }),
-            () => Effect.promise(() => nodefs.chmod(oldestPath, 0o755)).pipe(Effect.ignore),
+            () => Effect.promise(() => chmod(oldestPath, 0o755)).pipe(Effect.ignore),
           )
         }).pipe(Effect.provide(layers(root)))
       }),
