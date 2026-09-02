@@ -464,7 +464,7 @@ exports[`tool parameters JSON Schema (wire shape) workflow 1`] = `
               "type": "string",
             },
             "spec_path": {
-              "description": "(start/extend/control replan/read/validate) An exact saved workflow name returned by workflow(action="list"), or a path to a YAML workflow spec. Graph content belongs in that file; relative paths resolve from the session directory",
+              "description": "(start/extend/control replan/read/validate) An exact saved workflow name returned by workflow(action="list"), or a path to a YAML workflow spec. The \`builtin://<name>\` path marker list shows for builtin templates also resolves, by name. Graph content belongs in that file; relative paths resolve from the session directory",
               "type": "string",
             },
           },
@@ -484,7 +484,7 @@ exports[`tool parameters JSON Schema (wire shape) workflow 1`] = `
               "type": "string",
             },
             "spec_path": {
-              "description": "(start/extend/control replan/read/validate) An exact saved workflow name returned by workflow(action="list"), or a path to a YAML workflow spec. Graph content belongs in that file; relative paths resolve from the session directory",
+              "description": "(start/extend/control replan/read/validate) An exact saved workflow name returned by workflow(action="list"), or a path to a YAML workflow spec. The \`builtin://<name>\` path marker list shows for builtin templates also resolves, by name. Graph content belongs in that file; relative paths resolve from the session directory",
               "type": "string",
             },
             "workflow_id": {
@@ -517,7 +517,7 @@ exports[`tool parameters JSON Schema (wire shape) workflow 1`] = `
               "type": "string",
             },
             "spec_path": {
-              "description": "(start/extend/control replan/read/validate) An exact saved workflow name returned by workflow(action="list"), or a path to a YAML workflow spec. Graph content belongs in that file; relative paths resolve from the session directory",
+              "description": "(start/extend/control replan/read/validate) An exact saved workflow name returned by workflow(action="list"), or a path to a YAML workflow spec. The \`builtin://<name>\` path marker list shows for builtin templates also resolves, by name. Graph content belongs in that file; relative paths resolve from the session directory",
               "type": "string",
             },
             "workflow_id": {
@@ -649,7 +649,7 @@ exports[`tool parameters JSON Schema (wire shape) workflow 1`] = `
               "type": "string",
             },
             "spec_path": {
-              "description": "(start/extend/control replan/read/validate) An exact saved workflow name returned by workflow(action="list"), or a path to a YAML workflow spec. Graph content belongs in that file; relative paths resolve from the session directory",
+              "description": "(start/extend/control replan/read/validate) An exact saved workflow name returned by workflow(action="list"), or a path to a YAML workflow spec. The \`builtin://<name>\` path marker list shows for builtin templates also resolves, by name. Graph content belongs in that file; relative paths resolve from the session directory",
               "type": "string",
             },
           },
@@ -739,7 +739,7 @@ exports[`tool parameters JSON Schema (wire shape) workflow 1`] = `
                             "type": "boolean",
                           },
                           "worker_config": {
-                            "description": "{ timeout_ms } — bounds node execution; overrides config.node_defaults.worker_config",
+                            "description": "{ timeout_ms } — bounds the node from admission to completion; queue wait counts toward the budget and an expired queued node fails without spawning. A running node that exceeds it escalates to the parent for adjudication (capped deadline extensions) before failing. Overrides config.node_defaults.worker_config",
                             "properties": {
                               "timeout_ms": {
                                 "type": "number",
@@ -935,7 +935,7 @@ exports[`tool parameters JSON Schema (wire shape) workflow 1`] = `
                             "type": "boolean",
                           },
                           "review": {
-                            "description": "(deep review workers) design reviews pre-implementation artifacts; diff reviews require implementation_node_id and verification_node_id",
+                            "description": "(deep review workers) design reviews pre-implementation artifacts; diff reviews require implementation_node_id, verification_node_id, and authoring-validated wiring: transitive review→verification→implementation dependencies, input_mapping for the diff artifact, fingerprint, and verification output, a PASS-gated condition, and a verdict+implementation_fingerprint output_schema; deep mode additionally requires the diff review to feed a required final gate conditioned on verdict ACCEPT. Violations are authoring errors in deep mode, warnings in standard mode.",
                             "properties": {
                               "implementation_node_id": {
                                 "type": "string",
@@ -957,7 +957,7 @@ exports[`tool parameters JSON Schema (wire shape) workflow 1`] = `
                             "type": "object",
                           },
                           "worker_config": {
-                            "description": "{ timeout_ms } — bounds node execution. Inherits config.node_defaults.worker_config",
+                            "description": "{ timeout_ms } — bounds the node from admission to completion; queue wait counts toward the budget and an expired queued node fails without spawning. A running node that exceeds it escalates to the parent for adjudication (capped deadline extensions) before failing. Inherits config.node_defaults.worker_config",
                             "properties": {
                               "timeout_ms": {
                                 "type": "number",
@@ -1020,7 +1020,7 @@ exports[`tool parameters JSON Schema (wire shape) workflow 1`] = `
               "type": "string",
             },
             "spec_path": {
-              "description": "(start/extend/control replan/read/validate) An exact saved workflow name returned by workflow(action="list"), or a path to a YAML workflow spec. Graph content belongs in that file; relative paths resolve from the session directory",
+              "description": "(start/extend/control replan/read/validate) An exact saved workflow name returned by workflow(action="list"), or a path to a YAML workflow spec. The \`builtin://<name>\` path marker list shows for builtin templates also resolves, by name. Graph content belongs in that file; relative paths resolve from the session directory",
               "type": "string",
             },
           },

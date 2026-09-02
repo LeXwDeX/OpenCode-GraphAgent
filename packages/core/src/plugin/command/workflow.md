@@ -587,7 +587,7 @@ omitted content from its preview.
 | `condition`        | no       | Expression evaluated before spawn; node is skipped if false                                                                                          |
 | `input_mapping`    | no       | Map upstream node outputs into template variables                                                                                                    |
 | `report_to_parent` | no       | If true, the parent agent is woken when this node completes or fails. The workflow's terminal status always wakes the parent regardless of this flag |
-| `worker_config`    | no       | `{ timeout_ms }` — bounds node execution (defaults to 10 minutes if omitted)                                                                         |
+| `worker_config`    | no       | `{ timeout_ms }` — bounds the node from admission to completion (defaults to 10 minutes if omitted); queue wait counts toward the budget, an expired queued node fails without spawning, and a running node that exceeds it escalates to the parent for adjudication (capped deadline extensions) before failing |
 | `output_schema`    | no       | JSON Schema; when declared, the child agent must call `submit_result` to submit structured output — failure to submit results in node failure        |
 | `restart`          | no       | (replan only) Re-spawn this running node with new prompt                                                                                             |
 | `cancel`           | no       | (replan only) Cancel this node                                                                                                                       |

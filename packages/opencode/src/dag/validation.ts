@@ -204,7 +204,7 @@ export const NodeSchema = Schema.Struct({
     }),
   ).annotate({
     description:
-      "{ timeout_ms } — bounds the node from admission to completion; queue wait counts toward the budget and an expired queued node fails without spawning. Inherits config.node_defaults.worker_config",
+      "{ timeout_ms } — bounds the node from admission to completion; queue wait counts toward the budget and an expired queued node fails without spawning. A running node that exceeds it escalates to the parent for adjudication (capped deadline extensions) before failing. Inherits config.node_defaults.worker_config",
   }),
   input_mapping: Schema.optional(Schema.Record(Schema.String, Schema.String)).annotate({
     description:
@@ -233,7 +233,7 @@ export const NodeSchema = Schema.Struct({
     }),
   ).annotate({
     description:
-      "(deep review workers) design reviews pre-implementation artifacts; diff reviews require implementation_node_id, verification_node_id, and authoring-validated wiring: transitive review→verification→implementation dependencies, input_mapping for the diff artifact, fingerprint, and verification output, a PASS-gated condition, and a verdict+implementation_fingerprint output_schema. Deep mode rejects violations; standard mode warns.",
+      "(deep review workers) design reviews pre-implementation artifacts; diff reviews require implementation_node_id, verification_node_id, and authoring-validated wiring: transitive review→verification→implementation dependencies, input_mapping for the diff artifact, fingerprint, and verification output, a PASS-gated condition, and a verdict+implementation_fingerprint output_schema; deep mode additionally requires the diff review to feed a required final gate conditioned on verdict ACCEPT. Violations are authoring errors in deep mode, warnings in standard mode.",
   }),
 })
 
