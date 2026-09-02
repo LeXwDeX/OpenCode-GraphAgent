@@ -333,6 +333,7 @@ describe("ShareNext", () => {
           expect(seen).toHaveLength(1)
           expect(seen[0].url).toBe("https://legacy-share.example.com/api/share/shr_abc/sync")
 
+          // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion -- intentional wire-shape assertion on parsed JSON in a test
           const body = JSON.parse(seen[0].body) as {
             secret: string
             data: Array<{

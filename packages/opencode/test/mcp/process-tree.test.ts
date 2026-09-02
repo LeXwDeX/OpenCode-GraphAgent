@@ -21,7 +21,7 @@ test("mcp disconnect kills the local server process and its spawned child", asyn
     Bun.readableStreamToText(child.stderr),
   ])
 
-  expect(code, stderr.toString()).toBe(0)
-  const jsonLine = stdout.toString().trimEnd().split("\n").pop()
+  expect(code, stderr).toBe(0)
+  const jsonLine = stdout.trimEnd().split("\n").pop()
   expect(JSON.parse(jsonLine ?? "")).toMatchObject({ ok: true, rootDead: true, childDead: true })
 })
