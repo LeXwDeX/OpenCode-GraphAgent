@@ -29,6 +29,10 @@ const METADATA_KEYS = [
 ] as const
 const ITEM_KEYS = ["id", "kind", "content", "rationale", "confirmed_at"] as const
 
+// Keep a few recent generations on disk: a reader holding a just-published
+// manifest must still find its generation after later commits GC older ones.
+const RETAINED_GENERATIONS = 3
+
 const PROHIBITED_CONTENT = [
   /```|`[^`]+`/,
   /(?:^|\s)(?:~\/|\.\.?\/|\/)[^\s]+/,
@@ -236,6 +240,25 @@ export const layer = Layer.effect(
       } satisfies Snapshot
     })
 
+    const gcGenerations = Effect.fnUntraced(function* (projectID: ProjectV2.ID) {
+      const generations = home.generations(projectID)
+      const entries = yield* fs.readDirectoryEntries(generations)
+      const stale = entries
+        .filter((entry) => entry.type === "directory" && !entry.name.startsWith("."))
+        .sort(
+          (a, b) => Number.parseInt(b.name, 10) - Number.parseInt(a.name, 10) || b.name.localeCompare(a.name),
+        )
+        .slice(RETAINED_GENERATIONS)
+        .map((entry) => join(generations, entry.name))
+      // Orphan staging directories are rename leftovers from crashed writes.
+      const staging = entries
+        .filter((entry) => entry.name.startsWith(".") && entry.name.endsWith(".tmp"))
+        .map((entry) => join(generations, entry.name))
+      yield* Effect.forEach([...stale, ...staging], (path) => fs.remove(path, { force: true, recursive: true }), {
+        discard: true,
+      })
+    })
+
     const writeSnapshot = Effect.fnUntraced(function* (
       projectID: ProjectV2.ID,
       revision: number,
@@ -265,6 +288,11 @@ export const layer = Layer.effect(
         )
       }).pipe(Effect.onError(() => fs.remove(staging, { force: true, recursive: true }).pipe(Effect.ignore)))
       yield* fs.remove(home.topics(projectID), { force: true, recursive: true }).pipe(Effect.ignore)
+      // GC is best-effort: the commit has already landed, a cleanup failure
+      // must never fail it.
+      yield* gcGenerations(projectID).pipe(
+        Effect.catchCause((cause) => Effect.logWarning("memory generation GC failed", { cause: cause })),
+      )
     })
 
     const readTopics = Effect.fn("MemoryStore.readTopics")((projectID: ProjectV2.ID) =>

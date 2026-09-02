@@ -144,6 +144,12 @@ export async function run(cmd: string[], opts: RunOptions = {}): Promise<Result>
   throw new RunFailedError(cmd, out.code, out.stdout, out.stderr)
 }
 
+// Bounded-stop escalation constants, shared by stop() and stopTree(): time
+// allowed for exit after SIGTERM before escalating to SIGKILL, and the bounded
+// wait for exit after SIGKILL.
+export const STOP_TERM_GRACE_MS = 3_000
+export const STOP_KILL_GRACE_MS = 2_000
+
 // Duplicated in `packages/sdk/js/src/process.ts` because the SDK cannot import
 // `opencode` without creating a cycle. Keep both copies in sync.
 export async function stop(proc: ChildProcess) {
@@ -151,6 +157,9 @@ export async function stop(proc: ChildProcess) {
 
   if (process.platform !== "win32" || !proc.pid) {
     proc.kill()
+    if (await exitedWithin(proc, STOP_TERM_GRACE_MS)) return
+    proc.kill("SIGKILL")
+    await exitedWithin(proc, STOP_KILL_GRACE_MS)
     return
   }
 
@@ -160,6 +169,70 @@ export async function stop(proc: ChildProcess) {
 
   if (out.code === 0) return
   proc.kill()
+}
+
+function exitedWithin(proc: ChildProcess, timeoutMs: number) {
+  if (proc.exitCode !== null || proc.signalCode !== null) return Promise.resolve(true)
+  return new Promise<boolean>((resolve) => {
+    const done = () => {
+      clearTimeout(timer)
+      resolve(true)
+    }
+    const timer = setTimeout(() => {
+      proc.off("exit", done)
+      proc.off("error", done)
+      resolve(proc.exitCode !== null || proc.signalCode !== null)
+    }, timeoutMs)
+    proc.once("exit", done)
+    proc.once("error", done)
+  })
+}
+
+export interface StopTreeOptions {
+  termGraceMs?: number
+  killGraceMs?: number
+}
+
+// Kill every pid in the list: SIGTERM round, bounded wait, SIGKILL round,
+// bounded wait. The pids may belong to processes we did not spawn
+// (grandchildren), so liveness is polled with signal 0 instead of exit events.
+export async function stopTree(pids: number[], opts: StopTreeOptions = {}) {
+  const targets = pids.filter((pid) => pid > 1)
+  if (targets.length === 0) return
+  signalTree(targets, "SIGTERM")
+  if (await treeExitedWithin(targets, opts.termGraceMs ?? STOP_TERM_GRACE_MS)) return
+  signalTree(targets, "SIGKILL")
+  await treeExitedWithin(targets, opts.killGraceMs ?? STOP_KILL_GRACE_MS)
+}
+
+function signalTree(pids: number[], signal: NodeJS.Signals) {
+  for (const pid of pids) {
+    try {
+      process.kill(pid, signal)
+    } catch {}
+  }
+}
+
+function treeExitedWithin(pids: number[], timeoutMs: number) {
+  const deadline = Date.now() + timeoutMs
+  return new Promise<boolean>((resolve) => {
+    const tick = () => {
+      if (pids.every((pid) => !alive(pid))) return resolve(true)
+      if (Date.now() >= deadline) return resolve(false)
+      setTimeout(tick, 50)
+    }
+    tick()
+  })
+}
+
+function alive(pid: number) {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    // EPERM: the process exists but belongs to another user.
+    return (error as NodeJS.ErrnoException).code === "EPERM"
+  }
 }
 
 export async function text(cmd: string[], opts: RunOptions = {}): Promise<TextResult> {
