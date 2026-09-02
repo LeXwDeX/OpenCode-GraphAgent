@@ -137,6 +137,11 @@ try {
   // Some subprocesses don't react properly to SIGTERM and similar signals.
   // Most notably, some docker-container-based MCP servers don't handle such signals unless
   // run using `docker run --init`.
-  // Explicitly exit to avoid any hanging subprocesses.
-  process.exit()
+  // Bounded exit window (#503): the unconditional process.exit() used here cut
+  // off pending async cleanup (instance finalizers, MCP/process stop
+  // escalation). Instead let the event loop drain — a clean exit completes its
+  // cleanup and exits immediately — and force-exit via this unref'd timer only
+  // when a hanging subprocess keeps the loop alive. The grace matches the stop
+  // escalation budget (SIGTERM grace + SIGKILL wait) in util/process.
+  setTimeout(() => process.exit(), 5_000).unref?.()
 }
