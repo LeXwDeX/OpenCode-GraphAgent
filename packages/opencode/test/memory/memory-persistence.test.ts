@@ -7,6 +7,7 @@ import { AbsolutePath } from "@opencode-ai/core/schema"
 import { EffectFlock } from "@opencode-ai/core/util/effect-flock"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Effect, Exit, Fiber, Layer, Ref, Schema } from "effect"
+import * as nodefs from "node:fs/promises"
 import path from "node:path"
 import { MemoryConfig } from "@/memory/config"
 import { MemoryHome } from "@/memory/home"
@@ -767,6 +768,87 @@ describe("Project-owned MEMORY persistence", () => {
           // cross-process conflict guarantee of the commit protocol.
           expect(yield* Effect.promise(() => child.exited)).toBe(0)
           expect(yield* store.readSnapshot(projectID)).toEqual({ revision: 1, topics: [value] })
+        }).pipe(Effect.provide(layers(root)))
+      }),
+  )
+
+  it.live(
+    "retains only the newest generations after repeated commits and sweeps orphan staging",
+    () =>
+      Effect.gen(function* () {
+        const root = yield* tmpdirScoped()
+        yield* Effect.gen(function* () {
+          const fs = yield* FSUtil.Service
+          const home = yield* MemoryHome.Service
+          const store = yield* MemoryStore.Service
+
+          // Crash leftover: a staging directory that never reached its rename.
+          const orphan = path.join(home.generations(projectID), ".0-crashed.tmp")
+          yield* fs.makeDirectory(orphan, { recursive: true })
+          yield* fs.writeFileString(path.join(orphan, "project-architecture.yaml"), "id: orphan\n")
+
+          for (let i = 1; i <= 5; i++) {
+            yield* replaceTopics(store, projectID, [topic(`第${i}版已确认架构边界`)])
+          }
+
+          const entries = yield* fs.readDirectoryEntries(home.generations(projectID))
+          const generations = entries
+            .filter((entry) => !entry.name.startsWith("."))
+            .map((entry) => entry.name)
+            .sort((a, b) => Number.parseInt(a, 10) - Number.parseInt(b, 10))
+          expect(generations).toHaveLength(3)
+          expect(generations.map((name) => Number.parseInt(name, 10))).toEqual([3, 4, 5])
+          expect(entries.some((entry) => entry.name.endsWith(".tmp"))).toBe(false)
+          // The manifest still points at a retained generation.
+          expect(yield* store.readSnapshot(projectID)).toEqual({
+            revision: 5,
+            topics: [topic("第5版已确认架构边界")],
+          })
+        }).pipe(Effect.provide(layers(root)))
+      }),
+  )
+
+  // Windows chmod is a no-op on directories, so the undeletable-generation
+  // injection cannot be staged there.
+  const itPosix = process.platform === "win32" ? it.live.skip : it.live
+  itPosix(
+    "keeps committing when generation GC cannot delete a stale generation",
+    () =>
+      Effect.gen(function* () {
+        const root = yield* tmpdirScoped()
+        yield* Effect.gen(function* () {
+          const fs = yield* FSUtil.Service
+          const home = yield* MemoryHome.Service
+          const store = yield* MemoryStore.Service
+
+          for (let i = 1; i <= 3; i++) {
+            yield* replaceTopics(store, projectID, [topic(`第${i}版已确认架构边界`)])
+          }
+          const entries = yield* fs.readDirectoryEntries(home.generations(projectID))
+          const oldest = entries
+            .filter((entry) => !entry.name.startsWith("."))
+            .map((entry) => entry.name)
+            .sort((a, b) => Number.parseInt(a, 10) - Number.parseInt(b, 10))[0]
+          const oldestPath = path.join(home.generations(projectID), oldest)
+
+          // A read-only directory with a file inside cannot be removed; GC
+          // fails while the commit that already landed must not.
+          yield* Effect.acquireUseRelease(
+            Effect.promise(() => nodefs.chmod(oldestPath, 0o555)),
+            () =>
+              Effect.gen(function* () {
+                const exit = yield* Effect.exit(replaceTopics(store, projectID, [topic("第四版已确认架构边界")]))
+                expect(Exit.isSuccess(exit)).toBe(true)
+                expect(yield* store.readSnapshot(projectID)).toEqual({
+                  revision: 4,
+                  topics: [topic("第四版已确认架构边界")],
+                })
+                // The undeletable generation is still on disk — the failure
+                // is contained in GC, not the commit.
+                expect(yield* fs.exists(oldestPath)).toBe(true)
+              }),
+            () => Effect.promise(() => nodefs.chmod(oldestPath, 0o755)).pipe(Effect.ignore),
+          )
         }).pipe(Effect.provide(layers(root)))
       }),
   )
