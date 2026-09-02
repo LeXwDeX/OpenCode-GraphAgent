@@ -1,17 +1,22 @@
 version: 1
-delivery: accept-builtin-spec
+delivery: hook-command-grandchildren
 context:
   kind: branch
-  branch: fix/506-accept-builtin-spec
+  branch: fix/500-hook-command-grandchildren
 issues:
-  - 506
-  - 507
-  - 508
+  - 500
+  - 501
+  - 502
+  - 503
+  - 504
 issueKinds:
-  - issue: 506
+  - issue: 500
     kind: kind::fix
-  - issue: 507
+  - issue: 501
     kind: kind::fix
-  - issue: 508
-    kind: kind::docs
-pr: 509
+  - issue: 502
+    kind: kind::fix
+  - issue: 503
+    kind: kind::fix
+  - issue: 504
+    kind: kind::fix
