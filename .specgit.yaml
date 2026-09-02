@@ -1,9 +1,8 @@
 version: 1
-delivery: correct-v1-0
+delivery: sync-main-to
 context:
   kind: branch
-  branch: docs/493-correct-v1-0
+  branch: chore/496-sync-main-to
 issues:
-  - 493
-  - 494
-pr: 495
+  - 496
+pr: 497
