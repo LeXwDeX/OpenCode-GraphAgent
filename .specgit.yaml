@@ -1,11 +1,19 @@
 version: 1
-delivery: release-notes-v1-0-38
+delivery: leftover-hardening
 context:
   kind: branch
-  branch: docs/510-release-notes-v1-0-38
+  branch: test/512-leftover-hardening
 issues:
-  - 510
+  - 512
+  - 513
+  - 514
+  - 515
 issueKinds:
-  - issue: 510
-    kind: kind::docs
-pr: 511
+  - issue: 512
+    kind: kind::test
+  - issue: 513
+    kind: kind::fix
+  - issue: 514
+    kind: kind::test
+  - issue: 515
+    kind: kind::refactor
