@@ -36,7 +36,8 @@ export class WorkflowBlock extends Schema.Class<WorkflowBlock>("WorkflowBlock")(
       timeout_ms: Schema.Number,
     }),
   ).annotate({
-    description: "{ timeout_ms } — bounds node execution; overrides config.node_defaults.worker_config",
+      description:
+        "{ timeout_ms } — bounds the node from admission to completion (queue wait counts toward the budget); overrides config.node_defaults.worker_config",
   }),
   required: Schema.optional(Schema.Boolean).annotate({
     description:

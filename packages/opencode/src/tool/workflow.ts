@@ -57,7 +57,7 @@ export { Parameters as WorkflowParameters }
 // ============================================================================
 
 const specPathDescription =
-  '(start/extend/control replan/read/validate) An exact saved workflow name returned by workflow(action="list"), or a path to a YAML workflow spec. Graph content belongs in that file; relative paths resolve from the session directory'
+  '(start/extend/control replan/read/validate) An exact saved workflow name returned by workflow(action="list"), or a path to a YAML workflow spec. The `builtin://<name>` path marker list shows for builtin templates also resolves, by name. Graph content belongs in that file; relative paths resolve from the session directory'
 
 const StartPath = Schema.Struct({
   action: Schema.Literal("start").annotate({ description: "Create a workflow" }),
