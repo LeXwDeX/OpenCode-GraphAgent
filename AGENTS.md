@@ -33,7 +33,7 @@ feat/**, fix/** ──PR(Typecheck + Unit Tests 门禁)──▶ dev ──push 
 **CI 配置**：
 - `ci-typecheck.yml`：push 到 `main`/`dev` + PR → `main`/`dev` 时触发；除 lint + typecheck 外还跑 `test:dag-core` DAG 核心行为/覆盖率门禁（10min 超时）
 - `ci-test.yml`：push 到 `main`/`dev` + PR → `main`/`dev` 时触发全量测试（`cancel-in-progress: false` 保证跑完）；Linux unit-tests job 额外校验生成物新鲜度（`packages/client` 与 `packages/sdk/js` 的 `check:generated`）并跑 HttpAPI 契约门禁（`test:httpapi:ci`）
-- `specgit-accept.yml`：仅 PR → `main` 时触发；安装 pinned `specgit@1.0.1`，等 `spec_git/policy.yaml` `required_checks` 全部到终态后运行 `specgit finish --json` 产出 SpecGit Acceptance 裁决
+- `specgit-accept.yml`：仅 PR → `main` 时触发；全局安装 `specgit@^0.5.0`（`npm install -g`；workspace 内安装会因 bun `catalog:` 协议失败），等 `spec_git/policy.yaml` `required_checks` 全部到终态后运行 `specgit finish --json` 产出 SpecGit Acceptance 裁决
 - `release-fork.yml`：手动 `workflow_dispatch` 是唯一真实构建路径（push 到 `main`/`dev` 仅注册不构建）；从 `dev` 发布自动产出 `X.Y.Z-dev.N` prerelease，从 `main` 发布 `X.Y.Z` 并标 Latest
 
 ## Standard Delivery Workflow (标准交付流程)
