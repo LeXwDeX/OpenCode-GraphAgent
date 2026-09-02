@@ -1716,7 +1716,11 @@ describe("memory hidden model", () => {
         catch: (cause) => cause,
       }).pipe(Effect.flip)
       expect(error instanceof MemoryModel.Stalled).toBe(true)
-      expect(Date.now() - started).toBeLessThan(200)
+      // Fail-fast bound, not a scheduler bound: drainWithLiveness arms raw
+      // setTimeout (no TestClock), and a loaded linux runner was observed
+      // firing the 40ms connectTimeout at 288ms. 2000ms still separates
+      // fail-fast from hang (a hang trips the test timeout instead).
+      expect(Date.now() - started).toBeLessThan(2000)
     }),
   )
 

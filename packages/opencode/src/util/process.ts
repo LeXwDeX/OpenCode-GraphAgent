@@ -150,6 +150,20 @@ export async function run(cmd: string[], opts: RunOptions = {}): Promise<Result>
 export const STOP_TERM_GRACE_MS = 3_000
 export const STOP_KILL_GRACE_MS = 2_000
 
+// Platform group-kill primitive: POSIX signals the process group led by `pid`
+// (the child must be a detached group leader); win32 has no group semantics,
+// so `taskkill /T /F` tree-kills instead and `signal` is ignored. Resolves
+// once the kill is delivered — on win32 that means awaiting the taskkill exit
+// code — and throws when delivery fails, leaving fallback and logging to the
+// caller.
+export async function killGroupPid(pid: number, signal: NodeJS.Signals = "SIGKILL") {
+  if (process.platform !== "win32") {
+    process.kill(-pid, signal)
+    return
+  }
+  await run(["taskkill", "/pid", String(pid), "/T", "/F"])
+}
+
 // Duplicated in `packages/sdk/js/src/process.ts` because the SDK cannot import
 // `opencode` without creating a cycle. Keep both copies in sync.
 export async function stop(proc: ChildProcess) {
@@ -163,12 +177,11 @@ export async function stop(proc: ChildProcess) {
     return
   }
 
-  const out = await run(["taskkill", "/pid", String(proc.pid), "/T", "/F"], {
-    nothrow: true,
-  })
-
-  if (out.code === 0) return
-  proc.kill()
+  try {
+    await killGroupPid(proc.pid)
+  } catch {
+    proc.kill()
+  }
 }
 
 function exitedWithin(proc: ChildProcess, timeoutMs: number) {
