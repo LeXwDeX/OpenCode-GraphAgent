@@ -64,8 +64,11 @@ config:
 
 ## Saved workflows
 
-A `spec_path` with no path separator and no `.yaml`/`.yml` extension is a
-**name** resolved against the workflow library instead of the filesystem:
+A `spec_path` with no path separator, no leading `.`, no control characters,
+and no `.yaml`/`.yml` extension is a **name** resolved against the workflow
+library instead of the filesystem (a leading dot or a recognized extension
+means a filesystem path). The synthetic `builtin://<name>` marker the `list`
+output shows for builtin templates also resolves by name:
 
 1. `.opencode/workflows/<name>.yaml` — project scope, committed with the repo
 2. `<opencode config dir>/workflows/<name>.yaml` — global scope, available in every project
@@ -340,7 +343,7 @@ Workflows are not static. After creating a workflow, use `extend` and `control(r
 
 - **Scale up**: a node reports the work is larger than expected → `extend` with additional parallel nodes to split the load.
 - **Cut short**: a node proves the remaining work is unnecessary → `control(complete)` to early-complete and skip pending nodes.
-- **Redirect**: a gate or review reveals a wrong direction → `control(pause)` first to freeze scheduling, then `control(replan)` with `restart: true` on the affected nodes and `cancel: true` on their downstream dependents, then `control(resume)`.
+- **Redirect**: a gate or review reveals a wrong direction → `control(pause)` first to freeze scheduling, then `control(replan)` with `restart: true` on the affected nodes and `cancel: true` on their downstream dependents. A successful replan auto-resumes a paused workflow; issue `control(resume)` manually only when the replan output reports the automatic resume raced with another control op.
 
 Only nodes with `report_to_parent: true` produce intermediate parent
 checkpoints, and those reports are delivered at the next actionable wake
@@ -527,6 +530,24 @@ validation status. This lists reusable specs, not running workflows; use
 Pass `spec_path`, then retarget generic objectives and block instructions in
 the parent, write the edited result to YAML, and start that file by path.
 
+**draft** — Render a structured graph `config` (same fields as the start
+file's `config`) into a validated YAML spec and return its `spec_path`; no
+workflow is created. Preferred over hand-writing YAML: the parameter schema
+rejects unknown fields, eliminating serialization drift. When validation fails
+the file is still on disk — fix it by calling draft again with corrected
+fields, then start the returned `spec_path`.
+
+**guide** — Load on-demand authoring guidance. `topic` is one of `blocks`
+(composable block schema), `interface` (low-level node fields), `policy`
+(gates, admission, recovery), or `patterns` (cross-domain playbooks); omit it
+for the compact index. Load only the topic needed for the current decision.
+
+**validate** — Pre-flight one spec without creating a workflow. Pass
+`spec_path` and an optional `profile` (`portable` for distributable-template
+checks, `environment` to additionally resolve prompts, workers, and models in
+this project; builtin specs default to portable, everything else to
+environment). Returns diagnostics with per-error paths, never a workflow ID.
+
 **extend** — Add nodes to a running workflow. Existing nodes are unaffected;
 new nodes are immediately eligible for scheduling if their dependencies are
 met. It also accepts a genuinely additive wave after a reporting leaf
@@ -547,9 +568,9 @@ omitted content from its preview.
 **control** — Control a running workflow:
 
 - `pause` — let running nodes finish, don't spawn new ones (pause does NOT stop nodes that are already running). On a cancel/replan intent, always pause FIRST: it needs no fragment and freezes scheduling while you compose the replan, so the graph cannot terminalize under you.
-- `resume` — resume scheduling
+- `resume` — resume scheduling. Unneeded after a successful replan or extend: both auto-resume a paused workflow; resume manually only when their output reports the automatic resume raced with another control op and the workflow is still paused.
 - `cancel` — cancel the entire workflow
-- `replan` — put `fragment: { ... }` with the graph fields and node definitions in YAML and pass its `spec_path`; running nodes can be `restart: true` or `cancel: true`; pending nodes absent from the fragment are cancelled. Valid while paused — the pause → write file → replan → resume sequence is the safe path.
+- `replan` — put `fragment: { ... }` with the graph fields and node definitions in YAML and pass its `spec_path`; running nodes can be `restart: true` or `cancel: true`; pending nodes absent from the fragment are cancelled. Valid while paused — the pause → write file → replan sequence is the safe path: a successful replan auto-resumes the workflow, an explicit resume belongs only in the rare case the replan output reports the automatic resume raced with another control op and the workflow is still paused.
 - `complete` — early-complete: remaining pending nodes are skipped (non-violation)
 - `step` — advance exactly one ready node (the first by node ID lexicographic order), then wait. Use for controlled debugging or staged verification of a critical path. Unlike `pause`, which freezes all scheduling, `step` advances one node and re-waits. A second `step` while the stepped node is still running is rejected. Use `resume` to return to full-speed scheduling. Nodes are selected in lexicographic ID order for determinism.
 
@@ -570,6 +591,7 @@ omitted content from its preview.
 | `output_schema`    | no       | JSON Schema; when declared, the child agent must call `submit_result` to submit structured output — failure to submit results in node failure        |
 | `restart`          | no       | (replan only) Re-spawn this running node with new prompt                                                                                             |
 | `cancel`           | no       | (replan only) Cancel this node                                                                                                                       |
+| `review`           | no       | (deep review workers) `{ phase: "design" \| "diff" }`; a `diff` review also declares `implementation_node_id` and `verification_node_id`              |
 
 ### What NOT to expect
 
