@@ -233,7 +233,7 @@ export const NodeSchema = Schema.Struct({
     }),
   ).annotate({
     description:
-      "(deep review workers) design reviews pre-implementation artifacts; diff reviews require implementation_node_id and verification_node_id, plus input_mapping entries binding the implementation diff/changed_files and fingerprint and the verification output",
+      "(deep review workers) design reviews pre-implementation artifacts; diff reviews require implementation_node_id, verification_node_id, and authoring-validated wiring: transitive review→verification→implementation dependencies, input_mapping for the diff artifact, fingerprint, and verification output, a PASS-gated condition, and a verdict+implementation_fingerprint output_schema. Deep mode rejects violations; standard mode warns.",
   }),
 })
 

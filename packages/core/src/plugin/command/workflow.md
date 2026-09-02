@@ -591,7 +591,7 @@ omitted content from its preview.
 | `output_schema`    | no       | JSON Schema; when declared, the child agent must call `submit_result` to submit structured output — failure to submit results in node failure        |
 | `restart`          | no       | (replan only) Re-spawn this running node with new prompt                                                                                             |
 | `cancel`           | no       | (replan only) Cancel this node                                                                                                                       |
-| `review`           | no       | (deep review workers) `{ phase: "design" \| "diff" }`; a `diff` review also declares `implementation_node_id` and `verification_node_id`              |
+| `review`           | no       | (deep review workers) `{ phase: "design" \| "diff" }`; a `diff` review must also declare `implementation_node_id` / `verification_node_id` and wire them: transitive review→verification→implementation dependencies, `input_mapping` for the diff artifact + fingerprint + verification output, a PASS-gated `condition`, and a `verdict`+`implementation_fingerprint` `output_schema`. Authoring rejects violations in deep mode and warns in standard |
 
 ### What NOT to expect
 
