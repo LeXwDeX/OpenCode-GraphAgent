@@ -143,7 +143,11 @@ describe("util.process stop", () => {
     if (process.platform === "win32") return
 
     const proc = Process.spawn(
-      node('process.stdout.write("ready\\n");process.on("SIGTERM", () => {});setInterval(() => {}, 1000)'),
+      // Trap BEFORE the ready write: the parent stops as soon as it sees
+      // "ready", and under CI load the child can be preempted between the two
+      // statements, taking the first SIGTERM with the default handler still
+      // installed (exits SIGTERM instead of escalating to SIGKILL).
+      node('process.on("SIGTERM", () => {});process.stdout.write("ready\\n");setInterval(() => {}, 1000)'),
       { stdout: "pipe" },
     )
     await new Promise<void>((resolve) => proc.stdout!.once("data", resolve))
