@@ -20,7 +20,11 @@ export function pruneHeapSnapshots(directory: string, keep = RETAINED_SNAPSHOTS)
       const names = entries
         .filter((entry) => entry.isFile() && entry.name.startsWith("heap-") && entry.name.endsWith(".heapsnapshot"))
         .map((entry) => entry.name)
-        .sort()
+        // Oldest-first by embedded timestamp, NOT by full name: the layout is
+        // heap-<pid>-<ts>, so a plain lexicographic sort orders snapshots by
+        // pid across runs (pid digit-count changes and wraparound) and pruning
+        // would delete the newest snapshot while keeping stale ones.
+        .sort((a, b) => snapshotTime(a).localeCompare(snapshotTime(b)))
       return Promise.all(
         names.slice(0, Math.max(0, names.length - keep)).map((name) =>
           fs.rm(path.join(directory, name), { force: true }).catch((cause) => {
@@ -29,7 +33,16 @@ export function pruneHeapSnapshots(directory: string, keep = RETAINED_SNAPSHOTS)
         ),
       )
     })
-    .catch(() => {})
+    .catch((cause) => {
+      // A missing log directory is the normal first-run state; anything else
+      // is a real prune failure and best-effort cleanup must still surface it.
+      if ((cause as { code?: string }).code === "ENOENT") return
+      console.warn(`opencode: failed to list heap snapshots for pruning: ${String(cause)}`)
+    })
+}
+
+function snapshotTime(name: string) {
+  return name.slice(name.lastIndexOf("-") + 1)
 }
 
 export function start() {
