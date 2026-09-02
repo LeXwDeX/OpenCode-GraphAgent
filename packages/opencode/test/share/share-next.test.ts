@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect } from "bun:test"
-import { Effect, Exit, Layer, Option } from "effect"
+import { Effect, Exit, Layer, Option, Context } from "effect"
 import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { httpClient } from "@opencode-ai/core/effect/layer-node-platform"
@@ -9,6 +9,8 @@ import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { AccessToken, AccountID, OrgID, RefreshToken } from "../../src/account/schema"
 import { AccountRepo } from "../../src/account/repo"
 import { EventV2Bridge } from "../../src/event-v2-bridge"
+import { InstanceStore } from "../../src/project/instance-store"
+import { EventV2 } from "@opencode-ai/core/event"
 import { Session } from "@/session/session"
 import type { SessionID } from "../../src/session/schema"
 import { ShareNext } from "@/share/share-next"
@@ -51,6 +53,43 @@ function integrationLayer(client: HttpClient.HttpClient) {
     ]),
     {
       replacements: [LayerNode.replace(httpClient, Layer.succeed(HttpClient.HttpClient, client))],
+    },
+  )
+}
+
+type ListenerCounts = { listen: number; removed: number }
+
+// Wraps the real bridge and counts listen registrations and the unsubscribers
+// ShareNext is expected to run on instance disposal.
+function countingBridgeNode(counts: ListenerCounts) {
+  return LayerNode.make(
+    Layer.effect(
+      EventV2Bridge.Service,
+      Effect.gen(function* () {
+        const bridge = Context.get(yield* Layer.build(EventV2Bridge.layer), EventV2Bridge.Service)
+        const listen: EventV2.Interface["listen"] = (listener) =>
+          Effect.suspend(() => {
+            counts.listen++
+            return bridge.listen(listener).pipe(
+              Effect.map((unsubscribe) =>
+                Effect.sync(() => {
+                  counts.removed++
+                }).pipe(Effect.andThen(unsubscribe)),
+              ),
+            )
+          })
+        return EventV2Bridge.Service.of({ ...bridge, listen })
+      }),
+    ),
+    [EventV2.node],
+  )
+}
+
+function countingLayer(counts: ListenerCounts) {
+  return LayerNode.buildLayer(
+    LayerNode.group([ShareNext.node, Session.node, SessionProjector.node, AccountRepo.node, Database.node]),
+    {
+      replacements: [LayerNode.replaceWithNode(EventV2Bridge.node, countingBridgeNode(counts))],
     },
   )
 }
@@ -294,6 +333,7 @@ describe("ShareNext", () => {
           expect(seen).toHaveLength(1)
           expect(seen[0].url).toBe("https://legacy-share.example.com/api/share/shr_abc/sync")
 
+          // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion -- intentional wire-shape assertion on parsed JSON in a test
           const body = JSON.parse(seen[0].body) as {
             secret: string
             data: Array<{
@@ -325,4 +365,26 @@ describe("ShareNext", () => {
       { config: { enterprise: { url: "https://legacy-share.example.com" } } },
     ),
   )
+
+  it.live("unsubscribes instance event listeners on dispose so remounts do not accumulate", () => {
+    const counts: ListenerCounts = { listen: 0, removed: 0 }
+    const layers = countingLayer(counts)
+    return provideTmpdirInstance((directory) =>
+      Effect.gen(function* () {
+        const store = yield* InstanceStore.Service
+
+        yield* ShareNext.use.init().pipe(Effect.provide(layers))
+        expect(counts.listen).toBe(5)
+
+        yield* store.disposeDirectory(directory)
+        expect(counts.removed).toBe(5)
+
+        yield* ShareNext.use.init().pipe(Effect.provide(layers))
+        expect(counts.listen).toBe(10)
+
+        yield* store.disposeDirectory(directory)
+        expect(counts.removed).toBe(10)
+      }),
+    )
+  })
 })

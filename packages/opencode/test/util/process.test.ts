@@ -126,3 +126,106 @@ describe("util.process", () => {
     })
   })
 })
+
+describe("util.process stop", () => {
+  test("fast path: awaits exit when the child honors SIGTERM", async () => {
+    if (process.platform === "win32") return
+
+    const proc = Process.spawn(node("setInterval(() => {}, 1000)"))
+    const started = Date.now()
+    await Process.stop(proc)
+    await proc.exited
+
+    expect(Date.now() - started).toBeLessThan(1500)
+  }, 3000)
+
+  test("escalates to SIGKILL when the child ignores SIGTERM", async () => {
+    if (process.platform === "win32") return
+
+    const proc = Process.spawn(
+      // Trap BEFORE the ready write: the parent stops as soon as it sees
+      // "ready", and under CI load the child can be preempted between the two
+      // statements, taking the first SIGTERM with the default handler still
+      // installed (exits SIGTERM instead of escalating to SIGKILL).
+      node('process.on("SIGTERM", () => {});process.stdout.write("ready\\n");setInterval(() => {}, 1000)'),
+      { stdout: "pipe" },
+    )
+    await new Promise<void>((resolve) => proc.stdout!.once("data", resolve))
+
+    const started = Date.now()
+    await Process.stop(proc)
+    await proc.exited
+
+    expect(proc.signalCode).toBe("SIGKILL")
+    expect(Date.now() - started).toBeLessThan(6000)
+  }, 10000)
+
+  test("is a no-op for an already-exited child", async () => {
+    const proc = Process.spawn(node("process.exit(0)"))
+    await proc.exited
+
+    const started = Date.now()
+    await Process.stop(proc)
+
+    expect(Date.now() - started).toBeLessThan(100)
+  })
+})
+
+describe("util.process stopTree", () => {
+  test("terminates a spawned process tree", async () => {
+    if (process.platform === "win32") return
+
+    const pids = await spawnTree("echo $$; sleep 300 & echo $!; sleep 300 & echo $!; wait", 3)
+    const started = Date.now()
+    await Process.stopTree(pids)
+
+    for (const pid of pids) expect(treeAlive(pid)).toBe(false)
+    expect(Date.now() - started).toBeLessThan(2000)
+  }, 5000)
+
+  test("escalates to SIGKILL when tree members ignore SIGTERM", async () => {
+    if (process.platform === "win32") return
+
+    const pids = await spawnTree('echo $$; trap "" TERM; sleep 300 & echo $!; wait', 2)
+    const started = Date.now()
+    await Process.stopTree(pids, { termGraceMs: 250, killGraceMs: 2000 })
+
+    for (const pid of pids) expect(treeAlive(pid)).toBe(false)
+    expect(Date.now() - started).toBeLessThan(3000)
+  }, 5000)
+
+  test("returns immediately for an empty pid list", async () => {
+    await Process.stopTree([])
+  })
+})
+
+function treeAlive(pid: number) {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false
+  }
+}
+
+// Spawns `sh -c <script>` (the script announces pids on stdout) and resolves
+// once `expected` pids have been announced.
+function spawnTree(script: string, expected: number) {
+  const proc = Process.spawn(["sh", "-c", script], { stdout: "pipe" })
+  return new Promise<number[]>((resolve, reject) => {
+    let text = ""
+    const timer = setTimeout(() => reject(new Error(`timed out waiting for ${expected} pids, got: ${text.trim()}`)), 5000)
+    proc.stdout!.on("data", (chunk) => {
+      text += chunk.toString()
+      const lines = text.split("\n").filter(Boolean)
+      if (lines.length >= expected) {
+        clearTimeout(timer)
+        resolve(lines.slice(0, expected).map(Number))
+      }
+    })
+    proc.once("error", (error) => {
+      clearTimeout(timer)
+      reject(error)
+    })
+  })
+}

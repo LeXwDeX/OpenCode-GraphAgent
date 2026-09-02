@@ -2560,6 +2560,52 @@ describe("workflow tool saved workflows", () => {
     ),
   )
 
+  runtime.effect("builtin:// spec_path from list output round-trips by name", () =>
+    withGlobalConfigDir((globalDir) =>
+      Effect.gen(function* () {
+        const routeSpec = (name: string) =>
+          `title: ${name} title\nconfig:\n  name: ${name}\n  objective: Route objective\n  blocks:\n    - id: plan\n      kind: plan\n`
+        yield* Effect.promise(() =>
+          Bun.write(path.join(globalDir, "workflows", "marker-route.yaml"), routeSpec("global-route")),
+        )
+        const previousBuiltin = (globalThis as Record<string, unknown>).OPENCODE_DAG_TEMPLATES
+        ;(globalThis as Record<string, unknown>).OPENCODE_DAG_TEMPLATES = {
+          "marker-builtin": routeSpec("marker-builtin-route"),
+        }
+        try {
+          const info = yield* WorkflowTool
+          const workflow = yield* info.init()
+
+          // the synthetic builtin:// marker resolves by name through the library
+          const builtinRead = yield* workflow.execute(
+            { params: { action: "read", spec_path: "builtin://marker-builtin" }},
+            contextWith([]),
+          )
+          expect(JSON.parse(builtinRead.output).spec.title).toContain("marker-builtin-route")
+
+          // the marker resolves through the same shadowing chain as a bare name
+          const shadowed = yield* workflow.execute(
+            { params: { action: "validate", spec_path: "builtin://marker-route" }},
+            contextWith([]),
+          )
+          expect(JSON.parse(shadowed.output).source).toBe(path.join(globalDir, "workflows", "marker-route.yaml"))
+
+          // unknown builtin names fail as a library lookup, not a path extension error
+          const missingExit = yield* Effect.exit(
+            workflow.execute({ params: { action: "read", spec_path: "builtin://missing-route" }}, contextWith([])),
+          )
+          expect(Exit.isFailure(missingExit)).toBe(true)
+          if (Exit.isFailure(missingExit)) {
+            expect(Cause.pretty(missingExit.cause)).toContain('Saved workflow not found: "missing-route"')
+          }
+        } finally {
+          if (previousBuiltin === undefined) delete (globalThis as Record<string, unknown>).OPENCODE_DAG_TEMPLATES
+          else (globalThis as Record<string, unknown>).OPENCODE_DAG_TEMPLATES = previousBuiltin
+        }
+      }),
+    ),
+  )
+
   runtime.effect("list marks invalid templates without hiding them", () =>
     withGlobalConfigDir((globalDir) =>
       Effect.gen(function* () {

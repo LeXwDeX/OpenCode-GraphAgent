@@ -51,6 +51,7 @@ import { generateObject, generateText, type ModelMessage } from "ai"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import * as Log from "@/util/log"
+import { Process } from "@/util/process"
 import { Global } from "@opencode-ai/core/global"
 import { InstanceState } from "@/effect/instance-state"
 import { MCP } from "@/mcp"
@@ -1009,6 +1010,12 @@ export function warnUnsupportedFields(
 
 const DEFAULT_TIMEOUT_MS = 60_000 // CC default
 
+// #500: after the child exits (or the spawn timeout SIGTERMs it), stdio EOF is
+// given this grace before the whole process group is SIGKILLed; DRAIN_MS is
+// the post-kill window for final buffered output before resolving partial.
+const KILL_GRACE_MS = 2_000
+const DRAIN_MS = 500
+
 function execShell(
   entry: HookCommand,
   stdinJSON: string,
@@ -1051,12 +1058,16 @@ function execShell(
       }
     }
 
+    // POSIX: run the child as a process-group leader so a hung grandchild
+    // holding the stdio pipes can be signaled as a group (#500). Windows
+    // relies on `taskkill /T` tree kill instead.
     const child = spawn(expandedCommand, [], {
       cwd,
       shell,
       env: { ...process.env, ...extraEnv },
       stdio: ["pipe", "pipe", "pipe"],
       timeout: timeoutMs,
+      detached: process.platform !== "win32",
     })
 
     let stdout = ""
@@ -1078,20 +1089,80 @@ function execShell(
       log.warn("hook stdin write failed", { command, error: String(err) })
     }
 
-    child.on("error", (err) => {
-      log.error("hook command failed to spawn", { command, error: err.message })
-      resolve({ exitCode: null, stdout, stderr, spawnError: err.message })
+    // #500: `close` only fires after BOTH exit and stdio EOF; a grandchild
+    // that inherits the pipes and outlives the shell blocks EOF forever, so
+    // the old `close` waiter never resolved. Exit and stream EOF are now
+    // awaited as independent conditions, with a process-group SIGKILL as the
+    // fallback that guarantees resolution.
+    let exitCode: number | null = null
+    let settled = false
+    const timers = new Set<NodeJS.Timeout>()
+    const arm = (fire: () => void, ms: number) => {
+      const timer = setTimeout(() => {
+        timers.delete(timer)
+        if (!settled) fire()
+      }, ms)
+      timers.add(timer)
+    }
+    const exited = new Promise<void>((resolveExit) => {
+      child.on("exit", (code) => {
+        exitCode = code
+        resolveExit()
+      })
     })
-
-    child.on("close", (code) => {
+    // `end` alone is not enough: on spawn failure the streams can close or
+    // error without ever reaching EOF.
+    const streamSettled = (stream: NodeJS.ReadableStream) =>
+      new Promise<void>((resolveStream) => {
+        stream.on("end", resolveStream)
+        stream.on("close", resolveStream)
+        stream.on("error", resolveStream)
+      })
+    const streamsDone = Promise.all([streamSettled(child.stdout), streamSettled(child.stderr)])
+    const finish = (spawnError?: string) => {
+      if (settled) return
+      settled = true
+      for (const timer of timers) clearTimeout(timer)
+      timers.clear()
+      child.stdout.destroy()
+      child.stderr.destroy()
       log.debug("hook close", {
         command: command.slice(0, 80),
-        exitCode: code,
+        exitCode,
         stdoutLen: stdout.length,
         stderrLen: stderr.length,
       })
-      resolve({ exitCode: code, stdout, stderr })
+      resolve(spawnError === undefined ? { exitCode, stdout, stderr } : { exitCode, stdout, stderr, spawnError })
+    }
+
+    child.on("error", (err) => {
+      log.error("hook command failed to spawn", { command, error: err.message })
+      finish(err.message)
     })
+
+    let killSent = false
+    const killGroup = () => {
+      if (killSent || child.pid === undefined) return
+      killSent = true
+      void Process.killGroupPid(child.pid, "SIGKILL").catch((err) => {
+        log.warn("hook process-group kill failed", { command, error: String(err) })
+      })
+    }
+    const afterKill = () => {
+      killGroup()
+      const drained = new Promise<void>((resolveDrain) => arm(resolveDrain, DRAIN_MS))
+      void Promise.all([exited, Promise.race([streamsDone, drained])]).then(() => finish())
+    }
+
+    void Promise.all([exited, streamsDone]).then(() => finish())
+
+    // Child exited but pipes are still open (grandchild holds them): kill the
+    // group after the EOF grace, then resolve with whatever was captured.
+    void exited.then(() => arm(afterKill, KILL_GRACE_MS))
+
+    // Child ignored the spawn-timeout SIGTERM and never exited: kill the group
+    // at the absolute deadline, wait for the reap, then resolve.
+    arm(afterKill, timeoutMs + KILL_GRACE_MS)
   })
 }
 

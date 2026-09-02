@@ -1,8 +1,20 @@
 version: 1
-delivery: sync-main-to
+delivery: leftover-hardening
 context:
   kind: branch
-  branch: chore/496-sync-main-to
+  branch: test/512-leftover-hardening
 issues:
-  - 496
-pr: 497
+  - 512
+  - 513
+  - 514
+  - 515
+issueKinds:
+  - issue: 512
+    kind: kind::test
+  - issue: 513
+    kind: kind::fix
+  - issue: 514
+    kind: kind::test
+  - issue: 515
+    kind: kind::refactor
+pr: 516

@@ -57,7 +57,7 @@ export { Parameters as WorkflowParameters }
 // ============================================================================
 
 const specPathDescription =
-  '(start/extend/control replan/read/validate) An exact saved workflow name returned by workflow(action="list"), or a path to a YAML workflow spec. Graph content belongs in that file; relative paths resolve from the session directory'
+  '(start/extend/control replan/read/validate) An exact saved workflow name returned by workflow(action="list"), or a path to a YAML workflow spec. The `builtin://<name>` path marker list shows for builtin templates also resolves, by name. Graph content belongs in that file; relative paths resolve from the session directory'
 
 const StartPath = Schema.Struct({
   action: Schema.Literal("start").annotate({ description: "Create a workflow" }),
@@ -913,19 +913,19 @@ function searchedScopes(directory: string) {
 
 function resolveSpecPath(specPath: string, directory: string, ctx: Tool.Context) {
   return Effect.gen(function* () {
-    // A bare name addresses the workflow library. Its project/global scopes
-    // are curated assets the user placed under `.opencode/` or the config
-    // dir — the same trust level as dag.jsonc — so a resolved name needs no
-    // external-directory prompt even when the global scope lands outside the
-    // session directory. Arbitrary paths below keep the prompt.
-    if (DagWorkflows.isName(specPath)) {
-      const entry = yield* DagWorkflows.resolve(specPath, directory)
+    // A bare name addresses the workflow library. The synthetic
+    // `builtin://name` marker list output advertises must round-trip the same
+    // way: strip the scheme and resolve by name instead of letting the path
+    // branch reject it with a cwd-joined extension error. Its project/global
+    // scopes are curated assets the user placed under `.opencode/` or the
+    // config dir — the same trust level as dag.jsonc — so a resolved name
+    // needs no external-directory prompt even when the global scope lands
+    // outside the session directory. Arbitrary paths below keep the prompt.
+    const name = DagWorkflows.isBuiltinPath(specPath) ? DagWorkflows.builtinName(specPath) : specPath
+    if (DagWorkflows.isName(name)) {
+      const entry = yield* DagWorkflows.resolve(name, directory)
       if (entry) return entry.path
-      return yield* Effect.fail(
-        new Error(
-          `Saved workflow not found: "${specPath}". Searched ${searchedScopes(directory)}. Run workflow(action: "list") to see what is available, or pass a path to a .yaml spec file.`,
-        ),
-      )
+      return yield* Effect.fail(savedWorkflowNotFound(name, directory))
     }
     const filepath = path.isAbsolute(specPath) ? path.normalize(specPath) : path.resolve(directory, specPath)
     if (![".yaml", ".yml"].includes(path.extname(filepath).toLowerCase())) {
@@ -938,6 +938,12 @@ function resolveSpecPath(specPath: string, directory: string, ctx: Tool.Context)
     }
     return filepath
   })
+}
+
+function savedWorkflowNotFound(name: string, directory: string) {
+  return new Error(
+    `Saved workflow not found: "${name}". Searched ${searchedScopes(directory)}. Run workflow(action: "list") to see what is available, or pass a path to a .yaml spec file.`,
+  )
 }
 
 /** Terminal-workflow rejections surface as defects carrying recovery
