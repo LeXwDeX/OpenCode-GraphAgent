@@ -77,6 +77,10 @@ type AgentCatalogOptions = {
   heading: string
   includeHidden: boolean
   includeModelState: boolean
+  /** Workflow worker_type defaults compile to the native build/plan primary
+   * agents, so the workflow catalog lists native primaries even though the
+   * task subagent catalog and user-defined primary modes stay filtered out. */
+  includePrimary?: boolean
 }
 
 export interface Interface {
@@ -278,7 +282,7 @@ export const layer = Layer.effect(
       options: AgentCatalogOptions,
     ) {
       const description = (yield* agents.list())
-        .filter((item) => item.mode !== "primary")
+        .filter((item) => item.mode !== "primary" || (options.includePrimary && item.native))
         .filter((item) => options.includeHidden || !item.hidden)
         .filter((item) => Permission.evaluate("task", item.name, caller.permission).action !== "deny")
         .toSorted((a, b) => a.name.localeCompare(b.name))
@@ -333,6 +337,7 @@ export const layer = Layer.effect(
                     heading: "Available workflow worker_type values:",
                     includeHidden: false,
                     includeModelState: true,
+                    includePrimary: true,
                   })
                 : undefined,
             ]

@@ -26,6 +26,11 @@ on:
       - main
       - dev
   pull_request:
+    # ready_for_review matters: the SpecGit Acceptance verdict requires
+    # required-check runs that started at/after the draft→ready transition
+    # (#315 anchor). Without this type a ready transition finds only stale
+    # pre-ready runs and the gate times out waiting for fresh ones.
+    types: [opened, synchronize, reopened, ready_for_review]
     branches:
       - main
       - dev

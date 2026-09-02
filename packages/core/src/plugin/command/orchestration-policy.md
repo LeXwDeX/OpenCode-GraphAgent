@@ -333,6 +333,6 @@ A replan fragment takes real time to compose — template rendering, model reaso
 1. On any user cancel/replan/model-change intent, IMMEDIATELY issue `control(pause)` in the same turn. Pause needs no fragment, applies in milliseconds, and stops new node spawns.
 2. Pause does not interrupt nodes that are already running. Decide their disposition inside the fragment: `restart: true` re-spawns a running node with the new definition (its in-flight child session is hard-aborted at re-spawn), `cancel: true` terminates it, absence keeps it running to completion.
 3. Compose the fragment, then issue `control(replan)` — replan is valid while paused.
-4. Issue `control(resume)` to restore scheduling.
+4. A successful replan auto-resumes the workflow. Issue `control(resume)` manually only when the replan output reports the automatic resume raced with another control op and the workflow is still paused; never resume a workflow the output says was already resumed.
 
 If the workflow terminalized before you paused, do not force the replan: start a new workflow carrying the updated definitions, and state which prior results are superseded.

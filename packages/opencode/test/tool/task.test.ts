@@ -364,6 +364,30 @@ describe("tool.task", () => {
   )
 
   it.instance(
+    "workflow worker_type catalog lists primary build and plan, task catalog does not",
+    () =>
+      Effect.gen(function* () {
+        const agent = yield* Agent.Service
+        const build = yield* agent.get("build")
+        const registry = yield* ToolRegistry.Service
+        const tools = yield* registry.tools({ ...ref, agent: build })
+        const taskDescription = tools.find((tool) => tool.id === TaskTool.id)?.description ?? ""
+        const workflowDescription = tools.find((tool) => tool.id === WorkflowTool.id)?.description ?? ""
+
+        // blocks compile coding/prototype to build and plan blocks to plan, so
+        // the workflow catalog must let the model name them explicitly
+        expect(workflowDescription).toContain("- build:")
+        expect(workflowDescription).toContain("- plan:")
+        expect(workflowDescription).toContain("- general:")
+        expect(workflowDescription).toContain("- explore:")
+        // hidden primaries stay hidden and the task catalog stays subagent-only
+        expect(workflowDescription).not.toContain("- compaction:")
+        expect(taskDescription).not.toContain("- build:")
+        expect(taskDescription).not.toContain("- plan:")
+      }),
+  )
+
+  it.instance(
     "description hides denied subagents for the caller",
     () =>
       Effect.gen(function* () {
