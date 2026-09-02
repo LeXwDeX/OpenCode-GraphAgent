@@ -150,9 +150,16 @@ export const layer = Layer.effect(
     const state: InstanceState.InstanceState<State> = yield* InstanceState.make<State>(
       Effect.fn("ShareNext.state")(function* (_ctx) {
         const cache: State = { queue: new Map(), scope: yield* Scope.make(), shared: new Map() }
+        // EventV2 listeners live in a process-level array; collect their
+        // unsubscribers or every instance remount leaks another batch of
+        // subscribers pinning this closure.
+        const unsubscribers: Array<EventV2.Unsubscribe> = []
 
         yield* Effect.addFinalizer(() =>
-          Scope.close(cache.scope, Exit.void).pipe(
+          // Unsubscribe before closing the scope so no in-flight event lands
+          // in a subscriber whose fork scope is already gone.
+          Effect.forEach(unsubscribers, (unsubscribe) => unsubscribe, { discard: true }).pipe(
+            Effect.andThen(Scope.close(cache.scope, Exit.void)),
             Effect.andThen(
               Effect.sync(() => {
                 cache.queue.clear()
@@ -182,7 +189,7 @@ export const layer = Layer.effect(
                 Effect.logError("share subscriber failed", { type: def.type, cause: cause }),
               ),
             )
-          })
+          }).pipe(Effect.tap((unsubscribe) => Effect.sync(() => unsubscribers.push(unsubscribe))))
 
         yield* watch(Session.Event.Updated, (data) =>
           Effect.gen(function* () {
