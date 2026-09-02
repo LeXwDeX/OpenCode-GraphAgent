@@ -12,6 +12,7 @@ import { ConfigMCPV1 } from "@opencode-ai/core/v1/config/mcp"
 import { NamedError } from "@opencode-ai/core/util/error"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import { withTimeout } from "@/util/timeout"
+import { Process } from "@/util/process"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { McpOAuthProvider, OAUTH_CALLBACK_PATH } from "./oauth-provider"
 import { McpOAuthCallback } from "./oauth-callback"
@@ -398,7 +399,10 @@ export const layer = Layer.effect(
           } satisfies CreateResult
         }).pipe(
           Effect.catchCause((cause) =>
-            Effect.tryPromise(() => mcpClient.close()).pipe(Effect.ignore, Effect.andThen(Effect.failCause(cause))),
+            Effect.gen(function* () {
+              yield* shutdownClient(mcpClient)
+              return yield* Effect.failCause(cause)
+            }),
           ),
         )
       },
@@ -436,6 +440,19 @@ export const layer = Layer.effect(
       Effect.scoped,
       Effect.catch(() => Effect.succeed([] as number[])),
     )
+
+    // Close a client and make sure its whole process tree is reaped. The
+    // descendant snapshot must be taken while the root pid is alive (pgrep
+    // walks parent links); close() shuts the root down gracefully, and
+    // stopTree force-kills whatever survived (ignored SIGTERM, orphaned
+    // grandchildren) and waits for exit.
+    const shutdownClient = Effect.fnUntraced(function* (client: MCPClient) {
+      const pid = client.transport instanceof StdioClientTransport ? client.transport.pid : null
+      const tree = typeof pid === "number" ? [pid, ...(yield* descendants(pid))] : []
+      yield* Effect.tryPromise(() => client.close()).pipe(Effect.ignore)
+      if (tree.length === 0) return
+      yield* Effect.tryPromise(() => Process.stopTree(tree)).pipe(Effect.ignore)
+    })
 
     function watch(s: State, name: string, client: MCPClient, bridge: EffectBridge.Shape, timeout?: number) {
       // mcp-elicitation-notification: handle `elicitation/create` reverse requests.
@@ -536,23 +553,7 @@ export const layer = Layer.effect(
             s.clients = {}
             s.defs = {}
             s.instructions = {}
-            yield* Effect.forEach(
-              clients,
-              (client) =>
-                Effect.gen(function* () {
-                  const pid = client.transport instanceof StdioClientTransport ? client.transport.pid : null
-                  if (typeof pid === "number") {
-                    const pids = yield* descendants(pid)
-                    for (const dpid of pids) {
-                      try {
-                        process.kill(dpid, "SIGTERM")
-                      } catch {}
-                    }
-                  }
-                  yield* Effect.tryPromise(() => client.close()).pipe(Effect.ignore)
-                }),
-              { concurrency: "unbounded" },
-            )
+            yield* Effect.forEach(clients, (client) => shutdownClient(client), { concurrency: "unbounded" })
             pendingOAuthTransports.clear()
           }),
         )
@@ -567,7 +568,7 @@ export const layer = Layer.effect(
       delete s.defs[name]
       delete s.instructions[name]
       if (!client) return Effect.void
-      return Effect.tryPromise(() => client.close()).pipe(Effect.ignore)
+      return shutdownClient(client)
     }
 
     const storeClient = Effect.fnUntraced(function* (
@@ -586,7 +587,7 @@ export const layer = Layer.effect(
       if (instructions) s.instructions[name] = instructions
       else delete s.instructions[name]
       watch(s, name, client, bridge, timeout)
-      if (previous) yield* Effect.tryPromise(() => previous.close()).pipe(Effect.ignore)
+      if (previous) yield* shutdownClient(previous)
       return s.status[name]
     })
 
