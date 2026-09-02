@@ -1,8 +1,8 @@
 version: 1
-delivery: shell-silence-guard
+delivery: sync-main-to
 context:
   kind: branch
-  branch: feat/433-shell-silence-guard
+  branch: chore/496-sync-main-to
 issues:
-  - 433
-pr: 491
+  - 496
+pr: 497
