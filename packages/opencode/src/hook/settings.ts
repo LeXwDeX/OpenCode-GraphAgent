@@ -51,6 +51,7 @@ import { generateObject, generateText, type ModelMessage } from "ai"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import * as Log from "@/util/log"
+import { Process } from "@/util/process"
 import { Global } from "@opencode-ai/core/global"
 import { InstanceState } from "@/effect/instance-state"
 import { MCP } from "@/mcp"
@@ -1143,18 +1144,9 @@ function execShell(
     const killGroup = () => {
       if (killSent || child.pid === undefined) return
       killSent = true
-      if (process.platform === "win32") {
-        spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true }).on(
-          "error",
-          (err) => log.warn("hook taskkill failed", { command, error: err.message }),
-        )
-        return
-      }
-      try {
-        process.kill(-child.pid, "SIGKILL")
-      } catch (err) {
+      void Process.killGroupPid(child.pid, "SIGKILL").catch((err) => {
         log.warn("hook process-group kill failed", { command, error: String(err) })
-      }
+      })
     }
     const afterKill = () => {
       killGroup()
