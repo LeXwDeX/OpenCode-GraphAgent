@@ -5,3 +5,4 @@ context:
   branch: feat/530-specgit-bootstrap-rollback
 issues:
   - 530
+pr: 533
