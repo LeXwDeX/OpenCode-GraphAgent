@@ -1,8 +1,7 @@
 version: 1
-delivery: event-idempotency-gate
+delivery: specgit-bootstrap-wrapper
 context:
   kind: branch
-  branch: fix/523-event-idempotency-gate
+  branch: feat/521-specgit-bootstrap-wrapper
 issues:
-  - 523
-pr: 527
+  - 521
