@@ -2,7 +2,8 @@
 # shellcheck disable=SC2015,SC2329
 # ok/bad always return 0, so `cond && ok .. || bad ..` cannot mis-fire (SC2015);
 # cleanup() runs via the EXIT trap, which shellcheck does not count (SC2329).
-# Behavior tests for script/specgit-bootstrap.sh (#521, #530 record rollback).
+# Behavior tests for script/specgit-bootstrap.sh (#521, #530 record rollback,
+# #529 issue-title type preflight).
 #
 # Zero network, zero forge: `specgit` is a stub placed first on PATH; every
 # fixture is a throwaway git repo under $TMPDIR. The real repository is never
@@ -86,12 +87,16 @@ make_stub() { # <case-name>
   local dir="$WORK/stubs/$1"
   mkdir -p "$dir"
   : > "$dir/log"
+  : > "$dir/log.argv"
   cat > "$dir/specgit" <<'EOF'
 #!/usr/bin/env bash
 # stub specgit: records argv to $STUB_LOG, simulates harness refresh plus the
 # scripted exit/mode contract. Never touches network or forge.
 set -u
 printf '%s\n' "$*" >> "${STUB_LOG:?STUB_LOG required}"
+# NUL-separated argv sidecar: preserves argument boundaries, so tests can
+# assert byte-exact passthrough (the "$*" log above cannot).
+printf '%s\0' "$@" >> "${STUB_LOG:?STUB_LOG required}.argv"
 cmd="${1:-}"
 [ $# -gt 0 ] && shift
 case "$cmd" in
@@ -179,6 +184,47 @@ run_wrapper() {
   ( cd "$fx" && env PATH="$WORK/stubs/$case:$PATH" STUB_LOG="$WORK/stubs/$case/log" "$WRAPPER" "$@" > "$WORK/$case.out" 2> "$WORK/$case.err" )
 }
 
+# want_argv <file> <issue-args...> — expected stub sidecar stream: the init
+# record followed by the issue record, NUL-separated exactly as the stub
+# writes them (byte-exact passthrough evidence, unlike the "$*" log).
+want_argv() {
+  local f="$1"
+  shift
+  {
+    printf 'init\0--force\0--no-protect\0'
+    printf 'issue\0'
+    printf '%s\0' "$@"
+  } > "$f"
+}
+
+# assert_argv <case> — stub sidecar must byte-equal the want_argv file.
+assert_argv() {
+  cmp -s "$WORK/$1.wantargv" "$WORK/stubs/$1/log.argv" \
+    && ok "$1: argv byte-exact through wrapper" \
+    || bad "$1: argv sidecar mismatch (wrapper rewrote or dropped bytes)"
+}
+
+# expect_reject <case> <diag-needle> <args...> — #529 preflight rejection:
+# exit 2, specgit-bootstrap: diagnostics naming the violation, zero stub
+# calls (no init, no inner CLI), empty stdout (no JSON envelope), fixture
+# untouched.
+expect_reject() {
+  local case="$1" needle="$2"
+  shift 2
+  new_fixture "$case"
+  make_stub "$case"
+  run_wrapper "$case" "$@"
+  local rc=$?
+  assert_rc 2 "$rc" && ok "$case: preflight exits 2" || bad "$case: exit $rc, want 2"
+  grep -q '^specgit-bootstrap:' "$WORK/$case.err" && ok "$case: diagnostics use specgit-bootstrap: prefix" || bad "$case: missing prefix"
+  grep -qF -- "$needle" "$WORK/$case.err" && ok "$case: diagnostic names the violation" || bad "$case: diagnostic lacks '$needle': $(tr '\n' '|' < "$WORK/$case.err")"
+  { [ ! -s "$WORK/stubs/$case/log" ] && [ ! -s "$WORK/stubs/$case/log.argv" ]; } \
+    && ok "$case: zero stub calls (no init, no inner CLI)" \
+    || bad "$case: stub was called: $(tr '\n' '|' < "$WORK/stubs/$case/log")"
+  [ ! -s "$WORK/$case.out" ] && ok "$case: stdout empty (no JSON envelope)" || bad "$case: stdout not empty: $(tr '\n' '|' < "$WORK/$case.out")"
+  assert_clean "$WORK/$case" && ok "$case: fixture untouched" || bad "$case: fixture dirty: $(git -C "$WORK/$case" status --porcelain | tr '\n' '|')"
+}
+
 report() {
   printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
   [ "$FAIL" -eq 0 ]
@@ -189,6 +235,153 @@ report() {
   report
   exit 1
 }
+
+# ==== #529: issue-title type preflight ======================================
+# Rejection group: unsupported types must exit 2 with zero side effects,
+# before specgit init or any inner CLI execution. No type is ever mapped.
+expect_reject c18 "unsupported issue title type 'ci'" "ci: normalize coverage gates"
+expect_reject c19 "unsupported issue title type 'perf'" "perf: speed up warm path"
+expect_reject c20 "unsupported issue title type 'dogfood'" "dogfood: exercise wrapper"
+expect_reject c21 "unsupported issue title type 'fix(tui)'" "fix(tui): simplify thinking toggle styling"
+expect_reject c22 "unsupported issue title type 'Feat'" "Feat: capitalized probe"
+expect_reject c23 "unsupported issue title syntax" "feat:no-space probe"
+expect_reject c24 "unsupported issue title syntax" "feat:"
+expect_reject c25 "unsupported issue title type 'upgrade the thing'" "upgrade the thing"
+expect_reject c26 "unsupported issue title type '#529'" "#529"
+expect_reject c27 "empty issue title" ""
+expect_reject c28 "empty issue title" "   "
+expect_reject c29 "unsupported issue title type 'ci'" -- "ci: after dd"
+expect_reject c30 "unsupported issue title type 'ci'" "fix: ok" "ci: bad"
+expect_reject c31 "unsupported issue title type 'ci'" --json "ci: x"
+# vocabulary + corrective command, never a mapping
+new_fixture c32h
+make_stub c32h
+run_wrapper c32h "ci: normalize coverage gates"
+grep -q 'allowed types: chore docs feat fix hotfix refactor release test' "$WORK/c32h.err" \
+  && ok "c32h: rejection names the full allowed vocabulary" \
+  || bad "c32h: vocabulary line missing: $(tr '\n' '|' < "$WORK/c32h.err")"
+grep -q 'no type mapping is performed' "$WORK/c32h.err" \
+  && ok "c32h: rejection states no type mapping is performed" \
+  || bad "c32h: corrective-command line missing"
+
+# Pass group: every allowed form reaches the inner CLI byte-exact.
+# ---- case 33 (#529): issue-number reuse passes preflight --------------------
+new_fixture c33
+make_stub c33
+surface_digests "$WORK/c33" > "$WORK/c33.baseline"
+want_argv "$WORK/c33.wantargv" 529
+run_wrapper c33 529
+rc=$?
+assert_rc 0 "$rc" && ok "c33: number reuse 529 passes preflight" || bad "c33: exit $rc, want 0"
+assert_argv c33
+assert_surface_restored "$WORK/c33" "$WORK/c33.baseline" && ok "c33: surface bytes restored" || bad "c33: surface bytes differ"
+assert_clean "$WORK/c33" && ok "c33: fixture clean" || bad "c33: fixture dirty"
+
+# ---- case 34 (#529): number + valid title mixed targets ---------------------
+new_fixture c34
+make_stub c34
+surface_digests "$WORK/c34" > "$WORK/c34.baseline"
+want_argv "$WORK/c34.wantargv" 529 "fix: probe title"
+run_wrapper c34 529 "fix: probe title"
+rc=$?
+assert_rc 0 "$rc" && ok "c34: mixed number + title passes preflight" || bad "c34: exit $rc, want 0"
+assert_argv c34
+assert_surface_restored "$WORK/c34" "$WORK/c34.baseline" && ok "c34: surface bytes restored" || bad "c34: surface bytes differ"
+
+# ---- case 35 (#529): all eight allowed types, spelling retained byte-exact --
+new_fixture c35
+make_stub c35
+for t in feat fix chore docs refactor test release hotfix; do
+  : > "$WORK/stubs/c35/log"; : > "$WORK/stubs/c35/log.argv"
+  want_argv "$WORK/c35.wantargv" "$t: probe title"
+  run_wrapper c35 "$t: probe title"
+  rc=$?
+  assert_rc 0 "$rc" && ok "c35: '$t:' passes preflight" || bad "c35: '$t:' exit $rc, want 0"
+  assert_argv c35
+done
+assert_clean "$WORK/c35" && ok "c35: fixture clean after 8 runs" || bad "c35: fixture dirty"
+
+# ---- case 36 (#529): multi-line title (dotAll anchoring) --------------------
+new_fixture c36
+make_stub c36
+surface_digests "$WORK/c36" > "$WORK/c36.baseline"
+want_argv "$WORK/c36.wantargv" $'feat: multi\nline title'
+run_wrapper c36 $'feat: multi\nline title'
+rc=$?
+assert_rc 0 "$rc" && ok "c36: multi-line title passes preflight" || bad "c36: exit $rc, want 0"
+assert_argv c36
+
+# ---- case 37 (#529): padded title passes raw (no silent rewrite/trim) -------
+new_fixture c37
+make_stub c37
+surface_digests "$WORK/c37" > "$WORK/c37.baseline"
+want_argv "$WORK/c37.wantargv" "   feat: padded title   "
+run_wrapper c37 "   feat: padded title   "
+rc=$?
+assert_rc 0 "$rc" && ok "c37: padded title passes preflight" || bad "c37: exit $rc, want 0"
+assert_argv c37
+
+# ---- case 38 (#529): interleaved options; --tags/--delivery consume 1 value -
+new_fixture c38
+make_stub c38
+surface_digests "$WORK/c38" > "$WORK/c38.baseline"
+want_argv "$WORK/c38.wantargv" --json --tags feat,fix "fix: x" --delivery=add-login
+run_wrapper c38 --json --tags feat,fix "fix: x" --delivery=add-login
+rc=$?
+assert_rc 0 "$rc" && ok "c38: interleaved options pass preflight" || bad "c38: exit $rc, want 0 (option values must not be read as titles)"
+assert_argv c38
+
+# ---- case 39 (#529): inline --tags= forms skip validation -------------------
+new_fixture c39
+make_stub c39
+surface_digests "$WORK/c39" > "$WORK/c39.baseline"
+want_argv "$WORK/c39.wantargv" --tags=feat,fix --delivery=add-login "docs: x"
+run_wrapper c39 --tags=feat,fix --delivery=add-login "docs: x"
+rc=$?
+assert_rc 0 "$rc" && ok "c39: inline --tags= forms pass preflight" || bad "c39: exit $rc, want 0"
+assert_argv c39
+
+# ---- case 40 (#529): operands after -- are still validated but pass ---------
+new_fixture c40
+make_stub c40
+surface_digests "$WORK/c40" > "$WORK/c40.baseline"
+want_argv "$WORK/c40.wantargv" -- "chore: x"
+run_wrapper c40 -- "chore: x"
+rc=$?
+assert_rc 0 "$rc" && ok "c40: valid title after -- passes" || bad "c40: exit $rc, want 0"
+assert_argv c40
+
+# ---- case 41 (#529): unknown flags are left to the inner CLI ----------------
+new_fixture c41
+make_stub c41
+surface_digests "$WORK/c41" > "$WORK/c41.baseline"
+want_argv "$WORK/c41.wantargv" --bogus "fix: probe"
+run_wrapper c41 --bogus "fix: probe"
+rc=$?
+assert_rc 0 "$rc" && ok "c41: unknown flag does not trip preflight" || bad "c41: exit $rc, want 0"
+assert_argv c41
+
+# ---- case 42 (#529): -h short-circuits validation, argv intact --------------
+new_fixture c42
+make_stub c42
+surface_digests "$WORK/c42" > "$WORK/c42.baseline"
+want_argv "$WORK/c42.wantargv" -h
+run_wrapper c42 -h
+rc=$?
+assert_rc 0 "$rc" && ok "c42: -h passes preflight (help answered by CLI)" || bad "c42: exit $rc, want 0"
+assert_argv c42
+[ -s "$WORK/stubs/c42/log" ] && ok "c42: inner CLI executed for -h" || bad "c42: stub not called"
+
+# ---- case 43 (#529): numeric operand with leading zeros ---------------------
+new_fixture c43
+make_stub c43
+surface_digests "$WORK/c43" > "$WORK/c43.baseline"
+want_argv "$WORK/c43.wantargv" 007
+run_wrapper c43 007
+rc=$?
+assert_rc 0 "$rc" && ok "c43: 007 passes preflight (number reuse)" || bad "c43: exit $rc, want 0"
+assert_argv c43
+assert_clean "$WORK/c43" && ok "c43: fixture clean" || bad "c43: fixture dirty"
 
 # ---- case 1: success — args passed through verbatim, bytes restored --------
 new_fixture c1
