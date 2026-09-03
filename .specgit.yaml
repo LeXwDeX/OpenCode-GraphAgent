@@ -1,8 +1,7 @@
 version: 1
-delivery: specgit-bootstrap-rollback
+delivery: specgit-branch-type-preflight
 context:
   kind: branch
-  branch: feat/530-specgit-bootstrap-rollback
+  branch: feat/529-specgit-branch-type-preflight
 issues:
-  - 530
-pr: 533
+  - 529
