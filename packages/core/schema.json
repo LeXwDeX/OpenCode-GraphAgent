@@ -1,9 +1,9 @@
 {
   "version": "7",
   "dialect": "sqlite",
-  "id": "874d8e74-d354-4dcb-b98c-c893660c9371",
+  "id": "abadf28b-1770-46c6-bbf6-b7800a9ca874",
   "prevIds": [
-    "4142b961-0712-4834-b475-16ea4a74c43c"
+    "874d8e74-d354-4dcb-b98c-c893660c9371"
   ],
   "ddl": [
     {
@@ -1769,16 +1769,6 @@
       "default": null,
       "generated": null,
       "name": "summary_files",
-      "entityType": "columns",
-      "table": "session"
-    },
-    {
-      "type": "text",
-      "notNull": false,
-      "autoincrement": false,
-      "default": null,
-      "generated": null,
-      "name": "summary_diffs",
       "entityType": "columns",
       "table": "session"
     },

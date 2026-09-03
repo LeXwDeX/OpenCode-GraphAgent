@@ -182,22 +182,6 @@ const insertCorruptV2Message = (sessionID: SessionIDType, time = 1) =>
       .pipe(Effect.orDie)
   })
 
-const setLegacySummaryDiff = (sessionID: SessionIDType) =>
-  Effect.gen(function* () {
-    const { db } = yield* Database.Service
-    yield* db
-      .update(SessionTable)
-      .set({
-        summary_additions: 1,
-        summary_deletions: 0,
-        summary_files: 1,
-        summary_diffs: [{ additions: 1, deletions: 0 }],
-      })
-      .where(eq(SessionTable.id, sessionID))
-      .run()
-      .pipe(Effect.orDie)
-  })
-
 const getWorkspaceID = (sessionID: SessionIDType) =>
   Effect.gen(function* () {
     const { db } = yield* Database.Service
@@ -686,24 +670,6 @@ describe("session HttpApi", () => {
         })
         expect((contextBody as { ref?: unknown }).ref).toMatch(/^err_[0-9a-f-]{8}$/)
         expect(JSON.stringify(contextBody)).not.toContain("assistant")
-      }),
-    { git: true, config: { formatter: false, lsp: false } },
-  )
-
-  it.instance(
-    "serves sessions with migrated summary diffs missing file details",
-    () =>
-      Effect.gen(function* () {
-        const test = yield* TestInstance
-        const session = yield* createSession({ title: "legacy diff" })
-        yield* setLegacySummaryDiff(session.id)
-
-        const response = yield* request(pathFor(SessionPaths.get, { sessionID: session.id }), {
-          headers: { "x-opencode-directory": test.directory },
-        })
-
-        expect(response.status).toBe(200)
-        expect((yield* json<Session.Info>(response)).summary?.diffs).toEqual([{ additions: 1, deletions: 0 }])
       }),
     { git: true, config: { formatter: false, lsp: false } },
   )
