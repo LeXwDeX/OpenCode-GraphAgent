@@ -20,6 +20,15 @@
 #   4. restores the snapshots on every exit path (EXIT/INT/TERM/HUP) and
 #      verifies each restored file byte-for-byte against the recorded hash;
 #      any mismatch is reported loudly and exits 3.
+#   5. on inner success only, verifies the delivered PR targets the dev
+#      integration base (#528; AGENTS.md, "Git Workflow"): the PR number is
+#      discovered from the `.specgit.yaml` `pr:` entry on disk, a wrong base
+#      is corrected with `gh pr edit --base dev`, and `baseRefName` is
+#      re-verified; discovery/edit/verification failures exit 3 with
+#      `specgit-bootstrap:` diagnostics while keeping the successful binding.
+#      Fail-closed: a successful delivery without a unique, readable `pr:`
+#      record cannot have its PR base verified and exits 3 - a missing,
+#      unreadable, ambiguous, or malformed entry is never tolerated.
 #
 # The `.specgit.yaml` delivery record gets conditional rollback (#530): a
 # failed inner `specgit issue` (nonzero exit, signal, or init failure) has its
@@ -270,6 +279,73 @@ trap 'restore_all; exit 129' HUP
 trap 'restore_all; exit 130' INT
 trap 'restore_all; exit 143' TERM
 
+# ---- #528: PR base verification ---------------------------------------------
+# AGENTS.md ("Git Workflow") routes every {type}/** pull request to the dev
+# integration branch. A successful inner `specgit issue` therefore must not
+# report success while its PR targets another base. The constant mirrors that
+# guidance verbatim so drift surfaces in review (same pattern as
+# PF_ALLOWED_TYPES above).
+PR_TARGET_BASE='dev'
+
+# Runs ONLY after a successful inner call (issue_status 0). Discovers the PR
+# number from the delivery record on disk (never from the inner CLI's stdout,
+# which stays byte-exact), corrects a wrong base via `gh pr edit`, and
+# re-verifies. Every discovery/edit/verification failure exits 3 with a
+# `specgit-bootstrap:` diagnostic; because issue_status is 0, restore_all
+# keeps the successful binding (#530) — the PR is real on the remote, so a
+# retry can resume from it. Fail-closed (#528): the PR base cannot be
+# verified without a unique `pr:` record, so a missing entry exits 3 (no
+# success tolerance), and an unreadable/failed scan exits 3 with its own
+# diagnosis instead of degrading to a zero-match count. Ambiguous or
+# malformed entries also fail closed.
+verify_pr_base() {
+  if [ ! -f .specgit.yaml ]; then
+    say "PR base verification failed: .specgit.yaml missing after successful bootstrap"
+    exit 3
+  fi
+  pr_matches=$(sed -n '/^pr:/p' .specgit.yaml) || {
+    say "PR base verification failed: .specgit.yaml could not be scanned for the pr: entry"
+    exit 3
+  }
+  if [ -z "$pr_matches" ]; then
+    say "PR base verification failed: .specgit.yaml has no pr: entry - the PR base cannot be verified"
+    exit 3
+  fi
+  pr_count=$(printf '%s\n' "$pr_matches" | wc -l | tr -d ' ')
+  if [ "$pr_count" -gt 1 ]; then
+    say "PR base verification failed: .specgit.yaml has $pr_count pr: entries (ambiguous)"
+    exit 3
+  fi
+  command -v gh >/dev/null 2>&1 || {
+    say "PR base verification failed: 'gh' not found on PATH - cannot verify the PR base"
+    exit 3
+  }
+  pr_number=$(sed -n 's/^pr:[[:space:]]*\([0-9][0-9]*\)[[:space:]]*$/\1/p' .specgit.yaml)
+  if [ -z "$pr_number" ]; then
+    say "PR base verification failed: .specgit.yaml pr: entry is not a plain number"
+    exit 3
+  fi
+  pr_base=$(gh pr view "$pr_number" --json baseRefName --jq .baseRefName) || {
+    say "PR base verification failed: gh pr view $pr_number could not read the PR base"
+    exit 3
+  }
+  [ "$pr_base" = "$PR_TARGET_BASE" ] && return 0
+  say "PR #$pr_number targets base '$pr_base' - correcting to '$PR_TARGET_BASE' (AGENTS.md \"Git Workflow\")"
+  # gh edit prose goes to stderr so a wrapped --json stdout stays byte-exact.
+  gh pr edit "$pr_number" --base "$PR_TARGET_BASE" >&2 || {
+    say "PR base verification failed: gh pr edit $pr_number --base $PR_TARGET_BASE did not succeed"
+    exit 3
+  }
+  pr_base=$(gh pr view "$pr_number" --json baseRefName --jq .baseRefName) || {
+    say "PR base verification failed: gh pr view $pr_number (re-check) could not read the PR base"
+    exit 3
+  }
+  if [ "$pr_base" != "$PR_TARGET_BASE" ]; then
+    say "PR base verification failed: PR #$pr_number still targets '$pr_base' after correction"
+    exit 3
+  fi
+}
+
 # init's stdout prose must not pollute the wrapped --json parse surface.
 specgit init --force --no-protect >&2
 init_status=$?
@@ -282,5 +358,11 @@ fi
 # All arguments pass through verbatim; exit status and diagnostics inherit.
 specgit issue "$@"
 issue_status=$?
+if [ "$issue_status" -eq 0 ]; then
+  # #528: verify (and correct) the PR base before reporting success. On a
+  # verification failure verify_pr_base exits 3 while issue_status stays 0,
+  # so restore_all keeps the successful binding for retries.
+  verify_pr_base
+fi
 restore_all
 exit "$issue_status"

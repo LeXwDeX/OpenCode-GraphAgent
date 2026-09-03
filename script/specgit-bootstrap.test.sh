@@ -3,7 +3,7 @@
 # ok/bad always return 0, so `cond && ok .. || bad ..` cannot mis-fire (SC2015);
 # cleanup() runs via the EXIT trap, which shellcheck does not count (SC2329).
 # Behavior tests for script/specgit-bootstrap.sh (#521, #530 record rollback,
-# #529 issue-title type preflight).
+# #529 issue-title type preflight, #528 PR base verification).
 #
 # Zero network, zero forge: `specgit` is a stub placed first on PATH; every
 # fixture is a throwaway git repo under $TMPDIR. The real repository is never
@@ -66,7 +66,9 @@ new_fixture() { # <name> [no-binding]
   git -C "$fx" config user.email test@example.invalid
   git -C "$fx" config user.name test
   printf 'version: 1\nkind: probe\n' > "$fx/spec_git/policy.yaml"
-  printf 'version: 1\nbranch: feat/probe\nissues: []\n' > "$fx/.specgit.yaml"
+  # pr: 535 mirrors a bound repo mid-delivery (resume): default-mode inner
+  # successes carry a verifiable PR through #528 verification via the gh stub.
+  printf 'version: 1\nbranch: feat/probe\nissues: []\npr: 535\n' > "$fx/.specgit.yaml"
   cat > "$fx/.github/workflows/specgit-accept.yml" <<'YAML'
 # fixture accept workflow
 spec-a: drop-dispatch
@@ -154,7 +156,34 @@ case "$cmd" in
         exit "${STUB_ISSUE_EXIT:-3}"
         ;;
       succeed_after_record_write)
+        [ "${1:-}" = "--json" ] && printf '{"stub":"issue"}\n'
         printf 'version: 1\nbranch: feat/probe\nissues: [530]\n' > .specgit.yaml
+        exit 0
+        ;;
+      succeed_after_pr_write)
+        [ "${1:-}" = "--json" ] && printf '{"stub":"issue"}\n'
+        printf 'version: 1\nbranch: feat/probe\nissues: [528]\npr: %s\n' "${STUB_RECORD_PR:-535}" > .specgit.yaml
+        exit 0
+        ;;
+      succeed_after_pr_write_dup)
+        [ "${1:-}" = "--json" ] && printf '{"stub":"issue"}\n'
+        printf 'version: 1\nbranch: feat/probe\nissues: [528]\npr: 535\npr: 536\n' > .specgit.yaml
+        exit 0
+        ;;
+      succeed_after_pr_write_malformed)
+        [ "${1:-}" = "--json" ] && printf '{"stub":"issue"}\n'
+        printf 'version: 1\nbranch: feat/probe\nissues: [528]\npr: 535x\n' > .specgit.yaml
+        exit 0
+        ;;
+      succeed_then_delete_record)
+        [ "${1:-}" = "--json" ] && printf '{"stub":"issue"}\n'
+        rm -f .specgit.yaml
+        exit 0
+        ;;
+      succeed_after_unreadable_record)
+        [ "${1:-}" = "--json" ] && printf '{"stub":"issue"}\n'
+        printf 'version: 1\nbranch: feat/probe\nissues: [528]\n' > .specgit.yaml
+        chmod 000 .specgit.yaml
         exit 0
         ;;
       tamper_record_snapshot)
@@ -174,6 +203,49 @@ case "$cmd" in
 esac
 EOF
   chmod +x "$dir/specgit"
+  cat > "$dir/gh" <<'EOF'
+#!/usr/bin/env bash
+# stub gh: records argv to $STUB_LOG.ghargv (NUL-separated, its own sidecar so
+# the specgit passthrough sidecar stays byte-exact), simulates `gh pr view` /
+# `gh pr edit` via env knobs plus an edit marker file that flips the reported
+# base. Never touches network or forge.
+set -u
+printf '%s\0' "$@" >> "${STUB_LOG:?STUB_LOG required}.ghargv"
+cmd="${1:-}"
+[ $# -gt 0 ] && shift
+case "$cmd" in
+  pr)
+    sub="${1:-}"
+    [ $# -gt 0 ] && shift
+    case "$sub" in
+      view)
+        rc="${STUB_GH_VIEW_EXIT:-0}"
+        if [ "$rc" -ne 0 ]; then
+          printf 'gh: view failed (stub)\n' >&2
+          exit "$rc"
+        fi
+        if [ -f "${STUB_LOG}.gh-edited" ]; then
+          printf '%s\n' "${STUB_GH_VIEW2_BASE:-${STUB_GH_VIEW_BASE:-dev}}"
+        else
+          printf '%s\n' "${STUB_GH_VIEW_BASE:-dev}"
+        fi
+        exit 0
+        ;;
+      edit)
+        rc="${STUB_GH_EDIT_EXIT:-0}"
+        printf '%s\n' 'https://example.invalid/pr/edited (stub)'
+        if [ "$rc" -eq 0 ]; then
+          printf 'edited\n' > "${STUB_LOG:?STUB_LOG required}.gh-edited"
+        fi
+        exit "$rc"
+        ;;
+    esac
+    ;;
+esac
+printf 'stub gh: unknown invocation: %s\n' "$cmd" >&2
+exit 64
+EOF
+  chmod +x "$dir/gh"
 }
 
 # run_wrapper <case> [args...]  — env knobs must already be exported.
@@ -224,6 +296,232 @@ expect_reject() {
   [ ! -s "$WORK/$case.out" ] && ok "$case: stdout empty (no JSON envelope)" || bad "$case: stdout not empty: $(tr '\n' '|' < "$WORK/$case.out")"
   assert_clean "$WORK/$case" && ok "$case: fixture untouched" || bad "$case: fixture dirty: $(git -C "$WORK/$case" status --porcelain | tr '\n' '|')"
 }
+
+# ---- #528 helpers ------------------------------------------------------------
+# want_gh <file> <gh argv words...> — expected gh stub sidecar stream.
+want_gh() {
+  local f="$1"
+  shift
+  printf '%s\0' "$@" > "$f"
+}
+
+# gh_calls <case> — newline view of the gh stub sidecar (NUL-separated argv).
+gh_calls() {
+  tr '\0' '\n' < "$WORK/stubs/$1/log.ghargv" 2>/dev/null || true
+}
+
+assert_no_gh_calls() { # <case>
+  [ ! -s "$WORK/stubs/$1/log.ghargv" ] \
+    && ok "$1: zero gh calls" \
+    || bad "$1: unexpected gh calls: $(gh_calls "$1" | tr '\n' '|')"
+}
+
+# assert_record_kept <case> — the successful inner binding (stub-written record
+# with pr: 535) survived byte-exactly: a failed post-step must never roll it
+# back, because the PR is real on the remote (#530 success semantics).
+assert_record_kept() {
+  printf 'version: 1\nbranch: feat/probe\nissues: [528]\npr: 535\n' > "$WORK/$1.wantrecord"
+  diff "$WORK/$1.wantrecord" "$WORK/$1/.specgit.yaml" >/dev/null \
+    && ok "$1: successful binding kept byte-exactly (pr: 535)" \
+    || bad "$1: record deviates: $(tr '\n' '|' < "$WORK/$1/.specgit.yaml" 2>/dev/null)"
+}
+
+# ==== #528: PR base verification =============================================
+# A successful inner delivery must target dev (AGENTS.md "Git Workflow"): the
+# wrapper discovers the PR number from the record on disk, corrects a wrong
+# base via `gh pr edit`, and re-verifies before reporting success. All gh
+# interaction goes through the case's stub dir (first on PATH; the host may
+# carry a real gh) — zero network, zero forge.
+
+# NOGHBIN: minimal tool mirror with NO gh, so the gh-missing case exercises a
+# genuine `command -v gh` failure on any host (CI runners ship gh).
+NOGHBIN="$WORK/noghbin"
+mkdir -p "$NOGHBIN"
+for t in sh bash env git sed awk mktemp mkdir rm cp cat grep ls wc tr chmod sleep uname dirname basename; do
+  p=$(command -v "$t" 2>/dev/null) && ln -sf "$p" "$NOGHBIN/$t"
+done
+
+# ---- case 44: base already dev — verified, never edited ----------------------
+new_fixture c44
+make_stub c44
+surface_digests "$WORK/c44" > "$WORK/c44.baseline"
+want_argv "$WORK/c44.wantargv" --json "feat: probe"
+want_gh "$WORK/c44.wantgh" pr view 535 --json baseRefName --jq .baseRefName
+STUB_ISSUE_MODE=succeed_after_pr_write run_wrapper c44 --json "feat: probe"
+rc=$?
+assert_rc 0 "$rc" && ok "c44: base already dev exits 0" || bad "c44: exit $rc, want 0"
+assert_argv c44
+cmp -s "$WORK/c44.wantgh" "$WORK/stubs/c44/log.ghargv" \
+  && ok "c44: exactly one gh pr view call" \
+  || bad "c44: gh calls mismatch: $(gh_calls c44 | tr '\n' '|')"
+[ ! -f "$WORK/stubs/c44/log.gh-edited" ] && ok "c44: already-dev avoids edit" || bad "c44: edit ran on a dev PR"
+printf '{"stub":"issue"}\n' > "$WORK/c44.wantout"
+cmp -s "$WORK/c44.out" "$WORK/c44.wantout" && ok "c44: --json stdout is exactly the inner JSON" || bad "c44: stdout polluted: $(tr '\n' '|' < "$WORK/c44.out")"
+assert_record_kept c44
+assert_surface_restored "$WORK/c44" "$WORK/c44.baseline" && ok "c44: surface bytes restored" || bad "c44: surface bytes differ"
+[ "$(git -C "$WORK/c44" status --porcelain | grep -cv 'specgit.yaml')" = "0" ] && ok "c44: only the record binding differs" || bad "c44: residual changes: $(git -C "$WORK/c44" status --porcelain | tr '\n' '|')"
+
+# ---- case 45: base main — corrected to dev via gh pr edit --------------------
+new_fixture c45
+make_stub c45
+surface_digests "$WORK/c45" > "$WORK/c45.baseline"
+want_argv "$WORK/c45.wantargv" --json "feat: probe"
+want_gh "$WORK/c45.wantgh" pr view 535 --json baseRefName --jq .baseRefName pr edit 535 --base dev pr view 535 --json baseRefName --jq .baseRefName
+STUB_ISSUE_MODE=succeed_after_pr_write STUB_GH_VIEW_BASE=main STUB_GH_VIEW2_BASE=dev \
+  run_wrapper c45 --json "feat: probe"
+rc=$?
+assert_rc 0 "$rc" && ok "c45: wrong base corrected, exits 0" || bad "c45: exit $rc, want 0"
+assert_argv c45
+cmp -s "$WORK/c45.wantgh" "$WORK/stubs/c45/log.ghargv" \
+  && ok "c45: view -> edit --base dev -> re-view sequence" \
+  || bad "c45: gh sequence mismatch: $(gh_calls c45 | tr '\n' '|')"
+[ -f "$WORK/stubs/c45/log.gh-edited" ] && ok "c45: edit executed" || bad "c45: edit never ran"
+printf '{"stub":"issue"}\n' > "$WORK/c45.wantout"
+cmp -s "$WORK/c45.out" "$WORK/c45.wantout" && ok "c45: gh edit prose kept off stdout" || bad "c45: stdout polluted: $(tr '\n' '|' < "$WORK/c45.out")"
+grep -qF 'https://example.invalid/pr/edited' "$WORK/c45.err" && ok "c45: edit prose routed to stderr" || bad "c45: edit prose not on stderr"
+assert_record_kept c45
+assert_surface_restored "$WORK/c45" "$WORK/c45.baseline" && ok "c45: surface bytes restored" || bad "c45: surface bytes differ"
+
+# ---- case 46: gh pr edit fails — exit 3, no re-verify, binding kept ----------
+new_fixture c46
+make_stub c46
+surface_digests "$WORK/c46" > "$WORK/c46.baseline"
+want_gh "$WORK/c46.wantgh" pr view 535 --json baseRefName --jq .baseRefName pr edit 535 --base dev
+STUB_ISSUE_MODE=succeed_after_pr_write STUB_GH_VIEW_BASE=main STUB_GH_EDIT_EXIT=1 \
+  run_wrapper c46 "feat: probe"
+rc=$?
+assert_rc 3 "$rc" && ok "c46: edit failure exits 3" || bad "c46: exit $rc, want 3"
+cmp -s "$WORK/c46.wantgh" "$WORK/stubs/c46/log.ghargv" \
+  && ok "c46: failed edit not re-verified (no second view)" \
+  || bad "c46: gh sequence mismatch: $(gh_calls c46 | tr '\n' '|')"
+[ ! -s "$WORK/c46.out" ] && ok "c46: stdout empty (no JSON envelope)" || bad "c46: stdout not empty: $(tr '\n' '|' < "$WORK/c46.out")"
+grep -q '^specgit-bootstrap:' "$WORK/c46.err" && ok "c46: diagnostics use specgit-bootstrap: prefix" || bad "c46: missing prefix"
+grep -qF 'gh pr edit' "$WORK/c46.err" && ok "c46: diagnostic names gh pr edit" || bad "c46: no edit diagnostic: $(tr '\n' '|' < "$WORK/c46.err")"
+assert_record_kept c46
+assert_surface_restored "$WORK/c46" "$WORK/c46.baseline" && ok "c46: surface bytes restored" || bad "c46: surface bytes differ"
+[ "$(git -C "$WORK/c46" status --porcelain | grep -cv 'specgit.yaml')" = "0" ] && ok "c46: only the record binding differs" || bad "c46: residual changes: $(git -C "$WORK/c46" status --porcelain | tr '\n' '|')"
+
+# ---- case 47: gh pr view fails — exit 3, zero edits --------------------------
+new_fixture c47
+make_stub c47
+surface_digests "$WORK/c47" > "$WORK/c47.baseline"
+want_gh "$WORK/c47.wantgh" pr view 535 --json baseRefName --jq .baseRefName
+STUB_ISSUE_MODE=succeed_after_pr_write STUB_GH_VIEW_EXIT=1 run_wrapper c47 "feat: probe"
+rc=$?
+assert_rc 3 "$rc" && ok "c47: view failure exits 3" || bad "c47: exit $rc, want 3"
+cmp -s "$WORK/c47.wantgh" "$WORK/stubs/c47/log.ghargv" \
+  && ok "c47: zero edits after view failure" \
+  || bad "c47: gh calls: $(gh_calls c47 | tr '\n' '|')"
+[ ! -s "$WORK/c47.out" ] && ok "c47: stdout empty (no JSON envelope)" || bad "c47: stdout not empty: $(tr '\n' '|' < "$WORK/c47.out")"
+grep -q '^specgit-bootstrap:' "$WORK/c47.err" && ok "c47: diagnostics use specgit-bootstrap: prefix" || bad "c47: missing prefix"
+grep -qF 'gh pr view' "$WORK/c47.err" && ok "c47: diagnostic names gh pr view" || bad "c47: no view diagnostic: $(tr '\n' '|' < "$WORK/c47.err")"
+assert_record_kept c47
+assert_surface_restored "$WORK/c47" "$WORK/c47.baseline" && ok "c47: surface bytes restored" || bad "c47: surface bytes differ"
+
+# ---- case 48: edit succeeds but base still main — exit 3, exactly one edit ---
+new_fixture c48
+make_stub c48
+surface_digests "$WORK/c48" > "$WORK/c48.baseline"
+want_gh "$WORK/c48.wantgh" pr view 535 --json baseRefName --jq .baseRefName pr edit 535 --base dev pr view 535 --json baseRefName --jq .baseRefName
+STUB_ISSUE_MODE=succeed_after_pr_write STUB_GH_VIEW_BASE=main STUB_GH_VIEW2_BASE=main \
+  run_wrapper c48 --json "feat: probe"
+rc=$?
+assert_rc 3 "$rc" && ok "c48: unverifiable base exits 3" || bad "c48: exit $rc, want 3"
+cmp -s "$WORK/c48.wantgh" "$WORK/stubs/c48/log.ghargv" \
+  && ok "c48: exactly one edit then re-view" \
+  || bad "c48: gh sequence: $(gh_calls c48 | tr '\n' '|')"
+grep -qF 'still targets' "$WORK/c48.err" && ok "c48: re-verification failure reported" || bad "c48: no still-targets diagnostic: $(tr '\n' '|' < "$WORK/c48.err")"
+printf '{"stub":"issue"}\n' > "$WORK/c48.wantout"
+cmp -s "$WORK/c48.out" "$WORK/c48.wantout" && ok "c48: stdout is exactly the inner JSON despite failure" || bad "c48: stdout polluted: $(tr '\n' '|' < "$WORK/c48.out")"
+assert_record_kept c48
+assert_surface_restored "$WORK/c48" "$WORK/c48.baseline" && ok "c48: surface bytes restored" || bad "c48: surface bytes differ"
+
+# ---- case 49: gh genuinely absent — exit 3, binding kept ---------------------
+new_fixture c49
+make_stub c49
+rm -f "$WORK/stubs/c49/gh"
+surface_digests "$WORK/c49" > "$WORK/c49.baseline"
+( cd "$WORK/c49" && env -i PATH="$WORK/stubs/c49:$NOGHBIN" HOME="$HOME" STUB_LOG="$WORK/stubs/c49/log" STUB_ISSUE_MODE=succeed_after_pr_write "$WRAPPER" "feat: probe" > "$WORK/c49.out" 2> "$WORK/c49.err" )
+rc=$?
+assert_rc 3 "$rc" && ok "c49: missing gh exits 3" || bad "c49: exit $rc, want 3"
+[ -s "$WORK/stubs/c49/log" ] && ok "c49: inner CLI ran before verification" || bad "c49: stub never ran"
+[ ! -s "$WORK/c49.out" ] && ok "c49: stdout empty (no JSON envelope)" || bad "c49: stdout not empty: $(tr '\n' '|' < "$WORK/c49.out")"
+grep -q '^specgit-bootstrap:' "$WORK/c49.err" && ok "c49: diagnostics use specgit-bootstrap: prefix" || bad "c49: missing prefix"
+grep -qF 'not found on PATH' "$WORK/c49.err" && ok "c49: diagnostic names missing gh" || bad "c49: no gh diagnostic: $(tr '\n' '|' < "$WORK/c49.err")"
+assert_no_gh_calls c49
+assert_record_kept c49
+assert_surface_restored "$WORK/c49" "$WORK/c49.baseline" && ok "c49: surface bytes restored" || bad "c49: surface bytes differ"
+
+# ---- case 50: record without pr: entry — fail-closed, zero gh calls ---------
+# After a successful inner call a missing unique pr: record means the PR base
+# cannot be verified: exit 3 (no success tolerance), empty stdout, stderr
+# diagnosis, zero gh calls — and the successful binding is kept (#530: the
+# delivery is real on the remote, so a retry can resume from it).
+new_fixture c50
+make_stub c50
+surface_digests "$WORK/c50" > "$WORK/c50.baseline"
+STUB_ISSUE_MODE=succeed_after_record_write run_wrapper c50 "feat: probe"
+rc=$?
+assert_rc 3 "$rc" && ok "c50: record without pr: exits 3" || bad "c50: exit $rc, want 3"
+assert_no_gh_calls c50
+[ ! -s "$WORK/c50.out" ] && ok "c50: stdout empty (no JSON envelope)" || bad "c50: stdout not empty: $(tr '\n' '|' < "$WORK/c50.out")"
+grep -qF 'has no pr: entry' "$WORK/c50.err" && ok "c50: diagnostic names the missing pr: entry" || bad "c50: no missing-entry diagnostic: $(tr '\n' '|' < "$WORK/c50.err")"
+printf 'version: 1\nbranch: feat/probe\nissues: [530]\n' > "$WORK/c50.wantrecord"
+cmp -s "$WORK/c50.wantrecord" "$WORK/c50/.specgit.yaml" && ok "c50: successful binding kept byte-exactly" || bad "c50: binding lost: $(tr '\n' '|' < "$WORK/c50/.specgit.yaml" 2>/dev/null)"
+assert_surface_restored "$WORK/c50" "$WORK/c50.baseline" && ok "c50: surface bytes restored" || bad "c50: surface bytes differ"
+
+# ---- case 51: ambiguous record (two pr: entries) — fail-closed discovery -----
+new_fixture c51
+make_stub c51
+surface_digests "$WORK/c51" > "$WORK/c51.baseline"
+STUB_ISSUE_MODE=succeed_after_pr_write_dup run_wrapper c51 "feat: probe"
+rc=$?
+assert_rc 3 "$rc" && ok "c51: ambiguous pr: entries exit 3" || bad "c51: exit $rc, want 3"
+assert_no_gh_calls c51
+[ ! -s "$WORK/c51.out" ] && ok "c51: stdout empty (no JSON envelope)" || bad "c51: stdout not empty"
+grep -qF 'pr: entries' "$WORK/c51.err" && ok "c51: diagnostic names the ambiguity" || bad "c51: no ambiguity diagnostic: $(tr '\n' '|' < "$WORK/c51.err")"
+grep -q 'pr: 535' "$WORK/c51/.specgit.yaml" && ok "c51: binding kept" || bad "c51: binding lost"
+assert_surface_restored "$WORK/c51" "$WORK/c51.baseline" && ok "c51: surface bytes restored" || bad "c51: surface bytes differ"
+
+# ---- case 52: malformed pr: entry — fail-closed discovery --------------------
+new_fixture c52
+make_stub c52
+surface_digests "$WORK/c52" > "$WORK/c52.baseline"
+STUB_ISSUE_MODE=succeed_after_pr_write_malformed run_wrapper c52 "feat: probe"
+rc=$?
+assert_rc 3 "$rc" && ok "c52: malformed pr: entry exits 3" || bad "c52: exit $rc, want 3"
+assert_no_gh_calls c52
+[ ! -s "$WORK/c52.out" ] && ok "c52: stdout empty (no JSON envelope)" || bad "c52: stdout not empty"
+grep -qF 'not a plain number' "$WORK/c52.err" && ok "c52: diagnostic names the malformed entry" || bad "c52: no malformed diagnostic: $(tr '\n' '|' < "$WORK/c52.err")"
+assert_surface_restored "$WORK/c52" "$WORK/c52.baseline" && ok "c52: surface bytes restored" || bad "c52: surface bytes differ"
+
+# ---- case 53: record deleted after inner success — fail-closed discovery -----
+new_fixture c53
+make_stub c53
+surface_digests "$WORK/c53" > "$WORK/c53.baseline"
+STUB_ISSUE_MODE=succeed_then_delete_record run_wrapper c53 "feat: probe"
+rc=$?
+assert_rc 3 "$rc" && ok "c53: missing record after success exits 3" || bad "c53: exit $rc, want 3"
+assert_no_gh_calls c53
+[ ! -s "$WORK/c53.out" ] && ok "c53: stdout empty (no JSON envelope)" || bad "c53: stdout not empty"
+grep -qF 'missing after successful bootstrap' "$WORK/c53.err" && ok "c53: diagnostic names the missing record" || bad "c53: no missing-record diagnostic: $(tr '\n' '|' < "$WORK/c53.err")"
+[ ! -f "$WORK/c53/.specgit.yaml" ] && ok "c53: deleted record not resurrected (deliberate artifact)" || bad "c53: record unexpectedly present"
+assert_surface_restored "$WORK/c53" "$WORK/c53.baseline" && ok "c53: surface bytes restored" || bad "c53: surface bytes differ"
+
+# ---- case 54: unreadable record — failed scan is fail-closed, not exit 0 -----
+# chmod 000 makes the record unreadable to sed: the scan must exit 3 with its
+# own diagnosis instead of degrading to a zero-match count. (Root could still
+# read the file and takes the no-entry path — also exit 3.)
+new_fixture c54
+make_stub c54
+surface_digests "$WORK/c54" > "$WORK/c54.baseline"
+STUB_ISSUE_MODE=succeed_after_unreadable_record run_wrapper c54 "feat: probe"
+rc=$?
+assert_rc 3 "$rc" && ok "c54: unreadable record scan exits 3" || bad "c54: exit $rc, want 3"
+assert_no_gh_calls c54
+[ ! -s "$WORK/c54.out" ] && ok "c54: stdout empty (no JSON envelope)" || bad "c54: stdout not empty"
+grep -qF 'could not be scanned' "$WORK/c54.err" && ok "c54: diagnostic names the failed scan" || bad "c54: no scan diagnostic: $(tr '\n' '|' < "$WORK/c54.err")"
+assert_surface_restored "$WORK/c54" "$WORK/c54.baseline" && ok "c54: surface bytes restored" || bad "c54: surface bytes differ"
 
 report() {
   printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
@@ -540,13 +838,15 @@ assert_surface_restored "$WORK/c12" "$WORK/c12.baseline" && ok "case12: surface 
 assert_clean "$WORK/c12" && ok "case12: fixture clean" || bad "case12: fixture dirty: $(git -C "$WORK/c12" status --porcelain | tr '\n' '|')"
 
 # ---- case 13: success keeps the new binding ---------------------------------
+# Record carries pr: 535 so #528 verification passes and the run exits 0;
+# assert_record_kept proves the stub-written binding survived byte-exactly.
 new_fixture c13
 make_stub c13
 surface_digests "$WORK/c13" > "$WORK/c13.baseline"
-STUB_ISSUE_MODE=succeed_after_record_write run_wrapper c13 "feat: probe"
+STUB_ISSUE_MODE=succeed_after_pr_write run_wrapper c13 "feat: probe"
 rc=$?
 assert_rc 0 "$rc" && ok "case13: wrapper exits 0" || bad "case13: exit $rc, want 0"
-grep -q 'issues: \[530\]' "$WORK/c13/.specgit.yaml" && ok "case13: successful bootstrap keeps new binding" || bad "case13: new binding lost: $(tr '\n' '|' < "$WORK/c13/.specgit.yaml")"
+assert_record_kept c13
 assert_surface_restored "$WORK/c13" "$WORK/c13.baseline" && ok "case13: surface bytes restored" || bad "case13: surface bytes differ"
 [ "$(git -C "$WORK/c13" status --porcelain | grep -cv 'specgit.yaml')" = "0" ] && ok "case13: only the record binding differs post-success" || bad "case13: unexpected residual changes: $(git -C "$WORK/c13" status --porcelain | tr '\n' '|')"
 
