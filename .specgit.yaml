@@ -1,8 +1,8 @@
 version: 1
-delivery: auto-close-linked
+delivery: summary-diff-continue
 context:
   kind: branch
-  branch: feat/519-auto-close-linked
+  branch: fix/525-summary-diff-continue
 issues:
-  - 519
-pr: 520
+  - 525
+pr: 526
