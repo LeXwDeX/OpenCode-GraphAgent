@@ -8,7 +8,9 @@
 # specializations"). This wrapper makes the refresh safe:
 #
 #   1. refuses to run when any init write-surface path has uncommitted changes
-#      (tracked, staged, or untracked), or when the repo has no SpecGit binding;
+#      (tracked, staged, or untracked), when the repo has no SpecGit binding,
+#      or when any requested issue title carries a type outside the allowed
+#      branch-type vocabulary (#529; AGENTS.md, "Branch Names");
 #   2. snapshots every existing write-surface path to a temp directory OUTSIDE
 #      the repository, recording each file's `git hash-object` content hash;
 #   3. runs `specgit init --force --no-protect` (hardcoded, offline; init's
@@ -72,6 +74,100 @@ if [ -n "$dirty" ]; then
   say "commit or stash those changes first, then retry"
   exit 2
 fi
+
+# ---- #529 preflight: reject unsupported issue title types BEFORE any side
+# effect (no snapshot, no init, no inner CLI). The allowed vocabulary is owned
+# by AGENTS.md ("Branch Names"); this constant mirrors it verbatim so drift
+# surfaces in review. Types are only accepted or rejected - never mapped.
+# Rejections are fail-closed: exit 2, `specgit-bootstrap:` diagnostics on
+# stderr, no `--json` envelope on stdout.
+
+PF_ALLOWED_TYPES='chore docs feat fix hotfix refactor release test'
+
+pf_trim() { # POSIX-whitespace trim; result in $pf_t
+  pf_t=$1
+  pf_t=${pf_t#"${pf_t%%[![:space:]]*}"}
+  pf_t=${pf_t%"${pf_t##*[![:space:]]}"}
+}
+
+pf_hint() {
+  say "allowed types: $PF_ALLOWED_TYPES (AGENTS.md \"Branch Names\")"
+  say "edit the title type to an allowed one, then re-run (no type mapping is performed)"
+}
+
+# Scans the wrapped argv left to right, mirroring the specgit 1.10.1 option
+# grammar: --delivery/--tags consume one value each, --name= carries it
+# inline, -- ends options, and -h/--help is answered by the CLI without
+# operand validation. Positional operands are issue numbers (pure digits -
+# the reuse path, "007" -> 7) or titles that must start with
+# '<allowed type>: '. The first violation exits 2.
+pf_check_issue_titles() {
+  pf_seen_dd=0
+  pf_swallow=0
+  for pf_arg in "$@"; do
+    if [ "$pf_swallow" -eq 1 ]; then
+      pf_swallow=0
+      continue
+    fi
+    if [ "$pf_seen_dd" -eq 0 ]; then
+      case $pf_arg in
+        --)
+          pf_seen_dd=1
+          continue
+          ;;
+        --delivery|--tags)
+          pf_swallow=1
+          continue
+          ;;
+        --delivery=*|--tags=*)
+          continue
+          ;;
+        -h|--help)
+          return 0
+          ;;
+        -*)
+          continue
+          ;;
+      esac
+    fi
+    pf_trim "$pf_arg"
+    if [ -z "$pf_t" ]; then
+      say "empty issue title argument: '$pf_arg'"
+      pf_hint
+      exit 2
+    fi
+    case $pf_t in
+      *[!0123456789]*) ;;
+      *) continue ;; # pure digits: issue-number reuse
+    esac
+    pf_type=${pf_t%%:*}
+    pf_rest=${pf_t#*:}
+    if [ "$pf_rest" = "$pf_t" ]; then
+      say "unsupported issue title type '$pf_t' in: $pf_arg"
+      pf_hint
+      exit 2
+    fi
+    # Conventional titles need whitespace after the colon ("type: desc");
+    # trimming changes pf_rest iff it has leading whitespace.
+    pf_trim "$pf_rest"
+    if [ "$pf_t" = "$pf_rest" ]; then
+      say "unsupported issue title syntax in: $pf_arg - need 'type: description' (whitespace after the colon)"
+      pf_hint
+      exit 2
+    fi
+    case " $PF_ALLOWED_TYPES " in
+      *" $pf_type "*)
+        ;;
+      *)
+        say "unsupported issue title type '$pf_type' in: $pf_arg"
+        pf_hint
+        exit 2
+        ;;
+    esac
+  done
+}
+
+pf_check_issue_titles "$@"
 
 SNAP=$(mktemp -d "${TMPDIR:-/tmp}/specgit-bootstrap.XXXXXX") || {
   say "cannot create snapshot directory under \${TMPDIR:-/tmp}"
