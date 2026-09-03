@@ -279,7 +279,7 @@ Kept OUTSIDE the managed block so `specgit init`/`--force` never rewrites them; 
 
 - Never run bare `specgit init --force` here: it overwrites the six specialized bytes; the wrapper exists to make that refresh transient.
 - Fail-closed rejections: dirty write-surface paths (tracked/staged/untracked) → exit 2 with the offending paths listed; no SpecGit binding (`.specgit.yaml` or `spec_git/policy.yaml` missing) → exit 3; restore hash mismatch → exit 3 with the snapshot kept for forensics. Rejection paths print plain `specgit-bootstrap:` stderr lines and NEVER produce a `--json` envelope.
-- The inner `.specgit.yaml` written by `specgit issue` is a legitimate binding artifact and is never rolled back.
+- The inner `.specgit.yaml` delivery record is rolled back to its pre-run bytes when the inner `specgit issue` exits nonzero (or a signal/init failure interrupts); a successful call keeps the new binding. Record-restore failure keeps the forensic snapshot and exits 3, overriding the inner exit code. Branches, commits, and remote side effects are never undone (#530).
 - Managed-block guidance referencing bare `specgit issue` commands is superseded by this section for this repository. Behavior tests: `bash script/specgit-bootstrap.test.sh` (stubbed CLI, zero network; not CI-wired).
 
 <!-- specgit:block:start -->
