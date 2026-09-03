@@ -5,3 +5,4 @@ context:
   branch: fix/525-summary-diff-continue
 issues:
   - 525
+pr: 526
