@@ -2,7 +2,7 @@
 # shellcheck disable=SC2015,SC2329
 # ok/bad always return 0, so `cond && ok .. || bad ..` cannot mis-fire (SC2015);
 # cleanup() runs via the EXIT trap, which shellcheck does not count (SC2329).
-# Behavior tests for script/specgit-bootstrap.sh (#521).
+# Behavior tests for script/specgit-bootstrap.sh (#521, #530 record rollback).
 #
 # Zero network, zero forge: `specgit` is a stub placed first on PATH; every
 # fixture is a throwaway git repo under $TMPDIR. The real repository is never
@@ -127,6 +127,36 @@ case "$cmd" in
         d=$(ls -dt "${TMPDIR:-/tmp}"/specgit-bootstrap.* 2>/dev/null | sed -n '1p')
         if [ -n "$d" ] && [ -f "$d/tree/.github/workflows/specgit-accept.yml" ]; then
           printf 'tampered-by-test\n' > "$d/tree/.github/workflows/specgit-accept.yml"
+        fi
+        exit "${STUB_ISSUE_EXIT:-0}"
+        ;;
+      fail_after_branch_write)
+        printf 'version: 1\nbranch: feat/probe\nissues: [530]\n' > .specgit.yaml
+        exit "${STUB_ISSUE_EXIT:-3}"
+        ;;
+      fail_after_push_delete)
+        rm -f .specgit.yaml
+        exit "${STUB_ISSUE_EXIT:-3}"
+        ;;
+      fail_after_pr_write)
+        printf 'version: 1\nbranch: feat/probe\nissues: [530, 533]\n' > .specgit.yaml
+        exit "${STUB_ISSUE_EXIT:-3}"
+        ;;
+      fail_after_push_commit)
+        printf 'version: 1\nbranch: feat/probe\nissues: [530]\n' > .specgit.yaml
+        git add .specgit.yaml
+        git commit -qm "stub: record delivery binding"
+        exit "${STUB_ISSUE_EXIT:-3}"
+        ;;
+      succeed_after_record_write)
+        printf 'version: 1\nbranch: feat/probe\nissues: [530]\n' > .specgit.yaml
+        exit 0
+        ;;
+      tamper_record_snapshot)
+        d=$(ls -dt "${TMPDIR:-/tmp}"/specgit-bootstrap.* 2>/dev/null | sed -n '1p')
+        if [ -n "$d" ] && [ -d "$d/tree" ]; then
+          printf 'tampered-record\n' > "$d/tree/.specgit.yaml"
+          printf '%s\n' "$d" >> "${STUB_LOG}.snapdir"
         fi
         exit "${STUB_ISSUE_EXIT:-0}"
         ;;
@@ -266,6 +296,115 @@ assert_rc 3 "$rc" && ok "case8: wrapper exits 3 on unbound repository" || bad "c
 [ ! -s "$WORK/stubs/c8/log" ] && ok "case8: inner CLI never executed" || bad "case8: stub was called"
 grep -q 'spec_git/policy.yaml\|\.specgit\.yaml' "$WORK/c8.err" && ok "case8: stderr names the missing binding" || bad "case8: stderr lacks binding context"
 grep -q '^specgit-bootstrap:' "$WORK/c8.err" && ok "case8: diagnostics use specgit-bootstrap: prefix" || bad "case8: missing prefix"
+
+# ---- case 9: validation failure — record untouched, rc passthrough ---------
+new_fixture c9
+make_stub c9
+cp "$WORK/c9/.specgit.yaml" "$WORK/c9.record-baseline"
+surface_digests "$WORK/c9" > "$WORK/c9.baseline"
+STUB_ISSUE_EXIT=2 run_wrapper c9 "fix: probe"
+rc=$?
+assert_rc 2 "$rc" && ok "case9: wrapper exits 2 (validation failure passthrough)" || bad "case9: exit $rc, want 2"
+diff "$WORK/c9/.specgit.yaml" "$WORK/c9.record-baseline" >/dev/null && ok "case9: record bytes untouched" || bad "case9: record bytes changed"
+assert_surface_restored "$WORK/c9" "$WORK/c9.baseline" && ok "case9: surface bytes restored" || bad "case9: surface bytes differ"
+assert_clean "$WORK/c9" && ok "case9: fixture clean" || bad "case9: fixture dirty: $(git -C "$WORK/c9" status --porcelain | tr '\n' '|')"
+
+# ---- case 10: branch-creation failure — rewritten record rolled back --------
+new_fixture c10
+make_stub c10
+cp "$WORK/c10/.specgit.yaml" "$WORK/c10.record-baseline"
+surface_digests "$WORK/c10" > "$WORK/c10.baseline"
+STUB_ISSUE_MODE=fail_after_branch_write STUB_ISSUE_EXIT=3 run_wrapper c10 "fix: probe"
+rc=$?
+assert_rc 3 "$rc" && ok "case10: wrapper exits 3 (branch failure passthrough)" || bad "case10: exit $rc, want 3"
+diff "$WORK/c10/.specgit.yaml" "$WORK/c10.record-baseline" >/dev/null && ok "case10: rewritten record rolled back to pre-run bytes" || bad "case10: record not rolled back: $(tr '\n' '|' < "$WORK/c10/.specgit.yaml")"
+assert_surface_restored "$WORK/c10" "$WORK/c10.baseline" && ok "case10: surface bytes restored" || bad "case10: surface bytes differ"
+assert_clean "$WORK/c10" && ok "case10: fixture clean" || bad "case10: fixture dirty: $(git -C "$WORK/c10" status --porcelain | tr '\n' '|')"
+
+# ---- case 11: push failure deleting the record — file recreated (#519) ------
+new_fixture c11
+make_stub c11
+cp "$WORK/c11/.specgit.yaml" "$WORK/c11.record-baseline"
+surface_digests "$WORK/c11" > "$WORK/c11.baseline"
+STUB_ISSUE_MODE=fail_after_push_delete STUB_ISSUE_EXIT=3 run_wrapper c11 "fix: probe"
+rc=$?
+assert_rc 3 "$rc" && ok "case11: wrapper exits 3 (push failure passthrough)" || bad "case11: exit $rc, want 3"
+[ -f "$WORK/c11/.specgit.yaml" ] && ok "case11: deleted record recreated" || bad "case11: record still missing"
+diff "$WORK/c11/.specgit.yaml" "$WORK/c11.record-baseline" >/dev/null 2>&1 && ok "case11: record bytes byte-identical after deletion rollback" || bad "case11: record bytes: $(tr '\n' '|' < "$WORK/c11/.specgit.yaml" 2>/dev/null)"
+assert_surface_restored "$WORK/c11" "$WORK/c11.baseline" && ok "case11: surface bytes restored" || bad "case11: surface bytes differ"
+assert_clean "$WORK/c11" && ok "case11: fixture clean" || bad "case11: fixture dirty: $(git -C "$WORK/c11" status --porcelain | tr '\n' '|')"
+
+# ---- case 12: PR-creation failure — rewritten record rolled back ------------
+new_fixture c12
+make_stub c12
+cp "$WORK/c12/.specgit.yaml" "$WORK/c12.record-baseline"
+surface_digests "$WORK/c12" > "$WORK/c12.baseline"
+STUB_ISSUE_MODE=fail_after_pr_write STUB_ISSUE_EXIT=3 run_wrapper c12 "fix: probe"
+rc=$?
+assert_rc 3 "$rc" && ok "case12: wrapper exits 3 (PR failure passthrough)" || bad "case12: exit $rc, want 3"
+diff "$WORK/c12/.specgit.yaml" "$WORK/c12.record-baseline" >/dev/null && ok "case12: rewritten record rolled back to pre-run bytes" || bad "case12: record not rolled back: $(tr '\n' '|' < "$WORK/c12/.specgit.yaml")"
+assert_surface_restored "$WORK/c12" "$WORK/c12.baseline" && ok "case12: surface bytes restored" || bad "case12: surface bytes differ"
+assert_clean "$WORK/c12" && ok "case12: fixture clean" || bad "case12: fixture dirty: $(git -C "$WORK/c12" status --porcelain | tr '\n' '|')"
+
+# ---- case 13: success keeps the new binding ---------------------------------
+new_fixture c13
+make_stub c13
+surface_digests "$WORK/c13" > "$WORK/c13.baseline"
+STUB_ISSUE_MODE=succeed_after_record_write run_wrapper c13 "feat: probe"
+rc=$?
+assert_rc 0 "$rc" && ok "case13: wrapper exits 0" || bad "case13: exit $rc, want 0"
+grep -q 'issues: \[530\]' "$WORK/c13/.specgit.yaml" && ok "case13: successful bootstrap keeps new binding" || bad "case13: new binding lost: $(tr '\n' '|' < "$WORK/c13/.specgit.yaml")"
+assert_surface_restored "$WORK/c13" "$WORK/c13.baseline" && ok "case13: surface bytes restored" || bad "case13: surface bytes differ"
+[ "$(git -C "$WORK/c13" status --porcelain | grep -cv 'specgit.yaml')" = "0" ] && ok "case13: only the record binding differs post-success" || bad "case13: unexpected residual changes: $(git -C "$WORK/c13" status --porcelain | tr '\n' '|')"
+
+# ---- case 14: pre-run dirty record — dirty bytes restored, not committed ----
+new_fixture c14
+make_stub c14
+printf 'version: 1\nbranch: feat/dirty-pre\nissues: [519]\n' > "$WORK/c14/.specgit.yaml"
+cp "$WORK/c14/.specgit.yaml" "$WORK/c14.record-baseline"
+surface_digests "$WORK/c14" > "$WORK/c14.baseline"
+STUB_ISSUE_MODE=fail_after_branch_write STUB_ISSUE_EXIT=3 run_wrapper c14 "fix: probe"
+rc=$?
+assert_rc 3 "$rc" && ok "case14: wrapper exits 3" || bad "case14: exit $rc, want 3"
+diff "$WORK/c14/.specgit.yaml" "$WORK/c14.record-baseline" >/dev/null && ok "case14: pre-run dirty bytes restored (not committed bytes)" || bad "case14: record bytes: $(tr '\n' '|' < "$WORK/c14/.specgit.yaml")"
+assert_surface_restored "$WORK/c14" "$WORK/c14.baseline" && ok "case14: surface bytes restored" || bad "case14: surface bytes differ"
+
+# ---- case 15: untracked record (git rm --cached) — restored byte-for-byte ---
+new_fixture c15
+make_stub c15
+git -C "$WORK/c15" rm -q --cached .specgit.yaml
+cp "$WORK/c15/.specgit.yaml" "$WORK/c15.record-baseline"
+STUB_ISSUE_MODE=fail_after_pr_write STUB_ISSUE_EXIT=3 run_wrapper c15 "fix: probe"
+rc=$?
+assert_rc 3 "$rc" && ok "case15: wrapper exits 3" || bad "case15: exit $rc, want 3"
+[ -f "$WORK/c15/.specgit.yaml" ] && ok "case15: untracked record file exists after restore" || bad "case15: record missing"
+diff "$WORK/c15/.specgit.yaml" "$WORK/c15.record-baseline" >/dev/null && ok "case15: untracked record bytes restored" || bad "case15: record bytes: $(tr '\n' '|' < "$WORK/c15/.specgit.yaml")"
+
+# ---- case 16: record snapshot tampering — loud mismatch, exit 3, snap kept --
+new_fixture c16
+make_stub c16
+STUB_ISSUE_MODE=tamper_record_snapshot STUB_ISSUE_EXIT=1 run_wrapper c16 "fix: probe"
+rc=$?
+assert_rc 3 "$rc" && ok "case16: wrapper exits 3 on record restore mismatch" || bad "case16: exit $rc, want 3"
+grep -q 'RESTORE MISMATCH for .specgit.yaml' "$WORK/c16.err" && ok "case16: record mismatch reported loudly on stderr" || bad "case16: no record RESTORE MISMATCH diagnostic"
+snapdir=$(sed -n '1p' "$WORK/stubs/c16/log.snapdir" 2>/dev/null)
+[ -n "$snapdir" ] && [ -d "$snapdir" ] && ok "case16: forensic snapshot kept" || bad "case16: snapshot removed: ${snapdir:-<none>}"
+grep -q 'tampered-record' "$WORK/c16/.specgit.yaml" && ok "case16: corrupted record surfaced (deliberate artifact)" || bad "case16: record bytes unexpected"
+
+# ---- case 17: failed push that committed — commit kept, worktree restored ---
+new_fixture c17
+make_stub c17
+cp "$WORK/c17/.specgit.yaml" "$WORK/c17.record-baseline"
+heads0=$(git -C "$WORK/c17" rev-list --count HEAD)
+STUB_ISSUE_MODE=fail_after_push_commit STUB_ISSUE_EXIT=3 run_wrapper c17 "fix: probe"
+rc=$?
+assert_rc 3 "$rc" && ok "case17: wrapper exits 3" || bad "case17: exit $rc, want 3"
+heads1=$(git -C "$WORK/c17" rev-list --count HEAD)
+assert_rc $((heads0 + 1)) "$heads1" && ok "case17: commit made during failed bootstrap is NOT undone" || bad "case17: HEAD count $heads1, want $((heads0 + 1))"
+git -C "$WORK/c17" show HEAD:.specgit.yaml > "$WORK/c17.head-record" 2>/dev/null && \
+  grep -q 'issues: \[530\]' "$WORK/c17.head-record" && ok "case17: committed record content intact in HEAD" || bad "case17: HEAD record missing stub content"
+diff "$WORK/c17/.specgit.yaml" "$WORK/c17.record-baseline" >/dev/null && ok "case17: only the record's worktree diff restored" || bad "case17: worktree record not restored: $(tr '\n' '|' < "$WORK/c17/.specgit.yaml")"
+[ "$(git -C "$WORK/c17" status --porcelain | grep -cv 'specgit.yaml')" = "0" ] && ok "case17: non-record paths clean (worktree == committed surface)" || bad "case17: unexpected residual changes: $(git -C "$WORK/c17" status --porcelain | tr '\n' '|')"
 
 report
 exit $?

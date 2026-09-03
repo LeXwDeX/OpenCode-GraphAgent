@@ -19,10 +19,14 @@
 #      verifies each restored file byte-for-byte against the recorded hash;
 #      any mismatch is reported loudly and exits 3.
 #
-# The `.specgit.yaml` binding written/updated by the inner `specgit issue` is a
-# legitimate delivery artifact and is never rolled back. Wrapper rejections
-# print plain stderr lines prefixed `specgit-bootstrap:` — never a `--json`
-# envelope; only the inner CLI receives the wrapped arguments.
+# The `.specgit.yaml` delivery record gets conditional rollback (#530): a
+# failed inner `specgit issue` (nonzero exit, signal, or init failure) has its
+# pre-run bytes restored byte-for-byte; a successful inner call keeps the new
+# binding. Record-restore failure keeps the snapshot for forensics and exits
+# 3, overriding the inner exit code. Branches, commits, and remote side
+# effects are never undone. Wrapper rejections print plain stderr lines
+# prefixed `specgit-bootstrap:` — never a `--json` envelope; only the inner
+# CLI receives the wrapped arguments.
 #
 # Usage: script/specgit-bootstrap.sh <specgit issue args...>
 #
@@ -99,7 +103,26 @@ for rel in $SURFACE; do
   }
 done
 
+# Conditional record rollback (#530): snapshot the pre-run `.specgit.yaml`
+# bytes so a failed inner call can restore them; snapshot failure aborts
+# before any side effect.
+RECORD_SNAPPED=0
+cp .specgit.yaml "$SNAP/tree/.specgit.yaml" || {
+  rm -rf "$SNAP"
+  say "snapshot copy failed for .specgit.yaml"
+  exit 3
+}
+git hash-object -- .specgit.yaml > "$SNAP/hashes/.specgit.yaml" || {
+  rm -rf "$SNAP"
+  say "content hash failed for .specgit.yaml"
+  exit 3
+}
+RECORD_SNAPPED=1
+
 RESTORED=0
+# Default "failed until the inner call proves success": signal and init
+# failure paths hit restore_all before `issue_status` is ever assigned.
+issue_status=1
 
 # Idempotent restore + byte verification. On mismatch the snapshot directory
 # is KEPT for forensics and the wrapper exits 3 (fail-closed, aligning with
@@ -120,6 +143,23 @@ restore_all() {
       mismatched=1
     fi
   done
+  # Roll back the delivery record only when the inner bootstrap failed;
+  # success keeps the new binding verbatim (#530).
+  if [ "$RECORD_SNAPPED" -eq 1 ] && [ "$issue_status" -ne 0 ]; then
+    if [ -f "$SNAP/tree/.specgit.yaml" ]; then
+      cp "$SNAP/tree/.specgit.yaml" .specgit.yaml
+      now=$(git hash-object -- .specgit.yaml 2>/dev/null)
+      want=$(cat "$SNAP/hashes/.specgit.yaml" 2>/dev/null)
+      if [ "$now" != "$want" ]; then
+        printf 'specgit-bootstrap: RESTORE MISMATCH for %s (got %s, expected %s)\n' \
+          ".specgit.yaml" "${now:-<none>}" "${want:-<none>}" >&2
+        mismatched=1
+      fi
+    else
+      printf 'specgit-bootstrap: RESTORE MISMATCH for %s (snapshot missing)\n' ".specgit.yaml" >&2
+      mismatched=1
+    fi
+  fi
   if [ "$mismatched" -eq 1 ]; then
     say "restored bytes differ from pre-run snapshots - specialized harness bytes may be corrupted."
     say "snapshot kept for forensics at $SNAP; inspect 'git diff' before continuing."
