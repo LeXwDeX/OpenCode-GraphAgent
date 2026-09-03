@@ -41,7 +41,7 @@ feat/**, fix/** ──PR(Typecheck + Unit Tests 门禁)──▶ dev ──push 
 新功能开发、Debug 等一切交付范畴恒定走此循环；后续所有工作必须遵守该方案，不得另起流程：
 
 1. **确立条目**：明确条目的内容、范围、类型（`feat`/`fix`/…）。一个 issue = 一个可独立验证的 WHY，无法独立验证的先拆分再立项。
-2. **SpecGit 立项**：`specgit issue <title-or-number>` 创建/复用 issues 批次，确立交付分支与草稿 PR 脚手架（`.specgit.yaml` 绑定）；立项前先查重，避免同一 WHY 双开。
+2. **SpecGit 立项**：`script/specgit-bootstrap.sh <title-or-number>` 创建/复用 issues 批次，确立交付分支与草稿 PR 脚手架（`.specgit.yaml` 绑定）；立项前先查重，避免同一 WHY 双开。wrapper 是 canonical 入口（见 "SpecGit harness local specializations"）；直跑裸 `specgit issue` 预期被 harness currency gate 以 `harness_stale` (exit 2) 拒绝。
 3. **超流执行**：安排 DAG workflow（超流）承载实现——并行开发 + 多角度 Review + 复合（synthesize），其产出作为交付证据基线。
 4. **PR 过门禁**：SpecGit 发起/推进 PR，过 TDD 与 CI 门禁（Typecheck、Unit Tests、DAG gate；`specgit finish` exit 0 是唯一 "done"）。
 5. **修复门禁问题**：门禁失败在交付分支修代码/测试，永远不削弱门禁本身。
@@ -272,6 +272,15 @@ Kept OUTSIDE the managed block so `specgit init`/`--force` never rewrites them; 
 - `specgit-accept.yml` pins `node-version: '22'` for the wait script and the CLI.
 - The wait script hand-parses `spec_git/policy.yaml` (minimal line-based parse) instead of importing the `yaml` package: no root-reachable `yaml` exists under workspace catalog isolation, so `import { parse } from 'yaml'` would fail to resolve on the runner.
 - `spec_git/policy.yaml` `required_checks` uses the template's canonical check IDs (`unit-tests`, `e2e-tests`), not display names.
+
+#### specgit-bootstrap wrapper (canonical `specgit issue` entry, #521)
+
+`script/specgit-bootstrap.sh <specgit issue args...>` is THE canonical way to run `specgit issue` in this repository. Bare `specgit issue` is expected to fail with `harness_stale` (exit 2) whenever the pinned CLI's harness template moves — the wrapper satisfies that gate safely: it snapshots the full init write surface to a temp dir outside the repo, runs `specgit init --force --no-protect` (hardcoded, offline), then `specgit issue "$@"` with arguments, exit status, and diagnostics passed through verbatim, and restores the specialized bytes above on success and every failure path (EXIT/INT/TERM/HUP), verifying each file byte-for-byte via `git hash-object`.
+
+- Never run bare `specgit init --force` here: it overwrites the six specialized bytes; the wrapper exists to make that refresh transient.
+- Fail-closed rejections: dirty write-surface paths (tracked/staged/untracked) → exit 2 with the offending paths listed; no SpecGit binding (`.specgit.yaml` or `spec_git/policy.yaml` missing) → exit 3; restore hash mismatch → exit 3 with the snapshot kept for forensics. Rejection paths print plain `specgit-bootstrap:` stderr lines and NEVER produce a `--json` envelope.
+- The inner `.specgit.yaml` written by `specgit issue` is a legitimate binding artifact and is never rolled back.
+- Managed-block guidance referencing bare `specgit issue` commands is superseded by this section for this repository. Behavior tests: `bash script/specgit-bootstrap.test.sh` (stubbed CLI, zero network; not CI-wired).
 
 <!-- specgit:block:start -->
 ## SpecGit delivery harness
