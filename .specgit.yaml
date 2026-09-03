@@ -1,8 +1,7 @@
 version: 1
-delivery: specgit-bootstrap-wrapper
+delivery: specgit-bootstrap-rollback
 context:
   kind: branch
-  branch: feat/521-specgit-bootstrap-wrapper
+  branch: feat/530-specgit-bootstrap-rollback
 issues:
-  - 521
-pr: 532
+  - 530
