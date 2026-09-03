@@ -1270,4 +1270,9 @@ main() {
 
 # OC 不提供 CLI 子命令。所有功能通过 TUI 菜单访问。
 # 无论传入何种参数，均直接进入 TUI 主界面。
-main
+# 仅在直接执行时进入 TUI；被 source（测试/验收 harness）时跳过。
+# 用 if 而非 `cond && main`：sourced 且条件为假时 if 返回 0，
+# `cond && main` 会以非 0 结束并在 set -e 下中断 source。
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main
+fi

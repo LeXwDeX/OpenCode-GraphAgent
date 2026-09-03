@@ -250,6 +250,11 @@ DAG 相关的东西都放在 `.opencode/` 下，在 opencode 配置目录（`OPE
 
 预构建 CLI 二进制（Linux / macOS / Windows，附 SHA256SUMS）发布在 [releases 页面](https://github.com/LeXwDeX/OpenCode-GraphAgent/releases)。从 `main` 构建的是正式版；从 `dev` 构建的是预发布版。
 
+发布验收维护两条相互独立的完整性边界：
+
+- **归档完整性（解包前）**：`oc` 安装器在解包前校验 release 的 `SHA256SUMS` 条目，不匹配则拒绝解包。若上游未提供 `SHA256SUMS`，则告警后继续安装（仅依赖 GitHub HTTPS 传输安全）。
+- **安装后签名有效性（macOS）**：安装器清除 quarantine 属性（`xattr -cr`）并做 ad-hoc 重签名（`codesign -fs -`），验收断言 `codesign --verify` 通过且二进制可执行。安装后的二进制 hash **有意**不与归档 payload 对比——ad-hoc 签名可能改写二进制字节，两者 hash 即使不同也属正常。也不发布签名后 digest（codesign 输出的跨版本可复现性尚未确立，亦无受支持的可复现性矩阵）。
+
 从源码构建（需要 [Bun](https://bun.sh) 1.3+）：
 
 ```bash
