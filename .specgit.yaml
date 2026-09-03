@@ -1,8 +1,7 @@
 version: 1
-delivery: specgit-pr-base-dev
+delivery: macos-integrity-boundary
 context:
   kind: branch
-  branch: feat/528-specgit-pr-base-dev
+  branch: feat/498-macos-integrity-boundary
 issues:
-  - 528
-pr: 535
+  - 498
