@@ -5,3 +5,4 @@ context:
   branch: feat/528-specgit-pr-base-dev
 issues:
   - 528
+pr: 535
