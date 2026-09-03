@@ -1,8 +1,8 @@
 version: 1
-delivery: specgit-branch-type-preflight
+delivery: specgit-pr-base-dev
 context:
   kind: branch
-  branch: feat/529-specgit-branch-type-preflight
+  branch: feat/528-specgit-pr-base-dev
 issues:
-  - 529
-pr: 534
+  - 528
+pr: 535
