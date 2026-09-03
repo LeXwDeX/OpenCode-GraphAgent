@@ -241,6 +241,17 @@ jobs:
             fi
           done
 
+      # #498 B2: macOS release acceptance — after the installer-style xattr +
+      # ad-hoc re-sign mutation, assert codesign validity and executable smoke.
+      # The installed binary's hash is intentionally NOT compared to the
+      # archive payload (ad-hoc re-signing can rewrite bytes, so byte equality
+      # is not a stable signature-validity boundary and differing hashes are
+      # legitimate); no post-sign digest.
+      - name: macOS Install Acceptance
+        if: matrix.name == 'macos' && (inputs.platforms == '' || contains(inputs.platforms, matrix.name))
+        run: bash script/oc-macos-acceptance.test.sh packages/opencode/dist/opencode-darwin-arm64.zip
+        timeout-minutes: 10
+
       - name: Upload Artifacts
         if: inputs.platforms == '' || contains(inputs.platforms, matrix.name)
         uses: actions/upload-artifact@v4

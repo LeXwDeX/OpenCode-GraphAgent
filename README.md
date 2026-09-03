@@ -287,6 +287,11 @@ All upstream capabilities (multi-provider, built-in LSP, client/server architect
 
 Prebuilt CLI binaries (Linux / macOS / Windows, with SHA256SUMS) are published on the [releases page](https://github.com/LeXwDeX/OpenCode-GraphAgent/releases). Builds from `main` are formal releases; builds from `dev` are prereleases.
 
+Release acceptance enforces two distinct integrity boundaries:
+
+- **Archive integrity (before extraction)**: the `oc` installer verifies the release `SHA256SUMS` entry before unpacking and refuses to extract on mismatch. If upstream serves no `SHA256SUMS`, it installs with a warning (GitHub HTTPS transport only).
+- **Post-install signature validity (macOS)**: the installer clears quarantine attributes (`xattr -cr`) and ad-hoc re-signs (`codesign -fs -`); acceptance then asserts `codesign --verify` passes and the binary runs. The installed binary's hash is intentionally **not** compared to the archive payload — ad-hoc signing can rewrite the binary's bytes, so differing hashes are legitimate. No post-signature digest is published (cross-version reproducibility of codesign output has not been established, and no supported reproducibility matrix exists).
+
 From source (requires [Bun](https://bun.sh) 1.3+):
 
 ```bash
