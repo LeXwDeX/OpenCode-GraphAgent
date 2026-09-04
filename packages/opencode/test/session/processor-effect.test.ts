@@ -19,7 +19,7 @@ import { SessionStatus } from "../../src/session/status"
 import { SessionSummary } from "../../src/session/summary"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { provideTmpdirInstance, provideTmpdirServer } from "../fixture/fixture"
-import { testEffect } from "../lib/effect"
+import { awaitWithTimeout, testEffect } from "../lib/effect"
 import { raw, reply, TestLLMServer } from "../lib/llm-server"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
@@ -183,6 +183,18 @@ const replacements = [
 const env = LayerNode.buildLayer(LayerNode.group([root, LayerNode.make(TestLLMServer.layer, [])]), { replacements })
 
 const it = testEffect(env)
+
+const native = testEffect(
+  LayerNode.buildLayer(LayerNode.group([root, LayerNode.make(TestLLMServer.layer, [])]), {
+    replacements: [
+      LayerNode.replace(SessionSummary.node, summary),
+      LayerNode.replace(
+        RuntimeFlags.node,
+        RuntimeFlags.layer({ experimentalEventSystem: true, experimentalNativeLlm: true }),
+      ),
+    ],
+  }),
+)
 
 const providerErrorLLM = Layer.succeed(
   LLM.Service,
@@ -819,6 +831,202 @@ it.live("session.processor effect tests complete AI SDK tool calls when native f
         expect(call.state.metadata).toEqual({ source: "test" })
         expect(call.state.time.start).toBeDefined()
         expect(call.state.time.end).toBeDefined()
+      }),
+    { config: (url) => providerCfg(url) },
+  ),
+)
+
+native.live("native tools settle before high usage requests compaction", () =>
+  provideTmpdirServer(
+    ({ dir, llm }) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+        yield* llm.push(reply().tool("lookup", { query: "weather" }).usage({ input: 30_000, output: 1 }))
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "finish the slow lookup before compacting")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const model = {
+          ...(yield* provider.getModel(ref.providerID, ref.modelID)),
+          limit: { context: 32_000, output: 4_000 },
+        }
+        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model })
+        const value = yield* handle.process({
+          user: parent,
+          sessionID: chat.id,
+          model,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "finish the slow lookup before compacting" }],
+          tools: {
+            lookup: tool({
+              description: "Delayed lookup",
+              inputSchema: z.object({ query: z.string() }),
+              execute: async (input, options) => {
+                await new Promise<void>((resolve, reject) => {
+                  const timer = setTimeout(resolve, 500)
+                  options.abortSignal?.addEventListener(
+                    "abort",
+                    () => {
+                      clearTimeout(timer)
+                      reject(new Error("lookup interrupted"))
+                    },
+                    { once: true },
+                  )
+                })
+                return { title: "Lookup", output: `result:${input.query}`, metadata: {} }
+              },
+            }),
+          },
+        })
+        const parts = yield* MessageV2.parts(msg.id)
+        const call = parts.find((part): part is SessionV1.ToolPart => part.type === "tool")
+        expect(value).toBe("compact")
+        expect(call?.state.status).toBe("completed")
+        if (call?.state.status !== "completed") return
+        expect(call.state.output).toBe("result:weather")
+        expect(call.state.input).toEqual({ query: "weather" })
+        expect(handle.message.tokens.input).toBe(30_000)
+      }),
+    { config: (url) => providerCfg(url) },
+  ),
+)
+
+native.live("native parallel tools all deliver results before compaction", () =>
+  provideTmpdirServer(
+    ({ dir, llm }) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+        yield* llm.push(
+          raw({
+            chunks: [
+              {
+                id: "chatcmpl-parallel",
+                object: "chat.completion.chunk",
+                choices: [
+                  {
+                    index: 0,
+                    delta: {
+                      tool_calls: ["first", "second"].map((query, index) => ({
+                        index,
+                        id: `call_${query}`,
+                        type: "function",
+                        function: { name: "lookup", arguments: JSON.stringify({ query }) },
+                      })),
+                    },
+                    finish_reason: "tool_calls",
+                  },
+                ],
+                usage: { prompt_tokens: 30_000, completion_tokens: 1, total_tokens: 30_001 },
+              },
+            ],
+          }),
+        )
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "complete both lookups")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const model = {
+          ...(yield* provider.getModel(ref.providerID, ref.modelID)),
+          limit: { context: 32_000, output: 4_000 },
+        }
+        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model })
+        const started: string[] = []
+        const bothStarted = defer<void>()
+        const value = yield* handle
+          .process({
+            user: parent,
+            sessionID: chat.id,
+            model,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "complete both lookups" }],
+            tools: {
+              lookup: tool({
+                description: "Parallel lookup",
+                inputSchema: z.object({ query: z.string() }),
+                execute: async (input) => {
+                  started.push(input.query)
+                  if (started.length === 2) bothStarted.resolve()
+                  await bothStarted.promise
+                  return { title: "Lookup", output: `result:${input.query}`, metadata: {} }
+                },
+              }),
+            },
+          })
+          .pipe((effect) => awaitWithTimeout(effect, "parallel native tools did not complete", "5 seconds"))
+        expect(value).toBe("compact")
+        const calls = (yield* MessageV2.parts(msg.id)).filter((part) => part.type === "tool")
+        expect(
+          calls.map((part) => ({
+            id: part.callID,
+            state: part.state.status,
+            output: part.state.status === "completed" ? part.state.output : undefined,
+          })),
+        ).toEqual([
+          { id: "call_first", state: "completed", output: "result:first" },
+          { id: "call_second", state: "completed", output: "result:second" },
+        ])
+      }),
+    { config: (url) => providerCfg(url) },
+  ),
+)
+
+native.live("user interruption still aborts a native tool waiting to settle", () =>
+  provideTmpdirServer(
+    ({ dir, llm }) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+        yield* llm.push(reply().tool("lookup", { query: "weather" }).usage({ input: 30_000, output: 1 }))
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "cancel the lookup")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const model = {
+          ...(yield* provider.getModel(ref.providerID, ref.modelID)),
+          limit: { context: 32_000, output: 4_000 },
+        }
+        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model })
+        const started = defer<void>()
+        let aborted = false
+        const run = yield* handle
+          .process({
+            user: parent,
+            sessionID: chat.id,
+            model,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "cancel the lookup" }],
+            tools: {
+              lookup: tool({
+                description: "Pending lookup",
+                inputSchema: z.object({ query: z.string() }),
+                execute: async (_input, options) => {
+                  await new Promise<void>((_resolve, reject) => {
+                    options.abortSignal?.addEventListener(
+                      "abort",
+                      () => {
+                        aborted = true
+                        reject(new Error("lookup interrupted"))
+                      },
+                      { once: true },
+                    )
+                    started.resolve()
+                  })
+                  return { title: "Lookup", output: "unexpected completion", metadata: {} }
+                },
+              }),
+            },
+          })
+          .pipe(Effect.forkChild)
+        yield* awaitWithTimeout(
+          Effect.promise(() => started.promise),
+          "native tool did not start",
+        )
+        yield* awaitWithTimeout(Fiber.interrupt(run), "native tool ignored user interruption")
+        expect(aborted).toBe(true)
+        const exit = yield* Fiber.await(run)
+        expect(Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)).toBe(true)
+        const call = (yield* MessageV2.parts(msg.id)).find((part) => part.type === "tool")
+        expect(call?.state.status).toBe("error")
+        if (call?.state.status === "error") expect(call.state.metadata?.interrupted).toBe(true)
       }),
     { config: (url) => providerCfg(url) },
   ),

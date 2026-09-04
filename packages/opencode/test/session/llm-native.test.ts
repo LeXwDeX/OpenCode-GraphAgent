@@ -557,7 +557,7 @@ describe("session.llm-native.request", () => {
     }),
   )
 
-  it.effect("emits native tool calls before overlapping local settlements complete", () =>
+  it.effect("settles parallel native tools before completing the provider step", () =>
     Effect.gen(function* () {
       const observed: string[] = []
       const started: string[] = []
@@ -585,6 +585,7 @@ describe("session.llm-native.request", () => {
           Stream.fromIterable([
             LLMEvent.toolCall({ id: "call-1", name: "lookup", input: {} }),
             LLMEvent.toolCall({ id: "call-2", name: "lookup", input: {} }),
+            LLMEvent.stepFinish({ index: 0, reason: "tool-calls", usage: { inputTokens: 30_000, outputTokens: 1 } }),
             LLMEvent.finish({ reason: "tool-calls" }),
           ]),
         generate: () => Effect.die("unused"),
@@ -609,11 +610,11 @@ describe("session.llm-native.request", () => {
       yield* Effect.promise(() => bothStarted)
 
       expect(started).toEqual(["call-1", "call-2"])
-      expect(observed).toEqual(["tool-call", "tool-call", "finish"])
+      expect(observed).toEqual(["tool-call", "tool-call"])
 
       release?.()
       yield* Fiber.join(fiber)
-      expect(observed).toEqual(["tool-call", "tool-call", "finish", "tool-result", "tool-result"])
+      expect(observed).toEqual(["tool-call", "tool-call", "tool-result", "tool-result", "step-finish", "finish"])
     }),
   )
 
