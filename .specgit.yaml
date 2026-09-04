@@ -1,8 +1,7 @@
 version: 1
-delivery: event-retention-reclamation
+delivery: preserve-npm-lock
 context:
   kind: branch
-  branch: feat/524-event-retention-reclamation
+  branch: feat/541-preserve-npm-lock
 issues:
-  - 524
-pr: 537
+  - 541
