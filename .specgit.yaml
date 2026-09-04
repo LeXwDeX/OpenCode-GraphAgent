@@ -1,8 +1,12 @@
 version: 1
-delivery: preserve-npm-lock
+delivery: native-tool-settlement
 context:
   kind: branch
-  branch: feat/541-preserve-npm-lock
+  branch: fix/538-native-tool-settlement
 issues:
-  - 541
-pr: 542
+  - 538
+  - 540
+issueKinds:
+  - issue: 538
+    kind: kind::fix
+pr: 539
