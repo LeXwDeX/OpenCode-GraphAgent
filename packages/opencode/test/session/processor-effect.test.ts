@@ -247,6 +247,17 @@ const boot = Effect.fn("test.boot")(function* () {
   return { processors, session, provider }
 })
 
+const nativeCompactionProcessor = Effect.fn("test.nativeCompactionProcessor")(function* (msg: SessionV1.Assistant) {
+  const processors = yield* SessionProcessor.Service
+  const provider = yield* Provider.Service
+  const model = {
+    ...(yield* provider.getModel(ref.providerID, ref.modelID)),
+    limit: { context: 32_000, output: 4_000 },
+  }
+  const handle = yield* processors.create({ assistantMessage: msg, sessionID: msg.sessionID, model })
+  return { model, handle }
+})
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -840,16 +851,12 @@ native.live("native tools settle before high usage requests compaction", () =>
   provideTmpdirServer(
     ({ dir, llm }) =>
       Effect.gen(function* () {
-        const { processors, session, provider } = yield* boot()
+        const { session } = yield* boot()
         yield* llm.push(reply().tool("lookup", { query: "weather" }).usage({ input: 30_000, output: 1 }))
         const chat = yield* session.create({})
         const parent = yield* user(chat.id, "finish the slow lookup before compacting")
         const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
-        const model = {
-          ...(yield* provider.getModel(ref.providerID, ref.modelID)),
-          limit: { context: 32_000, output: 4_000 },
-        }
-        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model })
+        const { model, handle } = yield* nativeCompactionProcessor(msg)
         const value = yield* handle.process({
           user: parent,
           sessionID: chat.id,
@@ -895,7 +902,7 @@ native.live("native parallel tools all deliver results before compaction", () =>
   provideTmpdirServer(
     ({ dir, llm }) =>
       Effect.gen(function* () {
-        const { processors, session, provider } = yield* boot()
+        const { session } = yield* boot()
         yield* llm.push(
           raw({
             chunks: [
@@ -924,11 +931,7 @@ native.live("native parallel tools all deliver results before compaction", () =>
         const chat = yield* session.create({})
         const parent = yield* user(chat.id, "complete both lookups")
         const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
-        const model = {
-          ...(yield* provider.getModel(ref.providerID, ref.modelID)),
-          limit: { context: 32_000, output: 4_000 },
-        }
-        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model })
+        const { model, handle } = yield* nativeCompactionProcessor(msg)
         const started: string[] = []
         const bothStarted = defer<void>()
         const value = yield* handle
@@ -974,16 +977,12 @@ native.live("user interruption still aborts a native tool waiting to settle", ()
   provideTmpdirServer(
     ({ dir, llm }) =>
       Effect.gen(function* () {
-        const { processors, session, provider } = yield* boot()
+        const { session } = yield* boot()
         yield* llm.push(reply().tool("lookup", { query: "weather" }).usage({ input: 30_000, output: 1 }))
         const chat = yield* session.create({})
         const parent = yield* user(chat.id, "cancel the lookup")
         const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
-        const model = {
-          ...(yield* provider.getModel(ref.providerID, ref.modelID)),
-          limit: { context: 32_000, output: 4_000 },
-        }
-        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model })
+        const { model, handle } = yield* nativeCompactionProcessor(msg)
         const started = defer<void>()
         let aborted = false
         const run = yield* handle
