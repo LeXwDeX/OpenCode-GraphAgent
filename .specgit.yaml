@@ -5,6 +5,7 @@ context:
   branch: fix/538-native-tool-settlement
 issues:
   - 538
+  - 540
 issueKinds:
   - issue: 538
     kind: kind::fix
