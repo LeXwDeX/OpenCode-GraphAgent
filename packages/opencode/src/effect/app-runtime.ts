@@ -61,6 +61,7 @@ import { DagStore } from "@opencode-ai/core/dag/store"
 import { DagLoop } from "@/dag/runtime/loop"
 import { DagSummaryPublisher } from "@/dag/runtime/summary-publisher"
 import { DagSupervisionSweep } from "@/dag/runtime/supervision-sweep"
+import { EventResidueSweep } from "@opencode-ai/core/event/residue-sweep"
 import { Memory } from "@/memory/memory"
 
 export const AppLayer = Layer.mergeAll(
@@ -138,6 +139,11 @@ export const AppLayer = Layer.mergeAll(
   // DagLoop it must NOT die with a per-directory instance teardown, or a
   // `running` node with dead supervision would rot forever.
   Layer.provideMerge(DagSupervisionSweep.defaultLayer),
+  // #524: default-on startup residue sweep for crash/in-flight zombie event
+  // aggregates (both read models absent). Host-level like the supervision
+  // sweep: one pass per process start, forked into the layer scope,
+  // soft-degrading — never blocks or fails startup.
+  Layer.provideMerge(EventResidueSweep.defaultLayer),
   Layer.provideMerge(SettingsHook.defaultLayer),
 )
 

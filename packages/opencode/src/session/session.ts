@@ -38,7 +38,7 @@ import { SessionID, MessageID, PartID } from "./schema"
 
 import type { Provider } from "@/provider/provider"
 import { Global } from "@opencode-ai/core/global"
-import { Effect, Layer, Option, Context, Schema, Types } from "effect"
+import { Cause, Effect, Layer, Option, Context, Schema, Types } from "effect"
 import { NonNegativeInt, optionalOmitUndefined } from "@opencode-ai/core/schema"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
@@ -709,6 +709,11 @@ export const layer: Layer.Layer<
         // the startup orphan-pending sweep (cancel is not a valid transition
         // from pending).
         const workflows = yield* dag.store.listBySession(sessionID).pipe(Effect.orDie)
+        // #524: capture EVERY related dag aggregate before the Deleted publish —
+        // the projector's session-row delete FK-cascades the workflow rows away
+        // inside the publish transaction, so listBySession after it returns []
+        // and terminal aggregates would be stranded as event-store residue.
+        const dagIDs = workflows.map((workflow) => workflow.id)
         for (const workflow of workflows) {
           // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion -- WorkflowRow.status is a plain string column whose values are the WorkflowStatus literals (only the projector writes it, via validated transitions).
           if (isWorkflowTerminalStatus(workflow.status as never)) continue
@@ -734,6 +739,24 @@ export const layer: Layer.Layer<
         // comes LAST, after every cleanup step above.
         yield* events.publish(SessionV1.Event.Deleted, { sessionID, info: session })
         yield* events.remove(sessionID)
+        // #524: scrub the related dag event aggregates after the session
+        // aggregate — terminal workflows included (the cancel loop above skips
+        // them). Soft-degrading like the EventResidueSweep sibling: a failed
+        // scrub is logged and leaves the aggregate for the startup residue
+        // sweep, never fails the removal. Interruption is preserved, not
+        // degraded into a warning (same hasInterrupts re-raise discipline).
+        yield* Effect.forEach(
+          dagIDs,
+          (dagID) =>
+            events.remove(dagID).pipe(
+              Effect.catchCause((cause) =>
+                Cause.hasInterrupts(cause)
+                  ? Effect.interrupt
+                  : Effect.logWarning("dag aggregate scrub failed during session remove", { sessionID, dagID, cause }),
+              ),
+            ),
+          { discard: true },
+        )
       } catch (error) {
         yield* Effect.logError("failed to remove session", { sessionID, error })
       }

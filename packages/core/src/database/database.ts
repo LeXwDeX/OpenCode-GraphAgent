@@ -2,7 +2,8 @@ export * as Database from "./database"
 
 import { EffectDrizzleSqlite } from "@opencode-ai/effect-drizzle-sqlite"
 import { layer as sqliteLayer } from "#sqlite"
-import { Context, Effect, Layer } from "effect"
+import { Cause, Context, Effect, Layer } from "effect"
+import { sql } from "drizzle-orm"
 import { Global } from "../global"
 import { Flag } from "../flag/flag"
 import { isAbsolute, join } from "path"
@@ -29,6 +30,27 @@ export const layer = Layer.effect(
     yield* db.run("PRAGMA busy_timeout = 5000")
     yield* db.run("PRAGMA cache_size = -64000")
     yield* db.run("PRAGMA foreign_keys = ON")
+    // #524: genuinely new databases were switched to auto_vacuum=FULL by the
+    // sqlite driver BEFORE WAL init. A legacy database keeps its NONE mode —
+    // converting one silently at startup would need a blocking full VACUUM —
+    // so it is only detected and surfaced softly here; conversion is the
+    // explicit user-triggered `opencode db vacuum --db <path>` command.
+    // Detect-only means detect-only: a failed readback degrades to a warning
+    // (the layer body is orDie'd, so an unhandled failure would kill startup),
+    // while an interruption is always re-raised.
+    const autoVacuum = yield* db.get<{ auto_vacuum: number }>(sql`PRAGMA auto_vacuum`).pipe(
+      Effect.catchCause((cause) =>
+        Cause.hasInterrupts(cause)
+          ? Effect.interrupt
+          : Effect.logWarning("database auto_vacuum readback failed — skipping the detect-only check", { cause }).pipe(
+              Effect.as(undefined),
+            ),
+      ),
+    )
+    if (autoVacuum?.auto_vacuum === 0)
+      yield* Effect.logWarning(
+        "database auto_vacuum is NONE — deleted pages stay allocated until converted; run `opencode db vacuum --db <path>` (prints its path with `opencode db path`)",
+      )
     yield* db.run("PRAGMA wal_checkpoint(PASSIVE)")
     yield* DatabaseMigration.apply(db)
 

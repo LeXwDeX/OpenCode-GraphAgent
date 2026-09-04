@@ -1,8 +1,8 @@
 version: 1
-delivery: macos-integrity-boundary
+delivery: event-retention-reclamation
 context:
   kind: branch
-  branch: feat/498-macos-integrity-boundary
+  branch: feat/524-event-retention-reclamation
 issues:
-  - 498
-pr: 536
+  - 524
+pr: 537

@@ -1,12 +1,14 @@
 import { describe, expect } from "bun:test"
-import { Effect, Layer, Option } from "effect"
-import { and, eq } from "drizzle-orm"
+import { Cause, Context, Effect, Exit, Layer, Option } from "effect"
+import { eq, inArray } from "drizzle-orm"
 import { Database } from "@opencode-ai/core/database/database"
-import { EventTable } from "@opencode-ai/core/event/sql"
 import { EventV2 } from "@opencode-ai/core/event"
-import { DagEvent } from "@opencode-ai/schema/dag-event"
+import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { SessionProjector } from "@opencode-ai/core/session/projector"
+import { EventSequenceTable, EventTable } from "@opencode-ai/core/event/sql"
 import { GoalOutcomeTable, GoalStateTable } from "@opencode-ai/core/goal/sql"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
+import { EventV2Bridge } from "@/event-v2-bridge"
 import { Session as SessionNs } from "@/session/session"
 import { SessionAutomationLease } from "@/session/automation-lease"
 import { Goal } from "@/goal/goal"
@@ -127,33 +129,163 @@ describe("Session.remove dag lease cleanup (GOAL-FP-01-06)", () => {
       })
       expect((yield* dag.store.getWorkflow(dagID).pipe(Effect.orDie))?.status).toBe("running")
 
+      // #524 supersession: this pin used to observe the cancel through the
+      // durable dag.workflow.cancelled event row. Since Session.remove now
+      // scrubs the whole dag event aggregate AFTER the cancel transition (the
+      // transition itself is pinned by the dag lifecycle tests), the boundary
+      // observable is the absence of residue: the cancelled workflow leaves no
+      // read-model row and no event-store rows behind.
       yield* session.remove(sessionID)
 
-      // The workflow READ row is FK-cascaded away with the session row, so
-      // the cancellation contract observable here is the durable
-      // dag.workflow.cancelled event — the terminalization that stops the
-      // running DagLoop runtime (aborting child sessions and releasing the
-      // dag lease) and keeps the workflow out of the restart recovery scan.
-      const cancelledEvent = yield* db
-        .select()
-        .from(EventTable)
-        .where(
-          and(
-            eq(EventTable.aggregate_id, dagID),
-            eq(EventTable.type, EventV2.versionedType(DagEvent.WorkflowCancelled.type, 1)),
-          ),
-        )
-        .get()
+      const sequences = yield* db
+        .select({ aggregate: EventSequenceTable.aggregate_id })
+        .from(EventSequenceTable)
+        .where(eq(EventSequenceTable.aggregate_id, dagID))
+        .all()
         .pipe(Effect.orDie)
-      // P2-B: toBeNull() was vacuous — drizzle .get() returns undefined for a
-      // missing row and `expect(undefined).not.toBeNull()` always passes.
-      // toBeDefined() actually pins the durable dag.workflow.cancelled event.
-      expect(cancelledEvent).toBeDefined()
+      expect(sequences).toEqual([])
+
+      const events = yield* db
+        .select({ aggregate: EventTable.aggregate_id })
+        .from(EventTable)
+        .where(eq(EventTable.aggregate_id, dagID))
+        .all()
+        .pipe(Effect.orDie)
+      expect(events).toEqual([])
 
       // Recovery scan contract (dag/runtime/loop.ts adopts only
       // running/paused/stepping rows): the workflow must not be re-adoptable.
       const adoptable = yield* dag.store.listByStatus("running").pipe(Effect.orDie)
       expect(adoptable.map((wf) => wf.id)).not.toContain(dagID)
+    }),
+  )
+})
+
+const workflowConfig = (name: string) => ({
+  name,
+  nodes: [
+    {
+      id: "n1",
+      name: "n1",
+      worker_type: "build",
+      depends_on: [],
+      required: true,
+      prompt_template: { inline: "do work" },
+    },
+  ],
+})
+
+describe("Session.remove dag aggregate scrub (#524)", () => {
+  it.instance("removes every related dag event aggregate including terminal workflows", () =>
+    Effect.gen(function* () {
+      const session = yield* SessionNs.Service
+      const dag = yield* Dag.Service
+      const { db } = yield* Database.Service
+
+      const info = yield* session.create({})
+      const sessionID = info.id
+      const terminalDag = yield* dag.create({
+        projectID: info.projectID,
+        sessionID,
+        title: "scrub-terminal",
+        config: workflowConfig("scrub-terminal"),
+      })
+      // Terminal BEFORE remove: the pre-publish capture must include it even
+      // though the cancel loop skips terminal rows as already inert.
+      yield* dag.cancel(terminalDag)
+      const liveDag = yield* dag.create({
+        projectID: info.projectID,
+        sessionID,
+        title: "scrub-live",
+        config: workflowConfig("scrub-live"),
+      })
+
+      const aggregateIDs = [terminalDag, liveDag, sessionID]
+      const pre = yield* db
+        .select({ aggregate: EventSequenceTable.aggregate_id })
+        .from(EventSequenceTable)
+        .where(inArray(EventSequenceTable.aggregate_id, aggregateIDs))
+        .all()
+        .pipe(Effect.orDie)
+      expect(new Set(pre.map((row) => row.aggregate)).size).toBe(3)
+
+      yield* session.remove(sessionID)
+
+      const sequences = yield* db
+        .select({ aggregate: EventSequenceTable.aggregate_id })
+        .from(EventSequenceTable)
+        .where(inArray(EventSequenceTable.aggregate_id, aggregateIDs))
+        .all()
+        .pipe(Effect.orDie)
+      expect(sequences).toEqual([])
+      const events = yield* db
+        .select({ aggregate: EventTable.aggregate_id })
+        .from(EventTable)
+        .where(inArray(EventTable.aggregate_id, aggregateIDs))
+        .all()
+        .pipe(Effect.orDie)
+      expect(events).toEqual([])
+    }),
+  )
+})
+
+// #524 interrupt-contract regression: the per-dag scrub catchCause must
+// preserve interruption (the EventResidueSweep sibling discipline) instead of
+// degrading it into a logWarning. The stub bridge fails events.remove with a
+// self-thrown interrupt cause — the only cause shape catchCause can
+// intercept; external interrupts bypass it — for every aggregate EXCEPT the
+// session's own, so any interrupt surfacing from session.remove can only
+// originate from the dag scrub step.
+function interruptingScrubBridgeNode(gate: { sessionID?: string }) {
+  return LayerNode.make(
+    Layer.effect(
+      EventV2Bridge.Service,
+      Effect.gen(function* () {
+        const bridge = Context.get(yield* Layer.build(EventV2Bridge.layer), EventV2Bridge.Service)
+        return EventV2Bridge.Service.of({
+          ...bridge,
+          remove: (aggregateID) =>
+            Effect.suspend(() =>
+              gate.sessionID !== undefined && aggregateID !== gate.sessionID
+                ? Effect.interrupt
+                : bridge.remove(aggregateID),
+            ),
+        })
+      }),
+    ),
+    [EventV2.node],
+  )
+}
+
+const scrubGate: { sessionID?: string } = {}
+const scrubInterruptIt = testEffect(
+  Layer.mergeAll(
+    LayerNode.buildLayer(LayerNode.group([SessionNs.node, SessionProjector.node, Dag.node]), {
+      replacements: [LayerNode.replaceWithNode(EventV2Bridge.node, interruptingScrubBridgeNode(scrubGate))],
+    }),
+    CrossSpawnSpawner.defaultLayer,
+  ),
+)
+
+describe("Session.remove dag aggregate scrub interrupt contract (#524)", () => {
+  scrubInterruptIt.instance("scrub interruption propagates out of remove instead of degrading to a warning", () =>
+    Effect.gen(function* () {
+      const session = yield* SessionNs.Service
+      const dag = yield* Dag.Service
+      const info = yield* session.create({})
+      const sessionID = info.id
+      yield* dag.create({
+        projectID: info.projectID,
+        sessionID,
+        title: "scrub-interrupt",
+        config: workflowConfig("scrub-interrupt"),
+      })
+
+      scrubGate.sessionID = sessionID
+      const exit = yield* session.remove(sessionID).pipe(Effect.exit)
+      scrubGate.sessionID = undefined
+
+      expect(Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause)).toBe(true)
     }),
   )
 })

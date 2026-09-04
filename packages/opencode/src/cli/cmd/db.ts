@@ -1,9 +1,10 @@
 import type { Argv } from "yargs"
 import { spawn } from "child_process"
 import { Database } from "@opencode-ai/core/database/database"
+import { Vacuum } from "@opencode-ai/core/database/vacuum"
 import { Effect } from "effect"
 import { sql } from "drizzle-orm"
-import { effectCmd } from "../effect-cmd"
+import { effectCmd, fail } from "../effect-cmd"
 
 const QueryCommand = effectCmd({
   command: "$0 [query]",
@@ -51,12 +52,43 @@ const PathCommand = effectCmd({
   }),
 })
 
+// #524: the ONLY conversion path for legacy auto_vacuum=NONE databases.
+// Deliberate invocation by design — the target file must be named explicitly
+// with --db, never a default path; pair it with `opencode db path`. Refuses
+// anything that is not an existing regular file (a typo must not create a
+// database). Converts FULL -> VACUUM -> wal_checkpoint(TRUNCATE) outside any
+// startup path and fails nonzero unless the readback is FULL.
+const VacuumCommand = effectCmd({
+  command: "vacuum",
+  describe: "convert a database file to full auto_vacuum (FULL -> VACUUM -> truncate WAL)",
+  instance: false,
+  builder: (yargs: Argv) => {
+    return yargs.option("db", {
+      type: "string",
+      demandOption: true,
+      describe: "path to the SQLite database file (print the default with `opencode db path`)",
+    })
+  },
+  handler: Effect.fn("Cli.db.vacuum")(function* (args: { db: string }) {
+    const result = yield* Vacuum.convertToFull(args.db).pipe(
+      Effect.catch((cause) =>
+        cause._tag === "VacuumRefused"
+          ? fail(cause.message)
+          : fail(
+              `vacuum failed for ${args.db} — close running opencode processes that use this file and retry (${cause.message})`,
+            ),
+      ),
+    )
+    console.log(`auto_vacuum=${result.autoVacuum}`)
+  }),
+})
+
 export const DbCommand = effectCmd({
   command: "db",
   describe: "database tools",
   instance: false,
   builder: (yargs: Argv) => {
-    return yargs.command(QueryCommand).command(PathCommand).demandCommand()
+    return yargs.command(QueryCommand).command(PathCommand).command(VacuumCommand).demandCommand()
   },
   handler: Effect.fn("Cli.db")(function* () {}),
 })
