@@ -1,0 +1,98 @@
+# ============================================================================
+# 🧹 Dev · Issue Auto-Close
+# ----------------------------------------------------------------------------
+# Purpose: Mirror GitHub's native issue auto-close for PRs merged into `dev`.
+#          Native auto-close (`Closes #n` in the PR body) only fires when a PR
+#          merges into the DEFAULT branch (`main`). This repo delivers into
+#          `dev` first (two-tier Git Workflow), so dev-delivered issues would
+#          otherwise stay open until manual close (#433/#472/#496/#517 et al.).
+# Trigger: `pull_request: types: [closed]`. The job-level `if` gates actual
+#          work to MERGED PRs whose base is `dev`; merges to `main` keep
+#          GitHub's native auto-close (no overlap).
+# Jobs   : autoclose — single Linux runner, pure event payload + `gh` CLI.
+#          No `actions/checkout`, no third-party actions. The PR body reaches
+#          the script ONLY via `env:` (script-injection safety); refs are
+#          matched case-insensitively against the official closing keywords
+#          followed by bare `#n` (plain-text scan of the whole body, matching
+#          GitHub's own scanner — refs inside fenced code blocks are included,
+#          best-effort native parity). Shared issue/PR number space guards:
+#          numbers resolving to a pull request are skipped, nonexistent
+#          numbers are skipped, already-CLOSED issues are skipped (no
+#          duplicate comments). Survivors are closed as `completed` with a
+#          comment naming the delivery PR.
+# Notes  : The whole matrix (extraction + guards) is exercised by the dry-run
+#          harness under /tmp/dev-issue-autoclose/ (see issue #519 evidence).
+#          Runs on every PR close event; non-dev or unmerged closes exit at
+#          the job-level `if` without consuming a runner step.
+# ============================================================================
+
+name: 🧹 Dev · Issue Auto-Close
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: read
+
+jobs:
+  autoclose:
+    name: Auto-close linked issues
+    if: github.event.pull_request.merged == true && github.event.pull_request.base.ref == 'dev'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Close linked issues referenced in the PR body
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$PR_BODY" ]; then
+            echo "dev-issue-autoclose: PR #$PR_NUMBER has no body; nothing to do"
+            exit 0
+          fi
+
+          # Official closing keywords + bare #n, case-insensitive, deduped.
+          # Plain-text scan of the whole body (code fences included) mirrors
+          # GitHub's own scanner; qualified `owner/repo#n` and URL refs do not
+          # match (whitespace must sit directly before `#`).
+          refs=$(printf '%s' "$PR_BODY" \
+            | grep -oiE '\b(close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved)[[:space:]]+#[0-9]+\b' \
+            | grep -oE '#[0-9]+\b' \
+            | tr -d '#' \
+            | sort -nu \
+            || true)
+
+          if [ -z "$refs" ]; then
+            echo "dev-issue-autoclose: PR #$PR_NUMBER body has no closing-keyword refs; nothing to do"
+            exit 0
+          fi
+
+          echo "dev-issue-autoclose: PR #$PR_NUMBER -> refs: $(echo "$refs" | tr '\n' ' ')"
+
+          for n in $refs; do
+            # Shared issue/PR number space: skip numbers that resolve to a PR.
+            if gh pr view "$n" --repo "$REPO" >/dev/null 2>&1; then
+              echo "dev-issue-autoclose: #$n is a pull request; skipping"
+              continue
+            fi
+            # Skip numbers that do not exist as issues.
+            if ! state=$(gh issue view "$n" --repo "$REPO" --json state --jq .state 2>/dev/null); then
+              echo "dev-issue-autoclose: #$n not found; skipping"
+              continue
+            fi
+            # Skip already-closed issues (no duplicate comments).
+            if [ "$state" = "CLOSED" ]; then
+              echo "dev-issue-autoclose: #$n is already CLOSED; skipping (no duplicate comment)"
+              continue
+            fi
+            gh issue close "$n" --repo "$REPO" --reason completed \
+              --comment "Auto-closed: delivery PR #$PR_NUMBER ([view]($PR_URL)) merged into \`dev\` with a closing keyword for #$n in its body. GitHub's native auto-close only fires on the default branch (\`main\`); this mirrors it for the dev integration layer ([#519](https://github.com/$REPO/issues/519))."
+            echo "dev-issue-autoclose: #$n closed (reason: completed) by delivery PR #$PR_NUMBER"
+          done

@@ -10,7 +10,7 @@ import { EventSequenceTable, EventTable } from "@opencode-ai/core/event/sql"
 import { Location } from "@opencode-ai/core/location"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import { WorkspaceV2 } from "@opencode-ai/core/workspace"
-import { eq } from "drizzle-orm"
+import { asc, eq } from "drizzle-orm"
 import { location } from "./fixture/location"
 import { testEffect } from "./lib/effect"
 
@@ -379,6 +379,238 @@ describe("EventV2", () => {
         .pipe(Effect.orDie)
 
       expect(rows.map((row) => row.seq)).toEqual([0, 1])
+    }),
+  )
+
+  it.effect("skips a byte-identical duplicate of the latest same-type durable event", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const { db } = yield* Database.Service
+      const aggregateID = EventV2.ID.create()
+
+      const first = yield* events.publish(SyncMessage, { id: aggregateID, text: "hello" })
+      const duplicate = yield* events.publish(SyncMessage, { id: aggregateID, text: "hello" })
+      const rows = yield* db
+        .select({ seq: EventTable.seq, dataHash: EventTable.data_hash })
+        .from(EventTable)
+        .where(eq(EventTable.aggregate_id, aggregateID))
+        .all()
+        .pipe(Effect.orDie)
+
+      expect(first.durable?.seq).toBe(0)
+      expect(duplicate.durable).toBeUndefined()
+      expect(rows).toHaveLength(1)
+      expect(rows[0]?.dataHash).toHaveLength(64)
+    }),
+  )
+
+  it.effect("keeps the persisted sequence dense when a duplicate is skipped", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const { db } = yield* Database.Service
+      const aggregateID = EventV2.ID.create()
+
+      yield* events.publish(SyncMessage, { id: aggregateID, text: "hello" })
+      yield* events.publish(SyncMessage, { id: aggregateID, text: "hello" })
+      const third = yield* events.publish(SyncMessage, { id: aggregateID, text: "world" })
+      const rows = yield* db
+        .select({ seq: EventTable.seq, data: EventTable.data })
+        .from(EventTable)
+        .where(eq(EventTable.aggregate_id, aggregateID))
+        .orderBy(asc(EventTable.seq))
+        .all()
+        .pipe(Effect.orDie)
+
+      expect(third.durable?.seq).toBe(1)
+      expect(rows.map((row) => [row.seq, row.data["text"]])).toEqual([
+        [0, "hello"],
+        [1, "world"],
+      ])
+    }),
+  )
+
+  it.effect("appends when the payload differs from the latest same-type event", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const { db } = yield* Database.Service
+      const aggregateID = EventV2.ID.create()
+
+      yield* events.publish(SyncMessage, { id: aggregateID, text: "a" })
+      yield* events.publish(SyncMessage, { id: aggregateID, text: "b" })
+      yield* events.publish(SyncMessage, { id: aggregateID, text: "a" })
+      const rows = yield* db
+        .select({ seq: EventTable.seq })
+        .from(EventTable)
+        .where(eq(EventTable.aggregate_id, aggregateID))
+        .all()
+        .pipe(Effect.orDie)
+
+      expect(rows).toHaveLength(3)
+    }),
+  )
+
+  it.effect("dedupes only against the same aggregate and event type", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const { db } = yield* Database.Service
+      const aggregateID = EventV2.ID.create()
+      const otherAggregateID = EventV2.ID.create()
+
+      yield* events.publish(SyncMessage, { id: aggregateID, text: "same" })
+      yield* events.publish(SyncSent, { messageID: aggregateID, text: "same" })
+      yield* events.publish(SyncMessage, { id: otherAggregateID, text: "same" })
+      const own = yield* db
+        .select({ type: EventTable.type })
+        .from(EventTable)
+        .where(eq(EventTable.aggregate_id, aggregateID))
+        .all()
+        .pipe(Effect.orDie)
+      const other = yield* db
+        .select({ seq: EventTable.seq })
+        .from(EventTable)
+        .where(eq(EventTable.aggregate_id, otherAggregateID))
+        .all()
+        .pipe(Effect.orDie)
+
+      expect(new Set(own.map((row) => row.type))).toHaveLength(2)
+      expect(other).toHaveLength(1)
+    }),
+  )
+
+  it.effect("skips duplicates inside a publishMany batch and keeps payloads aligned", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const { db } = yield* Database.Service
+      const aggregateID = EventV2.ID.create()
+
+      const payloads = yield* events.publishMany([
+        { definition: SyncMessage, data: { id: aggregateID, text: "a" } },
+        { definition: SyncMessage, data: { id: aggregateID, text: "a" } },
+        { definition: SyncMessage, data: { id: aggregateID, text: "b" } },
+      ])
+      const rows = yield* db
+        .select({ seq: EventTable.seq })
+        .from(EventTable)
+        .where(eq(EventTable.aggregate_id, aggregateID))
+        .all()
+        .pipe(Effect.orDie)
+
+      expect(rows).toHaveLength(2)
+      expect(payloads.map((event) => event.data)).toEqual([
+        { id: aggregateID, text: "a" },
+        { id: aggregateID, text: "a" },
+        { id: aggregateID, text: "b" },
+      ])
+      expect(payloads.map((event) => event.durable?.seq)).toEqual([0, undefined, 1])
+    }),
+  )
+
+  it.effect("runs projectors and commit hooks only for persisted appends", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const projected = new Array<EventV2.Payload>()
+      yield* events.project(SyncMessage, (event) =>
+        Effect.sync(() => {
+          projected.push(event)
+        }),
+      )
+      const commits = new Array<number>()
+      const aggregateID = EventV2.ID.create()
+      const publishWithCommit = () =>
+        events.publish(
+          SyncMessage,
+          { id: aggregateID, text: "hello" },
+          { commit: (seq) => Effect.sync(() => commits.push(seq)) },
+        )
+
+      yield* publishWithCommit()
+      yield* publishWithCommit()
+
+      expect(projected.map((event) => event.durable?.seq)).toEqual([0])
+      expect(commits).toEqual([0])
+    }),
+  )
+
+  it.effect("never dedupes against legacy rows with a NULL hash", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const { db } = yield* Database.Service
+      const aggregateID = EventV2.ID.create()
+
+      yield* db
+        .insert(EventSequenceTable)
+        .values([{ aggregate_id: aggregateID, seq: 0 }])
+        .run()
+        .pipe(Effect.orDie)
+      yield* db
+        .insert(EventTable)
+        .values([
+          {
+            id: EventV2.ID.create(),
+            aggregate_id: aggregateID,
+            seq: 0,
+            type: EventV2.versionedType(SyncMessage.type, 1),
+            data: { id: aggregateID, text: "legacy" },
+          },
+        ])
+        .run()
+        .pipe(Effect.orDie)
+
+      const published = yield* events.publish(SyncMessage, { id: aggregateID, text: "legacy" })
+      const rows = yield* db
+        .select({ seq: EventTable.seq })
+        .from(EventTable)
+        .where(eq(EventTable.aggregate_id, aggregateID))
+        .all()
+        .pipe(Effect.orDie)
+
+      expect(published.durable?.seq).toBe(1)
+      expect(rows).toHaveLength(2)
+    }),
+  )
+
+  it.effect("replay with an explicit seq is never deduped", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const { db } = yield* Database.Service
+      const aggregateID = Session.ID.create()
+
+      yield* events.publish(DurableMessage, durableData(aggregateID, "same"))
+      yield* events.replay({
+        id: EventV2.ID.create(),
+        type: EventV2.versionedType(DurableMessage.type, 1),
+        seq: 1,
+        aggregateID,
+        data: durableData(aggregateID, "same"),
+      })
+      const rows = yield* db
+        .select({ seq: EventTable.seq })
+        .from(EventTable)
+        .where(eq(EventTable.aggregate_id, aggregateID))
+        .all()
+        .pipe(Effect.orDie)
+
+      expect(rows).toHaveLength(2)
+    }),
+  )
+
+  it.effect("durable readers observe only persisted events after a skipped duplicate", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const aggregateID = Session.ID.create()
+      yield* events.publish(DurableMessage, durableData(aggregateID, "zero"))
+      const fiber = yield* events
+        .durable({ aggregateID })
+        .pipe(Stream.take(2), Stream.runCollect, Effect.forkScoped)
+      yield* Effect.yieldNow
+
+      yield* events.publish(DurableMessage, durableData(aggregateID, "zero"))
+      yield* events.publish(DurableMessage, durableData(aggregateID, "one"))
+
+      expect(Array.from(yield* Fiber.join(fiber)).map((event) => [event.durable?.seq, event.data])).toEqual([
+        [0, durableData(aggregateID, "zero")],
+        [1, durableData(aggregateID, "one")],
+      ])
     }),
   )
 

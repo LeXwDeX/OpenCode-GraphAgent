@@ -18,6 +18,7 @@ import simplifySessionInputMigration from "@opencode-ai/core/database/migration/
 import capturedOutputMigration from "@opencode-ai/core/database/migration/20260715035022_captured_output"
 import fearlessCammiMigration from "@opencode-ai/core/database/migration/20260717034735_fearless_cammi"
 import dagWorkflowNodeIdentityMigration from "@opencode-ai/core/database/migration/20260720013828_dag-workflow-node-identity"
+import dropSessionSummaryDiffsMigration from "@opencode-ai/core/database/migration/20260903044702_drop_session_summary_diffs"
 import { EventV2 } from "@opencode-ai/core/event"
 import { ProjectV2 } from "@opencode-ai/core/project"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
@@ -96,6 +97,39 @@ describe("DatabaseMigration", () => {
           { name: "session_message_session_time_created_id_idx" },
           { name: "session_message_session_type_seq_idx" },
         ])
+      }),
+    )
+  })
+
+  test("drops the legacy session summary_diffs column", async () => {
+    await run(
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        // Legacy install: the column still exists with data, and only the drop migration is pending.
+        yield* db.run(sql`CREATE TABLE session (id text PRIMARY KEY, summary_diffs text)`)
+        yield* db.run(
+          sql`INSERT INTO session (id, summary_diffs) VALUES ('ses_legacy', '[{"file":"a.txt","patch":"p","additions":1,"deletions":0,"status":"modified"}]')`,
+        )
+
+        yield* DatabaseMigration.applyOnly(db, [dropSessionSummaryDiffsMigration])
+
+        expect(
+          yield* db.get(sql`SELECT name FROM pragma_table_info('session') WHERE name = 'summary_diffs'`),
+        ).toBeUndefined()
+        expect(yield* db.get(sql`SELECT id FROM session WHERE id = 'ses_legacy'`)).toEqual({ id: "ses_legacy" })
+        expect(yield* db.get(sql`SELECT id FROM migration WHERE id = ${dropSessionSummaryDiffsMigration.id}`)).toEqual({
+          id: dropSessionSummaryDiffsMigration.id,
+        })
+      }),
+    )
+
+    await run(
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        yield* DatabaseMigration.apply(db)
+        expect(
+          yield* db.get(sql`SELECT name FROM pragma_table_info('session') WHERE name = 'summary_diffs'`),
+        ).toBeUndefined()
       }),
     )
   })

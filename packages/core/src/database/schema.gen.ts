@@ -149,6 +149,7 @@ export default {
           \`seq\` integer NOT NULL,
           \`type\` text NOT NULL,
           \`data\` text NOT NULL,
+          \`data_hash\` text,
           CONSTRAINT \`fk_event_aggregate_id_event_sequence_aggregate_id_fk\` FOREIGN KEY (\`aggregate_id\`) REFERENCES \`event_sequence\`(\`aggregate_id\`) ON DELETE CASCADE
         );
       `)
@@ -274,7 +275,6 @@ export default {
           \`summary_additions\` integer,
           \`summary_deletions\` integer,
           \`summary_files\` integer,
-          \`summary_diffs\` text,
           \`metadata\` text,
           \`cost\` real DEFAULT 0 NOT NULL,
           \`tokens_input\` integer DEFAULT 0 NOT NULL,

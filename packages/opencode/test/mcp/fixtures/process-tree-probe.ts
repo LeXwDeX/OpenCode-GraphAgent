@@ -80,5 +80,5 @@ const result = await Effect.runPromise(
   ).pipe(Effect.scoped, Effect.provide(MCP.defaultLayer)),
 )
 
-console.log(JSON.stringify(result))
-if (!result.ok || !result.rootDead || !result.childDead) process.exit(1)
+await Bun.write(Bun.stdout, `${JSON.stringify(result)}\n`)
+process.exit(result.ok && result.rootDead && result.childDead ? 0 : 1)

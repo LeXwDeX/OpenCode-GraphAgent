@@ -105,6 +105,7 @@ export function stream(input: StreamInput): StreamResult {
       Effect.gen(function* () {
         const settlements = yield* FiberSet.make<void>()
         const results = yield* Queue.unbounded<LLMEvent, Cause.Done>()
+        const completion: LLMEvent[] = []
         const provider = input.llmClient
           .stream(
             LLMRequest.update(request, {
@@ -112,8 +113,14 @@ export function stream(input: StreamInput): StreamResult {
             }),
           )
           .pipe(
-            Stream.flatMap((event) =>
-              event.type !== "tool-call" || event.providerExecuted
+            Stream.flatMap((event) => {
+              // The processor may close the stream for compaction at step-finish.
+              // Deliver every local settlement before exposing that boundary.
+              if (event.type === "step-finish" || event.type === "finish") {
+                completion.push(event)
+                return Stream.empty
+              }
+              return event.type !== "tool-call" || event.providerExecuted
                 ? Stream.make(event)
                 : Stream.make(event).pipe(
                     Stream.concat(
@@ -126,15 +133,18 @@ export function stream(input: StreamInput): StreamResult {
                         ),
                       ),
                     ),
-                  ),
-            ),
+                  )
+            }),
             Stream.concat(
               Stream.fromEffectDrain(
                 FiberSet.awaitEmpty(settlements).pipe(Effect.andThen(Queue.end(results)), Effect.asVoid),
               ),
             ),
           )
-        return provider.pipe(Stream.concat(Stream.fromQueue(results)))
+        return provider.pipe(
+          Stream.concat(Stream.fromQueue(results)),
+          Stream.concat(Stream.suspend(() => Stream.fromIterable(completion))),
+        )
       }),
     ),
   )

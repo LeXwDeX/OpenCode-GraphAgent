@@ -1,11 +1,11 @@
 version: 1
-delivery: sync-v1-0-39
+delivery: stable-release
 context:
   kind: branch
-  branch: chore/517-sync-v1-0-39
+  branch: chore/543-stable-release
 issues:
-  - 517
+  - 543
 issueKinds:
-  - issue: 517
+  - issue: 543
     kind: kind::chore
-pr: 518
+pr: 544

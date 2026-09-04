@@ -17,6 +17,11 @@ export const EventTable = sqliteTable(
     seq: integer().notNull(),
     type: text().notNull(),
     data: text({ mode: "json" }).$type<Record<string, unknown>>().notNull(),
+    // sha256 of the serialized payload, written once at append time. The
+    // idempotency gate compares against the latest same-type row via
+    // event_aggregate_type_seq_idx instead of re-hashing MiB-scale payloads.
+    // Nullable: legacy rows predate the column and never match the gate.
+    data_hash: text(),
   },
   (table) => [
     uniqueIndex("event_aggregate_seq_idx").on(table.aggregate_id, table.seq),

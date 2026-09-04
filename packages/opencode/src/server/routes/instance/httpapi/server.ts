@@ -50,6 +50,7 @@ import { Storage } from "@/storage/storage"
 import { Goal } from "@/goal/goal"
 import { GoalLoop } from "@/goal/loop"
 import { DagSupervisionSweep } from "@/dag/runtime/supervision-sweep"
+import { EventResidueSweep } from "@opencode-ai/core/event/residue-sweep"
 import { SettingsHook } from "@/hook/settings"
 import { HookRewakeLive } from "@/hook/rewake-live"
 import { SessionHooks } from "@/hook/session-hooks"
@@ -318,6 +319,12 @@ export const app = LayerNode.group([
   // conditional projector UPDATE), so the duplicate is safe — see the sweep
   // header's multi-host convergence notes.
   DagSupervisionSweep.node,
+  // EventResidueSweep (#524): default-on startup residue sweep for crash/
+  // in-flight zombie event aggregates. Same app-graph-level placement
+  // rationale as DagSupervisionSweep above — the desktop sidecar and headless
+  // serving processes build this node graph without AppLayer, and the sweep
+  // is idempotent (a second pass in AppLayer processes removes nothing).
+  EventResidueSweep.node,
 ])
 
 export function createRoutes(
