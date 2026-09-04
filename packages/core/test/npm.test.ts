@@ -54,7 +54,9 @@ describe("Npm.add", () => {
     await Bun.write(path.join(tmp.path, "fixture-provider", "index.js"), "export const fixture = true\n")
 
     const spec = `fixture-provider@file:${path.join(tmp.path, "fixture-provider")}`
-    await fs.mkdir(path.join(tmp.path, "cache", "packages", Npm.sanitize(spec)), { recursive: true })
+    const cache = path.join(tmp.path, "cache", "packages", Npm.sanitize(spec))
+    await fs.mkdir(cache, { recursive: true })
+    await Bun.write(path.join(cache, ".npmrc"), "audit=false\n")
 
     const entry = await Effect.gen(function* () {
       const npm = yield* Npm.Service
@@ -78,7 +80,7 @@ describe("Npm.install", () => {
         "dev-pkg": "file:./dev-pkg",
       },
     })
-    await Bun.write(path.join(tmp.path, ".npmrc"), "omit=dev\n")
+    await Bun.write(path.join(tmp.path, ".npmrc"), "omit=dev\naudit=false\n")
     await fs.mkdir(path.join(tmp.path, "prod-pkg"))
     await fs.mkdir(path.join(tmp.path, "dev-pkg"))
     await writePackage(path.join(tmp.path, "prod-pkg"), { name: "prod-pkg" })
@@ -108,7 +110,10 @@ describe("Npm.install", () => {
     const bundled = path.join(tmp.path, "bundled-plugin-sdk")
     process.env.OPENCODE_PLUGIN_SDK_PATH = bundled
     await fs.mkdir(path.join(bundled, "src"), { recursive: true })
-    await writePackage(bundled, { name: "@opencode-ai/plugin", exports: { ".": "./src/index.ts", "./tui": "./src/tui.ts" } })
+    await writePackage(bundled, {
+      name: "@opencode-ai/plugin",
+      exports: { ".": "./src/index.ts", "./tui": "./src/tui.ts" },
+    })
     await Bun.write(path.join(bundled, "src", "index.ts"), "export const plugin = true\n")
     await Bun.write(path.join(bundled, "src", "tui.ts"), "export const tui = true\n")
 
@@ -118,7 +123,9 @@ describe("Npm.install", () => {
         yield* npm.install(tmp.path, { add: [{ name: "@opencode-ai/plugin" }] })
       }).pipe(Effect.scoped, Effect.provide(npmLayer(path.join(tmp.path, "cache"))), Effect.runPromise)
 
-      await expect(fs.stat(path.join(tmp.path, "node_modules", "@opencode-ai", "plugin", "src", "tui.ts"))).resolves.toBeDefined()
+      await expect(
+        fs.stat(path.join(tmp.path, "node_modules", "@opencode-ai", "plugin", "src", "tui.ts")),
+      ).resolves.toBeDefined()
       await expect(fs.stat(path.join(tmp.path, "package-lock.json"))).rejects.toThrow()
     } finally {
       delete process.env.OPENCODE_PLUGIN_SDK_PATH
