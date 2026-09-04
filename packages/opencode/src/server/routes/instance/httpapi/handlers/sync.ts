@@ -72,7 +72,13 @@ export const syncHandlers = HttpApiBuilder.group(InstanceHttpApi, "sync", (handl
     const history = Effect.fn("SyncHttpApi.history")(function* (ctx: { payload: typeof HistoryPayload.Type }) {
       const exclude = Object.entries(ctx.payload)
       return yield* db
-        .select()
+        .select({
+          id: EventTable.id,
+          aggregate_id: EventTable.aggregate_id,
+          seq: EventTable.seq,
+          type: EventTable.type,
+          data: EventTable.data,
+        })
         .from(EventTable)
         .where(
           exclude.length > 0

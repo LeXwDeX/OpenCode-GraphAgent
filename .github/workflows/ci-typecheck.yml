@@ -54,3 +54,10 @@ jobs:
         working-directory: packages/opencode
         run: bun run test:dag-core
         timeout-minutes: 10
+
+      # #498 B1: archive integrity boundary of the `oc` installer — SHA256SUMS
+      # must be verified before extraction and fail closed on mismatch.
+      # Zero network (stub curl); portable across bash hosts.
+      - name: Run oc install boundary tests
+        run: bash script/oc-install-boundary.test.sh
+        timeout-minutes: 5

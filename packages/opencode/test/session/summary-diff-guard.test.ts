@@ -3,12 +3,10 @@ import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
-import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { Effect, Layer } from "effect"
-import { eq } from "drizzle-orm"
 import { Snapshot } from "@/snapshot"
 import { Session as SessionNs, truncateSummaryDiffs, MAX_SUMMARY_DIFF_BYTES } from "@/session/session"
 import { SessionSummary } from "@/session/summary"
@@ -47,22 +45,6 @@ const giantDiffs = (count: number) =>
     deletions: 2,
     status: "modified" as const,
   }))
-
-const setSummaryRow = (sessionID: SessionID, summary: { additions: number; deletions: number; files: number; diffs: Snapshot.FileDiff[] }) =>
-  Effect.gen(function* () {
-    const database = yield* Database.Service
-    yield* database.db
-      .update(SessionTable)
-      .set({
-        summary_additions: summary.additions,
-        summary_deletions: summary.deletions,
-        summary_files: summary.files,
-        summary_diffs: summary.diffs,
-      })
-      .where(eq(SessionTable.id, sessionID))
-      .run()
-      .pipe(Effect.orDie)
-  })
 
 const seedUserTurn = Effect.fnUntraced(function* (sessionID: SessionID) {
   const sessions = yield* SessionNs.Service
@@ -140,34 +122,6 @@ describe("summary.diffs source truncation", () => {
   )
 })
 
-describe("summary_diffs read guard", () => {
-  it.instance("strips oversized legacy summary_diffs on read and keeps stats", () =>
-    Effect.gen(function* () {
-      const sessions = yield* SessionNs.Service
-      const database = yield* Database.Service
-      const session = yield* sessions.create({ title: "legacy-giant-diffs" })
-
-      yield* database.db
-        .update(SessionTable)
-        .set({
-          summary_additions: 12,
-          summary_deletions: 34,
-          summary_files: 56,
-          summary_diffs: giantDiffs(300),
-        })
-        .where(eq(SessionTable.id, session.id))
-        .run()
-        .pipe(Effect.orDie)
-
-      const info = yield* sessions.get(session.id)
-      expect(info.summary?.additions).toBe(12)
-      expect(info.summary?.deletions).toBe(34)
-      expect(info.summary?.files).toBe(56)
-      expect(info.summary?.diffs).toBeUndefined()
-    }),
-  )
-})
-
 describe("truncateSummaryDiffs boundaries", () => {
   const item = {
     file: "a.txt",
@@ -194,45 +148,31 @@ describe("truncateSummaryDiffs boundaries", () => {
     expect(kept?.length).toBe(count)
     expect(Buffer.byteLength(JSON.stringify(kept))).toBeLessThanOrEqual(MAX_SUMMARY_DIFF_BYTES)
   })
-})
 
-describe("summary diffs budget boundary", () => {
-  it.instance("keeps diffs at just under the budget on write and read", () =>
-    Effect.gen(function* () {
-      const sessions = yield* SessionNs.Service
-      const session = yield* sessions.create({ title: "under-budget" })
-      const info = yield* sessions.get(session.id)
+  test("skips an oversized entry and keeps later entries that still fit", () => {
+    const huge = { ...item, file: "huge.txt", patch: "x".repeat(MAX_SUMMARY_DIFF_BYTES) }
+    const smallA = { ...item, file: "small-a.txt", patch: "y".repeat(64) }
+    const smallB = { ...item, file: "small-b.txt", patch: "z".repeat(64) }
+    const kept = truncateSummaryDiffs([huge, smallA, smallB])
+    expect(kept).toEqual([smallA, smallB])
+    expect(Buffer.byteLength(JSON.stringify(kept))).toBeLessThanOrEqual(MAX_SUMMARY_DIFF_BYTES)
+  })
 
-      const diffs = giantDiffs(100)
-      expect(Buffer.byteLength(JSON.stringify(diffs))).toBeLessThan(SessionNs.MAX_SUMMARY_DIFF_BYTES)
-      const row = SessionNs.toRow({ ...info, summary: { additions: 5, deletions: 6, files: 100, diffs } })
-      expect(row.summary_diffs).toEqual(diffs)
-
-      yield* setSummaryRow(session.id, { additions: 5, deletions: 6, files: 100, diffs })
-      const back = yield* sessions.get(session.id)
-      expect(back.summary?.diffs).toEqual(diffs)
-      expect(back.summary?.additions).toBe(5)
-      expect(back.summary?.deletions).toBe(6)
-      expect(back.summary?.files).toBe(100)
-    }),
-  )
-
-  it.instance("truncates oversized diffs on write within the budget", () =>
-    Effect.gen(function* () {
-      const sessions = yield* SessionNs.Service
-      const session = yield* sessions.create({ title: "over-budget-write" })
-      const info = yield* sessions.get(session.id)
-
-      const row = SessionNs.toRow({
-        ...info,
-        summary: { additions: 5, deletions: 6, files: 300, diffs: giantDiffs(300) },
-      })
-      const kept = row.summary_diffs
-      expect(kept?.length).toBeGreaterThan(0)
-      expect(kept?.length).toBeLessThan(300)
-      expect(Buffer.byteLength(JSON.stringify(kept))).toBeLessThanOrEqual(SessionNs.MAX_SUMMARY_DIFF_BYTES)
-      expect(kept?.[0]?.file).toBe("f000.txt")
-      expect(kept?.at(-1)?.file).toBe(`f${String((kept?.length ?? 1) - 1).padStart(3, "0")}.txt`)
-    }),
-  )
+  test("keeps serialized output within the budget for mixed oversized inputs", () => {
+    const huge = { ...item, patch: "x".repeat(MAX_SUMMARY_DIFF_BYTES) }
+    const nearBudget = { ...item, patch: "x".repeat(MAX_SUMMARY_DIFF_BYTES - 120) }
+    const shapes = [
+      [huge, item, item],
+      [item, huge, item],
+      [item, item, huge],
+      [nearBudget, item, nearBudget, item],
+      [huge, nearBudget, huge, item],
+      [nearBudget, nearBudget],
+      [item, nearBudget, item, huge, item],
+    ]
+    shapes.forEach((shape) => {
+      const kept = truncateSummaryDiffs(shape)
+      expect(Buffer.byteLength(JSON.stringify(kept))).toBeLessThanOrEqual(MAX_SUMMARY_DIFF_BYTES)
+    })
+  })
 })

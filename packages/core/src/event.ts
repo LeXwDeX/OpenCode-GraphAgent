@@ -3,13 +3,14 @@ export * as EventV2 from "./event"
 import { Cause, Context, Effect, FiberSet, Layer, Option, PubSub, Schema, Stream } from "effect"
 import { Event } from "@opencode-ai/schema/event"
 import type { Data, Definition, Payload } from "@opencode-ai/schema/event"
-import { and, asc, eq, gt } from "drizzle-orm"
+import { and, asc, desc, eq, gt } from "drizzle-orm"
 import { Database } from "./database/database"
 import { EventSequenceTable, EventTable } from "./event/sql"
 import { Location } from "./location"
 import { LayerNode } from "./effect/layer-node"
 import { isDeepStrictEqual } from "node:util"
 import { Durable } from "@opencode-ai/schema/durable-event-manifest"
+import { Hash } from "./util/hash"
 
 export const ID = Event.ID
 export type ID = import("@opencode-ai/schema/event").ID
@@ -227,6 +228,30 @@ export const layerWith = (options?: LayerOptions) =>
           if (input && row?.ownerID && row.ownerID !== input.ownerID) {
             return undefined
           }
+          const dataHash = Hash.sha256(JSON.stringify(encoded))
+          if (!input) {
+            // Idempotency gate (#523): a fresh append that byte-for-byte repeats
+            // this aggregate's latest same-type event carries zero information
+            // delta. Skip it entirely — no seq consumed, no projectors, no commit
+            // hook, no durable wake — so the persisted sequence stays dense and
+            // both the replayAll contiguity check and gt(seq, after) readers are
+            // unaffected. Replay appends (input) keep their exact-seq contract,
+            // and legacy rows carry a NULL hash so they never match.
+            const previous = yield* db
+              .select({ dataHash: EventTable.data_hash })
+              .from(EventTable)
+              .where(
+                and(
+                  eq(EventTable.aggregate_id, aggregateID),
+                  eq(EventTable.type, versionedType(definition.type, durable.version)),
+                ),
+              )
+              .orderBy(desc(EventTable.seq))
+              .limit(1)
+              .get()
+              .pipe(Effect.orDie)
+            if (previous && previous.dataHash === dataHash) return undefined
+          }
           const seq = input?.seq ?? latest + 1
           if (input && seq !== latest + 1) {
             yield* Effect.die(
@@ -278,6 +303,7 @@ export const layerWith = (options?: LayerOptions) =>
                 seq,
                 type: versionedType(definition.type, durable.version),
                 data: encoded,
+                data_hash: dataHash,
               },
             ])
             .run()
@@ -479,7 +505,9 @@ export const layerWith = (options?: LayerOptions) =>
                 .transaction(
                   () =>
                     Effect.gen(function* () {
-                      const results = new Array<{ aggregateID: string; seq: number }>()
+                      // Aligned with entries by index: a deduped entry yields
+                      // undefined so the payload pairing below stays positional.
+                      const results = new Array<{ aggregateID: string; seq: number } | undefined>()
                       for (const entry of entries) {
                         // No replay input: seq is allocated contiguously from the latest sequence inside the transaction.
                         const result = yield* commitDurableEventInner(
@@ -488,7 +516,7 @@ export const layerWith = (options?: LayerOptions) =>
                           undefined,
                           entry.commit,
                         )
-                        if (result) results.push(result)
+                        results.push(result)
                       }
                       return results
                     }),
@@ -499,19 +527,19 @@ export const layerWith = (options?: LayerOptions) =>
               return results
             }),
           )
-          const payloads = entries.flatMap((entry, index) => {
+          const payloads = entries.map((entry, index) => {
             const result = committed[index]
-            if (!result) return []
-            return [
-              {
-                ...entry.event,
-                durable: {
-                  aggregateID: result.aggregateID,
-                  seq: result.seq,
-                  version: entry.durable.version,
-                },
-              } as Payload,
-            ]
+            // A deduped entry is still notified (mirrors the single-publish
+            // path) but stays unstamped: it occupies no sequence position.
+            if (!result) return entry.event
+            return {
+              ...entry.event,
+              durable: {
+                aggregateID: result.aggregateID,
+                seq: result.seq,
+                version: entry.durable.version,
+              },
+            } as Payload
           })
           for (const payload of payloads) {
             yield* notify(payload)
