@@ -1,11 +1,10 @@
 version: 1
-delivery: sync-v1-0-39
+delivery: native-tool-settlement
 context:
   kind: branch
-  branch: chore/517-sync-v1-0-39
+  branch: fix/538-native-tool-settlement
 issues:
-  - 517
+  - 538
 issueKinds:
-  - issue: 517
-    kind: kind::chore
-pr: 518
+  - issue: 538
+    kind: kind::fix
