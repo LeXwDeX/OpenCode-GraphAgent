@@ -2,22 +2,19 @@ name: SpecGit Acceptance
 
 on:
   pull_request:
-    branches: [main]
+    branches: ["main"]
     # A draft PR fails the verdict (pr_draft), so the draft→ready
     # transition must re-verdict. Listing types replaces the defaults,
-    # so the default activity types are listed alongside.
-    types: [opened, synchronize, reopened, ready_for_review]
-    # No workflow_dispatch (local specialization): dispatch is the privileged
-    # context that fires CodeQL's cache-poisoning taint rule on the head_ref
-    # checkout (false positive: no cache use, read-only token,
-    # persist-credentials: false), and on dispatch events head_ref is empty so
-    # the verdict would evaluate the default branch — the wrong tree. Delivery
-    # here always goes through a PR.
+    # so the default activity types are listed alongside. Title and body
+    # edits change live acceptance evidence even when the head is unchanged.
+    types: [opened, synchronize, reopened, ready_for_review, edited]
+  workflow_dispatch:
 
 permissions:
   contents: read
   issues: read
   pull-requests: read
+  actions: read
 
 # One verdict per head at a time (#319): a newer trigger event (a push
 # after the draft opened, then ready_for_review) supersedes the older
@@ -35,33 +32,47 @@ jobs:
     # project's own toolchain (package manager, lockfile, build, layout)
     # is never assumed and never invoked.
     runs-on: ubuntu-latest
-    # Local specialization: must exceed the slowest required sibling
-    # (Unit Tests (linux) runs ~28min on PRs) — the verdict waits for every
-    # policy check to reach a terminal state before evaluating.
+    # This repository's required Linux unit suite normally takes about 28
+    # minutes, so leave enough time for it to finish and for the verdict.
     timeout-minutes: 45
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # Check out the PR head branch by name so HEAD is on the branch
-          # (not the detached merge ref): the execution context gate reads
-          # live git. Falls back to the default ref on non-PR events.
-          ref: ${{ github.head_ref || github.ref }}
+          # Pin execution to this event; a newer branch push must not change
+          # the code tested by an older run. Manual dispatch uses its own SHA.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Restore the event branch
+        if: github.event_name == 'pull_request' || github.ref_type == 'branch'
+        env:
+          SPECGIT_BRANCH: ${{ github.head_ref || github.ref_name }}
+        run: |
+          git check-ref-format --branch "$SPECGIT_BRANCH" >/dev/null
+          git switch --create "$SPECGIT_BRANCH"
 
       - name: Setup Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: '22'
+          node-version: '20.19'
+          package-manager-cache: false
 
       - name: Install pinned SpecGit CLI
-        # Local specialization — install GLOBALLY, not `npm install --no-save
-        # specgit@X`: a workspace-local install reads this bun workspace's
-        # package.json and dies on the `catalog:` protocol (EUNSUPPORTEDPROTOCOL,
-        # #434/#459). Exact pin on purpose: the gate must evaluate with the
-        # same CLI generation that wrote the binding (1.10.1 re-init).
-        run: npm install -g --no-audit --no-fund specgit@1.10.1
+        # Exact version on purpose (no ^): the gate must evaluate with the
+        # same CLI generation that wrote the binding; upgrades are a
+        # deliberate re-init. An isolated prefix avoids installing the
+        # adopting project's dependencies or running its lifecycle scripts.
+        run: npm install --prefix "$RUNNER_TEMP/specgit-cli" --no-save --no-audit --no-fund specgit@1.13.1
+
+      - name: Prepare approved policy for acceptance
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SPECGIT_WAIT_POLICY: ${{ runner.temp }}/specgit-policy.yaml
+        run: |
+          gh auth setup-git
+          node "$RUNNER_TEMP/specgit-cli/node_modules/specgit/dist/automation/workflow-policy.js"
 
       - name: Wait for sibling checks
         # The verdict must see the OTHER required checks in a terminal
@@ -78,21 +89,23 @@ jobs:
           WAIT_REPO: ${{ github.repository }}
           WAIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           WAIT_PR: ${{ github.event.pull_request.number || '' }}
+          WAIT_POLICY: ${{ runner.temp }}/specgit-policy.yaml
+          SPECGIT_CLI_DIR: ${{ runner.temp }}/specgit-cli
         run: |
           node --input-type=module <<'EOF'
           import { existsSync, readFileSync } from 'node:fs';
           import { execFileSync } from 'node:child_process';
-          if (!existsSync('spec_git/policy.yaml')) {
+          import { createRequire } from 'node:module';
+          const { parse } = process.env.SPECGIT_CLI_DIR
+            ? createRequire(process.env.SPECGIT_CLI_DIR + '/node_modules/specgit/package.json')('yaml')
+            : await import('yaml');
+          const policyPath = process.env.WAIT_POLICY || 'spec_git/policy.yaml';
+          if (!existsSync(policyPath)) {
             console.error('spec_git/policy.yaml is absent at this head — an adoption PR carries no binding commit yet (expected once; merge it before enabling branch protection), and a delivery PR must carry it via specgit issue.');
             process.exit(1);
           }
-          // Local specialization — minimal hand parse of policy.yaml's
-          // required_checks block: this bun-based repo does not expose a
-          // root-reachable `yaml` package (workspace catalog isolation), so
-          // `import { parse } from 'yaml'` would fail to resolve here.
-          const policy = readFileSync('spec_git/policy.yaml', 'utf8');
-          const section = policy.slice(policy.indexOf('required_checks:'));
-          const required = [...section.matchAll(/^\s*-\s*(.+)$/gm)].map((m) => m[1].trim());
+          const policy = parse(readFileSync(policyPath, 'utf8'));
+          const required = policy.required_checks ?? [];
           // gh.cmd needs a shell on Windows; POSIX execs the binary
 
           // directly (shell stays off where it is not needed). The
@@ -169,6 +182,109 @@ jobs:
               }
             }
           };
+          /** @param {unknown} value @returns {value is number} */
+          function positiveIdentity(value) {
+            return typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
+          }
+
+          /** @param {unknown} app */
+          export function isGithubActionsApp(app) {
+            return typeof app === 'object' && app !== null &&
+              (('slug' in app && app.slug === 'github-actions') || ('id' in app && app.id === 15368));
+          }
+
+          /**
+           * One ownership decision for the provider and embedded wait program.
+           * Callers prove the head and list completeness before passing normalized rows.
+           * Pending owners stay pending; callers decide which jobs must wait for them.
+           * @template {import('./actions-ownership.mjs').ActionsWorkflow} T
+           * @param {readonly T[]} workflows
+           * @returns {import('./actions-ownership.mjs').ActionsOwnership<T>}
+           */
+          export function createActionsOwnership(workflows) {
+            /** @type {Map<string, T>} */
+            const latest = new Map();
+            /** @type {Map<number, T>} */
+            const owners = new Map();
+            const ids = new Set();
+            for (const workflow of workflows) {
+              const check = workflow.check;
+              if (typeof workflow.key !== 'string' || !workflow.key ||
+                  !positiveIdentity(check.id) || !positiveIdentity(workflow.checkSuiteId) ||
+                  !positiveIdentity(workflow.runAttempt) || typeof check.startedAt !== 'string' ||
+                  !Number.isFinite(Date.parse(check.startedAt)) || owners.has(workflow.checkSuiteId) ||
+                  ids.has(check.id) || !['queued', 'in_progress', 'completed', 'waiting', 'pending', 'requested'].includes(check.status)) {
+                throw new Error('GitHub returned incomplete or ambiguous Actions workflow ownership.');
+              }
+              owners.set(workflow.checkSuiteId, workflow);
+              ids.add(check.id);
+              const previous = latest.get(workflow.key);
+              const started = Date.parse(check.startedAt);
+              if (!previous || started > Date.parse(previous.check.startedAt ?? '') ||
+                  (started === Date.parse(previous.check.startedAt ?? '') && check.id > previous.check.id)) {
+                latest.set(workflow.key, workflow);
+              }
+            }
+            return {
+              latest: [...latest.values()],
+              currentFor(checkSuiteId) {
+                if (!positiveIdentity(checkSuiteId)) {
+                  throw new Error('GitHub returned an Actions check without a check-suite identity.');
+                }
+                const owner = owners.get(checkSuiteId);
+                if (!owner) throw new Error('The Actions check has no proven owning workflow run.');
+                return latest.get(owner.key)?.check.id === owner.check.id ? owner : null;
+              },
+            };
+          }
+          const isActions = (check) => isGithubActionsApp(check.app);
+          const listWorkflowsWithRetry = async (page) => {
+            for (let attempt = 1; ; attempt++) {
+              try {
+                return JSON.parse(execFileSync('gh', [
+                    'api', 'repos/' + process.env.WAIT_REPO + '/actions/runs', '--method', 'GET',
+                    '--field', 'head_sha=' + process.env.WAIT_SHA, '--field', 'per_page=' + PER_PAGE, '--field', 'page=' + page,
+                  ], { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'], shell: process.platform === 'win32' }));
+              } catch (error) {
+                const text = String(error) + ' ' + String(error && error.stderr ? error.stderr : '');
+                if (attempt >= 5 || !/HTTP 5\d\d|HTTP 429|ETIMEDOUT|ECONNRESET|ENOTFOUND|timed out/i.test(text)) throw error;
+                await new Promise((resolve) => setTimeout(resolve, Math.min(30000, 2000 * 2 ** (attempt - 1))));
+              }
+            }
+          };
+          const currentExecutionChecks = async (checks) => {
+            if (!checks.some(isActions)) return checks;
+            const workflows = [];
+            const positive = (value) => Number.isSafeInteger(value) && value > 0;
+            let total;
+            for (let page = 1; page <= 10; page++) {
+              const payload = await listWorkflowsWithRetry(page);
+              if (!Array.isArray(payload?.workflow_runs) || payload.workflow_runs.length > PER_PAGE
+                || !Number.isSafeInteger(payload.total_count) || payload.total_count < 0) throw new Error('GitHub Actions workflow evidence is malformed.');
+              if (payload.total_count > 1000) throw new Error('GitHub Actions workflow evidence exceeds the 1000-run API limit.');
+              if (total !== undefined && total !== payload.total_count) throw new Error('GitHub Actions workflow evidence changed during pagination.');
+              total = payload.total_count;
+              for (const run of payload.workflow_runs) {
+                if (!positive(run?.workflow_id) || run.head_sha !== process.env.WAIT_SHA
+                  || typeof run.event !== 'string' || run.event.length === 0) throw new Error('GitHub Actions workflow ownership is missing, invalid, or ambiguous.');
+                workflows.push({ key: JSON.stringify([run.workflow_id, run.event]), checkSuiteId: run.check_suite_id,
+                  runAttempt: run.run_attempt, check: { id: run.id, startedAt: run.run_started_at, status: run.status } });
+              }
+              if (payload.workflow_runs.length < PER_PAGE) break;
+              if (page === 10) throw new Error('GitHub Actions workflow evidence reached the pagination limit.');
+            }
+            if (workflows.length !== total) throw new Error('GitHub Actions workflow evidence is incomplete.');
+            const ownership = createActionsOwnership(workflows);
+            return checks.flatMap((check) => {
+              if (!isActions(check)) return [check];
+              let owner;
+              try { owner = ownership.currentFor(check.check_suite?.id); }
+              catch { throw new Error('A GitHub Actions check has no verified workflow owner.'); }
+              if (owner === null) return [];
+              // A rerun can retain completed jobs from its prior attempt until new jobs register.
+              return [owner.check.status === 'completed' ? check : { ...check, status: 'in_progress', conclusion: null }];
+            });
+          };
           const terminal = new Set(['completed']);
           const PER_PAGE = 100;
           // #300: page the listing to exhaustion — a head with more than
@@ -227,9 +343,7 @@ jobs:
 
           // being killed by the job timeout mid-line.
 
-          // Local specialization: 40min because the slowest required
-
-          // sibling (Unit Tests (linux)) runs ~28min on PRs.
+          // The required Linux unit suite normally takes about 28 minutes.
 
           const deadline = Date.now() + 40 * 60 * 1000;
           while (Date.now() < deadline) {
@@ -247,7 +361,7 @@ jobs:
                 + (error && error.message ? error.message : String(error)));
               process.exit(1);
             }
-            const runs = await fetchAllCheckRuns();
+            const runs = await currentExecutionChecks(await fetchAllCheckRuns());
             // #119: re-runs keep every same-name run; terminality is
             // decided on the truth run — latest started_at, ties broken
             // by the higher check-run id (docs/reference.md) — never on
@@ -304,6 +418,6 @@ jobs:
 
 
       - name: specgit finish
-        run: specgit finish --json
+        run: '"$RUNNER_TEMP/specgit-cli/node_modules/.bin/specgit" finish --json'
         env:
           GH_TOKEN: ${{ github.token }}
