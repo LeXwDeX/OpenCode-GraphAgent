@@ -10,6 +10,12 @@ import { PluginSdk } from "@opencode-ai/core/plugin-sdk"
 import { EffectFlock } from "@opencode-ai/core/util/effect-flock"
 import { tmpdir } from "./fixture/tmpdir"
 
+// CI runners blackhole the registry audit POST that arborist.reify issues,
+// hanging these fixtures past Bun's default 5000ms test timeout. Audit is
+// incidental to what these tests assert; NpmConfig.load spreads process.env
+// into Arborist, so disabling it here keeps reify hermetic.
+process.env.npm_config_audit = "false"
+
 const win = process.platform === "win32"
 
 const writePackage = (dir: string, pkg: Record<string, unknown>) =>
