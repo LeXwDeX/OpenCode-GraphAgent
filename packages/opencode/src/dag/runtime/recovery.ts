@@ -30,7 +30,7 @@ import type { DagStore } from "@opencode-ai/core/dag/store"
 import { isTransitionRejection } from "@opencode-ai/core/dag/core/types"
 import { reviewImplementationFingerprint } from "../review-lifecycle"
 import { resolveInputMapping } from "./eval"
-import { settleCapturedOutput } from "./capture"
+import { settleCapturedOutput, settlePlainTextOutput } from "./capture"
 import type { CapturedSettlement } from "./capture"
 import { captureOutputFileRef, ensureReportAreaGitignore } from "./output-ref"
 
@@ -47,6 +47,7 @@ export function reconcileWorkflow(
     const nodes = yield* dag.store.getNodes(dagID)
     const settle = (nodeID: string, action: Effect.Effect<void, Error>) =>
       action.pipe(
+        Effect.as(true),
         Effect.catchIf(
           isTransitionRejection,
           (error) =>
@@ -54,13 +55,17 @@ export function reconcileWorkflow(
               dagID,
               nodeID,
               error,
-            }),
+            }).pipe(Effect.as(false)),
         ),
       )
     let reconciled = 0
     let ownershipLost = 0
 
     for (const node of nodes) {
+      const attempt = {
+        replanAttempts: node.replanAttempts,
+        ...(node.childSessionId ? { childSessionID: node.childSessionId } : {}),
+      }
       // Pending/queued nodes have no live execution attempt — a queued node
       // never created its child session (P0-2: sessions materialize inside
       // the permit), so both re-enter scheduling after runtime reconstruction
@@ -91,12 +96,14 @@ export function reconcileWorkflow(
       if (!node.childSessionId) {
         // Crash landed between admission and session creation — no durable
         // outcome exists, so this is an invented failure like ownership loss.
-        ownershipLost++
-        yield* settle(
+        const settled = yield* settle(
           node.id,
-          dag.nodeFailed(dagID, node.id, "node was running but had no child session on recovery", "exec_failed"),
+          dag.nodeFailed(dagID, node.id, "node was running but had no child session on recovery", "exec_failed", attempt),
         )
-        reconciled++
+        if (settled) {
+          ownershipLost++
+          reconciled++
+        }
         continue
       }
 
@@ -110,17 +117,20 @@ export function reconcileWorkflow(
         // carrying node would bypass settleCapturedOutput and land as an
         // undefined output. Fail loudly instead of inventing a settlement.
         if (workflowConfig === null) {
-          ownershipLost++
-          yield* settle(
+          const settled = yield* settle(
             node.id,
             dag.nodeFailed(
               dagID,
               node.id,
               "child session completed but the workflow config is unparseable on recovery — cannot settle safely",
               "exec_failed",
+              attempt,
             ),
           )
-          reconciled++
+          if (settled) {
+            ownershipLost++
+            reconciled++
+          }
           continue
         }
         const nodeConfig = workflowConfig?.nodes.find((n) => n.id === node.id)
@@ -128,30 +138,30 @@ export function reconcileWorkflow(
           // Same settlement decision as spawn's completion gate — recovery
           // must not become a bypass of the review-result contract again (B1).
           const settlement = recoveredSettlement(nodeConfig, nodes, node.capturedOutput)
-          yield* settle(
+          const settled = yield* settle(
             node.id,
             settlement.kind === "complete"
-              ? dag.nodeCompleted(dagID, node.id, settlement.output)
-              : dag.nodeFailed(dagID, node.id, settlement.reason, "verdict_fail"),
+              ? dag.nodeCompleted(dagID, node.id, settlement.output, attempt)
+              : dag.nodeFailed(dagID, node.id, settlement.reason, "verdict_fail", attempt),
           )
+          if (settled) reconciled++
         } else {
-          // #345: the live path (spawn.ts) completes a schemaless node with
-          // the child's last assistant text; recovery must mirror it instead
-          // of completing with undefined — a schemaless checkpoint's string
-          // verdict (e.g. a bare {"verdict":"replan"} reply) would silently
-          // vanish after a crash otherwise: no pause, no warning, and gated
-          // dependents resolve no fields. Callers that inject no reader keep
-          // the legacy undefined settlement.
-          const rawText = lastAssistantText
-            ? (yield* lastAssistantText(node.childSessionId)) ?? ""
-            : undefined
-          // #388 parity with the live path: when the recovered reply IS one
-          // existing absolute file path, capture the same {content_ref, size,
-          // sha256, summary} receipt submit-time detection records, so live
-          // and recovered settlement produce identical durable output
-          // metadata. Best-effort like the live path — any anomaly keeps the
-          // plain inline completion and never fails the node.
-          if (rawText) {
+          const settlement = settlePlainTextOutput(
+            lastAssistantText ? yield* lastAssistantText(node.childSessionId) : undefined,
+          )
+          if (settlement.kind === "fail") {
+            if (yield* settle(
+              node.id,
+              dag.nodeFailed(dagID, node.id, settlement.reason, "verdict_fail", attempt),
+            )) reconciled++
+          } else {
+            const rawText = settlement.output
+            // #388 parity with the live path: when the recovered reply IS one
+            // existing absolute file path, capture the same {content_ref, size,
+            // sha256, summary} receipt submit-time detection records, so live
+            // and recovered settlement produce identical durable output
+            // metadata. Best-effort like the live path — any anomaly keeps the
+            // plain inline completion and never fails the node.
             const fileRef = yield* captureOutputFileRef(rawText)
             if (fileRef) {
               yield* dag.store.setCapturedOutput(node.childSessionId, fileRef).pipe(
@@ -165,18 +175,15 @@ export function reconcileWorkflow(
               )
               if (directory) yield* ensureReportAreaGitignore(directory, fileRef.path)
             }
+            if (yield* settle(node.id, dag.nodeCompleted(dagID, node.id, rawText, attempt))) reconciled++
           }
-          yield* settle(node.id, dag.nodeCompleted(dagID, node.id, rawText))
         }
-        reconciled++
       } else if (sessionStatus === "failed") {
-        yield* settle(
+        if (yield* settle(
           node.id,
-          dag.nodeFailed(dagID, node.id, "child session failed (recovered)", "exec_failed"),
-        )
-        reconciled++
+          dag.nodeFailed(dagID, node.id, "child session failed (recovered)", "exec_failed", attempt),
+        )) reconciled++
       } else {
-        ownershipLost++
         if (cancelSession) {
           yield* cancelSession(node.childSessionId).pipe(
             Effect.catchCause((cause) =>
@@ -197,7 +204,7 @@ export function reconcileWorkflow(
             // was never re-extended, and the durable escalation count proves
             // it. Failure reason records the escalation so the parent can tell
             // "ran out of time after N extensions" from "never escalated".
-            yield* settle(
+            const settled = yield* settle(
               node.id,
               dag.nodeFailed(
                 dagID,
@@ -206,22 +213,30 @@ export function reconcileWorkflow(
                   ? `timeout escalated (${node.timeoutExtensions} extension(s)) node failed on recovery`
                   : "deadline exceeded on recovery",
                 "timeout",
+                attempt,
               ),
             )
-            reconciled++
+            if (settled) {
+              ownershipLost++
+              reconciled++
+            }
             continue
           }
         }
-        yield* settle(
+        const settled = yield* settle(
           node.id,
           dag.nodeFailed(
             dagID,
             node.id,
             "execution ownership lost on recovery",
             "exec_failed",
+            attempt,
           ),
         )
-        reconciled++
+        if (settled) {
+          ownershipLost++
+          reconciled++
+        }
       }
     }
 

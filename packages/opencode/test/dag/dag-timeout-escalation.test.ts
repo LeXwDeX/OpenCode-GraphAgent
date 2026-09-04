@@ -1,8 +1,10 @@
 import { describe, expect, it } from "bun:test"
+import { eq } from "drizzle-orm"
 import { Deferred, Effect, Layer, Option, Queue } from "effect"
 import type { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Database } from "@opencode-ai/core/database/database"
 import { DagProjector } from "@opencode-ai/core/dag/projector"
+import { WorkflowTable } from "@opencode-ai/core/dag/sql"
 import { DagStore } from "@opencode-ai/core/dag/store"
 import { EventV2 } from "@opencode-ai/core/event"
 import { Project } from "@opencode-ai/core/project"
@@ -12,7 +14,7 @@ import { SessionTable } from "@opencode-ai/core/session/sql"
 import { Model } from "@opencode-ai/schema/model"
 import { Provider } from "@opencode-ai/schema/provider"
 import { Agent } from "@/agent/agent"
-import { Dag, type NodeConfig } from "@/dag/dag"
+import { Dag, type NodeConfig, parseWorkflowConfig } from "@/dag/dag"
 import { DagLoop } from "@/dag/runtime/loop"
 import { InstanceRef } from "@/effect/instance-ref"
 import { EventV2Bridge } from "@/event-v2-bridge"
@@ -203,6 +205,11 @@ function runLoopTest<A>(
   opts?: {
     readonly nodeExtendTimeout?: (dagID: string, nodeID: string, newDeadlineMs: number) => Effect.Effect<number, Error>
     readonly nodeTimeoutEscalated?: (dagID: string, nodeID: string, childSessionID: string, timeoutExtensions: number) => Effect.Effect<void, Error>
+    readonly beforeInit?: (services: {
+      readonly dag: Dag.Interface
+      readonly store: DagStore.Interface
+      readonly database: Database.Interface
+    }) => Effect.Effect<void, Error>
   },
 ) {
   return Effect.gen(function* () {
@@ -228,6 +235,7 @@ function runLoopTest<A>(
         title: "Parent",
         version: "test",
       }).run().pipe(Effect.orDie)
+      if (opts?.beforeInit) yield* opts.beforeInit({ dag, store, database })
       yield* loop.init()
       return yield* test({
         dag,
@@ -592,6 +600,89 @@ describe("DagLoop timeout escalation", () => {
           expect(wake2.text).toContain("[DAG Node Timeout]")
           yield* Deferred.succeed(wake2.release, "success")
         }),
+      ),
+    )
+  })
+
+  it("does not re-time a legacy running node when the fragment omits its inherited timeout", async () => {
+    let dagID = ""
+    let extendCalls = 0
+    await Effect.runPromise(
+      runLoopTest(
+        ({ dag, store, childPrompts, parentPrompts }) =>
+          Effect.gen(function* () {
+            const first = yield* takeWithin(childPrompts, "legacy node did not start")
+            expect(first.title).toBe("a")
+            const running = yield* pollWithTimeout(
+              store.getNode(dagID, "a").pipe(
+                Effect.map((current) =>
+                  current?.status === "running" && current.childSessionId ? current : undefined,
+                ),
+              ),
+              "legacy node did not reach running",
+            )
+            const deadlineBefore = running.deadlineMs
+
+            // Put the node at the exact adjudication boundary where a real
+            // timeout change is allowed to re-time it, then prove an omitted
+            // inherited timeout is still treated as unchanged.
+            yield* dag.nodeTimeoutEscalated(
+              dagID,
+              "a",
+              running.childSessionId!,
+              running.timeoutExtensions + 1,
+            )
+            const wake = yield* takeWithin(parentPrompts, "legacy timeout wake did not reach the parent")
+            yield* Deferred.succeed(wake.release, "success")
+            yield* pollWithTimeout(
+              store.getNode(dagID, "a").pipe(
+                Effect.map((current) =>
+                  current?.escalationPending && current.wakeReported ? current : undefined,
+                ),
+              ),
+              "legacy timeout wake was not durably delivered",
+            )
+
+            yield* dag.replan(dagID, { nodes: [node("a"), node("b")] })
+            const second = yield* takeWithin(childPrompts, "added node did not start after replan")
+            expect(second.title).toBe("b")
+            expect(extendCalls).toBe(0)
+            expect((yield* store.getNode(dagID, "a"))?.deadlineMs).toBe(deadlineBefore)
+          }),
+        {
+          nodeExtendTimeout: () =>
+            Effect.sync(() => {
+              extendCalls++
+              return 1
+            }),
+          beforeInit: ({ dag, store, database }) =>
+            Effect.gen(function* () {
+              dagID = yield* dag.create({
+                projectID: "project-1",
+                sessionID: "ses_parent",
+                title: "Inherited timeout omission",
+                config: {
+                  name: "inherited-timeout",
+                  max_concurrency: 2,
+                  node_defaults: { worker_config: { timeout_ms: 1_200 } },
+                  nodes: [node("a")],
+                },
+              })
+              const workflow =
+                (yield* store.getWorkflow(dagID))
+                ?? (yield* Effect.fail(new Error("workflow was not created")))
+              const legacy =
+                parseWorkflowConfig(workflow.config)
+                ?? (yield* Effect.fail(new Error("workflow config was not readable")))
+              delete legacy.nodes[0]?.worker_config
+              yield* database.db
+                .update(WorkflowTable)
+                .set({ config: JSON.stringify(legacy) })
+                .where(eq(WorkflowTable.id, dagID))
+                .run()
+                .pipe(Effect.orDie)
+            }),
+        },
       ),
     )
   })

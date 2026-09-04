@@ -11,6 +11,15 @@ import { Context, Effect, Layer } from "effect"
 
 export class Service extends Context.Service<Service, EventV2.Interface>()("@opencode/EventV2Bridge") {}
 
+function projectIDFromLocation(location: Location.Ref | undefined) {
+  if (!location || !("project" in location)) return undefined
+  const project = location.project
+  if (!project || typeof project !== "object" || !("id" in project) || typeof project.id !== "string") {
+    return undefined
+  }
+  return project.id
+}
+
 export const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
@@ -32,20 +41,37 @@ export const layer = Layer.effect(
         })
       })
 
+    const publishMany: EventV2.Interface["publishMany"] = (entries, options) =>
+      Effect.gen(function* () {
+        if (options?.location) return yield* events.publishMany(entries, options)
+        const ctx = yield* InstanceRef
+        if (!ctx) return yield* events.publishMany(entries, options)
+        const workspaceID = yield* WorkspaceRef
+        return yield* events.publishMany(entries, {
+          ...options,
+          location: new Location.Info({
+            directory: AbsolutePath.make(ctx.directory),
+            ...(workspaceID ? { workspaceID } : {}),
+            project: { id: Project.ID.make(ctx.project.id), directory: AbsolutePath.make(ctx.worktree) },
+          }),
+        })
+      })
+
     const unsubscribe = yield* events.listen((event) =>
       Effect.gen(function* () {
         const ctx = yield* InstanceRef
         const workspaceID = (yield* WorkspaceRef) ?? event.location?.workspaceID
+        const projectID = ctx?.project.id ?? projectIDFromLocation(event.location)
         GlobalBus.emit("event", {
           directory: event.location?.directory ?? ctx?.directory,
-          project: ctx?.project.id,
+          project: projectID,
           workspace: workspaceID,
           payload: { id: event.id, type: event.type, properties: event.data },
         })
         if (event.durable === undefined) return
         GlobalBus.emit("event", {
           directory: event.location?.directory ?? ctx?.directory,
-          project: ctx?.project.id,
+          project: projectID,
           workspace: workspaceID,
           payload: {
             type: "sync",
@@ -62,7 +88,7 @@ export const layer = Layer.effect(
     )
     yield* Effect.addFinalizer(() => unsubscribe)
 
-    return Service.of({ ...events, publish })
+    return Service.of({ ...events, publish, publishMany })
   }),
 )
 
