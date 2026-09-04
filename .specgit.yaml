@@ -1,12 +1,10 @@
 version: 1
-delivery: native-tool-settlement
+delivery: stable-release
 context:
   kind: branch
-  branch: fix/538-native-tool-settlement
+  branch: chore/543-stable-release
 issues:
-  - 538
-  - 540
+  - 543
 issueKinds:
-  - issue: 538
-    kind: kind::fix
-pr: 539
+  - issue: 543
+    kind: kind::chore
