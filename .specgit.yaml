@@ -30,3 +30,4 @@ issueKinds:
     kind: kind::fix
   - issue: 552
     kind: kind::chore
+pr: 553
