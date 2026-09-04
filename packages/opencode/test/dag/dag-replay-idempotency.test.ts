@@ -1,12 +1,14 @@
 import { describe, expect, it } from "bun:test"
-import { DateTime, Effect, Layer } from "effect"
-import { sql } from "drizzle-orm"
+import { Cause, DateTime, Effect, Exit, Layer } from "effect"
+import { eq, sql } from "drizzle-orm"
 import { Database } from "@opencode-ai/core/database/database"
 import { EventV2 } from "@opencode-ai/core/event"
 import { EventTable, EventSequenceTable } from "@opencode-ai/core/event/sql"
 import { DagProjector } from "@opencode-ai/core/dag/projector"
 import { DagStore } from "@opencode-ai/core/dag/store"
-import { DagEvent } from "@opencode-ai/schema/dag-event"
+import { DagEvent, DagID } from "@opencode-ai/schema/dag-event"
+import { ProjectID } from "@opencode-ai/schema/project-id"
+import { SessionID } from "@opencode-ai/schema/session-id"
 import { Project } from "@opencode-ai/core/project"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
 import { SessionTable } from "@opencode-ai/core/session/sql"
@@ -179,6 +181,47 @@ describe("DagProjector: replay idempotency", () => {
         expect(replayed.nodes[0]?.replanAttempts).toBe(1)
         expect(replayed.nodes[0]?.output).toBe("restarted-done")
       }).pipe(Effect.provide(projectorLayer)) as Effect.Effect<never>,
+    )
+  })
+
+  it("re-materializing a dag aggregate without its session row dies on the workflow FK (#524 zombie shape)", async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        yield* setupFKs()
+        const { db } = yield* Database.Service
+        const events = yield* EventV2.Service
+        const sessionID = SessionID.make("ses_doomed")
+
+        yield* db
+          .insert(SessionTable)
+          .values({ id: sessionID, project_id: Project.ID.global, slug: "doomed", directory: "/project", title: "doomed", version: "test" })
+          .run()
+          .pipe(Effect.orDie)
+        const dagID = DagID.make("dag_replay_zombie")
+        yield* events.publish(DagEvent.WorkflowCreated, { dagID, projectID: ProjectID.global, sessionID, title: "zombie-test", config: "{}", status: "pending", timestamp: ts(0) })
+        yield* events.publish(DagEvent.WorkflowCompleted, { dagID, durationMs: 0, timestamp: ts(1) })
+
+        const serialized = yield* serializeAndWipe(dagID)
+        yield* db.delete(SessionTable).where(eq(SessionTable.id, sessionID)).run().pipe(Effect.orDie)
+
+        // Crash/in-flight zombie shape (#524): the aggregate's session row is
+        // gone, so the WorkflowCreated read-model INSERT dies on the
+        // workflow.session_id FK — a wiped dag aggregate whose session was
+        // removed can never be re-materialized. This is why Session.remove
+        // scrubs the dag event aggregates instead of relying on replay.
+        const exit = yield* events.replayAll(serialized).pipe(Effect.exit)
+        expect(Exit.isFailure(exit)).toBe(true)
+        if (Exit.isFailure(exit)) expect(Cause.pretty(exit.cause)).toContain("FOREIGN KEY constraint failed")
+
+        // The FK death aborts the replay transaction — no partial-commit garbage.
+        const residue = yield* db
+          .select({ id: EventTable.id })
+          .from(EventTable)
+          .where(eq(EventTable.aggregate_id, dagID))
+          .all()
+          .pipe(Effect.orDie)
+        expect(residue).toEqual([])
+      }).pipe(Effect.provide(projectorLayer)),
     )
   })
 })

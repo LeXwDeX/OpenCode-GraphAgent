@@ -217,7 +217,12 @@ export const layer = Layer.effect(
         remaining.push(pkg)
       }
 
-      if (remaining.length !== requested.length) {
+      // Only a mixed batch (part of the deps pinned locally/bundled, part still
+      // going to the registry) needs the lock dropped so the registry deps are
+      // re-resolved. An all-local/all-bundled batch must leave a valid lock
+      // untouched, or every startup deletes and rebuilds it; an all-registry
+      // batch never deleted it either.
+      if (remaining.length > 0 && remaining.length < requested.length) {
         yield* fs.remove(path.join(dir, "package-lock.json")).pipe(Effect.orElseSucceed(() => undefined))
       }
 

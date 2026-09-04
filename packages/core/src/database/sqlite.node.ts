@@ -156,10 +156,39 @@ const nativeLayer = (config: Config) =>
         open: true,
       })
       yield* Effect.addFinalizer(() => Effect.sync(() => native.close()))
+      // #524: auto_vacuum must be set BEFORE any WAL initialization — after
+      // WAL init the pragma silently yields NONE even on an empty database.
+      // On an existing non-empty database the pragma is a SQLite no-op, so
+      // legacy NONE databases are never converted here (startup stays
+      // detect-only; the explicit conversion lives in ./vacuum).
+      native.exec("PRAGMA busy_timeout = 5000;")
+      if (config.readonly !== true) setAutoVacuumFull(native)
       if (config.disableWAL !== true && config.readonly !== true) native.exec("PRAGMA journal_mode = WAL;")
       return native
     }),
   )
+
+/**
+ * Setting auto_vacuum needs the write lock of a read-header-then-write
+ * upgrade, which SQLite fails with an immediate SQLITE_BUSY the busy handler
+ * cannot retry — a second opener racing the first one's initialization on the
+ * same new file hits it. Skipping on BUSY is safe: auto_vacuum is a
+ * persistent header property and every opener runs this pragma BEFORE any
+ * WAL/migration write, so whichever connection wins the first-write race sets
+ * FULL for the database.
+ */
+function setAutoVacuumFull(native: DatabaseSync) {
+  const page: unknown = native.prepare("PRAGMA page_count").get()
+  const pageCount = typeof page === "object" && page !== null && "page_count" in page ? page.page_count : undefined
+  if (typeof pageCount !== "number" || pageCount !== 0) return
+  try {
+    native.exec("PRAGMA auto_vacuum = FULL;")
+  } catch (cause) {
+    if (!isSqliteBusy(cause)) throw cause
+  }
+}
+
+const isSqliteBusy = (cause: unknown) => cause instanceof Error && /SQLITE_BUSY|database is locked/i.test(cause.message)
 
 const sqliteLayer = (config: Config) => Layer.effect(Client.SqlClient, make(config))
 
