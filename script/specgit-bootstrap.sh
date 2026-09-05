@@ -1,9 +1,9 @@
 #!/bin/sh
 # specgit-bootstrap — repository-local fail-safe wrapper around `specgit issue` (#521).
 #
-# Why: `specgit issue` (1.10.1) runs an unconditional harness-currency gate that
+# Why: `specgit issue` (1.13.1) runs an unconditional harness-currency gate that
 # exits 2 (`harness_stale`) unless the managed harness was refreshed by
-# `specgit init --force`. But `init --force` overwrites this repository's six
+# `specgit init --force`. But `init --force` overwrites this repository's
 # hand-applied specializations (see AGENTS.md, "SpecGit harness local
 # specializations"). This wrapper makes the refresh safe:
 #
@@ -41,19 +41,27 @@
 #
 # Usage: script/specgit-bootstrap.sh <specgit issue args...>
 #
-# Write surface below mirrors specgit 1.10.1 harness-placement; it is
+# Write surface below mirrors specgit 1.13.1 init reconciliation; it is
 # version-coupled to the pinned CLI in .github/workflows/specgit-accept.yml.
+# Generated command and portable-skill entry points belong to `specgit setup`,
+# which this wrapper does not invoke.
 
 set -u
 
 SURFACE='
 .github/workflows/specgit-accept.yml
+.github/workflows/specgit-complete.yml
+.gitlab-ci.yml
+.gitlab/specgit-business.yml
+.gitlab/specgit-complete.yml
+.gitignore
 AGENTS.md
 CLAUDE.md
 .opencode/hooks.json
 .opencode/hooks/specgit-merge-guard.sh
 .git/hooks/pre-push
 .husky/_/pre-push
+spec_git/policy.yaml
 '
 
 say() {
@@ -104,12 +112,12 @@ pf_hint() {
   say "edit the title type to an allowed one, then re-run (no type mapping is performed)"
 }
 
-# Scans the wrapped argv left to right, mirroring the specgit 1.10.1 option
-# grammar: --delivery/--tags consume one value each, --name= carries it
-# inline, -- ends options, and -h/--help is answered by the CLI without
-# operand validation. Positional operands are issue numbers (pure digits -
-# the reuse path, "007" -> 7) or titles that must start with
-# '<allowed type>: '. The first violation exits 2.
+# Scans the wrapped argv left to right, mirroring the specgit 1.13.1 option
+# grammar: --delivery/--tags/--body-file/--pr-body-file consume one value
+# each, --name= carries it inline, -- ends options, and -h/--help is answered
+# by the CLI without operand validation. Positional operands are issue
+# numbers (pure digits - the reuse path, "007" -> 7) or titles that must
+# start with '<allowed type>: '. The first violation exits 2.
 pf_check_issue_titles() {
   pf_seen_dd=0
   pf_swallow=0
@@ -124,11 +132,11 @@ pf_check_issue_titles() {
           pf_seen_dd=1
           continue
           ;;
-        --delivery|--tags)
+        --delivery|--tags|--body-file|--pr-body-file)
           pf_swallow=1
           continue
           ;;
-        --delivery=*|--tags=*)
+        --delivery=*|--tags=*|--body-file=*|--pr-body-file=*)
           continue
           ;;
         -h|--help)

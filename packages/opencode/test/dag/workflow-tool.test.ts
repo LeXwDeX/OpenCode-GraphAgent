@@ -202,6 +202,18 @@ const mockNodes = (id: string) =>
         ]
       : []
 
+const mockWorkflowConfig = (id: string) => JSON.stringify({
+  name: id,
+  nodes: mockNodes(id).map((node) => ({
+    id: node.id,
+    name: node.name,
+    worker_type: node.workerType,
+    depends_on: node.dependsOn,
+    required: node.required,
+    prompt_template: { inline: node.name },
+  })),
+})
+
 const store = Layer.mock(DagStore.Service, {
   getWorkflow: (id: string) =>
     Effect.succeed(
@@ -213,7 +225,7 @@ const store = Layer.mock(DagStore.Service, {
             title: "Status workflow",
             directory: null,
             status: "running",
-            config: "{}",
+            config: mockWorkflowConfig(id),
             seq: 1,
             wakeReported: false,
             graphRev: 1,
@@ -230,7 +242,7 @@ const store = Layer.mock(DagStore.Service, {
               title: "Result workflow",
             directory: null,
               status: "completed",
-              config: "{}",
+              config: mockWorkflowConfig(id),
               seq: 1,
               wakeReported: true,
               graphRev: 1,
@@ -247,7 +259,7 @@ const store = Layer.mock(DagStore.Service, {
                 title: "Control workflow",
             directory: null,
                 status: id === "dag_paused" ? "paused" : "running",
-                config: "{}",
+                config: mockWorkflowConfig(id),
                 seq: 1,
                 wakeReported: false,
                 graphRev: 1,
@@ -323,6 +335,10 @@ const store = Layer.mock(DagStore.Service, {
     Effect.succeed(resultNodes.find((node) => node.workflowId === workflowID && node.id === nodeID)),
 })
 const events = Layer.mock(EventV2Bridge.Service, {
+  publishMany: (entries) => Effect.sync(() => {
+    for (const entry of entries) published.push({ type: entry.definition.type, data: entry.data })
+    return []
+  }),
   publish: (definition, data) =>
     Effect.sync(() => {
       published.push({ type: definition.type, data })

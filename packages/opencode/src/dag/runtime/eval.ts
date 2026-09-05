@@ -12,8 +12,6 @@
  * by the scheduling layer.
  */
 
-import type { DagStore } from "@opencode-ai/core/dag/store"
-
 const CONDITION_RE = /^(.+?)\s*(==|!=|>=|<=|>|<)\s*(.+)$/
 
 /**
@@ -91,7 +89,66 @@ export function conditionReference(condition: string | undefined): string | null
   if (!condition || condition.trim() === "") return null
   const match = condition.match(CONDITION_RE)
   if (!match) return null
-  return match[1]!.trim().split(".")[0] || null
+  return match[1].trim().split(".")[0] || null
+}
+
+export type InputMappingReference = {
+  nodeID: string
+  path: string[]
+}
+
+/** Parse the documented input_mapping source forms without inventing any
+ * scheduling semantics: `node-id`, `node-id.output`, or a dotted path below
+ * `node-id.output`. */
+export function parseInputMappingReference(
+  source: string,
+): ({ ok: true } & InputMappingReference) | { ok: false; error: string } {
+  if (source.length === 0) return { ok: false, error: "source is empty" }
+  const parts = source.split(".")
+  const nodeID = parts.shift()!
+  if (!nodeID) return { ok: false, error: "source node id is empty" }
+  if (parts.length === 0) return { ok: true, nodeID, path: [] }
+  if (parts.shift() !== "output") return { ok: false, error: 'the first path segment must be "output"' }
+  if (parts.some((part) => part.length === 0)) return { ok: false, error: "output path contains an empty segment" }
+  return { ok: true, nodeID, path: parts }
+}
+
+export type InputMappingOutput = { found: true; output: unknown } | { found: false }
+
+/** Strict execution-boundary resolution. Structural validation guarantees
+ * ordering for new graphs; this result also protects resumed historical
+ * configs and catches a declared field that is absent from durable output. */
+export function resolveInputMappingChecked(
+  mapping: Record<string, string> | undefined,
+  getOutput: (nodeID: string) => InputMappingOutput,
+): { ok: true; value: Record<string, unknown> } | { ok: false; error: string } {
+  if (!mapping) return { ok: true, value: {} }
+  const value: Record<string, unknown> = {}
+  for (const [variable, source] of Object.entries(mapping)) {
+    const parsed = parseInputMappingReference(source)
+    if (!parsed.ok) {
+      return {
+        ok: false,
+        error: `input_mapping variable "${variable}" has invalid source "${source}": ${parsed.error}`,
+      }
+    }
+    const resolved = getOutput(parsed.nodeID)
+    if (!resolved.found) {
+      return {
+        ok: false,
+        error: `input_mapping variable "${variable}" source "${source}" has no durable output for node "${parsed.nodeID}"`,
+      }
+    }
+    const output = resolveMappedOutput(resolved.output, parsed.path)
+    if (output === undefined) {
+      return {
+        ok: false,
+        error: `input_mapping variable "${variable}" source "${source}" resolved to undefined`,
+      }
+    }
+    value[variable] = output
+  }
+  return { ok: true, value }
 }
 
 /**
@@ -115,20 +172,31 @@ export function resolveInputMapping(
   if (!mapping) return {}
   const result: Record<string, unknown> = {}
   for (const [varName, ref] of Object.entries(mapping)) {
-    // ref format: "nodeID" or "nodeID.output" or "nodeID.output.field"
-    const parts = ref.split(".")
-    const nodeID = parts[0]!
-    const base = getOutput(nodeID)
-    if (parts.length === 1) {
-      result[varName] = base
-    } else {
-      result[varName] = resolvePath(parts.slice(1).join("."), { output: base })
+    const parsed = parseInputMappingReference(ref)
+    if (!parsed.ok) {
+      result[varName] = undefined
+      continue
     }
+    const base = getOutput(parsed.nodeID)
+    result[varName] = resolveMappedOutput(base, parsed.path)
   }
   return result
 }
 
 // --------------------------------------------------------------------------
+
+function resolveMappedOutput(output: unknown, path: readonly string[]): unknown {
+  let current = output
+  for (const part of path) {
+    if (current == null) return undefined
+    current = readProperty(current, part)
+  }
+  return current
+}
+
+function readProperty(value: unknown, key: string): unknown {
+  return Reflect.get(Object(value), key)
+}
 
 function resolvePath(path: string, source: Record<string, unknown>): unknown {
   const parts = path.split(".")
@@ -142,7 +210,7 @@ function resolvePath(path: string, source: Record<string, unknown>): unknown {
 
   for (const part of parts) {
     if (current == null) return undefined
-    current = (current as Record<string, unknown>)[part]
+    current = readProperty(current, part)
   }
   return current
 }

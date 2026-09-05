@@ -31,10 +31,18 @@ fi
 
 SURFACE_FILES=(
   .github/workflows/specgit-accept.yml
+  .github/workflows/specgit-complete.yml
+  .gitlab-ci.yml
+  .gitlab/specgit-business.yml
+  .gitlab/specgit-complete.yml
+  .gitignore
   AGENTS.md
+  CLAUDE.md
   .opencode/hooks.json
   .opencode/hooks/specgit-merge-guard.sh
   .git/hooks/pre-push
+  .husky/_/pre-push
+  spec_git/policy.yaml
 )
 
 ok() { PASS=$((PASS + 1)); printf 'ok   - %s\n' "$1"; }
@@ -61,11 +69,12 @@ assert_rc() { # <expected> <actual> <label>
 
 new_fixture() { # <name> [no-binding]
   local fx="$WORK/$1"
-  mkdir -p "$fx/.github/workflows" "$fx/.opencode/hooks" "$fx/spec_git" "$fx/.git/hooks"
+  mkdir -p "$fx/.github/workflows" "$fx/.gitlab" "$fx/.opencode/hooks" "$fx/spec_git" "$fx/.git/hooks" "$fx/.husky/_"
   git -C "$fx" -c init.defaultBranch=main init -q
   git -C "$fx" config user.email test@example.invalid
   git -C "$fx" config user.name test
   printf 'version: 1\nkind: probe\n' > "$fx/spec_git/policy.yaml"
+  printf '# fixture ignore rules\n' > "$fx/.gitignore"
   # pr: 535 mirrors a bound repo mid-delivery (resume): default-mode inner
   # successes carry a verifiable PR through #528 verification via the gh stub.
   printf 'version: 1\nbranch: feat/probe\nissues: []\npr: 535\n' > "$fx/.specgit.yaml"
@@ -74,10 +83,16 @@ new_fixture() { # <name> [no-binding]
 spec-a: drop-dispatch
 spec-b: global-install
 YAML
+  printf '# Managed by SpecGit: trusted delivery completion.\n' > "$fx/.github/workflows/specgit-complete.yml"
+  printf '# Managed by SpecGit: isolated GitLab routing.\n' > "$fx/.gitlab-ci.yml"
+  printf '# fixture GitLab business workflow\n' > "$fx/.gitlab/specgit-business.yml"
+  printf '# Managed by SpecGit: include in a trusted default-branch pipeline.\n' > "$fx/.gitlab/specgit-complete.yml"
   printf '# fixture agents\n' > "$fx/AGENTS.md"
+  printf '# fixture claude instructions\n' > "$fx/CLAUDE.md"
   printf '{\n  "hooks": []\n}\n' > "$fx/.opencode/hooks.json"
   printf '#!/bin/sh\nexit 0\n' > "$fx/.opencode/hooks/specgit-merge-guard.sh"
   printf '#!/bin/sh\nexit 0\n' > "$fx/.git/hooks/pre-push"
+  printf '#!/bin/sh\nexit 0\n' > "$fx/.husky/_/pre-push"
   git -C "$fx" add -A
   git -C "$fx" commit -qm "fixture $1"
   if [ "${2:-}" = "no-binding" ]; then
@@ -104,14 +119,48 @@ cmd="${1:-}"
 case "$cmd" in
   init)
     printf 'specgit init: refreshing harness files\n'
-    printf '\n# canonical harness refresh (stub init)\n' >> .github/workflows/specgit-accept.yml
+    while IFS= read -r path; do
+      [ -n "$path" ] || continue
+      printf '\n# canonical harness refresh (stub init)\n' >> "$path"
+    done <<'SURFACE'
+.github/workflows/specgit-accept.yml
+.github/workflows/specgit-complete.yml
+.gitlab-ci.yml
+.gitlab/specgit-business.yml
+.gitlab/specgit-complete.yml
+.gitignore
+AGENTS.md
+CLAUDE.md
+.opencode/hooks.json
+.opencode/hooks/specgit-merge-guard.sh
+.git/hooks/pre-push
+.husky/_/pre-push
+spec_git/policy.yaml
+SURFACE
     exit "${STUB_INIT_EXIT:-0}"
     ;;
   issue)
-    grep -q 'canonical harness refresh' .github/workflows/specgit-accept.yml || {
-      printf 'stub: refreshed harness bytes were not visible to the inner CLI\n' >&2
-      exit 99
-    }
+    while IFS= read -r path; do
+      [ -n "$path" ] || continue
+      grep -q 'canonical harness refresh' "$path" || {
+        printf 'stub: refreshed harness bytes were not visible in %s\n' "$path" >&2
+        exit 99
+      }
+    done <<'SURFACE'
+.github/workflows/specgit-accept.yml
+.github/workflows/specgit-complete.yml
+.gitlab-ci.yml
+.gitlab/specgit-business.yml
+.gitlab/specgit-complete.yml
+.gitignore
+AGENTS.md
+CLAUDE.md
+.opencode/hooks.json
+.opencode/hooks/specgit-merge-guard.sh
+.git/hooks/pre-push
+.husky/_/pre-push
+spec_git/policy.yaml
+SURFACE
     case "${STUB_ISSUE_MODE:-exit}" in
       exit)
         [ "${1:-}" = "--json" ] && printf '{"stub":"issue"}\n'
@@ -638,6 +687,45 @@ run_wrapper c39 --tags=feat,fix --delivery=add-login "docs: x"
 rc=$?
 assert_rc 0 "$rc" && ok "c39: inline --tags= forms pass preflight" || bad "c39: exit $rc, want 0"
 assert_argv c39
+
+# ---- case 55 (#552): 1.13.1 body-file values are never parsed as titles -----
+new_fixture c55
+make_stub c55
+surface_digests "$WORK/c55" > "$WORK/c55.baseline"
+cp "$WORK/c55/.gitignore" "$WORK/c55.ignore-baseline"
+cp "$WORK/c55/spec_git/policy.yaml" "$WORK/c55.policy-baseline"
+want_argv "$WORK/c55.wantargv" --json --body-file "ci: first issue body.md" "fix: first" \
+  --body-file="perf: second issue body.md" "docs: second" \
+  --pr-body-file "dogfood: pull request body.md" --delivery=body-files
+run_wrapper c55 --json --body-file "ci: first issue body.md" "fix: first" \
+  --body-file="perf: second issue body.md" "docs: second" \
+  --pr-body-file "dogfood: pull request body.md" --delivery=body-files
+rc=$?
+assert_rc 0 "$rc" && ok "c55: 1.13.1 body-file options pass preflight" || bad "c55: exit $rc, want 0"
+assert_argv c55
+assert_surface_restored "$WORK/c55" "$WORK/c55.baseline" \
+  && ok "c55: full 1.13.1 init surface restored" \
+  || bad "c55: init surface bytes differ"
+cmp -s "$WORK/c55/.gitignore" "$WORK/c55.ignore-baseline" \
+  && cmp -s "$WORK/c55/spec_git/policy.yaml" "$WORK/c55.policy-baseline" \
+  && ok "c55: .gitignore and policy restored byte-exactly" \
+  || bad "c55: .gitignore or policy bytes differ"
+assert_clean "$WORK/c55" && ok "c55: fixture clean" || bad "c55: fixture dirty"
+
+# ---- case 56 (#552): newly covered init assets participate in dirty guard ---
+new_fixture c56
+make_stub c56
+printf '# dirty ignore rule\n' >> "$WORK/c56/.gitignore"
+printf '# dirty policy note\n' >> "$WORK/c56/spec_git/policy.yaml"
+run_wrapper c56 "fix: probe"
+rc=$?
+assert_rc 2 "$rc" && ok "c56: dirty new init assets exit 2" || bad "c56: exit $rc, want 2"
+[ ! -s "$WORK/stubs/c56/log" ] \
+  && ok "c56: dirty guard makes zero stub calls" \
+  || bad "c56: stub was called: $(tr '\n' '|' < "$WORK/stubs/c56/log")"
+grep -q '\.gitignore' "$WORK/c56.err" && grep -q 'spec_git/policy.yaml' "$WORK/c56.err" \
+  && ok "c56: dirty diagnostic names both new init assets" \
+  || bad "c56: dirty diagnostic omitted a new init asset: $(tr '\n' '|' < "$WORK/c56.err")"
 
 # ---- case 40 (#529): operands after -- are still validated but pass ---------
 new_fixture c40

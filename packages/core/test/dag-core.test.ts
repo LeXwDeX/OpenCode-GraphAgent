@@ -7,9 +7,11 @@ import {
   getValidNextNodeStatuses,
   getValidNextWorkflowStatuses,
   InvalidTransitionError,
+  isTransitionRejection,
   isNodeTerminalStatus,
   isWorkflowTerminalStatus,
   NodeStatus,
+  StaleNodeAttemptError,
   TerminalViolationError,
   WorkflowStatus,
 } from "@opencode-ai/core/dag/core/types"
@@ -209,6 +211,20 @@ describe("iron laws (transition tables)", () => {
     expect(() => assertValidNodeTransition("n1", NodeStatus.PENDING, NodeStatus.COMPLETED)).toThrow(
       InvalidTransitionError,
     )
+  })
+
+  it("classifies stale execution attempts as concurrent transition rejections", () => {
+    const error = new StaleNodeAttemptError(
+      "n1",
+      { replanAttempts: 0, nodeSeq: 4, childSessionID: "ses_old", graphRev: 2 },
+      { replanAttempts: 1, nodeSeq: 9, childSessionID: "ses_new", graphRev: 3 },
+    )
+    expect(isTransitionRejection(error)).toBe(true)
+    expect(error.context).toEqual({
+      nodeId: "n1",
+      expected: { replanAttempts: 0, nodeSeq: 4, childSessionID: "ses_old", graphRev: 2 },
+      actual: { replanAttempts: 1, nodeSeq: 9, childSessionID: "ses_new", graphRev: 3 },
+    })
   })
 
   it("assertValidWorkflowTransition allows PAUSED → RUNNING (resume)", () => {

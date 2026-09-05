@@ -66,14 +66,22 @@ function makeDagLayer(
 
 describe("reconcileWorkflow", () => {
   it("publishes NodeCompleted for running node with completed child session", async () => {
-    const events: { type: string; nodeID: string }[] = []
+    const events: TrackedEvent[] = []
     const nodes = [makeNodeRow({ id: "n1", status: "running", childSessionId: "ses_1" })]
     const dagLayer = makeDagLayer(nodes, events)
     const checkStatus = () => Effect.succeed("completed" as const)
 
-    await Effect.runPromise(reconcileWorkflow("wf-1", checkStatus).pipe(Effect.provide(dagLayer)))
+    await Effect.runPromise(
+      reconcileWorkflow(
+        "wf-1",
+        checkStatus,
+        undefined,
+        { nodes: [{ id: "n1" }] },
+        () => Effect.succeed("recovered output"),
+      ).pipe(Effect.provide(dagLayer)),
+    )
 
-    expect(events).toContainEqual({ type: "nodeCompleted", nodeID: "n1" })
+    expect(events).toContainEqual({ type: "nodeCompleted", nodeID: "n1", output: "recovered output" })
     expect(events).not.toContainEqual({ type: "nodeFailed", nodeID: "n1" })
   })
 
@@ -360,7 +368,13 @@ describe("reconcileWorkflow", () => {
     const checkStatus = () => Effect.succeed("completed" as const)
 
     const exit = await Effect.runPromiseExit(
-      reconcileWorkflow("wf-1", checkStatus).pipe(Effect.provide(dagLayer)),
+      reconcileWorkflow(
+        "wf-1",
+        checkStatus,
+        undefined,
+        { nodes: [{ id: "n1" }] },
+        () => Effect.succeed("recovered output"),
+      ).pipe(Effect.provide(dagLayer)),
     )
 
     expect(Exit.isSuccess(exit)).toBe(true)
@@ -377,7 +391,13 @@ describe("reconcileWorkflow", () => {
     const checkStatus = () => Effect.succeed("completed" as const)
 
     const exit = await Effect.runPromiseExit(
-      reconcileWorkflow("wf-1", checkStatus).pipe(Effect.provide(dagLayer)),
+      reconcileWorkflow(
+        "wf-1",
+        checkStatus,
+        undefined,
+        { nodes: [{ id: "n1" }] },
+        () => Effect.succeed("recovered output"),
+      ).pipe(Effect.provide(dagLayer)),
     )
 
     expect(Exit.isFailure(exit)).toBe(true)
@@ -481,7 +501,7 @@ describe("rehydration via toSchedulingNodes", () => {
     expect(events).not.toContainEqual({ type: "nodeFailed", nodeID: "cp" })
   })
 
-  it("floors a missing text part to the live path's empty string, not undefined", async () => {
+  it("fails a completed schemaless node whose text part is missing", async () => {
     const events: TrackedEvent[] = []
     const nodes = [makeNodeRow({ id: "n1", status: "running", childSessionId: "ses_1" })]
     const dagLayer = makeDagLayer(nodes, events)
@@ -493,7 +513,13 @@ describe("rehydration via toSchedulingNodes", () => {
       ),
     )
 
-    expect(events).toContainEqual({ type: "nodeCompleted", nodeID: "n1", output: "" })
+    expect(events).toContainEqual({
+      type: "nodeFailed",
+      nodeID: "n1",
+      reason: "provider returned empty output",
+      trigger: "verdict_fail",
+    })
+    expect(events).not.toContainEqual(expect.objectContaining({ type: "nodeCompleted", nodeID: "n1" }))
   })
 
   // #345 degenerate branch: an unparseable workflow row (explicit null) must
@@ -521,8 +547,7 @@ describe("rehydration via toSchedulingNodes", () => {
     expect(result.ownershipLost).toBe(1)
   })
 
-  // Legacy callers that inject no reader keep the undefined settlement.
-  it("keeps the legacy undefined settlement when no text reader is injected", async () => {
+  it("fails safely when a completed schemaless node has no text reader", async () => {
     const events: TrackedEvent[] = []
     const nodes = [makeNodeRow({ id: "n1", status: "running", childSessionId: "ses_1" })]
     const dagLayer = makeDagLayer(nodes, events)
@@ -532,7 +557,13 @@ describe("rehydration via toSchedulingNodes", () => {
       reconcileWorkflow("wf-1", checkStatus, undefined, { nodes: [{ id: "n1" }] }).pipe(Effect.provide(dagLayer)),
     )
 
-    expect(events).toContainEqual({ type: "nodeCompleted", nodeID: "n1" })
+    expect(events).toContainEqual({
+      type: "nodeFailed",
+      nodeID: "n1",
+      reason: "provider returned empty output",
+      trigger: "verdict_fail",
+    })
+    expect(events).not.toContainEqual(expect.objectContaining({ type: "nodeCompleted", nodeID: "n1" }))
   })
 })
 

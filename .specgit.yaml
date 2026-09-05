@@ -1,11 +1,12 @@
 version: 1
-delivery: stable-release
+delivery: dag-release
 context:
   kind: branch
-  branch: chore/543-stable-release
+  branch: chore/554-dag-release
 issues:
-  - 543
+  - 554
+  - 556
 issueKinds:
-  - issue: 543
+  - issue: 554
     kind: kind::chore
-pr: 544
+pr: 555

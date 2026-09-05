@@ -7,9 +7,18 @@ import { EventV2 } from "@opencode-ai/core/event"
 import { Location } from "@opencode-ai/core/location"
 import { Project } from "@opencode-ai/core/project"
 import { AbsolutePath } from "@opencode-ai/core/schema"
-import { Context, Effect, Layer } from "effect"
+import { Cause, Context, Effect, Layer, Stream } from "effect"
 
 export class Service extends Context.Service<Service, EventV2.Interface>()("@opencode/EventV2Bridge") {}
+
+function projectIDFromLocation(location: Location.Ref | undefined) {
+  if (!location || !("project" in location)) return undefined
+  const project = location.project
+  if (!project || typeof project !== "object" || !("id" in project) || typeof project.id !== "string") {
+    return undefined
+  }
+  return project.id
+}
 
 export const layer = Layer.effect(
   Service,
@@ -32,20 +41,37 @@ export const layer = Layer.effect(
         })
       })
 
-    const unsubscribe = yield* events.listen((event) =>
+    const publishMany: EventV2.Interface["publishMany"] = (entries, options) =>
       Effect.gen(function* () {
+        if (options?.location) return yield* events.publishMany(entries, options)
+        const ctx = yield* InstanceRef
+        if (!ctx) return yield* events.publishMany(entries, options)
+        const workspaceID = yield* WorkspaceRef
+        return yield* events.publishMany(entries, {
+          ...options,
+          location: new Location.Info({
+            directory: AbsolutePath.make(ctx.directory),
+            ...(workspaceID ? { workspaceID } : {}),
+            project: { id: Project.ID.make(ctx.project.id), directory: AbsolutePath.make(ctx.worktree) },
+          }),
+        })
+      })
+
+    const forward = Effect.fnUntraced(
+      function* (event: EventV2.Payload) {
         const ctx = yield* InstanceRef
         const workspaceID = (yield* WorkspaceRef) ?? event.location?.workspaceID
+        const projectID = ctx?.project.id ?? projectIDFromLocation(event.location)
         GlobalBus.emit("event", {
           directory: event.location?.directory ?? ctx?.directory,
-          project: ctx?.project.id,
+          project: projectID,
           workspace: workspaceID,
           payload: { id: event.id, type: event.type, properties: event.data },
         })
         if (event.durable === undefined) return
         GlobalBus.emit("event", {
           directory: event.location?.directory ?? ctx?.directory,
-          project: ctx?.project.id,
+          project: projectID,
           workspace: workspaceID,
           payload: {
             type: "sync",
@@ -58,11 +84,20 @@ export const layer = Layer.effect(
             },
           },
         })
-      }),
+      },
+      (effect, event) =>
+        Effect.catchCauseIf(
+          effect,
+          (cause) => !Cause.hasInterrupts(cause),
+          (cause) => Effect.logError("EventV2 bridge forwarding failed", { eventID: event.id, cause }),
+        ),
     )
-    yield* Effect.addFinalizer(() => unsubscribe)
 
-    return Service.of({ ...events, publish })
+    // startImmediately runs the stream through its PubSub subscription before
+    // the layer is acquired, so the first publish cannot race bridge startup.
+    yield* events.all().pipe(Stream.runForEach(forward), Effect.forkScoped({ startImmediately: true }))
+
+    return Service.of({ ...events, publish, publishMany })
   }),
 )
 

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test"
-import { Deferred, Effect, Layer, Option, Queue } from "effect"
+import { Cause, Deferred, Effect, Layer, Option, Queue, Stream } from "effect"
 import type { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Database } from "@opencode-ai/core/database/database"
 import { DagProjector } from "@opencode-ai/core/dag/projector"
@@ -7,8 +7,9 @@ import { DagStore } from "@opencode-ai/core/dag/store"
 import { EventV2 } from "@opencode-ai/core/event"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
 import { SessionTable } from "@opencode-ai/core/session/sql"
+import { DagEvent } from "@opencode-ai/schema/dag-event"
 import { Agent } from "@/agent/agent"
-import { Dag, type NodeConfig } from "@/dag/dag"
+import { Dag, type NodeConfig, type NodeExecutionAttempt } from "@/dag/dag"
 import { DagLoop } from "@/dag/runtime/loop"
 import { InstanceRef } from "@/effect/instance-ref"
 import { EventV2Bridge } from "@/event-v2-bridge"
@@ -21,11 +22,22 @@ import { withIdleAdmission } from "../lib/session-prompt"
 
 interface PromptGate {
   readonly title: string
+  readonly text: string
   readonly release: Deferred.Deferred<string>
 }
 
 interface ParentPromptGate {
   readonly release: Deferred.Deferred<"success" | "failure">
+}
+
+interface AttemptSettlement {
+  readonly kind: "completed" | "failed"
+  readonly attempt?: NodeExecutionAttempt
+}
+
+interface AdmissionAttempt {
+  readonly nodeID: string
+  readonly attempt?: NodeExecutionAttempt
 }
 
 function takeWithin<A>(queue: Queue.Queue<A>, message: string) {
@@ -36,6 +48,10 @@ function takeWithin<A>(queue: Queue.Queue<A>, message: string) {
       onSome: Effect.succeed,
     })),
   )
+}
+
+function requireValue<A>(value: A | null | undefined, message: string): Effect.Effect<A> {
+  return value == null ? Effect.die(new Error(message)) : Effect.succeed(value)
 }
 
 function reply(sessionID: string, text: string): SessionV1.WithParts {
@@ -75,20 +91,61 @@ function node(id: string, dependsOn: string[] = [], timeoutMs?: number): NodeCon
 function loopLayer(input: {
   readonly childPrompts: Queue.Queue<PromptGate>
   readonly parentPrompts: Queue.Queue<ParentPromptGate>
+  readonly settlements: Queue.Queue<AttemptSettlement>
+  readonly admissions: Queue.Queue<AdmissionAttempt>
+  readonly holdReplan?: Deferred.Deferred<void>
 }) {
   const database = Database.layerFromPath(":memory:")
   const events = EventV2.layer.pipe(Layer.provide(database))
-  const bridge = EventV2Bridge.layer.pipe(Layer.provide(events))
+  const rawBridge = EventV2Bridge.layer.pipe(Layer.provide(events))
+  const bridge = Layer.effect(
+    EventV2Bridge.Service,
+    Effect.gen(function* () {
+      const original = yield* EventV2Bridge.Service
+      return EventV2Bridge.Service.of({
+        ...original,
+        subscribe: (definition) =>
+          original.subscribe(definition).pipe(
+            Stream.tap(() =>
+              definition.type === DagEvent.WorkflowReplanned.type && input.holdReplan
+                ? Deferred.await(input.holdReplan)
+                : Effect.void,
+            ),
+          ),
+      })
+    }),
+  ).pipe(Layer.provide(rawBridge))
   const store = DagStore.layer.pipe(Layer.provide(database))
   const status = SessionStatus.layer.pipe(Layer.provide(bridge))
   const projector = DagProjector.layer.pipe(
     Layer.provide(events),
     Layer.provide(database),
   )
-  const dag = Dag.layer.pipe(
+  const rawDag = Dag.layer.pipe(
     Layer.provide(bridge),
     Layer.provide(store),
   )
+  const dag = Layer.effect(
+    Dag.Service,
+    Effect.gen(function* () {
+      const original = yield* Dag.Service
+      return Dag.Service.of({
+        ...original,
+        nodeQueued: (dagID, nodeID, deadlineMs, attempt) =>
+          original.nodeQueued(dagID, nodeID, deadlineMs, attempt).pipe(
+            Effect.ensuring(Queue.offer(input.admissions, { nodeID, attempt })),
+          ),
+        nodeCompleted: (dagID, nodeID, output, attempt) =>
+          original.nodeCompleted(dagID, nodeID, output, attempt).pipe(
+            Effect.ensuring(Queue.offer(input.settlements, { kind: "completed", attempt })),
+          ),
+        nodeFailed: (dagID, nodeID, reason, trigger, attempt) =>
+          original.nodeFailed(dagID, nodeID, reason, trigger, attempt).pipe(
+            Effect.ensuring(Queue.offer(input.settlements, { kind: "failed", attempt })),
+          ),
+      })
+    }),
+  ).pipe(Layer.provide(rawDag))
   const base = Layer.mergeAll(database, events, bridge, store, projector, dag, status)
   const childTitles = new Map<string, string>()
   const created: string[] = []
@@ -115,6 +172,7 @@ function loopLayer(input: {
     const release = yield* Deferred.make<string>()
     yield* Queue.offer(input.childPrompts, {
       title: childTitles.get(sessionID) ?? sessionID,
+      text: value.parts.find((part) => part.type === "text")?.text ?? "",
       release,
     })
     return reply(sessionID, yield* Deferred.await(release))
@@ -152,11 +210,16 @@ function runLoopTest<A>(
     readonly store: DagStore.Interface
     readonly childPrompts: Queue.Queue<PromptGate>
     readonly parentPrompts: Queue.Queue<ParentPromptGate>
+    readonly settlements: Queue.Queue<AttemptSettlement>
+    readonly admissions: Queue.Queue<AdmissionAttempt>
   }) => Effect.Effect<A, Error>,
+  options: { readonly holdReplan?: Deferred.Deferred<void> } = {},
 ) {
   return Effect.gen(function* () {
     const childPrompts = yield* Queue.unbounded<PromptGate>()
     const parentPrompts = yield* Queue.unbounded<ParentPromptGate>()
+    const settlements = yield* Queue.unbounded<AttemptSettlement>()
+    const admissions = yield* Queue.unbounded<AdmissionAttempt>()
     return yield* Effect.gen(function* () {
       const dag = yield* Dag.Service
       const loop = yield* DagLoop.Service
@@ -176,9 +239,9 @@ function runLoopTest<A>(
         version: "test",
       }).run().pipe(Effect.orDie)
       yield* loop.init()
-      return yield* test({ dag, store, childPrompts, parentPrompts })
+      return yield* test({ dag, store, childPrompts, parentPrompts, settlements, admissions })
     }).pipe(
-      Effect.provide(loopLayer({ childPrompts, parentPrompts })),
+      Effect.provide(loopLayer({ childPrompts, parentPrompts, settlements, admissions, holdReplan: options.holdReplan })),
       Effect.provideService(InstanceRef, {
         directory: process.cwd(),
         worktree: process.cwd(),
@@ -190,6 +253,139 @@ function runLoopTest<A>(
 }
 
 describe("DagLoop replan vs stale NodeFailed", () => {
+  for (const outcome of ["completed", "failed"] as const) {
+    it(`fences a delayed old prompt ${outcome} before WorkflowReplanned cleanup`, async () => {
+      const holdReplan = await Effect.runPromise(Deferred.make<void>())
+      await Effect.runPromise(
+        runLoopTest(
+          ({ dag, store, childPrompts, settlements }) =>
+            Effect.gen(function* () {
+              const dagID = yield* dag.create({
+                projectID: "project-1",
+                sessionID: "ses_parent",
+                title: `Attempt fence ${outcome}`,
+                config: { name: `attempt-fence-${outcome}`, nodes: [node("a")] },
+              })
+              const first = yield* takeWithin(childPrompts, "old attempt did not reach its prompt")
+              const old = yield* requireValue(yield* store.getNode(dagID, "a"), "old attempt row missing")
+
+              yield* dag.replan(dagID, { nodes: [{ ...node("a"), restart: true }] })
+              const replacement = yield* requireValue(
+                yield* store.getNode(dagID, "a"),
+                "replacement attempt row missing",
+              )
+              yield* dag.nodeQueued(dagID, "a", Date.now() + 60_000, {
+                replanAttempts: replacement.replanAttempts,
+                nodeSeq: replacement.seq,
+              })
+              yield* dag.nodeStarted(dagID, "a", "ses_current", Date.now() + 60_000, true, {
+                replanAttempts: replacement.replanAttempts,
+              })
+
+              if (outcome === "completed") {
+                yield* Deferred.succeed(first.release, "old result")
+              } else {
+                yield* Deferred.failCause(first.release, Cause.die(new Error("old prompt failed after restart")))
+              }
+              const observed = yield* takeWithin(settlements, "old prompt never attempted settlement")
+              expect(observed.kind).toBe(outcome)
+              expect(observed.attempt).toEqual({
+                replanAttempts: old.replanAttempts,
+                childSessionID: "ses_child_1",
+              })
+              expect(yield* store.getNode(dagID, "a")).toEqual(
+                expect.objectContaining({
+                  status: "running",
+                  childSessionId: "ses_current",
+                  replanAttempts: replacement.replanAttempts,
+                }),
+              )
+
+              yield* dag.nodeCompleted(dagID, "a", "current result", {
+                replanAttempts: replacement.replanAttempts,
+                childSessionID: "ses_current",
+              })
+              expect(yield* store.getNode(dagID, "a")).toEqual(
+                expect.objectContaining({ status: "completed", output: "current result" }),
+              )
+              yield* Deferred.succeed(holdReplan, undefined)
+            }),
+          { holdReplan },
+        ),
+      )
+    })
+  }
+
+  it("does not admit a fresh node row with the cached config from the prior graph revision", async () => {
+    const holdReplan = await Effect.runPromise(Deferred.make<void>())
+    await Effect.runPromise(
+      runLoopTest(
+        ({ dag, store, childPrompts, admissions }) =>
+          Effect.gen(function* () {
+            const dagID = yield* dag.create({
+              projectID: "project-1",
+              sessionID: "ses_parent",
+              title: "Admission config generation fence",
+              config: {
+                name: "admission-config-generation-fence",
+                nodes: [
+                  { ...node("a"), report_to_parent: false },
+                  { ...node("b", ["a"]), prompt_template: { inline: "old b prompt" } },
+                ],
+              },
+            })
+            const first = yield* takeWithin(childPrompts, "a did not reach its prompt")
+            expect(first.title).toBe("a")
+            const firstAdmission = yield* takeWithin(admissions, "a admission was not observed")
+            expect(firstAdmission.nodeID).toBe("a")
+            const originalGraphRev = firstAdmission.attempt?.graphRev
+
+            yield* dag.replan(dagID, {
+              nodes: [
+                { ...node("a"), report_to_parent: false },
+                {
+                  ...node("b", ["a"]),
+                  name: "replacement b",
+                  prompt_template: { inline: "replacement b prompt" },
+                },
+              ],
+            })
+            const replacement = yield* requireValue(
+              yield* store.getNode(dagID, "b"),
+              "replacement node row missing",
+            )
+            const workflow = yield* requireValue(
+              yield* store.getWorkflow(dagID),
+              "replacement workflow row missing",
+            )
+            expect(workflow.graphRev).toBeGreaterThan(originalGraphRev ?? 0)
+
+            yield* Deferred.succeed(first.release, "a done")
+            const staleAdmission = yield* takeWithin(admissions, "stale b admission was not attempted")
+            expect(staleAdmission).toEqual({
+              nodeID: "b",
+              attempt: {
+                replanAttempts: replacement.replanAttempts,
+                nodeSeq: replacement.seq,
+                graphRev: originalGraphRev,
+              },
+            })
+            expect((yield* store.getNode(dagID, "b"))?.status).toBe("pending")
+            expect(Option.isNone(yield* Queue.poll(childPrompts))).toBe(true)
+
+            yield* Deferred.succeed(holdReplan, undefined)
+            const currentAdmission = yield* takeWithin(admissions, "current b admission was not attempted")
+            expect(currentAdmission.attempt?.graphRev).toBe(workflow.graphRev)
+            const current = yield* takeWithin(childPrompts, "replacement b did not reach its prompt")
+            expect(current.title).toBe("replacement b")
+            expect(current.text).toBe("replacement b prompt")
+            yield* Deferred.succeed(current.release, "b done")
+          }),
+        { holdReplan },
+      ),
+    )
+  })
+
   it("does not terminalize the old graph while a replacement graph is being applied", async () => {
     await Effect.runPromise(
       runLoopTest(({ dag, store, childPrompts }) =>
