@@ -22,7 +22,10 @@ function makeEventTracker() {
   const storeStub: Partial<DagStore.Interface> = {
     tryClaimAdoption: () => Effect.succeed(true),
     getNode: Effect.fn("s")((_workflowID: string, nodeID: string) =>
-      Effect.sync(() => ({ ...makeNodeRow({ id: nodeID }), capturedOutput: capturedStore.get(nodeID) }))),
+      Effect.sync(() => ({
+        ...makeNodeRow({ id: nodeID, status: "running", childSessionId: "ses_child" }),
+        capturedOutput: capturedStore.get(nodeID),
+      }))),
     setCapturedOutput: Effect.fn("s")((_childSessionID: string, payload: unknown) =>
       Effect.sync(() => { capturedStore.set("node-1", payload) })),
   }

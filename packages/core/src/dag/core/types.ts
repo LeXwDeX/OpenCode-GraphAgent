@@ -64,6 +64,7 @@ export enum SkipReason {
 
 export enum ErrorCode {
   INVALID_TRANSITION = "INVALID_TRANSITION",
+  STALE_NODE_ATTEMPT = "STALE_NODE_ATTEMPT",
   TERMINAL_VIOLATION = "TERMINAL_VIOLATION",
   STATE_MACHINE_VIOLATION = "STATE_MACHINE_VIOLATION",
   EVENT_NOT_BROADCAST = "EVENT_NOT_BROADCAST",
@@ -109,9 +110,30 @@ export class TerminalViolationError extends DagCoreError {
   }
 }
 
+export class StaleNodeAttemptError extends DagCoreError {
+  constructor(
+    nodeId: string,
+    expected: { replanAttempts: number; nodeSeq?: number; childSessionID?: string; graphRev?: number },
+    actual: { replanAttempts: number; nodeSeq: number; childSessionID: string | null; graphRev: number },
+  ) {
+    super(ErrorCode.STALE_NODE_ATTEMPT, `Stale execution attempt rejected: ${nodeId}`, {
+      nodeId,
+      expected,
+      actual,
+    })
+    this.name = "StaleNodeAttemptError"
+  }
+}
+
 /** Returns true when a concurrent status change made the requested transition obsolete. */
-export function isTransitionRejection(error: unknown): error is InvalidTransitionError | TerminalViolationError {
-  return error instanceof InvalidTransitionError || error instanceof TerminalViolationError
+export function isTransitionRejection(
+  error: unknown,
+): error is InvalidTransitionError | TerminalViolationError | StaleNodeAttemptError {
+  return (
+    error instanceof InvalidTransitionError ||
+    error instanceof TerminalViolationError ||
+    error instanceof StaleNodeAttemptError
+  )
 }
 
 export class StateNotPersistedError extends DagCoreError {

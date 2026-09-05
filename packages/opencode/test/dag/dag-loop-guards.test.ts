@@ -25,6 +25,7 @@ import { DagProjector } from "@opencode-ai/core/dag/projector"
 import { WorkflowNodeTable, WorkflowTable } from "@opencode-ai/core/dag/sql"
 import { DagStore } from "@opencode-ai/core/dag/store"
 import { EventV2 } from "@opencode-ai/core/event"
+import { Project } from "@opencode-ai/core/project"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
 import { SessionTable } from "@opencode-ai/core/session/sql"
 import { Agent } from "@/agent/agent"
@@ -33,7 +34,7 @@ import { DagLoop } from "@/dag/runtime/loop"
 import { InstanceRef } from "@/effect/instance-ref"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { SessionPrompt } from "@/session/prompt"
-import { MessageID } from "@/session/schema"
+import { MessageID, SessionID } from "@/session/schema"
 import { Session } from "@/session/session"
 import { SessionStatus } from "@/session/status"
 import { pollWithTimeout } from "../lib/effect"
@@ -82,6 +83,7 @@ function reply(sessionID: string, text: string): SessionV1.WithParts {
 function guardLayer(input: {
   readonly childPrompts: Queue.Queue<PromptGate>
   readonly cancels: string[]
+  readonly created: string[]
   /** Injected one-shot defects for DagStore.getWorkflow (P1 survival test). */
   readonly failGetWorkflow?: { remaining: number }
   /** Injected Dag.pause failures (typed or defect) for the DAG-03 gate test. */
@@ -136,19 +138,32 @@ function guardLayer(input: {
                 }
                 return real.pause(id)
               }),
+            pauseForCheckpoint: (id, checkpointSeq) =>
+              Effect.gen(function* () {
+                const acknowledgedSeq = yield* real.store.getLatestCheckpointControlSeq(id)
+                if (acknowledgedSeq !== undefined && acknowledgedSeq >= checkpointSeq) {
+                  return yield* real.pauseForCheckpoint(id, checkpointSeq)
+                }
+                if (input.failPause!.remaining > 0) {
+                  input.failPause!.remaining--
+                  return yield* input.failPause!.defect
+                    ? Effect.die(new Error("injected checkpoint pause defect"))
+                    : Effect.fail(new Error("injected checkpoint pause failure"))
+                }
+                return yield* real.pauseForCheckpoint(id, checkpointSeq)
+              }),
           })
         }),
       ).pipe(Layer.provide(realDag))
     : realDag
   const base = Layer.mergeAll(database, events, bridge, store, projector, dag, status)
   const childTitles = new Map<string, string>()
-  const created: string[] = []
   const session = Layer.mock(Session.Service, {
     get: () => Effect.succeed({ id: "ses_parent", permission: [], agent: "build" } as never),
     create: (value) =>
       Effect.sync(() => {
-        const id = `ses_child_${created.length + 1}`
-        created.push(id)
+        const id = `ses_child_${input.created.length + 1}`
+        input.created.push(id)
         childTitles.set(id, (value?.title ?? id).replace(" (DAG node)", ""))
         return { id } as never
       }),
@@ -207,12 +222,14 @@ function runGuardTest<A>(
     readonly store: DagStore.Interface
     readonly childPrompts: Queue.Queue<PromptGate>
     readonly cancels: string[]
+    readonly created: string[]
   }) => Effect.Effect<A, Error>,
   beforeInit?: (services: { readonly database: Database.Interface }) => Effect.Effect<void>,
 ) {
   return Effect.gen(function* () {
     const childPrompts = yield* Queue.unbounded<PromptGate>()
     const cancels: string[] = []
+    const created: string[] = []
     return yield* Effect.gen(function* () {
       const dag = yield* Dag.Service
       const loop = yield* DagLoop.Service
@@ -236,9 +253,9 @@ function runGuardTest<A>(
       }
       if (beforeInit) yield* beforeInit({ database })
       yield* loop.init()
-      return yield* test({ dag, loop, store, childPrompts, cancels })
+      return yield* test({ dag, loop, store, childPrompts, cancels, created })
     }).pipe(
-      Effect.provide(guardLayer({ childPrompts, cancels, failGetWorkflow: options.failGetWorkflow, failPause: options.failPause })),
+      Effect.provide(guardLayer({ childPrompts, cancels, created, failGetWorkflow: options.failGetWorkflow, failPause: options.failPause })),
       Effect.provideService(InstanceRef, {
         directory: process.cwd(),
         worktree: process.cwd(),
@@ -324,6 +341,53 @@ describe("DagLoop cross-instance adoption guard", () => {
                 required: true,
                 depends_on: [],
                 child_session_id: "ses_orphan",
+                seq: 9,
+              }).run()
+            }),
+          ).pipe(Effect.orDie),
+      ),
+    )
+  })
+})
+
+describe("DagLoop missing node config guard (DAG-A03)", () => {
+  it("fails an active row closed without creating or prompting a child session", async () => {
+    await Effect.runPromise(
+      runGuardTest(
+        { instanceProject: "project-1" },
+        ({ store, created }) =>
+          Effect.gen(function* () {
+            const failed = yield* pollWithTimeout(
+              store.getNode("dag_missing_config", "orphan-node").pipe(
+                Effect.map((row) => row?.status === "failed" ? row : undefined),
+              ),
+              "missing-config node was not failed closed",
+            )
+            expect(failed.errorReason).toBe("Node configuration missing for active node: orphan-node")
+            expect(failed.errorClass).toBe("exec_failed")
+            expect(created).toEqual([])
+          }),
+        ({ database }) =>
+          database.db.transaction((tx) =>
+            Effect.gen(function* () {
+              yield* tx.insert(WorkflowTable).values({
+                id: "dag_missing_config",
+                project_id: Project.ID.make("project-1"),
+                session_id: SessionID.make("ses_project-1"),
+                directory: process.cwd(),
+                title: "Missing config",
+                status: "running",
+                config: JSON.stringify({ name: "missing-config", nodes: [] }),
+                seq: 10,
+              }).run()
+              yield* tx.insert(WorkflowNodeTable).values({
+                id: "orphan-node",
+                workflow_id: "dag_missing_config",
+                name: "orphan-node",
+                worker_type: "build",
+                status: "pending",
+                required: true,
+                depends_on: [],
                 seq: 9,
               }).run()
             }),

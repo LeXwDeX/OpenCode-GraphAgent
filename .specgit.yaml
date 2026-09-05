@@ -1,12 +1,33 @@
 version: 1
-delivery: native-tool-settlement
+delivery: dag-audit-reliability
 context:
-  kind: branch
-  branch: fix/538-native-tool-settlement
+  kind: worktree
+  label: opencode-dag-delivery-2026-09-05
+  branch: fix/545-dag-audit-reliability
 issues:
-  - 538
-  - 540
+  - 545
+  - 546
+  - 547
+  - 548
+  - 549
+  - 550
+  - 551
+  - 552
 issueKinds:
-  - issue: 538
+  - issue: 545
     kind: kind::fix
-pr: 539
+  - issue: 546
+    kind: kind::fix
+  - issue: 547
+    kind: kind::fix
+  - issue: 548
+    kind: kind::fix
+  - issue: 549
+    kind: kind::fix
+  - issue: 550
+    kind: kind::fix
+  - issue: 551
+    kind: kind::fix
+  - issue: 552
+    kind: kind::chore
+pr: 553
