@@ -622,6 +622,8 @@ describe("DagLoop timeout escalation", () => {
               "legacy node did not reach running",
             )
             const deadlineBefore = running.deadlineMs
+            const childSessionID =
+              running.childSessionId ?? (yield* Effect.fail(new Error("legacy node lost its child session")))
 
             // Put the node at the exact adjudication boundary where a real
             // timeout change is allowed to re-time it, then prove an omitted
@@ -629,7 +631,7 @@ describe("DagLoop timeout escalation", () => {
             yield* dag.nodeTimeoutEscalated(
               dagID,
               "a",
-              running.childSessionId!,
+              childSessionID,
               running.timeoutExtensions + 1,
             )
             const wake = yield* takeWithin(parentPrompts, "legacy timeout wake did not reach the parent")

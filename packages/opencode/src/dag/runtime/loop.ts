@@ -39,7 +39,7 @@ import { DagConfig } from "../config"
 import { spawnNode, makeDeadlineWatcher } from "./spawn"
 import { evaluateCondition, resolveInputMapping, resolveInputMappingChecked } from "./eval"
 import { reconcileWorkflow, makeSessionStatusChecker, makeLastAssistantTextReader } from "./recovery"
-import { latestReplanCheckpoint, type ReplanCheckpoint } from "./checkpoint"
+import { Checkpoint } from "./checkpoint"
 
 const parseJsonOption = Schema.decodeUnknownOption(Schema.UnknownFromJsonString)
 
@@ -113,13 +113,13 @@ const serviceLayer = Layer.effect(
 
         const checkpointDisposition = Effect.fn("DagLoop.checkpointDisposition")(function* (
           dagID: string,
-          checkpoint: ReplanCheckpoint,
+          checkpoint: Checkpoint.ReplanCheckpoint,
         ) {
           const attempt = dag
             .pauseForCheckpoint(dagID, checkpoint.seq)
             .pipe(
               Effect.catchCause((cause) =>
-                Cause.hasInterrupts(cause) ? Effect.failCause(cause) : Effect.succeed(undefined),
+                Cause.hasInterrupts(cause) ? Effect.failCause(cause) : Effect.void,
               ),
             )
           const first = yield* attempt
@@ -128,7 +128,7 @@ const serviceLayer = Layer.effect(
           if (second) return second
 
           const workflow = yield* store.getWorkflow(dagID).pipe(
-            Effect.catchCause(() => Effect.succeed(undefined)),
+            Effect.catchCause(() => Effect.void),
           )
           if (
             !workflow ||
@@ -151,7 +151,7 @@ const serviceLayer = Layer.effect(
           entry: WorkflowEntry,
           nodes?: readonly DagStore.NodeRow[],
         ) {
-          const checkpoint = latestReplanCheckpoint(entry.config, nodes ?? (yield* store.getCurrentNodes(dagID)))
+          const checkpoint = Checkpoint.latestReplanCheckpoint(entry.config, nodes ?? (yield* store.getCurrentNodes(dagID)))
           if (!checkpoint) return false
 
           const disposition = yield* checkpointDisposition(dagID, checkpoint)
@@ -643,7 +643,7 @@ const serviceLayer = Layer.effect(
             // WorkflowReplanned handler). Durable truth (the unfiltered read
             // in recovery reconcile above) is untouched.
             const nodes = yield* store.getCurrentNodes(dagID)
-            const checkpoint = latestReplanCheckpoint(config, nodes)
+            const checkpoint = Checkpoint.latestReplanCheckpoint(config, nodes)
             const checkpointState = checkpoint ? yield* checkpointDisposition(dagID, checkpoint) : undefined
             const pausedForCheckpoint = checkpointState === "paused" || checkpointState === "held"
             if (pausedForCheckpoint) {

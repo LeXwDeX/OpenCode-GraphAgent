@@ -3,9 +3,9 @@
 
 import { describe, expect } from "bun:test"
 import fs from "node:fs/promises"
-import os from "node:os"
 import path from "node:path"
 import { Effect, Layer } from "effect"
+import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Database } from "@opencode-ai/core/database/database"
 import { DagProjector } from "@opencode-ai/core/dag/projector"
 import { DagStore } from "@opencode-ai/core/dag/store"
@@ -18,6 +18,7 @@ import { Dag, type NodeConfig } from "@/dag/dag"
 import { reconcileWorkflow } from "@/dag/runtime/recovery"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { SessionID } from "@/session/schema"
+import { tmpdirScoped } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
 
 const persistence = Layer.mergeAll(
@@ -26,6 +27,7 @@ const persistence = Layer.mergeAll(
   DagProjector.defaultLayer,
   DagStore.defaultLayer,
   EventV2Bridge.defaultLayer,
+  CrossSpawnSpawner.defaultLayer,
 )
 const it = testEffect(Layer.provideMerge(Dag.layer, persistence))
 
@@ -115,7 +117,7 @@ describe("plain-text settlement parity", () => {
     }),
   )
 
-  it.effect("preserves valid recovered text byte-for-byte and keeps file-ref capture best-effort", () =>
+  it.live("preserves valid recovered text byte-for-byte and keeps file-ref capture best-effort", () =>
     Effect.gen(function* () {
       yield* setupProject()
       const dag = yield* Dag.Service
@@ -129,30 +131,28 @@ describe("plain-text settlement parity", () => {
       expect(inlineRow?.status).toBe("completed")
       expect(inlineRow?.output).toBe(exact)
 
-      const dir = yield* Effect.promise(() => fs.mkdtemp(path.join(os.tmpdir(), "dag-text-settlement-")))
-      yield* Effect.gen(function* () {
-        const reportPath = path.join(dir, "report.md")
-        yield* Effect.promise(() => fs.writeFile(reportPath, "durable report"))
-        const file = yield* createRunning(dag, "file")
-        yield* reconcileWorkflow(
-          file.dagID,
-          completed,
-          undefined,
-          { nodes: [{ id: "file" }] },
-          () => Effect.succeed(reportPath),
-          dir,
-        )
-        const fileRow = yield* dag.store.getNode(file.dagID, "file")
-        expect(fileRow?.status).toBe("completed")
-        expect(fileRow?.output).toBe(reportPath)
-        expect(fileRow?.capturedOutput).toEqual(
-          expect.objectContaining({
-            kind: "file_ref",
-            content_ref: reportPath,
-            path: reportPath,
-          }),
-        )
-      }).pipe(Effect.ensuring(Effect.promise(() => fs.rm(dir, { recursive: true, force: true }))))
+      const dir = yield* tmpdirScoped()
+      const reportPath = path.join(dir, "report.md")
+      yield* Effect.promise(() => fs.writeFile(reportPath, "durable report"))
+      const file = yield* createRunning(dag, "file")
+      yield* reconcileWorkflow(
+        file.dagID,
+        completed,
+        undefined,
+        { nodes: [{ id: "file" }] },
+        () => Effect.succeed(reportPath),
+        dir,
+      )
+      const fileRow = yield* dag.store.getNode(file.dagID, "file")
+      expect(fileRow?.status).toBe("completed")
+      expect(fileRow?.output).toBe(reportPath)
+      expect(fileRow?.capturedOutput).toEqual(
+        expect.objectContaining({
+          kind: "file_ref",
+          content_ref: reportPath,
+          path: reportPath,
+        }),
+      )
     }),
   )
 

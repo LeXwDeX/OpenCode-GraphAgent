@@ -12,7 +12,7 @@ import { ProjectTable } from "@opencode-ai/core/project/sql"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import { SessionTable } from "@opencode-ai/core/session/sql"
 import { Dag, type NodeConfig, parseWorkflowConfig } from "@/dag/dag"
-import { changedAdmittedNodeFields } from "@/dag/replan-definition"
+import { ReplanDefinition } from "@/dag/replan-definition"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { SessionID } from "@/session/schema"
 import { testEffect } from "../lib/effect"
@@ -307,7 +307,7 @@ describe("replan admitted-definition guard", () => {
       worker_config: { sandbox: { filesystem: "write", network: false }, timeout_ms: 9_000 },
     }
 
-    expect(changedAdmittedNodeFields(current, next, { allowTimeoutUpdate: true })).toEqual([
+    expect(ReplanDefinition.changedAdmittedNodeFields(current, next, { allowTimeoutUpdate: true })).toEqual([
       "permissions",
       "review",
       "worker_config.sandbox",

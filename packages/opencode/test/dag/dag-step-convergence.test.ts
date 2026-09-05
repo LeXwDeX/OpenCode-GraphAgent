@@ -1,6 +1,6 @@
 /* oxlint-disable typescript-eslint/no-unsafe-type-assertion --
  * Branded test fixtures and Effect service mocks use the established DAG harness narrowing pattern. */
-import { describe, expect, it } from "bun:test"
+import { describe, expect } from "bun:test"
 import { Deferred, Effect, Layer, Option, Queue } from "effect"
 import type { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Database } from "@opencode-ai/core/database/database"
@@ -18,8 +18,10 @@ import { SessionPrompt } from "@/session/prompt"
 import { MessageID } from "@/session/schema"
 import { Session } from "@/session/session"
 import { SessionStatus } from "@/session/status"
-import { pollWithTimeout } from "../lib/effect"
+import { pollWithTimeout, testEffect } from "../lib/effect"
 import { withIdleAdmission } from "../lib/session-prompt"
+
+const it = testEffect(Layer.empty)
 
 interface PromptGate {
   readonly title: string
@@ -162,7 +164,6 @@ function runStepTest<A>(
         worktree: process.cwd(),
         project: { id: "project-1" },
       } as never),
-      Effect.scoped,
     )
   })
 }
@@ -188,96 +189,90 @@ function completeParent(dag: Dag.Interface, dagID: string) {
 }
 
 describe("Dag single-step skip convergence", () => {
-  it("converges condition-false and dependent skips to workflow completion in one step", async () => {
-    await Effect.runPromise(
-      runStepTest(({ dag, loop, store, childPrompts }) =>
-        Effect.gen(function* () {
-          const dagID = yield* createGatedWorkflow(dag)
-          yield* completeParent(dag, dagID)
+  it.live("converges condition-false and dependent skips to workflow completion in one step", () =>
+    runStepTest(({ dag, loop, store, childPrompts }) =>
+      Effect.gen(function* () {
+        const dagID = yield* createGatedWorkflow(dag)
+        yield* completeParent(dag, dagID)
 
-          // Reproduce a step event that occurred before the loop subscribed.
-          expect(yield* dag.step(dagID)).toEqual({ status: "stepping", nodeID: "a" })
-          yield* loop.init()
-          expect(yield* dag.step(dagID)).toEqual({ status: "stepping", nodeID: "a" })
+        // Reproduce a step event that occurred before the loop subscribed.
+        expect(yield* dag.step(dagID)).toEqual({ status: "stepping", nodeID: "a" })
+        yield* loop.init()
+        expect(yield* dag.step(dagID)).toEqual({ status: "stepping", nodeID: "a" })
 
-          const settled = yield* pollWithTimeout(
-            Effect.gen(function* () {
-              const workflow = yield* store.getWorkflow(dagID)
-              const a = yield* store.getNode(dagID, "a")
-              const b = yield* store.getNode(dagID, "b")
-              return workflow?.status === "completed" ? { a, b } : undefined
-            }),
-            "step did not converge the skipped branch to completion",
-          )
-          expect(settled.a?.status).toBe("skipped")
-          expect(settled.b?.status).toBe("skipped")
-          expect(Option.isNone(yield* Queue.poll(childPrompts))).toBe(true)
-        }),
-      ),
-    )
-  })
+        const settled = yield* pollWithTimeout(
+          Effect.gen(function* () {
+            const workflow = yield* store.getWorkflow(dagID)
+            const a = yield* store.getNode(dagID, "a")
+            const b = yield* store.getNode(dagID, "b")
+            return workflow?.status === "completed" ? { a, b } : undefined
+          }),
+          "step did not converge the skipped branch to completion",
+        )
+        expect(settled.a?.status).toBe("skipped")
+        expect(settled.b?.status).toBe("skipped")
+        expect(Option.isNone(yield* Queue.poll(childPrompts))).toBe(true)
+      }),
+    ),
+  )
 
-  it("uses a later step to recover an already-stranded skip cascade", async () => {
-    await Effect.runPromise(
-      runStepTest(({ dag, loop, store, childPrompts }) =>
-        Effect.gen(function* () {
-          const dagID = yield* createGatedWorkflow(dag)
-          yield* completeParent(dag, dagID)
-          yield* dag.nodeSkipped(dagID, "a", "condition_false")
+  it.live("uses a later step to recover an already-stranded skip cascade", () =>
+    runStepTest(({ dag, loop, store, childPrompts }) =>
+      Effect.gen(function* () {
+        const dagID = yield* createGatedWorkflow(dag)
+        yield* completeParent(dag, dagID)
+        yield* dag.nodeSkipped(dagID, "a", "condition_false")
 
-          expect(yield* dag.step(dagID)).toEqual({ status: "stepping", nodeID: "b" })
-          yield* loop.init()
-          expect(yield* dag.step(dagID)).toEqual({ status: "stepping", nodeID: "b" })
+        expect(yield* dag.step(dagID)).toEqual({ status: "stepping", nodeID: "b" })
+        yield* loop.init()
+        expect(yield* dag.step(dagID)).toEqual({ status: "stepping", nodeID: "b" })
 
-          yield* pollWithTimeout(
-            Effect.gen(function* () {
-              const workflow = yield* store.getWorkflow(dagID)
-              const b = yield* store.getNode(dagID, "b")
-              return workflow?.status === "completed" && b?.status === "skipped" ? true : undefined
-            }),
-            "repeated step did not recover the stranded skip cascade",
-          )
-          expect(Option.isNone(yield* Queue.poll(childPrompts))).toBe(true)
-        }),
-      ),
-    )
-  })
+        yield* pollWithTimeout(
+          Effect.gen(function* () {
+            const workflow = yield* store.getWorkflow(dagID)
+            const b = yield* store.getNode(dagID, "b")
+            return workflow?.status === "completed" && b?.status === "skipped" ? true : undefined
+          }),
+          "repeated step did not recover the stranded skip cascade",
+        )
+        expect(Option.isNone(yield* Queue.poll(childPrompts))).toBe(true)
+      }),
+    ),
+  )
 
-  it("does not dispatch a runnable sibling while the selected skip branch converges", async () => {
-    await Effect.runPromise(
-      runStepTest(({ dag, loop, store, childPrompts }) =>
-        Effect.gen(function* () {
-          const dagID = yield* createGatedWorkflow(dag, true)
-          yield* completeParent(dag, dagID)
-          expect(yield* dag.step(dagID)).toEqual({ status: "stepping", nodeID: "a" })
-          yield* loop.init()
+  it.live("does not dispatch a runnable sibling while the selected skip branch converges", () =>
+    runStepTest(({ dag, loop, store, childPrompts }) =>
+      Effect.gen(function* () {
+        const dagID = yield* createGatedWorkflow(dag, true)
+        yield* completeParent(dag, dagID)
+        expect(yield* dag.step(dagID)).toEqual({ status: "stepping", nodeID: "a" })
+        yield* loop.init()
 
-          expect(yield* dag.step(dagID)).toEqual({ status: "stepping", nodeID: "a" })
-          yield* pollWithTimeout(
-            Effect.gen(function* () {
-              const a = yield* store.getNode(dagID, "a")
-              const b = yield* store.getNode(dagID, "b")
-              return a?.status === "skipped" && b?.status === "skipped" ? true : undefined
-            }),
-            "selected skip branch did not converge",
-          )
-          expect((yield* store.getNode(dagID, "c"))?.status).toBe("pending")
-          expect(Option.isNone(yield* Queue.poll(childPrompts))).toBe(true)
+        expect(yield* dag.step(dagID)).toEqual({ status: "stepping", nodeID: "a" })
+        yield* pollWithTimeout(
+          Effect.gen(function* () {
+            const a = yield* store.getNode(dagID, "a")
+            const b = yield* store.getNode(dagID, "b")
+            return a?.status === "skipped" && b?.status === "skipped" ? true : undefined
+          }),
+          "selected skip branch did not converge",
+        )
+        expect((yield* store.getNode(dagID, "c"))?.status).toBe("pending")
+        expect(Option.isNone(yield* Queue.poll(childPrompts))).toBe(true)
 
-          expect(yield* dag.step(dagID)).toEqual({ status: "stepping", nodeID: "c" })
-          const child = yield* takeWithin(childPrompts, "runnable sibling did not start on its own step")
-          expect(child.title).toBe("c")
-          expect(Option.isNone(yield* Queue.poll(childPrompts))).toBe(true)
-          yield* Deferred.succeed(child.release, "done")
-          yield* pollWithTimeout(
-            Effect.gen(function* () {
-              const workflow = yield* store.getWorkflow(dagID)
-              return workflow?.status === "completed" ? true : undefined
-            }),
-            "workflow did not complete after the single dispatched sibling",
-          )
-        }),
-      ),
-    )
-  })
+        expect(yield* dag.step(dagID)).toEqual({ status: "stepping", nodeID: "c" })
+        const child = yield* takeWithin(childPrompts, "runnable sibling did not start on its own step")
+        expect(child.title).toBe("c")
+        expect(Option.isNone(yield* Queue.poll(childPrompts))).toBe(true)
+        yield* Deferred.succeed(child.release, "done")
+        yield* pollWithTimeout(
+          Effect.gen(function* () {
+            const workflow = yield* store.getWorkflow(dagID)
+            return workflow?.status === "completed" ? true : undefined
+          }),
+          "workflow did not complete after the single dispatched sibling",
+        )
+      }),
+    ),
+  )
 })

@@ -33,7 +33,7 @@ import {
   validateAdmission,
 } from "./admission"
 import { unresolvedReviewOutcomes } from "./review-lifecycle"
-import { changedAdmittedNodeFields } from "./replan-definition"
+import { ReplanDefinition } from "./replan-definition"
 import { DagValidation, StructuralValidationError } from "./validation"
 import { DagLocation } from "./location"
 import { SessionLocation } from "@/session/location"
@@ -649,7 +649,7 @@ export const layer = Layer.effect(
           )
           continue
         }
-        const fields = changedAdmittedNodeFields(normalizeNodeConfig(current, defaults), next, {
+        const fields = ReplanDefinition.changedAdmittedNodeFields(normalizeNodeConfig(current, defaults), next, {
           allowTimeoutUpdate: status === NodeStatus.RUNNING,
         })
         if (fields.length === 0) continue

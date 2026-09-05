@@ -1,5 +1,5 @@
 import { describe, expect } from "bun:test"
-import { Effect, Exit, Fiber, Layer, Stream } from "effect"
+import { Deferred, Effect, Exit, Fiber, Layer, Stream } from "effect"
 import { eq } from "drizzle-orm"
 import { Database } from "@opencode-ai/core/database/database"
 import { DagProjector } from "@opencode-ai/core/dag/projector"
@@ -10,10 +10,11 @@ import { Project } from "@opencode-ai/core/project"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import { SessionTable } from "@opencode-ai/core/session/sql"
+import { WorkspaceV2 } from "@opencode-ai/core/workspace"
 import { DagEvent } from "@opencode-ai/schema/dag-event"
 import { GlobalBus, type GlobalEvent } from "@/bus/global"
 import { Dag, type NodeConfig } from "@/dag/dag"
-import { InstanceRef } from "@/effect/instance-ref"
+import { InstanceRef, WorkspaceRef } from "@/effect/instance-ref"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import type { InstanceContext } from "@/project/instance-context"
 import { SessionID } from "@/session/schema"
@@ -22,10 +23,15 @@ import { pollWithTimeout, testEffect } from "../lib/effect"
 
 interface BatchProbe {
   failAtConfig: boolean
+  holdRegistered?: {
+    entered: Deferred.Deferred<void>
+    release: Deferred.Deferred<void>
+  }
 }
 
 const directory = process.cwd()
 const projectID = Project.ID.make("project-1")
+const workspaceID = WorkspaceV2.ID.make("wrk_1")
 const instance = {
   directory,
   worktree: directory,
@@ -51,7 +57,23 @@ function node(id: string, prompt: string): NodeConfig {
 function atomicLayer(probe: BatchProbe) {
   const database = Database.layerFromPath(":memory:")
   const events = EventV2.layer.pipe(Layer.provide(database))
-  const rawBridge = EventV2Bridge.layer.pipe(Layer.provide(events))
+  const eventsWithPriorListener = Layer.effect(
+    EventV2.Service,
+    Effect.gen(function* () {
+      const service = yield* EventV2.Service
+      const unsubscribe = yield* service.listen((event) => {
+        const hold = probe.holdRegistered
+        const data: unknown = event.data
+        if (!hold || event.type !== DagEvent.NodeRegistered.type || !isRecord(data) || data.nodeID !== "replacement") {
+          return Effect.void
+        }
+        return Deferred.succeed(hold.entered, undefined).pipe(Effect.andThen(Deferred.await(hold.release)))
+      })
+      yield* Effect.addFinalizer(() => unsubscribe)
+      return service
+    }),
+  ).pipe(Layer.provide(events))
+  const rawBridge = EventV2Bridge.layer.pipe(Layer.provide(eventsWithPriorListener))
   const bridge = Layer.effect(
     EventV2Bridge.Service,
     Effect.gen(function* () {
@@ -80,9 +102,9 @@ function atomicLayer(probe: BatchProbe) {
     }),
   ).pipe(Layer.provide(rawBridge))
   const store = DagStore.layer.pipe(Layer.provide(database))
-  const projector = DagProjector.layer.pipe(Layer.provide(events), Layer.provide(database))
+  const projector = DagProjector.layer.pipe(Layer.provide(eventsWithPriorListener), Layer.provide(database))
   const dag = Dag.layer.pipe(Layer.provide(bridge), Layer.provide(store))
-  return Layer.mergeAll(database, events, bridge, store, projector, dag)
+  return Layer.mergeAll(database, eventsWithPriorListener, bridge, store, projector, dag)
 }
 
 function setup() {
@@ -140,9 +162,18 @@ describe("Dag.replan atomic transaction (DAG-A03)", () => {
     }).pipe(Effect.provideService(InstanceRef, instance)),
   )
 
-  it.live("rolls back the complete graph and only exposes a successful committed batch", () =>
+  it.live("rolls back the graph and forwards a committed batch past a yielding prior listener", () =>
     Effect.gen(function* () {
       probe.failAtConfig = true
+      const priorListenerEntered = yield* Deferred.make<void>()
+      const releasePriorListener = yield* Deferred.make<void>()
+      probe.holdRegistered = { entered: priorListenerEntered, release: releasePriorListener }
+      yield* Effect.addFinalizer(() =>
+        Deferred.succeed(releasePriorListener, undefined).pipe(
+          Effect.andThen(Effect.sync(() => delete probe.holdRegistered)),
+          Effect.asVoid,
+        ),
+      )
       yield* setup()
 
       const dag = yield* Dag.Service
@@ -164,6 +195,7 @@ describe("Dag.replan atomic transaction (DAG-A03)", () => {
         seq?: number
         directory?: string
         project?: string
+        workspace?: string
       }>()
       const onGlobal = (event: GlobalEvent) => {
         const payload: unknown = event.payload
@@ -175,12 +207,21 @@ describe("Dag.replan atomic transaction (DAG-A03)", () => {
         if (aggregateID !== dagID && propertiesDagID !== dagID) return
         const syncType = typeof sync?.type === "string" ? sync.type : undefined
         const syncSeq = typeof sync?.seq === "number" ? sync.seq : undefined
+        const type = syncType ?? (typeof payload.type === "string" ? payload.type : "unknown")
+        const data = sync ? (isRecord(sync.data) ? sync.data : undefined) : properties
+        if (
+          (type === DagEvent.NodeRegistered.type || type === EventV2.versionedType(DagEvent.NodeRegistered.type, 1)) &&
+          data?.nodeID !== "replacement"
+        ) {
+          return
+        }
         globalEvents.push({
           kind: sync ? "sync" : "event",
-          type: syncType ?? (typeof payload.type === "string" ? payload.type : "unknown"),
+          type,
           ...(syncSeq === undefined ? {} : { seq: syncSeq }),
           directory: event.directory,
           project: event.project,
+          workspace: event.workspace,
         })
       }
       yield* Effect.acquireRelease(
@@ -216,6 +257,18 @@ describe("Dag.replan atomic transaction (DAG-A03)", () => {
         add: ["replacement"],
         ignore: [],
       })
+      yield* Deferred.await(priorListenerEntered).pipe(
+        Effect.timeoutOrElse({
+          duration: "1 second",
+          orElse: () => Effect.fail(new Error("prior EventV2 listener did not block NodeRegistered")),
+        }),
+      )
+
+      const firstForwarded = yield* pollWithTimeout(
+        Effect.sync(() => globalEvents[0]),
+        "EventV2Bridge did not forward while the prior listener was blocked",
+      )
+      expect(firstForwarded).toEqual(expect.objectContaining({ kind: "event", type: DagEvent.NodeRegistered.type }))
 
       const workflow = yield* store.getWorkflow(dagID)
       const rows = yield* store.getNodes(dagID)
@@ -245,11 +298,12 @@ describe("Dag.replan atomic transaction (DAG-A03)", () => {
       )
       for (const event of observed) {
         const location = event.location as
-          | { directory?: string; project?: { id: string; directory: string } }
+          | { directory?: string; project?: { id: string; directory: string }; workspaceID?: string }
           | undefined
         expect(location?.directory).toBe(directory)
         expect(location?.project?.id).toBe(projectID)
         expect(location?.project?.directory).toBe(directory)
+        expect(location?.workspaceID).toBe(workspaceID)
       }
 
       const forwarded = yield* pollWithTimeout(
@@ -273,7 +327,9 @@ describe("Dag.replan atomic transaction (DAG-A03)", () => {
       for (const event of forwarded) {
         expect(event.directory).toBe(directory)
         expect(event.project).toBe(projectID)
+        expect(event.workspace).toBe(workspaceID)
       }
-    }).pipe(Effect.provideService(InstanceRef, instance)),
+      yield* Deferred.succeed(releasePriorListener, undefined)
+    }).pipe(Effect.provideService(InstanceRef, instance), Effect.provideService(WorkspaceRef, workspaceID)),
   )
 })

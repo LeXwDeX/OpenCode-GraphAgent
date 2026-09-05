@@ -30,3 +30,5 @@ export function latestReplanCheckpoint(
     return { id: node.id, seq: node.seq }
   }, undefined)
 }
+
+export * as Checkpoint from "./checkpoint"
