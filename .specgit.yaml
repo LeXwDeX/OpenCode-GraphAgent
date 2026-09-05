@@ -1,11 +1,11 @@
 version: 1
 delivery: dag-release
 context:
-  kind: worktree
-  label: opencode-dag-main-release-2026-09-05
+  kind: branch
   branch: chore/554-dag-release
 issues:
   - 554
+  - 556
 issueKinds:
   - issue: 554
     kind: kind::chore
