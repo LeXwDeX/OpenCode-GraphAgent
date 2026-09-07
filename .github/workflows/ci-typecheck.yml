@@ -32,6 +32,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   typecheck:
@@ -41,16 +42,30 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
+      - name: Check previously verified content
+        id: evidence
+        uses: ./.github/actions/verified-content
+        with:
+          check: typecheck
+          job-name: Typecheck
+
       - name: Setup Bun
+        if: steps.evidence.outputs.reused != 'true'
         uses: ./.github/actions/setup-bun
 
+      - name: Test CI verification fingerprint
+        run: node --test script/ci-fingerprint.test.mjs script/ci-evidence.test.mjs
+
       - name: Run lint
+        if: steps.evidence.outputs.reused != 'true'
         run: bun run lint
 
       - name: Run typecheck
+        if: steps.evidence.outputs.reused != 'true'
         run: bun typecheck
 
       - name: Run DAG core behavior and coverage gate
+        if: steps.evidence.outputs.reused != 'true'
         working-directory: packages/opencode
         run: bun run test:dag-core
         timeout-minutes: 10
@@ -59,5 +74,14 @@ jobs:
       # must be verified before extraction and fail closed on mismatch.
       # Zero network (stub curl); portable across bash hosts.
       - name: Run oc install boundary tests
+        if: steps.evidence.outputs.reused != 'true'
         run: bash script/oc-install-boundary.test.sh
         timeout-minutes: 5
+
+      - name: Record successful verification
+        if: success() && steps.evidence.outputs.reused != 'true'
+        uses: ./.github/actions/record-verification
+        with:
+          key: ${{ steps.evidence.outputs.key }}
+          path: ${{ steps.evidence.outputs.path }}
+          job-name: Typecheck
