@@ -1,5 +1,5 @@
 /**
- * Settings-based hook system — Claude Code protocol-level 1:1 compatible.
+ * Settings-based hooks with Claude Code-compatible envelopes and explicit runtime support.
  *
  * Reads hooks from a dedicated hooks.json chain (later layers concat-append on
  * top of earlier ones, mirroring Claude Code's merge semantics — hooks
@@ -46,7 +46,7 @@ import { Effect, Layer, Context, Option, Scope, Exit } from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/unstable/http"
 import { ChildProcessSpawner } from "effect/unstable/process/ChildProcessSpawner"
-import z from "zod"
+import { HookCommandSchema, HookOutputSchema } from "./schema"
 import { generateObject, generateText, type ModelMessage } from "ai"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
@@ -69,7 +69,7 @@ import { isTrusted, trustFilePath } from "./workspace-trust" // [FORK:hook-ext] 
 
 const log = Log.create({ service: "hook.settings" })
 
-// ── Types (Claude Code 1:1) ─────────────────────────────────────
+// ── Hook protocol types ────────────────────────────────────────
 
 export type HookEvent =
   | "PreToolUse"
@@ -150,8 +150,8 @@ export interface HookCommand {
   statusMessage?: string
   once?: boolean
   /**
-   * Shell selector for `type:"command"`. CC honors `bash` (default on POSIX) and `powershell`
-   * (default on Windows). Currently a schema placeholder — execShell still picks based on platform.
+   * Explicit interpreter for command hooks. When omitted, preserve the platform
+   * default (/bin/sh on POSIX, cmd.exe on Windows). The interpreter must be installed.
    */
   shell?: "bash" | "powershell"
   /**
@@ -254,34 +254,6 @@ export interface HookJSONOutput {
   reason?: string
   hookSpecificOutput?: HookSpecificOutput
 }
-
-// Loose flat zod schema mirroring HookJSONOutput — used by the prompt handler to
-// constrain LLM structured output. Intentionally NOT `.strict()`: lets the model
-// emit unknown fields without failing parse. Single source of truth lives next
-// to the HookJSONOutput interface; not exported (settings.ts internal only).
-const HookSpecificOutputZodSchema = z.object({
-  hookEventName: z.string().optional(),
-  permissionDecision: z.enum(["allow", "deny", "ask"]).optional(),
-  permissionDecisionReason: z.string().optional(),
-  updatedInput: z.record(z.string(), z.unknown()).optional(),
-  additionalContext: z.string().optional(),
-  initialUserMessage: z.string().optional(),
-  updatedMCPToolOutput: z.unknown().optional(),
-  watchPaths: z.array(z.string()).optional(),
-  displayMessage: z.string().optional(),
-  compactSummary: z.string().optional(),
-  customSummary: z.string().optional(),
-})
-
-const HookJSONOutputZodSchema = z.object({
-  continue: z.boolean().optional(),
-  stopReason: z.string().optional(),
-  suppressOutput: z.boolean().optional(),
-  systemMessage: z.string().optional(),
-  decision: z.enum(["approve", "block"]).optional(),
-  reason: z.string().optional(),
-  hookSpecificOutput: HookSpecificOutputZodSchema.optional(),
-})
 
 // ── Async rewake (hook-async-rewake) ───────────────────────────
 // Sentinel prefix for rewake prompts. UserPromptSubmit hook processing skips
@@ -514,11 +486,7 @@ export interface ForkHooks {
    * INTENT: Centralized pre-dispatch filtering for condition-filter,
    * future rate-limiting, logging, etc.
    */
-  readonly beforeRunEntry?: (
-    entry: HookCommand,
-    envelope: Record<string, unknown>,
-    event: HookEvent,
-  ) => boolean
+  readonly beforeRunEntry?: (entry: HookCommand, envelope: Record<string, unknown>, event: HookEvent) => boolean
 
   /**
    * Called AFTER runEntry() for each executed hook entry.
@@ -593,6 +561,20 @@ function httpUrl(entry: HookCommand): string {
   return entry.url ?? entry.command ?? ""
 }
 
+function httpHeaders(entry: HookCommand): Record<string, string> {
+  if (entry.allowedEnvVars === undefined) return entry.headers ?? {}
+  const allowed = new Set(entry.allowedEnvVars ?? [])
+  return Object.fromEntries(
+    Object.entries(entry.headers ?? {}).map(([name, value]) => [
+      name,
+      value.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)/g, (_match, braced, bare) => {
+        const key = braced ?? bare
+        return allowed.has(key) ? (process.env[key] ?? "") : ""
+      }),
+    ]),
+  )
+}
+
 function promptText(entry: HookCommand): string {
   return entry.prompt ?? entry.command ?? ""
 }
@@ -659,35 +641,44 @@ export function readJSON(filepath: string): Settings | null {
     // hooks.json uses top-level event keys; a legacy {"hooks": {...}} wrapper is
     // tolerated (D1 graceful degradation). The wrapper wins when present.
     const obj =
-      parsed && typeof parsed === "object" && !Array.isArray(parsed)
-        ? (parsed as Record<string, unknown>)
-        : undefined
-    const rawHooks = obj && obj.hooks && typeof obj.hooks === "object" && !Array.isArray(obj.hooks)
-      ? obj.hooks as Record<string, unknown>
-      : obj
-    
-    // Filter to only valid HookEvent keys with array values (defends against
-    // non-event keys like "$schema" being treated as matchers)
+      parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : undefined
+    const rawHooks =
+      obj && obj.hooks && typeof obj.hooks === "object" && !Array.isArray(obj.hooks)
+        ? (obj.hooks as Record<string, unknown>)
+        : obj
+
     const hooks: Settings["hooks"] = {}
-    if (rawHooks && typeof rawHooks === "object") {
-      for (const [key, value] of Object.entries(rawHooks)) {
-        if (VALID_HOOK_EVENTS.has(key) && Array.isArray(value)) {
-          hooks[key as HookEvent] = value
-        }
-      }
-    }
-    
-    // Stamp every HookCommand with the directory of the hooks.json file that
-    // declared it. execShell uses this to populate CLAUDE_PLUGIN_ROOT /
-    // CLAUDE_PLUGIN_DATA — now resolves to .opencode/ or ~/.config/opencode/
-    // rather than .claude/.
     const sourceDir = path.dirname(filepath)
-    if (hooks) {
-      for (const matchers of Object.values(hooks)) {
-        if (!matchers) continue
-        for (const m of matchers) {
-          for (const h of m.hooks ?? []) h.__sourceDir = sourceDir
+    if (rawHooks) {
+      for (const [key, value] of Object.entries(rawHooks)) {
+        if (!VALID_HOOK_EVENTS.has(key)) continue
+        if (!Array.isArray(value)) {
+          log.warn("invalid hook event configuration", { path: filepath, event: key })
+          continue
         }
+        const groups: HookMatcher[] = []
+        for (const group of value) {
+          if (
+            !group ||
+            typeof group !== "object" ||
+            !Array.isArray(group.hooks) ||
+            (group.matcher !== undefined && typeof group.matcher !== "string")
+          ) {
+            log.warn("invalid hook matcher skipped", { path: filepath, event: key })
+            continue
+          }
+          const commands: HookCommand[] = []
+          for (const candidate of group.hooks) {
+            const parsed = HookCommandSchema.safeParse(candidate)
+            if (!parsed.success) {
+              log.warn("invalid hook command skipped", { path: filepath, event: key, error: parsed.error.message })
+              continue
+            }
+            commands.push({ ...parsed.data, __sourceDir: sourceDir })
+          }
+          if (commands.length) groups.push({ matcher: group.matcher, hooks: commands })
+        }
+        hooks[key as HookEvent] = groups
       }
     }
     log.info("loaded hook settings", {
@@ -952,35 +943,18 @@ export function __resetDeprecatedWarnings(): void {
   warnedDeprecatedHooks.clear()
 }
 
-/**
- * Pure detection of HookCommand fields the fork has not yet implemented (`shell`).
- * Exported for unit testing. `if` is fully implemented via condition-filter
- * (`extensions/condition-filter.ts` evaluates it in `ForkHooks.beforeRunEntry`),
- * and `async` / `asyncRewake` are fully implemented (hook-async-execution); all
- * three are therefore excluded. `shell` has no runtime handler and MUST be flagged.
- */
+/** Diagnose fields that have no effect for the selected handler type. */
 export function detectUnsupportedFields(
   hooks: Settings["hooks"],
 ): Array<{ field: string; value: unknown; eventName: string }> {
-  if (!hooks) return []
   const unsupported: Array<{ field: string; value: unknown; eventName: string }> = []
-  for (const [eventName, matchers] of Object.entries(hooks)) {
-    if (!matchers) continue
-    for (const m of matchers) {
-      for (const h of m.hooks ?? []) {
-        if (h.shell !== undefined) unsupported.push({ field: "shell", value: h.shell, eventName })
-        // issue #286 — schema-accepted but executor-dropped fields. Surfaced
-        // here instead of silently swallowed: allowedEnvVars/statusMessage have
-        // zero consumers anywhere; per-command `once` is never read (only the
-        // entry-level _sessionEntry?.once is consumed). `timeout` is NOT
-        // flagged — every handler type applies it (incl. prompt).
-        if (h.allowedEnvVars !== undefined)
-          unsupported.push({ field: "allowedEnvVars", value: h.allowedEnvVars, eventName })
-        if (h.statusMessage !== undefined)
-          unsupported.push({ field: "statusMessage", value: h.statusMessage, eventName })
-        if (h.once !== undefined) unsupported.push({ field: "once", value: h.once, eventName })
-        // `if` is implemented (condition-filter); async/asyncRewake implemented.
-        // All 5 known types now have handlers; type-level unsupported set is empty by design.
+  for (const [eventName, matchers] of Object.entries(hooks ?? {})) {
+    for (const matcher of matchers ?? []) {
+      for (const entry of matcher.hooks) {
+        if (entry.shell !== undefined && entry.type !== "command")
+          unsupported.push({ field: "shell", value: entry.shell, eventName })
+        if (entry.allowedEnvVars !== undefined && entry.type !== "http")
+          unsupported.push({ field: "allowedEnvVars", value: entry.allowedEnvVars, eventName })
       }
     }
   }
@@ -988,18 +962,12 @@ export function detectUnsupportedFields(
 }
 
 /**
- * Internal: scan loaded settings for HookCommand fields the fork has not yet implemented
- * (`shell`) and emit a single `log.warn` per settings file. Runtime still proceeds —
- * this field is silently ignored. Exported for unit testing only; not part of the public
- * surface. `if` / `async` / `asyncRewake` are fully implemented and excluded.
+ * Warn about fields supplied to a handler type that cannot use them.
  */
-export function warnUnsupportedFields(
-  hooks: Settings["hooks"],
-  sourceDir: string,
-): void {
+export function warnUnsupportedFields(hooks: Settings["hooks"], sourceDir: string): void {
   const unsupported = detectUnsupportedFields(hooks)
   if (unsupported.length > 0) {
-    log.warn("hook settings contains unsupported fields (will be ignored or fail at runtime)", {
+    log.warn("hook settings contains fields ignored by this handler type", {
       sourceDir,
       unsupported,
     })
@@ -1020,10 +988,26 @@ function execShell(
   entry: HookCommand,
   stdinJSON: string,
   cwd: string,
+  signal: AbortSignal,
 ): Promise<{ exitCode: number | null; stdout: string; stderr: string; spawnError?: string }> {
   return new Promise((resolve) => {
+    if (signal.aborted) {
+      resolve({ exitCode: null, stdout: "", stderr: "" })
+      return
+    }
     const timeoutMs = entry.timeout ? entry.timeout * 1000 : DEFAULT_TIMEOUT_MS
-    const shell = process.platform === "win32" ? true : "/bin/sh"
+    const shell =
+      entry.shell === "powershell"
+        ? process.platform === "win32"
+          ? "powershell.exe"
+          : "pwsh"
+        : entry.shell === "bash"
+          ? process.platform === "win32"
+            ? "bash.exe"
+            : "/bin/bash"
+          : process.platform === "win32"
+            ? true
+            : "/bin/sh"
     const expandedCommand = expandCommand(entry)
 
     const command = commandText(entry)
@@ -1066,7 +1050,6 @@ function execShell(
       shell,
       env: { ...process.env, ...extraEnv },
       stdio: ["pipe", "pipe", "pipe"],
-      timeout: timeoutMs,
       detached: process.platform !== "win32",
     })
 
@@ -1095,6 +1078,7 @@ function execShell(
     // awaited as independent conditions, with a process-group SIGKILL as the
     // fallback that guarantees resolution.
     let exitCode: number | null = null
+    let timedOut = false
     let settled = false
     const timers = new Set<NodeJS.Timeout>()
     const arm = (fire: () => void, ms: number) => {
@@ -1122,6 +1106,7 @@ function execShell(
     const finish = (spawnError?: string) => {
       if (settled) return
       settled = true
+      signal.removeEventListener("abort", afterKill)
       for (const timer of timers) clearTimeout(timer)
       timers.clear()
       child.stdout.destroy()
@@ -1132,7 +1117,10 @@ function execShell(
         stdoutLen: stdout.length,
         stderrLen: stderr.length,
       })
-      resolve(spawnError === undefined ? { exitCode, stdout, stderr } : { exitCode, stdout, stderr, spawnError })
+      const code = timedOut || signal.aborted ? null : exitCode
+      resolve(
+        spawnError === undefined ? { exitCode: code, stdout, stderr } : { exitCode: code, stdout, stderr, spawnError },
+      )
     }
 
     child.on("error", (err) => {
@@ -1154,6 +1142,9 @@ function execShell(
       void Promise.all([exited, Promise.race([streamsDone, drained])]).then(() => finish())
     }
 
+    signal.addEventListener("abort", afterKill, { once: true })
+    if (signal.aborted) afterKill()
+
     void Promise.all([exited, streamsDone]).then(() => finish())
 
     // Child exited but pipes are still open (grandchild holds them): kill the
@@ -1162,7 +1153,14 @@ function execShell(
 
     // Child ignored the spawn-timeout SIGTERM and never exited: kill the group
     // at the absolute deadline, wait for the reap, then resolve.
-    arm(afterKill, timeoutMs + KILL_GRACE_MS)
+    arm(() => {
+      timedOut = true
+      if (child.pid !== undefined)
+        void Process.killGroupPid(child.pid, "SIGTERM").catch((error) => {
+          log.warn("hook process-group termination failed", { error: String(error) })
+        })
+      arm(afterKill, KILL_GRACE_MS)
+    }, timeoutMs)
   })
 }
 
@@ -1173,7 +1171,12 @@ function parseStdout(stdout: string, command: string): HookJSONOutput | undefine
     return undefined
   }
   try {
-    return JSON.parse(trimmed) as HookJSONOutput
+    const parsed = HookOutputSchema.safeParse(JSON.parse(trimmed))
+    if (!parsed.success) {
+      log.warn("hook returned invalid output shape", { command, error: parsed.error.message })
+      return undefined
+    }
+    return parsed.data as HookJSONOutput
   } catch {
     log.warn("hook returned invalid JSON", { command, output: trimmed.slice(0, 200) })
     return undefined
@@ -1250,18 +1253,14 @@ function buildStdinEnvelope(payload: HookPayload, ctx: TriggerContext, cwd: stri
       return {
         ...base,
         stop_hook_active: payload.stopHookActive,
-        ...(payload.lastAssistantMessage !== undefined
-          ? { last_assistant_message: payload.lastAssistantMessage }
-          : {}),
+        ...(payload.lastAssistantMessage !== undefined ? { last_assistant_message: payload.lastAssistantMessage } : {}),
       }
     case "StopFailure":
       return {
         ...base,
         stop_hook_active: payload.stopHookActive,
         error: payload.error,
-        ...(payload.lastAssistantMessage !== undefined
-          ? { last_assistant_message: payload.lastAssistantMessage }
-          : {}),
+        ...(payload.lastAssistantMessage !== undefined ? { last_assistant_message: payload.lastAssistantMessage } : {}),
       }
     case "SubagentStart":
       return { ...base, agent_id: payload.agentID, agent_type: payload.agentType }
@@ -1270,13 +1269,9 @@ function buildStdinEnvelope(payload: HookPayload, ctx: TriggerContext, cwd: stri
         ...base,
         stop_hook_active: payload.stopHookActive,
         ...(payload.agentID !== undefined ? { agent_id: payload.agentID } : {}),
-        ...(payload.agentTranscriptPath !== undefined
-          ? { agent_transcript_path: payload.agentTranscriptPath }
-          : {}),
+        ...(payload.agentTranscriptPath !== undefined ? { agent_transcript_path: payload.agentTranscriptPath } : {}),
         ...(payload.agentType !== undefined ? { agent_type: payload.agentType } : {}),
-        ...(payload.lastAssistantMessage !== undefined
-          ? { last_assistant_message: payload.lastAssistantMessage }
-          : {}),
+        ...(payload.lastAssistantMessage !== undefined ? { last_assistant_message: payload.lastAssistantMessage } : {}),
       }
     case "PreCompact":
       return {
@@ -1289,9 +1284,7 @@ function buildStdinEnvelope(payload: HookPayload, ctx: TriggerContext, cwd: stri
         ...base,
         ...(payload.trigger !== undefined ? { trigger: payload.trigger } : {}),
         ...(payload.compactSummary !== undefined ? { compact_summary: payload.compactSummary } : {}),
-        ...(payload.customInstructions !== undefined
-          ? { custom_instructions: payload.customInstructions }
-          : {}),
+        ...(payload.customInstructions !== undefined ? { custom_instructions: payload.customInstructions } : {}),
       }
     case "SessionStart":
       return {
@@ -1396,6 +1389,7 @@ interface State {
    * the "" bucket, preserving the prior global-dedup behavior for those.
    */
   seen: Map<string, Set<string>>
+  once: Map<string, WeakSet<HookCommand>>
   /**
    * Scope-tagged summaries of the currently-effective hooks, computed by
    * `summarizeChain` alongside `settings` (same closure, same hot-reload
@@ -1405,10 +1399,7 @@ interface State {
 }
 
 export interface Interface {
-  readonly trigger: (
-    payload: HookPayload,
-    ctx: TriggerContext,
-  ) => Effect.Effect<TriggerResult>
+  readonly trigger: (payload: HookPayload, ctx: TriggerContext) => Effect.Effect<TriggerResult>
   /**
    * Read-only view of the currently-effective hooks (merged global + project +
    * worktree chain), one entry per hook command tagged with its source layer.
@@ -1450,8 +1441,8 @@ const commandHandler: HookHandler = {
   type: "command",
   run: Effect.fn("SettingsHook.handler.command")(function* (entry, envelope, cwd, _inHook) {
     const stdinJSON = JSON.stringify(envelope)
-    const { exitCode, stdout, stderr, spawnError } = yield* Effect.promise(() =>
-      execShell(entry, stdinJSON, cwd),
+    const { exitCode, stdout, stderr, spawnError } = yield* Effect.promise((signal) =>
+      execShell(entry, stdinJSON, cwd, signal),
     )
 
     if (spawnError) {
@@ -1461,7 +1452,7 @@ const commandHandler: HookHandler = {
     // Exit-code 2: block + stderr-as-reason (CC contract)
     if (exitCode === 2) {
       const reason = stderr.trim() || "Hook blocked execution"
-      return { json: parseStdout(stdout, commandText(entry)), exitBlock: reason, rawStdout: stdout, exitCode }
+      return { exitBlock: reason, exitCode }
     }
 
     // Other non-zero exits: log and continue (do not abort main flow)
@@ -1483,7 +1474,9 @@ const commandHandler: HookHandler = {
     // trigger aggregator can inject it as additionalContext for
     // UserPromptSubmit / SessionStart (CC protocol). JSON stdout still parses
     // normally via parseStdout; rawStdout is only consumed when json is null.
-    return { json: parseStdout(stdout, commandText(entry)), exitBlock: undefined, rawStdout: stdout, exitCode }
+    return exitCode === 0
+      ? { json: parseStdout(stdout, commandText(entry)), rawStdout: stdout, exitCode }
+      : { exitCode }
   }),
 }
 
@@ -1496,10 +1489,7 @@ const mcpHandler: HookHandler = {
       return { json: undefined, exitBlock: undefined }
     }
     const timeoutMs = entry.timeout ? entry.timeout * 1000 : DEFAULT_TIMEOUT_MS
-    const exit = yield* invokeMcpHook(mcpSvc, commandText(entry), envelope).pipe(
-      Effect.timeout(timeoutMs),
-      Effect.exit,
-    )
+    const exit = yield* invokeMcpHook(mcpSvc, commandText(entry), envelope).pipe(Effect.timeout(timeoutMs), Effect.exit)
     if (exit._tag === "Failure") {
       log.warn("mcp hook timed out or failed (non-blocking)", {
         command: commandText(entry),
@@ -1536,7 +1526,7 @@ const httpHandler: HookHandler = {
 
     const url = httpUrl(entry)
     const exit = yield* HttpClientRequest.post(url).pipe(
-      HttpClientRequest.setHeaders(entry.headers ?? {}),
+      HttpClientRequest.setHeaders(httpHeaders(entry)),
       HttpClientRequest.bodyJson(envelope),
       Effect.flatMap((req) => httpRead.execute(req)),
       Effect.flatMap((res) =>
@@ -1571,7 +1561,7 @@ const httpHandler: HookHandler = {
  *
  * `entry.command` is interpreted as the system prompt template; the stdin envelope
  * (already shaped by buildStdinEnvelope) is JSON-stringified into the user message.
- * The model returns structured output matching HookJSONOutputZodSchema (loose flat
+ * The model returns structured output matching HookOutputSchema (loose flat
  * shape; see definition near HookJSONOutput).
  *
  * Failure policy is **silent allow** — mirrors httpHandler's network-error path:
@@ -1615,7 +1605,7 @@ const promptHandler: HookHandler = {
           { role: "system", content: prompt } as ModelMessage,
           { role: "user", content: JSON.stringify(envelope) } as ModelMessage,
         ],
-        schema: HookJSONOutputZodSchema,
+        schema: HookOutputSchema,
       } satisfies Parameters<typeof generateObject>[0]
 
       // issue #286 — the header doc promises `timeout` for every hook type,
@@ -1625,12 +1615,9 @@ const promptHandler: HookHandler = {
       const timeoutMs = entry.timeout ? entry.timeout * 1000 : DEFAULT_TIMEOUT_MS
 
       const llmExit = yield* Effect.tryPromise({
-        try: () => generateObject(params).then((r) => r.object),
+        try: (abortSignal) => generateObject({ ...params, abortSignal }).then((r) => r.object),
         catch: (e) => e,
-      }).pipe(
-        Effect.timeout(timeoutMs),
-        Effect.exit,
-      )
+      }).pipe(Effect.timeout(timeoutMs), Effect.exit)
 
       if (llmExit._tag === "Failure") {
         log.warn("prompt hook failed (non-blocking)", { error: String(llmExit.cause) })
@@ -1690,45 +1677,40 @@ const agentHandler: HookHandler = {
       }
 
       const captured: { value: HookJSONOutput | null } = { value: null }
-      const ac = new AbortController()
       const timeoutMs = entry.timeout ? entry.timeout * 1000 : DEFAULT_AGENT_TIMEOUT_MS
-      const timer = setTimeout(() => ac.abort(), timeoutMs)
 
       const loopExit = yield* Effect.tryPromise({
-        try: async () => {
-          try {
-            const tools = buildAgentTools({ spawner, fs, signal: ac.signal, cwd, captured })
-            const messages: ModelMessage[] = [
-              { role: "system", content: prompt },
-              { role: "user", content: JSON.stringify(envelope) },
-            ]
-            for (let turn = 0; turn < MAX_AGENT_TURNS; turn++) {
-              const result = await generateText({
-                model: language,
-                messages,
-                tools,
-                toolChoice: "auto",
-                abortSignal: ac.signal,
-                maxOutputTokens: 4096,
-                allowSystemInMessages: true,
-              } as any)
-              if (captured.value) return captured.value
-              messages.push(...result.response.messages)
-              if (
-                result.finishReason === "stop" ||
-                result.finishReason === "length" ||
-                result.finishReason === "content-filter"
-              )
-                break
-              if (result.toolCalls.length === 0) break
-            }
-            return null
-          } finally {
-            clearTimeout(timer)
+        try: async (signal) => {
+          const tools = buildAgentTools({ spawner, fs, signal, cwd, captured })
+          const messages: ModelMessage[] = [
+            { role: "system", content: prompt },
+            { role: "user", content: JSON.stringify(envelope) },
+          ]
+          for (let turn = 0; turn < MAX_AGENT_TURNS; turn++) {
+            signal.throwIfAborted()
+            const result = await generateText({
+              model: language,
+              messages,
+              tools,
+              toolChoice: "auto",
+              abortSignal: signal,
+              maxOutputTokens: 4096,
+              allowSystemInMessages: true,
+            } as any)
+            if (captured.value) return captured.value
+            messages.push(...result.response.messages)
+            if (
+              result.finishReason === "stop" ||
+              result.finishReason === "length" ||
+              result.finishReason === "content-filter"
+            )
+              break
+            if (result.toolCalls.length === 0) break
           }
+          return null
         },
         catch: (e) => e,
-      }).pipe(Effect.exit)
+      }).pipe(Effect.timeout(timeoutMs), Effect.exit)
 
       if (loopExit._tag === "Failure") {
         const cause = String(loopExit.cause)
@@ -1804,6 +1786,14 @@ export const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const sessionHooks = yield* SessionHooks.Service
+    const handlerContext = Context.pick(
+      MCP.Service,
+      Provider.Service,
+      Auth.Service,
+      FSUtil.Service,
+      ChildProcessSpawner,
+      HttpClient.HttpClient,
+    )(yield* Effect.context<never>())
 
     const state = yield* InstanceState.make(
       Effect.fn("SettingsHook.state")(function* (instCtx) {
@@ -1813,6 +1803,7 @@ export const layer = Layer.effect(
           hooksList: chain.summaries,
           cwd: instCtx.directory,
           seen: new Map<string, Set<string>>(),
+          once: new Map<string, WeakSet<HookCommand>>(),
         } satisfies State
 
         // [FORK:hook-ext] Hot-reload settings files at runtime. The watcher
@@ -1833,11 +1824,12 @@ export const layer = Layer.effect(
         const handle = watchSettings(
           instCtx.directory,
           instCtx.worktree,
-          () => Effect.sync(() => {
-            const reloaded = loadChainWithSummaries(instCtx.directory, instCtx.worktree)
-            lastSummaries = reloaded.summaries
-            return reloaded.settings
-          }),
+          () =>
+            Effect.sync(() => {
+              const reloaded = loadChainWithSummaries(instCtx.directory, instCtx.worktree)
+              lastSummaries = reloaded.summaries
+              return reloaded.settings
+            }),
           (newSettings, changedFile) => {
             stateObj.settings = newSettings
             stateObj.hooksList = lastSummaries
@@ -1870,9 +1862,7 @@ export const layer = Layer.effect(
 
     // [FORK:hook-ext] Assemble fork middleware — wired from hook/extensions/index.ts
     // When undefined, trigger() behaves identically to upstream.
-    const forkHooks: ForkHooks | undefined = buildForkHooks
-      ? buildForkHooks({ sessionHooks })
-      : undefined
+    const forkHooks: ForkHooks | undefined = buildForkHooks ? buildForkHooks({ sessionHooks }) : undefined
 
     /**
      * Execute a single hook entry. Never throws. Returns the parsed JSON
@@ -1898,7 +1888,23 @@ export const layer = Layer.effect(
           exitCode: undefined as number | null | undefined,
         }
       }
-      return yield* handler.run(entry as never, envelope, cwd, inHook)
+      const result = yield* handler
+        .run(entry as never, envelope, cwd, inHook)
+        .pipe(Effect.updateContext((current: Context.Context<never>) => Context.merge(handlerContext, current)))
+      const hso = result.json?.hookSpecificOutput
+      if (hso) {
+        for (const field of [
+          "initialUserMessage",
+          "watchPaths",
+          "updatedMCPToolOutput",
+          "displayMessage",
+          "compactSummary",
+          "customSummary",
+        ] as const) {
+          if (field in hso) log.warn("hook output field is not supported", { event: envelope.hook_event_name, field })
+        }
+      }
+      return result
     })
 
     // Background scope for async hooks. Lives as long as the SettingsHook service
@@ -1934,7 +1940,9 @@ export const layer = Layer.effect(
         return
       }
       if (!hookRewake) {
-        log.warn("async hook rewake skipped: HookRewake.Service unavailable", { command: commandText(entry).slice(0, 80) })
+        log.warn("async hook rewake skipped: HookRewake.Service unavailable", {
+          command: commandText(entry).slice(0, 80),
+        })
         return
       }
 
@@ -1955,7 +1963,7 @@ export const layer = Layer.effect(
         (event === "UserPromptSubmit" || event === "SessionStart")
       ) {
         const text = result.rawStdout.trim()
-        if (text) parts.push(text)
+        if (text && !text.startsWith("{")) parts.push(text)
       }
       if (parts.length === 0) {
         log.debug("async hook completed: nothing rewake-worthy", { command: commandText(entry).slice(0, 80) })
@@ -1965,16 +1973,16 @@ export const layer = Layer.effect(
       const text = buildRewakePrompt(entry, event, parts.join("\n"))
       yield* hookRewake.rewake({ sessionID: SessionID.make(sessionID), text }).pipe(
         Effect.catchDefect((defect) => {
-          log.warn("async hook rewake defect swallowed", { command: commandText(entry).slice(0, 80), error: String(defect) })
+          log.warn("async hook rewake defect swallowed", {
+            command: commandText(entry).slice(0, 80),
+            error: String(defect),
+          })
           return Effect.void
         }),
       )
     })
 
-    const trigger = Effect.fn("SettingsHook.trigger")(function* (
-      payload: HookPayload,
-      ctx: TriggerContext,
-    ) {
+    const trigger = Effect.fn("SettingsHook.trigger")(function* (payload: HookPayload, ctx: TriggerContext) {
       using _ = log.time("trigger", { event: payload.event, sessionID: ctx.sessionID })
       const s = yield* InstanceState.get(state)
       const result: TriggerResult = { additionalContexts: [], systemMessages: [] }
@@ -1995,6 +2003,7 @@ export const layer = Layer.effect(
       // session, which is harmless.
       if (payload.event === "SessionEnd" && ctx.sessionID) {
         s.seen.delete(ctx.sessionID)
+        s.once.delete(ctx.sessionID)
         // NOTE: sessionHooks.clear is deferred to after hook execution
         // (before each return point below) — clearing here would remove
         // session-registered SessionEnd hooks before the matcher can see them.
@@ -2007,8 +2016,7 @@ export const layer = Layer.effect(
       // s.settings is already cached on the InstanceState, so the file-side
       // probe is a property access. The session probe is O(1) (Map.get +
       // .some over the session's own array, typically empty).
-      const sessionEvent: HookEvent =
-        ctx.isSubAgent && payload.event === "Stop" ? "SubagentStop" : payload.event
+      const sessionEvent: HookEvent = ctx.isSubAgent && payload.event === "Stop" ? "SubagentStop" : payload.event
       const hasFile = (s.settings.hooks?.[payload.event]?.length ?? 0) > 0
       const hasSession = ctx.sessionID
         ? yield* sessionHooks.hasForEvent(SessionID.make(ctx.sessionID), sessionEvent)
@@ -2017,6 +2025,8 @@ export const layer = Layer.effect(
         log.info("trigger short-circuit", { event: payload.event, reason: "no_matchers", hasFile, hasSession })
         if (payload.event === "SessionEnd" && ctx.sessionID) {
           yield* sessionHooks.clear(SessionID.make(ctx.sessionID))
+          s.seen.delete(ctx.sessionID)
+          s.once.delete(ctx.sessionID)
         }
         return result
       }
@@ -2029,8 +2039,7 @@ export const layer = Layer.effect(
       // A layer may declare `allowUntrusted: true` to opt out of the gate. NEVER
       // deny / throw — a trust gate that throws becomes a denial vector. Default
       // (enforcement off) is byte-for-byte the prior behavior (zero gate).
-      const requireTrust =
-        s.settings.requireTrust === true || process.env.OPENCODE_HOOKS_REQUIRE_TRUST === "1"
+      const requireTrust = s.settings.requireTrust === true || process.env.OPENCODE_HOOKS_REQUIRE_TRUST === "1"
       if (requireTrust && !isTrusted(s.cwd) && s.settings.allowUntrusted !== true) {
         log.warn("hooks skipped: workspace not trusted", {
           cwd: s.cwd,
@@ -2043,6 +2052,8 @@ export const layer = Layer.effect(
         // leaked in memory for the process lifetime.
         if (payload.event === "SessionEnd" && ctx.sessionID) {
           yield* sessionHooks.clear(SessionID.make(ctx.sessionID))
+          s.seen.delete(ctx.sessionID)
+          s.once.delete(ctx.sessionID)
         }
         return result
       }
@@ -2075,6 +2086,8 @@ export const layer = Layer.effect(
         log.info("trigger short-circuit", { event: payload.event, reason: "empty_matchers" })
         if (payload.event === "SessionEnd" && ctx.sessionID) {
           yield* sessionHooks.clear(SessionID.make(ctx.sessionID))
+          s.seen.delete(ctx.sessionID)
+          s.once.delete(ctx.sessionID)
         }
         return result
       }
@@ -2085,6 +2098,7 @@ export const layer = Layer.effect(
       for (const group of matchers) {
         if (!matches(group.matcher, target)) continue
 
+        let claimed = false
         for (const entry of group.hooks) {
           // Forward-compat: skip truly unknown types so future schema additions don't crash
           // older handlers. Known types (command/mcp/http/prompt/agent) all flow into runEntry.
@@ -2100,15 +2114,25 @@ export const layer = Layer.effect(
           // [FORK:hook-ext] Pre-dispatch filter — skip entry if condition not met
           if (forkHooks?.beforeRunEntry && !forkHooks.beforeRunEntry(entry, envelope, payload.event)) continue
 
+          const onceBucket = s.once.get(ctx.sessionID) ?? new WeakSet<HookCommand>()
+          if (entry.once && onceBucket.has(entry)) continue
+
+          if (group._sessionEntry?.once && ctx.sessionID && !claimed) {
+            if (!(yield* sessionHooks.claim(SessionID.make(ctx.sessionID), group._sessionEntry.id))) break
+            claimed = true
+          }
+          if (entry.once) {
+            onceBucket.add(entry)
+            s.once.set(ctx.sessionID, onceBucket)
+          }
+          if (entry.statusMessage) log.info("hook status", { event: payload.event, message: entry.statusMessage })
+
           // ── Async fork (hook-async-rewake) ──────────────────────
           // async:true entries are forked into the background and do NOT
           // participate in the current TriggerResult aggregation. Their output
           // (when asyncRewake:true) is delivered back via onAsyncComplete →
           // Session.rewake once the background fiber settles.
           if (entry.async) {
-            if (group._sessionEntry?.once && ctx.sessionID) {
-              yield* sessionHooks.remove(SessionID.make(ctx.sessionID), group._sessionEntry.id)
-            }
             const hookRewake = Option.getOrUndefined(yield* Effect.serviceOption(HookRewake.Service))
             const capturedEvent = payload.event
             const capturedSessionID = ctx.sessionID
@@ -2152,7 +2176,12 @@ export const layer = Layer.effect(
                 command: commandText(entry),
                 error: String(defect),
               })
-              return Effect.succeed({ json: undefined, exitBlock: undefined, rawStdout: undefined, exitCode: undefined })
+              return Effect.succeed({
+                json: undefined,
+                exitBlock: undefined,
+                rawStdout: undefined,
+                exitCode: undefined,
+              })
             }),
           )
 
@@ -2176,13 +2205,9 @@ export const layer = Layer.effect(
               (payload.event === "UserPromptSubmit" || payload.event === "SessionStart")
             ) {
               const text = rawStdout.trim()
-              if (text && addSeen(s.seen, ctx.sessionID, text)) {
+              if (text && !text.startsWith("{") && addSeen(s.seen, ctx.sessionID, text)) {
                 result.additionalContexts.push(text)
               }
-            }
-            // once: true entries are cleared after running, regardless of result.
-            if (group._sessionEntry?.once && ctx.sessionID) {
-              yield* sessionHooks.remove(SessionID.make(ctx.sessionID), group._sessionEntry.id)
             }
             continue
           }
@@ -2217,9 +2242,7 @@ export const layer = Layer.effect(
             // Most-restrictive-wins: deny > ask > allow. A later hook cannot
             // relax an earlier hook's deny (Claude Code permission semantics).
             const moreRestrictive =
-              current === undefined ||
-              incoming === "deny" ||
-              (incoming === "ask" && current === "allow")
+              current === undefined || incoming === "deny" || (incoming === "ask" && current === "allow")
             if (moreRestrictive) {
               result.permissionDecision = incoming
               result.permissionDecisionReason =
@@ -2228,12 +2251,6 @@ export const layer = Layer.effect(
           }
           if (hso && "updatedInput" in hso && hso.updatedInput) {
             result.updatedInput = hso.updatedInput
-          }
-
-          // once: true cleanup — runs after aggregating this entry's json so
-          // additionalContext etc. still surface on the first (and only) firing.
-          if (group._sessionEntry?.once && ctx.sessionID) {
-            yield* sessionHooks.remove(SessionID.make(ctx.sessionID), group._sessionEntry.id)
           }
 
           // CC contract: continue=false short-circuits remaining hooks in this
@@ -2246,6 +2263,8 @@ export const layer = Layer.effect(
 
       if (payload.event === "SessionEnd" && ctx.sessionID) {
         yield* sessionHooks.clear(SessionID.make(ctx.sessionID))
+        s.seen.delete(ctx.sessionID)
+        s.once.delete(ctx.sessionID)
       }
       return result
     })
@@ -2259,12 +2278,16 @@ export const layer = Layer.effect(
   }),
 )
 
-// Only provide deps needed at layer construction (SessionHooks — the sole
-// service yielded in the layer body). Handler deps (MCP/Provider/Auth/FSUtil/
-// HttpClient/CrossSpawnSpawner/HookRewake) are resolved lazily at trigger time
-// from whatever ambient context the Effect runs in.
-export const defaultLayer = layer.pipe(
-  Layer.provide(SessionHooks.defaultLayer),
+export const defaultLayer = Layer.suspend(() =>
+  layer.pipe(
+    Layer.provide(SessionHooks.defaultLayer),
+    Layer.provide(MCP.defaultLayer),
+    Layer.provide(Provider.defaultLayer),
+    Layer.provide(Auth.defaultLayer),
+    Layer.provide(FSUtil.defaultLayer),
+    Layer.provide(CrossSpawnSpawner.defaultLayer),
+    Layer.provide(FetchHttpClient.layer),
+  ),
 )
 
 // ── type:"mcp" hook execution ───────────────────────────────────
@@ -2285,11 +2308,7 @@ export const defaultLayer = layer.pipe(
  * tool with the hook envelope as `arguments`. Parses the first text content
  * item as JSON to obtain the standard hook control output.
  */
-function invokeMcpHook(
-  mcpSvc: MCP.Interface,
-  command: string,
-  envelope: Record<string, unknown>,
-) {
+function invokeMcpHook(mcpSvc: MCP.Interface, command: string, envelope: Record<string, unknown>) {
   return Effect.gen(function* () {
     if (!command.startsWith("mcp__")) {
       log.warn("mcp hook command must start with mcp__", { command })
@@ -2321,13 +2340,16 @@ function invokeMcpHook(
       return undefined
     }
 
-    const result = yield* Effect.promise(() =>
+    const result = yield* Effect.promise((signal) =>
       Promise.resolve(
-        tool.execute!(envelope as never, {
-          toolCallId: `hook-${Date.now()}`,
-          messages: [],
-          abortSignal: new AbortController().signal,
-        } as never),
+        tool.execute!(
+          envelope as never,
+          {
+            toolCallId: `hook-${Date.now()}`,
+            messages: [],
+            abortSignal: signal,
+          } as never,
+        ),
       ).catch((err) => {
         log.warn("mcp hook execution threw", { command, error: String(err) })
         return undefined
@@ -2337,13 +2359,29 @@ function invokeMcpHook(
     if (!result || typeof result !== "object" || !("content" in result)) return undefined
 
     const content = (result as { content: Array<{ type: string; text?: string }> }).content
-    const firstText = content.find((c) => c.type === "text" && typeof c.text === "string")?.text
+    if (!Array.isArray(content)) return undefined
+    const firstText = content.find((c) => c && c.type === "text" && typeof c.text === "string")?.text
     if (!firstText) return undefined
 
     return parseStdout(firstText, command)
   })
 }
 
-export const node = LayerNode.make(layer, [SessionHooks.node])
+// Resolve module references after initialization; provider/plugin imports can
+// otherwise encounter this module while their own node exports are in the TDZ.
+export const node = {
+  ...LayerNode.make(layer, [SessionHooks.node]),
+  get dependencies() {
+    return [
+      SessionHooks.node,
+      MCP.node,
+      Provider.node,
+      Auth.node,
+      FSUtil.node,
+      CrossSpawnSpawner.node,
+      LayerNode.make(FetchHttpClient.layer, []),
+    ]
+  },
+}
 
 export * as SettingsHook from "./settings"

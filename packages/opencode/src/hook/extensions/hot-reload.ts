@@ -36,11 +36,7 @@ const POLL_INTERVAL_MS = 2000
  * is never read. Global is included so editing `~/.config/opencode/hooks.json`
  * takes effect without a restart (previously startup-only).
  */
-function watchedFiles(
-  projectDir: string,
-  worktree: string | undefined,
-  opencodeGlobalConfig?: string,
-): string[] {
+function watchedFiles(projectDir: string, worktree: string | undefined, opencodeGlobalConfig?: string): string[] {
   const files: string[] = []
   if (opencodeGlobalConfig) files.push(path.join(opencodeGlobalConfig, "hooks.json"))
   files.push(path.join(projectDir, ".opencode", "hooks.json"))
@@ -111,13 +107,13 @@ export function watchSettings(
   const fireReload = (changedFile: string) => {
     log.info("hooks.json changed, reloading", { file: changedFile })
     // Fire-and-forget: reload errors are logged but never crash
-    Effect.runPromise(reload()).then(
-      (settings) => {
+    Effect.runPromise(Effect.suspend(reload))
+      .then((settings) => {
+        if (closed) return
         log.info("hooks hot-reloaded", { file: changedFile, hookCount: countHooks(settings) })
         onReload(settings, changedFile)
-      },
-      (err) => log.warn("hooks reload failed", { file: changedFile, error: String(err) }),
-    )
+      })
+      .catch((err) => log.warn("hooks reload failed", { file: changedFile, error: String(err) }))
   }
 
   // Debounce: 500ms. Min 1s between reloads. On min-interval block, reschedule
