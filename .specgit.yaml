@@ -5,8 +5,12 @@ context:
   label: opencode-release-1042
   branch: chore/576-stable-release-1042
 issues:
+  - 568
+  - 569
+  - 570
+  - 571
+  - 572
+  - 574
+  - 575
   - 576
-issueKinds:
-  - issue: 576
-    kind: kind::chore
 pr: 577

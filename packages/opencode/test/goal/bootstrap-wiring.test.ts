@@ -2,6 +2,8 @@ import { describe, expect } from "bun:test"
 import { Effect, Layer } from "effect"
 import { NodeFileSystem } from "@effect/platform-node"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
+import { Session } from "@/session/session"
+import { SessionPrompt } from "@/session/prompt"
 import { Goal } from "@/goal/goal"
 import { SessionStatus } from "@/session/status"
 import { SessionID } from "@/session/schema"
@@ -68,3 +70,56 @@ describe("GoalLoop production wiring — idle must drive afterIdle", () => {
     20_000,
   )
 })
+
+it.live(
+  "production AppLayer dispatches Goal controls without invoking the model",
+  () =>
+    provideTmpdirInstance((directory) =>
+      Effect.promise(async () => {
+        await Bun.write(
+          `${directory}/opencode.json`,
+          JSON.stringify({
+            model: "test/test-model",
+            formatter: false,
+            lsp: false,
+            provider: {
+              test: {
+                npm: "@ai-sdk/openai-compatible",
+                models: { "test-model": { name: "Test Model" } },
+                options: { apiKey: "test", baseURL: "http://127.0.0.1:1/v1" },
+              },
+            },
+          }),
+        )
+        const { AppRuntime } = await import("@/effect/app-runtime")
+        await AppRuntime.runPromise(
+          Effect.gen(function* () {
+            const store = yield* InstanceStore.Service
+            yield* store.provide(
+              { directory },
+              Effect.gen(function* () {
+                const session = yield* (yield* Session.Service).create({ title: "Goal wiring" })
+                const goal = yield* Goal.Service
+                yield* goal.set(session.id, "production Goal wiring", 7)
+                yield* goal.pause(session.id, "smoke test")
+                const result = yield* (yield* SessionPrompt.Service).command({
+                  sessionID: session.id,
+                  command: "goal",
+                  arguments: "status",
+                })
+                const text = result.parts
+                  .filter((part) => part.type === "text")
+                  .map((part) => part.text)
+                  .join("\n")
+                expect(text).toContain("production Goal wiring")
+                expect(text).toContain("0/7")
+                expect((yield* goal.load(session.id))?.status).toBe("paused")
+                yield* goal.clear(session.id)
+              }),
+            )
+          }),
+        )
+      }),
+    ),
+  20_000,
+)

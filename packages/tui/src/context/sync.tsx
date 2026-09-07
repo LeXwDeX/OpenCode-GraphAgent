@@ -636,9 +636,11 @@ export const {
       if (sessionIDs.length === 0) return Promise.resolve()
       return Promise.all(
         sessionIDs.map((sessionID) =>
-          sdk.client.session.goal({ sessionID }, { throwOnError: false })
+          sdk.client.session
+            .goal({ sessionID }, { throwOnError: false })
             .then((response) => {
-              setStore("goal", sessionID, response.data ?? undefined)
+              if (response.data) setStore("goal", sessionID, response.data)
+              else if (response.response?.status === 404) setStore("goal", sessionID, undefined)
             })
             .catch(() => {}),
         ),

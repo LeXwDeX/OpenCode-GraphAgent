@@ -9,9 +9,11 @@ A `goal` **tool** is also available. Use `goal(action: "complete")` to self-decl
 ## Commands (user-facing; only you or the user can issue these)
 
 - `/goal <text>` — Set a new autonomous goal. The agent will work in a loop until the goal is achieved or the turn budget is exhausted.
+- `/goal --max-turns <N> <text>` — Set a goal with a positive integer total turn budget (default 20).
 - `/goal status` — Show the current goal state (active/paused/achieved, turns used/total).
 - `/goal pause` — Pause the current goal. Use `/goal resume` to continue.
-- `/goal resume` — Resume a paused goal.
+- `/goal resume` — Resume a paused goal without resetting used turns or changing the budget. If exhausted, this permits one additional execution before the judge may pause it again.
+- `/goal resume --max-turns <N>` — Resume with a new total budget greater than the turns already used.
 - `/goal clear` or `/goal stop` — Clear the current goal and stop the loop.
 - `/goal done` — Explicitly mark the goal as finished (same as the `goal` tool with `action=complete`).
 - `/subgoal <text>` — Add a subgoal to the current goal.
