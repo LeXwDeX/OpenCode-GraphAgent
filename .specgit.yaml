@@ -10,6 +10,7 @@ issues:
   - 570
   - 571
   - 572
+  - 574
 issueKinds:
   - issue: 568
     kind: kind::fix
