@@ -20,6 +20,7 @@ import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { ChildProcessSpawner } from "effect/unstable/process/ChildProcessSpawner"
 import { buildAgentTools } from "@/hook/agent-tools"
+import { jsonSchema, tool } from "ai"
 
 const quote = (text: string) => "'" + text.replaceAll("'", "'\\''") + "'"
 const jsonCommand = (json: unknown) => "printf '%s' " + quote(JSON.stringify(json))
@@ -113,6 +114,52 @@ describe("real SessionTools call path", () => {
       const tools = yield* resolve(id, instance.directory)
       const result = yield* execute(tools, path.join(instance.directory, "changed.txt")).pipe(Effect.exit)
       expect(result._tag).toBe("Success")
+    }),
+  )
+
+  it.instance("rejected MCP calls run failure hooks and keep feedback", () =>
+    Effect.gen(function* () {
+      const instance = yield* TestInstance
+      const store = yield* SessionHooks.Service
+      const mcp = yield* MCP.Service
+      const id = SessionID.descending()
+      yield* store.add(id, {
+        event: "PostToolUseFailure",
+        hooks: [{ type: "command", command: jsonCommand({ decision: "block", reason: "MCP_FAILURE_FEEDBACK" }) }],
+      })
+      const tools = yield* resolve(id, instance.directory).pipe(
+        Effect.provideService(MCP.Service, {
+          ...mcp,
+          tools: () =>
+            Effect.succeed({
+              audit_failure: tool({
+                inputSchema: jsonSchema({ type: "object", properties: {} }),
+                execute: async (): Promise<{ content: { type: "text"; text: string }[] }> => {
+                  throw new Error("MCP transport rejected")
+                },
+              }),
+            }),
+        }),
+      )
+      const result = yield* Effect.tryPromise({
+        try: () =>
+          Promise.resolve(
+            tools.audit_failure.execute!(
+              {},
+              {
+                toolCallId: "audit-failure",
+                messages: [],
+                abortSignal: new AbortController().signal,
+              },
+            ),
+          ),
+        catch: (error) => error,
+      }).pipe(Effect.exit)
+      expect(result._tag).toBe("Failure")
+      if (result._tag !== "Failure") return
+      const failure = String(Cause.squash(result.cause))
+      expect(failure).toContain("MCP transport rejected")
+      expect(failure).toContain("MCP_FAILURE_FEEDBACK")
     }),
   )
 })

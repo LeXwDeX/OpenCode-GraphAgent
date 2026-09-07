@@ -18,7 +18,7 @@ import { withHookFeedback, withHookFailure } from "@/hook/trigger-result"
 import { toolFileChanges } from "@/hook/file-changes"
 import { applyPreHookDecision, classifyPermissionAsk } from "@/hook/pre-hook-decision"
 import { type Tool as AITool, tool, jsonSchema, type ToolExecutionOptions, asSchema } from "ai"
-import { Effect } from "effect"
+import { Cause, Effect } from "effect"
 import * as Option from "effect/Option"
 import { Session } from "./session"
 import { SessionProcessor } from "./processor"
@@ -260,8 +260,10 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
               }
               return output
             }).pipe(
-              Effect.catch((error: unknown) =>
+              Effect.catchCause((cause) =>
                 Effect.gen(function* () {
+                  if (Cause.hasInterrupts(cause)) return yield* Effect.failCause(cause)
+                  const error = Cause.squash(cause)
                   // SettingsHook PostToolUseFailure
                   if (settingsHook) {
                     const failResult = yield* settingsHook
@@ -281,9 +283,11 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
                         ),
                       )
                     yield* SettingsHook.landSystemMessages(failResult, { sessionID: input.session.id })
-                    error = withHookFailure(error, failResult)
+                    const failure = withHookFailure(error, failResult)
+                    if (failure !== error)
+                      return yield* Cause.hasDies(cause) ? Effect.die(failure) : Effect.fail(failure)
                   }
-                  return yield* Effect.fail(error)
+                  return yield* Effect.failCause(cause)
                 }),
               ),
             ),
@@ -719,8 +723,10 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
           }
           return output
         }).pipe(
-          Effect.catch((error: unknown) =>
+          Effect.catchCause((cause) =>
             Effect.gen(function* () {
+              if (Cause.hasInterrupts(cause)) return yield* Effect.failCause(cause)
+              const error = Cause.squash(cause)
               if (settingsHook) {
                 const failResult = yield* settingsHook
                   .trigger(
@@ -737,9 +743,10 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
                     Effect.catch(() => Effect.succeed<TriggerResult>({ additionalContexts: [], systemMessages: [] })),
                   )
                 yield* SettingsHook.landSystemMessages(failResult, { sessionID: input.session.id })
-                error = withHookFailure(error, failResult)
+                const failure = withHookFailure(error, failResult)
+                if (failure !== error) return yield* Cause.hasDies(cause) ? Effect.die(failure) : Effect.fail(failure)
               }
-              return yield* Effect.fail(error)
+              return yield* Effect.failCause(cause)
             }),
           ),
         ),

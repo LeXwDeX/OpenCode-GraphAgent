@@ -306,6 +306,45 @@ it.live("session cancellation aborts a post-tool hook and preserves the complete
   ),
 )
 
+it.live("native tool failures run failure hooks and preserve their feedback", () =>
+  provideTmpdirServer(
+    Effect.fnUntraced(function* ({ llm, dir }) {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const hooks = yield* SessionHooks.Service
+      const session = yield* sessions.create({
+        title: "Native failure hook",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      yield* hooks.add(session.id, {
+        event: "PostToolUseFailure",
+        hooks: [
+          {
+            type: "command",
+            command: `printf '%s' '{"hookSpecificOutput":{"additionalContext":"failure-feedback: retry an existing file"}}'`,
+          },
+        ],
+      })
+      yield* llm.tool("read", { filePath: path.join(dir, "missing.txt") })
+      yield* llm.text("I will retry a file that exists.")
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        parts: [{ type: "text", text: "read the missing file" }],
+      })
+      const parts = (yield* sessions.messages({ sessionID: session.id })).flatMap((message) => message.parts)
+      const failed = parts.find((part) => part.type === "tool" && part.tool === "read")
+      expect(failed?.type).toBe("tool")
+      if (failed?.type !== "tool") return
+      expect(failed?.state.status).toBe("error")
+      if (failed?.state.status !== "error") return
+      expect(failed.state.error).toContain("failure-feedback")
+      expect(JSON.stringify(yield* llm.inputs)).toContain("failure-feedback")
+    }),
+    { git: true, config: providerCfg },
+  ),
+)
+
 it.live("native write, edit and multi-file patch emit actual FileChanged paths", () =>
   provideTmpdirServer(
     Effect.fnUntraced(function* ({ llm, dir }) {
