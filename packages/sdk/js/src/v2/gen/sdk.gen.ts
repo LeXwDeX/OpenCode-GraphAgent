@@ -3461,6 +3461,13 @@ export class Hook extends HeyApiClient {
         if?: string
         async?: boolean
         asyncRewake?: boolean
+        shell?: "bash" | "powershell"
+        allowedEnvVars?: Array<string>
+        statusMessage?: string
+        once?: boolean
+        options?: {
+          [key: string]: unknown
+        }
       }>
       once?: boolean
     },

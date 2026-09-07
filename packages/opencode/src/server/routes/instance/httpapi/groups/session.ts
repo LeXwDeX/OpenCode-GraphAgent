@@ -92,6 +92,11 @@ export const SessionHookCommandPayload = Schema.Struct({
   if: Schema.optional(Schema.String),
   async: Schema.optional(Schema.Boolean),
   asyncRewake: Schema.optional(Schema.Boolean),
+  shell: Schema.optional(Schema.Literals(["bash", "powershell"])),
+  allowedEnvVars: Schema.optional(Schema.Array(Schema.String)),
+  statusMessage: Schema.optional(Schema.String),
+  once: Schema.optional(Schema.Boolean),
+  options: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)),
 })
 export const SessionHookAddPayload = Schema.Struct({
   event: HookEventParam,

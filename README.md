@@ -265,6 +265,7 @@ its single-session complement: one durable goal that the agent works toward
 autonomously across turns of the current session.
 
 - Commands: `/goal <text>` sets a goal and starts the loop; `/goal status|pause|resume|done|clear|stop` controls it; `/subgoal <text>|list|remove <n>|clear` manages subgoals attached to the active goal.
+- Budget: `/goal --max-turns 30 <text>` sets a positive integer total budget (default 20). `/goal resume --max-turns 50` changes the total budget without resetting used turns; the new total must exceed used turns. Plain `/goal resume` retains the budget and permits one more execution when exhausted.
 - Judge loop: after each turn an external judge evaluates progress — `done` clears the goal, `continue` injects the next continuation turn against a configurable turn budget (budget exhaustion pauses the goal; it stays resumable). The agent can self-declare completion with the `goal(action: "complete")` tool, which bypasses the judge; `goal(action: "status")` inspects state.
 - Visibility: while a goal is active or paused, the system prompt carries a live goal block (text, status, turns used/remaining, subgoals, last judge verdict); the TUI sidebar shows a compact goal widget; `GET /session/:sessionID/goal` exposes the state (`404` when no goal is set).
 - Durability: goal state is persisted per session (`goal_state`), survives restarts, and is cleared automatically when the session is deleted.

@@ -17,7 +17,7 @@ case "$tool" in
     # (branch "feat/1-a" must never satisfy a record for "feat/1-a2").
     branch=$(git branch --show-current 2>/dev/null)
     if [ -z "$branch" ] || [ ! -f .specgit.yaml ] || ! grep -qFx "  branch: $branch" .specgit.yaml; then
-      echo "specgit: start gate - this branch has no delivery binding. Start the delivery first: specgit issue \"<type>: <title>\", then fill each issue body from the discussion, then edit files." >&2
+      echo "specgit: start gate - this branch has no delivery binding. Start the delivery first according to the managed guidance: prepare any required body files, then run specgit issue \"<type>: <title>\" with them before editing files." >&2
       exit 2
     fi
     exit 0
@@ -25,19 +25,161 @@ case "$tool" in
 esac
 command=$(printf '%s' "$payload" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{try{const j=JSON.parse(s);process.stdout.write((j.tool_input&&j.tool_input.command)||'')}catch{process.stdout.write('')}})")
 
-case "$command" in
-  gh\ pr\ merge*|glab\ mr\ merge*)
+# Classify statically visible forge-merge commands without executing or
+# expanding shell input. The lexer understands quoting, command separators,
+# environment assignments, env/command/exec wrappers, and forge-global repo
+# selectors. It deliberately inspects only each simple command's executable
+# and leading global options, so quoted prose such as echo "gh pr merge" does
+# not trigger the gate.
+merge_command=$(printf '%s' "$command" | node -e '
+  const fs = require("fs");
+  const source = fs.readFileSync(0, "utf8");
+  const SQ = String.fromCharCode(39);
+  const DQ = String.fromCharCode(34);
+  const BS = String.fromCharCode(92);
+
+  function tokenize(text) {
+    const tokens = [];
+    let word = "";
+    let active = false;
+    let quote = 0;
+    const flush = () => {
+      if (!active) return;
+      tokens.push({ kind: "word", value: word });
+      word = "";
+      active = false;
+    };
+    for (let index = 0; index < text.length; index += 1) {
+      const char = text[index];
+      if (quote === 39) {
+        if (char === SQ) quote = 0;
+        else word += char;
+        continue;
+      }
+      if (quote === 34) {
+        if (char === DQ) {
+          quote = 0;
+        } else if (char === BS) {
+          if (index + 1 >= text.length) return null;
+          word += text[++index];
+        } else {
+          word += char;
+        }
+        continue;
+      }
+      if (char === SQ || char === DQ) {
+        quote = char === SQ ? 39 : 34;
+        active = true;
+      } else if (char === BS) {
+        if (index + 1 >= text.length) return null;
+        const next = text[++index];
+        if (next !== "\n") {
+          word += next;
+          active = true;
+        }
+      } else if (char === " " || char === "\t" || char === "\r") {
+        flush();
+      } else if (char === "\n" || char === ";" || char === "|" ||
+                 char === "&" || char === "(" || char === ")") {
+        flush();
+        if ((char === "|" || char === "&") && text[index + 1] === char) index += 1;
+        tokens.push({ kind: "boundary" });
+      } else if (char === "#" && !active) {
+        while (index + 1 < text.length && text[index + 1] !== "\n") index += 1;
+      } else {
+        word += char;
+        active = true;
+      }
+    }
+    if (quote !== 0) return null;
+    flush();
+    return tokens;
+  }
+
+  const executable = (word) => {
+    const base = word.replace(/\\/g, "/").split("/").pop() || "";
+    return base.toLowerCase().replace(/\.exe$/, "");
+  };
+  const assignment = /^[A-Za-z_][A-Za-z0-9_]*=/;
+
+  function unwrap(words) {
+    let index = 0;
+    while (assignment.test(words[index] || "")) index += 1;
+    if (executable(words[index] || "") === "env") {
+      index += 1;
+      while (assignment.test(words[index] || "")) index += 1;
+    }
+    while (["command", "exec"].includes(executable(words[index] || ""))) {
+      index += 1;
+    }
+    return words.slice(index);
+  }
+
+  function isForgeMerge(segment) {
+    const words = unwrap(segment);
+    const forge = executable(words[0] || "");
+    if (forge !== "gh" && forge !== "glab") return false;
+    let index = 1;
+    while (index < words.length) {
+      const option = words[index];
+      if (["-R", "--repo", "--hostname"].includes(option)) {
+        if (index + 1 >= words.length) return false;
+        index += 2;
+      } else if (option === "--" || option.startsWith("--repo=") ||
+                 option.startsWith("--hostname=") ||
+                 (option.startsWith("-R") && option.length > 2)) {
+        index += 1;
+        if (option === "--") break;
+      } else {
+        break;
+      }
+    }
+    return forge === "gh"
+      ? words[index] === "pr" && words[index + 1] === "merge"
+      : words[index] === "mr" && words[index + 1] === "merge";
+  }
+
+  const tokens = tokenize(source);
+  if (tokens === null) {
+    process.stdout.write("indeterminate");
+  } else {
+    let segment = [];
+    for (const token of [...tokens, { kind: "boundary" }]) {
+      if (token.kind === "word") {
+        segment.push(token.value);
+      } else {
+        if (isForgeMerge(segment)) {
+          process.stdout.write("merge");
+          process.exit(0);
+        }
+        segment = [];
+      }
+    }
+  }
+')
+classifier_status=$?
+if [ "$classifier_status" -ne 0 ]; then
+  merge_command=indeterminate
+fi
+
+case "$merge_command" in
+  indeterminate)
+    echo "specgit: command blocked - the merge guard could not safely classify the shell input. Retry with a direct gh pr merge or glab mr merge command." >&2
+    exit 2
+    ;;
+  merge)
     exec node -e '
       const { spawn } = require("child_process");
       const fs = require("fs");
       const path = require("path");
-      const ghMsRaw = parseInt(process.env.SPECGIT_GH_TIMEOUT_MS || "", 10);
-      const ghMs = Number.isFinite(ghMsRaw) && ghMsRaw > 0 ? ghMsRaw : 15000;
-      const ghS = Math.max(1, Math.floor(ghMs / 1000));
-      let budgetS = Math.max(60, ghS * 8);
+      const timeoutMs = ["SPECGIT_GH_TIMEOUT_MS", "SPECGIT_GLAB_TIMEOUT_MS"]
+        .map((name) => parseInt(process.env[name] || "", 10))
+        .map((value) => Number.isFinite(value) && value > 0 ? value : 15000);
+      const providerS = Math.max(1, Math.ceil(Math.max(...timeoutMs) / 1000));
+      let budgetS = Math.max(60, providerS * 8);
       const overrideRaw = parseInt(process.env.SPECGIT_GUARD_BUDGET_S || "", 10);
       if (Number.isFinite(overrideRaw) && overrideRaw > 0) {
-        budgetS = Math.max(overrideRaw, ghS);
+        budgetS = Math.max(overrideRaw, providerS);
       }
       // The hook runner kills long hooks; surface the mismatch instead of
       // being cut off mid-verdict.
@@ -135,7 +277,7 @@ case "$command" in
           );
         } else {
           lines.push(
-            "specgit: merge blocked - no verdict possible (evidence incomplete, exit " + code + "). This is not a rejection: fix evidence gathering (network, gh auth), then retry."
+            "specgit: merge blocked - no verdict possible (evidence incomplete, exit " + code + "). This is not a rejection: follow errors[].fix in the specgit finish --json result first. Run specgit doctor --json only for git, repository, origin, configured provider CLI/auth, or policy probes, then retry."
           );
         }
         if (pending.length > 0) {
@@ -167,9 +309,33 @@ case "$command" in
       });
     '
     ;;
-  git\ push\ origin\ main*|git\ push\ origin\ +main*|git\ push\ origin\ HEAD:main*)
-    echo "specgit: direct push to main is not the delivery path. Deliveries go: specgit issue -> PR -> CI -> specgit finish (exit 0) -> merge." >&2
-    exit 2
+esac
+unset classifier_status merge_command
+
+specgit_default_ref() {
+  specgit_ref=$(git symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null) || return 1
+  case "$specgit_ref" in
+    refs/remotes/origin/HEAD) return 1 ;;
+    refs/remotes/origin/?*) ;;
+    *) return 1 ;;
+  esac
+  git rev-parse --verify "$specgit_ref^{commit}" >/dev/null 2>&1 || return 1
+  printf '%s' "$specgit_ref"
+}
+
+case "$command" in
+  git\ push\ origin\ *)
+    default_ref=$(specgit_default_ref) || {
+      echo "specgit: cannot prove origin/HEAD. Run git fetch origin and git remote set-head origin -a before pushing." >&2
+      exit 2
+    }
+    default_branch=${default_ref#refs/remotes/origin/}
+    case "$command" in
+      git\ push\ origin\ "$default_branch"|git\ push\ origin\ "$default_branch"\ *|git\ push\ origin\ +"$default_branch"|git\ push\ origin\ +"$default_branch"\ *|git\ push\ origin\ HEAD:"$default_branch"|git\ push\ origin\ HEAD:"$default_branch"\ *)
+        echo "specgit: direct push to $default_branch is not the delivery path. Deliveries go: specgit issue -> PR/MR -> CI -> specgit finish (exit 0) -> merge." >&2
+        exit 2
+        ;;
+    esac
     ;;
 esac
 exit 0

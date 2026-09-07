@@ -1,0 +1,159 @@
+import { expect, describe } from "bun:test"
+import { Effect, Layer } from "effect"
+import { MockLanguageModelV3 } from "ai/test"
+import { SettingsHook, type HookCommand } from "@/hook/settings"
+import { SessionHooks } from "@/hook/session-hooks"
+import { EventV2Bridge } from "@/event-v2-bridge"
+import { Database } from "@opencode-ai/core/database/database"
+import { SessionID } from "@/session/schema"
+import { Provider } from "@/provider/provider"
+import { ProviderTest } from "../fake/provider"
+import { Auth } from "@/auth"
+import { MCP } from "@/mcp"
+import { FSUtil } from "@opencode-ai/core/fs-util"
+import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
+import { testEffect } from "../lib/effect"
+
+const base = SettingsHook.layer.pipe(
+  Layer.provide(EventV2Bridge.defaultLayer),
+  Layer.provide(Database.defaultLayer),
+  Layer.provideMerge(SessionHooks.defaultLayer),
+)
+const it = testEffect(Layer.mergeAll(base, CrossSpawnSpawner.defaultLayer, FSUtil.defaultLayer))
+const run = (entry: HookCommand) =>
+  Effect.gen(function* () {
+    const store = yield* SessionHooks.Service
+    const settings = yield* SettingsHook.Service
+    const id = SessionID.descending()
+    yield* store.add(id, { event: "PreToolUse", hooks: [entry] })
+    return yield* settings.trigger(
+      { event: "PreToolUse", toolName: "bash", toolInput: {} },
+      { sessionID: id, transcriptPath: "" },
+    )
+  })
+const usage = {
+  inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
+  outputTokens: { total: 1, text: 1, reasoning: 0 },
+}
+const generated = (text: string) => ({
+  content: [{ type: "text" as const, text }],
+  finishReason: { unified: "stop" as const, raw: "stop" },
+  usage,
+  warnings: [],
+})
+const providerLayer = (language: any) =>
+  Layer.mergeAll(
+    Layer.mock(Provider.Service, {
+      defaultModel: () => Effect.succeed({ providerID: "audit" as any, modelID: "test" as any }),
+      getModel: () => Effect.succeed(ProviderTest.model()),
+      getLanguage: () => Effect.succeed(language),
+    }),
+    Layer.mock(Auth.Service, { get: () => Effect.succeed({ type: "api", key: "test-only" } as any) }),
+  )
+
+describe("hook handlers through real AI SDK and MCP invocation adapter", () => {
+  it.instance("prompt handler accepts a model-produced block decision", () =>
+    Effect.gen(function* () {
+      const model = new MockLanguageModelV3({
+        doGenerate: generated(JSON.stringify({ decision: "block", reason: "prompt-real-handler" })),
+      })
+      const result = yield* run({ type: "prompt", prompt: "audit decision" }).pipe(Effect.provide(providerLayer(model)))
+      expect(result.blocked?.reason).toBe("prompt-real-handler")
+    }),
+  )
+
+  it.instance("agent handler runs synthetic_output and accepts the result", () =>
+    Effect.gen(function* () {
+      const model = new MockLanguageModelV3({
+        doGenerate: {
+          content: [
+            {
+              type: "tool-call",
+              toolCallId: "audit-output",
+              toolName: "synthetic_output",
+              input: JSON.stringify({ decision: "block", reason: "agent-real-handler" }),
+            },
+          ],
+          finishReason: { unified: "tool-calls", raw: "tool_calls" },
+          usage,
+          warnings: [],
+        },
+      })
+      const result = yield* run({ type: "agent", prompt: "emit audit decision" }).pipe(
+        Effect.provide(providerLayer(model)),
+      )
+      expect(result.blocked?.reason).toBe("agent-real-handler")
+    }),
+  )
+
+  it.instance("mcp handler maps its tool name and accepts the decision", () =>
+    Effect.gen(function* () {
+      let envelope: any
+      const mcp = Layer.mock(MCP.Service, {
+        tools: () =>
+          Effect.succeed({
+            audit_check: {
+              execute: async (input: any) => {
+                envelope = input
+                return {
+                  content: [{ type: "text", text: JSON.stringify({ decision: "block", reason: "mcp-real-handler" }) }],
+                }
+              },
+            },
+          } as any),
+      })
+      const result = yield* run({ type: "mcp", command: "mcp__audit__check" }).pipe(Effect.provide(mcp))
+      expect(envelope.hook_event_name).toBe("PreToolUse")
+      expect(result.blocked?.reason).toBe("mcp-real-handler")
+    }),
+  )
+
+  it.instance("prompt timeout must abort the underlying model request", () =>
+    Effect.gen(function* () {
+      let release!: () => void
+      let signal: AbortSignal | undefined
+      const gate = new Promise<void>((resolve) => (release = resolve))
+      const model = new MockLanguageModelV3({
+        doGenerate: async (input) => {
+          signal = input.abortSignal
+          await gate
+          return generated("{}")
+        },
+      })
+      const result = yield* run({ type: "prompt", prompt: "audit timeout", timeout: 0.03 }).pipe(
+        Effect.provide(providerLayer(model)),
+      )
+      const aborted = signal?.aborted ?? false
+      release()
+      expect(result.blocked).toBeUndefined()
+      expect(model.doGenerateCalls.length).toBe(1)
+      expect(aborted).toBe(true)
+    }),
+  )
+
+  it.instance("mcp timeout must abort the underlying tool request", () =>
+    Effect.gen(function* () {
+      let release!: () => void
+      let signal: AbortSignal | undefined
+      const gate = new Promise<void>((resolve) => (release = resolve))
+      const mcp = Layer.mock(MCP.Service, {
+        tools: () =>
+          Effect.succeed({
+            audit_check: {
+              execute: async (_input: any, options: any) => {
+                signal = options.abortSignal
+                await gate
+                return { content: [] }
+              },
+            },
+          } as any),
+      })
+      const result = yield* run({ type: "mcp", command: "mcp__audit__check", timeout: 0.03 }).pipe(Effect.provide(mcp))
+      const aborted = signal?.aborted ?? false
+      release()
+      expect(result.blocked).toBeUndefined()
+      expect(signal).toBeDefined()
+      expect(aborted).toBe(true)
+    }),
+  )
+})

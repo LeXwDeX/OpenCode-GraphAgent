@@ -56,7 +56,7 @@ export interface Interface {
   readonly lastOutcome: (sessionID: SessionID) => Effect.Effect<GoalState.Info | undefined>
   readonly set: (sessionID: SessionID, goal: string, maxTurns?: number) => Effect.Effect<GoalState.Info>
   readonly pause: (sessionID: SessionID, reason: string) => Effect.Effect<GoalState.Info | undefined>
-  readonly resume: (sessionID: SessionID) => Effect.Effect<GoalState.Info | undefined>
+  readonly resume: (sessionID: SessionID, maxTurns?: number) => Effect.Effect<GoalState.Info | undefined>
   readonly clear: (sessionID: SessionID) => Effect.Effect<void>
   /** Session-deletion cleanup: remove goal_state AND all goal_outcome rows. */
   readonly purgeSession: (sessionID: SessionID) => Effect.Effect<void>
@@ -596,11 +596,14 @@ const serviceLayer = Layer.effect(
       })
     })
 
-    const resume = Effect.fn("Goal.resume")(function* (sessionID: SessionID) {
+    const resume = Effect.fn("Goal.resume")(function* (sessionID: SessionID, maxTurns?: number) {
       const updated = yield* transition(sessionID, (state) => {
         if (!state || state.status !== "paused") return { tag: "noop", value: undefined }
+        if (maxTurns !== undefined && (!Number.isSafeInteger(maxTurns) || maxTurns <= state.turns_used))
+          return { tag: "noop", value: undefined }
         const updated = GoalState.advance(state, {
           status: "active",
+          max_turns: GoalState.nni(maxTurns ?? state.max_turns),
           consecutive_parse_failures: GoalState.nni(0),
           paused_reason: undefined,
           last_turn_at: Date.now(),
@@ -814,7 +817,22 @@ const serviceLayer = Layer.effect(
 
     const dispatch = Effect.fn("Goal.dispatch")(function* (sessionID: SessionID, args: string) {
       const trimmed = args.trim()
-      const lower = trimmed.toLowerCase()
+      const budget = /^(?:(resume)\s+)?--max-turns(?:\s+(\S+))?(?:\s+([\s\S]*))?$/i.exec(trimmed)
+      const maxTurns = budget ? Number(budget[2]) : undefined
+      const invalidBudget =
+        budget &&
+        (!/^\d+$/.test(budget[2] ?? "") ||
+          !Number.isSafeInteger(maxTurns) ||
+          (maxTurns ?? 0) < 1 ||
+          (budget[1] ? !!budget[3] : !budget[3]?.trim()))
+      if (invalidBudget || (!budget && /^(?:resume\s+)?--/i.test(trimmed))) {
+        return {
+          type: "message" as const,
+          text: "轮预算必须是正整数。用法：/goal --max-turns <N> <目标> 或 /goal resume --max-turns <N>。",
+        }
+      }
+      const text = budget && !budget[1] ? (budget[3] ?? "").trim() : trimmed
+      const lower = budget ? (budget[1] ? "resume" : undefined) : trimmed.toLowerCase()
 
       const isControlCommand =
         lower === "" ||
@@ -867,7 +885,12 @@ const serviceLayer = Layer.effect(
             text: "Session 正在执行中。请先 /stop 中断后再 /goal resume。",
           }
         }
-        const result = yield* resume(sessionID)
+        if (maxTurns !== undefined) {
+          const current = yield* loadState(sessionID)
+          if (current?.status === "paused" && maxTurns <= current.turns_used)
+            return { type: "message" as const, text: `总轮预算必须大于已用的 ${current.turns_used} 轮。` }
+        }
+        const result = yield* resume(sessionID, maxTurns)
         if (!result) return { type: "message" as const, text: "没有已暂停的目标可以恢复。" }
         // Warning UX for budget-exhaustion pauses: we kept turns_used intact
         // (see resume()), so a goal paused because turns >= max will resume
@@ -876,7 +899,7 @@ const serviceLayer = Layer.effect(
         // text a second later, which looks like resume didn't work.
         const announceMsg =
           result.turns_used >= result.max_turns
-            ? `⚠ 目标已恢复，但轮预算已耗尽（${result.turns_used}/${result.max_turns} 轮）。resume 会重启一整轮执行：本轮内任务完成才会计为达成，否则 judge 会再次暂停。建议 /goal clear 后用更大的 maxTurns 重新设定。`
+            ? `⚠ 目标已恢复，但轮预算已耗尽（${result.turns_used}/${result.max_turns} 轮）。resume 会重启一整轮执行：本轮内任务完成才会计为达成，否则 judge 会再次暂停。再次暂停后可用 /goal resume --max-turns ${result.turns_used + GoalPrompts.DEFAULT_MAX_TURNS} 增加总轮预算。`
             : undefined
         return {
           type: "kick" as const,
@@ -915,8 +938,7 @@ const serviceLayer = Layer.effect(
         // done row leftover (loop.ts usually auto-clears; defensive guard)
         yield* clear(sessionID)
       }
-      const maxTurns = GoalPrompts.DEFAULT_MAX_TURNS
-      const state = yield* set(sessionID, trimmed, maxTurns)
+      const state = yield* set(sessionID, text, maxTurns ?? GoalPrompts.DEFAULT_MAX_TURNS)
       return {
         type: "kick" as const,
         text: state.goal,

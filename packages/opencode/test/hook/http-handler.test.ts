@@ -32,6 +32,51 @@ const withFetch = <A, E, R>(
   )
 
 describe("SettingsHook http handler", () => {
+  it.instance("expands only allowed header environment variables on the wire", () =>
+    Effect.gen(function* () {
+      const store = yield* SessionHooks.Service
+      const hook = yield* SettingsHook.Service
+      const id = SessionID.descending()
+      const previous = process.env.OPENCODE_HOOK_HEADER_TEST
+      process.env.OPENCODE_HOOK_HEADER_TEST = "fixture-value"
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          if (previous === undefined) delete process.env.OPENCODE_HOOK_HEADER_TEST
+          else process.env.OPENCODE_HOOK_HEADER_TEST = previous
+        }),
+      )
+      let seen: Headers | undefined
+      yield* withFetch(
+        (request) => {
+          seen = request.headers
+          return Response.json({})
+        },
+        (url) =>
+          Effect.gen(function* () {
+            yield* store.add(id, {
+              event: "UserPromptSubmit",
+              hooks: [
+                {
+                  type: "http",
+                  url,
+                  allowedEnvVars: ["OPENCODE_HOOK_HEADER_TEST"],
+                  headers: {
+                    "x-allowed": "Bearer ${OPENCODE_HOOK_HEADER_TEST}",
+                    "x-bare": "$OPENCODE_HOOK_HEADER_TEST",
+                    "x-denied": "value:${HOME}",
+                  },
+                },
+              ],
+            })
+            yield* hook.trigger({ event: "UserPromptSubmit", prompt: "hello" }, { sessionID: id, transcriptPath: "" })
+            expect(seen?.get("x-allowed")).toBe("Bearer fixture-value")
+            expect(seen?.get("x-bare")).toBe("fixture-value")
+            expect(seen?.get("x-denied")).toBe("value:")
+          }),
+      )
+    }),
+  )
+
   it.instance("applies configured entry.headers to the outbound POST", () =>
     Effect.gen(function* () {
       const sessionHooks = yield* SessionHooks.Service

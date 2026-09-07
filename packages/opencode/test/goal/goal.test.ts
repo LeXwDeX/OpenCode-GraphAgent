@@ -1025,3 +1025,51 @@ describe("Goal.dispatch resume — busy guard (D5)", () => {
       }),
   )
 })
+
+it.instance("Goal commands configure and extend a total turn budget", () =>
+  Effect.gen(function* () {
+    const goal = yield* Goal.Service
+    const id = SessionID.descending()
+    expect((yield* goal.dispatch(id, "--max-turns 3 write docs")).type).toBe("kick")
+    const state = yield* goal.load(id)
+    expect(state).toMatchObject({ goal: "write docs", max_turns: 3 })
+    yield* goal.updateAfterJudge(id, "continue", "more", false, { goalID: state!.goal_id!, revision: state!.revision! })
+    yield* goal.pause(id, "user-paused")
+    expect((yield* goal.dispatch(id, "resume --max-turns 6")).type).toBe("kick")
+    expect(yield* goal.load(id)).toMatchObject({ status: "active", max_turns: 6, turns_used: 1 })
+  }),
+)
+
+for (const value of ["0", "-1", "1.5", "abc", "9007199254740992", ""]) {
+  it.instance(`Goal rejects invalid budget ${JSON.stringify(value)} without creating state`, () =>
+    Effect.gen(function* () {
+      const goal = yield* Goal.Service
+      const id = SessionID.descending()
+      expect((yield* goal.dispatch(id, `--max-turns ${value} write docs`)).type).toBe("message")
+      expect(yield* goal.load(id)).toBeUndefined()
+    }),
+  )
+}
+
+it.instance("Goal invalid resume budgets preserve the entire paused state", () =>
+  Effect.gen(function* () {
+    const goal = yield* Goal.Service
+    const id = SessionID.descending()
+    const initial = yield* goal.set(id, "write docs", 3)
+    yield* goal.updateAfterJudge(id, "continue", "more work", false, {
+      goalID: initial.goal_id ?? "legacy",
+      revision: initial.revision ?? 0,
+    })
+    const paused = yield* goal.pause(id, "user-paused")
+    for (const argument of [
+      "resume --max-turns 1",
+      "resume --max-turns 0",
+      "resume --max-turns abc",
+      "resume --max-turns 5 extra",
+      "resume --max-turns=5",
+    ]) {
+      expect((yield* goal.dispatch(id, argument)).type).toBe("message")
+      expect(yield* goal.load(id)).toEqual(paused)
+    }
+  }),
+)

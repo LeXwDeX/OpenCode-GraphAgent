@@ -64,7 +64,7 @@ jobs:
         # same CLI generation that wrote the binding; upgrades are a
         # deliberate re-init. An isolated prefix avoids installing the
         # adopting project's dependencies or running its lifecycle scripts.
-        run: npm install --prefix "$RUNNER_TEMP/specgit-cli" --no-save --no-audit --no-fund specgit@1.13.1
+        run: npm install --prefix "$RUNNER_TEMP/specgit-cli" --no-save --no-audit --no-fund specgit@1.14.0
 
       - name: Prepare approved policy for acceptance
         env:

@@ -20,34 +20,18 @@
  * Storage is process-local memory — entries do NOT survive a restart; users
  * wanting persistent hooks should use the on-disk hooks.json chain.
  */
-import { Context, Effect, Layer } from "effect"
+import { Context, Effect, Layer, Schema } from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { SessionID } from "@/session/schema"
 import { InstanceState } from "@/effect/instance-state"
-import type { HookEvent, HookJSONOutput } from "./settings"
+import type { HookEvent, HookJSONOutput, HookCommand } from "./settings"
+import { HookCommandSchema } from "./schema"
 
-// Shape of the inner hooks array on a session entry. Mirrors the `hooks[]`
-// array nested under each HookMatcher in the settings file format. We re-declare
-// here rather than import HookCommand to avoid a settings.ts → session-hooks.ts
-// import cycle (settings.ts already depends on session-hooks for the trigger merge).
-export interface SessionHookCommand {
-  type: "command" | "mcp" | "http" | "prompt" | "agent"
-  command?: string
-  /** Claude Code `type:"http"` endpoint. Legacy configs may still use `command`. */
-  url?: string
-  /** Claude Code `type:"prompt" | "agent"` prompt. Legacy configs may still use `command`. */
-  prompt?: string
-  headers?: Record<string, string>
-  timeout?: number
-  shell?: "bash" | "powershell"
-  if?: string
-  /** Background execution — see HookCommand.async in settings.ts. */
-  async?: boolean
-  /** Deliver async result to agent — see HookCommand.asyncRewake in settings.ts. */
-  asyncRewake?: boolean
-  options?: Record<string, unknown>
-  __sourceDir?: string
-}
+export type SessionHookCommand = HookCommand
+
+export class InvalidHookError extends Schema.TaggedErrorClass<InvalidHookError>()("InvalidHookError", {
+  message: Schema.String,
+}) {}
 
 export interface SessionHookEntryInput {
   event: HookEvent
@@ -64,7 +48,9 @@ export interface SessionHookEntry extends SessionHookEntryInput {
 }
 
 export interface Interface {
-  readonly add: (sessionID: SessionID, entry: SessionHookEntryInput) => Effect.Effect<string>
+  readonly add: (sessionID: SessionID, entry: SessionHookEntryInput) => Effect.Effect<string, InvalidHookError>
+  /** Atomically remove a registration if still present; only one trigger can claim it. */
+  readonly claim: (sessionID: SessionID, id: string) => Effect.Effect<boolean>
   readonly remove: (sessionID: SessionID, id: string) => Effect.Effect<void>
   readonly list: (sessionID: SessionID, event: HookEvent) => Effect.Effect<readonly SessionHookEntry[]>
   /** All entries for a session across every event (backs the HTTP GET endpoint). */
@@ -88,22 +74,31 @@ export const layer = Layer.effect(
     )
 
     const add = Effect.fn("SessionHooks.add")(function* (sessionID: SessionID, entry: SessionHookEntryInput) {
+      const parsed = HookCommandSchema.array().min(1).safeParse(entry.hooks)
+      if (!parsed.success) return yield* new InvalidHookError({ message: parsed.error.message })
+      if (entry.matcher !== undefined && typeof entry.matcher !== "string")
+        return yield* new InvalidHookError({ message: "matcher must be a string" })
       const data = yield* InstanceState.get(state)
       const list = data.get(sessionID) ?? []
       const id = crypto.randomUUID()
-      list.push({ id, ...entry })
+      list.push({ ...entry, id, hooks: parsed.data })
       data.set(sessionID, list)
       return id
     })
 
-    const remove = Effect.fn("SessionHooks.remove")(function* (sessionID: SessionID, id: string) {
+    const claim = Effect.fn("SessionHooks.claim")(function* (sessionID: SessionID, id: string) {
       const data = yield* InstanceState.get(state)
       const list = data.get(sessionID)
-      if (!list) return
-      const next = list.filter((e) => e.id !== id)
+      if (!list?.some((entry) => entry.id === id)) return false
+      const next = list.filter((entry) => entry.id !== id)
       if (next.length === 0) data.delete(sessionID)
       else data.set(sessionID, next)
+      return true
     })
+
+    const remove = Effect.fn("SessionHooks.remove")((sessionID: SessionID, id: string) =>
+      claim(sessionID, id).pipe(Effect.asVoid),
+    )
 
     const list = Effect.fn("SessionHooks.list")(function* (sessionID: SessionID, event: HookEvent) {
       const data = yield* InstanceState.get(state)
@@ -128,7 +123,7 @@ export const layer = Layer.effect(
       data.delete(sessionID)
     })
 
-    return Service.of({ add, remove, list, listAll, hasForEvent, clear })
+    return Service.of({ add, claim, remove, list, listAll, hasForEvent, clear })
   }),
 )
 

@@ -42,6 +42,7 @@ concurrency:
 
 permissions:
   contents: read
+  actions: read
   checks: write
 
 env:
@@ -72,19 +73,29 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Check previously verified content
+        id: evidence
+        uses: ./.github/actions/verified-content
+        with:
+          check: unit
+          job-name: Unit Tests (${{ matrix.settings.name }})
+          runner-label: ${{ matrix.settings.host }}
+
       - name: Setup Node
+        if: steps.evidence.outputs.reused != 'true'
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "24"
 
       - name: Setup Go
-        if: runner.os == 'Linux'
+        if: steps.evidence.outputs.reused != 'true' && (runner.os == 'Linux')
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: config_assistant/go.mod
           cache-dependency-path: config_assistant/go.sum
 
       - name: Setup Bun
+        if: steps.evidence.outputs.reused != 'true'
         uses: ./.github/actions/setup-bun
         with:
           # ci-typecheck.yml's Linux job is the designated Linux cache
@@ -93,17 +104,20 @@ jobs:
           save-cache: false
 
       - name: Configure Git Identity
+        if: steps.evidence.outputs.reused != 'true'
         run: |
           git config --global user.email "bot@opencode.ai"
           git config --global user.name "opencode"
 
       - name: Install ripgrep
+        if: steps.evidence.outputs.reused != 'true'
         # tool.glob tests hit ripgrep; without the system binary, binary.ts
         # downloads rg from GitHub releases every run (temp XDG per preload),
         # gambling on network stability — ECONNRESET fails the test.
         run: sudo apt-get update && sudo apt-get install -y ripgrep
 
       - name: Cache Turbo
+        if: steps.evidence.outputs.reused != 'true'
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: node_modules/.cache/turbo
@@ -113,6 +127,7 @@ jobs:
             turbo-${{ runner.os }}-
 
       - name: Run unit tests
+        if: steps.evidence.outputs.reused != 'true'
         # opencode:test alone (244 files / 3048 tests, many spawning real CLI
         # subprocesses via cliIt) measured at 803s / 13m24s locally, and this
         # job has been seen at 16-17m in CI. turbo buffers a concurrent
@@ -126,22 +141,22 @@ jobs:
           OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER: ${{ runner.os == 'Windows' && 'true' || 'false' }}
 
       - name: Run config assistant tests
-        if: runner.os == 'Linux'
+        if: steps.evidence.outputs.reused != 'true' && (runner.os == 'Linux')
         working-directory: config_assistant
         run: go test ./...
 
       - name: Check generated client
-        if: runner.os == 'Linux'
+        if: steps.evidence.outputs.reused != 'true' && (runner.os == 'Linux')
         working-directory: packages/client
         run: bun run check:generated
 
       - name: Check generated SDK
-        if: runner.os == 'Linux'
+        if: steps.evidence.outputs.reused != 'true' && (runner.os == 'Linux')
         working-directory: packages/sdk/js
         run: bun run check:generated
 
       - name: Run HttpAPI Exerciser Gates
-        if: runner.os == 'Linux'
+        if: steps.evidence.outputs.reused != 'true' && (runner.os == 'Linux')
         working-directory: packages/opencode
         # The exerciser aggregates its report and prints it in one flush, so
         # this step is silent while it runs. A latent uninterruptible hang
@@ -158,6 +173,14 @@ jobs:
         # phase — the step timeout stays as the final backstop.
         timeout-minutes: 15
         run: bun run test:httpapi:ci
+
+      - name: Record successful verification
+        if: success() && steps.evidence.outputs.reused != 'true'
+        uses: ./.github/actions/record-verification
+        with:
+          key: ${{ steps.evidence.outputs.key }}
+          path: ${{ steps.evidence.outputs.path }}
+          job-name: Unit Tests (${{ matrix.settings.name }})
 
   e2e-tests:
     name: E2E Tests (${{ matrix.settings.name }})
@@ -181,13 +204,23 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Check previously verified content
+        id: evidence
+        uses: ./.github/actions/verified-content
+        with:
+          check: e2e
+          job-name: E2E Tests (${{ matrix.settings.name }})
+          runner-label: ${{ matrix.settings.host }}
+
       - name: Setup Node
+        if: steps.evidence.outputs.reused != 'true'
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           # Playwright 1.59 hangs while extracting Chromium with Node 24.16.
           node-version: "24.15"
 
       - name: Setup Bun
+        if: steps.evidence.outputs.reused != 'true'
         uses: ./.github/actions/setup-bun
         with:
           # Only Windows saves (sole Windows job). Linux e2e skips —
@@ -196,12 +229,14 @@ jobs:
           save-cache: ${{ matrix.settings.name == 'windows' }}
 
       - name: Read Playwright version
+        if: steps.evidence.outputs.reused != 'true'
         id: playwright-version
         run: |
           version=$(node -e 'console.log(require("./package.json").workspaces.catalog["@playwright/test"])')
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Cache Playwright browsers
+        if: steps.evidence.outputs.reused != 'true'
         id: playwright-cache
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
@@ -209,23 +244,24 @@ jobs:
           key: ${{ runner.os }}-${{ runner.arch }}-playwright-${{ steps.playwright-version.outputs.version }}-chromium
 
       - name: Install Playwright system dependencies
-        if: runner.os == 'Linux'
+        if: steps.evidence.outputs.reused != 'true' && (runner.os == 'Linux')
         working-directory: packages/app
         run: bunx playwright install-deps chromium
 
       - name: Install Playwright browsers
-        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        if: steps.evidence.outputs.reused != 'true' && (steps.playwright-cache.outputs.cache-hit != 'true')
         working-directory: packages/app
         run: bunx playwright install chromium
 
       - name: Run app e2e tests
+        if: steps.evidence.outputs.reused != 'true'
         run: bun --cwd packages/app test:e2e:local
         env:
           CI: true
         timeout-minutes: 30
 
       - name: Upload Playwright artifacts
-        if: always()
+        if: steps.evidence.outputs.reused != 'true' && (always())
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: playwright-${{ matrix.settings.name }}-${{ github.run_attempt }}
@@ -234,3 +270,11 @@ jobs:
           path: |
             packages/app/e2e/test-results
             packages/app/e2e/playwright-report
+
+      - name: Record successful verification
+        if: success() && steps.evidence.outputs.reused != 'true'
+        uses: ./.github/actions/record-verification
+        with:
+          key: ${{ steps.evidence.outputs.key }}
+          path: ${{ steps.evidence.outputs.path }}
+          job-name: E2E Tests (${{ matrix.settings.name }})

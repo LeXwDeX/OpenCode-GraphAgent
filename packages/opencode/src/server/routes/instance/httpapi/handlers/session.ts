@@ -491,12 +491,14 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
           (hook.timeout !== undefined && hook.timeout <= 0),
       )
       if (invalidEntry) return yield* new HttpApiError.BadRequest({})
-      const id = yield* sessionHooks.add(ctx.params.sessionID, {
-        event: ctx.payload.event as HookEvent,
-        matcher: ctx.payload.matcher,
-        hooks: ctx.payload.hooks as SessionHookCommand[],
-        once: ctx.payload.once,
-      })
+      const id = yield* sessionHooks
+        .add(ctx.params.sessionID, {
+          event: ctx.payload.event as HookEvent,
+          matcher: ctx.payload.matcher,
+          hooks: ctx.payload.hooks as SessionHookCommand[],
+          once: ctx.payload.once,
+        })
+        .pipe(Effect.mapError(() => new HttpApiError.BadRequest({})))
       return { id }
     })
 

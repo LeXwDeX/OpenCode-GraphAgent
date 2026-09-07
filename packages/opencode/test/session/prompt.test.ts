@@ -6,7 +6,7 @@ import { eq } from "drizzle-orm"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { FetchHttpClient } from "effect/unstable/http"
 import { expect } from "bun:test"
-import { Cause, Deferred, Duration, Effect, Exit, Fiber, Layer, Option } from "effect"
+import { Cause, Deferred, Duration, Effect, Exit, Fiber, Layer, Option, Stream } from "effect"
 import path from "path"
 import { fileURLToPath, pathToFileURL } from "url"
 import { NamedError } from "@opencode-ai/core/util/error"
@@ -48,6 +48,7 @@ import { Snapshot } from "../../src/snapshot"
 import { ToolRegistry } from "@/tool/registry"
 import { Dag } from "@/dag/dag"
 import { Goal } from "@/goal/goal"
+import { GoalLoop, GoalLoopJudgeLLM } from "@/goal/loop"
 import { Truncate } from "@/tool/truncate"
 import { SettingsHook, type HookPayload } from "@/hook/settings"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
@@ -235,13 +236,16 @@ type PromptLayerOptions = {
   mcpInstructions?: MCP.ServerInstructions[]
   processor?: "blocking"
   goal?: boolean
+  goalLayer?: Layer.Layer<Goal.Service>
   memoryContext?: string[]
 }
 
 function makePrompt(input?: PromptLayerOptions) {
   // goal: false exercises the Goal-absent degradation path (serviceOption None)
   const goalLayer: Layer.Layer<Goal.Service> =
-    input?.goal === false ? (Layer.empty as unknown as Layer.Layer<Goal.Service>) : Goal.defaultLayer
+    input?.goal === false
+      ? (Layer.empty as unknown as Layer.Layer<Goal.Service>)
+      : (input?.goalLayer ?? Goal.defaultLayer)
   const memoryLayer = Layer.mock(Memory.Service, {
     init: () => Effect.void,
     prepare: () => Effect.void,
@@ -3165,4 +3169,252 @@ noLLMServer.instance(
       }
     }),
   30_000,
+)
+
+function goalRuntime(call: GoalLoopJudgeLLM["Service"]["call"], onSettled = () => {}) {
+  const goalLayer = Layer.effect(
+    Goal.Service,
+    Effect.gen(function* () {
+      const goal = yield* Goal.Service
+      return Goal.Service.of({
+        ...goal,
+        clearLoopFiberIf: (sessionID, fiber) =>
+          goal.clearLoopFiberIf(sessionID, fiber).pipe(Effect.tap(() => Effect.sync(onSettled))),
+      })
+    }),
+  ).pipe(Layer.provide(Goal.defaultLayer))
+  return GoalLoop.layer.pipe(
+    Layer.provideMerge(makeHttp({ goalLayer })),
+    Layer.provideMerge(Layer.succeed(GoalLoopJudgeLLM, { call })),
+  )
+}
+
+for (const verdict of ["done", "blocked", "continue"] as const) {
+  let started = false
+  let settled = false
+  let release: Deferred.Deferred<void>
+  const race = testEffect(
+    goalRuntime(
+      () =>
+        Effect.gen(function* () {
+          started = true
+          yield* Deferred.await(release)
+          return JSON.stringify({ verdict, reason: "old response" })
+        }),
+      () => {
+        settled = true
+      },
+    ),
+  )
+  race.instance(`Goal rejects stale ${verdict} while a new human turn is running`, () =>
+    Effect.gen(function* () {
+      started = false
+      settled = false
+      release = yield* Deferred.make<void>()
+      const { llm } = yield* useServerConfig(providerCfg)
+      const { prompt, chat } = yield* boot()
+      const goal = yield* Goal.Service
+      yield* seed(chat.id, { finish: "stop" })
+      yield* goal.set(chat.id, "write the docs")
+      yield* (yield* GoalLoop.Service).init()
+      yield* pollWithTimeout(
+        Effect.sync(() => started || undefined),
+        "judge never started",
+      )
+      yield* llm.hang
+      const work = yield* prompt
+        .prompt({ sessionID: chat.id, parts: [{ type: "text", text: "Add the missing section first." }] })
+        .pipe(Effect.forkChild)
+      yield* llm.wait(1)
+      yield* waitForBusy(chat.id)
+      yield* Deferred.succeed(release, undefined)
+      yield* pollWithTimeout(
+        Effect.sync(() => settled || undefined),
+        "judge never settled",
+      )
+      expect(yield* goal.lastOutcome(chat.id)).toBeUndefined()
+      expect(yield* goal.load(chat.id)).toMatchObject({ status: "active", turns_used: 0 })
+      yield* prompt.cancel(chat.id)
+      yield* Fiber.await(work)
+    }),
+  )
+}
+
+for (const command of [
+  { command: "goal", arguments: "status" },
+  { command: "subgoal", arguments: "additional criterion" },
+]) {
+  let calls: string[] = []
+  let release: Deferred.Deferred<void>
+  const controls = testEffect(
+    goalRuntime((opts) =>
+      Effect.gen(function* () {
+        calls.push(opts.user)
+        yield* Deferred.await(release)
+        return JSON.stringify({ verdict: "continue", reason: "more work remains" })
+      }),
+    ),
+  )
+  controls.instance(`Goal /${command.command} control preserves the pending work boundary`, () =>
+    Effect.gen(function* () {
+      calls = []
+      release = yield* Deferred.make<void>()
+      const { llm } = yield* useServerConfig(providerCfg)
+      const { prompt, chat } = yield* boot()
+      const goal = yield* Goal.Service
+      yield* seed(chat.id, { finish: "stop" })
+      yield* goal.set(chat.id, "write the docs")
+      yield* (yield* GoalLoop.Service).init()
+      yield* pollWithTimeout(
+        Effect.sync(() => calls.length || undefined),
+        "judge never started",
+      )
+      for (let i = 0; i < (command.command === "goal" ? 25 : 1); i++) {
+        yield* prompt.command({ sessionID: chat.id, ...command })
+      }
+      if (command.command === "subgoal") {
+        yield* pollWithTimeout(
+          Effect.sync(() => calls.some((x) => x.includes("additional criterion")) || undefined),
+          "new subgoal was not judged",
+        )
+      }
+      yield* llm.hang
+      yield* Deferred.succeed(release, undefined)
+      yield* awaitWithTimeout(llm.wait(1), "control prevented continuation")
+      expect(yield* goal.load(chat.id)).toMatchObject({ status: "active", turns_used: 1 })
+      if (command.command === "goal") expect(calls).toHaveLength(1)
+      const inputs = JSON.stringify(
+        (yield* llm.inputs).map((input) =>
+          Array.isArray(input.messages) ? input.messages.filter((m: { role: string }) => m.role === "user") : [],
+        ),
+      )
+      expect(inputs).not.toContain("/goal status")
+      if (command.command === "subgoal") expect(inputs).toContain("additional criterion")
+      yield* prompt.cancel(chat.id)
+    }),
+  )
+}
+
+let goalJudges = 0
+const autonomous = testEffect(
+  goalRuntime(() =>
+    Effect.sync(() =>
+      JSON.stringify({
+        verdict: ++goalJudges === 1 ? "continue" : "done",
+        reason: "scripted progress",
+      }),
+    ),
+  ),
+)
+autonomous.instance("Goal question cannot leave an autonomous continuation waiting for input", () =>
+  Effect.gen(function* () {
+    goalJudges = 0
+    const { llm } = yield* useServerConfig(providerCfg)
+    const { prompt, chat } = yield* boot()
+    const goal = yield* Goal.Service
+    const questions = yield* Question.Service
+    yield* (yield* GoalLoop.Service).init()
+    yield* llm.text("First step done.")
+    yield* llm.tool("question", {
+      questions: [
+        {
+          question: "Which option?",
+          header: "Choice",
+          options: [
+            { label: "A", description: "First" },
+            { label: "B", description: "Second" },
+          ],
+        },
+      ],
+    })
+    yield* llm.text("I chose A and completed the work.")
+    yield* prompt.command({ sessionID: chat.id, command: "goal", arguments: "write the docs" })
+    const outcome = yield* pollWithTimeout(goal.lastOutcome(chat.id), "Goal stuck waiting for a question", "5 seconds")
+    expect(outcome.status).toBe("done")
+    expect(yield* questions.list()).toHaveLength(0)
+    expect((yield* llm.inputs).length).toBe(3)
+  }),
+)
+
+for (const entry of ["prompt", "loop", "shell"] as const) {
+  it.instance(`Goal idle commit serializes ${entry} admission without holding the execution`, () =>
+    withSh(() =>
+      Effect.gen(function* () {
+        const { llm } = yield* useServerConfig(providerCfg)
+        const { prompt, chat } = yield* boot()
+        yield* user(chat.id, "start work")
+        const entered = yield* Deferred.make<void>()
+        const attempted = yield* Deferred.make<void>()
+        const release = yield* Deferred.make<void>()
+        const order: string[] = []
+        const events = yield* EventV2Bridge.Service
+        yield* events.subscribe(SessionStatus.Event.Status).pipe(
+          Stream.runForEach((event) =>
+            Effect.sync(() => {
+              if (event.data.sessionID === chat.id && event.data.status.type === "busy") order.push("busy")
+            }),
+          ),
+          Effect.forkScoped({ startImmediately: true }),
+        )
+        const commit = yield* prompt
+          .withIdle(
+            chat.id,
+            Effect.gen(function* () {
+              yield* Deferred.succeed(entered, undefined)
+              yield* Deferred.await(release)
+              order.push("commit")
+            }),
+          )
+          .pipe(Effect.forkChild)
+        yield* Deferred.await(entered)
+        yield* llm.hang
+        const input =
+          entry === "shell"
+            ? prompt.shell({ sessionID: chat.id, agent: "build", command: "sleep 30" }).pipe(Effect.orDie)
+            : entry === "loop"
+              ? prompt.loop({ sessionID: chat.id })
+              : prompt.prompt({ sessionID: chat.id, parts: [{ type: "text", text: "continue" }] }).pipe(Effect.orDie)
+        const work = yield* Deferred.succeed(attempted, undefined).pipe(Effect.andThen(input), Effect.forkChild)
+        yield* Deferred.await(attempted)
+        yield* Effect.yieldNow
+        expect((yield* (yield* SessionStatus.Service).get(chat.id)).type).toBe("idle")
+        yield* Deferred.succeed(release, undefined)
+        yield* Fiber.join(commit)
+        yield* waitForBusy(chat.id)
+        expect(order[0]).toBe("commit")
+        // The commit lock is released before the provider/shell finishes.
+        expect(Option.isNone(yield* prompt.withIdle(chat.id, Effect.void))).toBe(true)
+        yield* prompt.cancel(chat.id)
+        yield* Fiber.await(work)
+      }),
+    ),
+  )
+}
+
+it.instance("human prompt retains question interaction with an active Goal", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const { prompt, chat } = yield* boot()
+    const goal = yield* Goal.Service
+    const questions = yield* Question.Service
+    yield* goal.set(chat.id, "write docs")
+    yield* goal.markTurnDriven(chat.id)
+    yield* llm.tool("question", {
+      questions: [
+        { question: "Which section?", header: "Section", options: [{ label: "API", description: "Document the API" }] },
+      ],
+    })
+    yield* llm.text("Documented the API.")
+    const work = yield* prompt
+      .prompt({ sessionID: chat.id, parts: [{ type: "text", text: "Ask me which section to document." }] })
+      .pipe(Effect.forkChild)
+    const pending = yield* pollWithTimeout(
+      questions.list().pipe(Effect.map((items) => items[0])),
+      "human question was suppressed",
+    )
+    expect(yield* goal.isTurnDriven(chat.id)).toBe(false)
+    yield* questions.reply({ requestID: pending.id, answers: [["API"]] })
+    yield* Fiber.join(work)
+    expect(yield* questions.list()).toHaveLength(0)
+  }),
 )

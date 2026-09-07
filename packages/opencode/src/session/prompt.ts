@@ -1,3 +1,4 @@
+import { withHookFeedback } from "@/hook/trigger-result"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import path from "path"
@@ -67,6 +68,7 @@ import { SettingsHook, HOOK_REWAKE_SENTINEL, type TriggerResult } from "@/hook/s
 import { applyPreHookDecision } from "@/hook/pre-hook-decision"
 import { dispatchTrust } from "@/hook/workspace-trust"
 import { HookStartContext } from "@/hook/start-context"
+import { HookRewake } from "@/hook/rewake"
 import { Goal } from "@/goal/goal"
 import { KeyedMutex } from "@opencode-ai/core/effect/keyed-mutex"
 import { Memory } from "@/memory/memory"
@@ -117,6 +119,11 @@ function isOrphanedInterruptedTool(part: SessionV1.ToolPart) {
 export interface Interface {
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
   readonly prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
+  /** Run a short commit while idle, serialized with prompt admission. Never start or await a turn here. */
+  readonly withIdle: <A, E, R>(
+    sessionID: SessionID,
+    work: Effect.Effect<A, E, R>,
+  ) => Effect.Effect<Option.Option<A>, E, R>
   readonly prepareIfIdle: (input: PromptInput) => Effect.Effect<Option.Option<IdleAdmission>, Image.Error>
   readonly promptIfIdle: (input: PromptInput) => Effect.Effect<Option.Option<SessionV1.WithParts>, Image.Error>
   readonly loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts>
@@ -165,7 +172,18 @@ export const layer = Layer.effect(
     const flags = yield* RuntimeFlags.Service
     const database = yield* Database.Service
     const { db } = database
-    const settingsHook = Option.getOrUndefined(yield* Effect.serviceOption(SettingsHook.Service))
+    const rawSettingsHook = Option.getOrUndefined(yield* Effect.serviceOption(SettingsHook.Service))
+    const rewake = Context.make(
+      HookRewake.Service,
+      HookRewake.bind(({ sessionID, text }) => prompt({ sessionID, parts: [{ type: "text", text }] })),
+    )
+    const settingsHook: SettingsHook.Interface | undefined = rawSettingsHook && {
+      ...rawSettingsHook,
+      trigger: (payload, context) =>
+        rawSettingsHook
+          .trigger(payload, context)
+          .pipe(Effect.updateContext((current: Context.Context<never>) => Context.merge(rewake, current))),
+    }
     const startContext = Option.getOrUndefined(yield* Effect.serviceOption(HookStartContext.Service))
     const goal = Option.getOrUndefined(yield* Effect.serviceOption(Goal.Service))
     const promptLocks = KeyedMutex.makeUnsafe<SessionID>()
@@ -350,24 +368,48 @@ export const layer = Layer.effect(
       // SettingsHook: PreToolUse for task tool
       if (settingsHook) {
         const preResult = yield* settingsHook
-          .trigger(
-            { event: "PreToolUse", toolName: TaskTool.id, toolInput: taskArgs, toolUseID: part.callID } as any,
-            { sessionID, transcriptPath: "" },
+          .trigger({ event: "PreToolUse", toolName: TaskTool.id, toolInput: taskArgs, toolUseID: part.callID } as any, {
+            sessionID,
+            transcriptPath: "",
+          })
+          .pipe(
+            Effect.catch(() =>
+              Effect.succeed({
+                blocked: undefined,
+                permissionDecision: undefined as "allow" | "deny" | "ask" | undefined,
+                permissionDecisionReason: undefined as string | undefined,
+              } as any),
+            ),
           )
-          .pipe(Effect.catch(() => Effect.succeed({ blocked: undefined, permissionDecision: undefined as "allow" | "deny" | "ask" | undefined, permissionDecisionReason: undefined as string | undefined } as any)))
         yield* SettingsHook.landSystemMessages(preResult as TriggerResult, { sessionID })
         const decision = applyPreHookDecision(taskArgs, preResult as any)
         // deny / blocked → error part
         if (decision.deniedReason) {
           if (part.state.status === "running") {
-            part = yield* sessions.updatePart({ ...part, state: { ...part.state, status: "error", error: decision.deniedReason, time: { ...part.state.time, end: Date.now() } } } satisfies SessionV1.ToolPart)
+            part = yield* sessions.updatePart({
+              ...part,
+              state: {
+                ...part.state,
+                status: "error",
+                error: decision.deniedReason,
+                time: { ...part.state.time, end: Date.now() },
+              },
+            } satisfies SessionV1.ToolPart)
           }
           return { info: assistantMessage, parts: [part] }
         }
         // preventContinuation → stop; reflect the stop message as the part output so the agent sees it
         if (decision.stopReason) {
           if (part.state.status === "running") {
-            part = yield* sessions.updatePart({ ...part, state: { ...part.state, status: "error", error: `[Hook stopped] ${decision.stopReason}`, time: { ...part.state.time, end: Date.now() } } } satisfies SessionV1.ToolPart)
+            part = yield* sessions.updatePart({
+              ...part,
+              state: {
+                ...part.state,
+                status: "error",
+                error: `[Hook stopped] ${decision.stopReason}`,
+                time: { ...part.state.time, end: Date.now() },
+              },
+            } satisfies SessionV1.ToolPart)
           }
           return { info: assistantMessage, parts: [part] }
         }
@@ -380,7 +422,10 @@ export const layer = Layer.effect(
             hookReason: preResult.permissionDecisionReason,
           })
           if (part.state.status === "running") {
-            part = yield* sessions.updatePart({ ...part, state: { ...part.state, status: "error", error: reason, time: { ...part.state.time, end: Date.now() } } } satisfies SessionV1.ToolPart)
+            part = yield* sessions.updatePart({
+              ...part,
+              state: { ...part.state, status: "error", error: reason, time: { ...part.state.time, end: Date.now() } },
+            } satisfies SessionV1.ToolPart)
           }
           return { info: assistantMessage, parts: [part] }
         }
@@ -476,16 +521,18 @@ export const layer = Layer.effect(
       if (settingsHook) {
         const postResult: any = yield* settingsHook
           .trigger(
-            { event: "PostToolUse", toolName: TaskTool.id, toolInput: taskArgs, toolResponse: result?.output ?? "", toolUseID: part.callID } as any,
+            {
+              event: "PostToolUse",
+              toolName: TaskTool.id,
+              toolInput: taskArgs,
+              toolResponse: result?.output ?? "",
+              toolUseID: part.callID,
+            } as any,
             { sessionID, transcriptPath: "" },
           )
           .pipe(Effect.catch(() => Effect.succeed({ additionalContexts: [], systemMessages: [] } as TriggerResult)))
         yield* SettingsHook.landSystemMessages(postResult as TriggerResult, { sessionID })
-        // PostToolUse preventContinuation: tool already executed, annotate its output.
-        if (postResult?.preventContinuation && result) {
-          const stopReason = postResult.stopReason ?? "Hook requested stop"
-          ;(result as any).output = `${result.output ?? ""}\n\n[Hook stopped] ${stopReason}`
-        }
+        if (result) result.output = withHookFeedback(result.output ?? "", postResult)
       }
 
       assistantMessage.finish = "tool-calls"
@@ -680,10 +727,23 @@ export const layer = Layer.effect(
               if (settingsHook) {
                 const preResult = yield* settingsHook
                   .trigger(
-                    { event: "PreToolUse", toolName: "bash", toolInput: { command: input.command }, toolUseID: mutablePart.callID } as any,
+                    {
+                      event: "PreToolUse",
+                      toolName: "bash",
+                      toolInput: { command: input.command },
+                      toolUseID: mutablePart.callID,
+                    } as any,
                     { sessionID: input.sessionID, transcriptPath: "" },
                   )
-                  .pipe(Effect.catch(() => Effect.succeed({ blocked: undefined, permissionDecision: undefined as "allow" | "deny" | "ask" | undefined, permissionDecisionReason: undefined as string | undefined } as any)))
+                  .pipe(
+                    Effect.catch(() =>
+                      Effect.succeed({
+                        blocked: undefined,
+                        permissionDecision: undefined as "allow" | "deny" | "ask" | undefined,
+                        permissionDecisionReason: undefined as string | undefined,
+                      } as any),
+                    ),
+                  )
                 yield* SettingsHook.landSystemMessages(preResult as TriggerResult, { sessionID: input.sessionID })
                 const decision = applyPreHookDecision({ command: input.command }, preResult as any)
                 // deny / blocked / stop / ask-degrade all skip execution; each surfaces its own message.
@@ -704,9 +764,20 @@ export const layer = Layer.effect(
                   })
                 }
                 if (skipReason !== undefined) {
-                  const errorState = { status: "error" as const, error: skipReason, time: { start: (mutablePart.state as any).time?.start ?? Date.now(), end: Date.now() }, input: mutablePart.state.input }
-                  mutablePart = yield* sessions.updatePart({ ...mutablePart, state: errorState as any } satisfies SessionV1.ToolPart)
-                } else if (decision.effectiveArgs.command !== undefined && decision.effectiveArgs.command !== input.command) {
+                  const errorState = {
+                    status: "error" as const,
+                    error: skipReason,
+                    time: { start: (mutablePart.state as any).time?.start ?? Date.now(), end: Date.now() },
+                    input: mutablePart.state.input,
+                  }
+                  mutablePart = yield* sessions.updatePart({
+                    ...mutablePart,
+                    state: errorState as any,
+                  } satisfies SessionV1.ToolPart)
+                } else if (
+                  decision.effectiveArgs.command !== undefined &&
+                  decision.effectiveArgs.command !== input.command
+                ) {
                   // updatedInput rewrote the command — sync execution (args), TUI display (part.state.input),
                   // and PostToolUse toolInput (which reads effectiveCommand below). `!== undefined` (not
                   // truthiness) so a hook that clears the command to "" is honored rather than ignored.
@@ -717,24 +788,24 @@ export const layer = Layer.effect(
                 }
               }
               if (!shellHookDenied) {
-              const cmd = ChildProcess.make(sh, args, {
-                cwd,
-                extendEnv: true,
-                env: { ...shellEnv.env, TERM: "dumb" },
-                stdin: "ignore",
-                forceKillAfter: "3 seconds",
-              })
-              const handle = yield* spawner.spawn(cmd)
-              yield* Stream.runForEach(Stream.decodeText(handle.all), (chunk) =>
-                Effect.gen(function* () {
-                  output += chunk
-                  if (mutablePart.state.status === "running") {
-                    mutablePart.state.metadata = { output }
-                    yield* sessions.updatePart(mutablePart)
-                  }
-                }),
-              )
-              yield* handle.exitCode
+                const cmd = ChildProcess.make(sh, args, {
+                  cwd,
+                  extendEnv: true,
+                  env: { ...shellEnv.env, TERM: "dumb" },
+                  stdin: "ignore",
+                  forceKillAfter: "3 seconds",
+                })
+                const handle = yield* spawner.spawn(cmd)
+                yield* Stream.runForEach(Stream.decodeText(handle.all), (chunk) =>
+                  Effect.gen(function* () {
+                    output += chunk
+                    if (mutablePart.state.status === "running") {
+                      mutablePart.state.metadata = { output }
+                      yield* sessions.updatePart(mutablePart)
+                    }
+                  }),
+                )
+                yield* handle.exitCode
               } // end if (!shellHookDenied)
             }).pipe(Effect.scoped, Effect.orDie),
           ).pipe(Effect.exit)
@@ -748,17 +819,22 @@ export const layer = Layer.effect(
           if (settingsHook && !shellHookDenied) {
             const postResult: any = yield* settingsHook
               .trigger(
-                { event: "PostToolUse", toolName: "bash", toolInput: { command: effectiveCommand }, toolResponse: output, toolUseID: mutablePart.callID } as any,
+                {
+                  event: "PostToolUse",
+                  toolName: "bash",
+                  toolInput: { command: effectiveCommand },
+                  toolResponse: output,
+                  toolUseID: mutablePart.callID,
+                } as any,
                 { sessionID: input.sessionID, transcriptPath: "" },
               )
               .pipe(Effect.catch(() => Effect.succeed({ additionalContexts: [], systemMessages: [] } as TriggerResult)))
             yield* SettingsHook.landSystemMessages(postResult as TriggerResult, { sessionID: input.sessionID })
-            // PostToolUse preventContinuation: annotate output (command already ran).
-            if (postResult?.preventContinuation) {
-              const stopReason = postResult.stopReason ?? "Hook requested stop"
-              output += `\n\n[Hook stopped] ${stopReason}`
+            const annotated = withHookFeedback(output, postResult)
+            if (annotated !== output) {
+              output = annotated
               if (mutablePart.state.status === "completed") {
-                mutablePart.state = { ...mutablePart.state, output, metadata: { output } } as any
+                mutablePart.state = { ...mutablePart.state, output, metadata: { output } }
                 yield* sessions.updatePart(mutablePart)
               }
             }
@@ -1332,7 +1408,7 @@ export const layer = Layer.effect(
       // Loop guard (hook-async-rewake): skip hooks for rewake prompts (those whose
       // text starts with HOOK_REWAKE_SENTINEL) to prevent hook → rewake → hook loops.
       let hookAdditionalContexts: string[] = []
-      const promptText = input.parts.map((p: any) => p.type === "text" ? p.text : "").join("\n")
+      const promptText = input.parts.map((p: any) => (p.type === "text" ? p.text : "")).join("\n")
       const isRewake = promptText.startsWith(HOOK_REWAKE_SENTINEL)
       if (settingsHook && !isRewake) {
         const hookResult = yield* settingsHook
@@ -1346,19 +1422,32 @@ export const layer = Layer.effect(
         // parts when the turn proceeds so the model sees them — no silent drop).
         yield* SettingsHook.landSystemMessages(hookResult, {
           sessionID: input.sessionID,
-          inject: hookResult.blocked
-            ? undefined
-            : (text) =>
-                sessions.updatePart({
-                  id: PartID.ascending(),
-                  messageID: message.info.id,
-                  sessionID: input.sessionID,
-                  type: "text",
-                  text,
-                  synthetic: true,
-                } satisfies SessionV1.TextPart),
+          inject:
+            hookResult.blocked || hookResult.preventContinuation
+              ? undefined
+              : (text) =>
+                  sessions.updatePart({
+                    id: PartID.ascending(),
+                    messageID: message.info.id,
+                    sessionID: input.sessionID,
+                    type: "text",
+                    text,
+                    synthetic: true,
+                  } satisfies SessionV1.TextPart),
         })
-        if (hookResult.blocked) return { message, run: false as const }
+        if (hookResult.blocked || hookResult.preventContinuation) {
+          const reason = hookResult.stopReason ?? hookResult.blocked?.reason ?? "Hook requested stop"
+          const part = yield* sessions.updatePart({
+            id: PartID.ascending(),
+            messageID: message.info.id,
+            sessionID: input.sessionID,
+            type: "text",
+            text: `[Hook stopped] ${reason}`,
+            synthetic: true,
+          } satisfies SessionV1.TextPart)
+          message.parts.push(part)
+          return { message, run: false as const }
+        }
       }
 
       // SettingsHook: drain HookStartContext queued by SessionStart hooks (only if not blocked)
@@ -1395,6 +1484,7 @@ export const layer = Layer.effect(
     )(function* (input: PromptInput) {
       const wait = yield* promptLocks.withLock(input.sessionID)(
         Effect.gen(function* () {
+          if (goal && input.noReply !== true) yield* goal.clearTurnDriven(input.sessionID)
           const admitted = yield* admitPrompt(input)
           if (!admitted.run) return Effect.succeed(admitted.message)
           return yield* state.ensureRunningHandle(
@@ -1407,55 +1497,65 @@ export const layer = Layer.effect(
       return yield* wait
     })
 
-    const prepareIfIdle: Interface["prepareIfIdle"] = Effect.fn("SessionPrompt.prepareIfIdle")(
-      function* (input: PromptInput) {
-        return yield* promptLocks.withLock(input.sessionID)(
-          Effect.uninterruptibleMask((restore) =>
-            Effect.gen(function* () {
-              const activation = yield* Deferred.make<void>()
-              const admission = yield* Deferred.make<
-                Exit.Exit<{ readonly message: SessionV1.WithParts; readonly run: boolean }, Image.Error>
-              >()
-              const wait = yield* state.startIfIdle(
-                input.sessionID,
-                lastAssistant(input.sessionID),
-                Effect.gen(function* () {
-                  yield* Deferred.await(activation)
-                  const admitted = yield* Deferred.await(admission)
-                  if (Exit.isFailure(admitted)) return yield* Effect.failCause(admitted.cause)
-                  if (!admitted.value.run) return admitted.value.message
-                  return yield* runLoop(input.sessionID)
-                }).pipe(Effect.orDie),
-              )
-              if (Option.isNone(wait)) return Option.none<IdleAdmission>()
-
-              const admitted = yield* restore(admitPrompt(input)).pipe(Effect.exit)
-              yield* Deferred.succeed(admission, admitted)
-              if (Exit.isFailure(admitted)) {
-                yield* Deferred.succeed(activation, undefined)
-                return yield* Effect.failCause(admitted.cause)
-              }
-              return Option.some({
-                activate: Deferred.succeed(activation, undefined).pipe(Effect.asVoid),
-                result: wait.value,
-                abort: state.cancel(input.sessionID),
-              })
-            }),
-          ),
-        )
-      },
-    )
-
-    const promptIfIdle: Interface["promptIfIdle"] = Effect.fn("SessionPrompt.promptIfIdle")(
-      (input: PromptInput) =>
-        Effect.uninterruptibleMask((restore) =>
+    const withIdle: Interface["withIdle"] = Effect.fn("SessionPrompt.withIdle")(
+      <A, E, R>(sessionID: SessionID, work: Effect.Effect<A, E, R>) =>
+        promptLocks.withLock(sessionID)(
           Effect.gen(function* () {
-            const prepared = yield* restore(prepareIfIdle(input))
-            if (Option.isNone(prepared)) return Option.none()
-            yield* prepared.value.activate.pipe(Effect.onError(() => prepared.value.abort))
-            return Option.some(yield* restore(prepared.value.result))
+            if ((yield* status.get(sessionID)).type !== "idle") return Option.none()
+            return Option.some(yield* work)
           }),
         ),
+    )
+
+    const prepareIfIdle: Interface["prepareIfIdle"] = Effect.fn("SessionPrompt.prepareIfIdle")(function* (
+      input: PromptInput,
+    ) {
+      return yield* promptLocks.withLock(input.sessionID)(
+        Effect.uninterruptibleMask((restore) =>
+          Effect.gen(function* () {
+            const activation = yield* Deferred.make<void>()
+            const admission =
+              yield* Deferred.make<
+                Exit.Exit<{ readonly message: SessionV1.WithParts; readonly run: boolean }, Image.Error>
+              >()
+            const wait = yield* state.startIfIdle(
+              input.sessionID,
+              lastAssistant(input.sessionID),
+              Effect.gen(function* () {
+                yield* Deferred.await(activation)
+                const admitted = yield* Deferred.await(admission)
+                if (Exit.isFailure(admitted)) return yield* Effect.failCause(admitted.cause)
+                if (!admitted.value.run) return admitted.value.message
+                return yield* runLoop(input.sessionID)
+              }).pipe(Effect.orDie),
+            )
+            if (Option.isNone(wait)) return Option.none<IdleAdmission>()
+
+            const admitted = yield* restore(admitPrompt(input)).pipe(Effect.exit)
+            yield* Deferred.succeed(admission, admitted)
+            if (Exit.isFailure(admitted)) {
+              yield* Deferred.succeed(activation, undefined)
+              return yield* Effect.failCause(admitted.cause)
+            }
+            return Option.some({
+              activate: Deferred.succeed(activation, undefined).pipe(Effect.asVoid),
+              result: wait.value,
+              abort: state.cancel(input.sessionID),
+            })
+          }),
+        ),
+      )
+    })
+
+    const promptIfIdle: Interface["promptIfIdle"] = Effect.fn("SessionPrompt.promptIfIdle")((input: PromptInput) =>
+      Effect.uninterruptibleMask((restore) =>
+        Effect.gen(function* () {
+          const prepared = yield* restore(prepareIfIdle(input))
+          if (Option.isNone(prepared)) return Option.none()
+          yield* prepared.value.activate.pipe(Effect.onError(() => prepared.value.abort))
+          return Option.some(yield* restore(prepared.value.result))
+        }),
+      ),
     )
 
     const lastAssistant = Effect.fnUntraced(function* (sessionID: SessionID) {
@@ -1500,6 +1600,7 @@ export const layer = Layer.effect(
           yield* Effect.logInfo("loop", { "session.id": sessionID, step })
 
           let msgs = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
+            Effect.map((messages) => messages.filter((message) => !MessageV2.isIgnoredUser(message))),
             Effect.provideService(Database.Service, database),
           )
 
@@ -1566,9 +1667,7 @@ export const layer = Layer.effect(
                 const stopResult = yield* settingsHook
                   .trigger(stopPayload, { sessionID, transcriptPath: "" })
                   .pipe(
-                    Effect.catch(() =>
-                      Effect.succeed({ additionalContexts: [], systemMessages: [] } as TriggerResult),
-                    ),
+                    Effect.catch(() => Effect.succeed({ additionalContexts: [], systemMessages: [] } as TriggerResult)),
                   )
                 // Consume Stop-hook outputs so nothing is silently dropped: inject
                 // additionalContexts as synthetic text parts (model-visible on the
@@ -1600,7 +1699,7 @@ export const layer = Layer.effect(
                 // stop_hook_active=true so a well-behaved hook stops blocking (anti-loop).
                 // Capped by MAX_STOP_CONTINUATIONS so a hook that ignores the signal
                 // can't loop forever; at the limit we log.warn and force a normal exit.
-                if (!turnError && stopResult.blocked) {
+                if (!turnError && stopResult.blocked && !stopResult.preventContinuation) {
                   if (stopContinuationCount < SettingsHook.MAX_STOP_CONTINUATIONS) {
                     stopContinuationCount++
                     stopHookBlocked = true
@@ -1743,6 +1842,7 @@ export const layer = Layer.effect(
               bypassAgentCheck,
               messages: msgs,
               promptOps,
+              hooks: settingsHook,
             }).pipe(
               Effect.provideService(Plugin.Service, plugin),
               Effect.provideService(Permission.Service, permission),
@@ -1869,14 +1969,20 @@ export const layer = Layer.effect(
     const loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.loop")(function* (
       input: LoopInput,
     ) {
-      return yield* state.ensureRunning(input.sessionID, lastAssistant(input.sessionID), runLoop(input.sessionID))
+      const result = yield* promptLocks.withLock(input.sessionID)(
+        state.ensureRunningHandle(input.sessionID, lastAssistant(input.sessionID), runLoop(input.sessionID)),
+      )
+      return yield* result
     })
 
     const shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError> = Effect.fn(
       "SessionPrompt.shell",
     )(function* (input: ShellInput) {
       const ready = yield* Latch.make()
-      return yield* state.startShell(input.sessionID, lastAssistant(input.sessionID), shellImpl(input, ready), ready)
+      const result = yield* promptLocks.withLock(input.sessionID)(
+        state.startShellHandle(input.sessionID, lastAssistant(input.sessionID), shellImpl(input, ready), ready),
+      )
+      return yield* result
     })
 
     // #409: early-return command dispatches (/memory, /trust, /goal non-kick)
@@ -1885,8 +1991,12 @@ export const layer = Layer.effect(
     // startIfIdle keeps today's inline semantics while another turn is running
     // (no queueing, no second idle); the in-flight turn re-emits idle itself.
     const commandTurn = Effect.fnUntraced(function* (sessionID: SessionID, work: Effect.Effect<SessionV1.WithParts>) {
-      const handle = yield* state.startIfIdle(sessionID, lastAssistant(sessionID), work)
-      return yield* Option.getOrElse(handle, () => work)
+      return yield* promptLocks.withLock(sessionID)(
+        Effect.gen(function* () {
+          const handle = yield* state.startIfIdle(sessionID, lastAssistant(sessionID), work)
+          return yield* Option.getOrElse(handle, () => work)
+        }),
+      )
     })
 
     const command = Effect.fn("SessionPrompt.command")(function* (input: CommandInput) {
@@ -2082,6 +2192,7 @@ export const layer = Layer.effect(
                 messageID: userMsg.id,
                 sessionID: input.sessionID,
                 type: "text",
+                ignored: true,
                 text: `⚠️ /${input.command} 执行失败，请检查日志。`,
                 synthetic: true,
                 time: { start: now, end: now },
@@ -2096,6 +2207,7 @@ export const layer = Layer.effect(
               messageID: userMsg.id,
               sessionID: input.sessionID,
               type: "text",
+              ignored: true,
               text: `/${input.command} ${input.arguments}`.trim(),
             }
             yield* sessions.updatePart(cmdText)
@@ -2110,6 +2222,7 @@ export const layer = Layer.effect(
               messageID: userMsg.id,
               sessionID: input.sessionID,
               type: "text",
+              ignored: true,
               text: dispatchText,
               time: { start: now, end: now },
             }
@@ -2229,6 +2342,7 @@ export const layer = Layer.effect(
     return Service.of({
       cancel,
       prompt,
+      withIdle,
       prepareIfIdle,
       promptIfIdle,
       loop,
@@ -2241,7 +2355,7 @@ export const layer = Layer.effect(
 
 export const defaultLayer = Layer.suspend(() =>
   layer.pipe(
-    Layer.provide(SessionRunState.defaultLayer),
+    Layer.provide(Layer.mergeAll(Goal.defaultLayer, SessionRunState.defaultLayer)),
     Layer.provide(SessionStatus.defaultLayer),
     Layer.provide(SessionCompaction.defaultLayer),
     Layer.provide(SessionProcessor.defaultLayer),
@@ -2270,6 +2384,7 @@ export const defaultLayer = Layer.suspend(() =>
         RuntimeFlags.defaultLayer,
         EventV2Bridge.defaultLayer,
         HookStartContext.defaultLayer,
+        SettingsHook.defaultLayer,
         Todo.defaultLayer,
       ),
     ),
@@ -2427,7 +2542,9 @@ export const node = LayerNode.make(layer, [
   Database.node,
   Memory.node,
   Todo.node,
-  HookStartContext.node, SettingsHook.node, Goal.node,
+  HookStartContext.node,
+  SettingsHook.node,
+  Goal.node,
 ])
 
 export function admitIfIdle(
