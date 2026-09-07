@@ -1,38 +1,23 @@
 version: 1
-delivery: hooks-runtime-reliability
+delivery: goal-reliability
 context:
-  kind: branch
-  branch: fix/557-hooks-runtime-reliability
+  kind: worktree
+  label: opencode-goal-fixes
+  branch: fix/568-goal-reliability
 issues:
-  - 557
-  - 558
-  - 559
-  - 560
-  - 561
-  - 562
-  - 563
-  - 564
-  - 565
-  - 566
+  - 568
+  - 569
+  - 570
+  - 571
+  - 572
 issueKinds:
-  - issue: 557
+  - issue: 568
     kind: kind::fix
-  - issue: 558
+  - issue: 569
     kind: kind::fix
-  - issue: 559
+  - issue: 570
     kind: kind::fix
-  - issue: 560
+  - issue: 571
     kind: kind::fix
-  - issue: 561
+  - issue: 572
     kind: kind::fix
-  - issue: 562
-    kind: kind::fix
-  - issue: 563
-    kind: kind::fix
-  - issue: 564
-    kind: kind::fix
-  - issue: 565
-    kind: kind::fix
-  - issue: 566
-    kind: kind::fix
-pr: 567
