@@ -19,6 +19,33 @@ function addHook(directory: string, sessionID: string, hook: Record<string, unkn
 
 describe("session hook add validation", () => {
   it.instance(
+    "rejects missing handler descriptors and round-trips supported command fields",
+    () =>
+      Effect.gen(function* () {
+        const instance = yield* TestInstance
+        const session = yield* Session.use.create({})
+        for (const type of ["mcp", "http", "prompt", "agent"]) {
+          const response = yield* addHook(instance.directory, session.id, { type })
+          expect(response.status).toBe(400)
+        }
+        const input = {
+          type: "command",
+          command: "true",
+          shell: "bash",
+          once: true,
+          statusMessage: "checking",
+          options: { mode: "check" },
+        }
+        const added = yield* addHook(instance.directory, session.id, input)
+        expect(added.status).toBe(200)
+        const listed = yield* requestInDirectory(`/session/${session.id}/hook`, instance.directory)
+        expect(listed.status).toBe(200)
+        expect(yield* listed.json).toMatchObject([{ hooks: [input] }])
+      }),
+    { git: true },
+  )
+
+  it.instance(
     "rejects command-type hooks with a missing or blank command",
     () =>
       Effect.gen(function* () {

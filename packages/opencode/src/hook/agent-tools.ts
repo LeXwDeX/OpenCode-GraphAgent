@@ -1,22 +1,4 @@
-/**
- * WP-4D micro-WP-1 — agent-handler tool set (LLM-facing).
- *
- * Builds the 5-tool palette consumed by the WP-4D-2 agent loop:
- *   read_file / list_dir / grep / bash / synthetic_output
- *
- * Design contract:
- *   - All tools are pure ai-SDK `Tool` values; no Effect dependencies on the
- *     LLM-side execute path. Effect Services (spawner / fs) are pre-resolved
- *     by the caller and captured via closure.
- *   - Every `execute` is wrapped in try/catch. Errors return
- *     `{ output: "Error: <message>" }` and **never throw** — the agent loop
- *     must be able to keep running and let the model decide whether to retry.
- *   - bash uses a strict read-only whitelist. The token list and forbidden
- *     metachar regex are the v1 contract; expanding either requires a
- *     deliberate WP, not a one-off addition.
- *   - synthetic_output writes into the caller-owned `captured.value` slot;
- *     the loop polls it after each turn to decide termination.
- */
+/** Read-only tools for model-driven hooks. Every operation observes the hook abort signal. */
 import path from "path"
 import { Effect, Stream } from "effect"
 import { ChildProcess } from "effect/unstable/process"
@@ -24,59 +6,10 @@ import type { ChildProcessSpawner } from "effect/unstable/process/ChildProcessSp
 import { type Tool, tool, jsonSchema } from "ai"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import type { HookJSONOutput } from "./settings"
+import { HookOutputSchema } from "./schema"
+import { FORBIDDEN_META, parseReadonlyCommand, readonlyExecutable, whitelistReject } from "./readonly-command"
 
-// ── bash whitelist (read-only, POSIX-only) ──────────────────────
-
-const BASH_WHITELIST_SINGLE = new Set([
-  "ls",
-  "cat",
-  "grep",
-  "find",
-  "test",
-  "wc",
-  "head",
-  "tail",
-  "sort",
-  "uniq",
-  "awk",
-  "echo",
-  "pwd",
-  "which",
-  "file",
-  "stat",
-])
-
-const BASH_WHITELIST_PAIR = new Set([
-  "git status",
-  "git log",
-  "git diff",
-  "git show",
-  "sed -n",
-  "du -sh",
-])
-
-/**
- * Reject metacharacters that enable composition / redirection / substitution.
- * v1 only allows a single command invocation — no pipes, chains, redirects,
- * background, command substitution, or backticks.
- */
-const FORBIDDEN_META = /[|;&`$<>]|\$\(|\)\s*$/
-
-function whitelistReject(cmd: string): string | null {
-  const trimmed = cmd.trim()
-  if (!trimmed) return "empty command"
-  if (FORBIDDEN_META.test(trimmed))
-    return `compound/redirect not allowed in v1: ${trimmed.slice(0, 60)}`
-  const tokens = trimmed.split(/\s+/)
-  const first = tokens[0]
-  const pair = tokens.length >= 2 ? `${tokens[0]} ${tokens[1]}` : ""
-  if (BASH_WHITELIST_SINGLE.has(first)) return null
-  if (pair && BASH_WHITELIST_PAIR.has(pair)) return null
-  return `command "${first}" not in read-only whitelist`
-}
-
-// Exported for unit tests only — not part of the runtime surface.
-export const __test__ = { whitelistReject, BASH_WHITELIST_SINGLE, BASH_WHITELIST_PAIR, FORBIDDEN_META }
+export const __test__ = { whitelistReject, FORBIDDEN_META }
 
 // ── helpers ─────────────────────────────────────────────────────
 
@@ -87,38 +20,6 @@ function resolvePath(p: string, cwd: string): string {
 const MAX_BASH_OUTPUT = 8000
 const MAX_GREP_RESULTS_DEFAULT = 100
 const MAX_READ_LINES_DEFAULT = 2000
-
-// ── synthetic_output schema (mirrors HookJSONOutput) ────────────
-
-const HOOK_OUTPUT_SCHEMA = {
-  type: "object",
-  properties: {
-    continue: { type: "boolean" },
-    stopReason: { type: "string" },
-    suppressOutput: { type: "boolean" },
-    systemMessage: { type: "string" },
-    decision: { type: "string", enum: ["approve", "block"] },
-    reason: { type: "string" },
-    hookSpecificOutput: {
-      type: "object",
-      properties: {
-        hookEventName: { type: "string" },
-        permissionDecision: { type: "string", enum: ["allow", "deny", "ask"] },
-        permissionDecisionReason: { type: "string" },
-        updatedInput: { type: "object" },
-        additionalContext: { type: "string" },
-        initialUserMessage: { type: "string" },
-        updatedMCPToolOutput: {},
-      },
-    },
-  },
-} as const
-
-// Compile-time guard: the synthetic_output schema must remain a structural
-// subset of HookJSONOutput. If HookJSONOutput grows a required field, this
-// assignment has to be updated alongside HOOK_OUTPUT_SCHEMA above.
-const _schemaTypeCheck: (a: HookJSONOutput) => HookJSONOutput = (a) => a
-void _schemaTypeCheck
 
 // ── factory ─────────────────────────────────────────────────────
 
@@ -148,7 +49,7 @@ export function buildAgentTools(deps: BuildAgentToolsDeps): Record<string, Tool>
     execute: async (args: any) => {
       try {
         const resolved = resolvePath(String(args.path), cwd)
-        const text = await Effect.runPromise(fs.readFileString(resolved) as Effect.Effect<string, unknown>)
+        const text = await Effect.runPromise(fs.readFileString(resolved), { signal })
         const offset = typeof args.offset === "number" && args.offset > 0 ? args.offset - 1 : 0
         const limit = typeof args.limit === "number" && args.limit > 0 ? args.limit : MAX_READ_LINES_DEFAULT
         const lines = text.split("\n").slice(offset, offset + limit)
@@ -176,8 +77,9 @@ export function buildAgentTools(deps: BuildAgentToolsDeps): Record<string, Tool>
         const lines: string[] = []
 
         const walk = async (dir: string, rel: string): Promise<void> => {
-          const entries = await Effect.runPromise(fs.readDirectoryEntries(dir) as Effect.Effect<FSUtil.DirEntry[], unknown>)
+          const entries = await Effect.runPromise(fs.readDirectoryEntries(dir), { signal })
           for (const e of entries) {
+            signal.throwIfAborted()
             const display = (rel ? rel + "/" : "") + e.name + (e.type === "directory" ? "/" : "")
             lines.push(display)
             if (recursive && e.type === "directory") {
@@ -211,7 +113,8 @@ export function buildAgentTools(deps: BuildAgentToolsDeps): Record<string, Tool>
       try {
         const re = new RegExp(String(args.pattern))
         const root = resolvePath(String(args.path), cwd)
-        const max = typeof args.max_results === "number" && args.max_results > 0 ? args.max_results : MAX_GREP_RESULTS_DEFAULT
+        const max =
+          typeof args.max_results === "number" && args.max_results > 0 ? args.max_results : MAX_GREP_RESULTS_DEFAULT
         // Treat include as a suffix filter only — minimatch is not in the
         // hook subsystem's dep set and grep is best-effort here. Strip a
         // leading '*' so '*.ts' and '.ts' both work.
@@ -225,8 +128,9 @@ export function buildAgentTools(deps: BuildAgentToolsDeps): Record<string, Tool>
           if (suffix && !filepath.endsWith(suffix)) return
           let content: string
           try {
-            content = await Effect.runPromise(fs.readFileString(filepath) as Effect.Effect<string, unknown>)
+            content = await Effect.runPromise(fs.readFileString(filepath), { signal })
           } catch {
+            signal.throwIfAborted()
             return
           }
           const lines = content.split("\n")
@@ -239,15 +143,16 @@ export function buildAgentTools(deps: BuildAgentToolsDeps): Record<string, Tool>
         }
 
         const walk = async (dir: string): Promise<void> => {
-          const entries = await Effect.runPromise(fs.readDirectoryEntries(dir) as Effect.Effect<FSUtil.DirEntry[], unknown>)
+          const entries = await Effect.runPromise(fs.readDirectoryEntries(dir), { signal })
           for (const e of entries) {
+            signal.throwIfAborted()
             const child = path.join(dir, e.name)
             if (e.type === "directory") await walk(child)
             else if (e.type === "file") await scanFile(child)
           }
         }
 
-        const isDir = await Effect.runPromise(fs.isDir(root))
+        const isDir = await Effect.runPromise(fs.isDir(root), { signal })
         if (isDir) await walk(root)
         else await scanFile(root)
 
@@ -262,7 +167,7 @@ export function buildAgentTools(deps: BuildAgentToolsDeps): Record<string, Tool>
 
   const bash = tool({
     description:
-      "Run a single read-only shell command (whitelist enforced: ls/cat/grep/find/git status/git log/git diff/git show/sed -n/test/wc/head/tail/sort/uniq/awk/echo/pwd/which/file/stat/du -sh). No pipes, redirects, or substitution.",
+      "Run one POSIX read-only command with restricted options: ls/cat/grep/find/git status/log/diff/show/sed -n/test/wc/head/tail/sort/uniq/echo/pwd/which/file/stat/du. Quotes are supported; shell syntax, interpreters and output-file options are rejected.",
     inputSchema: jsonSchema({
       type: "object",
       properties: { command: { type: "string" } },
@@ -270,22 +175,24 @@ export function buildAgentTools(deps: BuildAgentToolsDeps): Record<string, Tool>
     }),
     execute: async (args: any) => {
       const command = String(args?.command ?? "")
-      const reject = whitelistReject(command)
-      if (reject) return { output: `Error: ${reject}` }
-
-      // Align with settings.ts execShell: use cmd.exe on Windows (no `sh`),
-      // POSIX `sh -c` elsewhere. Previously this bailed on win32 while command
-      // hooks ran fine via cmd.exe — asymmetric behavior across handler types.
-      const isWin = process.platform === "win32"
-
       try {
+        signal.throwIfAborted()
+        const parsed = parseReadonlyCommand(command)
+        const executable = readonlyExecutable(parsed.name)
         const result = await Effect.runPromise(
           Effect.scoped(
             Effect.gen(function* () {
               const handle = yield* spawner.spawn(
-                ChildProcess.make(isWin ? "cmd.exe" : "sh", isWin ? ["/c", command] : ["-c", command], {
+                ChildProcess.make(executable, parsed.args, {
                   cwd,
                   extendEnv: true,
+                  env: {
+                    GIT_OPTIONAL_LOCKS: "0",
+                    GIT_CONFIG_NOSYSTEM: "1",
+                    GIT_CONFIG_GLOBAL: "/dev/null",
+                    GIT_NO_LAZY_FETCH: "1",
+                    GIT_TERMINAL_PROMPT: "0",
+                  },
                   stdin: "ignore",
                   stdout: "pipe",
                   stderr: "pipe",
@@ -301,7 +208,8 @@ export function buildAgentTools(deps: BuildAgentToolsDeps): Record<string, Tool>
               )
               return { stdout, stderr, code }
             }),
-          ) as Effect.Effect<{ stdout: string; stderr: string; code: number }, unknown>,
+          ),
+          { signal },
         )
 
         const body = `exit=${result.code}\n${result.stdout}` + (result.stderr ? `\n[stderr]\n${result.stderr}` : "")
@@ -314,23 +222,17 @@ export function buildAgentTools(deps: BuildAgentToolsDeps): Record<string, Tool>
 
   const synthetic_output = tool({
     description: "Emit the final hook decision and stop. Call this exactly once when ready to terminate.",
-    inputSchema: jsonSchema(HOOK_OUTPUT_SCHEMA as Record<string, unknown>),
+    inputSchema: HookOutputSchema,
     execute: async (args: any) => {
       try {
-        captured.value = args as HookJSONOutput
+        signal.throwIfAborted()
+        captured.value = HookOutputSchema.parse(args) as HookJSONOutput
         return { output: "ok" }
       } catch (e: any) {
         return { output: `Error: ${e?.message ?? String(e)}` }
       }
     },
   })
-
-  // signal is captured for the loop's transport-level cancellation; the
-  // tool execute paths above don't directly consume it (Effect.scoped on
-  // the bash spawn unwinds child handles when the runtime is interrupted
-  // by the outer agent loop). Reference here is intentional to keep the
-  // dep contract honest without a noisy unused-param warning.
-  void signal
 
   return { read_file, list_dir, grep, bash, synthetic_output }
 }

@@ -33,6 +33,27 @@ export interface TriggerResult {
   updatedInput?: Record<string, unknown>
 }
 
+/** Post hooks run after the side effect; report validation feedback to the model. */
+export function postHookFeedback(result: TriggerResult): string {
+  return [
+    ...(result.additionalContexts ?? []),
+    ...(result.systemMessages ?? []),
+    ...(result.blocked ? [`[Post-tool hook blocked] ${result.blocked.reason}`] : []),
+    ...(result.preventContinuation ? [`[Hook stopped] ${result.stopReason ?? "Hook requested stop"}`] : []),
+  ].join("\n\n")
+}
+
+export function withHookFeedback(output: string, result: TriggerResult): string {
+  const feedback = postHookFeedback(result)
+  return feedback ? `${output}\n\n${feedback}` : output
+}
+
+export function withHookFailure(error: unknown, result: TriggerResult): unknown {
+  const feedback = postHookFeedback(result)
+  if (!feedback) return error
+  return new Error(`${error instanceof Error ? error.message : String(error)}\n\n${feedback}`, { cause: error })
+}
+
 /**
  * Land a TriggerResult's `systemMessages` so they are never silently dropped.
  *

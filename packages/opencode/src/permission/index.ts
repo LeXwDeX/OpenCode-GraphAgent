@@ -7,6 +7,7 @@ import * as Option from "effect/Option"
 import os from "os"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { EventV2Bridge } from "@/event-v2-bridge"
+import { type TriggerResult } from "@/hook/trigger-result"
 import { SettingsHook } from "@/hook/settings"
 import { Notification } from "@/notification"
 import { PermissionV1Event } from "@opencode-ai/schema/permission-v1"
@@ -121,40 +122,34 @@ export const layer = Layer.effect(
       }
       yield* Effect.logInfo("asking", { id, permission: info.permission, patterns: info.patterns })
 
+      if (settingsHook) {
+        const hookResult = yield* settingsHook
+          .trigger(
+            {
+              event: "PermissionRequest",
+              toolName: request.permission,
+              toolInput: {
+                permission: request.permission,
+                patterns: request.patterns,
+                metadata: request.metadata,
+                always: request.always,
+              },
+              toolUseID: id,
+            } as any,
+            { sessionID: request.sessionID ?? "", transcriptPath: "" },
+          )
+          .pipe(Effect.catch(() => Effect.succeed({ additionalContexts: [], systemMessages: [] } as TriggerResult)))
+        yield* SettingsHook.landSystemMessages(hookResult as any, { sessionID: request.sessionID ?? "" })
+        if (hookResult.blocked || hookResult.preventContinuation || hookResult.permissionDecision === "deny") {
+          const reason = hookResult.blocked?.reason ?? hookResult.stopReason ?? hookResult.permissionDecisionReason
+          if (reason) return yield* new PermissionV1.CorrectedError({ feedback: `Permission hook: ${reason}` })
+          return yield* new PermissionV1.RejectedError({})
+        }
+        if (hookResult.permissionDecision === "allow") return
+      }
       const deferred = yield* Deferred.make<void, PermissionV1.RejectedError | PermissionV1.CorrectedError>()
       pending.set(id, { info, deferred })
-      let hookAutoDecided = false
-      if (settingsHook) {
-        const hookResult = yield* settingsHook.trigger(
-          {
-            event: "PermissionRequest",
-            toolName: request.permission,
-            toolInput: {
-              permission: request.permission,
-              patterns: request.patterns,
-              metadata: request.metadata,
-              always: request.always,
-            },
-            toolUseID: id,
-          } as any,
-          { sessionID: request.sessionID ?? "", transcriptPath: "" },
-        ).pipe(Effect.catch(() => Effect.succeed({ permissionDecision: undefined, additionalContexts: [], systemMessages: [] } as any)))
-        yield* SettingsHook.landSystemMessages(hookResult as any, { sessionID: request.sessionID ?? "" })
-        // Auto-approve/deny based on hook decision
-        if ((hookResult as any).permissionDecision === "allow") {
-          hookAutoDecided = true
-          pending.delete(id)
-          yield* events.publish(Event.Asked, info)
-          yield* Deferred.succeed(deferred, undefined)
-        } else if ((hookResult as any).permissionDecision === "deny") {
-          hookAutoDecided = true
-          pending.delete(id)
-          yield* events.publish(Event.Asked, info)
-          yield* Deferred.fail(deferred, new PermissionV1.RejectedError({}))
-        }
-      }
-      // Only publish Event.Asked if hook didn't already handle the decision
-      if (!hookAutoDecided) {
+      return yield* Effect.gen(function* () {
         yield* events.publish(Event.Asked, info)
         // Notification emitter — routes "agent needs attention" through the single
         // choke point (which fires the Notification hook). Resolved at call time so
@@ -171,13 +166,8 @@ export const layer = Layer.effect(
             })
             .pipe(Effect.ignore, Effect.forkIn(scope), Effect.asVoid)
         }
-      }
-      return yield* Effect.ensuring(
-        Deferred.await(deferred),
-        Effect.sync(() => {
-          pending.delete(id)
-        }),
-      )
+        return yield* Deferred.await(deferred)
+      }).pipe(Effect.ensuring(Effect.sync(() => pending.delete(id))))
     })
 
     const reply = Effect.fn("Permission.reply")(function* (input: PermissionV1.ReplyInput) {
@@ -289,6 +279,7 @@ export function disabled(tools: string[], ruleset: PermissionV1.Ruleset): Set<st
 
 export const defaultLayer = layer.pipe(
   Layer.provide(EventV2Bridge.defaultLayer),
+  Layer.provide(SettingsHook.defaultLayer),
 )
 
 export const node = LayerNode.make(layer, [EventV2Bridge.node, SettingsHook.node, Notification.node])

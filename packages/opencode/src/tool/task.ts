@@ -404,7 +404,7 @@ export const TaskTool = Tool.define(
               .pipe(Effect.catch(() => Effect.succeed({ additionalContexts: [], systemMessages: [] } as TriggerResult)))
             // Land any hook systemMessages so they're never silently dropped.
             yield* SettingsHook.landSystemMessages(stopResult, { sessionID: ctx.sessionID })
-            if (!stopResult.blocked) {
+            if (!stopResult.blocked || stopResult.preventContinuation) {
               lastStillBlocked = false
               break
             }

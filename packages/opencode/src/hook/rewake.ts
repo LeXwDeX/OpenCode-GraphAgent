@@ -20,4 +20,18 @@ export interface Interface {
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/HookRewake") {}
 
+export function bind(
+  submit: (input: { sessionID: SessionID; text: string }) => Effect.Effect<unknown, unknown>,
+): Interface {
+  return {
+    rewake: (input) =>
+      submit(input).pipe(
+        Effect.catch((error) =>
+          Effect.logWarning("hook rewake prompt failed", { sessionID: input.sessionID, error: String(error) }),
+        ),
+        Effect.asVoid,
+      ),
+  }
+}
+
 export * as HookRewake from "./rewake"

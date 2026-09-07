@@ -10125,6 +10125,13 @@ export type SessionHookListResponses = {
       if?: string
       async?: boolean
       asyncRewake?: boolean
+      shell?: "bash" | "powershell"
+      allowedEnvVars?: Array<string>
+      statusMessage?: string
+      once?: boolean
+      options?: {
+        [key: string]: unknown
+      }
     }>
     once?: boolean
   }>
@@ -10174,6 +10181,13 @@ export type SessionHookAddData = {
       if?: string
       async?: boolean
       asyncRewake?: boolean
+      shell?: "bash" | "powershell"
+      allowedEnvVars?: Array<string>
+      statusMessage?: string
+      once?: boolean
+      options?: {
+        [key: string]: unknown
+      }
     }>
     once?: boolean
   }
