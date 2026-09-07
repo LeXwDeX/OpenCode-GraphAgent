@@ -21,3 +21,4 @@ issueKinds:
     kind: kind::fix
   - issue: 572
     kind: kind::fix
+pr: 573
