@@ -5,7 +5,10 @@ export * as DagStore from "./store"
 
 import { and, asc, count, desc, eq, gt, inArray, or } from "drizzle-orm"
 import { Context, Effect, Layer } from "effect"
+import { DagEvent } from "@opencode-ai/schema/dag-event"
 import { Database } from "../database/database"
+import { versionedType } from "../event"
+import { EventTable } from "../event/sql"
 import { LayerNode } from "../effect/layer-node"
 import { WorkflowNodeTable, WorkflowTable } from "./sql"
 
@@ -150,6 +153,13 @@ const wakeDeliverableNodePredicate = or(
   gt(WorkflowNodeTable.timeout_extensions, 0),
 )
 
+const checkpointControlTypes = [DagEvent.WorkflowResumed, DagEvent.WorkflowReplanned, DagEvent.WorkflowStepped].map(
+  (definition) => {
+    if (!definition.durable) throw new Error(`Checkpoint control event is not durable: ${definition.type}`)
+    return versionedType(definition.type, definition.durable.version)
+  },
+)
+
 // ============================================================================
 // Service interface
 // ============================================================================
@@ -162,6 +172,8 @@ export interface Interface {
   readonly listByProject: (projectId: string) => Effect.Effect<WorkflowRow[]>
   readonly listByStatus: (status: string) => Effect.Effect<WorkflowRow[]>
   readonly getWorkflowSummaries: (sessionId: string) => Effect.Effect<WorkflowSummary[]>
+  /** Latest explicit parent control that can dispose of a checkpoint veto. */
+  readonly getLatestCheckpointControlSeq: (workflowId: string) => Effect.Effect<number | undefined>
 
   readonly getNodes: (workflowId: string) => Effect.Effect<NodeRow[]>
   /**
@@ -198,6 +210,17 @@ export const layer = Layer.effect(
       getWorkflow: Effect.fn("DagStore.getWorkflow")(function* (id) {
         const row = yield* db.select().from(WorkflowTable).where(eq(WorkflowTable.id, id)).get().pipe(Effect.orDie)
         return row ? mapWorkflow(row) : undefined
+      }),
+
+      getLatestCheckpointControlSeq: Effect.fn("DagStore.getLatestCheckpointControlSeq")(function* (workflowId) {
+        const row = yield* db
+          .select({ seq: EventTable.seq })
+          .from(EventTable)
+          .where(and(eq(EventTable.aggregate_id, workflowId), inArray(EventTable.type, checkpointControlTypes)))
+          .orderBy(desc(EventTable.seq))
+          .get()
+          .pipe(Effect.orDie)
+        return row?.seq
       }),
 
       // #270 atomic-adoption fence (C2). The adoption sites previously re-read the

@@ -16,15 +16,22 @@
  * - terminal nodes (done/cancelled/failed) in the fragment → IGNORED (iron law #2)
  * - running nodes:
  *   - absent from fragment → kept unchanged (let finish)
- *   - present, no marker   → kept unchanged
+ *   - present, no marker   → classified as replace; the host must first prove
+ *                            the definition is equivalent or the update is safe
  *   - restart: true        → pause + discard child session + re-spawn with fragment's def
  *   - cancel: true         → cancelled; downstream becomes orphan (auto-failed via cascade)
+ * - queued/paused nodes:
+ *   - absent from fragment → cancelled (superseded)
+ *   - present               → classified as replace; the host must first prove
+ *                             captured execution fields are unchanged
  * - pending nodes:
  *   - absent from fragment → cancelled (superseded)
  *   - present               → replaced with fragment's def
  * - new ids (not in old graph) → added
  *
  * After merge the full graph MUST be acyclic; validation fails otherwise.
+ * This config-free planner cannot compare complete node definitions. Callers
+ * must validate execution-field changes before applying the returned plan.
  */
 
 import { CycleError, DependencyGraph } from "./graph"
@@ -36,7 +43,7 @@ export interface ReplanNodeInput {
   depends_on: string[]
   /** Marker: re-spawn this running node's child session with the fragment's def. */
   restart?: boolean
-  /** Marker: cancel this running/pending node; downstream is auto-failed via cascade. */
+  /** Marker: cancel this non-terminal node; downstream is auto-failed via cascade. */
   cancel?: boolean
 }
 
@@ -51,11 +58,11 @@ export interface CurrentNodeState {
 export interface ReplanMergePlan {
   /** Non-empty means the replan is REJECTED; the runtime must not apply it. */
   errors: string[]
-  /** Node ids to cancel (pending-not-in-fragment + running-with-cancel). */
+  /** Node ids to cancel (superseded pending/queued/paused + explicit cancel). */
   cancel: string[]
   /** Node ids to restart (running-with-restart); def comes from the fragment. */
   restart: string[]
-  /** Pending nodes to replace with the fragment's def. */
+  /** Non-terminal nodes to replace after the host validates their definitions. */
   replace: string[]
   /** New node ids to add. */
   add: string[]
@@ -189,13 +196,11 @@ export function planReplan(
   for (const n of current.nodes) {
     if (!survivingIds.has(n.id)) continue
     const frag = fragmentNodeById.get(n.id)
-    // P1a: the CHECK graph must equal the EXECUTION graph. A running node
-    // present without a restart marker is replaced (its definition is
-    // re-published via NodeRegistered and the projector upserts the fragment's
-    // depends_on into the durable row the runtime rebuilds from), so it takes
-    // the fragment's deps here too — otherwise a cycle only reachable through
-    // the replaced deps passes the check and crashes the runtime's
-    // rebuildGraph. Terminal nodes are immutable and keep their current deps.
+    // P1a: the CHECK graph must equal the proposed post-merge graph. A running
+    // node present without a restart marker is classified as replaced, so it
+    // takes the fragment's deps here. The host rejects changed admitted deps
+    // before applying this plan; keeping the proposed edge here also makes this
+    // config-free planner safe for every caller. Terminal nodes are immutable.
     const deps = frag && !isNodeTerminalStatus(n.status) ? frag.depends_on : n.depends_on
     for (const depId of deps) tryAddEdge(n.id, depId)
   }
@@ -233,10 +238,8 @@ export function planReplan(
         restart.push(n.id)
         continue
       }
-      // A running node present in the fragment (no restart marker) gets its
-      // definition replaced without re-executing — this is the timeout
-      // extension path: the merged config carries the new worker_config.timeout_ms,
-      // and the runtime recomputes the absolute deadline from it.
+      // The host must prevalidate this replacement. Dag._replan admits only an
+      // equivalent definition or its explicit running-time timeout update.
       if (frag) replace.push(n.id)
       continue
     }

@@ -410,10 +410,9 @@ export const layerWith = (options?: LayerOptions) =>
       //   the next event's listeners.
       // Consumers that need ordered, lossless delivery must use `subscribe` /
       // `all` (synchronous FIFO pubsub in publish order) or the durable
-      // stream; `listen` is for synchronous side effects (GlobalBus.emit,
-      // SSE queue offer) and fire-and-forget work. All current listeners
-      // (EventV2Bridge, SSE handler, summary publisher, plugins, VCS/project
-      // watchers) are of this shape, so the fork is semantics-preserving.
+      // stream; `listen` is for independent side effects and
+      // fire-and-forget work. EventV2Bridge consumes `all` because its
+      // GlobalBus notifications must retain committed event order.
       function notify(event: Payload) {
         return Effect.gen(function* () {
           const snapshot = Array.from(listeners)

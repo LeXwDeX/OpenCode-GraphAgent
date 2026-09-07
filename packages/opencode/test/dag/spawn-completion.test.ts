@@ -11,7 +11,14 @@ import { spawnNode, type NodeSpawnInput } from "@/dag/runtime/spawn"
 import { TerminalViolationError } from "@opencode-ai/core/dag/core/types"
 import { makeNodeRow } from "./fixtures"
 
-type TrackedEvent = { type: string; dagID: string; nodeID: string; output?: unknown; reason?: string }
+type TrackedEvent = {
+  type: string
+  dagID: string
+  nodeID: string
+  output?: unknown
+  reason?: string
+  trigger?: string
+}
 
 function makeEventTracker() {
   const events: TrackedEvent[] = []
@@ -26,8 +33,8 @@ function makeEventTracker() {
     nodeCompleted: Effect.fn("stub.nodeCompleted")((dagID: string, nodeID: string, output: unknown) =>
       Effect.sync(() => events.push({ type: "nodeCompleted", dagID, nodeID, output })),
     ),
-    nodeFailed: Effect.fn("stub.nodeFailed")((dagID: string, nodeID: string, reason: string) =>
-      Effect.sync(() => events.push({ type: "nodeFailed", dagID, nodeID, reason })),
+    nodeFailed: Effect.fn("stub.nodeFailed")((dagID: string, nodeID: string, reason: string, trigger: string) =>
+      Effect.sync(() => events.push({ type: "nodeFailed", dagID, nodeID, reason, trigger })),
     ),
   })
   return { events, dagLayer }
@@ -50,7 +57,7 @@ const sessionLayer = Layer.mock(Session.Service, {
   messages: () => Effect.succeed([]),
 })
 
-function reply(text: string): SessionV1.WithParts {
+function reply(text: string, includeText = text !== ""): SessionV1.WithParts {
   return {
     info: {
       id: MessageID.ascending(), role: "assistant", parentID: MessageID.ascending(),
@@ -60,7 +67,7 @@ function reply(text: string): SessionV1.WithParts {
       modelID: "test-model" as never, providerID: "test" as never,
       time: { created: Date.now() }, finish: "stop",
     },
-    parts: text ? [{ type: "text", text }] as never : [],
+    parts: includeText ? [{ type: "text", text }] as never : [],
   }
 }
 
@@ -232,12 +239,35 @@ describe("spawnNode completion bridge", () => {
     expect(started).toBeDefined()
   })
 
-  it("publishes NodeFailed when the provider returns no text output", async () => {
+  it("publishes verdict_fail when the provider returns no text output", async () => {
     const { events, dagLayer } = makeEventTracker()
     await runSpawn(dagLayer, makePromptLayer(reply("")))
 
     expect(findEvent(events, "nodeCompleted")).toBeUndefined()
-    expect(findEvent(events, "nodeFailed")?.reason).toContain("empty output")
+    expect(findEvent(events, "nodeFailed")).toEqual(expect.objectContaining({
+      reason: "provider returned empty output",
+      trigger: "verdict_fail",
+    }))
+  })
+
+  it("classifies empty and whitespace-only text parts like missing text", async () => {
+    for (const text of ["", " \n\t "]) {
+      const { events, dagLayer } = makeEventTracker()
+      await runSpawn(dagLayer, makePromptLayer(reply(text, true)))
+      expect(findEvent(events, "nodeCompleted")).toBeUndefined()
+      expect(findEvent(events, "nodeFailed")).toEqual(expect.objectContaining({
+        reason: "provider returned empty output",
+        trigger: "verdict_fail",
+      }))
+    }
+  })
+
+  it("preserves non-empty text byte-for-byte", async () => {
+    const { events, dagLayer } = makeEventTracker()
+    const text = "\n  exact output\t"
+    await runSpawn(dagLayer, makePromptLayer(reply(text, true)))
+
+    expect(findEvent(events, "nodeCompleted")?.output).toBe(text)
   })
 
   it("publishes NodeFailed when prompt fails", async () => {

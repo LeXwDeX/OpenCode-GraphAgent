@@ -29,7 +29,7 @@ import { DEFAULT_WORKFLOW_CONFIG } from "./dag"
 import { DagBlocks } from "./blocks"
 import { AdmissionInput, ExecutionMode } from "./admission"
 import { validateReviewLifecycle } from "./review-lifecycle"
-import { conditionReference } from "./runtime/eval"
+import { conditionReference, parseInputMappingReference } from "./runtime/eval"
 import { unsupportedSchemaKeywords } from "./runtime/capture"
 import { placeholderKeys, templateSourceById } from "./templates/resolve"
 
@@ -581,6 +581,78 @@ function conditionDiagnostics(nodes: readonly NodeConfig[]): Diagnostic[] {
   ]
 }
 
+/** input_mapping is a data dependency, not a scheduling edge. Every declared
+ * source therefore has to name an existing transitive predecessor; otherwise
+ * the scheduler may start the consumer before the value exists. */
+export function inputMappingDiagnostics(
+  consumers: readonly NodeConfig[],
+  graphNodes: readonly NodeConfig[] = consumers,
+): Diagnostic[] {
+  const byID = new Map(graphNodes.map((node) => [node.id, node]))
+
+  const dependencyClosure = (consumer: NodeConfig) => {
+    const closure = new Set<string>()
+    const pending = [...consumer.depends_on]
+    while (pending.length > 0) {
+      const dependency = pending.pop()!
+      if (closure.has(dependency)) continue
+      closure.add(dependency)
+      const node = byID.get(dependency)
+      if (node) pending.push(...node.depends_on)
+    }
+    return closure
+  }
+
+  return consumers.flatMap((consumer) => {
+    const closure = dependencyClosure(consumer)
+    return Object.entries(consumer.input_mapping ?? {}).flatMap(([variable, source]) => {
+      const path = `nodes[${consumer.id}].input_mapping.${variable}`
+      const parsed = parseInputMappingReference(source)
+      if (!parsed.ok) {
+        return [
+          diagnostic({
+            code: DIAGNOSTIC_CODES.dagInvalid,
+            path,
+            message: `node "${consumer.id}" input_mapping variable "${variable}" has invalid source "${source}": ${parsed.error}`,
+            hint: 'Use "node-id", "node-id.output", or "node-id.output.field"',
+          }),
+        ]
+      }
+      if (parsed.nodeID === consumer.id) {
+        return [
+          diagnostic({
+            code: DIAGNOSTIC_CODES.dagInvalid,
+            path,
+            message: `node "${consumer.id}" input_mapping variable "${variable}" references itself via "${source}"`,
+            hint: "Map inputs from a direct or transitive dependency",
+          }),
+        ]
+      }
+      if (!byID.has(parsed.nodeID)) {
+        return [
+          diagnostic({
+            code: DIAGNOSTIC_CODES.dagInvalid,
+            path,
+            message: `node "${consumer.id}" input_mapping variable "${variable}" references unknown source node "${parsed.nodeID}" via "${source}"`,
+            hint: "Map inputs from a node declared in this workflow",
+          }),
+        ]
+      }
+      if (!closure.has(parsed.nodeID)) {
+        return [
+          diagnostic({
+            code: DIAGNOSTIC_CODES.dagInvalid,
+            path,
+            message: `node "${consumer.id}" input_mapping variable "${variable}" references unordered source node "${parsed.nodeID}" via "${source}"`,
+            hint: `Add a direct or transitive depends_on path from "${consumer.id}" to "${parsed.nodeID}"`,
+          }),
+        ]
+      }
+      return []
+    })
+  })
+}
+
 /** A report_to_parent node wakes the parent for adjudication; a dependent
  * without a condition on that node's output is spawned the moment the
  * checkpoint completes, so the checkpoint verdict can never act first.
@@ -797,6 +869,7 @@ export function structuralDiagnostics(input: StructuralInput): Diagnostic[] {
   return sortDiagnostics([
     ...tagLegacyClass(duplicateIdDiagnostics(duplicates), 0),
     ...tagLegacyClass(danglingDependencyDiagnostics(input.nodes, input.known_node_ids), 1),
+    ...tagLegacyClass(inputMappingDiagnostics(input.nodes), 1),
     ...tagLegacyClass(conditionDiagnostics(input.nodes), 2),
     ...tagLegacyClass(bindingDiagnostics(input.nodes), 3),
     ...tagLegacyClass(ceilingDiagnostics(input), 4),
@@ -849,6 +922,7 @@ export function replanStructuralDiagnostics(input: ReplanStructuralInput): Diagn
   return sortDiagnostics([
     ...tagLegacyClass(duplicateIdDiagnostics(duplicates), 0),
     ...tagLegacyClass(danglingDependencyDiagnostics(input.rerunNodes, knownIds), 1),
+    ...tagLegacyClass(inputMappingDiagnostics(input.rerunNodes, input.merged.nodes), 1),
     ...tagLegacyClass(conditionDiagnostics(input.rerunNodes), 2),
     ...tagLegacyClass(bindingDiagnostics(input.rerunNodes), 3),
     ...tagLegacyClass(ceilingExceeded(input.existingNodeCount + input.addCount, input.config.max_total_nodes), 4),

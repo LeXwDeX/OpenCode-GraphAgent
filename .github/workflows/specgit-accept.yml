@@ -8,7 +8,7 @@ on:
     # so the default activity types are listed alongside. Title and body
     # edits change live acceptance evidence even when the head is unchanged.
     types: [opened, synchronize, reopened, ready_for_review, edited]
-    # Local specialization: acceptance runs only against a bound pull request.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -32,7 +32,8 @@ jobs:
     # project's own toolchain (package manager, lockfile, build, layout)
     # is never assumed and never invoked.
     runs-on: ubuntu-latest
-    # Unit Tests (linux) can take about 28 minutes on pull requests.
+    # This repository's required Linux unit suite normally takes about 28
+    # minutes, so leave enough time for it to finish and for the verdict.
     timeout-minutes: 45
     steps:
       - name: Checkout code
@@ -55,7 +56,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: '22'
+          node-version: '20.19'
           package-manager-cache: false
 
       - name: Install pinned SpecGit CLI
@@ -341,6 +342,8 @@ jobs:
           // sibling, the script exits with its own diagnosis instead of
 
           // being killed by the job timeout mid-line.
+
+          // The required Linux unit suite normally takes about 28 minutes.
 
           const deadline = Date.now() + 40 * 60 * 1000;
           while (Date.now() < deadline) {

@@ -1,0 +1,88 @@
+// SPDX-FileCopyrightText: 2026 LeXwDeX
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+import { describe, expect } from "bun:test"
+import { Effect, Layer } from "effect"
+import { DagStore } from "@opencode-ai/core/dag/store"
+import { Database } from "@opencode-ai/core/database/database"
+import { EventV2 } from "@opencode-ai/core/event"
+import { EventSequenceTable, EventTable } from "@opencode-ai/core/event/sql"
+import { DagEvent } from "@opencode-ai/schema/dag-event"
+import { testEffect } from "./lib/effect"
+
+const database = Database.layerFromPath(":memory:")
+const store = DagStore.layer.pipe(Layer.provide(database))
+const it = testEffect(Layer.merge(database, store))
+
+function durableType(definition: { readonly type: string; readonly durable?: { readonly version: number } }) {
+  if (!definition.durable) throw new Error(`Event is not durable: ${definition.type}`)
+  return EventV2.versionedType(definition.type, definition.durable.version)
+}
+
+describe("DagStore checkpoint control sequence", () => {
+  it.effect("returns only the latest explicit checkpoint-disposition control", () =>
+    Effect.gen(function* () {
+      const { db } = yield* Database.Service
+      const dagStore = yield* DagStore.Service
+      const dagID = "dag-checkpoint-control"
+      yield* db.insert(EventSequenceTable).values({ aggregate_id: dagID, seq: 12 }).run().pipe(Effect.orDie)
+      yield* db
+        .insert(EventTable)
+        .values([
+          {
+            id: EventV2.ID.create(),
+            aggregate_id: dagID,
+            seq: 4,
+            type: EventV2.versionedType(DagEvent.WorkflowPaused.type, 1),
+            data: {},
+          },
+          {
+            id: EventV2.ID.create(),
+            aggregate_id: dagID,
+            seq: 5,
+            type: durableType(DagEvent.WorkflowResumed),
+            data: {},
+          },
+          {
+            id: EventV2.ID.create(),
+            aggregate_id: dagID,
+            seq: 8,
+            type: durableType(DagEvent.WorkflowStepped),
+            data: {},
+          },
+          {
+            id: EventV2.ID.create(),
+            aggregate_id: dagID,
+            seq: 9,
+            type: durableType(DagEvent.WorkflowReplanned),
+            data: {},
+          },
+          {
+            id: EventV2.ID.create(),
+            aggregate_id: dagID,
+            seq: 12,
+            type: EventV2.versionedType(DagEvent.NodeCompleted.type, 1),
+            data: {},
+          },
+        ])
+        .run()
+        .pipe(Effect.orDie)
+      yield* db.insert(EventSequenceTable).values({ aggregate_id: "dag-pause-only", seq: 3 }).run().pipe(Effect.orDie)
+      yield* db
+        .insert(EventTable)
+        .values({
+          id: EventV2.ID.create(),
+          aggregate_id: "dag-pause-only",
+          seq: 3,
+          type: EventV2.versionedType(DagEvent.WorkflowPaused.type, 1),
+          data: {},
+        })
+        .run()
+        .pipe(Effect.orDie)
+
+      expect(yield* dagStore.getLatestCheckpointControlSeq(dagID)).toBe(9)
+      expect(yield* dagStore.getLatestCheckpointControlSeq("dag-pause-only")).toBeUndefined()
+      expect(yield* dagStore.getLatestCheckpointControlSeq("dag-without-controls")).toBeUndefined()
+    }),
+  )
+})

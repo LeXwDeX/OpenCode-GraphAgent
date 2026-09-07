@@ -33,7 +33,7 @@ feat/**, fix/** ──PR(Typecheck + Unit Tests 门禁)──▶ dev ──push 
 **CI 配置**：
 - `ci-typecheck.yml`：push 到 `main`/`dev` + PR → `main`/`dev` 时触发；除 lint + typecheck 外还跑 `test:dag-core` DAG 核心行为/覆盖率门禁（10min 超时）
 - `ci-test.yml`：push 到 `main`/`dev` + PR → `main`/`dev` 时触发全量测试（`cancel-in-progress: false` 保证跑完）；Linux unit-tests job 额外校验生成物新鲜度（`packages/client` 与 `packages/sdk/js` 的 `check:generated`）并跑 HttpAPI 契约门禁（`test:httpapi:ci`）
-- `specgit-accept.yml`：仅 PR → `main` 时触发；全局安装 `specgit@1.10.1`（`npm install -g`；workspace 内安装会因 bun `catalog:` 协议失败），等 `spec_git/policy.yaml` `required_checks` 全部到终态（等待脚本手工解析 YAML，不依赖 `yaml` 包）后运行 `specgit finish --json` 产出 SpecGit Acceptance 裁决
+- `specgit-accept.yml`：PR → `main` 和手动 dispatch 时运行当前提交的 SpecGit Acceptance；CLI 隔离安装、分支恢复和等待预算见下方 "SpecGit harness local specializations"。
 - `release-fork.yml`：手动 `workflow_dispatch` 是唯一真实构建路径（push 到 `main`/`dev` 仅注册不构建）；从 `dev` 发布自动产出 `X.Y.Z-dev.N` prerelease，从 `main` 发布 `X.Y.Z` 并标 Latest
 
 ## Standard Delivery Workflow (标准交付流程)
@@ -43,7 +43,7 @@ feat/**, fix/** ──PR(Typecheck + Unit Tests 门禁)──▶ dev ──push 
 1. **确立条目**：明确条目的内容、范围、类型（`feat`/`fix`/…）。一个 issue = 一个可独立验证的 WHY，无法独立验证的先拆分再立项。
 2. **SpecGit 立项**：`script/specgit-bootstrap.sh <title-or-number>` 创建/复用 issues 批次，确立交付分支与草稿 PR 脚手架（`.specgit.yaml` 绑定）；立项前先查重，避免同一 WHY 双开。wrapper 是 canonical 入口（见 "SpecGit harness local specializations"）；直跑裸 `specgit issue` 预期被 harness currency gate 以 `harness_stale` (exit 2) 拒绝。
 3. **超流执行**：安排 DAG workflow（超流）承载实现——并行开发 + 多角度 Review + 复合（synthesize），其产出作为交付证据基线。
-4. **PR 过门禁**：SpecGit 发起/推进 PR，过 TDD 与 CI 门禁（Typecheck、Unit Tests、DAG gate；`specgit finish` exit 0 是唯一 "done"）。
+4. **PR 过门禁**：SpecGit 发起/推进 PR，过 TDD 与 CI 门禁（Typecheck、Unit Tests、DAG gate）；`specgit finish` exit 0 表示 accepted，合并和所有绑定 issue 关闭后才完成交付。
 5. **修复门禁问题**：门禁失败在交付分支修代码/测试，永远不削弱门禁本身。
 6. **合并收尾**：完成 PR 合并（目标分支遵循 Git Workflow，dev 为集成层），PR 正文 `Closes #n` 自动关闭绑定 issues；版本确立与发布按 release train 既有节奏推进。
 
@@ -264,20 +264,18 @@ This repository uses a multi-context domain-document layout rooted at `CONTEXT-M
 
 ### SpecGit harness local specializations
 
-Kept OUTSIDE the managed block so `specgit init`/`--force` never rewrites them; re-apply each deviation after every re-init:
+Kept outside the managed block so routine bootstrap preserves the reviewed harness. The 1.13.1 refresh in #552 replaces the former 1.10.1 workarounds:
 
-- `specgit-accept.yml` drops the template's `workflow_dispatch` trigger. Dispatch is the privileged context that fires CodeQL's cache-poisoning taint rule on the `head_ref` checkout (false positive: no cache use, read-only token, `persist-credentials: false`), and on dispatch events `head_ref` is empty so the verdict would evaluate the default branch — the wrong tree. Delivery here always goes through a PR. The head-ref checkout itself must NOT be replaced with a SHA: `specgit finish` requires HEAD on the delivery branch (detached_head otherwise).
-- `specgit-accept.yml` installs the CLI globally (`npm install -g specgit@1.10.1`), NOT the template's `npm install --no-save specgit@X`: a workspace-local install reads this bun workspace's package.json and dies on the `catalog:` protocol (EUNSUPPORTEDPROTOCOL, #434, again on #459). Re-apply after every `specgit init --force`.
-- `specgit-accept.yml` runs the job with `timeout-minutes: 45` while the wait script's own poll deadline is 40 minutes (`Date.now() + 40 * 60 * 1000`): the deadline must stay BELOW the job timeout so a lost race against a slow sibling check exits with its own diagnosis instead of being killed mid-line by the job timeout.
-- `specgit-accept.yml` pins `node-version: '22'` for the wait script and the CLI.
-- The wait script hand-parses `spec_git/policy.yaml` (minimal line-based parse) instead of importing the `yaml` package: no root-reachable `yaml` exists under workspace catalog isolation, so `import { parse } from 'yaml'` would fail to resolve on the runner.
-- `spec_git/policy.yaml` `required_checks` uses the template's canonical check IDs (`unit-tests`, `e2e-tests`), not display names.
+- Use the generated event-SHA checkout and branch-restoration steps together: the verdict evaluates the triggering commit while SpecGit sees the delivery branch. The generated dispatch path supplies its own ref and SHA.
+- Install the pinned CLI under the generated isolated prefix, outside this Bun workspace, and use its bundled YAML parser. This avoids the workspace `catalog:` installation failure and root-package resolution assumptions. Keep the generated Node version with that CLI.
+- Preserve the repository's 45-minute job timeout and 40-minute sibling-check deadline. The inner deadline stays below the job timeout so slow or missing checks produce a verdict diagnosis. This is the remaining template deviation; the bootstrap wrapper restores it after transient initialization.
+- Read check identities and automation choices from `spec_git/policy.yaml`. Keep the configured checks and current-head ownership checks intact; a harness refresh does not authorize enabling automatic merge.
 
 #### specgit-bootstrap wrapper (canonical `specgit issue` entry, #521)
 
 `script/specgit-bootstrap.sh <specgit issue args...>` is THE canonical way to run `specgit issue` in this repository. Bare `specgit issue` is expected to fail with `harness_stale` (exit 2) whenever the pinned CLI's harness template moves — the wrapper satisfies that gate safely: it snapshots the full init write surface to a temp dir outside the repo, runs `specgit init --force --no-protect` (hardcoded, offline), then `specgit issue "$@"` with arguments, exit status, and diagnostics passed through verbatim, and restores the specialized bytes above on success and every failure path (EXIT/INT/TERM/HUP), verifying each file byte-for-byte via `git hash-object`.
 
-- Never run bare `specgit init --force` here: it overwrites the six specialized bytes; the wrapper exists to make that refresh transient.
+- Use the wrapper for ordinary issue bootstrap. Intentional CLI/harness upgrades are tracked changes: review the generated diff and update these specializations together, while preserving the timeout budget and policy.
 - Fail-closed rejections: dirty write-surface paths (tracked/staged/untracked) → exit 2 with the offending paths listed; no SpecGit binding (`.specgit.yaml` or `spec_git/policy.yaml` missing) → exit 3; restore hash mismatch → exit 3 with the snapshot kept for forensics. Rejection paths print plain `specgit-bootstrap:` stderr lines and NEVER produce a `--json` envelope.
 - The inner `.specgit.yaml` delivery record is rolled back to its pre-run bytes when the inner `specgit issue` exits nonzero (or a signal/init failure interrupts); a successful call keeps the new binding. Record-restore failure keeps the forensic snapshot and exits 3, overriding the inner exit code. Branches, commits, and remote side effects are never undone (#530).
 - Managed-block guidance referencing bare `specgit issue` commands is superseded by this section for this repository. Behavior tests: `bash script/specgit-bootstrap.test.sh` (stubbed CLI, zero network; not CI-wired).

@@ -31,6 +31,7 @@ const lockTimeoutLayer = (getWorkflow: () => Effect.Effect<unknown>) => {
     EventV2Bridge.Service,
     EventV2Bridge.Service.of({
       publish: () => Effect.succeed({ seq: 1 }),
+      publishMany: () => Effect.succeed([]),
     } as never),
   )
   return Layer.mergeAll(
@@ -66,6 +67,7 @@ describe("Dag.Service workflow lock", () => {
       EventV2Bridge.Service,
       EventV2Bridge.Service.of({
         publish: () => Effect.succeed({ seq: 1 }),
+        publishMany: () => Effect.succeed([]),
       } as never),
     )
     const layer = Dag.layer.pipe(Layer.provide(events), Layer.provide(store))

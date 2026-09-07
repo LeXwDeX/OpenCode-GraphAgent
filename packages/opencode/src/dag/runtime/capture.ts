@@ -175,6 +175,18 @@ export type CapturedSettlement =
   | { readonly kind: "complete"; readonly output: unknown }
   | { readonly kind: "fail"; readonly reason: string }
 
+export type PlainTextSettlement =
+  | { readonly kind: "complete"; readonly output: string }
+  | { readonly kind: "fail"; readonly reason: string }
+
+/** Shared live/recovery decision for nodes without an output schema. */
+export function settlePlainTextOutput(text: string | undefined): PlainTextSettlement {
+  if (text === undefined || text.trim() === "") {
+    return { kind: "fail", reason: "provider returned empty output" }
+  }
+  return { kind: "complete", output: text }
+}
+
 export function settleCapturedOutput(captured: unknown, reviewFingerprint: string | undefined, suffix = ""): CapturedSettlement {
   if (captured === undefined || captured === null)
     return { kind: "fail", reason: `output_schema declared but submit_result was never successfully called${suffix}` }
