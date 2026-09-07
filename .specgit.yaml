@@ -8,3 +8,4 @@ issues:
 issueKinds:
   - issue: 579
     kind: kind::chore
+pr: 580
