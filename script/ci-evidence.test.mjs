@@ -6,9 +6,23 @@ const head = "a".repeat(40)
 const base = "b".repeat(40)
 function evidence() {
   const locator = { run: 12, attempt: 2, job: "Unit Tests (linux)" }
-  const expected = { job: locator.job, workflow: ".github/workflows/ci-test.yml", fingerprint: "tree-b" }
+  const expected = {
+    job: locator.job,
+    workflow: ".github/workflows/ci-test.yml",
+    fingerprint: "tree-b",
+    day: "2026-09-07",
+    runner: "ubuntu-latest",
+  }
   const run = { id: 12, run_attempt: 2, path: expected.workflow, head_sha: head, event: "push" }
-  const jobs = [{ name: locator.job, status: "completed", conclusion: "success" }]
+  const jobs = [
+    {
+      name: locator.job,
+      status: "completed",
+      conclusion: "success",
+      started_at: "2026-09-07T01:00:00Z",
+      labels: ["ubuntu-latest"],
+    },
+  ]
   const source = {
     run: () => run,
     jobs: () => jobs,
@@ -84,5 +98,17 @@ test("malformed source identities fail closed", () => {
   assert.equal(verifyEvidence(e.locator, e.expected, e.source), false)
   e.locator.run = 12
   e.run.head_sha = "untrusted-revision"
+  assert.equal(verifyEvidence(e.locator, e.expected, e.source), false)
+})
+
+test("a forged current-day key cannot reuse an old source job", () => {
+  const e = evidence()
+  e.jobs[0].started_at = "2026-09-06T01:00:00Z"
+  assert.equal(verifyEvidence(e.locator, e.expected, e.source), false)
+})
+
+test("the source job must use the expected runner label", () => {
+  const e = evidence()
+  e.jobs[0].labels = ["windows-latest"]
   assert.equal(verifyEvidence(e.locator, e.expected, e.source), false)
 })

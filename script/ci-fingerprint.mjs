@@ -27,9 +27,8 @@ export function fingerprint(ref = "HEAD", cwd = process.cwd()) {
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const value = fingerprint()
   const day = new Date().toISOString().slice(0, 10)
-  const image = [process.env.ImageOS, process.env.ImageVersion].filter(Boolean).join("-") || "unknown"
   if (process.env.GITHUB_OUTPUT) {
-    appendFileSync(process.env.GITHUB_OUTPUT, `fingerprint=${value}\nimage=${image}\nday=${day}\n`)
+    appendFileSync(process.env.GITHUB_OUTPUT, `fingerprint=${value}\nday=${day}\n`)
   }
   console.log(value)
 }

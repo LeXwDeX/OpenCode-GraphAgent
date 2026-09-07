@@ -48,6 +48,7 @@ jobs:
         with:
           check: typecheck
           job-name: Typecheck
+          runner-label: ubuntu-latest
 
       - name: Setup Bun
         if: steps.evidence.outputs.reused != 'true'

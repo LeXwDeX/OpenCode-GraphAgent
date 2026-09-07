@@ -13,6 +13,8 @@ export function verifyEvidence(locator, expected, source) {
   if (!["push", "pull_request", "workflow_dispatch"].includes(run.event)) return false
   const jobs = source.jobs(locator.run, locator.attempt).filter((job) => job.name === expected.job)
   if (jobs.length !== 1 || jobs[0].status !== "completed" || jobs[0].conclusion !== "success") return false
+  if (jobs[0].started_at?.slice(0, 10) !== expected.day) return false
+  if (!jobs[0].labels?.includes(expected.runner)) return false
   if (run.event === "pull_request") {
     // A divergent PR tests a synthetic merge tree. Without immutable evidence
     // of that tree, run the suite again instead of attributing it to its head.
@@ -58,6 +60,8 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
         JSON.parse(readFileSync(path, "utf8")),
         {
           job: process.env.CHECK_JOB,
+          runner: process.env.CHECK_RUNNER,
+          day: new Date().toISOString().slice(0, 10),
           workflow: process.env.GITHUB_WORKFLOW_REF.split("@")[0].slice(repo.length + 1),
           fingerprint: process.env.PRODUCT_FINGERPRINT,
         },
@@ -95,7 +99,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
       const locator = JSON.parse(readFileSync(path, "utf8"))
       appendFileSync(
         process.env.GITHUB_STEP_SUMMARY,
-        `### Reused successful product verification\n\nGitHub confirms the source job completed successfully and its product tree matches this checkout. Only the ordinary root SpecGit record is excluded. Suite, platform, runner image, and UTC day match.\n\nSource: ${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${locator.run}/attempts/${locator.attempt}\n`,
+        `### Reused successful product verification\n\nGitHub confirms the source job completed successfully today on the requested runner label, and its product tree matches this checkout. Only the ordinary root SpecGit record is excluded.\n\nSource: ${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${locator.run}/attempts/${locator.attempt}\n`,
       )
     }
   }

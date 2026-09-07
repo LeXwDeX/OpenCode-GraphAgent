@@ -7,6 +7,9 @@ inputs:
   job-name:
     description: Exact GitHub job name whose successful conclusion must be confirmed
     required: true
+  runner-label:
+    description: Runner label which must appear in the source job's platform evidence
+    required: true
 outputs:
   reused:
     value: ${{ steps.verify.outputs.reused }}
@@ -30,10 +33,9 @@ runs:
       env:
         CHECK: ${{ inputs.check }}
         FINGERPRINT: ${{ steps.content.outputs.fingerprint }}
-        IMAGE: ${{ steps.content.outputs.image }}
         DAY: ${{ steps.content.outputs.day }}
       run: |
-        echo "value=verified-v2-${RUNNER_OS}-${RUNNER_ARCH}-${IMAGE}-${DAY}-${CHECK}-${FINGERPRINT}" >> "$GITHUB_OUTPUT"
+        echo "value=verified-v3-${RUNNER_OS}-${RUNNER_ARCH}-${DAY}-${CHECK}-${FINGERPRINT}" >> "$GITHUB_OUTPUT"
         echo "path=${RUNNER_TEMP}/verified-${CHECK}.txt" >> "$GITHUB_OUTPUT"
     - name: Restore successful verification
       id: restore
@@ -49,6 +51,7 @@ runs:
       env:
         EVIDENCE: ${{ steps.key.outputs.path }}
         CHECK_JOB: ${{ inputs.job-name }}
+        CHECK_RUNNER: ${{ inputs.runner-label }}
         PRODUCT_FINGERPRINT: ${{ steps.content.outputs.fingerprint }}
         GH_TOKEN: ${{ github.token }}
       run: node script/ci-evidence.mjs verify

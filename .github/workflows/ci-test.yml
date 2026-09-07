@@ -79,6 +79,7 @@ jobs:
         with:
           check: unit
           job-name: Unit Tests (${{ matrix.settings.name }})
+          runner-label: ${{ matrix.settings.host }}
 
       - name: Setup Node
         if: steps.evidence.outputs.reused != 'true'
@@ -209,6 +210,7 @@ jobs:
         with:
           check: e2e
           job-name: E2E Tests (${{ matrix.settings.name }})
+          runner-label: ${{ matrix.settings.host }}
 
       - name: Setup Node
         if: steps.evidence.outputs.reused != 'true'
