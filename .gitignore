@@ -62,4 +62,17 @@ tsconfig.tsbuildinfo
 # >>> specgit: local delivery assets (managed by specgit init) >>>
 /.specgit.yaml
 /spec_git/
+/.opencode/hooks/specgit-merge-guard.sh
+/.opencode/command/specgit-issue.md
+/.agents/skills/specgit-issue/SKILL.md
+/.opencode/command/specgit-finish.md
+/.agents/skills/specgit-finish/SKILL.md
+/.opencode/command/specgit-doctor.md
+/.agents/skills/specgit-doctor/SKILL.md
+/.opencode/command/specgit-pr.md
+/.agents/skills/specgit-pr/SKILL.md
+/.opencode/command/specgit-status.md
+/.agents/skills/specgit-status/SKILL.md
+/.local/state/
+/.local/cache/
 # <<< specgit: local delivery assets (managed by specgit init) <<<

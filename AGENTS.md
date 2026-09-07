@@ -292,42 +292,55 @@ already exists); keep manual guidance outside them.
 ### The delivery story
 
 - Start with `specgit issue <title-or-number>...`: it creates or reuses
-  the issues, branches, opens the draft pull request pre-filled with a
-  deterministic scaffold (the `Closes #n` line for every bound issue,
-  then Why / What changed / Evidence / Checklist sections), and writes
-  `.specgit.yaml`. Re-running resumes; it is idempotent.
-- Issue bodies are filled at bootstrap, from the conversation: right after
-  `specgit issue` succeeds, edit each issue it created (`gh issue edit <n>`)
-  with the discussed Why / Scope / Approach / Acceptance, then implement.
-  The PR scaffold's placeholders are advisory — fill those sections in as
-  you deliver; the closing references are the only body gate. The PR body
-  is written once at creation; no SpecGit command edits an existing PR
-  body, and the repository's own pull-request template is never read.
-- A draft pull request always fails the verdict (`pr_draft`): before
+  the issues, writes and pushes the initial binding on the delivery branch,
+  opens the draft pull or merge request with the supplied body, selected policy
+  template, or built-in scaffold, then records and pushes its number. Re-running
+  resumes; it is idempotent.
+- Use the issue and PR/MR templates explicitly selected by policy. With
+  `validation.bodies` or `required_sections`, prepare complete content from
+  the discussion before bootstrap and supply `--body-file <path>` per new
+  title and `--pr-body-file <path>`. Without enforced body rules, the selected
+  policy template or built-in scaffold can be filled after creation. Preserve
+  every `Closes #n`; enabled body
+  rules apply at creation and acceptance. Resume keeps existing remote bodies
+  and user edits. Unselected repository templates are not silently loaded.
+- A draft PR/MR always fails the verdict (`pr_draft`): before
   `specgit finish`, mark it ready for review — `gh pr ready <number>`
   on GitHub, `glab mr update <number> --ready` on GitLab.
-- Finish with `specgit finish`: the verdict, derived from real git, PR,
-  and CI evidence. Exit code 0 is the only "done".
+- `specgit finish` is read-only: its verdict comes from real git, PR/MR,
+  and CI evidence; exit 0 means accepted. With automation enabled, the trusted
+  remote workflow continues after CI without another confirmation.
+  `specgit pr --merge --json` is the recovery path: it verifies the approved
+  `target_branch`, fresh acceptance, and all current-head CI, then confirms
+  the merge and every bound issue closure before reporting completed.
+  A failed closure remains recoverable and is never reported as completed.
 
 ### Issue tags
 
+- Follow the project's `language` for issues and PRs/MRs. Enabled `validation`
+  rules check titles and labels before creation and during `finish`.
+  `kind` mode requires one catalog kind and only declared extras;
+  `project` mode selects only policy `tags`. Users choose rule changes with
+  `specgit init --force --configure-rules`.
 - Every bootstrap applies the title's `kind::<type>` member
   automatically; pass `--tags <a,b>` to choose the full set explicitly.
 - Selection is pool-first: existing on-spec labels win verbatim; anything
   missing is seeded from the built-in `kind::` catalog or the policy's
   `tags:` declarations. Unknown vocabulary exits 2 naming the universe.
-- Choose with restraint: at most one label per axis, none when unsure —
+- Choose at most one label per axis; omit uncertain optional labels and
+  keep every label required by the selected policy. Existing pool labels
+  cannot override that policy —
   off-spec pool labels are reported (`tag_pool_dirty` warnings are for
   humans) and never renamed by SpecGit.
 
 ### Repair and diagnostics
 
-- `specgit pr` repairs the pull-request binding: with no arguments it
-  auto-discovers the pull request for this head branch, errors with a fix
+- `specgit pr` repairs the PR/MR binding: with no arguments it
+  auto-discovers the request for this head branch, errors with a fix
   when none is found, and refuses with a list when several match.
 - `specgit status` shows local evidence only: record, state, drift,
-  origin. `specgit doctor` probes git, repository, origin, gh, and
-  policy.
+  origin. `specgit doctor` probes git, repository, origin, the configured
+  provider CLI (`gh`, or `glab` for a declared GitLab host), and policy.
 
 ### The command surface
 
@@ -337,14 +350,23 @@ already exists); keep manual guidance outside them.
 - `specgit setup` installs the agent entry points (commands for opencode,
   portable skills for other tools); `specgit bind`, `specgit unbind`,
   and `specgit accept` are automation aliases for scripts and CI.
+- Automation defaults to off (`--automation no`). For a fresh policy, only
+  when the user personally chooses yes may they enable it with
+  `specgit init --automation yes --merge-target <branch>`. To change an
+  existing policy, use
+  `specgit init --force --automation yes --merge-target <branch>`; plain
+  `init --force` preserves its current choice and target. An agent must not
+  answer yes for the user.
 
 ### Before creating an issue, check for duplicates
 
 - Before running `specgit issue` with a new title, search the tracker for
-  similar open work: `gh issue list` with keywords from the title
-  (state, labels, and search terms via `gh search issues`).
-- Open and read every plausible candidate (`gh issue view <n>`) — compare
-  the WHY, not just the wording.
+  similar open work through the authenticated session: on GitHub use
+  `gh issue list --state open --search "<keywords>"`; on GitLab use
+  `glab issue list --search "<keywords>" --in title`. Narrow
+  further with labels when useful.
+- Open and read every plausible candidate with `gh issue view <n>` on GitHub
+  or `glab issue view <n>` on GitLab — compare the WHY, not just the wording.
 - If a candidate covers the same WHY, continue that issue instead of
   creating a new one; if it is close but different, say how they differ.
 - When unsure, ask the requester to decide between continuing the existing
@@ -366,28 +388,51 @@ verified on its own evidence, split it before binding.
 
 ### Agent contract essentials
 
-- **SpecGit is the default way of working here.** Any non-trivial
-  task — a feature, a fix, a refactor, a docs change — is a delivery:
+- **SpecGit is the default delivery workflow here.** An intended tracked
+  change — a feature, a fix, a refactor, a docs change, or shared rules — is a delivery:
   work items live in this tracker as issues, never in private task
   lists or conversational checklists. The trigger is the decision to
   start: the moment the conversation settles and you begin turning
   the plan into changes, the FIRST action is
-  `specgit issue <type>: <title>...` — before any file edit.
+  `specgit issue <type>: <title>...` — before tracked implementation edits.
+  Preparing temporary body files for bootstrap is part of this first step.
   Working without a binding is a contract violation, not a style
-  choice. Immediately after bootstrap, fill each issue body
-  (Why / Scope / Approach / Acceptance) from the discussion with
-  `gh issue edit`, then implement. Mid-conversation inventories
+  choice. After bootstrap, verify each issue contains the discussed
+  Why / Scope / Approach / Acceptance and fill only missing content with
+  `gh issue edit` or `glab issue update`,
+  then implement. Mid-conversation inventories
   ("let me list everything to do") become issues, not chat
   artifacts. Trivial replies and read-only questions need none of
   this.
-- The one rule: a delivery is done if and only if `specgit finish`
-  exits `0`. Never declare completion from task lists, file states, or
-  test runs you performed yourself.
+- Local maintenance: installing or upgrading the CLI and running `init` /
+  `setup` to refresh local configuration and entry points need no issue, PR/MR,
+  product build, or release when no product or shared-rule change is intended
+  for commit. After a package upgrade, a human may run plain `specgit init`
+  and approve its guided refresh when it proves drift; non-interactive agents
+  run `specgit init --force --no-protect`, then `specgit setup --tool all`,
+  then verify `specgit status --json`. Append `--no-ignore` to init when
+  authoritative delivery files are intentionally tracked without the managed
+  ignore block; setup preserves that proven choice. Review tracked diffs before choosing what to share; ignore rules
+  are never CI exemptions. Follow the host project's verification policy for
+  the actual changed inputs; documentation may itself be a product input.
+  Publishing requires explicit release intent within existing user authorization;
+  local maintenance and merging do not imply publication.
+- `specgit finish` exit `0` means accepted. Report completed only after
+  the configured target merge and every bound issue closure are confirmed.
+  Never declare completion from task lists, file states, or tests alone.
+  Track a failed PR/MR with a new repair issue; repeated causes reuse an open
+  repair issue and do not require abandoning the original PR/MR.
+- Use existing user authorization to complete issue bodies, the PR/MR body
+  and ready transition, CI repairs or retries, acceptance, and the authorized
+  merge. When user authorization or platform permission is missing, present
+  the prepared result and name the specific gap. Documentation and entry
+  points do not grant permission themselves.
 - Branch on exit codes, not phrasing: `1` = evidence complete, fix what
-  the gates named; `3` = evidence missing, fix the environment first
-  (`specgit doctor`). Never present exit `3` as success.
-- Keep the `Closes #n` references in the PR body intact; after changing
-  the PR body, head branch, or CI, re-run `specgit finish`. Never
+  the gates named; `3` = evidence missing, so follow `errors[].fix` first.
+  Run `specgit doctor --json` only for git, repository, origin, configured
+  provider CLI/auth, or policy probes. Never present exit `3` as success.
+- Keep the `Closes #n` references in the PR/MR body intact; after changing
+  the PR/MR body, head branch, or CI, re-run `specgit finish`. Never
   bypass or reconfig a required check to make acceptance pass.
 - Forge evidence flows through the user's authenticated CLI session only
   (`gh` / `glab`): never read, log, or pass around tokens.
