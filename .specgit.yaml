@@ -1,8 +1,7 @@
 version: 1
 delivery: hooks-runtime-reliability
 context:
-  kind: worktree
-  label: opencode-hooks-fix
+  kind: branch
   branch: fix/557-hooks-runtime-reliability
 issues:
   - 557
