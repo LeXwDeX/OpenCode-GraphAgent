@@ -1,8 +1,7 @@
 version: 1
 delivery: stable-release-1042
 context:
-  kind: worktree
-  label: opencode-release-1042
+  kind: branch
   branch: chore/576-stable-release-1042
 issues:
   - 568
