@@ -35,7 +35,7 @@ runs:
         FINGERPRINT: ${{ steps.content.outputs.fingerprint }}
         DAY: ${{ steps.content.outputs.day }}
       run: |
-        echo "value=verified-v3-${RUNNER_OS}-${RUNNER_ARCH}-${DAY}-${CHECK}-${FINGERPRINT}" >> "$GITHUB_OUTPUT"
+        echo "value=verified-v4-${RUNNER_OS}-${RUNNER_ARCH}-${DAY}-${CHECK}-${FINGERPRINT}" >> "$GITHUB_OUTPUT"
         echo "path=${RUNNER_TEMP}/verified-${CHECK}.txt" >> "$GITHUB_OUTPUT"
     - name: Restore successful verification
       id: restore

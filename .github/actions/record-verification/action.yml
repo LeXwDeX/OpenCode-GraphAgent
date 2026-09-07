@@ -13,11 +13,25 @@ inputs:
 runs:
   using: composite
   steps:
+    - name: Record tested product content
+      shell: bash
+      env:
+        EVIDENCE: ${{ inputs.path }}
+      run: node script/ci-evidence.mjs proof
+    - name: Upload immutable verification proof
+      id: proof
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      with:
+        name: ci-verification-${{ github.job }}-${{ runner.os }}-${{ runner.arch }}-${{ github.run_attempt }}
+        path: ${{ inputs.path }}.artifact/verification.json
+        retention-days: 2
+        if-no-files-found: error
     - name: Record verification source
       shell: bash
       env:
         EVIDENCE: ${{ inputs.path }}
         CHECK_JOB: ${{ inputs.job-name }}
+        ARTIFACT_ID: ${{ steps.proof.outputs.artifact-id }}
       run: node script/ci-evidence.mjs record
     - name: Save successful verification
       uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0

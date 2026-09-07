@@ -5,13 +5,14 @@ import { verifyEvidence } from "./ci-evidence.mjs"
 const head = "a".repeat(40)
 const base = "b".repeat(40)
 function evidence() {
-  const locator = { run: 12, attempt: 2, job: "Unit Tests (linux)" }
+  const locator = { run: 12, attempt: 2, job: "Unit Tests (linux)", artifact: 34 }
   const expected = {
     job: locator.job,
     workflow: ".github/workflows/ci-test.yml",
     fingerprint: "tree-b",
     day: "2026-09-07",
     runner: "ubuntu-latest",
+    artifactPrefix: "ci-verification-unit-tests-Linux-X64",
   }
   const run = { id: 12, run_attempt: 2, path: expected.workflow, head_sha: head, event: "push" }
   const jobs = [
@@ -23,16 +24,23 @@ function evidence() {
       labels: ["ubuntu-latest"],
     },
   ]
+  const artifact = {
+    name: `${expected.artifactPrefix}-2`,
+    size_in_bytes: 180,
+    expired: false,
+    workflow_run: { id: 12, head_sha: head },
+  }
   const source = {
     run: () => run,
     jobs: () => jobs,
-    contains: () => true,
+    artifact: () => artifact,
+    proof: () => ({ fingerprint: "tree-b" }),
     fingerprint: (sha) => {
       assert.equal(sha, head)
       return "tree-b"
     },
   }
-  return { locator, expected, run, jobs, source }
+  return { locator, expected, run, jobs, source, artifact }
 }
 
 test("exact successful job and platform-associated source can be reused", () => {
@@ -80,15 +88,16 @@ test("missing, ambiguous, or mismatched jobs are rejected", () => {
   assert.equal(verifyEvidence(e.locator, e.expected, e.source), false)
 })
 
-test("PR evidence requires proof that its tested merge tree equals its head tree", () => {
+test("live PR head updates do not overwrite the source run's immutable proof", () => {
   const e = evidence()
   e.run.event = "pull_request"
-  e.run.pull_requests = [{ head: { sha: head }, base: { sha: base } }]
+  e.run.pull_requests = [{ head: { sha: base }, base: { sha: base } }]
   assert.equal(verifyEvidence(e.locator, e.expected, e.source), true)
-  e.source.contains = () => false
-  assert.equal(verifyEvidence(e.locator, e.expected, e.source), false)
-  e.source.contains = () => true
-  e.run.pull_requests[0].head.sha = base
+})
+
+test("a formerly tested merge tree cannot lend evidence to different current content", () => {
+  const e = evidence()
+  e.source.proof = () => ({ fingerprint: "different-merge-tree" })
   assert.equal(verifyEvidence(e.locator, e.expected, e.source), false)
 })
 
@@ -110,5 +119,23 @@ test("a forged current-day key cannot reuse an old source job", () => {
 test("the source job must use the expected runner label", () => {
   const e = evidence()
   e.jobs[0].labels = ["windows-latest"]
+  assert.equal(verifyEvidence(e.locator, e.expected, e.source), false)
+})
+
+test("an artifact from another run or job cannot be borrowed", () => {
+  const e = evidence()
+  e.artifact.workflow_run.id = 99
+  assert.equal(verifyEvidence(e.locator, e.expected, e.source), false)
+  e.artifact.workflow_run.id = 12
+  e.artifact.name = "ci-verification-e2e-tests-Linux-X64-2"
+  assert.equal(verifyEvidence(e.locator, e.expected, e.source), false)
+})
+
+test("expired or unexpectedly large artifacts fall back to full verification", () => {
+  const e = evidence()
+  e.artifact.expired = true
+  assert.equal(verifyEvidence(e.locator, e.expected, e.source), false)
+  e.artifact.expired = false
+  e.artifact.size_in_bytes = 10001
   assert.equal(verifyEvidence(e.locator, e.expected, e.source), false)
 })
