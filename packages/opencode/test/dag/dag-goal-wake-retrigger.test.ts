@@ -154,6 +154,7 @@ function goalWakeLayer(input: { childPrompts: Queue.Queue<ChildPromptGate>; fail
   const base = Layer.mergeAll(database, events, bridge, store, projector, dag, goal, status)
   const childTitles = new Map<string, string>()
   const created: string[] = []
+  let lastAssistant = mkAssistant()
   const session = Layer.mock(Session.Service, {
     get: (_sessionID) =>
       Effect.succeed({
@@ -183,7 +184,7 @@ function goalWakeLayer(input: { childPrompts: Queue.Queue<ChildPromptGate>; fail
     // GoalLoop.afterIdle reads the last-20 message window: an assistant
     // message must exist so the judge is reached (no stale-zombie / no-assistant
     // early pauses).
-    messages: () => Effect.succeed([mkAssistant()]),
+    messages: () => Effect.succeed([lastAssistant]),
   })
   const deliver = Effect.fn("test.goalWake.SessionPrompt.deliver")(function* (value: SessionPrompt.PromptInput) {
     const sessionID = value.sessionID as string
@@ -203,6 +204,7 @@ function goalWakeLayer(input: { childPrompts: Queue.Queue<ChildPromptGate>; fail
       // dag — the blocked claim the unregister re-trigger exists to retry
       // (GOAL-FP-01-02 / R1). Later parent prompts are goal continuations and
       // must not re-emit (the mock has no real runner turn).
+      lastAssistant = reply(sessionID, "parent turn")
       if (parentPromptCalls === 0) {
         parentPromptCalls += 1
         yield* Effect.serviceOption(EventV2Bridge.Service).pipe(
@@ -216,7 +218,7 @@ function goalWakeLayer(input: { childPrompts: Queue.Queue<ChildPromptGate>; fail
           ),
         )
       }
-      return reply(sessionID, "parent turn")
+      return lastAssistant
     }
     const release = yield* Deferred.make<string>()
     yield* Queue.offer(input.childPrompts, { title: childTitles.get(sessionID) ?? sessionID, release })
@@ -387,13 +389,21 @@ describe("DagLoop final wake delivery re-triggers the goal (GOAL-FP-01-02)", () 
             "wake was never reported",
           )
 
-          // Public contract: with NO further idle events, the dag release must
-          // itself re-trigger the goal evaluation. judgeCalls > 0 proves
-          // GoalLoop.afterIdle ran a full cycle (lease claimed → judge →
-          // updateAfterJudge → continuation dispatch).
+          // Observe the committed Goal state and continuation, not merely entry
+          // into the judge: the durable commit is asynchronous after that call.
           yield* pollWithTimeout(
-            Effect.sync(() => (judgeCalls >= 1 ? true : undefined)),
-            "goal was not re-evaluated after the dag lease release (GOAL-FP-01-02)",
+            goal
+              .load(sid)
+              .pipe(
+                Effect.map((state) =>
+                  state &&
+                  state.turns_used >= 1 &&
+                  promptCalls.some((p) => !p.noReply && p.text.includes("ship the feature"))
+                    ? state
+                    : undefined,
+                ),
+              ),
+            "goal did not progress after the dag lease release (GOAL-FP-01-02)",
             "5 seconds",
           )
 

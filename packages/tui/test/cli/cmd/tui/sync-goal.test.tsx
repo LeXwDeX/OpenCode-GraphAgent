@@ -98,3 +98,46 @@ describe("tui sync goal slice", () => {
     }
   })
 })
+
+for (const status of [200, 404, 500]) {
+  test(`Goal reconnect handles HTTP ${status}`, async () => {
+    await using tmp = await tmpdir()
+    await Bun.write(`${tmp.path}/kv.json`, "{}")
+    let reads = 0
+    const { app, emit, reconnect, sync } = await mount((url) => {
+      if (!url.pathname.endsWith("/goal")) return
+      reads++
+      return Response.json(
+        status === 200
+          ? {
+              goal: "updated goal",
+              status: "paused",
+              turnsUsed: 3,
+              maxTurns: 20,
+              subgoals: [],
+            }
+          : { message: "failed" },
+        { status },
+      )
+    }, tmp.path)
+    try {
+      emit(goalUpdated())
+      await wait(() => sync.data.goal[sid] !== undefined)
+      reconnect()
+      await wait(() => reads === 1)
+      if (status === 404) {
+        await wait(() => sync.data.goal[sid] === undefined)
+        expect(sync.data.goal[sid]).toBeUndefined()
+      } else {
+        // Starting another request proves the first reconnect finished.
+        await wait(() => {
+          reconnect()
+          return reads >= 2
+        })
+        expect(sync.data.goal[sid]?.goal).toBe(status === 200 ? "updated goal" : "ship the feature")
+      }
+    } finally {
+      app.renderer.destroy()
+    }
+  })
+}

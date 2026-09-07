@@ -131,6 +131,21 @@ describe("Runner", () => {
   )
 
   it.live(
+    "startShellHandle reserves the runner before its result is awaited",
+    Effect.gen(function* () {
+      const scope = yield* Scope.Scope
+      const runner = Runner.make<string>(scope)
+      const release = yield* Deferred.make<void>()
+      const result = yield* runner.startShellHandle(Deferred.await(release).pipe(Effect.as("shell-done")))
+      expect(runner.busy).toBe(true)
+      expect(runner.state._tag).toBe("Shell")
+      yield* Deferred.succeed(release, undefined)
+      expect(yield* result).toBe("shell-done")
+      expect(runner.busy).toBe(false)
+    }),
+  )
+
+  it.live(
     "startIfIdle atomically rejects replacement work while the first run is active",
     Effect.gen(function* () {
       const s = yield* Scope.Scope

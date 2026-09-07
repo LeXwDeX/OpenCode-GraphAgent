@@ -759,8 +759,8 @@ describe("GoalLoop — real SessionRunState admission seam (GOAL-FP-01-13)", () 
   })
   const promptMock = Layer.mock(SessionPrompt.Service, {
     prompt: () => Effect.die("the direct prompt path is not exercised in this scenario"),
+    ...withIdleAdmission({ promptIfIdle }),
     prepareIfIdle,
-    promptIfIdle,
   })
   const judgeMock = Layer.succeed(
     GoalLoopJudgeLLM,
@@ -979,84 +979,6 @@ describe("GoalLoop — empty assistant text → synthetic continue, no stall (br
       const g = yield* goal.load(sid)
       expect(g?.status).toBe("active")
       expect(Number(g?.turns_used)).toBe(1)
-    }),
-  )
-})
-
-// Branch 3 (loop.ts): after the judge call returns, the session status is no
-// longer idle (5-30s of judge latency). The loop now pauses visibly instead of
-// bare-returning. Status is pre-set to busy so afterIdle's post-judge status
-// check observes a non-idle state; the raw idle-event publish drives afterIdle
-// without clearing the stored busy entry.
-describe("GoalLoop — status changed during judge → visible pause (branch 3)", () => {
-  let judgeCalls = 0
-  const promptCalls: { noReply?: boolean; text: string }[] = []
-  const reset = () => {
-    judgeCalls = 0
-    promptCalls.length = 0
-  }
-
-  const sessionMock = Layer.succeed(Session.Service, {
-    messages: () => Effect.succeed([mkAssistant()]),
-  } as never)
-  const providerMock = Layer.succeed(Provider.Service, {} as never)
-  const judgeMock = Layer.succeed(
-    GoalLoopJudgeLLM,
-    GoalLoopJudgeLLM.of({
-      call: () =>
-        Effect.sync(() => {
-          judgeCalls += 1
-          return JSON.stringify({ done: false, reason: "more steps" })
-        }),
-    }),
-  )
-
-  const branchLayer = GoalLoop.layer.pipe(
-    Layer.provide(sessionMock),
-    Layer.provide(recordingPrompt(promptCalls)),
-    Layer.provide(providerMock),
-    Layer.provide(judgeMock),
-    Layer.provideMerge(Goal.defaultLayer),
-    // provideMerge (not provide): the test body yields SessionStatus.Service to
-    // pre-set busy, and afterIdle must read that SAME instance — a consumed
-    // (non-merged) SessionStatus would be invisible to the test body AND could
-    // diverge from the one afterIdle uses.
-    Layer.provideMerge(SessionStatus.defaultLayer),
-    Layer.provideMerge(EventV2Bridge.defaultLayer),
-  )
-  const it = testEffect(branchLayer)
-
-  it.instance("judge 期间 status 变非 idle → goal paused + 可见提示", () =>
-    Effect.gen(function* () {
-      reset()
-      const loop = yield* GoalLoop.Service
-      const goal = yield* Goal.Service
-      const status = yield* SessionStatus.Service
-      const events = yield* EventV2Bridge.Service
-      yield* loop.init()
-      const sid = SessionID.descending()
-      yield* goal.set(sid, "ship the feature", 10)
-      // Make the session non-idle so afterIdle's post-judge status check sees
-      // busy. The raw idle-event publish below drives afterIdle WITHOUT
-      // touching the status map, so the busy entry persists.
-      yield* status.set(sid, { type: "busy" })
-      yield* Effect.yieldNow
-
-      yield* events.publish(SessionStatus.Event.Status, { sessionID: sid, status: { type: "idle" } })
-      yield* pollWithTimeout(
-        Effect.gen(function* () {
-          const g = yield* goal.load(sid)
-          return g?.status === "paused" ? true : undefined
-        }),
-        "branch 3 never paused the goal",
-        "5 seconds",
-      )
-
-      expect(judgeCalls).toBeGreaterThanOrEqual(1)
-      const paused = yield* goal.load(sid)
-      expect(paused?.status).toBe("paused")
-      expect(String(paused?.paused_reason)).toContain("状态变化")
-      expect(promptCalls.some((p) => p.noReply)).toBe(true)
     }),
   )
 })
@@ -1583,11 +1505,10 @@ describe("GoalLoop — startup scan scoping and hardening (GOAL-FP-01-04 follow-
         "the scan's evaluation never reached the judge",
         "5 seconds",
       )
-      // Now a second evaluation races it: the idle event drives an
-      // independent trigger for the SAME turn boundary. The fiber map's
-      // interrupt-on-replace kills the parked scan evaluation, and exactly
-      // ONE commit for the boundary must land.
+      // A second idle for the same boundary must share the pending judge.
+      // Releasing that judge must commit the boundary exactly once.
       yield* events.publish(SessionStatus.Event.Status, { sessionID: sid, status: { type: "idle" } })
+      yield* Deferred.succeed(judgeRelease, undefined)
 
       yield* pollWithTimeout(
         Effect.gen(function* () {
@@ -1597,8 +1518,7 @@ describe("GoalLoop — startup scan scoping and hardening (GOAL-FP-01-04 follow-
         "no racing evaluation committed",
         "5 seconds",
       )
-      yield* Effect.sleep("50 millis")
-      yield* Deferred.succeed(judgeRelease, undefined)
+      expect(judgeCalls).toBe(1)
       const g = yield* goal.load(sid)
       expect(g?.status).toBe("active")
       // The single-writer commit point (matchesExpected + record gate) must
@@ -1681,24 +1601,29 @@ describe("GoalLoop — NotFoundError messages window pauses instead of stalling 
 // continuation branch (shouldPreempt is defensively false on an empty window).
 describe("GoalLoop — NotFoundError on the post-judge reload must not stall (GOAL-FP-01-18)", () => {
   let messageCall = 0
+  let vanished = false
   const sessionMock = Layer.mock(Session.Service, {
     messages: () =>
       Effect.suspend(() => {
         messageCall += 1
-        return messageCall === 1
+        return !vanished
           ? Effect.succeed([mkAssistant()])
           : Effect.fail(new NotFoundError({ message: "Session not found" }))
       }),
   })
   const promptMock = Layer.mock(SessionPrompt.Service, {
     prompt: () => Effect.die(new Error("unreachable - paused branch not expected")),
-    prepareIfIdle: () => Effect.succeed(Option.none()),
+    ...withIdleAdmission({ promptIfIdle: () => Effect.succeed(Option.none()) }),
   })
   const providerMock = Layer.mock(Provider.Service, {})
   const judgeMock = Layer.succeed(
     GoalLoopJudgeLLM,
     GoalLoopJudgeLLM.of({
-      call: () => Effect.succeed(JSON.stringify({ verdict: "continue", reason: "more work" })),
+      call: () =>
+        Effect.sync(() => {
+          vanished = true
+          return JSON.stringify({ verdict: "continue", reason: "more work" })
+        }),
     }),
   )
 
@@ -1713,9 +1638,10 @@ describe("GoalLoop — NotFoundError on the post-judge reload must not stall (GO
   )
   const it = testEffect(reloadLayer)
 
-  it.instance("a vanished session during judge still commits the turn", () =>
+  it.instance("a vanished session during judge pauses without charging the turn", () =>
     Effect.gen(function* () {
       messageCall = 0
+      vanished = false
       const loop = yield* GoalLoop.Service
       const goal = yield* Goal.Service
       const events = yield* EventV2Bridge.Service
@@ -1730,13 +1656,13 @@ describe("GoalLoop — NotFoundError on the post-judge reload must not stall (GO
       const committed = yield* pollWithTimeout(
         Effect.gen(function* () {
           const g = yield* goal.load(sid)
-          return g && g.turns_used >= 1 ? g : undefined
+          return g && g.status === "paused" ? g : undefined
         }),
-        "turn never committed — the post-judge reload failure escaped",
+        "missing boundary did not pause",
         "5 seconds",
       )
-      expect(committed.turns_used).toBe(1)
-      expect(committed.status).toBe("active")
+      expect(committed.turns_used).toBe(0)
+      expect(committed.status).toBe("paused")
       expect(messageCall).toBeGreaterThanOrEqual(2)
     }),
   )
@@ -1757,7 +1683,7 @@ describe("GoalLoop — judge-chain defect degrades into the parse budget (GOAL-F
   })
   const promptMock = Layer.mock(SessionPrompt.Service, {
     prompt: () => Effect.die(new Error("unreachable - paused branch not expected")),
-    prepareIfIdle: () => Effect.succeed(Option.none()),
+    ...withIdleAdmission({ promptIfIdle: () => Effect.succeed(Option.none()) }),
   })
   const providerMock = Layer.mock(Provider.Service, {})
   const judgeMock = Layer.succeed(

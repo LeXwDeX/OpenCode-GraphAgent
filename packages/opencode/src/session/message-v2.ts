@@ -577,6 +577,18 @@ export const filterCompactedEffect = Effect.fnUntraced(function* (sessionID: Ses
   return filterCompacted(yield* stream(sessionID))
 })
 
+/** Presentation-only user messages do not create a new model work boundary. */
+export function isIgnoredUser(message: {
+  info: { role: string }
+  parts?: ReadonlyArray<{ type: string; ignored?: boolean }>
+}) {
+  return (
+    message.info.role === "user" &&
+    !!message.parts?.length &&
+    message.parts.every((part) => part.type === "text" && part.ignored)
+  )
+}
+
 // filterCompacted reorders messages for model consumption
 // ([compaction-user, summary, ...retained tail..., continue-user]), so array
 // position is not chronological. Derive each binding by max (time.created, id)

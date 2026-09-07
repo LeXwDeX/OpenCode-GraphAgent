@@ -26,6 +26,12 @@ export interface Interface {
     onInterrupt: Effect.Effect<SessionV1.WithParts>,
     work: Effect.Effect<SessionV1.WithParts>,
   ) => Effect.Effect<Option.Option<Effect.Effect<SessionV1.WithParts>>>
+  readonly startShellHandle: (
+    sessionID: SessionID,
+    onInterrupt: Effect.Effect<SessionV1.WithParts>,
+    work: Effect.Effect<SessionV1.WithParts>,
+    ready?: Latch.Latch,
+  ) => Effect.Effect<Effect.Effect<SessionV1.WithParts, Session.BusyError>>
   readonly startShell: (
     sessionID: SessionID,
     onInterrupt: Effect.Effect<SessionV1.WithParts>,
@@ -119,18 +125,26 @@ export const layer = Layer.effect(
       return yield* (yield* runner(sessionID, onInterrupt)).startIfIdle(work)
     })
 
-    const startShell = Effect.fn("SessionRunState.startShell")(function* (
-      sessionID: SessionID,
-      onInterrupt: Effect.Effect<SessionV1.WithParts>,
-      work: Effect.Effect<SessionV1.WithParts>,
-      ready?: Latch.Latch,
-    ) {
-      return yield* (yield* runner(sessionID, onInterrupt))
-        .startShell(work, ready)
-        .pipe(Effect.catchTag("RunnerBusy", () => Effect.fail(busyError(sessionID))))
-    })
+    const startShellHandle: Interface["startShellHandle"] = Effect.fn("SessionRunState.startShellHandle")(
+      function* (sessionID, onInterrupt, work, ready) {
+        const result = yield* (yield* runner(sessionID, onInterrupt)).startShellHandle(work, ready)
+        return result.pipe(Effect.catchTag("RunnerBusy", () => Effect.fail(busyError(sessionID))))
+      },
+    )
 
-    return Service.of({ assertNotBusy, cancel, ensureRunning, ensureRunningHandle, startIfIdle, startShell })
+    const startShell: Interface["startShell"] = Effect.fn("SessionRunState.startShell")((...args) =>
+      startShellHandle(...args).pipe(Effect.flatten),
+    )
+
+    return Service.of({
+      assertNotBusy,
+      cancel,
+      ensureRunning,
+      ensureRunningHandle,
+      startIfIdle,
+      startShell,
+      startShellHandle,
+    })
   }),
 )
 
