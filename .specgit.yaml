@@ -1,16 +1,10 @@
 version: 1
-delivery: stable-release-1042
+delivery: main-release-1042
 context:
   kind: branch
-  branch: chore/576-stable-release-1042
+  branch: chore/579-main-release-1042
 issues:
-  - 568
-  - 569
-  - 570
-  - 571
-  - 572
-  - 574
-  - 575
-  - 576
-  - 578
-pr: 577
+  - 579
+issueKinds:
+  - issue: 579
+    kind: kind::chore
