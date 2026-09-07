@@ -2,3 +2,6 @@ version: 1
 required_checks:
   - Typecheck
   - Unit Tests (linux)
+automation:
+  merge: false
+  close_issues: false

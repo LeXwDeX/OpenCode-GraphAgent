@@ -1,11 +1,38 @@
 version: 1
-delivery: stable-release
+delivery: hooks-runtime-reliability
 context:
-  kind: branch
-  branch: chore/543-stable-release
+  kind: worktree
+  label: opencode-hooks-fix
+  branch: fix/557-hooks-runtime-reliability
 issues:
-  - 543
+  - 557
+  - 558
+  - 559
+  - 560
+  - 561
+  - 562
+  - 563
+  - 564
+  - 565
+  - 566
 issueKinds:
-  - issue: 543
-    kind: kind::chore
-pr: 544
+  - issue: 557
+    kind: kind::fix
+  - issue: 558
+    kind: kind::fix
+  - issue: 559
+    kind: kind::fix
+  - issue: 560
+    kind: kind::fix
+  - issue: 561
+    kind: kind::fix
+  - issue: 562
+    kind: kind::fix
+  - issue: 563
+    kind: kind::fix
+  - issue: 564
+    kind: kind::fix
+  - issue: 565
+    kind: kind::fix
+  - issue: 566
+    kind: kind::fix
