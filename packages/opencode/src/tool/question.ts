@@ -1,6 +1,7 @@
-import { Effect, Schema } from "effect"
+import { Effect, Option, Schema } from "effect"
 import * as Tool from "./tool"
 import { Question } from "../question"
+import { Goal } from "../goal/goal"
 import DESCRIPTION from "./question.txt"
 
 export const Parameters = Schema.Struct({
@@ -21,6 +22,15 @@ export const QuestionTool = Tool.define<typeof Parameters, Metadata, Question.Se
       parameters: Parameters,
       execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context<Metadata>) =>
         Effect.gen(function* () {
+          const goal = Option.getOrUndefined(yield* Effect.serviceOption(Goal.Service))
+          if (goal && (yield* goal.isTurnDriven(ctx.sessionID))) {
+            return {
+              title: "Autonomous turn: question unavailable",
+              output:
+                "Interactive questions are disabled during Goal execution. Make a reasonable decision and continue. If user input is essential, explain the blocker in your final response so the goal can pause.",
+              metadata: { answers: [] },
+            }
+          }
           const answers = yield* question.ask({
             sessionID: ctx.sessionID,
             questions: params.questions,

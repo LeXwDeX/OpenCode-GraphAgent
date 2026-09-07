@@ -96,7 +96,7 @@ export const layer = Layer.effect(
       }
       commands[Default.GOAL] = {
         name: Default.GOAL,
-        description: "设定持久目标，自动循环执行直到完成 [status|pause|resume|done|clear|stop]",
+        description: "设定持久目标 [--max-turns N] <目标>；控制 [status|pause|resume [--max-turns N]|done|clear|stop]",
         source: "command",
         template: "",
         hints: ["$ARGUMENTS"],

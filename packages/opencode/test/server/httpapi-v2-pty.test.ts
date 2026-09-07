@@ -209,7 +209,10 @@ describe("v2 pty HttpApi", () => {
           directoryHeader(dir),
           HttpClientRequest.bodyJson({
             command: "/bin/sh",
-            args: ["-c", 'printf "%s|%s|%s|%s|%s\\n" "$CALLER" "$SHARED" "$PLUGIN" "$TERM" "$HOOK_CWD"; sleep 5'],
+            args: [
+              "-c",
+              'printf "%s|%s|%s|%s|%s\\n" "$CALLER" "$SHARED" "$PLUGIN" "$TERM" "$HOOK_CWD"; read -r release',
+            ],
             cwd,
             env: { CALLER: "caller", SHARED: "caller", TERM: "caller" },
           }),
@@ -243,6 +246,7 @@ describe("v2 pty HttpApi", () => {
         expect(yield* takeUntil(`caller|plugin|plugin|xterm-256color|${cwd}`)).toContain(
           `caller|plugin|plugin|xterm-256color|${cwd}`,
         )
+        yield* write("done\n")
         yield* write(new Socket.CloseEvent(1000, "done")).pipe(Effect.catch(() => Effect.void))
         yield* HttpClientRequest.delete(`/api/pty/${info.id}`).pipe(directoryHeader(dir), HttpClient.execute)
       }),

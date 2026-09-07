@@ -7,6 +7,7 @@ import { InstanceState } from "@/effect/instance-state"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { SessionStatus } from "@/session/status"
 import { Session } from "@/session/session"
+import { MessageV2 } from "@/session/message-v2"
 import { SessionPrompt } from "@/session/prompt"
 import { Provider } from "@/provider/provider"
 import { Goal } from "./goal"
@@ -59,11 +60,15 @@ export class GoalLoopJudgeLLM extends Context.Service<GoalLoopJudgeLLM, GoalLoop
  * Operates on MessageV2 shape (`info.time.created`).
  */
 export function shouldPreempt(
-  msgs: ReadonlyArray<{ info: { role: "user" | "assistant"; time: { created: number } } }>,
+  msgs: ReadonlyArray<{
+    info: { role: "user" | "assistant"; time: { created: number } }
+    parts?: ReadonlyArray<{ type: string; ignored?: boolean }>
+  }>,
 ): boolean {
   let lastUserAt = -1
   let lastAsstAt = -1
   for (const m of msgs) {
+    if (MessageV2.isIgnoredUser(m)) continue
     const t = m.info.time?.created
     if (typeof t !== "number") continue
     if (m.info.role === "user" && t > lastUserAt) lastUserAt = t
@@ -117,6 +122,16 @@ const serviceLayer = Layer.effect(
     const goal = yield* Goal.Service
     const status = yield* SessionStatus.Service
     const automation = yield* SessionAutomationLease.Service
+
+    const workMessages = Effect.fn("GoalLoop.workMessages")(function* (sessionID: SessionID, limit = 20) {
+      let count = limit
+      for (;;) {
+        const messages = yield* sessions.messages({ sessionID, limit: count })
+        const work = messages.filter((message) => !MessageV2.isIgnoredUser(message))
+        if (work.length >= limit || messages.length < count) return work.slice(-limit)
+        count *= 2
+      }
+    })
 
     const pauseGoal = Effect.fnUntraced(function* (sessionID: SessionID, reason: string) {
       const paused = yield* goal.pauseAndPublish(sessionID, reason)
@@ -240,6 +255,7 @@ const serviceLayer = Layer.effect(
     // at the same terminal points where afterIdle unregisters the goal
     // automation.
     const evaluatedRevisions = new Map<SessionID, number>()
+    const inFlight = new Map<SessionID, string>()
 
     const afterIdle = Effect.fn("GoalLoop.afterIdle")(function* (sessionID: SessionID, scanResume?: boolean) {
       // GOAL-TURN-SCOPE: the goal-driven turn that produced this idle has
@@ -257,37 +273,17 @@ const serviceLayer = Layer.effect(
       // newer revision). If this process already evaluated the CURRENT
       // revision, the scan trigger is stale — skip.
       if (scanResume && evaluatedRevisions.get(sessionID) === (goalState.revision ?? 0)) return
-      // issue #285 — durable boundary gate (scan path only). The
-      // evaluatedRevisions map above is process-local and dies with the
-      // process; the goal row's last_judged_msg is the crash-surviving record
-      // of which boundary was already judged and committed. While the session
-      // window still ends on that same message, no new progress has landed —
-      // re-judging would inflate turns_used. Live idle events are never gated
-      // here: every dispatched continuation produces a fresh assistant
-      // message, so the live path always judges a new boundary.
-      //
-      // GOAL-01: the gate suppresses RE-JUDGMENT, never the drive. The old
-      // behavior `return`ed here, which permanently stranded goals whose
-      // committed continue evaluation lost its continuation to a crash
-      // (process died after the commit, before the next assistant message):
-      // every boot scan re-hit this gate, nothing ever dispatched another
-      // turn, and last_judged_msg (only written by judge commits) never
-      // advanced. Now the gate sets suppressJudge and falls through — the
-      // judge call and its updateAfterJudge commit below are skipped (the
-      // boundary is already judged; re-judging is what would inflate
-      // turns_used), but the shared continuation dispatch still runs and
-      // restores the driver. A second crash repeats this safely: a fresh
-      // process starts with an empty evaluatedRevisions map and an unchanged
-      // last_judged_msg, so the gate fires and re-dispatches again.
+      // A committed work boundary survives restart and control-command idle events.
+      // Reuse its verdict without charging another turn, but restore a continuation
+      // lost to a crash or invalidated by a subgoal edit.
       let suppressJudge = false
-      if (scanResume && goalState.last_judged_msg) {
-        const win = yield* sessions
-          .messages({ sessionID, limit: 20 })
-          .pipe(
-            Effect.catchIf((e) => NotFoundError.isInstance(e), () =>
-              Effect.succeed([] as SessionV1.WithParts[]),
-            ),
-          )
+      if (goalState.last_judged_msg) {
+        const win = yield* workMessages(sessionID).pipe(
+          Effect.catchIf(
+            (e) => NotFoundError.isInstance(e),
+            () => Effect.succeed([] as SessionV1.WithParts[]),
+          ),
+        )
         const lastSeen = [...win].reverse().find((m) => m.info.role === "assistant")
         if (lastSeen && lastSeen.info.id === goalState.last_judged_msg) suppressJudge = true
       }
@@ -310,17 +306,13 @@ const serviceLayer = Layer.effect(
       // fires. Uses pauseAndPublish (fiber-safe) — NOT goal.pause — because
       // we ARE the loop fiber tracked in the fibers map (same self-interrupt
       // hazard discipline as the done / shouldPreempt branches below).
-      if (
-        goalState.turns_used === 0 &&
-        Date.now() - goalState.created_at > GoalPrompts.FRESHNESS_THRESHOLD
-      ) {
-        const probeMsgs = yield* sessions
-          .messages({ sessionID, limit: 1 })
-          .pipe(
-            Effect.catchIf((e) => NotFoundError.isInstance(e), () =>
-              Effect.succeed([] as SessionV1.WithParts[]),
-            ),
-          )
+      if (goalState.turns_used === 0 && Date.now() - goalState.created_at > GoalPrompts.FRESHNESS_THRESHOLD) {
+        const probeMsgs = yield* workMessages(sessionID, 1).pipe(
+          Effect.catchIf(
+            (e) => NotFoundError.isInstance(e),
+            () => Effect.succeed([] as SessionV1.WithParts[]),
+          ),
+        )
         const hasAssistant = probeMsgs.some((m) => m.info.role === "assistant")
         if (isStaleZombie(goalState, hasAssistant)) {
           yield* pauseGoal(
@@ -336,13 +328,12 @@ const serviceLayer = Layer.effect(
       // (same pattern as MessageV2.stream) so the no-lastAssistant branch
       // below pauses visibly instead of this typed failure escaping and
       // leaving the goal permanently "active".
-      const msgs = yield* sessions
-        .messages({ sessionID, limit: 20 })
-        .pipe(
-          Effect.catchIf((e) => NotFoundError.isInstance(e), () =>
-            Effect.succeed([] as SessionV1.WithParts[]),
-          ),
-        )
+      const msgs = yield* workMessages(sessionID).pipe(
+        Effect.catchIf(
+          (e) => NotFoundError.isInstance(e),
+          () => Effect.succeed([] as SessionV1.WithParts[]),
+        ),
+      )
       const lastAssistant = [...msgs].reverse().find((m) => m.info.role === "assistant")
       if (!lastAssistant) {
         // No assistant message in the last 20 — the conversation may have
@@ -405,20 +396,34 @@ const serviceLayer = Layer.effect(
           : { verdict: "continue" as const, reason: "上一轮无文本输出（纯工具调用），跳过判定直接继续", parseFailed: false }
 
         const updateResult = Option.getOrUndefined(
-          yield* automation.use(
-            observedLease,
-            goal.updateAfterJudge(
-              sessionID,
-              verdict.verdict,
-              verdict.reason,
-              verdict.parseFailed,
-              {
-                goalID: goalState.goal_id ?? "legacy",
-                revision: goalState.revision ?? 0,
-              },
-              lastAssistant.info.id,
+          yield* automation
+            .use(
+              observedLease,
+              promptSvc
+                .withIdle(
+                  sessionID,
+                  Effect.gen(function* () {
+                    const current = yield* workMessages(sessionID)
+                    const latest = [...current].reverse().find((m) => m.info.role === "assistant")
+                    if (latest?.info.id !== lastAssistant.info.id || shouldPreempt(current)) return undefined
+                    return yield* goal.updateAfterJudge(
+                      sessionID,
+                      verdict.verdict,
+                      verdict.reason,
+                      verdict.parseFailed,
+                      { goalID: goalState.goal_id ?? "legacy", revision: goalState.revision ?? 0 },
+                      lastAssistant.info.id,
+                    )
+                  }),
+                )
+                .pipe(Effect.map(Option.getOrUndefined)),
+            )
+            .pipe(
+              Effect.catchIf(
+                (error) => NotFoundError.isInstance(error),
+                () => pauseGoal(sessionID, "评审期间会话消息已不可用，目标已暂停").pipe(Effect.as(Option.none())),
+              ),
             ),
-          ),
         )
         if (!updateResult) return
 
@@ -483,22 +488,7 @@ const serviceLayer = Layer.effect(
       }
 
       const currentStatus = yield* status.get(sessionID)
-      if (currentStatus.type !== "idle") {
-        // Session is no longer idle by the time dispatch resumes — it flipped
-        // during the judge call (5-30s latency), or between the gate and here
-        // on the GOAL-01 judge-less fall-through.
-        // Previously this was a bare `return` that left the goal silently
-        // "active" with no continuation. Pause with a visible reason so the
-        // user knows the loop was interrupted by a status change.
-        // Neutral wording on purpose: this pause is reachable both after a
-        // real judge call AND via the GOAL-01 gate-hit fall-through, where
-        // the judge was suppressed — the user-visible reason must not claim
-        // a judge was running.
-        const pauseMsg = `会话状态变化（${currentStatus.type}），目标已暂停`
-        yield* pauseGoal(sessionID, pauseMsg).pipe(Effect.ignore)
-        yield* promptSvc.prompt({ sessionID, noReply: true, parts: [{ type: "text", text: `⏸ 目标已暂停 — ${pauseMsg}` }] }).pipe(Effect.ignore)
-        return
-      }
+      if (currentStatus.type !== "idle") return
 
       // Reload messages before dispatch — the pre-judge snapshot may be stale
       // (the user can send messages during the 5-30s judge latency, or during
@@ -506,13 +496,12 @@ const serviceLayer = Layer.effect(
       // Same vanished-session tolerance as the pre-judge window: NotFoundError
       // becomes an empty window (shouldPreempt is defensively false for it),
       // never a typed failure escaping the fork.
-      const freshMsgs = yield* sessions
-        .messages({ sessionID, limit: 20 })
-        .pipe(
-          Effect.catchIf((e) => NotFoundError.isInstance(e), () =>
-            Effect.succeed([] as SessionV1.WithParts[]),
-          ),
-        )
+      const freshMsgs = yield* workMessages(sessionID).pipe(
+        Effect.catchIf(
+          (e) => NotFoundError.isInstance(e),
+          () => Effect.succeed([] as SessionV1.WithParts[]),
+        ),
+      )
 
       if (shouldPreempt(freshMsgs)) {
         // Same self-interrupt hazard as the done branch above: we ARE the
@@ -651,6 +640,15 @@ const serviceLayer = Layer.effect(
       const scope = yield* Scope.Scope
       const goalState = yield* goal.load(sessionID)
       if (!goalState || goalState.status !== "active") return
+      const messages = yield* workMessages(sessionID).pipe(
+        Effect.catchIf(
+          (e) => NotFoundError.isInstance(e),
+          () => Effect.succeed([] as SessionV1.WithParts[]),
+        ),
+      )
+      const last = [...messages].reverse().find((m) => m.info.role === "assistant")
+      const boundary = `${goalState.goal_id}:${goalState.revision}:${last?.info.id}`
+      if (inFlight.get(sessionID) === boundary) return
       // D-4 gate (scan path only): skip when this process already evaluated
       // the CURRENT revision — the boot snapshot went stale after a
       // legitimate evaluation (e.g. the session's own idle event ran before
@@ -669,7 +667,13 @@ const serviceLayer = Layer.effect(
       // zero logs — an invisible stall. Interrupts (fiber replacement by a
       // newer idle, scope disposal) stay silent: they are the normal
       // overwrite path, same F1 discipline as the continuation catch below.
+      inFlight.set(sessionID, boundary)
       const fiber = yield* afterIdle(sessionID, scanResume).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            if (inFlight.get(sessionID) === boundary) inFlight.delete(sessionID)
+          }),
+        ),
         Effect.catchCause((cause) =>
           Cause.hasInterrupts(cause)
             ? Effect.void

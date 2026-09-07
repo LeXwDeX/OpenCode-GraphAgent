@@ -1,5 +1,6 @@
 import { describe, expect } from "bun:test"
 import { Effect, Fiber, Layer, Queue } from "effect"
+import { Goal } from "@/goal/goal"
 import { QuestionTool } from "../../src/tool/question"
 import { Question } from "../../src/question"
 import { SessionID, MessageID } from "../../src/session/schema"
@@ -136,3 +137,19 @@ describe("tool.question", () => {
   //     }
   //   })
 })
+
+it.instance("question reads Goal from the execution context, not registry construction", () =>
+  Effect.gen(function* () {
+    // This test layer intentionally has no Goal at tool construction time.
+    const tool = yield* (yield* QuestionTool).init()
+    const questions = yield* Question.Service
+    const result = yield* tool
+      .execute({ questions: [] }, ctx)
+      .pipe(
+        Effect.provide(Layer.mock(Goal.Service, { isTurnDriven: () => Effect.succeed(true) })),
+        Effect.timeout("2 seconds"),
+      )
+    expect(result.output).toContain("Interactive questions are disabled")
+    expect(yield* questions.list()).toHaveLength(0)
+  }),
+)

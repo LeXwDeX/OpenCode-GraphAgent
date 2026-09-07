@@ -119,6 +119,11 @@ function isOrphanedInterruptedTool(part: SessionV1.ToolPart) {
 export interface Interface {
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
   readonly prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
+  /** Run a short commit while idle, serialized with prompt admission. Never start or await a turn here. */
+  readonly withIdle: <A, E, R>(
+    sessionID: SessionID,
+    work: Effect.Effect<A, E, R>,
+  ) => Effect.Effect<Option.Option<A>, E, R>
   readonly prepareIfIdle: (input: PromptInput) => Effect.Effect<Option.Option<IdleAdmission>, Image.Error>
   readonly promptIfIdle: (input: PromptInput) => Effect.Effect<Option.Option<SessionV1.WithParts>, Image.Error>
   readonly loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts>
@@ -1479,6 +1484,7 @@ export const layer = Layer.effect(
     )(function* (input: PromptInput) {
       const wait = yield* promptLocks.withLock(input.sessionID)(
         Effect.gen(function* () {
+          if (goal && input.noReply !== true) yield* goal.clearTurnDriven(input.sessionID)
           const admitted = yield* admitPrompt(input)
           if (!admitted.run) return Effect.succeed(admitted.message)
           return yield* state.ensureRunningHandle(
@@ -1490,6 +1496,16 @@ export const layer = Layer.effect(
       )
       return yield* wait
     })
+
+    const withIdle: Interface["withIdle"] = Effect.fn("SessionPrompt.withIdle")(
+      <A, E, R>(sessionID: SessionID, work: Effect.Effect<A, E, R>) =>
+        promptLocks.withLock(sessionID)(
+          Effect.gen(function* () {
+            if ((yield* status.get(sessionID)).type !== "idle") return Option.none()
+            return Option.some(yield* work)
+          }),
+        ),
+    )
 
     const prepareIfIdle: Interface["prepareIfIdle"] = Effect.fn("SessionPrompt.prepareIfIdle")(function* (
       input: PromptInput,
@@ -1584,6 +1600,7 @@ export const layer = Layer.effect(
           yield* Effect.logInfo("loop", { "session.id": sessionID, step })
 
           let msgs = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
+            Effect.map((messages) => messages.filter((message) => !MessageV2.isIgnoredUser(message))),
             Effect.provideService(Database.Service, database),
           )
 
@@ -1952,14 +1969,20 @@ export const layer = Layer.effect(
     const loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.loop")(function* (
       input: LoopInput,
     ) {
-      return yield* state.ensureRunning(input.sessionID, lastAssistant(input.sessionID), runLoop(input.sessionID))
+      const result = yield* promptLocks.withLock(input.sessionID)(
+        state.ensureRunningHandle(input.sessionID, lastAssistant(input.sessionID), runLoop(input.sessionID)),
+      )
+      return yield* result
     })
 
     const shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError> = Effect.fn(
       "SessionPrompt.shell",
     )(function* (input: ShellInput) {
       const ready = yield* Latch.make()
-      return yield* state.startShell(input.sessionID, lastAssistant(input.sessionID), shellImpl(input, ready), ready)
+      const result = yield* promptLocks.withLock(input.sessionID)(
+        state.startShellHandle(input.sessionID, lastAssistant(input.sessionID), shellImpl(input, ready), ready),
+      )
+      return yield* result
     })
 
     // #409: early-return command dispatches (/memory, /trust, /goal non-kick)
@@ -1968,8 +1991,12 @@ export const layer = Layer.effect(
     // startIfIdle keeps today's inline semantics while another turn is running
     // (no queueing, no second idle); the in-flight turn re-emits idle itself.
     const commandTurn = Effect.fnUntraced(function* (sessionID: SessionID, work: Effect.Effect<SessionV1.WithParts>) {
-      const handle = yield* state.startIfIdle(sessionID, lastAssistant(sessionID), work)
-      return yield* Option.getOrElse(handle, () => work)
+      return yield* promptLocks.withLock(sessionID)(
+        Effect.gen(function* () {
+          const handle = yield* state.startIfIdle(sessionID, lastAssistant(sessionID), work)
+          return yield* Option.getOrElse(handle, () => work)
+        }),
+      )
     })
 
     const command = Effect.fn("SessionPrompt.command")(function* (input: CommandInput) {
@@ -2165,6 +2192,7 @@ export const layer = Layer.effect(
                 messageID: userMsg.id,
                 sessionID: input.sessionID,
                 type: "text",
+                ignored: true,
                 text: `⚠️ /${input.command} 执行失败，请检查日志。`,
                 synthetic: true,
                 time: { start: now, end: now },
@@ -2179,6 +2207,7 @@ export const layer = Layer.effect(
               messageID: userMsg.id,
               sessionID: input.sessionID,
               type: "text",
+              ignored: true,
               text: `/${input.command} ${input.arguments}`.trim(),
             }
             yield* sessions.updatePart(cmdText)
@@ -2193,6 +2222,7 @@ export const layer = Layer.effect(
               messageID: userMsg.id,
               sessionID: input.sessionID,
               type: "text",
+              ignored: true,
               text: dispatchText,
               time: { start: now, end: now },
             }
@@ -2312,6 +2342,7 @@ export const layer = Layer.effect(
     return Service.of({
       cancel,
       prompt,
+      withIdle,
       prepareIfIdle,
       promptIfIdle,
       loop,
@@ -2324,7 +2355,7 @@ export const layer = Layer.effect(
 
 export const defaultLayer = Layer.suspend(() =>
   layer.pipe(
-    Layer.provide(SessionRunState.defaultLayer),
+    Layer.provide(Layer.mergeAll(Goal.defaultLayer, SessionRunState.defaultLayer)),
     Layer.provide(SessionStatus.defaultLayer),
     Layer.provide(SessionCompaction.defaultLayer),
     Layer.provide(SessionProcessor.defaultLayer),
