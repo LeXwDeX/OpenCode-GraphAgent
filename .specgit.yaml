@@ -9,3 +9,4 @@ issues:
 issueKinds:
   - issue: 581
     kind: kind::fix
+pr: 582
