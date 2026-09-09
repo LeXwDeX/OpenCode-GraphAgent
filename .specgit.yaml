@@ -1,11 +1,11 @@
 version: 1
 delivery: memory-release
 context:
-  kind: worktree
-  label: promotion
+  kind: branch
   branch: chore/583-memory-release
 issues:
   - 583
+  - 585
 issueKinds:
   - issue: 583
     kind: kind::chore
