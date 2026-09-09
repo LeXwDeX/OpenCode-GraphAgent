@@ -1,12 +1,11 @@
 version: 1
-delivery: memory-activation
+delivery: memory-release
 context:
   kind: worktree
-  label: delivery
-  branch: fix/581-memory-activation
+  label: promotion
+  branch: chore/583-memory-release
 issues:
-  - 581
+  - 583
 issueKinds:
-  - issue: 581
-    kind: kind::fix
-pr: 582
+  - issue: 583
+    kind: kind::chore
