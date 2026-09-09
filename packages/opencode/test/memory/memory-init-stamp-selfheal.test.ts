@@ -76,6 +76,42 @@ const layer = Layer.mergeAll(Memory.layer.pipe(Layer.provideMerge(base)), CrossS
 const it = testEffect(layer)
 
 describe("memory /init stamp self-heal", () => {
+  for (const configured of ["missing", "disabled", "unavailable-model"]) {
+    it.live(
+      `first enable completes after self-healing with ${configured} project config`,
+      () =>
+        Effect.gen(function* () {
+          const dir = yield* tmpdirScoped({ git: true })
+          yield* provideInstance(dir)(
+            Effect.gen(function* () {
+              const project = yield* Project.Service
+              const memory = yield* Memory.Service
+              const config = yield* MemoryConfig.Service
+              const { project: info } = yield* project.fromDirectory(dir)
+              fs.writeFileSync(path.join(info.worktree, "AGENTS.md"), "# project guide\n")
+              if (configured !== "missing") {
+                yield* config.writeProject(info.worktree, {
+                  schema_version: 1,
+                  enabled: configured === "unavailable-model",
+                  model: configured === "unavailable-model" ? "missing/model" : "openai/gpt-5.2",
+                  topic_limit: 10,
+                  turn_interval: 5,
+                  injection: { max_topics: 3, max_tokens: 1_200 },
+                })
+              }
+
+              expect(yield* memory.setEnabled(true)).toBe("Memory on")
+              expect((yield* project.get(info.id))?.time.initialized).toBeDefined()
+              expect((yield* config.load(info.worktree))?.config.enabled).toBe(true)
+              expect((yield* config.load(info.worktree))?.config.model).toBe("openai/gpt-5.2")
+              expect(yield* memory.status()).toBe("Memory on")
+            }),
+          ).pipe(Effect.provide(testInstanceStoreLayer))
+        }),
+      { timeout: 30_000 },
+    )
+  }
+
   it.live(
     "statusReason stamps the project when AGENTS.md already exists",
     () =>
@@ -117,6 +153,9 @@ describe("memory /init stamp self-heal", () => {
 
             const reason = yield* memory.statusReason()
             expect(reason).toContain("/init")
+            expect(yield* memory.setEnabled(true)).toContain("/init")
+            expect(yield* memory.setEnabled(false)).toBe("Memory remains off")
+            expect((yield* project.get(info.id))?.time.initialized).toBeUndefined()
             // #415 diagnostics: the blocker carries the actual row state so a
             // stale identity (worktree pointing at a deleted clone) is visible.
             expect(reason).toContain("time_initialized")

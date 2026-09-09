@@ -1,11 +1,12 @@
 version: 1
-delivery: main-release-1042
+delivery: memory-release
 context:
   kind: branch
-  branch: chore/579-main-release-1042
+  branch: chore/583-memory-release
 issues:
-  - 579
+  - 583
+  - 585
 issueKinds:
-  - issue: 579
+  - issue: 583
     kind: kind::chore
-pr: 580
+pr: 584
