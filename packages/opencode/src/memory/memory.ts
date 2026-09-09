@@ -841,7 +841,10 @@ export const layer: Layer.Layer<
 
     const setEnabledUnsafe = Effect.fn("Memory.setEnabledUnsafe")(function* (enabled: boolean) {
       const initial = yield* configuration()
-      if (!initial) {
+      // statusReason can repair a missing init stamp. Re-read before deciding
+      // activation is blocked so this same command can enable or repair the model.
+      const ready = initial ?? (enabled ? yield* statusReason().pipe(Effect.andThen(configuration)) : undefined)
+      if (!ready) {
         if (!enabled) return "Memory remains off"
         // #350: a /memory on that cannot activate must say WHY — the bare
         // "remains off" sent users to guess (real case: an initialized git
@@ -849,11 +852,11 @@ export const layer: Layer.Layer<
         // disabled Memory).
         return (yield* statusReason()) ?? "Memory remains off"
       }
-      const value = initial.loaded
-        ? initial
+      const value = ready.loaded
+        ? ready
         : yield* Effect.gen(function* () {
             yield* initUnsafe()
-            return (yield* configuration()) ?? initial
+            return (yield* configuration()) ?? ready
           })
       if (!value.loaded) return "Memory remains off" as const
       const loaded = value.loaded

@@ -1,16 +1,12 @@
 version: 1
-delivery: stable-release-1042
+delivery: memory-activation
 context:
-  kind: branch
-  branch: chore/576-stable-release-1042
+  kind: worktree
+  label: delivery
+  branch: fix/581-memory-activation
 issues:
-  - 568
-  - 569
-  - 570
-  - 571
-  - 572
-  - 574
-  - 575
-  - 576
-  - 578
-pr: 577
+  - 581
+issueKinds:
+  - issue: 581
+    kind: kind::fix
+pr: 582
