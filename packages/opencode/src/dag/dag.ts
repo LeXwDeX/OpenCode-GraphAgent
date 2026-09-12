@@ -38,6 +38,8 @@ import { DagValidation, StructuralValidationError } from "./validation"
 import { DagLocation } from "./location"
 import { SessionLocation } from "@/session/location"
 import { SessionID } from "@/session/schema"
+import { planRecovery, type RecoveryPlan } from "./recovery-plan"
+import { verifyOutputFileRef } from "./runtime/output-ref"
 
 export { StructuralValidationError } from "./validation"
 
@@ -90,6 +92,8 @@ export interface NodeConfig {
   restart?: boolean
   cancel?: boolean
   output_schema?: Record<string, unknown>
+  /** Controller-owned lineage; each recovery gets a distinct durable node ID. */
+  recovery?: { logical_node_id: string; attempt: number; previous_node_id: string }
   review?: {
     phase: "design" | "diff"
     implementation_node_id?: string
@@ -289,9 +293,14 @@ export interface Interface {
     { cancel: string[]; restart: string[]; replace: string[]; add: string[]; ignore: string[] },
     Error
   >
+  readonly recover: (dagID: string, input: {
+    nodeIDs: readonly string[]
+    expectedGraphRev: number
+    resumeCancelled?: boolean
+  }) => Effect.Effect<Omit<RecoveryPlan, "config"> & { graphRev: number }, Error>
   readonly nodeQueued: (dagID: string, nodeID: string, deadlineMs?: number, attempt?: NodeExecutionAttempt) => Effect.Effect<void, Error>
   readonly nodeStarted: (dagID: string, nodeID: string, childSessionID: string, deadlineMs?: number, wakeEligible?: boolean, attempt?: NodeExecutionAttempt) => Effect.Effect<void, Error>
-  readonly nodeCompleted: (dagID: string, nodeID: string, output: unknown, attempt?: NodeExecutionAttempt) => Effect.Effect<void, Error>
+  readonly nodeCompleted: (dagID: string, nodeID: string, output: unknown, attempt?: NodeExecutionAttempt, capturedOutput?: unknown) => Effect.Effect<void, Error>
   readonly nodeFailed: (dagID: string, nodeID: string, reason: string, trigger: string, attempt?: NodeExecutionAttempt) => Effect.Effect<void, Error>
   readonly nodeSkipped: (dagID: string, nodeID: string, reason: string, attempt?: NodeExecutionAttempt) => Effect.Effect<void, Error>
   readonly nodeCancelled: (dagID: string, nodeID: string) => Effect.Effect<void, Error>
@@ -919,6 +928,95 @@ export const layer = Layer.effect(
       return yield* _replan(lock, dagID, { nodes: [...preserved, ...newNodes] }, reopenCompleted)
     })
 
+    const recover: Interface["recover"] = Effect.fn("Dag.recover")(function* (dagID, input) {
+      const workflow = yield* store.getWorkflow(dagID).pipe(Effect.orDie)
+      if (!workflow) return yield* Effect.fail(new Error(`Workflow not found: ${dagID}`))
+      if (!Number.isSafeInteger(input.expectedGraphRev) || input.expectedGraphRev !== workflow.graphRev) {
+        return yield* Effect.fail(new Error(`Recovery rejected: stale expected_graph_rev; current graph_rev is ${workflow.graphRev}`))
+      }
+      if (workflow.status !== "paused" && workflow.status !== "failed" && workflow.status !== "cancelled") {
+        return yield* Effect.fail(new Error(`Recovery requires a paused or failed workflow; ${workflow.status} cannot recover (pause live scheduling first)`))
+      }
+      if (workflow.status === "cancelled" && !input.resumeCancelled) {
+        return yield* Effect.fail(new Error("Recovery of a cancelled workflow requires explicit resume_cancelled: true"))
+      }
+      const config = parseWorkflowConfig(workflow.config)
+      if (!config) return yield* Effect.fail(new Error(`Recovery cannot read the workflow definition: ${dagID}`))
+      const nodes = yield* store.getNodes(dagID)
+      const plan = yield* Effect.try({
+        try: () => planRecovery(config, nodes, input.nodeIDs, workflow.graphRev + 1,
+          config.max_node_replan_attempts ?? DEFAULT_WORKFLOW_CONFIG.maxNodeReplanAttempts),
+        catch: (error) => error instanceof Error ? error : new Error(String(error)),
+      })
+      const addedIDs = new Set(plan.replacements.map((replacement) => replacement.current))
+      const added = plan.config.nodes.filter((node) => addedIDs.has(node.id))
+      const diagnostics = DagValidation.replanStructuralDiagnostics({
+        fragmentNodes: added,
+        rerunNodes: added,
+        existingNodeIds: new Set(plan.preserved),
+        existingNodeCount: nodes.length,
+        addCount: added.length,
+        merged: plan.config,
+        terminalNodeIds: new Set(plan.reused),
+        config,
+      }).filter((diagnostic) => diagnostic.severity === "error")
+      if (diagnostics.length > 0) return yield* Effect.fail(new StructuralValidationError({ diagnostics }))
+
+      // Hashing is outside the workflow mutex. Both workflow and node sequence
+      // fences are rechecked in the durable batch before any projection changes.
+      for (const id of plan.reused) {
+        const node = nodes.find((candidate) => candidate.id === id)!
+        yield* verifyOutputFileRef(node.capturedOutput).pipe(Effect.mapError((error) =>
+          new Error(`Recovery cannot reuse artifact from node "${id}": ${error.message}; include this node in node_ids to recompute it`),
+        ))
+      }
+      return yield* withWorkflowLock(dagID)((_lock) => Effect.gen(function* () {
+        const current = yield* store.getWorkflow(dagID).pipe(Effect.orDie)
+        if (!current || current.seq !== workflow.seq || current.graphRev !== input.expectedGraphRev) {
+          return yield* Effect.fail(new Error("Recovery rejected: workflow changed during artifact verification; inspect status and retry"))
+        }
+        const timestamp = yield* DateTime.now
+        // This fenced event is first so its projector can validate the original
+        // snapshot. publishMany commits all new attempts/config atomically.
+        const batch: BatchEvent[] = [{
+          definition: DagEvent.WorkflowReplanned,
+          data: {
+            dagID: ID.make(dagID),
+            added: added.length,
+            removed: plan.superseded.length,
+            replaced: 0,
+            restarted: 0,
+            superseded: plan.superseded.map((id) => NodeID.make(id)),
+            recovery: {
+              expectedGraphRev: input.expectedGraphRev,
+              expectedSeq: workflow.seq,
+              nodeSeqs: nodes.map((node) => ({ nodeID: NodeID.make(node.id), seq: node.seq })),
+              resumeCancelled: input.resumeCancelled === true,
+            },
+            timestamp,
+          },
+        }]
+        for (const id of plan.superseded) {
+          const node = nodes.find((candidate) => candidate.id === id)!
+          if (isNodeTerminalStatus(node.status as NodeStatus)) continue
+          batch.push({ definition: DagEvent.NodeCancelled, data: { dagID: ID.make(dagID), nodeID: NodeID.make(id), timestamp } })
+        }
+        for (const node of added) {
+          batch.push({ definition: DagEvent.NodeRegistered, data: {
+            dagID: ID.make(dagID), nodeID: NodeID.make(node.id), name: node.name,
+            workerType: node.worker_type, dependsOn: node.depends_on.map((id) => NodeID.make(id)),
+            required: node.required ?? false, ...(node.model ? { model: node.model } : {}), timestamp,
+          } })
+        }
+        batch.push({ definition: DagEvent.WorkflowConfigUpdated, data: {
+          dagID: ID.make(dagID), config: JSON.stringify(plan.config), timestamp,
+        } })
+        yield* events.publishMany(batch)
+        const { config: _config, ...result } = plan
+        return { ...result, graphRev: workflow.graphRev + 1 }
+      }))
+    })
+
     const nodeQueued = Effect.fn("Dag.nodeQueued")(function* (lock: WorkflowLock, dagID: string, nodeID: string, deadlineMs?: number, attempt?: NodeExecutionAttempt) {
       yield* guardNode(dagID, nodeID, NodeStatus.QUEUED, attempt)
       yield* events.publish(DagEvent.NodeQueued, { dagID: dagID as ID, nodeID: nodeID as never, deadlineMs, timestamp: yield* DateTime.now })
@@ -927,9 +1025,9 @@ export const layer = Layer.effect(
       yield* guardNode(dagID, nodeID, NodeStatus.RUNNING, attempt)
       yield* events.publish(DagEvent.NodeStarted, { dagID: dagID as ID, nodeID: nodeID as never, childSessionID: childSessionID as never, deadlineMs, wakeEligible, timestamp: yield* DateTime.now })
     })
-    const nodeCompleted = Effect.fn("Dag.nodeCompleted")(function* (lock: WorkflowLock, dagID: string, nodeID: string, output: unknown, attempt?: NodeExecutionAttempt) {
+    const nodeCompleted = Effect.fn("Dag.nodeCompleted")(function* (lock: WorkflowLock, dagID: string, nodeID: string, output: unknown, attempt?: NodeExecutionAttempt, capturedOutput?: unknown) {
       yield* guardNode(dagID, nodeID, NodeStatus.COMPLETED, attempt)
-      yield* events.publish(DagEvent.NodeCompleted, { dagID: dagID as ID, nodeID: nodeID as never, output, durationMs: 0 as never, timestamp: yield* DateTime.now })
+      yield* events.publish(DagEvent.NodeCompleted, { dagID: dagID as ID, nodeID: nodeID as never, output, ...(capturedOutput !== undefined ? { capturedOutput } : {}), durationMs: 0 as never, timestamp: yield* DateTime.now })
     })
     const nodeFailed = Effect.fn("Dag.nodeFailed")(function* (lock: WorkflowLock, dagID: string, nodeID: string, reason: string, trigger: string, attempt?: NodeExecutionAttempt) {
       yield* guardNode(dagID, nodeID, NodeStatus.FAILED, attempt)
@@ -1063,10 +1161,11 @@ export const layer = Layer.effect(
       fail: (dagID, reason) => withWorkflowLock(dagID)((lock) => fail(lock, dagID, reason)),
       replan: (dagID, fragment) => withWorkflowLock(dagID)((lock) => _replan(lock, dagID, fragment)),
       extend: (dagID, nodes) => withWorkflowLock(dagID)((lock) => _extend(lock, dagID, nodes)),
+      recover,
       nodeQueued: (dagID, nodeID, deadlineMs, attempt) => withWorkflowLock(dagID)((lock) => nodeQueued(lock, dagID, nodeID, deadlineMs, attempt)),
       nodeStarted: (dagID, nodeID, childSessionID, deadlineMs, wakeEligible, attempt) =>
         withWorkflowLock(dagID)((lock) => nodeStarted(lock, dagID, nodeID, childSessionID, deadlineMs, wakeEligible, attempt)),
-      nodeCompleted: (dagID, nodeID, output, attempt) => withWorkflowLock(dagID)((lock) => nodeCompleted(lock, dagID, nodeID, output, attempt)),
+      nodeCompleted: (dagID, nodeID, output, attempt, capturedOutput) => withWorkflowLock(dagID)((lock) => nodeCompleted(lock, dagID, nodeID, output, attempt, capturedOutput)),
       nodeFailed: (dagID, nodeID, reason, trigger, attempt) => withWorkflowLock(dagID)((lock) => nodeFailed(lock, dagID, nodeID, reason, trigger, attempt)),
       nodeSkipped: (dagID, nodeID, reason, attempt) => withWorkflowLock(dagID)((lock) => nodeSkipped(lock, dagID, nodeID, reason, attempt)),
       nodeCancelled: (dagID, nodeID) => withWorkflowLock(dagID)((lock) => nodeCancelled(lock, dagID, nodeID)),

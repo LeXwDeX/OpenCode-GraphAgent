@@ -29,7 +29,7 @@ team.**
 
 A workflow is a set of nodes connected by dependency edges. Each node is a real child session with its own agent and context window; an edge means the downstream node consumes the upstream node's output. Nodes run wave by wave in dependency order, so independent work executes in parallel and dependent work waits.
 
-The parent agent (your main conversation) owns the graph. It designs the graph for a task, starts it, and gets woken when a node reports or the workflow finishes — it never polls. When a wave fails, the parent rewrites the failed segment and the engine continues; the view always shows the current graph, not the history of rewrites (more on this under [Revisions](#revisions)).
+The parent agent (your main conversation) owns the graph. It designs the graph for a task, starts it, and gets woken when a node reports or the workflow finishes — it never polls. When a wave fails, the parent requests recovery of the affected nodes and the engine continues in the same workflow; the view always shows the current graph, not the history of rewrites (more on this under [Revisions](#revisions)).
 
 Three terms worth knowing:
 
@@ -181,13 +181,13 @@ Workflow-level knobs: `max_concurrency` (default 5), `max_node_replan_attempts` 
 ### Scheduling & execution
 
 - Nodes spawn as real child sessions through the same code path as the `task` tool, wave by wave in dependency order, bounded by a concurrency semaphore. A node is durably `queued` at admission and the child session only materializes inside the permit, so a 100-node fan-out never creates 100 sessions at once.
-- Dynamic replanning, pause-first: `pause` freezes scheduling instantly, `replan` merges a fragment (add / replace / cancel / restart nodes) atomically against the live graph, `resume` continues. Terminal nodes are immutable; retrying a failed node means adding a replacement under a new id. `extend` appends nodes, and may reopen a naturally-completed workflow (the single sanctioned exception to terminal irreversibility).
+- Dynamic replanning, pause-first: `pause` freezes scheduling, `replan` merges a fragment atomically, and `resume` continues. `control(recover)` replaces selected nodes and their downstream attempts in the same failed or paused workflow, using `expected_graph_rev` to reject stale requests. Old attempts remain immutable. Cancelled workflows require explicit resume intent. `extend` appends nodes and may reopen a naturally completed workflow at a reporting checkpoint.
 - Step mode runs one node at a time for debugging.
 - The parent does not poll. Synthetic messages wake it when a `report_to_parent` node or the workflow terminalizes. Checkpoint nodes emit a normalized verdict (`ACCEPT` / `REVISE` / `REJECT` / `BLOCKED`), and the disposal contract governs what happens next. Iteration is a bounded, verdict-driven replan wave; the graph never contains a cyclic edge.
 
 ### Revisions
 
-Rewriting a graph does not erase history, but it does retire it. A replan that supersedes nodes marks them; the workflow row carries a `graph_rev` counter and every view — status output, HTTP API, TUI inspector, summary counts — filters to the current revision. Completed nodes and their outputs survive into the new revision untouched. Audit of superseded nodes stays possible through the result store (an agent can look it up by node id); the TUI exposes no entry to it.
+Rewriting a graph does not erase history, but it does retire it. A replan that supersedes nodes marks them; the workflow row carries a `graph_rev` counter and every view — status output, HTTP API, TUI inspector, summary counts — filters to the current revision. Unrelated completed nodes and valid outputs survive into the new revision untouched; recovery replaces the selected nodes and their downstream closure. Audit of superseded nodes stays possible through the result store (an agent can look it up by node id); the TUI exposes no entry to it.
 
 Two things this fixes. A workflow whose failed segment was rewritten now reports `completed` when the replacement succeeds, instead of dragging the old failure along. And the failure counts you see are the failures that exist — a quota exhaustion or API error on the current graph stays visible until it is actually fixed.
 
@@ -196,11 +196,11 @@ Two things this fixes. A workflow whose failed segment was rewritten now reports
 - Declared transition tables for workflow and node status; every mutation goes through a guard, invalid transitions and terminal violations are typed errors (HTTP 409, not 500).
 - All changes are published as durable `dag.*` events; a projector writes the SQLite read model *inside* the publish transaction. History is event replay, not a log table. A drift test fails whenever the projector's guards and the declared transition tables are edited out of sync.
 - Crash recovery is lazy, per-workflow, and evidence-based: nodes left `running` are reconciled against their child session's durable state. Sessions that finished back-fill their captured output; when execution ownership was genuinely lost, the workflow pauses and the parent decides disposition (replan / resume / cancel). Recovery never adopts or restarts provider work on its own.
-- Failure triage: every failed node carries a failure class (`timeout` / `exec_failed` / `verdict_fail`) surfaced in `workflow(action=status)` and in the parent's wake — including a failed-nodes attribution digest when a workflow terminalizes failed — so the parent agent repairs the specific node (replan with a replacement under a new id, or a continuation workflow reusing completed outputs) instead of restarting the graph.
+- Failure triage: every failed node carries a failure class (`timeout` / `exec_failed` / `verdict_fail`) surfaced in `workflow(action=status)` and in the parent's wake — including a failed-nodes attribution digest when a workflow terminalizes failed — so the parent agent can select the failed node for local recovery instead of rebuilding the graph.
 
 ### Node outputs
 
-A node's final reply can be plain text, a structured payload (`output_schema` + `submit_result`), or a file. When the reply is a single absolute path to an existing non-empty file, the runtime captures `{content_ref, size, sha256, summary}`; `workflow(action="result")` returns the pointer with a short summary and the parent reads the file itself. This keeps long reports out of the transcript while preserving integrity (the hash is recorded at capture time). Report files written under `.opencode/workflow-reports/` get an append-only `.gitignore` entry on first write.
+A node's final reply can be plain text, a structured payload (`output_schema` + `submit_result`), or a file. For a node without an output schema, a final reply containing one absolute path to a non-empty file (up to 64 MiB) commits a managed copy under application data. Its receipt records the digest, size, short summary and execution provenance. Downstream nodes receive a path and read the body as needed; deleting the source working tree does not delete the managed result. Result reads, downstream execution and local recovery verify managed object integrity before reuse. Legacy receipts remain compatible. See [file artifacts and recovery](docs/dag-file-artifacts-and-recovery.md) for the tool calls and limits.
 
 ### Deep mode: admission & review
 

@@ -3,7 +3,7 @@ import { describe, expect } from "bun:test"
 import fs from "fs/promises"
 import os from "os"
 import path from "path"
-import { Effect, Layer } from "effect"
+import { Cause, Effect, Layer } from "effect"
 import { GrepTool } from "../../src/tool/grep"
 import { provideInstance, testInstanceStoreLayer, TestInstance } from "../fixture/fixture"
 import { SessionID, MessageID } from "../../src/session/schema"
@@ -159,6 +159,7 @@ describe("tool.grep", () => {
       const test = yield* TestInstance
       const file = path.join(test.directory, "test.txt")
       yield* Effect.promise(() => Bun.write(file, "line1\nline2\nline3"))
+      yield* Effect.promise(() => Bun.write(path.join(test.directory, "sibling.txt"), "line2 from sibling"))
       const info = yield* GrepTool
       const grep = yield* info.init()
       const result = yield* grep.execute(
@@ -171,6 +172,35 @@ describe("tool.grep", () => {
       expect(result.metadata.matches).toBe(1)
       expect(result.output).toContain(file)
       expect(result.output).toContain("Line 2: line2")
+      expect(result.output).not.toContain("sibling.txt")
+    }),
+  )
+
+  it.instance("fails an unavailable search path without searching its siblings", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const missing = path.join(test.directory, "missing.txt")
+      yield* Effect.promise(() => Bun.write(path.join(test.directory, "sibling.txt"), "needle"))
+      const info = yield* GrepTool
+      const grep = yield* info.init()
+      const result = yield* Effect.exit(grep.execute({ pattern: "needle", path: missing }, ctx))
+      expect(result._tag).toBe("Failure")
+      if (result._tag === "Failure") expect(Cause.pretty(result.cause)).toContain(`Cannot access search path: ${missing}`)
+    }),
+  )
+
+  it.instance("keeps directory searches constrained by include", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const file = path.join(test.directory, "target.md")
+      yield* Effect.promise(() => Bun.write(file, "needle"))
+      yield* Effect.promise(() => Bun.write(path.join(test.directory, "sibling.txt"), "needle"))
+      const info = yield* GrepTool
+      const grep = yield* info.init()
+      const result = yield* grep.execute({ pattern: "needle", path: test.directory, include: "*.md" }, ctx)
+      expect(result.metadata.matches).toBe(1)
+      expect(result.output).toContain(file)
+      expect(result.output).not.toContain("sibling.txt")
     }),
   )
 

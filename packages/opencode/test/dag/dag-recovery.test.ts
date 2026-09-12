@@ -14,6 +14,7 @@ import type { DagStore } from "@opencode-ai/core/dag/store"
 import { WorkflowRuntime, toSchedulingNodes } from "@opencode-ai/core/dag/core/scheduling"
 import { TerminalViolationError } from "@opencode-ai/core/dag/core/types"
 import { makeNodeRow } from "./fixtures"
+import { commitOutputFileRef } from "@/dag/runtime/output-ref"
 
 const tmpRoots: string[] = []
 
@@ -576,6 +577,65 @@ describe("rehydration via toSchedulingNodes", () => {
 // schemaless reply is one absolute path (issue #388)" — keep both green or
 // neither ships.
 describe("reconcileWorkflow output file refs (issue #388)", () => {
+  for (const checkpoint of [false, true]) {
+    it(`does not restore a file without source read authorization (checkpoint=${checkpoint})`, async () => {
+      const dir = await fs.mkdtemp(path.join(os.tmpdir(), "dag-recover-denied-"))
+      tmpRoots.push(dir)
+      const source = path.join(dir, "secret.md")
+      await fs.writeFile(source, `denied checkpoint ${dir}`)
+      const ref = checkpoint ? await Effect.runPromise(commitOutputFileRef(source, {
+        workflow_id: "wf-1", node_id: "n1", child_session_id: "ses_1", replan_attempt: 0,
+      })) : undefined
+      if (ref) tmpRoots.push(path.dirname(ref.path))
+      const events: TrackedEvent[] = []
+      const captured: { sid: string; payload: unknown }[] = []
+      const nodes = [makeNodeRow({ id: "n1", status: "running", childSessionId: "ses_1", capturedOutput: ref })]
+      const checked: string[] = []
+      await Effect.runPromise(reconcileWorkflow(
+        "wf-1", () => Effect.succeed("completed" as const), undefined, { nodes: [{ id: "n1" }] },
+        () => Effect.succeed(source), dir, (_sid, value) => Effect.suspend(() => {
+          checked.push(value)
+          return Effect.fail(new Error("source read denied"))
+        }),
+      ).pipe(Effect.provide(makeDagLayer(nodes, events, undefined, captured))))
+      expect(checked).toEqual([source])
+      expect(captured).toEqual([])
+      expect(events.some((event) => event.type === "nodeCompleted")).toBe(false)
+      expect(events).toContainEqual(expect.objectContaining({ type: "nodeFailed", trigger: "exec_failed" }))
+    })
+  }
+
+  for (const damaged of [false, true]) {
+    it(`recovers a committed receipt after source deletion (damaged=${damaged})`, async () => {
+      const dir = await fs.mkdtemp(path.join(os.tmpdir(), "dag-recover-managed-"))
+      tmpRoots.push(dir)
+      const source = path.join(dir, "report.md")
+      await fs.writeFile(source, `recovery checkpoint ${dir}`)
+      const ref = await Effect.runPromise(commitOutputFileRef(source, {
+        workflow_id: "wf-1", node_id: "n1", child_session_id: "ses_1", replan_attempt: 0,
+      }))
+      expect(ref).toBeDefined()
+      tmpRoots.push(path.dirname(ref!.path))
+      await fs.unlink(source)
+      if (damaged) {
+        await fs.chmod(ref!.path, 0o600)
+        await fs.unlink(ref!.path)
+      }
+      const events: TrackedEvent[] = []
+      const nodes = [makeNodeRow({ id: "n1", status: "running", childSessionId: "ses_1", capturedOutput: ref })]
+      await Effect.runPromise(reconcileWorkflow(
+        "wf-1", () => Effect.succeed("completed" as const), undefined, { nodes: [{ id: "n1" }] },
+        () => Effect.succeed(source),
+      ).pipe(Effect.provide(makeDagLayer(nodes, events))))
+      if (damaged) {
+        expect(events.some((event) => event.type === "nodeCompleted")).toBe(false)
+        expect(events).toContainEqual(expect.objectContaining({ type: "nodeFailed", trigger: "exec_failed" }))
+      } else {
+        expect(events).toContainEqual({ type: "nodeCompleted", nodeID: "n1", output: ref!.path })
+      }
+    })
+  }
+
   it("captures the same file_ref receipt as the live path for an absolute-path reply", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "dag-recovery-ref-"))
     tmpRoots.push(dir)
@@ -600,17 +660,19 @@ describe("reconcileWorkflow output file refs (issue #388)", () => {
       ).pipe(Effect.provide(dagLayer)),
     )
 
-    expect(events).toContainEqual({ type: "nodeCompleted", nodeID: "n1", output: reportPath })
+    expect(events).toContainEqual({ type: "nodeCompleted", nodeID: "n1", output: expect.stringContaining("workflow-artifacts") })
     expect(captured).toEqual([{
       sid: "ses_1",
-      payload: {
+      payload: expect.objectContaining({
         kind: "file_ref",
-        content_ref: reportPath,
-        path: reportPath,
+        storage: "managed-v1",
+        source_path: reportPath,
+        content_ref: expect.stringContaining("workflow-artifacts"),
+        path: expect.stringContaining("workflow-artifacts"),
         size: Buffer.byteLength(content),
         sha256: createHash("sha256").update(content).digest("hex"),
         summary: content,
-      },
+      }),
     }])
   })
 
@@ -637,9 +699,8 @@ describe("reconcileWorkflow output file refs (issue #388)", () => {
     expect(completed?.output).toMatch(/^Report written to /)
   })
 
-  // #388 best-effort contract: a captured-output persistence failure logs a
-  // warning and NEVER fails the node — the inline completion survives.
-  it("completes inline even when output-ref persistence fails (issue #388)", async () => {
+  // Managed artifact receipts must persist before recovery records success.
+  it("fails recovery when managed receipt persistence fails", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "dag-recovery-refboom-"))
     tmpRoots.push(dir)
     const reportPath = path.join(dir, "report.md")
@@ -660,8 +721,8 @@ describe("reconcileWorkflow output file refs (issue #388)", () => {
       ).pipe(Effect.provide(dagLayer)),
     )
 
-    expect(events).toContainEqual({ type: "nodeCompleted", nodeID: "n1", output: reportPath })
-    expect(events).not.toContainEqual({ type: "nodeFailed", nodeID: "n1" })
+    expect(events.some((event) => event.type === "nodeCompleted")).toBe(false)
+    expect(events).toContainEqual(expect.objectContaining({ type: "nodeFailed", nodeID: "n1", trigger: "exec_failed" }))
   })
 })
 

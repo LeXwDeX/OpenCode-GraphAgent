@@ -193,19 +193,6 @@ describe("Truncate", () => {
       }),
     )
 
-    it.live("suggests Task tool when agent has task permission", () =>
-      Effect.gen(function* () {
-        const svc = yield* Truncate.Service
-        const lines = Array.from({ length: 100 }, (_, i) => `line${i}`).join("\n")
-        const agent = { permission: [{ permission: "task", pattern: "*", action: "allow" as const }] }
-        const result = yield* svc.output(lines, { maxLines: 10 }, agent as any)
-
-        expect(result.truncated).toBe(true)
-        expect(result.content).toContain("Grep")
-        expect(result.content).toContain("Task tool")
-      }),
-    )
-
     it.live("omits Task tool hint when agent lacks task permission", () =>
       Effect.gen(function* () {
         const svc = yield* Truncate.Service
@@ -216,6 +203,22 @@ describe("Truncate", () => {
         expect(result.truncated).toBe(true)
         expect(result.content).toContain("Grep")
         expect(result.content).not.toContain("Task tool")
+      }),
+    )
+
+    it.live("keeps file retrieval available when the agent can delegate", () =>
+      Effect.gen(function* () {
+        const svc = yield* Truncate.Service
+        const content = "first\nsecond\nthird"
+        const agent = { permission: [{ permission: "task", pattern: "*", action: "allow" as const }] }
+        const result = yield* svc.output(content, { maxLines: 1 }, agent as any)
+
+        if (!result.truncated) throw new Error("expected truncated")
+        expect(result.content).toContain("Grep")
+        expect(result.content).toContain("Read with offset/limit")
+        expect(result.content).not.toContain("Task tool")
+        expect(result.content).not.toContain("Do NOT read")
+        expect(yield* (yield* FSUtil.Service).readFileString(result.outputPath)).toBe(content)
       }),
     )
 

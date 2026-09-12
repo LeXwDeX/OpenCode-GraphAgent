@@ -68,7 +68,16 @@ export function renderTemplate(
   return Effect.gen(function* () {
     const input = sanitizeInput({ ...dynamicInput, ...ref.input })
     const raw = yield* readTemplateSource(ref, projectDir)
-    return interpolate(raw, input)
+    const interpolatedDynamicKeys = placeholderKeys(raw).filter((key) =>
+      Object.hasOwn(dynamicInput, key)
+      && !Object.hasOwn(ref.input ?? {}, key)
+      && input[key] !== null
+      && input[key] !== undefined
+      // Context can omit a value only when interpolation delivered it intact.
+      // In particular, review evidence may be rewritten by this sanitizer.
+      && (input[key] === dynamicInput[key] || JSON.stringify(input[key]) === JSON.stringify(dynamicInput[key])),
+    )
+    return { ...interpolate(raw, input), interpolatedDynamicKeys }
   })
 }
 

@@ -23,6 +23,7 @@ import { pollWithTimeout, testEffect } from "../lib/effect"
 
 interface BatchProbe {
   failAtConfig: boolean
+  invalidRecoveryFence?: "workflow" | "node"
   holdRegistered?: {
     entered: Deferred.Deferred<void>
     release: Deferred.Deferred<void>
@@ -81,6 +82,16 @@ function atomicLayer(probe: BatchProbe) {
       return EventV2Bridge.Service.of({
         ...original,
         publishMany: (entries, options) => {
+          if (probe.invalidRecoveryFence) {
+            entries = entries.map((entry) => {
+              if (entry.definition !== DagEvent.WorkflowReplanned || !isRecord(entry.data) || !isRecord(entry.data.recovery)) return entry
+              const recovery = entry.data.recovery
+              return { ...entry, data: { ...entry.data, recovery: {
+                ...recovery,
+                ...(probe.invalidRecoveryFence === "workflow" ? { expectedSeq: -1 } : { nodeSeqs: [] }),
+              } } }
+            })
+          }
           const staged = entries.map((entry) =>
             probe.failAtConfig && entry.definition === DagEvent.WorkflowConfigUpdated
               ? {
@@ -133,6 +144,32 @@ function setup() {
 describe("Dag.replan atomic transaction (DAG-A03)", () => {
   const probe: BatchProbe = { failAtConfig: true }
   const it = testEffect(atomicLayer(probe))
+
+  it.live("rolls back recovery revision, superseded history, new attempts, and events as one batch", () =>
+    Effect.gen(function* () {
+      yield* setup()
+      const dag = yield* Dag.Service
+      const store = yield* DagStore.Service
+      const dagID = yield* dag.create({ projectID, sessionID: SessionID.make("ses_parent"), title: "Atomic recovery", config: { name: "atomic-recovery", nodes: [node("old", "Original task")] } })
+      yield* dag.pause(dagID)
+      const before = { workflow: yield* store.getWorkflow(dagID), nodes: yield* store.getNodes(dagID) }
+      probe.failAtConfig = true
+      const failed = yield* dag.recover(dagID, { nodeIDs: ["old"], expectedGraphRev: before.workflow!.graphRev }).pipe(Effect.exit)
+      expect(Exit.isFailure(failed)).toBe(true)
+      expect({ workflow: yield* store.getWorkflow(dagID), nodes: yield* store.getNodes(dagID) }).toEqual(before)
+      probe.failAtConfig = false
+      for (const fence of ["workflow", "node"] as const) {
+        probe.invalidRecoveryFence = fence
+        const raced = yield* dag.recover(dagID, { nodeIDs: ["old"], expectedGraphRev: before.workflow!.graphRev }).pipe(Effect.exit)
+        expect(Exit.isFailure(raced)).toBe(true)
+        expect({ workflow: yield* store.getWorkflow(dagID), nodes: yield* store.getNodes(dagID) }).toEqual(before)
+      }
+      delete probe.invalidRecoveryFence
+      const recovered = yield* dag.recover(dagID, { nodeIDs: ["old"], expectedGraphRev: before.workflow!.graphRev })
+      expect(recovered.graphRev).toBe(before.workflow!.graphRev + 1)
+      expect((yield* store.getNodes(dagID)).length).toBe(2)
+    }).pipe(Effect.provideService(InstanceRef, instance)),
+  )
 
   it.live("rejects an unreadable durable definition before changing any graph row or revision", () =>
     Effect.gen(function* () {

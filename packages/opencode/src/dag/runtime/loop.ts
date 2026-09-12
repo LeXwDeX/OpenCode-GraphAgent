@@ -37,9 +37,12 @@ import { renderTemplate } from "../templates/resolve"
 import { sanitizeInput } from "../templates/sanitize"
 import { DagConfig } from "../config"
 import { spawnNode, makeDeadlineWatcher } from "./spawn"
-import { evaluateCondition, resolveInputMapping, resolveInputMappingChecked } from "./eval"
+import { evaluateCondition, resolveInputMapping, resolveInputMappingChecked, parseInputMappingReference } from "./eval"
 import { reconcileWorkflow, makeSessionStatusChecker, makeLastAssistantTextReader } from "./recovery"
 import { Checkpoint } from "./checkpoint"
+import { verifyOutputFileRef, isManagedOutputFileRef } from "./output-ref"
+import { makeArtifactSourceAuthorizer } from "./artifact-permissions"
+import { Permission } from "@/permission"
 
 const parseJsonOption = Schema.decodeUnknownOption(Schema.UnknownFromJsonString)
 
@@ -82,6 +85,7 @@ const serviceLayer = Layer.effect(
     const agentSvc = yield* Agent.Service
     const sessionSvc = yield* Session.Service
     const promptSvc = yield* SessionPrompt.Service
+    const permissionSvc = Option.getOrUndefined(yield* Effect.serviceOption(Permission.Service))
     const statusSvc = yield* SessionStatus.Service
     const automation = yield* SessionAutomationLease.Service
 
@@ -312,6 +316,25 @@ const serviceLayer = Layer.effect(
 
             let resolvedMapping: Record<string, unknown> = {}
             const inputMapping = nodeConfig.input_mapping ?? Object.fromEntries(node.dependsOn.map((dependency) => [dependency, dependency]))
+            const sourceIDs = new Set([
+              ...node.dependsOn,
+              ...Object.values(inputMapping).flatMap((source) => {
+                const reference = parseInputMappingReference(source)
+                return reference.ok ? [reference.nodeID] : []
+              }),
+            ])
+            const inputSources = nodesSnapshot.filter((source) => sourceIDs.has(source.id) && source.status === "completed")
+            const artifactsValid = yield* Effect.forEach(
+              inputSources,
+              (source) => verifyOutputFileRef(source.capturedOutput),
+              { discard: true },
+            ).pipe(
+              Effect.as(true),
+              Effect.catch((error) => dag.nodeFailed(
+                dagID, nodeID, `Input artifact verification failed: ${error.message}`, "exec_failed", admissionAttempt,
+              ).pipe(Effect.as(false))),
+            )
+            if (!artifactsValid) continue
             if (nodeConfig.input_mapping) {
               const resolved = resolveInputMappingChecked(inputMapping, (dependency) => {
                 const source = nodesSnapshot.find((candidate) => candidate.id === dependency)
@@ -388,7 +411,7 @@ const serviceLayer = Layer.effect(
                           admissionAttempt,
                         )
                         .pipe(Effect.ignore)
-                      return { ok: false as const, text: "", unresolvedPlaceholders: [] }
+                      return { ok: false as const, text: "", unresolvedPlaceholders: [], interpolatedDynamicKeys: [] }
                     }),
                   ),
                 )
@@ -396,6 +419,7 @@ const serviceLayer = Layer.effect(
                   ok: true as const,
                   text: node.name,
                   unresolvedPlaceholders: [],
+                  interpolatedDynamicKeys: [],
                 }))
             if (!resolved.ok) continue
 
@@ -411,6 +435,13 @@ const serviceLayer = Layer.effect(
             }
 
             promptParts.push({ type: "text", text: resolved.text })
+            const recoveryContext = nodeConfig.recovery && nodeConfig.prompt_template?.input?.__workflow_recovery
+            if (recoveryContext) {
+              promptParts.push({
+                type: "text",
+                text: `\n\nRecovery context:\n${JSON.stringify(sanitizeInput({ recovery: recoveryContext }).recovery, null, 2)}`,
+              })
+            }
 
             const reviewContract = nodeConfig ? reviewContractForNode(nodeConfig) : undefined
             if (reviewContract) {
@@ -424,8 +455,12 @@ const serviceLayer = Layer.effect(
               })
             }
 
-            if (Object.keys(resolvedMapping).length > 0) {
-              promptParts.push({ type: "text", text: `\n\nContext:\n${JSON.stringify(resolvedMapping, null, 2)}` })
+            const interpolatedKeys = new Set(resolved.interpolatedDynamicKeys)
+            const remainingContext = Object.fromEntries(
+              Object.entries(resolvedMapping).filter(([key]) => !interpolatedKeys.has(key)),
+            )
+            if (Object.keys(remainingContext).length > 0) {
+              promptParts.push({ type: "text", text: `\n\nContext:\n${JSON.stringify(remainingContext, null, 2)}` })
             }
 
             if (nodeConfig?.output_schema) {
@@ -453,6 +488,7 @@ const serviceLayer = Layer.effect(
               }),
               parentSessionID: entry.parentSessionID,
               directory: ctx.directory,
+              inputArtifacts: inputSources.map((source) => source.capturedOutput).filter(isManagedOutputFileRef),
               promptParts,
               outputSchema: nodeConfig?.output_schema as Record<string, unknown> | undefined,
               timeoutMs: nodeConfig?.worker_config?.timeout_ms,
@@ -581,6 +617,7 @@ const serviceLayer = Layer.effect(
               config ?? null,
               lastAssistantText,
               ctx.directory,
+              makeArtifactSourceAuthorizer(sessionSvc, agentSvc, ctx.worktree, permissionSvc),
             ).pipe(
               Effect.provideService(Dag.Service, dag),
             )
@@ -1905,6 +1942,7 @@ export const defaultLayer = layer.pipe(
   Layer.provide(Agent.defaultLayer),
   Layer.provide(Session.defaultLayer),
   Layer.provide(SessionPrompt.defaultLayer),
+  Layer.provide(Permission.defaultLayer),
   Layer.provide(SessionStatus.defaultLayer),
 )
 
@@ -1915,5 +1953,6 @@ export const node = LayerNode.make(layer, [
   Agent.node,
   Session.node,
   SessionPrompt.node,
+  Permission.node,
   SessionStatus.node,
 ])

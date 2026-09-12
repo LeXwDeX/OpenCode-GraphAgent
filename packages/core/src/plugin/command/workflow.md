@@ -90,7 +90,7 @@ Heavy tasks follow one adaptive workflow whose decisions shape later waves. The 
 2. **Design review gate** — an advanced-tier gate node (`report_to_parent: true`, normalized verdict `output_schema`) rules on the design. `required: true` fails the workflow only when the gate node fails to execute or satisfy its output contract; a successful `REVISE` or `REJECT` is a business verdict, not an execution failure. Route the static ACCEPT path through a downstream `condition`, and dispose of a reported non-ACCEPT verdict per the Verdict Disposal Contract.
 3. **Parallel execution** — the accepted design decomposes into module-level worker nodes with disjoint write sets, fanning into a required assembler.
 4. **Verify + diff review + audit** — production assurance follows `implementation → verification(PASS) → diff review → final gate/audit` with fingerprint echo; `REJECT` routes through corrected implementation and verification before a new diff review. Progress tracking is updated to reflect what shipped.
-5. **Expansion decision** — iterate (bounded `control(replan)` of affected nodes), extend (additional parallel nodes in the same workflow), or complete (`control(complete)`). Start a continuation workflow only after the original is terminal and cannot be adapted.
+5. **Expansion decision** — iterate (bounded `control(replan)` of affected nodes), extend (additional parallel nodes in the same workflow), or complete (`control(complete)`). For failed work, prefer `control(recover)` to retry the affected subtree in place; cancelled workflows require explicit `resume_cancelled: true`. Start a continuation workflow only when the original cannot be adapted or recovered.
 
 Not every task needs all five phases: a well-specified task may enter at phase 3, a clear design with uncertain scope at phase 2. The lifecycle is a decision tree, not a pipeline. Concrete graph shapes are under Collaboration Patterns below.
 
@@ -99,7 +99,7 @@ Not every task needs all five phases: a well-specified task may enter at phase 3
 Every node automatically receives the outputs of its direct `depends_on` nodes:
 
 - The exact dependency ID is the default template variable. A node with `depends_on: [node-a, node-b]` can use `{{node-a}}` and `{{node-b}}` directly.
-- The same values are appended to the child prompt as structured context, so a downstream node can aggregate them without interpolation.
+- Values not already interpolated into the prompt are appended as structured context, so a downstream node can aggregate them without interpolation.
 - Use `input_mapping` only to rename a variable or select a field. Its direction is **template variable → upstream source**, for example:
 
 ```yaml
@@ -368,7 +368,7 @@ implicitly. The workflow then PAUSES instead of terminalizing, and you receive
 the failed-node wake. Downstream nodes stay `pending`, so the graph is still
 replannable. Dispose of it in the same turn:
 
-- **Replan + resume (preferred)**: the failed node is terminal and immutable — add a replacement under a NEW id, rewire its pending dependents' `depends_on` to the new id, then `control(resume)`.
+- **Recover (preferred for an unchanged graph)**: read `status` and call `control(recover)` with the failed `node_ids` and `expected_graph_rev`. It creates new attempts for the affected subtree and resumes scheduling. If prompts or topology must change, use the pause → replan path instead.
 - **Resume as-is**: accept the failure. A required-node failure terminalizes the workflow as `failed` (attributed to the node ids); optional failures degrade and continue.
 - **Cancel**: abandon the workflow.
 
@@ -396,12 +396,12 @@ Cascade detection has two shapes:
 - **Required node failed** → the workflow terminalizes `failed`; still-running nodes are failed with the workflow reason and all other pending/queued/paused dependents are terminalized to `skipped` with error_reason `workflow_failed` (dependents stay untouched only while the workflow is still `paused` — terminalization happens when the scheduler evaluates). The culprit is a node in the Failed-nodes block whose `error_class` is a real failure class; collateral rows carry the workflow reason instead.
 - **Optional node failed** → dependents ran with `Dependency "X" failed: ...` / `Dependency "X" skipped: ...` interpolated into their prompt text (inspect the dependent's rendered prompt/input, not its `error_reason`). Judge per dependent whether its output is still valid with the degraded input.
 
-In both shapes, repair the root/classed node first, then re-add the failed/skipped dependents rewired onto the replacement id.
+In both shapes, select the root/classed node for `control(recover)`; its downstream closure is replaced automatically. If the work definition needs changes, repair the graph through `replan` and rewire dependents explicitly.
 
 `orchestrator_unresponsive` recipe (zero attribution by design — the parent
 took no mandatory action while the workflow stalled): read `status`, identify
 which nodes were `running` or stuck when the guard fired, then dispose per the
-Verdict Disposal Contract: extend/replan those nodes, or change the approach
+Verdict Disposal Contract: recover those nodes, or change the approach
 (see Escalation) if the stall repeats. Never repair collateral rows blindly.
 
 The value set above is what the runtime produces today; `push_exhausted`
@@ -413,8 +413,9 @@ or stop, do not retry the identical plan (see Escalation).
 
 Where to apply the repair:
 
-- **Workflow still live** (running/paused/stepping): `control(pause)` → `control(replan)` adding a replacement node under a NEW id (rewire the failed node's pending dependents onto it; use `restart: true` for still-running nodes) → `control(resume)`. `extend` with the replacement node also works. Completed siblings are untouched.
-- **Workflow terminal `failed`**: terminal status is irreversible — you cannot replan it. Start a **continuation workflow** instead: reuse every completed node's output as static input (inject it into the downstream prompts; never re-run a completed node), re-add only the failed and still-pending tail, and record `reused_nodes` in the manifest.
+- **Local retry in the same workflow**: pause live scheduling, read `status`, then call `control(recover)` with the current `expected_graph_rev` and selected `node_ids`. Failed workflows can recover directly. The runtime creates new attempts for these nodes and their downstream closure, preserves unrelated nodes, checks reusable managed artifacts, and resumes scheduling atomically. Old attempts and results remain readable; no BUILD or replacement YAML is needed.
+- **Cancelled workflow**: recovery additionally requires `resume_cancelled: true`, reflecting an explicit request to resume cancelled work. Completed and archived workflows do not use this recovery action.
+- **Change the work definition**: use existing `replan`/`extend` for a different graph. Recovery retries the stored definitions; it does not rewrite prompts, reset budgets, roll back code, or undo external actions.
 
 Hard rule: an environmental single-node failure (timeout, wrong model, API
 error, crash-recovery loss) never justifies restarting the workflow from zero.
@@ -423,7 +424,7 @@ provider work and destroys evidence the earlier nodes already earned.
 
 ### Graph-action acceptance is not execution
 
-`start`, `extend`, and `control(replan)` responses confirm that a graph was
+`start`, `extend`, `control(replan)`, and `control(recover)` responses confirm that a graph was
 **accepted**, not that its nodes **execute**. Acceptance-time validation does
 not resolve template placeholders or map upstream outputs — spawn-time
 contract failures (`verdict_fail`: unresolved placeholders, broken
@@ -570,6 +571,7 @@ omitted content from its preview.
 - `pause` — let running nodes finish, don't spawn new ones (pause does NOT stop nodes that are already running). On a cancel/replan intent, always pause FIRST: it needs no fragment and freezes scheduling while you compose the replan, so the graph cannot terminalize under you.
 - `resume` — resume scheduling. Unneeded after a successful replan or extend: both auto-resume a paused workflow; resume manually only when their output reports the automatic resume raced with another control op and the workflow is still paused.
 - `cancel` — cancel the entire workflow
+- `recover` — retry selected `node_ids` and their downstream closure under the same workflow ID. Requires `expected_graph_rev` from status; stale revisions, unavailable reusable artifacts, and exhausted attempt/node budgets are rejected. Pause a live workflow first. Cancellation requires explicit `resume_cancelled: true`. Returns old-to-new attempt IDs and reused/preserved/superseded sets; unrelated pending work is preserved.
 - `replan` — put `fragment: { ... }` with the graph fields and node definitions in YAML and pass its `spec_path`; running nodes can be `restart: true` or `cancel: true`; pending nodes absent from the fragment are cancelled. Valid while paused — the pause → write file → replan sequence is the safe path: a successful replan auto-resumes the workflow, an explicit resume belongs only in the rare case the replan output reports the automatic resume raced with another control op and the workflow is still paused.
 - `complete` — early-complete: remaining pending nodes are skipped (non-violation)
 - `step` — advance exactly one ready node (the first by node ID lexicographic order), then wait. Use for controlled debugging or staged verification of a critical path. Unlike `pause`, which freezes all scheduling, `step` advances one node and re-waits. A second `step` while the stepped node is still running is rejected. Use `resume` to return to full-speed scheduling. Nodes are selected in lexicographic ID order for determinism.
