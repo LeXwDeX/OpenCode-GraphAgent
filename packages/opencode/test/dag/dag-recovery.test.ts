@@ -8,6 +8,7 @@ import os from "node:os"
 import path from "node:path"
 import { Effect, Exit, Layer } from "effect"
 import type { SessionV1 } from "@opencode-ai/core/v1/session"
+import { FSUtil } from "@opencode-ai/core/fs-util"
 import { reconcileWorkflow, makeLastAssistantTextReader } from "@/dag/runtime/recovery"
 import { Dag } from "@/dag/dag"
 import type { DagStore } from "@opencode-ai/core/dag/store"
@@ -598,7 +599,7 @@ describe("reconcileWorkflow output file refs (issue #388)", () => {
           return Effect.fail(new Error("source read denied"))
         }),
       ).pipe(Effect.provide(makeDagLayer(nodes, events, undefined, captured))))
-      expect(checked).toEqual([source])
+      expect(checked).toEqual([FSUtil.normalizePath(source)])
       expect(captured).toEqual([])
       expect(events.some((event) => event.type === "nodeCompleted")).toBe(false)
       expect(events).toContainEqual(expect.objectContaining({ type: "nodeFailed", trigger: "exec_failed" }))
@@ -666,7 +667,7 @@ describe("reconcileWorkflow output file refs (issue #388)", () => {
       payload: expect.objectContaining({
         kind: "file_ref",
         storage: "managed-v1",
-        source_path: reportPath,
+        source_path: FSUtil.normalizePath(reportPath),
         content_ref: expect.stringContaining("workflow-artifacts"),
         path: expect.stringContaining("workflow-artifacts"),
         size: Buffer.byteLength(content),

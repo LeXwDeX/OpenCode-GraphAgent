@@ -125,12 +125,15 @@ export function commitOutputFileRef(
   if (!candidate || candidate.length > MAX_PATH_CHARS || /[\r\n]/.test(candidate) || !path.isAbsolute(candidate))
     return Effect.succeed(undefined)
   return Effect.gen(function* () {
-    const info = yield* Effect.promise(() => stat(candidate).catch(() => undefined))
+    // Freeze the Windows identity while the source still exists. Receipts
+    // must retain permission matching after its worktree or alias is deleted.
+    const source = process.platform === "win32" ? FSUtil.normalizePath(candidate) : candidate
+    const info = yield* Effect.promise(() => stat(source).catch(() => undefined))
     if (!info?.isFile() || info.size <= 0 || info.size > FILE_REF_MAX_BYTES) return undefined
-    if (authorizeSource) yield* authorizeSource(candidate)
+    if (authorizeSource) yield* authorizeSource(source)
     return yield* Effect.tryPromise({
       try: async () => {
-        const bytes = await readBoundedFile(candidate)
+        const bytes = await readBoundedFile(source)
         if (!bytes) throw new Error("source became unavailable during capture")
         const digest = Hash.sha256(bytes)
         const destination = artifactPath(digest)
@@ -139,7 +142,7 @@ export function commitOutputFileRef(
         const ref: ManagedOutputFileRef = {
           kind: "file_ref",
           storage: "managed-v1",
-          source_path: candidate,
+          source_path: source,
           provenance,
           path: destination,
           content_ref: destination,
@@ -273,7 +276,8 @@ export function captureOutputFileRef(rawText: string): Effect.Effect<OutputFileR
  * — a permission blip must never fail the node completion.
  */
 export function ensureReportAreaGitignore(directory: string, refPath: string): Effect.Effect<void> {
-  if (!FSUtil.contains(path.join(directory, REPORT_AREA), refPath)) return Effect.void
+  const reportArea = FSUtil.normalizePath(path.join(directory, REPORT_AREA))
+  if (!FSUtil.contains(reportArea, FSUtil.normalizePath(refPath))) return Effect.void
   const gitignorePath = path.join(directory, ".gitignore")
   return Effect.gen(function* () {
     const existing = yield* Effect.promise(() => readFile(gitignorePath, "utf8").catch(() => undefined))

@@ -599,7 +599,7 @@ describe("DagLoop atomic wake integration", () => {
             expect(row.capturedOutput).toEqual(expect.objectContaining({
               kind: "file_ref",
               storage: "managed-v1",
-              source_path: reportPath,
+              source_path: FSUtil.normalizePath(reportPath),
               content_ref: row.output,
               path: row.output,
               size: Buffer.byteLength(content),
@@ -611,7 +611,7 @@ describe("DagLoop atomic wake integration", () => {
           }),
           undefined,
           [
-            { permission: "read", pattern: path.relative(process.cwd(), reportPath), action: "allow" },
+            { permission: "read", pattern: path.relative(process.cwd(), FSUtil.normalizePath(reportPath)), action: "allow" },
             { permission: "external_directory", pattern: FSUtil.normalizePathPattern(path.join(dir, "*")), action: "allow" },
           ],
         ),

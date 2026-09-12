@@ -11,12 +11,11 @@ import { LayerNode } from "../effect/layer-node"
 import { DagEvent } from "@opencode-ai/schema/dag-event"
 import { WorkflowNodeTable, WorkflowTable } from "./sql"
 
-type DatabaseService = Database.Interface["db"]
 type WorkflowStatus = DagEvent.WorkflowStatus
 const toMillis = (dt: DateTime.Utc) => DateTime.toEpochMillis(dt)
 
-/** Cast a status string to the WorkflowStatus literal type for Drizzle. */
-const ws = (s: WorkflowStatus) => s as DagEvent.WorkflowStatus
+/** Keep workflow status values typed at the Drizzle boundary. */
+const ws = (s: WorkflowStatus) => s
 
 /**
  * Event → status projection guards — the single source the drift test checks

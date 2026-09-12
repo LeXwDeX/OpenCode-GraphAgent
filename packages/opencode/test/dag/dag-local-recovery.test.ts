@@ -175,7 +175,7 @@ describe("DAG local recovery", () => {
       yield* events.replayAll(serialized)
       const replayed = (yield* dag.store.getWorkflow(id))!
       // Creation time is a local database default, not a durable event field.
-      expect({ workflow: { ...replayed, timeCreated: snapshot.workflow!.timeCreated }, nodes: yield* dag.store.getNodes(id) }).toEqual(snapshot)
+      expect({ workflow: { ...replayed, timeCreated: snapshot.workflow.timeCreated }, nodes: yield* dag.store.getNodes(id) }).toEqual(snapshot)
     }),
   )
 

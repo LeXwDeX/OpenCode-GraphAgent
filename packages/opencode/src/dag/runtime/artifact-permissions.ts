@@ -17,6 +17,13 @@ function directoryGlob(directory: string) {
     : path.join(directory, "*").replaceAll("\\", "/")
 }
 
+function permissionPath(filepath: string) {
+  if (process.platform !== "win32") return filepath
+  // Match ReadTool's canonical paths, including 8.3 directory aliases. The
+  // source file may already be deleted when granting a committed input.
+  return FSUtil.normalizePath(path.join(FSUtil.normalizePath(path.dirname(filepath)), path.basename(filepath)))
+}
+
 /** Permit only verified input objects. Preserve source read restrictions when
  * copying to content.txt, and never override an explicit external deny. */
 export function artifactReadPermissions(
@@ -25,19 +32,21 @@ export function artifactReadPermissions(
   ...rulesets: PermissionV1.Ruleset[]
 ): PermissionV1.Ruleset {
   return refs.flatMap((ref): PermissionV1.Ruleset => {
-    const directory = path.dirname(ref.path)
+    const target = permissionPath(ref.path)
+    const source = permissionPath(ref.source_path)
+    const directory = path.dirname(target)
     const glob = directoryGlob(directory)
     const denied = rulesets
       .flat()
       .some(
         (rule) =>
           rule.action === "deny" &&
-          [glob, directoryGlob(path.dirname(ref.source_path))].some(
+          [glob, directoryGlob(path.dirname(source))].some(
             (target) => Permission.evaluate("external_directory", target, [rule]).action === "deny",
           ),
       )
-    const sourceRead = Permission.evaluate("read", path.relative(worktree, ref.source_path), ...rulesets)
-    const targetRead = Permission.evaluate("read", path.relative(worktree, ref.path), ...rulesets)
+    const sourceRead = Permission.evaluate("read", path.relative(worktree, source), ...rulesets)
+    const targetRead = Permission.evaluate("read", path.relative(worktree, target), ...rulesets)
     const readAction: PermissionV1.Rule["action"] =
       sourceRead.action === "deny" || targetRead.action === "deny" ? "deny" : sourceRead.action
     return [
@@ -46,7 +55,7 @@ export function artifactReadPermissions(
         ? [
             {
               permission: "read",
-              pattern: path.relative(worktree, ref.path),
+              pattern: path.relative(worktree, target),
               action: readAction,
             } satisfies PermissionV1.Rule,
           ]
@@ -70,11 +79,12 @@ export function makeArtifactSourceAuthorizer(
       const agent = yield* agents.get(child.agent ?? workerType ?? "build")
       if (!agent) return yield* Effect.fail(new Error("DAG artifact source permission could not be resolved"))
       const rules = [agent.permission, child.permission ?? []]
+      const target = permissionPath(source)
       const requests = [
-        ...(!FSUtil.contains(worktree, source)
-          ? [{ permission: "external_directory", pattern: directoryGlob(path.dirname(source)) }]
+        ...(!FSUtil.contains(worktree, target)
+          ? [{ permission: "external_directory", pattern: directoryGlob(path.dirname(target)) }]
           : []),
-        { permission: "read", pattern: path.relative(worktree, source) },
+        { permission: "read", pattern: path.relative(worktree, target) },
       ]
       for (const request of requests) {
         const action = Permission.evaluate(request.permission, request.pattern, ...rules).action

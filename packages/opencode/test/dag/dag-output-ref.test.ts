@@ -18,6 +18,7 @@ import os from "node:os"
 import path from "node:path"
 import { Effect, Fiber, Layer, Semaphore } from "effect"
 import type { SessionV1 } from "@opencode-ai/core/v1/session"
+import { FSUtil } from "@opencode-ai/core/fs-util"
 import { SessionPrompt } from "@/session/prompt"
 import { MessageID } from "@/session/schema"
 import { Dag } from "@/dag/dag"
@@ -167,7 +168,7 @@ describe("submit-time absolute-path capture (Train B, B-p1)", () => {
     expect(capturedCalls[0]).toEqual(expect.objectContaining({
       kind: "file_ref",
       storage: "managed-v1",
-      source_path: reportPath,
+      source_path: FSUtil.normalizePath(reportPath),
       content_ref: completed!.output,
       path: completed!.output,
       size: Buffer.byteLength(content),

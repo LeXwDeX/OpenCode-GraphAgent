@@ -79,7 +79,9 @@ function runtimeLayer(records: Queue.Queue<PromptRecord>, created: string[], par
   const base = Layer.mergeAll(database, events, bridge, store, projector, status, dag)
   const titles = new Map<string, string>()
   const permissions = new Map<string, PermissionV1.Ruleset>()
-  const agentPermissions = Permission.fromConfig({ read: "allow", external_directory: { "*": "ask", [path.join(os.tmpdir(), "dag-*", "*")]: "allow" } })
+  // Resolve the existing temp root before adding wildcard segments: Windows
+  // realpath cannot expand RUNNER~1 through a non-existent dag-* directory.
+  const agentPermissions = Permission.fromConfig({ read: "allow", external_directory: { "*": "ask", [path.join(FSUtil.normalizePath(os.tmpdir()), "dag-*", "*")]: "allow" } })
   const session = Layer.mock(Session.Service, {
     get: (id) => Effect.succeed({ id, permission: permissions.get(id) ?? parentPermissions, agent: "build" } as never),
     create: (input) =>
@@ -266,7 +268,7 @@ describe("DagLoop input_mapping execution boundary", () => {
         store.getWorkflow(dagID).pipe(Effect.map((row) => row?.status === "failed" ? row : undefined)),
         "workflow did not become failed",
       )
-      yield* Effect.promise(() => fs.unlink(source))
+      yield* Effect.promise(() => fs.rm(directory, { recursive: true, force: true }))
       const analysis = yield* store.getNode(dagID, "analyze")
       if (!isManagedOutputFileRef(analysis?.capturedOutput)) throw new Error("missing analysis artifact")
       const objectDirectory = path.dirname(analysis.capturedOutput.path)
@@ -324,14 +326,14 @@ describe("DagLoop input_mapping execution boundary", () => {
           const ref = row.capturedOutput
           expect(isManagedOutputFileRef(ref)).toBe(true)
           if (!isManagedOutputFileRef(ref)) throw new Error("missing managed receipt")
-          if (sourceReadDeny) parentPermissions.push({ permission: "read", pattern: path.relative(process.cwd(), source), action: "deny" })
+          if (sourceReadDeny) parentPermissions.push({ permission: "read", pattern: path.relative(process.cwd(), FSUtil.normalizePath(source)), action: "deny" })
           if (deny) parentPermissions.push({ permission: "external_directory", pattern: "*", action: "deny" })
           if (targetReadDeny) parentPermissions.push(
-            { permission: "read", pattern: path.relative(process.cwd(), source), action: "ask" },
-            { permission: "read", pattern: path.relative(process.cwd(), ref.path), action: "deny" },
+            { permission: "read", pattern: path.relative(process.cwd(), FSUtil.normalizePath(source)), action: "ask" },
+            { permission: "read", pattern: path.relative(process.cwd(), FSUtil.normalizePath(ref.path)), action: "deny" },
           )
           yield* Effect.addFinalizer(() => Effect.promise(() => fs.rm(path.dirname(ref.path), { recursive: true, force: true })))
-          yield* Effect.promise(() => fs.unlink(source))
+          yield* Effect.promise(() => fs.rm(directory, { recursive: true, force: true }))
           if (corrupt) {
             yield* Effect.promise(() => fs.chmod(ref.path, 0o600))
             yield* Effect.promise(() => fs.writeFile(ref.path, "X".repeat(ref.size)))
@@ -350,7 +352,7 @@ describe("DagLoop input_mapping execution boundary", () => {
             expect(prompt.text).not.toContain(body)
             expect(prompt.text).not.toContain(source)
             expect(prompt.readOutput).toContain(body)
-            expect(Permission.evaluate("edit", path.relative(process.cwd(), ref.path), prompt.permission).action).toBe("deny")
+            expect(Permission.evaluate("edit", path.relative(process.cwd(), FSUtil.normalizePath(ref.path)), prompt.permission).action).toBe("deny")
             expect(Permission.evaluate("external_directory", path.join(path.dirname(path.dirname(ref.path)), "unrelated", "*"), prompt.permission).action).toBe("ask")
             expect(yield* Effect.promise(() => fs.readFile(ref.path, "utf8"))).toBe(body)
           }
