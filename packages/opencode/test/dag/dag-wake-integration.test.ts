@@ -5,6 +5,8 @@ import * as os from "node:os"
 import * as path from "node:path"
 import { Deferred, Effect, Fiber, Layer, Option, Queue } from "effect"
 import type { SessionV1 } from "@opencode-ai/core/v1/session"
+import type { PermissionV1 } from "@opencode-ai/core/v1/permission"
+import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Database } from "@opencode-ai/core/database/database"
 import { TerminalViolationError } from "@opencode-ai/core/dag/core/types"
 import { DagProjector } from "@opencode-ai/core/dag/projector"
@@ -106,6 +108,7 @@ function wakeLayer(input: {
   readonly childPrompts: Queue.Queue<PromptGate>
   readonly parentPrompts: Queue.Queue<ParentPromptGate>
   readonly parentSettled: Queue.Queue<void>
+  readonly agentPermissions: PermissionV1.Ruleset
 }) {
   const database = Database.layerFromPath(":memory:")
   const events = EventV2.layer.pipe(Layer.provide(database))
@@ -162,7 +165,7 @@ function wakeLayer(input: {
     get: () => Effect.succeed({
       name: "build",
       mode: "all",
-      permission: [],
+      permission: [...input.agentPermissions],
       options: {},
       description: "",
       prompt: "",
@@ -193,6 +196,7 @@ function runWakeTest<A>(
   beforeInit?: (services: {
     readonly database: Database.Interface
   }) => Effect.Effect<void>,
+  agentPermissions: PermissionV1.Ruleset = [],
 ) {
   return Effect.gen(function* () {
     const childPrompts = yield* Queue.unbounded<PromptGate>()
@@ -221,7 +225,7 @@ function runWakeTest<A>(
       yield* loop.init()
       return yield* test({ dag, loop, store, status, childPrompts, parentPrompts, parentSettled })
     }).pipe(
-      Effect.provide(wakeLayer({ childPrompts, parentPrompts, parentSettled })),
+      Effect.provide(wakeLayer({ childPrompts, parentPrompts, parentSettled, agentPermissions })),
       Effect.provideService(InstanceRef, {
         directory: process.cwd(),
         worktree: process.cwd(),
@@ -563,8 +567,8 @@ describe("DagLoop atomic wake integration", () => {
 
   // issue #388 live path: when a schemaless node's final reply IS one
   // existing absolute file path, submit-time detection records the durable
-  // {content_ref, size, sha256, summary} receipt while the settlement stays
-  // the raw path. Keep in lockstep with dag-recovery.test.ts
+  // {content_ref, size, sha256, summary} receipt while the settlement carries
+  // the managed path. Keep in lockstep with dag-recovery.test.ts
   // "reconcileWorkflow output file refs (issue #388)" — live and recovery
   // must produce identical durable effects for the same reply.
   it("captures a file_ref receipt when a schemaless reply is one absolute path (issue #388)", async () => {
@@ -591,16 +595,25 @@ describe("DagLoop atomic wake integration", () => {
               ),
               "file-ref node did not complete",
             )
-            expect(row.output).toBe(reportPath)
-            expect(row.capturedOutput).toEqual({
+            expect(row.output).toEqual(expect.stringContaining("workflow-artifacts"))
+            expect(row.capturedOutput).toEqual(expect.objectContaining({
               kind: "file_ref",
-              content_ref: reportPath,
-              path: reportPath,
+              storage: "managed-v1",
+              source_path: FSUtil.normalizePath(reportPath),
+              content_ref: row.output,
+              path: row.output,
               size: Buffer.byteLength(content),
               sha256: createHash("sha256").update(content).digest("hex"),
               summary: content,
-            })
+            }))
+            yield* Effect.promise(() => fs.rm(dir, { recursive: true, force: true }))
+            expect(yield* Effect.promise(() => fs.readFile(String(row.output), "utf8"))).toBe(content)
           }),
+          undefined,
+          [
+            { permission: "read", pattern: path.relative(process.cwd(), FSUtil.normalizePath(reportPath)), action: "allow" },
+            { permission: "external_directory", pattern: FSUtil.normalizePathPattern(path.join(dir, "*")), action: "allow" },
+          ],
         ),
       )
     } finally {

@@ -12,9 +12,10 @@
  * Exemptions:
  * - self-transitions (from === to): idempotent re-application of a replayed
  *   event, not a state change.
- * - WorkflowStatusProjection.replanReopen (completed→running): the single
- *   sanctioned exception to terminal irreversibility — additive extend may
+ * - WorkflowStatusProjection.replanReopen (completed→running): additive extend may
  *   reopen a naturally-completed workflow (see dag.ts reopenCompleted).
+ * - WorkflowStatusProjection.recoveryReopen (failed/cancelled→running): explicit
+ *   fenced recovery replaces affected node attempts and retains their history.
  */
 import { describe, expect, it } from "bun:test"
 import { NodeStatusProjection, WorkflowStatusProjection } from "../src/dag/projector"
@@ -45,7 +46,7 @@ describe("projector from-guards vs declared transition tables", () => {
     for (const [event, projection] of Object.entries(WorkflowStatusProjection)) {
       // The documented terminal-irreversibility exception: additive-extend
       // reopen of a completed workflow. Exempt exactly this entry.
-      if (event === "replanReopen") continue
+      if (event === "replanReopen" || event === "recoveryReopen") continue
       for (const from of projection.from) {
         if (from === projection.to) continue
         const allowed = getValidNextWorkflowStatuses(from as WorkflowStatus)
@@ -60,6 +61,11 @@ describe("projector from-guards vs declared transition tables", () => {
   it("keeps the reopen exemption scoped to completed→running only", () => {
     expect(WorkflowStatusProjection.replanReopen.to).toBe("running")
     expect([...WorkflowStatusProjection.replanReopen.from]).toEqual(["completed"])
+  })
+
+  it("scopes explicit recovery to failed/cancelled workflows without reopening archives", () => {
+    expect(WorkflowStatusProjection.recoveryReopen.to).toBe("running")
+    expect([...WorkflowStatusProjection.recoveryReopen.from]).toEqual(["failed", "cancelled"])
   })
 })
 

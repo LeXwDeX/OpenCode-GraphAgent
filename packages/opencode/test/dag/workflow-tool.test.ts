@@ -200,7 +200,9 @@ const mockNodes = (id: string) =>
             timeUpdated: 1,
           },
         ]
-      : []
+      : id === "dag_paused"
+        ? [makeNodeRow({ id: "retry", workflowId: id, name: "Retry", status: "failed", required: true })]
+        : []
 
 const mockWorkflowConfig = (id: string) => JSON.stringify({
   name: id,
@@ -1081,6 +1083,23 @@ describe("workflow tool execution", () => {
         DagEvent.WorkflowCancelled.type,
         DagEvent.WorkflowCompleted.type,
         DagEvent.WorkflowStepped.type,
+      ])
+    }),
+  )
+
+  runtime.effect("routes local recovery through the owned workflow and returns revision and attempt lineage", () =>
+    Effect.gen(function* () {
+      published.length = 0
+      const workflow = yield* (yield* WorkflowTool).init()
+      const result = yield* workflow.execute({ params: {
+        action: "control", workflow_id: Dag.ID.make("dag_paused"), operation: "recover",
+        node_ids: [DagEvent.NodeID.make("retry")], expected_graph_rev: 1,
+      } }, toolContext())
+      expect(result.title).toContain("Workflow recovered: 1 new attempts")
+      expect(result.output).toContain('"graph_rev": 2')
+      expect(result.output).toContain('"previous": "retry"')
+      expect(published.map((event) => event.type)).toEqual([
+        DagEvent.WorkflowReplanned.type, DagEvent.NodeRegistered.type, DagEvent.WorkflowConfigUpdated.type,
       ])
     }),
   )

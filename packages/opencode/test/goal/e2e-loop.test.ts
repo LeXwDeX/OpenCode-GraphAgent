@@ -2,6 +2,10 @@ import { describe, expect } from "bun:test"
 import { Cause, Deferred, Effect, Exit, Layer, Option } from "effect"
 import { GoalLoop, GoalLoopJudgeLLM } from "@/goal/loop"
 import { Goal } from "@/goal/goal"
+import { Memory } from "@/memory/memory"
+import { MessageV2 } from "@/session/message-v2"
+import { SessionV1 } from "@opencode-ai/core/v1/session"
+import { ProviderTest } from "../fake/provider"
 import { NotFoundError } from "@/storage/storage"
 import { GoalEvent } from "@/goal/events"
 import { EventV2Bridge } from "@/event-v2-bridge"
@@ -100,10 +104,12 @@ describe("GoalLoop end-to-end — continue → done lifecycle (P2b)", () => {
   // test serializes the two judge calls).
   let judgeCalls = 0
   const promptCalls: { noReply?: boolean; text: string }[] = []
+  const promptInputs: SessionPrompt.PromptInput[] = []
 
   const reset = () => {
     judgeCalls = 0
     promptCalls.length = 0
+    promptInputs.length = 0
   }
 
   const sessionMock = Layer.succeed(Session.Service, {
@@ -112,6 +118,7 @@ describe("GoalLoop end-to-end — continue → done lifecycle (P2b)", () => {
   const promptMock = Layer.succeed(SessionPrompt.Service, (() => {
     const record = (input: SessionPrompt.PromptInput) =>
       Effect.sync(() => {
+        promptInputs.push(input)
         promptCalls.push({
           noReply: input.noReply,
           text: input.parts.map((part) => (part.type === "text" ? part.text : "")).join("\n"),
@@ -149,6 +156,53 @@ describe("GoalLoop end-to-end — continue → done lifecycle (P2b)", () => {
     Layer.provideMerge(EventV2Bridge.defaultLayer),
   )
   const it = testEffect(e2eLayer)
+
+  it.instance("continuation reaches the model without becoming human memory evidence", () =>
+    Effect.gen(function* () {
+      reset()
+      const loop = yield* GoalLoop.Service
+      const goal = yield* Goal.Service
+      const events = yield* EventV2Bridge.Service
+      yield* loop.init()
+      const sid = SessionID.descending()
+      yield* goal.set(sid, "ship the feature", 10)
+      yield* Effect.yieldNow
+      yield* events.publish(SessionStatus.Event.Status, { sessionID: sid, status: { type: "idle" } })
+      const continuation = yield* pollWithTimeout(
+        Effect.sync(() => promptInputs.find((input) => !input.noReply)),
+        "continuation was not admitted",
+        "5 seconds",
+      )
+      const message = {
+        info: { id: "goal-continuation", role: "user" },
+        parts: continuation.parts,
+      } as SessionV1.WithParts
+      const completed = {
+        info: { role: "assistant", parentID: message.info.id, finish: "end_turn" },
+        parts: [],
+      } as unknown as SessionV1.WithParts
+      expect(Memory.cleanEvidence([message])).toBe("")
+      expect(Memory.completedTurns([message, completed])).toBe(0)
+      const human = {
+        info: { ...message.info, id: "human-input" },
+        parts: [{ type: "text", text: "长期偏好是简洁中文" }],
+      } as SessionV1.WithParts
+      const humanReply = {
+        ...completed,
+        info: { ...completed.info, parentID: human.info.id },
+      } as SessionV1.WithParts
+      expect(Memory.cleanEvidence([human, message])).toBe("user: 长期偏好是简洁中文")
+      expect(Memory.completedTurns([human, humanReply, message, completed])).toBe(1)
+      const modelMessages = yield* Effect.promise(() => MessageV2.toModelMessages([message], ProviderTest.model()))
+      expect(modelMessages).toEqual([
+        {
+          role: "user",
+          content: [{ type: "text", text: promptCalls[0].text }],
+        },
+      ])
+      yield* goal.clear(sid)
+    }),
+  )
 
   it.instance("set → continue → continuation → done → cleared, scripted judge", () =>
     Effect.gen(function* () {

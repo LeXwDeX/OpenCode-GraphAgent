@@ -46,7 +46,9 @@ import type { DagStore } from "@opencode-ai/core/dag/store"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { registerCaptureSlot, clearCaptureSlot, settleCapturedOutput, settlePlainTextOutput } from "./capture"
-import { captureOutputFileRef, ensureReportAreaGitignore } from "./output-ref"
+import { commitOutputFileRef, ensureReportAreaGitignore, verifyOutputFileRef, type ManagedOutputFileRef } from "./output-ref"
+import { artifactReadPermissions, makeArtifactSourceAuthorizer } from "./artifact-permissions"
+import { Permission } from "@/permission"
 
 type PromptParts = SessionPrompt.PromptInput["parts"]
 
@@ -62,6 +64,8 @@ export interface NodeSpawnInput {
   promptParts: PromptParts
   /** Workflow execution directory — keys the report-area gitignore guarantee (Train B, B4). */
   directory?: string
+  /** Verified completed dependency artifacts, scoped to this child session. */
+  inputArtifacts?: ManagedOutputFileRef[]
   outputSchema?: Record<string, unknown>
   timeoutMs?: number
   reportToParent?: boolean
@@ -305,6 +309,7 @@ export function spawnNode(
     const agentService = yield* Agent.Service
     const sessions = yield* Session.Service
     const promptSvc = yield* SessionPrompt.Service
+    const permissionSvc = Option.getOrUndefined(yield* Effect.serviceOption(Permission.Service))
     const scope = yield* Scope.Scope
     const admissionAttempt = {
       replanAttempts: input.node.replanAttempts,
@@ -370,10 +375,17 @@ export function spawnNode(
       providerID: ProviderV2.ID.make(resolvedModel.providerID),
     }
 
-    const childPermission = deriveSubagentSessionPermission({
+    const childPermission = [...deriveSubagentSessionPermission({
       parentSessionPermission: parent.permission ?? [],
       subagent: agent,
-    })
+    })]
+    const instance = yield* Effect.serviceOption(InstanceRef)
+    const worktree = (Option.isSome(instance) ? instance.value?.worktree : undefined) ?? input.directory ?? process.cwd()
+    if (input.inputArtifacts?.length) {
+      if (worktree) childPermission.push(...artifactReadPermissions(
+        input.inputArtifacts, worktree, agent.permission, childPermission,
+      ))
+    }
 
     // Resolve timeout and compute the absolute deadline at ADMISSION time
     // (P0-2). The deadline is persisted on the durable queued row so
@@ -484,6 +496,9 @@ export function spawnNode(
           // survives). This is the revalidation that closes the spawn window the
           // nodeQueued guard alone leaves open between its read and its publish.
           if (!(yield* dag.store.tryClaimAdoption(input.dagID))) return
+          // A permit or pause wait may outlive the scheduling-round check.
+          // Validate again before the child can consume or read its inputs.
+          yield* Effect.forEach(input.inputArtifacts ?? [], verifyOutputFileRef, { discard: true })
           // Permit acquired — only NOW materialize the child session and mark
           // the node running (P0-2). Before this point the node is durably
           // "queued" with no session: a 100-node fan-out holds at most
@@ -607,24 +622,26 @@ export function spawnNode(
               return
             }
             const rawText = settlement.output
-            // Train B (v1.0.15 B2): submit-time file-ref detection — when the
-            // reply IS an existing non-empty absolute path, record
-            // {content_ref, size, sha256, summary} in captured_output (the
-            // same durable column submit_result uses; reset on NodeStarted).
-            // The settlement stays the raw string: input mapping, wake
-            // digests, and legacy readers keep the exact inline behavior,
-            // and the result seam serves the pointer (B3). Any anomaly keeps
-            // the inline path — the capture must never fail the node.
-            const fileRef = yield* captureOutputFileRef(rawText)
+            const fileRef = yield* commitOutputFileRef(
+              rawText,
+              {
+                workflow_id: input.dagID,
+                node_id: input.nodeID,
+                child_session_id: childSession.id,
+                replan_attempt: settlementAttempt.replanAttempts,
+                graph_rev: input.graphRev,
+              },
+              (source) => makeArtifactSourceAuthorizer(sessions, agentService, worktree, permissionSvc)(
+                childSession.id, source, agent.name,
+              ),
+            )
             if (fileRef && childSessionID) {
-              yield* dag.store.setCapturedOutput(childSessionID, fileRef).pipe(
-                Effect.catchCause((cause) =>
-                  Effect.logWarning("output-ref capture persistence failed — inline output preserved", { cause }),
-                ),
-              )
-              if (input.directory) yield* ensureReportAreaGitignore(input.directory, fileRef.path)
+              // Receipt persistence precedes completion. A crash between the
+              // two writes is recovered from this receipt, never the source.
+              yield* dag.store.setCapturedOutput(childSessionID, fileRef)
+              if (input.directory) yield* ensureReportAreaGitignore(input.directory, fileRef.source_path)
             }
-            yield* dag.nodeCompleted(input.dagID, input.nodeID, rawText, settlementAttempt).pipe(
+            yield* dag.nodeCompleted(input.dagID, input.nodeID, fileRef?.path ?? rawText, settlementAttempt, fileRef).pipe(
               Effect.catchIf(
                 isTransitionRejection,
                 () => Effect.logWarning("nodeCompleted guard rejected — node already terminal"),

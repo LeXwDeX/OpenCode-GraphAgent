@@ -20,7 +20,7 @@
  * and terminalize on fabricated evidence (P2-2 recovery-pause).
  */
 
-import { Effect, Clock } from "effect"
+import { Effect, Clock, Cause } from "effect"
 import { Dag } from "../dag"
 import type { NodeConfig } from "../dag"
 import { Session } from "@/session/session"
@@ -32,7 +32,7 @@ import { reviewImplementationFingerprint } from "../review-lifecycle"
 import { resolveInputMapping } from "./eval"
 import { settleCapturedOutput, settlePlainTextOutput } from "./capture"
 import type { CapturedSettlement } from "./capture"
-import { captureOutputFileRef, ensureReportAreaGitignore } from "./output-ref"
+import { commitOutputFileRef, ensureReportAreaGitignore, isManagedOutputFileRef, verifyOutputFileRef } from "./output-ref"
 
 export function reconcileWorkflow(
   dagID: string,
@@ -41,6 +41,7 @@ export function reconcileWorkflow(
   workflowConfig?: { nodes: Pick<NodeConfig, "id" | "output_schema" | "review" | "input_mapping">[] } | null,
   lastAssistantText?: (childSessionID: string) => Effect.Effect<string | undefined, Error>,
   directory?: string,
+  authorizeSource?: (childSessionID: string, source: string, workerType?: string) => Effect.Effect<void, Error>,
 ): Effect.Effect<{ reconciled: number; ownershipLost: number }, Error, Dag.Service> {
   return Effect.gen(function* () {
     const dag = yield* Dag.Service
@@ -146,6 +147,31 @@ export function reconcileWorkflow(
           )
           if (settled) reconciled++
         } else {
+          const previousRefValid = yield* Effect.gen(function* () {
+            if (isManagedOutputFileRef(node.capturedOutput) && authorizeSource)
+              yield* authorizeSource(node.childSessionId!, node.capturedOutput.source_path, node.workerType)
+            yield* verifyOutputFileRef(node.capturedOutput)
+          }).pipe(
+            Effect.as(true),
+            Effect.catch((error) => settle(
+              node.id, dag.nodeFailed(dagID, node.id, error.message, "exec_failed", attempt),
+            ).pipe(Effect.tap((settled) => Effect.sync(() => { if (settled) reconciled++ })), Effect.as(false))),
+          )
+          if (!previousRefValid) continue
+          if (isManagedOutputFileRef(node.capturedOutput)) {
+            const ref = node.capturedOutput
+            const restored = yield* Effect.gen(function* () {
+              if (ref.provenance?.workflow_id !== dagID || ref.provenance?.node_id !== node.id
+                || ref.provenance?.child_session_id !== node.childSessionId
+                || ref.provenance?.replan_attempt !== node.replanAttempts)
+                return yield* Effect.fail(new Error("Managed DAG artifact belongs to another execution attempt"))
+              return yield* settle(node.id, dag.nodeCompleted(dagID, node.id, ref.path, attempt, ref))
+            }).pipe(Effect.catchCause((cause) => Cause.hasInterrupts(cause) ? Effect.interrupt : settle(
+              node.id, dag.nodeFailed(dagID, node.id, Cause.pretty(cause), "exec_failed", attempt),
+            )))
+            if (restored) reconciled++
+            continue
+          }
           const settlement = settlePlainTextOutput(
             lastAssistantText ? yield* lastAssistantText(node.childSessionId) : undefined,
           )
@@ -156,26 +182,22 @@ export function reconcileWorkflow(
             )) reconciled++
           } else {
             const rawText = settlement.output
-            // #388 parity with the live path: when the recovered reply IS one
-            // existing absolute file path, capture the same {content_ref, size,
-            // sha256, summary} receipt submit-time detection records, so live
-            // and recovered settlement produce identical durable output
-            // metadata. Best-effort like the live path — any anomaly keeps the
-            // plain inline completion and never fails the node.
-            const fileRef = yield* captureOutputFileRef(rawText)
-            if (fileRef) {
-              yield* dag.store.setCapturedOutput(node.childSessionId, fileRef).pipe(
-                Effect.catchCause((cause) =>
-                  Effect.logWarning("DAG recovery output-ref capture persistence failed — inline output preserved", {
-                    dagID,
-                    nodeID: node.id,
-                    cause,
-                  }),
-                ),
-              )
-              if (directory) yield* ensureReportAreaGitignore(directory, fileRef.path)
-            }
-            if (yield* settle(node.id, dag.nodeCompleted(dagID, node.id, rawText, attempt))) reconciled++
+            const completed = yield* Effect.gen(function* () {
+              const fileRef = yield* commitOutputFileRef(rawText, {
+                workflow_id: dagID,
+                node_id: node.id,
+                child_session_id: node.childSessionId!,
+                replan_attempt: node.replanAttempts,
+              }, authorizeSource ? (source) => authorizeSource(node.childSessionId!, source, node.workerType) : undefined)
+              if (fileRef) {
+                yield* dag.store.setCapturedOutput(node.childSessionId!, fileRef)
+                if (directory) yield* ensureReportAreaGitignore(directory, fileRef.source_path)
+              }
+              return yield* settle(node.id, dag.nodeCompleted(dagID, node.id, fileRef?.path ?? rawText, attempt, fileRef))
+            }).pipe(Effect.catchCause((cause) => Cause.hasInterrupts(cause) ? Effect.interrupt : settle(
+              node.id, dag.nodeFailed(dagID, node.id, Cause.pretty(cause), "exec_failed", attempt),
+            )))
+            if (completed) reconciled++
           }
         }
       } else if (sessionStatus === "failed") {

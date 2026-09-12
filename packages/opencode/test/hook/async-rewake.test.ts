@@ -6,6 +6,8 @@ import path from "path"
 import { SettingsHook, HOOK_REWAKE_SENTINEL } from "@/hook/settings"
 import { HookRewake } from "@/hook/rewake"
 import { SessionHooks } from "@/hook/session-hooks"
+import { InstanceState } from "@/effect/instance-state"
+import { InstanceStore } from "@/project/instance-store"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Database } from "@opencode-ai/core/database/database"
 import { SessionID } from "@/session/schema"
@@ -366,3 +368,100 @@ describe("hook-async-rewake", () => {
       }),
   )
 })
+
+for (const event of ["Stop", "StopFailure"] as const) {
+  for (const boundary of ["UserPromptSubmit", "SessionEnd", "InstanceDispose"] as const) {
+    const release = tmp(`stale-${event}-${boundary}-${crypto.randomUUID()}`)
+    const completed = `${release}.completed`
+    it.instance(`pending async ${event} callback is invalidated by ${boundary}`, () =>
+      Effect.gen(function* () {
+        rewakeCalls.length = 0
+        const hook = yield* SettingsHook.Service
+        const hooks = yield* SessionHooks.Service
+        const sessionID = SessionID.make(`ses-stale-${event}-${boundary}`)
+        yield* hooks.add(sessionID, {
+          event,
+          once: true,
+          hooks: [
+            {
+              type: "command",
+              async: true,
+              asyncRewake: true,
+              command: `while [ ! -f ${JSON.stringify(release)} ]; do sleep 0.01; done; printf '%s' '{"systemMessage":"stale result"}'; touch ${JSON.stringify(completed)}`,
+            },
+          ],
+        })
+        yield* hook.trigger(
+          event === "StopFailure"
+            ? { event, stopHookActive: false, error: "provider failure" }
+            : { event, stopHookActive: false },
+          { sessionID, transcriptPath: "" },
+        )
+        if (boundary === "InstanceDispose") {
+          const store = yield* InstanceStore.Service
+          yield* store.dispose(yield* InstanceState.context)
+        } else {
+          yield* hook.trigger(
+            boundary === "SessionEnd"
+              ? { event: "SessionEnd", reason: "other" }
+              : { event: "UserPromptSubmit", prompt: "new input" },
+            { sessionID, transcriptPath: "" },
+          )
+        }
+        yield* Effect.promise(() => fs.writeFile(release, "go"))
+        yield* pollWithTimeout(
+          Effect.promise(() =>
+            fs
+              .access(completed)
+              .then(() => true as const)
+              .catch(() => undefined),
+          ),
+          "pending hook did not complete",
+        )
+        yield* Effect.promise(() => new Promise((resolve) => setTimeout(resolve, 100)))
+        expect(rewakeCalls).toEqual([])
+        yield* Effect.promise(() => Promise.all([fs.rm(release), fs.rm(completed)]))
+      }),
+    )
+  }
+}
+
+it.instance("concurrent SubagentStop callbacks share the continuation budget", () =>
+  Effect.gen(function* () {
+    rewakeCalls.length = 0
+    const hook = yield* SettingsHook.Service
+    const hooks = yield* SessionHooks.Service
+    const sessionID = SessionID.make("ses-subagent-stop-budget")
+    const completed = tmp(`subagent-stop-budget-${crypto.randomUUID()}`)
+    yield* hooks.add(sessionID, {
+      event: "SubagentStop",
+      hooks: [
+        {
+          type: "command",
+          async: true,
+          asyncRewake: true,
+          command: `printf 'done\\n' >> ${JSON.stringify(completed)}; printf '%s' '{"systemMessage":"subagent verdict"}'`,
+        },
+      ],
+    })
+    const total = SettingsHook.MAX_STOP_CONTINUATIONS + 3
+    yield* Effect.forEach(
+      Array.from({ length: total }),
+      () => hook.trigger({ event: "SubagentStop", stopHookActive: false }, { sessionID, transcriptPath: "" }),
+      { concurrency: "unbounded" },
+    )
+    yield* pollWithTimeout(
+      Effect.promise(async () => {
+        try {
+          return (await fs.readFile(completed, "utf8")).trim().split("\n").length === total ? true : undefined
+        } catch {
+          return undefined
+        }
+      }),
+      "concurrent callbacks did not complete",
+    )
+    yield* Effect.promise(() => new Promise((resolve) => setTimeout(resolve, 100)))
+    expect(rewakeCalls).toHaveLength(SettingsHook.MAX_STOP_CONTINUATIONS)
+    yield* Effect.promise(() => fs.rm(completed))
+  }),
+)

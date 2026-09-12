@@ -138,6 +138,24 @@ describe("sanitizeInput", () => {
 })
 
 describe("resolveTemplate", () => {
+  it("reports only dynamic values delivered intact by a placeholder", async () => {
+    const result = await Effect.runPromise(renderTemplate(
+      { inline: "{{ findings }} {{findings}} {{overridden}} {{rewritten}} {{missing}}", input: { overridden: "static" } },
+      "/tmp",
+      {
+        findings: { summary: "complete findings" },
+        overridden: "dynamic",
+        rewritten: "```original evidence```",
+        missing: null,
+        unused: "extra context",
+      },
+    ))
+    expect(result.interpolatedDynamicKeys).toEqual(["findings"])
+    expect(result.unresolvedPlaceholders).toEqual(["missing"])
+    expect(result.text).toContain("static")
+    expect(result.text).toContain("``original evidence``")
+  })
+
   it("resolves inline template with interpolation", async () => {
     const program = resolveTemplate(
       { inline: "Hello {{name}}!", input: { name: "World" } },

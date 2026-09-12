@@ -228,6 +228,21 @@ jobs:
         if: inputs.platforms == '' || contains(inputs.platforms, matrix.name)
         run: bun run ./packages/opencode/script/prefetch-ripgrep.ts
 
+      - name: Verify CLI executable
+        if: matrix.name != 'macos' && (inputs.platforms == '' || contains(inputs.platforms, matrix.name))
+        run: |
+          for dir in packages/opencode/dist/opencode-*/; do
+            cli="$dir/bin/opencode"
+            if [[ -f "$cli.exe" ]]; then cli="$cli.exe"; fi
+            actual="$("$cli" --version)"
+            if [[ "$actual" != "${{ needs.version.outputs.version }}" ]]; then
+              echo "Unexpected CLI version: $actual" >&2
+              exit 1
+            fi
+            "$cli" --help > /dev/null
+          done
+        timeout-minutes: 5
+
       - name: Package Artifacts
         if: inputs.platforms == '' || contains(inputs.platforms, matrix.name)
         working-directory: packages/opencode/dist

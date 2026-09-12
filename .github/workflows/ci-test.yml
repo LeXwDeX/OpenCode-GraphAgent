@@ -26,10 +26,7 @@ on:
       - main
       - dev
   pull_request:
-    # ready_for_review matters: the SpecGit Acceptance verdict requires
-    # required-check runs that started at/after the draft→ready transition
-    # (#315 anchor). Without this type a ready transition finds only stale
-    # pre-ready runs and the gate times out waiting for fresh ones.
+    # Re-run checks when a draft becomes ready for review.
     types: [opened, synchronize, reopened, ready_for_review]
     branches:
       - main
@@ -252,6 +249,12 @@ jobs:
         if: steps.evidence.outputs.reused != 'true' && (steps.playwright-cache.outputs.cache-hit != 'true')
         working-directory: packages/app
         run: bunx playwright install chromium
+
+      - name: Verify DAG artifact storage on Windows
+        if: steps.evidence.outputs.reused != 'true' && runner.os == 'Windows'
+        working-directory: packages/opencode
+        run: bun test --timeout 30000 --only-failures test/dag/dag-output-ref.test.ts test/dag/dag-output-ref-result.test.ts test/dag/dag-input-mapping-runtime.test.ts test/dag/dag-artifact-permissions.test.ts
+        timeout-minutes: 5
 
       - name: Run app e2e tests
         if: steps.evidence.outputs.reused != 'true'

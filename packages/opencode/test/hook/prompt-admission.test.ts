@@ -1,3 +1,4 @@
+import { SettingsHook } from "@/hook/settings"
 import { SessionHooks } from "@/hook/session-hooks"
 import { expect } from "bun:test"
 import fs from "node:fs/promises"
@@ -423,3 +424,60 @@ it.live("native write, edit and multi-file patch emit actual FileChanged paths",
     },
   ),
 )
+
+for (const event of ["Stop", "StopFailure"] as const) {
+  it.live(`${event} asyncRewake shares a bounded chain and resets for a new prompt`, () =>
+    provideTmpdirServer(
+      Effect.fnUntraced(function* ({ llm, dir }) {
+        const prompt = yield* SessionPrompt.Service
+        const sessions = yield* Session.Service
+        const hooks = yield* SessionHooks.Service
+        const session = yield* sessions.create({ title: "Bounded Stop rewake audit", permission: [] })
+        const marker = path.join(dir, "stops")
+        const quote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'"
+        yield* hooks.add(session.id, {
+          event,
+          hooks: [
+            {
+              type: "command",
+              async: true,
+              asyncRewake: true,
+              command: `sleep 0.1; cat >> ${quote(marker)}; n=$(wc -l < ${quote(marker)}); if [ "$n" -le 14 ]; then printf '{"systemMessage":"hook revision %s"}' "$n"; fi`,
+            },
+          ],
+        })
+        for (let i = 0; i < 16; i++) {
+          if (event === "StopFailure") yield* llm.error(400, { error: { message: `provider failure ${i}` } })
+          else yield* llm.text(`response ${i}`)
+        }
+        const completedStops = (count: number) =>
+          pollWithTimeout(
+            Effect.promise(async () => {
+              try {
+                const lines = (await fs.readFile(marker, "utf8")).trim().split("\n")
+                return lines.length >= count ? lines.map((line) => JSON.parse(line)) : undefined
+              } catch {
+                return undefined
+              }
+            }),
+            `Stop chain did not finish ${count} events`,
+            "15 seconds",
+          )
+        yield* prompt.prompt({ sessionID: session.id, agent: "build", parts: [{ type: "text", text: "start" }] })
+        const first = yield* completedStops(SettingsHook.MAX_STOP_CONTINUATIONS + 1)
+        yield* Effect.promise(() => new Promise((resolve) => setTimeout(resolve, 200)))
+        expect(yield* llm.calls).toBe(SettingsHook.MAX_STOP_CONTINUATIONS + 1)
+        expect(first[0].stop_hook_active).toBe(false)
+        expect(first.slice(1).every((event) => event.stop_hook_active === true)).toBe(true)
+
+        yield* prompt.prompt({ sessionID: session.id, agent: "build", parts: [{ type: "text", text: "new input" }] })
+        const both = yield* completedStops((SettingsHook.MAX_STOP_CONTINUATIONS + 1) * 2)
+        yield* Effect.promise(() => new Promise((resolve) => setTimeout(resolve, 200)))
+        expect(yield* llm.calls).toBe((SettingsHook.MAX_STOP_CONTINUATIONS + 1) * 2)
+        expect(both[SettingsHook.MAX_STOP_CONTINUATIONS + 1].stop_hook_active).toBe(false)
+        yield* hooks.clear(session.id)
+      }),
+      { git: true, config: providerCfg },
+    ),
+  )
+}
