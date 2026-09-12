@@ -257,4 +257,4 @@ bun test --timeout 30000 --only-failures \
 - Hooks 复核补充了 `StopFailure` 错误路径：同样纳入共享自动链预算，持续模型错误不再绕过次数上限。
 - 本次未增加通用 `artifacts` JSON envelope、attempt draft 目录或 context manifest；没有自动判断任意代码/环境变更后哪些结果仍有效，也没有实现 Goal 的机器检查收据验收或新的全局编排策略。第 4 节仍是比首版更完整的后续设计，不能视作全部已交付。
 
-操作与边界见 [DAG 文件成果和局部恢复](dag-file-artifacts-and-recovery.md)。固定 Bun 1.3.14 的模块回归及最终 DAG core 行为/覆盖率门禁已通过。独立权限复核 25 项测试通过；root typecheck 的 29 个包通过，lint 为 0 errors / 4844 warnings，未提高 4850 上限。本机 CLI 已构建并通过 1.0.44 版本和帮助启动检查。原生产品 CI 和正式版本发布仍在进行，以最终 release 记录作为发布完成证据。
+操作与边界见 [DAG 文件成果和局部恢复](dag-file-artifacts-and-recovery.md)。固定 Bun 1.3.14 的模块回归及最终 DAG core 行为/覆盖率门禁已通过。独立权限复核 25 项测试通过；root typecheck 的 29 个包通过，lint 为 0 errors / 4844 warnings，未提高 4850 上限。本机 CLI 已构建并通过 1.0.44 版本和帮助启动检查；在隔离目录完成数据库初始化，健康接口返回 HTTP 200、healthy=true、version=1.0.44。原生产品 CI 和正式版本发布仍在进行，以最终 release 记录作为发布完成证据。

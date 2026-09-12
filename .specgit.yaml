@@ -1,12 +1,24 @@
-version: 1
-delivery: memory-release
-context:
-  kind: branch
-  branch: chore/583-memory-release
-issues:
-  - 583
-  - 585
-issueKinds:
-  - issue: 583
-    kind: kind::chore
-pr: 584
+version: 2
+remote: origin
+provider: github
+target: dev
+language: en
+validation:
+  titles: true
+  labels: off
+  bodies: true
+tags: []
+templates:
+  issue:
+    source: builtin
+  pr:
+    source: builtin
+agent:
+  native_auto_merge: false
+  close_issues_after_merge: false
+observation:
+  poll_seconds: 15
+  max_wait_seconds: 2400
+  notify:
+  - attention
+  - completed
