@@ -106,7 +106,7 @@ exports[`tool parameters JSON Schema (wire shape) grep 1`] = `
       "type": "string",
     },
     "path": {
-      "description": "The directory to search in. Defaults to the current working directory.",
+      "description": "The file or directory to search in. Defaults to the current working directory.",
       "type": "string",
     },
     "pattern": {
@@ -564,6 +564,53 @@ exports[`tool parameters JSON Schema (wire shape) workflow 1`] = `
             "action",
             "operation",
             "workflow_id",
+          ],
+          "type": "object",
+        },
+        {
+          "properties": {
+            "action": {
+              "enum": [
+                "control",
+              ],
+              "type": "string",
+            },
+            "expected_graph_rev": {
+              "description": "Exact graph_rev from workflow status; stale recovery requests are rejected",
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer",
+            },
+            "node_ids": {
+              "description": "Current node IDs to retry; their downstream closure is invalidated automatically",
+              "items": {
+                "type": "string",
+              },
+              "minItems": 1,
+              "type": "array",
+            },
+            "operation": {
+              "description": "Retry selected nodes and affected descendants in the same workflow, retaining valid completed work and prior attempts",
+              "enum": [
+                "recover",
+              ],
+              "type": "string",
+            },
+            "resume_cancelled": {
+              "description": "Set true only for an explicitly requested recovery of a cancelled workflow",
+              "type": "boolean",
+            },
+            "workflow_id": {
+              "pattern": "^dag.*$",
+              "type": "string",
+            },
+          },
+          "required": [
+            "action",
+            "operation",
+            "workflow_id",
+            "node_ids",
+            "expected_graph_rev",
           ],
           "type": "object",
         },

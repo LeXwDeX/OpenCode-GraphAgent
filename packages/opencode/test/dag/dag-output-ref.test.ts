@@ -7,38 +7,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 /**
- * Train B probes — node-output file references (workflows/dag-engine-optimization.md,
- * v1.0.15 ledger, decisions B1–B4).
- *
- * Dual track (B1): report nodes without an output_schema may submit an absolute
- * file path instead of inlining long text; output_schema nodes keep inline JSON.
- * At submit time the runtime validates existence + size>0 and records
- * `{content_ref, size, sha256}` in captured_output (B2); on first capture into
- * the project `.opencode/` report area the runtime ensures the `.gitignore`
- * entry exists (B4, append, never overwrite). The report area convention is
- * `.opencode/workflow-reports/` — no better-fit existing directory was found
- * under `.opencode/` (checked the worktree; naming mirrors the existing
- * `.opencode/workflow-drafts/` convention).
- *
- * NOTE: the run's evidence.md was not present in the worktree, the config
- * workflow repo, or the opencode data dir when this train started — the probe
- * contract below is derived directly from the settled ledger above.
- *
- * Probe map:
- * - B-p1: submit-time absolute-path detection — a child reply that IS an
- *   absolute path to an existing non-empty regular file captures a file_ref
- *   record ({kind, content_ref, path, size, sha256, summary}) into
- *   captured_output while nodeCompleted keeps the path string as the inline
- *   output (backward compatible: input mapping, wake digests, and legacy
- *   readers all see the same string they always did). RED on the unmodified
- *   engine: non-schema nodes never write captured_output.
- * - B-p2 (PIN): output_schema settlement is untouched — a captured payload
- *   containing an absolute-path string stays inline JSON, no file_ref rewrite.
- *   Green before AND after the feature.
- * - B-p4: `.gitignore` auto-entry — a capture whose ref path lies inside
- *   <directory>/.opencode/workflow-reports/ appends the report-area entry to
- *   <directory>/.gitignore exactly once, preserving pre-existing entries. RED
- *   on the unmodified engine: nothing touches the project `.gitignore`.
+ * File-output settlement probes. New schemaless file submissions commit
+ * immutable managed objects before success; legacy detection and inline JSON
+ * remain compatible. Both live capture and crash recovery verify receipts.
  */
 import { afterAll, describe, expect, it } from "bun:test"
 import { createHash } from "node:crypto"
@@ -47,6 +18,7 @@ import os from "node:os"
 import path from "node:path"
 import { Effect, Fiber, Layer, Semaphore } from "effect"
 import type { SessionV1 } from "@opencode-ai/core/v1/session"
+import { FSUtil } from "@opencode-ai/core/fs-util"
 import { SessionPrompt } from "@/session/prompt"
 import { MessageID } from "@/session/schema"
 import { Dag } from "@/dag/dag"
@@ -54,7 +26,7 @@ import { Agent } from "@/agent/agent"
 import { Session } from "@/session/session"
 import { spawnNode, type NodeSpawnInput } from "@/dag/runtime/spawn"
 import { registerCaptureSlot, validatePayload } from "@/dag/runtime/capture"
-import { captureOutputFileRef, ensureReportAreaGitignore, REPORT_AREA } from "@/dag/runtime/output-ref"
+import { captureOutputFileRef, commitOutputFileRef, verifyOutputFileRef, ensureReportAreaGitignore, REPORT_AREA } from "@/dag/runtime/output-ref"
 import { makeNodeRow } from "./fixtures"
 import type { DagStore } from "@opencode-ai/core/dag/store"
 
@@ -76,7 +48,7 @@ type TrackedEvent = { type: string; nodeID: string; output?: unknown; reason?: s
 let capturedStore: Map<string, unknown> = new Map()
 let capturedCalls: unknown[] = []
 
-function makeEventTracker() {
+function makeEventTracker(options: { capturedFail?: boolean } = {}) {
   const events: TrackedEvent[] = []
   capturedStore = new Map()
   capturedCalls = []
@@ -88,7 +60,7 @@ function makeEventTracker() {
         capturedOutput: capturedStore.get(nodeID),
       }))),
     setCapturedOutput: Effect.fn("s")((_childSessionID: string, payload: unknown) =>
-      Effect.sync(() => {
+      options.capturedFail ? Effect.die(new Error("receipt persistence failed")) : Effect.sync(() => {
         capturedCalls.push(payload)
         capturedStore.set("node-1", payload)
       })),
@@ -109,7 +81,7 @@ function makeEventTracker() {
 
 const agentLayer = Layer.mock(Agent.Service, {
   get: () => Effect.succeed({
-    name: "build", mode: "all", permission: [], options: {}, description: "", prompt: "",
+    name: "build", mode: "all", permission: [{ permission: "*", pattern: "*", action: "allow" }], options: {}, description: "", prompt: "",
     model: { providerID: "test" as never, modelID: "test-model" as never },
     tools: {}, hooks: {},
   }),
@@ -191,16 +163,55 @@ describe("submit-time absolute-path capture (Train B, B-p1)", () => {
     await runSpawn(dagLayer, makePromptLayer(reply(reportPath)))
     const completed = events.find((event) => event.type === "nodeCompleted")
     expect(completed).toBeDefined()
-    expect(completed!.output).toBe(reportPath)
+    expect(completed!.output).not.toBe(reportPath)
     expect(capturedCalls).toHaveLength(1)
-    expect(capturedCalls[0]).toEqual({
+    expect(capturedCalls[0]).toEqual(expect.objectContaining({
       kind: "file_ref",
-      content_ref: reportPath,
-      path: reportPath,
+      storage: "managed-v1",
+      source_path: FSUtil.normalizePath(reportPath),
+      content_ref: completed!.output,
+      path: completed!.output,
       size: Buffer.byteLength(content),
       sha256: createHash("sha256").update(content).digest("hex"),
       summary: `${content.slice(0, 200)}\u2026`,
-    })
+    }))
+    await fs.writeFile(reportPath, "overwritten source")
+    expect(await fs.readFile(String(completed!.output), "utf8")).toBe(content)
+    await fs.rm(dir, { recursive: true, force: true })
+    expect(await fs.readFile(String(completed!.output), "utf8")).toBe(content)
+  })
+
+  it("does not complete when the managed receipt cannot be persisted", async () => {
+    const dir = await tmpRoot("dag-ref-persist-")
+    const reportPath = path.join(dir, "report.md")
+    await Bun.write(reportPath, "receipt persistence regression")
+    const { events, dagLayer } = makeEventTracker({ capturedFail: true })
+    await runSpawn(dagLayer, makePromptLayer(reply(reportPath)))
+    expect(events.some((event) => event.type === "nodeCompleted")).toBe(false)
+    expect(events).toContainEqual(expect.objectContaining({ type: "nodeFailed", trigger: "exec_failed" }))
+  })
+
+  it("checks input artifacts again after waiting for a concurrency permit", async () => {
+    const dir = await tmpRoot("dag-ref-queued-")
+    const source = path.join(dir, "report.md")
+    await fs.writeFile(source, `queued artifact ${dir}`)
+    const ref = await Effect.runPromise(commitOutputFileRef(source, {
+      workflow_id: "wf-1", node_id: "producer", child_session_id: "ses_producer", replan_attempt: 0,
+    }))
+    if (!ref) throw new Error("missing input artifact")
+    tmpRoots.push(path.dirname(ref.path))
+    const { events, dagLayer } = makeEventTracker()
+    const semaphore = Semaphore.makeUnsafe(1)
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      yield* semaphore.take(1)
+      const spawned = yield* spawnNode(semaphore, makeSpawnInput(undefined, { directory: dir, inputArtifacts: [ref] }))
+      yield* Effect.promise(() => fs.chmod(ref.path, 0o600))
+      yield* Effect.promise(() => fs.unlink(ref.path))
+      yield* semaphore.release(1)
+      yield* Fiber.await(spawned.fiber)
+    })).pipe(Effect.provide(Layer.mergeAll(dagLayer, agentLayer, sessionLayer, makePromptLayer(reply("must not execute")))) ) as Effect.Effect<void, Error>)
+    expect(events.some((event) => event.type === "nodeCompleted")).toBe(false)
+    expect(events).toContainEqual(expect.objectContaining({ type: "nodeFailed", reason: expect.stringContaining("Managed DAG artifact unavailable") }))
   })
 
   it("B-p1(a2) keeps the full text as summary when the file is at most 200 chars", async () => {
@@ -210,7 +221,7 @@ describe("submit-time absolute-path capture (Train B, B-p1)", () => {
     await Bun.write(reportPath, content)
     const { events, dagLayer } = makeEventTracker()
     await runSpawn(dagLayer, makePromptLayer(reply(reportPath)))
-    expect(events.find((event) => event.type === "nodeCompleted")?.output).toBe(reportPath)
+    expect(events.find((event) => event.type === "nodeCompleted")?.output).toEqual(expect.stringContaining("workflow-artifacts"))
     expect(capturedCalls).toHaveLength(1)
     expect(capturedCalls[0]).toEqual(expect.objectContaining({ summary: "short report", size: Buffer.byteLength(content) }))
   })
@@ -294,7 +305,7 @@ describe("report-area gitignore entry (Train B, B-p4)", () => {
     await Bun.write(reportPath, "# report\n")
     const { events, dagLayer } = makeEventTracker()
     await runSpawn(dagLayer, makePromptLayer(reply(reportPath)), undefined, directoryOverride(projectDir))
-    expect(events.find((event) => event.type === "nodeCompleted")?.output).toBe(reportPath)
+    expect(events.find((event) => event.type === "nodeCompleted")?.output).toEqual(expect.stringContaining("workflow-artifacts"))
     const gitignore = await fs.readFile(path.join(projectDir, ".gitignore"), "utf8")
     expect(gitignore.split("\n").map((line) => line.trim())).toContain(".opencode/workflow-reports/")
   })
@@ -327,12 +338,50 @@ describe("report-area gitignore entry (Train B, B-p4)", () => {
     await Bun.write(reportPath, "# elsewhere\n")
     const { events, dagLayer } = makeEventTracker()
     await runSpawn(dagLayer, makePromptLayer(reply(reportPath)), undefined, directoryOverride(projectDir))
-    expect(events.find((event) => event.type === "nodeCompleted")?.output).toBe(reportPath)
+    expect(events.find((event) => event.type === "nodeCompleted")?.output).toEqual(expect.stringContaining("workflow-artifacts"))
     expect(await fs.readFile(path.join(projectDir, ".gitignore"), "utf8")).toBe("node_modules\n")
   })
 })
 
 describe("output-ref module rules (Train B, post-feature units)", () => {
+  it("shares immutable objects across captures and detects corruption without repairing over it", async () => {
+    const dir = await tmpRoot("dag-managed-object-")
+    const source = path.join(dir, "report.md")
+    const content = `managed integrity ${dir}`
+    await fs.writeFile(source, content)
+    const provenance = { workflow_id: "wf-object", node_id: "report", child_session_id: "ses-object", replan_attempt: 0 }
+    const first = await Effect.runPromise(commitOutputFileRef(source, provenance))
+    const second = await Effect.runPromise(commitOutputFileRef(source, provenance))
+    expect(first).toBeDefined()
+    expect(second?.path).toBe(first!.path)
+    tmpRoots.push(path.dirname(first!.path))
+    await fs.chmod(first!.path, 0o600)
+    await fs.writeFile(first!.path, "X".repeat(first!.size))
+    const verificationError = await Effect.runPromise(verifyOutputFileRef(first).pipe(Effect.flip))
+    expect(verificationError.message).toContain("digest mismatch")
+    const commitError = await Effect.runPromise(commitOutputFileRef(source, provenance).pipe(Effect.flip))
+    expect(commitError.message).toContain("DAG artifact commit failed")
+    expect(await fs.readFile(first!.path, "utf8")).toBe("X".repeat(first!.size))
+  })
+
+  it("rejects a missing managed object and leaves legacy refs compatible", async () => {
+    const dir = await tmpRoot("dag-managed-missing-")
+    const source = path.join(dir, "report.md")
+    await fs.writeFile(source, `missing artifact ${dir}`)
+    const ref = await Effect.runPromise(commitOutputFileRef(source, {
+      workflow_id: "wf-missing", node_id: "report", child_session_id: "ses-missing", replan_attempt: 0,
+    }))
+    expect(ref).toBeDefined()
+    tmpRoots.push(path.dirname(ref!.path))
+    await fs.chmod(ref!.path, 0o600)
+    await fs.unlink(ref!.path)
+    const verificationError = await Effect.runPromise(verifyOutputFileRef(ref).pipe(Effect.flip))
+    expect(verificationError.message).toContain("Managed DAG artifact unavailable")
+    const legacy = await Effect.runPromise(captureOutputFileRef(source))
+    await fs.unlink(source)
+    await Effect.runPromise(verifyOutputFileRef(legacy))
+  })
+
   it("rejects relative paths and paths containing whitespace even when the file exists", async () => {
     const dir = await tmpRoot("dag-ref-")
     const spacedPath = path.join(dir, "two words.md")

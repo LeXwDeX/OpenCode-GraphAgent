@@ -75,11 +75,8 @@ export interface ContinuationInput {
   readonly lastJudgeReason?: string
 }
 
-// Renders the single merged continuation injection. Carries goal text,
-// subgoals, turns/budget, the last judge reason (labeled), and the autonomous-mode
-// frame. This is both the user-visible per-turn progress line AND the prompt that
-// drives the next agent turn — it must reach the model (no `ignored` flag at the
-// call site) and render in the transcript (no `noReply`).
+// Renders the continuation sent as synthetic user text. It reaches the model
+// without appearing as human input in Memory or the visible conversation.
 export function renderContinuation(input: ContinuationInput): string {
   const remaining = Math.max(0, input.maxTurns - input.turnsUsed)
   const lines = [

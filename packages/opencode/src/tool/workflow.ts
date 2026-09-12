@@ -16,7 +16,7 @@ import { Provider } from "@/provider/provider"
 import { Session } from "@/session/session"
 import { SessionID } from "@/session/schema"
 import { createAdmissionRecord } from "@/dag/admission"
-import { isOutputFileRef } from "@/dag/runtime/output-ref"
+import { isOutputFileRef, isManagedOutputFileRef, verifyOutputFileRef } from "@/dag/runtime/output-ref"
 import { TerminalViolationError } from "@opencode-ai/core/dag/core/types"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { stringify as yamlStringify } from "yaml"
@@ -81,6 +81,14 @@ const ControlOther = Schema.Struct({
   }),
   workflow_id: Dag.ID.annotate({ description: "Target workflow ID" }),
 })
+const ControlRecover = Schema.Struct({
+  action: Schema.Literal("control"),
+  operation: Schema.Literal("recover").annotate({ description: "Retry selected nodes and affected descendants in the same workflow, retaining valid completed work and prior attempts" }),
+  workflow_id: Dag.ID,
+  node_ids: Schema.Array(Dag.NodeID).check(Schema.isMinLength(1)).annotate({ description: "Current node IDs to retry; their downstream closure is invalidated automatically" }),
+  expected_graph_rev: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)).annotate({ description: "Exact graph_rev from workflow status; stale recovery requests are rejected" }),
+  resume_cancelled: Schema.optional(Schema.Boolean).annotate({ description: "Set true only for an explicitly requested recovery of a cancelled workflow" }),
+})
 const Status = Schema.Struct({
   action: Schema.Literal("status").annotate({ description: "Inspect durable workflow and node state" }),
   workflow_id: Dag.ID.annotate({ description: "Target workflow ID" }),
@@ -140,6 +148,7 @@ const ActionParams = Schema.Union([
   ExtendPath,
   ControlReplanPath,
   ControlOther,
+  ControlRecover,
   Status,
   Result,
   List,
@@ -166,6 +175,7 @@ type Metadata = {
   cancel?: string[]
   restart?: string[]
   replace?: string[]
+  graphRev?: number
 }
 
 type AuthoringSource = Parameters<ReturnType<typeof WorkflowAuthoring.make>["prepare"]>[0]["source"]
@@ -433,6 +443,7 @@ export const WorkflowTool = Tool.define<
                     id: workflow.id,
                     title: workflow.title,
                     status: workflow.status,
+                    graph_rev: workflow.graphRev,
                     session_id: workflow.sessionId,
                     mode: config?.mode ?? "standard",
                     ...(unresolvedReviews.length > 0 ? { unresolved_reviews: unresolvedReviews } : {}),
@@ -462,6 +473,9 @@ export const WorkflowTool = Tool.define<
                       ...(node.childSessionId ? { child_session_id: node.childSessionId } : {}),
                       ...(node.errorReason ? { error_reason: node.errorReason } : {}),
                       ...(node.errorClass ? { error_class: node.errorClass } : {}),
+                      ...(config?.nodes.find((definition) => definition.id === node.id)?.recovery
+                        ? { recovery: config.nodes.find((definition) => definition.id === node.id)!.recovery }
+                        : {}),
                     })),
                   },
                   null,
@@ -476,6 +490,7 @@ export const WorkflowTool = Tool.define<
               if (!node) {
                 return yield* Effect.die(new Error(`Workflow node not found: ${params.workflow_id}/${params.node_id}`))
               }
+              yield* verifyOutputFileRef(node.capturedOutput).pipe(Effect.orDie)
               // Train B (v1.0.15 B3): a submit-time file ref reads as a durable
               // pointer — content_ref + summary + path — and the parent agent
               // fetches the content itself (read tool). No paging: the pointer
@@ -494,6 +509,12 @@ export const WorkflowTool = Tool.define<
                       summary: node.capturedOutput.summary,
                       size: node.capturedOutput.size,
                       sha256: node.capturedOutput.sha256,
+                      ...(isManagedOutputFileRef(node.capturedOutput) ? {
+                        storage: node.capturedOutput.storage,
+                        source_path: node.capturedOutput.source_path,
+                        provenance: node.capturedOutput.provenance,
+                        artifact_status: node.status === "completed" ? "committed" : "checkpoint",
+                      } : {}),
                       truncated: false,
                       next_cursor: null,
                     },
@@ -661,7 +682,7 @@ export const WorkflowTool = Tool.define<
               if (!result.valid || !result.prepared) return yield* rejectDiagnostics(result.errors, "Workflow extend")
               const r = yield* withTerminalRecovery(
                 dag.extend(params.workflow_id, result.prepared.nodes),
-                "Terminal workflows are immutable except for the additive-extend reopen, which requires the workflow to have completed naturally at a wake-eligible reporting checkpoint (fragment adds new node ids; no early control(complete); no executed node beyond the checkpoint — condition-skipped dependents are fine). When the reopen does not apply, recover by starting a NEW workflow spec that reuses this workflow's completed outputs as static input.",
+                "Terminal workflows are immutable except for the additive-extend reopen, which requires the workflow to have completed naturally at a wake-eligible reporting checkpoint (fragment adds new node ids; no early control(complete); no executed node beyond the checkpoint — condition-skipped dependents are fine). For failed workflows, use control(recover) with node_ids and expected_graph_rev from status. Cancelled workflows additionally require explicit resume_cancelled: true.",
               ).pipe(Effect.orDie)
               // #381: extend shares replan's resume contract — a paused
               // workflow must resume for the added nodes to ever run (pause
@@ -696,6 +717,28 @@ export const WorkflowTool = Tool.define<
             case "control": {
               const wfId = params.workflow_id
               const workflow = yield* requireOwnedWorkflow(wfId, ctx.sessionID)
+              if (params.operation === "recover") {
+                const result = yield* dag.recover(wfId, {
+                  nodeIDs: params.node_ids,
+                  expectedGraphRev: params.expected_graph_rev,
+                  resumeCancelled: params.resume_cancelled,
+                }).pipe(Effect.orDie)
+                return {
+                  title: `Workflow recovered: ${result.replacements.length} new attempts`,
+                  output: JSON.stringify({
+                    workflow_id: wfId,
+                    action: "recover",
+                    status: "running",
+                    graph_rev: result.graphRev,
+                    replacements: result.replacements,
+                    reused: result.reused,
+                    preserved: result.preserved,
+                    superseded: result.superseded,
+                    note: "Prior attempts remain readable with workflow result. New attempts must inspect existing workspace changes and prior child sessions before repeating side effects.",
+                  }, null, 2),
+                  metadata: { workflowId: wfId, graphRev: result.graphRev } as Metadata,
+                }
+              }
               if (params.operation === "replan") {
                 const workflowDefaults = Dag.parseWorkflowConfig(workflow.config)?.node_defaults
                 const knownDependencies = (yield* dag.store.getNodes(wfId).pipe(Effect.orDie)).map((node) => node.id)
@@ -716,7 +759,7 @@ export const WorkflowTool = Tool.define<
                 // the recovery options instead of a bare iron-law rejection.
                 const r = yield* withTerminalRecovery(
                   dag.replan(wfId, { nodes: result.prepared.nodes }),
-                  "The workflow reached a terminal status before the replan arrived — terminal workflows are immutable. Recover by starting a new workflow with the updated node definitions, or extend if a reporting leaf checkpoint naturally completed the graph. Next time issue control(pause) BEFORE composing the spec.",
+                  "The workflow reached a terminal status before the replan arrived. For a local retry of failed work, use control(recover) with current node_ids and expected_graph_rev; cancelled work also requires explicit resume_cancelled: true. Additive extend remains available after a qualifying naturally completed checkpoint. Pause live scheduling before composing a changed graph.",
                 ).pipe(Effect.orDie)
                 // A paused workflow (explicit pause-first protocol, or the
                 // runtime's gate pause after a checkpoint replan verdict) must

@@ -11,12 +11,11 @@ import { LayerNode } from "../effect/layer-node"
 import { DagEvent } from "@opencode-ai/schema/dag-event"
 import { WorkflowNodeTable, WorkflowTable } from "./sql"
 
-type DatabaseService = Database.Interface["db"]
 type WorkflowStatus = DagEvent.WorkflowStatus
 const toMillis = (dt: DateTime.Utc) => DateTime.toEpochMillis(dt)
 
-/** Cast a status string to the WorkflowStatus literal type for Drizzle. */
-const ws = (s: WorkflowStatus) => s as DagEvent.WorkflowStatus
+/** Keep workflow status values typed at the Drizzle boundary. */
+const ws = (s: WorkflowStatus) => s
 
 /**
  * Event → status projection guards — the single source the drift test checks
@@ -54,12 +53,13 @@ export const WorkflowStatusProjection = {
   failed: { to: "failed", from: ["running", "stepping"] },
   cancelled: { to: "cancelled", from: ["running", "paused", "stepping"] },
   /**
-   * Additive-extend reopen — the ONLY sanctioned exception to terminal
-   * irreversibility: a naturally-completed workflow with a reporting leaf
+   * Additive-extend reopen: a naturally-completed workflow with a reporting leaf
    * checkpoint may be reopened by _extend (see dag.ts reopenCompleted).
    * The drift test exempts exactly this entry.
    */
   replanReopen: { to: "running", from: ["completed"] },
+  /** Explicit fenced recovery creates new attempts; old node terminal states remain immutable. */
+  recoveryReopen: { to: "running", from: ["failed", "cancelled"] },
 } as const
 
 /**
@@ -141,6 +141,19 @@ export const layer = Layer.effectDiscard(
 
     yield* events.project(DagEvent.WorkflowReplanned, (event) =>
       Effect.gen(function* () {
+        const recovery = event.data.recovery
+        if (recovery) {
+          const current = yield* db.select().from(WorkflowTable).where(eq(WorkflowTable.id, event.data.dagID)).get().pipe(Effect.orDie)
+          if (
+            !current || current.graph_rev !== recovery.expectedGraphRev || current.seq !== recovery.expectedSeq ||
+            !["paused", "failed", ...(recovery.resumeCancelled ? ["cancelled"] : [])].includes(current.status)
+          ) yield* Effect.die(new Error("Recovery rejected: workflow changed after the recovery snapshot"))
+          const nodes = yield* db.select().from(WorkflowNodeTable).where(eq(WorkflowNodeTable.workflow_id, event.data.dagID)).all().pipe(Effect.orDie)
+          const expected = new Map<string, number>(recovery.nodeSeqs.map((node) => [node.nodeID, node.seq]))
+          if (nodes.length !== expected.size || nodes.some((node) => expected.get(node.id) !== node.seq)) {
+            yield* Effect.die(new Error("Recovery rejected: node state changed after the recovery snapshot"))
+          }
+        }
         // Rev-view (v1.0.15 Train A): every replan opens a new graph
         // revision. The two legs run in THIS order so each event bumps
         // graph_rev exactly once: the seq-bump leg matches the active
@@ -151,6 +164,7 @@ export const layer = Layer.effectDiscard(
         yield* db
           .update(WorkflowTable)
           .set({
+            ...(recovery ? { status: ws("running"), wake_reported: false, completed_at: null } : {}),
             graph_rev: sql`${WorkflowTable.graph_rev} + 1`,
             seq: event.durable!.seq,
             time_updated: toMillis(event.data.timestamp),
@@ -176,7 +190,9 @@ export const layer = Layer.effectDiscard(
           })
           .where(and(
             eq(WorkflowTable.id, event.data.dagID),
-            inArray(WorkflowTable.status, [...WorkflowStatusProjection.replanReopen.from]),
+            inArray(WorkflowTable.status, recovery
+              ? [...WorkflowStatusProjection.recoveryReopen.from]
+              : [...WorkflowStatusProjection.replanReopen.from]),
           ))
           .run()
           .pipe(Effect.orDie)
@@ -307,6 +323,7 @@ export const layer = Layer.effectDiscard(
         .set({
           status: "completed",
           output: event.data.output,
+          ...(event.data.capturedOutput !== undefined ? { captured_output: event.data.capturedOutput } : {}),
           completed_at: toMillis(event.data.timestamp),
           // Q1: a terminal node is no longer awaiting adjudication — clear the
           // escalation flag. Its result is delivered via the wake_reported

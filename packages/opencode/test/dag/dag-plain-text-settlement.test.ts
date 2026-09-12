@@ -117,7 +117,7 @@ describe("plain-text settlement parity", () => {
     }),
   )
 
-  it.live("preserves valid recovered text byte-for-byte and keeps file-ref capture best-effort", () =>
+  it.live("preserves recovered inline text and commits file results to durable objects", () =>
     Effect.gen(function* () {
       yield* setupProject()
       const dag = yield* Dag.Service
@@ -145,12 +145,14 @@ describe("plain-text settlement parity", () => {
       )
       const fileRow = yield* dag.store.getNode(file.dagID, "file")
       expect(fileRow?.status).toBe("completed")
-      expect(fileRow?.output).toBe(reportPath)
+      expect(fileRow?.output).toEqual(expect.stringContaining("workflow-artifacts"))
       expect(fileRow?.capturedOutput).toEqual(
         expect.objectContaining({
           kind: "file_ref",
-          content_ref: reportPath,
-          path: reportPath,
+          storage: "managed-v1",
+          source_path: reportPath,
+          content_ref: fileRow?.output,
+          path: fileRow?.output,
         }),
       )
     }),

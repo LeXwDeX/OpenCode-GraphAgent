@@ -189,6 +189,12 @@ export const WorkflowReplanned = Event.define({
     // never cancels. Optional so legacy durable events still decode (same
     // precedent as WorkflowCreated.directory); absent lists project nothing.
     superseded: Schema.optional(Schema.Array(NodeID)),
+    recovery: Schema.optional(Schema.Struct({
+      expectedGraphRev: NonNegativeInt,
+      expectedSeq: NonNegativeInt,
+      nodeSeqs: Schema.Array(Schema.Struct({ nodeID: NodeID, seq: NonNegativeInt })),
+      resumeCancelled: Schema.Boolean,
+    })),
   },
 })
 export type WorkflowReplanned = typeof WorkflowReplanned.Type
@@ -256,6 +262,7 @@ export const NodeCompleted = Event.define({
     ...Base,
     nodeID: NodeID,
     output: Schema.Unknown,
+    capturedOutput: Schema.optional(Schema.Unknown),
     durationMs: NonNegativeInt,
   },
 })

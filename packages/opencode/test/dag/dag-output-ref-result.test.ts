@@ -25,7 +25,9 @@
 import { describe, expect } from "bun:test"
 import os from "node:os"
 import path from "node:path"
-import { Effect, Layer } from "effect"
+import fs from "node:fs/promises"
+import { Cause, Effect, Layer } from "effect"
+import { commitOutputFileRef } from "@/dag/runtime/output-ref"
 import { DagStore } from "@opencode-ai/core/dag/store"
 import { ProjectV2 } from "@opencode-ai/core/project"
 import { ModelV2 } from "@opencode-ai/core/model"
@@ -186,6 +188,52 @@ function toolContext() {
 }
 
 describe("workflow tool result — file-ref view (Train B, B-p3)", () => {
+  for (const corrupt of [false, true]) {
+    runtime.effect(`verifies managed receipts at the result boundary (corrupt=${corrupt})`, () =>
+      Effect.acquireUseRelease(
+        Effect.promise(() => fs.mkdtemp(path.join(os.tmpdir(), "dag-result-managed-"))),
+        (directory) => Effect.gen(function* () {
+          const source = path.join(directory, "report.md")
+          yield* Effect.promise(() => fs.writeFile(source, `result boundary ${directory}`))
+          const ref = yield* commitOutputFileRef(source, {
+            workflow_id: "dag_output_ref", node_id: "node_managed", child_session_id: "ses-managed", replan_attempt: 0,
+          })
+          if (!ref) throw new Error("missing managed receipt")
+          return yield* Effect.acquireUseRelease(
+            Effect.sync(() => rows.push({ ...refRow, id: "node_managed", output: ref.path, capturedOutput: ref })),
+            () => Effect.gen(function* () {
+              yield* Effect.promise(() => fs.unlink(source))
+              if (corrupt) {
+                yield* Effect.promise(() => fs.chmod(ref.path, 0o600))
+                yield* Effect.promise(() => fs.unlink(ref.path))
+              }
+              const info = yield* WorkflowTool
+              const workflow = yield* info.init()
+              const result = yield* Effect.exit(workflow.execute(
+                { params: { action: "result", workflow_id: Dag.ID.make("dag_output_ref"), node_id: Dag.NodeID.make("node_managed") } },
+                toolContext(),
+              ))
+              if (corrupt) {
+                expect(result._tag).toBe("Failure")
+                if (result._tag === "Failure") expect(Cause.pretty(result.cause)).toContain("Managed DAG artifact unavailable")
+              } else {
+                expect(result._tag).toBe("Success")
+                if (result._tag === "Success") expect(JSON.parse(result.value.output)).toEqual(expect.objectContaining({
+                  path: ref.path, storage: "managed-v1", artifact_status: "committed", provenance: ref.provenance,
+                }))
+              }
+            }),
+            () => Effect.gen(function* () {
+              rows.splice(rows.findIndex((row) => row.id === "node_managed"), 1)
+              yield* Effect.promise(() => fs.rm(path.dirname(ref.path), { recursive: true, force: true }))
+            }),
+          )
+        }),
+        (directory) => Effect.promise(() => fs.rm(directory, { recursive: true, force: true })),
+      ),
+    )
+  }
+
   runtime.effect("result returns content_ref + summary + path for a captured file ref", () =>
     Effect.gen(function* () {
       const info = yield* WorkflowTool

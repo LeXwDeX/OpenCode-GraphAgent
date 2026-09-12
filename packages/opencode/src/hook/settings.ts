@@ -1377,6 +1377,10 @@ function matcherTarget(payload: HookPayload): string {
 
 // ── Effect service ──────────────────────────────────────────────
 
+interface StopRewakeChain {
+  count: number
+}
+
 interface State {
   settings: Settings
   cwd: string
@@ -1390,6 +1394,7 @@ interface State {
    */
   seen: Map<string, Set<string>>
   once: Map<string, WeakSet<HookCommand>>
+  stopRewakeChains: Map<string, StopRewakeChain>
   /**
    * Scope-tagged summaries of the currently-effective hooks, computed by
    * `summarizeChain` alongside `settings` (same closure, same hot-reload
@@ -1804,6 +1809,7 @@ export const layer = Layer.effect(
           cwd: instCtx.directory,
           seen: new Map<string, Set<string>>(),
           once: new Map<string, WeakSet<HookCommand>>(),
+          stopRewakeChains: new Map<string, StopRewakeChain>(),
         } satisfies State
 
         // [FORK:hook-ext] Hot-reload settings files at runtime. The watcher
@@ -1843,7 +1849,12 @@ export const layer = Layer.effect(
           },
           Global.Path.config,
         )
-        yield* Effect.addFinalizer(() => Effect.sync(() => handle.close()))
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => {
+            handle.close()
+            stateObj.stopRewakeChains.clear()
+          }),
+        )
 
         return stateObj
       }),
@@ -1923,6 +1934,8 @@ export const layer = Layer.effect(
       event: HookEvent,
       sessionID: string | undefined,
       hookRewake: HookRewake.Interface | undefined,
+      state: State,
+      stopChain: StopRewakeChain | undefined,
       result: {
         json?: HookJSONOutput | undefined
         exitBlock?: string | undefined
@@ -1970,6 +1983,17 @@ export const layer = Layer.effect(
         return
       }
 
+      if (stopChain) {
+        // A newer non-hook prompt or SessionEnd invalidates pending Stop callbacks.
+        if (state.stopRewakeChains.get(sessionID) !== stopChain) return
+        if (stopChain.count >= MAX_STOP_CONTINUATIONS) {
+          log.warn("async Stop hook continuation limit reached", { sessionID, limit: MAX_STOP_CONTINUATIONS })
+          return
+        }
+        // Reserve before yielding so concurrent completions share the same bound.
+        stopChain.count++
+      }
+
       const text = buildRewakePrompt(entry, event, parts.join("\n"))
       yield* hookRewake.rewake({ sessionID: SessionID.make(sessionID), text }).pipe(
         Effect.catchDefect((defect) => {
@@ -1986,6 +2010,20 @@ export const layer = Layer.effect(
       using _ = log.time("trigger", { event: payload.event, sessionID: ctx.sessionID })
       const s = yield* InstanceState.get(state)
       const result: TriggerResult = { additionalContexts: [], systemMessages: [] }
+
+      // Hook rewake prompts skip UserPromptSubmit in SessionPrompt. Every other
+      // prompt (including a Goal continuation) begins a new automatic hook chain.
+      if (payload.event === "UserPromptSubmit" && ctx.sessionID) s.stopRewakeChains.delete(ctx.sessionID)
+      if (payload.event === "SessionEnd" && ctx.sessionID) s.stopRewakeChains.delete(ctx.sessionID)
+      let stopChain: StopRewakeChain | undefined
+      if (
+        (payload.event === "Stop" || payload.event === "StopFailure" || payload.event === "SubagentStop") &&
+        ctx.sessionID
+      ) {
+        stopChain = s.stopRewakeChains.get(ctx.sessionID) ?? { count: 0 }
+        s.stopRewakeChains.set(ctx.sessionID, stopChain)
+        if (stopChain.count > 0) payload = { ...payload, stopHookActive: true }
+      }
 
       // ── SessionEnd lifecycle cleanup (F2) ──────────────────────
       // Evict this session's additionalContext dedup bucket AND its dynamic
@@ -2150,7 +2188,9 @@ export const layer = Layer.effect(
                   exitCode: undefined as number | null | undefined,
                 })
               }),
-              Effect.flatMap((r) => onAsyncComplete(entry, capturedEvent, capturedSessionID, hookRewake, r)),
+              Effect.flatMap((r) =>
+                onAsyncComplete(entry, capturedEvent, capturedSessionID, hookRewake, s, stopChain, r),
+              ),
               Effect.catchDefect((defect) => {
                 log.warn("async hook completion defect swallowed", {
                   command: commandText(entry),

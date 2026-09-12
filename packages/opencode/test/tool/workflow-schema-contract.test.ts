@@ -23,7 +23,9 @@ type JsonSchemaNode = {
 }
 
 function rootIsPlainObject(schema: JsonSchemaNode): boolean {
-  return schema.type === "object" && schema.anyOf === undefined && schema.oneOf === undefined && schema.allOf === undefined
+  return (
+    schema.type === "object" && schema.anyOf === undefined && schema.oneOf === undefined && schema.allOf === undefined
+  )
 }
 
 function branches(schema: JsonSchemaNode): JsonSchemaNode[] {
@@ -50,7 +52,7 @@ describe("workflow tool schema contract", () => {
 
   test("the union survives intact inside the params property", () => {
     const transformed = ToolJsonSchema.fromSchema(Parameters as never) as JsonSchemaNode
-    expect(branches(transformed)).toHaveLength(11)
+    expect(branches(transformed)).toHaveLength(12)
     expect(transformed.properties?.params).toBeDefined()
     expect(transformed.required).toEqual(["params"])
   })
@@ -59,15 +61,38 @@ describe("workflow tool schema contract", () => {
     const transformed = ToolJsonSchema.fromSchema(Parameters as never) as JsonSchemaNode
     expect(branchByAction(transformed, "start", "spec_path")).toHaveLength(1)
     expect(branchByAction(transformed, "result", "cursor")).toHaveLength(1)
-    const resultBranch = branches(transformed).find(
-      (branch) => branch.properties?.action?.enum?.includes("result"),
-    )!
+    const resultBranch = branches(transformed).find((branch) => branch.properties?.action?.enum?.includes("result"))!
     expect(resultBranch.required).toEqual(expect.arrayContaining(["workflow_id", "node_id"]))
   })
 
   test("decoded shape is { params: { action, ...fields } }", () => {
     const decoded = Schema.decodeUnknownSync(Parameters)({ params: { action: "list" } })
     expect(decoded).toEqual({ params: { action: "list" } })
+  })
+
+  test("recovery requires selected nodes and the observed graph revision", () => {
+    const params = {
+      action: "control",
+      operation: "recover",
+      workflow_id: "dag_test",
+      node_ids: ["C"],
+      expected_graph_rev: 3,
+    }
+    expect(JSON.stringify(Schema.decodeUnknownSync(Parameters)({ params }))).toBe(JSON.stringify({ params }))
+    expect(() => Schema.decodeUnknownSync(Parameters)({ params: { ...params, node_ids: [] } })).toThrow()
+    expect(() =>
+      Schema.decodeUnknownSync(Parameters)({ params: { ...params, expected_graph_rev: undefined } }),
+    ).toThrow()
+    expect(() => Schema.decodeUnknownSync(Parameters)({ params: { ...params, expected_graph_rev: 1.5 } })).toThrow()
+    for (const model of [openaiModel, azureModel, geminiModel, glmModel]) {
+      const schema = ProviderTransform.schema(model, ToolJsonSchema.fromSchema(Parameters as never)) as JsonSchemaNode
+      const recovery = branchByAction(schema, "control", "node_ids")
+      expect(recovery).toHaveLength(1)
+      expect(recovery[0].required).toEqual(
+        expect.arrayContaining(["operation", "workflow_id", "node_ids", "expected_graph_rev"]),
+      )
+      expect(recovery[0].properties?.operation.enum).toEqual(["recover"])
+    }
   })
 
   test("root-level action shortcut is rejected — params is the only root field", () => {

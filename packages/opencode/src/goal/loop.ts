@@ -517,18 +517,10 @@ const serviceLayer = Layer.effect(
       const reloadedState = yield* goal.load(sessionID)
       if (!reloadedState || reloadedState.status !== "active") return
 
-      // Single merged continuation injection. This replaces the former
-      // two-call sequence (a `noReply` progress line + an `ignored:true`
-      // continuation). The merged prompt carries goal text, subgoals, the
-      // turns/budget line, and the last judge reason, plus the autonomous-mode
-      // frame — and it is BOTH the user-visible per-turn progress line AND the
-      // prompt that drives the next agent turn.
-      //
-      // It is deliberately a plain text part: no `noReply` (so it spawns the
-      // next agent turn) and no `ignored` (so it renders in the transcript AND
-      // reaches the model — `ignored:true` text parts are filtered out of model
-      // messages in MessageV2.toModelMessagesEffect). Driving + visibility +
-      // model-reachability are all required by D4.2.
+      // Synthetic user text reaches the model while preserving its automation
+      // provenance: Memory must not treat this as human input or expire the
+      // current user's retrieved context. Goal events carry visible progress;
+      // the full continuation does not need a repeated user-message bubble.
       const continuationText = GoalPrompts.renderContinuation({
         goal: reloadedState.goal,
         subgoals: reloadedState.subgoals ?? [],
@@ -554,7 +546,7 @@ const serviceLayer = Layer.effect(
         yield* goal.markTurnDriven(sessionID)
         const admitted = yield* SessionPrompt.admitIfIdle(promptSvc, automation, continuationLease, {
           sessionID,
-          parts: [{ type: "text", text: continuationText }],
+          parts: [{ type: "text", text: continuationText, synthetic: true }],
         })
         if (Option.isNone(admitted)) {
           yield* goal.clearTurnDriven(sessionID)

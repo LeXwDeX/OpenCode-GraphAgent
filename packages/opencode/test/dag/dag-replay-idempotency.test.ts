@@ -82,12 +82,18 @@ describe("DagProjector: replay idempotency", () => {
         yield* setupFKs()
         const events = yield* EventV2.Service
         const dagID = "dag_replay_complete" as never
+        const receipt = { type: "file", path: "/managed/report.md", managed: true, sha256: "a".repeat(64), byte_size: 4, workflow_id: dagID, node_id: "a", child_session_id: "ses_child", replan_attempt: 0 }
 
         yield* events.publish(DagEvent.WorkflowCreated, { dagID, projectID: Project.ID.global as never, sessionID: "ses_replay" as never, title: "replay-test", config: "{}", status: "pending", timestamp: ts(0) })
         yield* events.publish(DagEvent.NodeRegistered, { dagID, nodeID: "a" as never, name: "A", workerType: "build", dependsOn: [], required: true, timestamp: ts(1) })
         yield* events.publish(DagEvent.WorkflowStarted, { dagID, timestamp: ts(2) })
         yield* events.publish(DagEvent.NodeStarted, { dagID, nodeID: "a" as never, childSessionID: "ses_child" as never, timestamp: ts(3) })
-        yield* events.publish(DagEvent.NodeCompleted, { dagID, nodeID: "a" as never, output: "done", durationMs: 0, timestamp: ts(4) })
+        const rejected = yield* events.publish(DagEvent.NodeCompleted, { dagID, nodeID: "a" as never, output: "done", capturedOutput: receipt, durationMs: 0, timestamp: ts(4) }, { commit: () => Effect.die("injected completion failure") }).pipe(Effect.exit)
+        expect(Exit.isFailure(rejected)).toBe(true)
+        const afterFailure = yield* snapshotState(dagID, ["a"])
+        expect(afterFailure.nodes[0]?.status).toBe("running")
+        expect(afterFailure.nodes[0]?.capturedOutput).toBeNull()
+        yield* events.publish(DagEvent.NodeCompleted, { dagID, nodeID: "a" as never, output: "done", capturedOutput: receipt, durationMs: 0, timestamp: ts(4) })
         yield* events.publish(DagEvent.WorkflowCompleted, { dagID, durationMs: 0, timestamp: ts(5) })
 
         const original = yield* snapshotState(dagID, ["a"])
@@ -99,6 +105,7 @@ describe("DagProjector: replay idempotency", () => {
         expect(replayed.workflowStatus).toBe("completed")
         expect(replayed.nodes[0]?.status).toBe("completed")
         expect(replayed.nodes[0]?.output).toBe("done")
+        expect(replayed.nodes[0]?.capturedOutput).toEqual(receipt)
       }).pipe(Effect.provide(projectorLayer)) as Effect.Effect<never>,
     )
   })

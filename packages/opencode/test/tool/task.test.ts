@@ -1,7 +1,7 @@
 import { afterEach, describe, expect } from "bun:test"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Database } from "@opencode-ai/core/database/database"
-import { Deferred, Effect, Exit, Fiber, Layer } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber, Layer } from "effect"
 import { Agent } from "../../src/agent/agent"
 import { BackgroundJob } from "@/background/job"
 import { EventV2Bridge } from "@/event-v2-bridge"
@@ -557,7 +557,7 @@ describe("tool.task", () => {
     }),
   )
 
-  it.instance("execute creates a child when task_id does not exist", () =>
+  it.instance("execute refuses a missing task_id without creating a replacement child", () =>
     Effect.gen(function* () {
       const sessions = yield* Session.Service
       const { chat, assistant } = yield* seed()
@@ -583,16 +583,70 @@ describe("tool.task", () => {
           metadata: () => Effect.void,
           ask: () => Effect.void,
         },
-      )
+      ).pipe(Effect.exit)
 
       const kids = yield* sessions.children(chat.id)
-      expect(kids).toHaveLength(1)
-      expect(kids[0]?.id).toBe(result.metadata.sessionId)
-      expect(result.metadata.sessionId).not.toBe("ses_missing")
-      expect(result.output).toContain(`<task id="${result.metadata.sessionId}" state="completed">`)
-      expect(seen?.sessionID).toBe(result.metadata.sessionId)
+      expect(kids).toHaveLength(0)
+      expect(seen).toBeUndefined()
+      expect(Exit.isFailure(result)).toBe(true)
+      if (Exit.isFailure(result)) expect(Cause.pretty(result.cause)).toContain("Session not found: ses_missing")
     }),
   )
+
+  for (const failure of ["defect", "interruption"] as const) {
+    it.instance(`execute preserves resume lookup ${failure} without creating a replacement child`, () =>
+      Effect.gen(function* () {
+        const sessions = yield* Session.Service
+        const { chat, assistant } = yield* seed()
+        const child = yield* sessions.create({ parentID: chat.id, title: "Existing child" })
+        const lookupError = new Error("resume database read failed")
+        let prompted = false
+        const tool = yield* TaskTool.pipe(
+          Effect.provideService(Session.Service, {
+            ...sessions,
+            get: (id) =>
+              id === child.id
+                ? failure === "defect"
+                  ? Effect.die(lookupError)
+                  : Effect.interrupt
+                : sessions.get(id),
+          }),
+        )
+        const def = yield* tool.init()
+        const result = yield* def.execute(
+          {
+            description: "resume work",
+            prompt: "continue from the previous result",
+            subagent_type: "general",
+            task_id: child.id,
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: {
+              promptOps: stubOps({
+                onPrompt: () => {
+                  prompted = true
+                },
+              }),
+            },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        ).pipe(Effect.exit)
+        expect((yield* sessions.children(chat.id)).map((item) => item.id)).toEqual([child.id])
+        expect(prompted).toBe(false)
+        expect(Exit.isFailure(result)).toBe(true)
+        if (Exit.isFailure(result)) {
+          if (failure === "interruption") expect(Cause.hasInterrupts(result.cause)).toBe(true)
+          else expect(Cause.squash(result.cause)).toBe(lookupError)
+        }
+      }),
+    )
+  }
 
   it.instance(
     "execute shapes child permissions for task, todowrite, and primary tools",
