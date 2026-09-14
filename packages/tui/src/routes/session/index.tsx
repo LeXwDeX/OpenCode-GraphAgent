@@ -15,6 +15,7 @@ import {
   useContext,
 } from "solid-js"
 import { Dynamic } from "solid-js/web"
+import { hideToolDetails, toolAttention } from "./tool-attention"
 import path from "node:path"
 import { mkdir, writeFile } from "node:fs/promises"
 import { useRoute, useRouteData } from "../../context/route"
@@ -1732,11 +1733,7 @@ function ToolPart(props: { last: boolean; part: ToolPart; message: AssistantMess
   const display = createMemo(() => toolDisplay(props.part.tool))
 
   // Hide tool if showDetails is false and tool completed successfully
-  const shouldHide = createMemo(() => {
-    if (ctx.showDetails()) return false
-    if (props.part.state.status !== "completed") return false
-    return true
-  })
+  const shouldHide = createMemo(() => hideToolDetails(props.part.tool, props.part.state, ctx.showDetails()))
 
   const toolprops = {
     get metadata() {
@@ -1814,6 +1811,7 @@ type ToolProps = {
   part: ToolPart
 }
 function GenericTool(props: ToolProps) {
+  const attention = createMemo(() => toolAttention(props.tool, props.part.state))
   const { theme } = useTheme()
   const ctx = use()
   const output = createMemo(() => props.output?.trim() ?? "")
@@ -1828,7 +1826,7 @@ function GenericTool(props: ToolProps) {
 
   return (
     <Show
-      when={props.output && ctx.showGenericToolOutput()}
+      when={attention() || (props.output && ctx.showGenericToolOutput())}
       fallback={
         <InlineTool icon="⚙" pending="Writing command..." complete={true} part={props.part}>
           {props.tool} {input(props.input)}
@@ -1836,11 +1834,12 @@ function GenericTool(props: ToolProps) {
       }
     >
       <BlockTool
-        title={`# ${props.tool} ${input(props.input)}`}
+        title={attention() ? `# ${props.tool}: blocked` : `# ${props.tool} ${input(props.input)}`}
         part={props.part}
         onClick={collapsed().overflow ? () => setExpanded((prev) => !prev) : undefined}
       >
         <box gap={1}>
+          <Show when={attention()}>{(reason) => <text fg={theme.error}>{reason()}</text>}</Show>
           <text fg={theme.text}>{limited()}</text>
           <Show when={collapsed().overflow}>
             <text fg={theme.textMuted}>{expanded() ? "Click to collapse" : "Click to expand"}</text>
