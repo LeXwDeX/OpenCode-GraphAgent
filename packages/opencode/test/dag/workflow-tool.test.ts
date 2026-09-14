@@ -1588,7 +1588,7 @@ config:
     }),
   )
 
-  missingModelRuntime.effect("start asks QA and creates nothing when no model can be resolved", () =>
+  missingModelRuntime.effect("start returns a recoverable blocker without asking the user or creating a workflow", () =>
     Effect.gen(function* () {
       published.length = 0
       questionsAsked.length = 0
@@ -1614,8 +1614,12 @@ config:
 
       expect(result.title).toBe("Workflow not started: model required")
       expect(result.metadata.workflowId).toBeUndefined()
-      expect(questionsAsked).toHaveLength(1)
-      expect(questionsAsked[0]?.question).toContain('"worker"')
+      expect(questionsAsked).toHaveLength(0)
+      expect(result.metadata.blocked).toBe(true)
+      const report = JSON.parse(result.output)
+      expect(report.workflow_created).toBe(false)
+      expect(report.recovery.max_attempts).toBe(2)
+      expect(report.errors[0].code).toBe("model.unavailable")
       expect(published).toHaveLength(0)
     }),
   )
@@ -1641,6 +1645,9 @@ config:
       const diagnostic = report.errors.find((d: { code: string }) => d.code === "model.unavailable")
       expect(diagnostic?.path).toBe("nodes[worker]")
       expect(result.title).toContain("failed")
+      expect(result.metadata.blocked).toBe(true)
+      expect(result.metadata.diagnosticSummary).toContain("model.unavailable")
+      expect(report.recovery.max_attempts).toBe(2)
     }),
   )
 
