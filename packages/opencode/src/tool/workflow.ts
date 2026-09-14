@@ -11,7 +11,6 @@ import { DagValidation, type Diagnostic } from "@/dag/validation"
 import { WorkflowAuthoring } from "@/dag/authoring"
 import { DagEnvironmentCatalogs } from "@/dag/environment-catalogs"
 import { Agent } from "@/agent/agent"
-import { Question } from "@/question"
 import { Provider } from "@/provider/provider"
 import { Session } from "@/session/session"
 import { SessionID } from "@/session/schema"
@@ -176,6 +175,8 @@ type Metadata = {
   restart?: string[]
   replace?: string[]
   graphRev?: number
+  blocked?: boolean
+  diagnosticSummary?: string
 }
 
 type AuthoringSource = Parameters<ReturnType<typeof WorkflowAuthoring.make>["prepare"]>[0]["source"]
@@ -183,14 +184,13 @@ type AuthoringSource = Parameters<ReturnType<typeof WorkflowAuthoring.make>["pre
 export const WorkflowTool = Tool.define<
   typeof Parameters,
   Metadata,
-  Dag.Service | Session.Service | Agent.Service | Question.Service | Provider.Service
+  Dag.Service | Session.Service | Agent.Service | Provider.Service
 >(
   id,
   Effect.gen(function* () {
     const dag = yield* Dag.Service
     const sessions = yield* Session.Service
     const agents = yield* Agent.Service
-    const question = yield* Question.Service
     const provider = yield* Provider.Service
 
     const requireOwnedWorkflow = Effect.fn("WorkflowTool.requireOwnedWorkflow")(function* (
@@ -209,7 +209,7 @@ export const WorkflowTool = Tool.define<
         new Error(
           `${context} rejected by workflow validation:\n${diagnostics
             .map((d) => `- [${d.code}] ${d.path}: ${d.message}${d.hint ? ` (${d.hint})` : ""}`)
-            .join("\n")}`,
+            .join("\n")}\n${WORKFLOW_RECOVERY.instruction}`,
         ),
       )
 
@@ -309,8 +309,9 @@ export const WorkflowTool = Tool.define<
                     `spec_path: ${specPath}`,
                     "The file is on disk; fix the errors by calling draft again with corrected fields. Diagnostics:",
                     ...result.errors.map((d) => `- [${d.code}] ${d.path}: ${d.message}${d.hint ? ` (${d.hint})` : ""}`),
+                    WORKFLOW_RECOVERY.instruction,
                   ].join("\n"),
-                  metadata: {},
+                  metadata: blockedMetadata(result.errors),
                 }
               }
               return {
@@ -420,7 +421,7 @@ export const WorkflowTool = Tool.define<
               return {
                 title: `Workflow validation ${result.valid ? "passed" : "failed"}: ${loaded.path} (${profile})`,
                 output: JSON.stringify(validationOutput(result), null, 2),
-                metadata: {},
+                metadata: result.valid ? {} : blockedMetadata(result.errors),
               }
             }
             case "status": {
@@ -613,33 +614,10 @@ export const WorkflowTool = Tool.define<
                 .map((diagnostic) => /^nodes\[([^\]]+)\]$/.exec(diagnostic.path)?.[1])
                 .filter((node): node is string => node !== undefined)
               if (missingModels.length > 0) {
-                yield* question
-                  .ask({
-                    sessionID,
-                    questions: [
-                      {
-                        header: "DAG model",
-                        question: `No model is available for DAG node${missingModels.length > 1 ? "s" : ""} ${missingModels.map((node) => `"${node}"`).join(", ")}. Configure the advanced/standard tiers in dag.jsonc, a model on the selected worker agent, or a parent-session model before starting. How would you like to proceed?`,
-                        custom: false,
-                        options: [
-                          {
-                            label: "Configure first",
-                            description: "Do not start the workflow; configure a model and retry.",
-                          },
-                          {
-                            label: "Cancel workflow",
-                            description: "Abandon this workflow start.",
-                          },
-                        ],
-                      },
-                    ],
-                    tool: ctx.callID ? { messageID: ctx.messageID, callID: ctx.callID } : undefined,
-                  })
-                  .pipe(Effect.orDie)
                 return {
                   title: "Workflow not started: model required",
-                  output: `No workflow was created. Missing model for: ${missingModels.join(", ")}. Configure dag.jsonc, the worker agent, or the parent session, then retry.`,
-                  metadata: {},
+                  output: JSON.stringify({ ...validationOutput(result), workflow_created: false }, null, 2),
+                  metadata: blockedMetadata(result.errors),
                 }
               }
               if (result.prepared?.action !== "start") return yield* rejectDiagnostics(result.errors, "Workflow start")
@@ -871,6 +849,20 @@ function validationOutput(result: DagValidation.ValidationResult) {
     errors: result.errors,
     warnings: result.warnings,
     nodes: result.nodes,
+    ...(!result.valid ? { recovery: WORKFLOW_RECOVERY } : {}),
+  }
+}
+
+const WORKFLOW_RECOVERY = {
+  max_attempts: 2,
+  instruction:
+    "Diagnose the reported cause and attempt only authorized, reversible recovery. Each retry requires a relevant change; never retry unchanged input or bypass validation, permissions, or model constraints. If no safe recovery exists or two attempts fail, stop and tell the user the cause, recovery attempted, actual workflow state, and available choices. Wait for their decision; never silently end or claim the workflow ran.",
+}
+
+function blockedMetadata(diagnostics: Diagnostic[]): Metadata {
+  return {
+    blocked: true,
+    diagnosticSummary: diagnostics.map((d) => `[${d.code}] ${d.message}`).join("; "),
   }
 }
 

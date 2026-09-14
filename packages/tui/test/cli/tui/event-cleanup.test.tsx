@@ -227,11 +227,16 @@ function SyncProbe(props: { onSync: (sync: ReturnType<typeof useSync>) => void }
 // Mirrors the production provider stack from src/app.tsx (same order, test
 // fixtures for config/keymap/paths/fetch). The route component is gated
 // behind a signal so the baseline can be captured before it mounts.
-async function mountRoute(view: "session" | "prompt") {
+async function mountRoute(view: "session" | "prompt", messages: unknown[] = [], hideDetails = false) {
   const tmp = await tmpdir()
-  await Bun.write(`${tmp.path}/kv.json`, "{}")
+  await Bun.write(
+    `${tmp.path}/kv.json`,
+    JSON.stringify({ tool_details_visibility: !hideDetails, generic_tool_output_visibility: false }),
+  )
   const events = createEventSource()
-  const calls = createFetch(routeFetch)
+  const calls = createFetch((url) =>
+    url.pathname === `/session/${routeSessionID}/message` ? json(messages) : routeFetch(url),
+  )
   const [mounted, setMounted] = createSignal(false)
   let sync!: ReturnType<typeof useSync>
   let counter!: () => number
@@ -321,6 +326,7 @@ async function mountRoute(view: "session" | "prompt") {
   await ready
   await wait(() => sync.status === "complete")
   return {
+    app,
     baseline: counter(),
     counter,
     mount: () => setMounted(true),
@@ -368,4 +374,69 @@ describe("real route component event cleanup", () => {
       await route.dispose()
     }
   })
+})
+
+describe("workflow failure rendering in the real session route", () => {
+  for (const legacy of [true, false]) {
+    test(`shows ${legacy ? "historical validation" : "blocked start"} with both output toggles disabled`, async () => {
+      const messages = [
+        {
+          info: {
+            id: "msg_failure",
+            sessionID: routeSessionID,
+            role: "assistant",
+            parentID: "msg_user",
+            time: { created: 1, completed: 2 },
+            agent: "build",
+            mode: "build",
+            providerID: "test",
+            modelID: "test",
+            path: { cwd: directory, root: directory },
+            cost: 0,
+            tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+            finish: "stop",
+          },
+          parts: [
+            {
+              id: "part_failure",
+              sessionID: routeSessionID,
+              messageID: "msg_failure",
+              type: "tool",
+              callID: "call_failure",
+              tool: "workflow",
+              state: {
+                status: "completed",
+                input: { params: { action: legacy ? "validate" : "start" } },
+                title: "Workflow validation failed",
+                time: { start: 1, end: 2 },
+                metadata: legacy
+                  ? {}
+                  : { blocked: true, diagnosticSummary: "[model.unavailable] unavailable worker model" },
+                output: JSON.stringify({
+                  valid: false,
+                  errors: [{ code: "model.unavailable", message: "unavailable worker model" }],
+                }),
+              },
+            },
+          ],
+        },
+      ]
+      const route = await mountRoute("session", messages, true)
+      try {
+        route.mount()
+        let frame = ""
+        for (let i = 0; i < 100; i++) {
+          await route.app.renderOnce()
+          frame = route.app.captureCharFrame()
+          if (frame.includes("model.unavailable")) break
+          await Bun.sleep(10)
+        }
+        expect(frame).toContain("workflow: blocked")
+        expect(frame).toContain("model.unavailable")
+        expect(frame).toContain("unavailable worker model")
+      } finally {
+        await route.dispose()
+      }
+    })
+  }
 })
