@@ -1,6 +1,7 @@
 import { SessionID, MessageID } from "./schema"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { ProviderV2 } from "@opencode-ai/core/provider"
+import { isContextOverflowFailure, ProviderErrorEvent } from "@opencode-ai/llm"
 import {
   APIError,
   AbortedError,
@@ -722,6 +723,10 @@ export function fromError(
         },
         { cause: e },
       ).toObject()
+    case isContextOverflowFailure(e):
+      return new ContextOverflowError({ message: errorMessage(e) }).toObject()
+    case Schema.is(ProviderErrorEvent)(e):
+      return new APIError({ message: e.message, isRetryable: e.retryable ?? false }).toObject()
     case e instanceof Error:
       return new NamedError.Unknown({ message: errorMessage(e) }, { cause: e }).toObject()
     default:

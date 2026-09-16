@@ -56,7 +56,7 @@ import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { Format } from "../../src/format"
 import { TestInstance } from "../fixture/fixture"
 import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
-import { reply, TestLLMServer } from "../lib/llm-server"
+import { raw, reply, TestLLMServer } from "../lib/llm-server"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
@@ -440,6 +440,7 @@ function foldingProviderCfg(url: string) {
   const base = providerCfg(url)
   return {
     ...base,
+    compaction: { auto: false },
     provider: {
       ...base.provider,
       test: {
@@ -453,6 +454,13 @@ function foldingProviderCfg(url: string) {
         },
       },
     },
+  }
+}
+
+function foldingAutoProviderCfg(url: string) {
+  return {
+    ...foldingProviderCfg(url),
+    compaction: { auto: true, dynamic: true },
   }
 }
 
@@ -1297,20 +1305,46 @@ it.instance("glob tool keeps instance context during prompt runs", () =>
 const contextFoldingClosedLoop = (runtime: "ai-sdk" | "native") =>
   Effect.gen(function* () {
     const { dir, llm } = yield* useServerConfig(foldingProviderCfg)
-    const prompt = yield* SessionPrompt.Service
-    const sessions = yield* Session.Service
-    const session = yield* sessions.create({
-      title: `Context folding ${runtime}`,
-      permission: [{ permission: "*", pattern: "*", action: "allow" }],
-    })
-
     const readFile = path.join(dir, "fold-read.txt")
+    const uniqueFile = path.join(dir, "fold-unique.txt")
     const grepFile = path.join(dir, "fold-grep.txt")
     const globDir = path.join(dir, "fold-glob")
+    const probeLedger = path.join(dir, "s08-probe-ledger.ndjson")
+    const probeTool = path.join(dir, ".opencode", "tools", "s08_probe.ts")
+    const uniqueMarker = `unique-tool-output-${runtime}-`
     yield* writeText(readFile, `${"read-body-abcdefghij ".repeat(1_400)}\n`)
+    yield* writeText(uniqueFile, `${uniqueMarker}${"u".repeat(4_000)}\n`)
     yield* writeText(
       grepFile,
       Array.from({ length: 40 }, (_, index) => `needle-${index}-${"g".repeat(320)}`).join("\n"),
+    )
+    yield* writeText(
+      probeTool,
+      [
+        "export default {",
+        "  description: 'S08 deterministic side-effect and lifecycle probe',",
+        "  args: { mode: { type: 'string' } },",
+        "  execute: async ({ mode }, ctx) => {",
+        "    const { appendFile } = await import('node:fs/promises')",
+        `    const ledger = ${JSON.stringify(probeLedger)}`,
+        "    await appendFile(ledger, JSON.stringify({ mode, event: 'start' }) + '\\n')",
+        "    if (mode === 'fail') throw new Error('s08 expected probe failure')",
+        "    if (mode === 'slow') {",
+        "      await new Promise((_resolve, reject) => {",
+        "        const abort = async () => {",
+        "          await appendFile(ledger, JSON.stringify({ mode, event: 'abort' }) + '\\n')",
+        "          reject(new Error('s08 probe cancelled'))",
+        "        }",
+        "        if (ctx.abort.aborted) void abort()",
+        "        else ctx.abort.addEventListener('abort', () => void abort(), { once: true })",
+        "      })",
+        "    }",
+        "    await appendFile(ledger, JSON.stringify({ mode, event: 'complete' }) + '\\n')",
+        "    return `s08-probe-${mode}-complete`",
+        "  },",
+        "}",
+        "",
+      ].join("\n"),
     )
     yield* ensureDir(globDir)
     yield* Effect.forEach(
@@ -1321,6 +1355,38 @@ const contextFoldingClosedLoop = (runtime: "ai-sdk" | "native") =>
       { concurrency: 16 },
     )
 
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const compaction = yield* SessionCompaction.Service
+    const session = yield* sessions.create({
+      title: `Context folding ${runtime}`,
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+
+    const parallelProbe = raw({
+      chunks: [
+        {
+          id: `chatcmpl-s08-${runtime}`,
+          object: "chat.completion.chunk",
+          choices: [
+            {
+              index: 0,
+              delta: {
+                role: "assistant",
+                tool_calls: ["success", "fail"].map((mode, index) => ({
+                  index,
+                  id: `call-probe-${mode}`,
+                  type: "function",
+                  function: { name: "s08_probe", arguments: JSON.stringify({ mode }) },
+                })),
+              },
+              finish_reason: "tool_calls",
+            },
+          ],
+        },
+      ],
+    })
+
     yield* prompt.prompt({
       sessionID: session.id,
       agent: "build",
@@ -1328,6 +1394,8 @@ const contextFoldingClosedLoop = (runtime: "ai-sdk" | "native") =>
       parts: [{ type: "text", text: "collect duplicate context" }],
     })
     yield* llm.push(
+      parallelProbe,
+      reply().tool("read", { filePath: uniqueFile }, "call-read-unique"),
       reply().tool("read", { filePath: readFile }, "call-read-source"),
       reply().tool("read", { filePath: readFile }, "call-read-witness"),
       reply().tool("grep", { pattern: "needle", path: grepFile }, "call-grep-source"),
@@ -1339,13 +1407,20 @@ const contextFoldingClosedLoop = (runtime: "ai-sdk" | "native") =>
     yield* prompt.loop({ sessionID: session.id })
 
     const beforeMessages = yield* MessageV2.filterCompactedEffect(session.id)
+    const probeParts = beforeMessages
+      .flatMap((message) => message.parts)
+      .filter((part): part is SessionV1.ToolPart => part.type === "tool" && part.tool === "s08_probe")
+    expect(probeParts.map((part) => ({ callID: part.callID, status: part.state.status }))).toEqual([
+      { callID: "call-probe-success", status: "completed" },
+      { callID: "call-probe-fail", status: "error" },
+    ])
     const beforeTools = beforeMessages
       .flatMap((message) => message.parts)
       .filter(
         (part): part is CompletedToolPart =>
           part.type === "tool" && part.state.status === "completed" && ["read", "grep", "glob"].includes(part.tool),
       )
-    expect(beforeTools.map((part) => part.tool)).toEqual(["read", "read", "grep", "grep", "glob", "glob"])
+    expect(beforeTools.map((part) => part.tool)).toEqual(["read", "read", "read", "grep", "grep", "glob", "glob"])
     expect(beforeTools.every((part) => part.state.metadata.contextFoldingInstructions === "none")).toBe(true)
     const persisted = beforeTools.map((part) => ({
       id: part.id,
@@ -1381,6 +1456,13 @@ const contextFoldingClosedLoop = (runtime: "ai-sdk" | "native") =>
     const outbound = JSON.stringify(hits.at(-1)?.body ?? {})
     expect(outbound).toContain("Duplicate tool output folded")
     expect((outbound.match(/Duplicate tool output folded/g) ?? []).length).toBeGreaterThanOrEqual(3)
+    expect(outbound).toContain(uniqueMarker)
+    expect(outbound).toContain("read-body-abcdefghij")
+    expect(outbound).toContain("needle-39-")
+    expect(outbound).toContain("context-folding-079-")
+    for (const witness of ["call-read-witness", "call-grep-witness", "call-glob-witness"])
+      expect(outbound).toContain(witness)
+    expect(outbound.indexOf("call-read-source")).toBeLessThan(outbound.indexOf("call-read-witness"))
 
     const afterMessages = yield* MessageV2.filterCompactedEffect(session.id)
     const afterByID = new Map(
@@ -1405,6 +1487,94 @@ const contextFoldingClosedLoop = (runtime: "ai-sdk" | "native") =>
           : undefined
       }),
     ).toEqual(persisted)
+    const probeEvents = (yield* Effect.promise(() => Bun.file(probeLedger).text()))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { mode: string; event: string })
+    expect(probeEvents.filter((event) => event.mode === "success")).toEqual(
+      expect.arrayContaining([
+        { mode: "success", event: "start" },
+        { mode: "success", event: "complete" },
+      ]),
+    )
+    expect(probeEvents.filter((event) => event.mode === "fail")).toEqual([{ mode: "fail", event: "start" }])
+    expect(probeEvents.filter((event) => event.mode === "success" && event.event === "start")).toHaveLength(1)
+    expect(probeEvents.filter((event) => event.mode === "fail" && event.event === "start")).toHaveLength(1)
+
+    const preCompactionHits = hits.length
+    yield* compaction.create({ sessionID: session.id, agent: "build", model: ref, auto: false })
+    yield* llm.text(`s08-manual-summary-${runtime}`)
+    const compacted = yield* prompt.loop({ sessionID: session.id })
+    expect(compacted.info.role).toBe("assistant")
+    const compactionHits = (yield* llm.hits).slice(preCompactionHits)
+    expect(compactionHits).toHaveLength(1)
+    expect(JSON.stringify(compactionHits[0]?.body ?? {})).not.toContain("Duplicate tool output folded")
+
+    yield* prompt.prompt({
+      sessionID: session.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "continue after the manual full compaction" }],
+    })
+    yield* llm.text(`s08-post-compaction-${runtime}`)
+    yield* prompt.loop({ sessionID: session.id })
+    const afterCompaction = JSON.stringify((yield* llm.hits).at(-1)?.body ?? {})
+    expect(afterCompaction).toContain(`s08-manual-summary-${runtime}`)
+    expect(afterCompaction).not.toContain("Duplicate tool output folded")
+
+    yield* prompt.prompt({
+      sessionID: session.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "start the cancellable lifecycle probe" }],
+    })
+    yield* llm.tool("s08_probe", { mode: "slow" })
+    const slowRun = yield* prompt.loop({ sessionID: session.id }).pipe(Effect.forkChild)
+    yield* pollWithTimeout(
+      Effect.gen(function* () {
+        if (!(yield* Effect.promise(() => Bun.file(probeLedger).exists()))) return
+        const text = yield* Effect.promise(() => Bun.file(probeLedger).text())
+        return text.includes('{"mode":"slow","event":"start"}') ? true : undefined
+      }),
+      "S08 slow probe did not start",
+      "10 seconds",
+    )
+    yield* prompt.cancel(session.id)
+    expect(Exit.isSuccess(yield* Fiber.await(slowRun))).toBe(true)
+    const cancelled = (yield* MessageV2.filterCompactedEffect(session.id))
+      .flatMap((message) => message.parts)
+      .findLast((part): part is SessionV1.ToolPart => part.type === "tool" && part.tool === "s08_probe")
+    expect(cancelled?.state.status).toBe("error")
+
+    yield* prompt.prompt({
+      sessionID: session.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "resume after cancellation" }],
+    })
+    yield* llm.text(`s08-cancel-recovered-${runtime}`)
+    const recovered = yield* prompt.loop({ sessionID: session.id })
+    expect(recovered.info.role).toBe("assistant")
+    expect(recovered.parts).toEqual(
+      expect.arrayContaining([expect.objectContaining({ type: "text", text: `s08-cancel-recovered-${runtime}` })]),
+    )
+    const finalProbeEvents = (yield* Effect.promise(() => Bun.file(probeLedger).text()))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { mode: string; event: string })
+    expect(finalProbeEvents.filter((event) => event.mode === "success" && event.event === "start")).toHaveLength(1)
+    expect(finalProbeEvents.filter((event) => event.mode === "fail" && event.event === "start")).toHaveLength(1)
+    expect(finalProbeEvents.filter((event) => event.mode === "slow" && event.event === "start")).toHaveLength(1)
+    expect(finalProbeEvents.filter((event) => event.mode === "slow" && event.event === "abort")).toHaveLength(1)
+    expect("prune" in compaction).toBe(false)
+    expect(
+      (yield* sessions.messages({ sessionID: session.id })).some((message) =>
+        message.parts.some(
+          (part) =>
+            part.type === "tool" && part.state.status === "completed" && part.state.time.compacted !== undefined,
+        ),
+      ),
+    ).toBe(false)
     expect(yield* llm.pending).toBe(0)
   })
 
@@ -1490,6 +1660,136 @@ const contextFoldingOverrideFailsClosed = (sourceKind: "custom" | "mcp") =>
     expect(yield* llm.pending).toBe(0)
   })
 
+const contextFoldingDisabledClosedLoop = (runtime: "ai-sdk" | "native") =>
+  Effect.gen(function* () {
+    const { dir, llm } = yield* useServerConfig((url) => ({
+      ...foldingProviderCfg(url),
+      compaction: { auto: false, dynamic: false },
+    }))
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({
+      title: `Context folding disabled ${runtime}`,
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    const file = path.join(dir, "fold-disabled.txt")
+    const marker = `disabled-full-output-${runtime}-`
+    yield* writeText(file, `${marker}${"d".repeat(28_000)}\n`)
+
+    yield* prompt.prompt({
+      sessionID: session.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "collect disabled duplicate context" }],
+    })
+    yield* llm.push(
+      reply().tool("read", { filePath: file }, "call-disabled-source"),
+      reply().tool("read", { filePath: file }, "call-disabled-witness"),
+      reply().text("disabled collection complete").stop(),
+    )
+    yield* prompt.loop({ sessionID: session.id })
+
+    for (let index = 0; index < 4; index++) {
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: `disabled recent protection ${index}` }],
+      })
+      yield* llm.text(`disabled-recent-${index}-${"context ".repeat(3_000)}`)
+      yield* prompt.loop({ sessionID: session.id })
+    }
+
+    yield* prompt.prompt({
+      sessionID: session.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "send disabled history unchanged" }],
+    })
+    yield* llm.text("disabled request accepted")
+    yield* prompt.loop({ sessionID: session.id })
+
+    const outbound = JSON.stringify((yield* llm.hits).at(-1)?.body ?? {})
+    expect(outbound).not.toContain("Duplicate tool output folded")
+    expect((outbound.match(new RegExp(marker, "g")) ?? []).length).toBeGreaterThanOrEqual(2)
+    const stored = (yield* MessageV2.filterCompactedEffect(session.id))
+      .flatMap((message) => message.parts)
+      .filter(
+        (part): part is CompletedToolPart =>
+          part.type === "tool" && part.tool === "read" && part.state.status === "completed",
+      )
+    expect(stored).toHaveLength(2)
+    expect(stored.every((part) => part.state.output.includes(marker))).toBe(true)
+    expect(yield* llm.pending).toBe(0)
+  })
+
+const contextFoldingOverflowLifecycle = (runtime: "ai-sdk" | "native", recovery: "success" | "terminal") =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(foldingAutoProviderCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({
+      title: `Context folding overflow ${runtime} ${recovery}`,
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+
+    for (let index = 0; index < 5; index++) {
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: `overflow seed ${index}` }],
+      })
+      yield* llm.text(`overflow-seed-${index}-${"context ".repeat(2_500)}`)
+      yield* prompt.loop({ sessionID: session.id })
+    }
+
+    yield* prompt.prompt({
+      sessionID: session.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: `trigger ${recovery} context overflow` }],
+    })
+    const before = (yield* llm.hits).length
+    yield* llm.error(413, { error: { message: "request entity too large" } })
+    if (recovery === "success") {
+      yield* llm.text(`s08-auto-summary-${runtime}`)
+      yield* llm.text(`s08-overflow-recovered-${runtime}`)
+    } else {
+      yield* llm.error(413, { error: { message: "request entity too large during summary" } })
+    }
+
+    const result = yield* prompt.loop({ sessionID: session.id })
+    const hits = (yield* llm.hits).slice(before)
+    if (recovery === "success") {
+      expect(hits).toHaveLength(3)
+      expect(JSON.stringify(hits[1]?.body ?? {})).not.toContain("Duplicate tool output folded")
+      expect(JSON.stringify(hits[2]?.body ?? {})).toContain(`s08-auto-summary-${runtime}`)
+      expect(result.info.role).toBe("assistant")
+      if (result.info.role === "assistant") {
+        expect(result.info.finish).toBe("stop")
+        expect(result.info.error).toBeUndefined()
+      }
+      expect(
+        (yield* sessions.messages({ sessionID: session.id })).some(
+          (message) => message.info.role === "assistant" && message.info.summary === true,
+        ),
+      ).toBe(true)
+    } else {
+      expect(hits).toHaveLength(2)
+      expect(result.info.role).toBe("assistant")
+      const terminal = (yield* sessions.messages({ sessionID: session.id })).findLast(
+        (message) => message.info.role === "assistant" && message.info.summary === true,
+      )
+      expect(terminal?.info.role).toBe("assistant")
+      if (terminal?.info.role === "assistant") {
+        expect(terminal.info.finish).toBe("error")
+        expect(terminal.info.error?.name).toBe("ContextOverflowError")
+      }
+    }
+    expect(yield* llm.pending).toBe(0)
+  })
+
 it.instance(
   "runs builtin read/grep/glob settlement through stored history into the next AI SDK request",
   () => contextFoldingClosedLoop("ai-sdk"),
@@ -1499,6 +1799,42 @@ it.instance(
 nativeIt.instance(
   "runs builtin read/grep/glob settlement through stored history into the next Native request",
   () => contextFoldingClosedLoop("native"),
+  30_000,
+)
+
+it.instance(
+  "keeps the full AI SDK outbound history when dynamic folding is disabled",
+  () => contextFoldingDisabledClosedLoop("ai-sdk"),
+  30_000,
+)
+
+nativeIt.instance(
+  "keeps the full Native outbound history when dynamic folding is disabled",
+  () => contextFoldingDisabledClosedLoop("native"),
+  30_000,
+)
+
+it.instance(
+  "recovers AI SDK overflow through an unprojected summary and a continued turn",
+  () => contextFoldingOverflowLifecycle("ai-sdk", "success"),
+  30_000,
+)
+
+nativeIt.instance(
+  "recovers Native overflow through an unprojected summary and a continued turn",
+  () => contextFoldingOverflowLifecycle("native", "success"),
+  30_000,
+)
+
+it.instance(
+  "terminates AI SDK overflow when the full compaction request is also rejected",
+  () => contextFoldingOverflowLifecycle("ai-sdk", "terminal"),
+  30_000,
+)
+
+nativeIt.instance(
+  "terminates Native overflow when the full compaction request is also rejected",
+  () => contextFoldingOverflowLifecycle("native", "terminal"),
   30_000,
 )
 
