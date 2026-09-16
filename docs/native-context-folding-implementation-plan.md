@@ -1,7 +1,7 @@
 # 内置动态上下文折叠：开发步骤
 
 - 日期：2026-09-16。
-- 状态：S01–S03 已通过父任务独立审计；S04–S05 已实现并完成各自分支复验，等待父任务审计；S06 已完成父审计 A01/P1 修复并等待重新审计；S07 已实现并完成当前分支复验，等待父任务独立审计；S08–S10 均未实施、未验收。
+- 状态：S01–S03 已通过父任务独立审计；S04–S05 已实现并完成各自分支复验，等待父任务审计；S06 已完成父审计 A01/P1 修复并等待重新审计；S07 已完成父审计 A01/P1 修复并等待重新审计；S08–S10 均未实施、未验收。
 - 规格依据：[开发设计与验收规格](native-context-folding-design.md)。发生冲突时先修订规格，不在实现中暗改规则。
 - 本文中的 U/I 编号对应规格第 11 节验收矩阵。
 - 初始规划阶段仅编写计划；进入实施后已按 SpecGit 2 建立 Issue #605。S01 不提交产品实现、不部署、不合并。
@@ -237,7 +237,7 @@ S02/S03 与 S04 在依赖上可分别开展；S05 与 S06 可以分别审查。�
 | S04  | 待父任务审计     | `feat/native-context-folding-s04` 当前 head（最终 SHA 见父审计记录） | [S04 证据](context-folding/evidence/S04.md) | 宿主接线及外部插件加载态/诊断仍留 S05/S07   |
 | S05  | 待父任务审计     | `f7ac15155b1e5819548baf5fe0255b8054e463b2`                           | [S05 证据](context-folding/evidence/S05.md) | 外部插件加载态与迁移诊断仍留 S07            |
 | S06  | 父审计修复待复审 | `feat/native-context-folding-s06` 当前 head（最终 SHA 见父审计记录） | [S06 证据](context-folding/evidence/S06.md) | A01/P1 已修复；S07–S10 未实施               |
-| S07  | 待父任务审计     | `feat/native-context-folding-s07` 当前 head（最终 SHA 见父审计记录） | [S07 证据](context-folding/evidence/S07.md) | S08–S10 未实施                              |
+| S07  | 父审计修复待复审 | `feat/native-context-folding-s07` 当前 head（最终 SHA 见父审计记录） | [S07 证据](context-folding/evidence/S07.md) | A01/P1 已修复；S08–S10 未实施               |
 | S08  | 未开始           | —                                                                    | —                                           | 真实宿主契约回归                            |
 | S09  | 未开始           | —                                                                    | —                                           | 质量与性能对照                              |
 | S10  | 未开始           | —                                                                    | —                                           | CI 与测试版本交付                           |

@@ -25,17 +25,23 @@ added because this repository has no existing context-folding settings surface.
 
 ## External DCP compatibility
 
-OpenCode defers its built-in folding only when the server-plugin loader has successfully applied the exact package
-`@lexwdex-org/opencode-dcp`:
+OpenCode defers its built-in folding only when the server-plugin loader identifies the exact package
+`@lexwdex-org/opencode-dcp` and that load leaves an active context-folding hook registered:
 
 - npm declarations are matched by their parsed package name;
 - file declarations require exact `package.json` name metadata;
-- configuration alone, install/import/compatibility/apply failures, substring matches, legacy single files without
-  metadata, and pure mode do not count as loaded.
+- the registered capability must be a callable `experimental.chat.messages.transform` or
+  `experimental.session.compacting` hook;
+- a successful empty plugin return, including DCP's `enabled: false` and `dtc.enabled: false` paths, keeps the built-in
+  implementation enabled and emits no migration warning;
+- configuration alone, install/import/compatibility/apply failures without a retained relevant hook, substring
+  matches, legacy single files without metadata, and pure mode do not count as active;
+- if a legacy module registers a relevant hook before a later export fails, that retained hook is still active, so the
+  built-in implementation retreats rather than running a second transformation over the same request.
 
-The first model request in each OpenCode instance emits one migration warning. Further sessions in that instance do
-not repeat it; a restarted instance may warn once again. The warning contains only the known package identity, source
-kind, and removal/restart action.
+The first model request that observes an active known DCP in each OpenCode instance emits one migration warning.
+Further sessions in that instance do not repeat it; a restarted instance may warn once again. The warning contains
+only the known package identity, source kind, and disable-or-remove/restart action.
 
 Core runner has no server-plugin loading capability. It reports external DCP state as `unknown` and never infers a
 loaded plugin. Other or unknown message-rewriting plugins are not automatically detected; operators must disable one
