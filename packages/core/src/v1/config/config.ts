@@ -152,7 +152,8 @@ export const Info = Schema.Struct({
         description: "Fold strictly duplicate older tool outputs in model requests (default: true)",
       }),
       prune: Schema.optional(Schema.Boolean).annotate({
-        description: "@deprecated Use 'dynamic'. Enable pruning of old tool outputs when dynamic is omitted.",
+        description:
+          "@deprecated Compatibility fallback for 'dynamic'. Used only when 'dynamic' is omitted to control strict duplicate-output folding in prepared model requests; original history is preserved.",
       }),
       tail_turns: Schema.optional(NonNegativeInt).annotate({
         description:
