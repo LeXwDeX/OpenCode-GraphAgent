@@ -52,6 +52,7 @@ export class Service extends Context.Service<Service, Interface>()("@opencode/v2
 type State = {
   readonly nonce: string
   readonly identities: Map<string, RecordedSource>
+  revision: number
   signature?: string
   generation?: string
 }
@@ -73,6 +74,7 @@ export const layer = Layer.effect(
     const state: State = {
       nonce: crypto.randomUUID(),
       identities: new Map(),
+      revision: 0,
     }
 
     const activate: Interface["activate"] = Effect.fn("ContextFoldingToolSourceLedger.activate")(
@@ -81,7 +83,8 @@ export const layer = Layer.effect(
         if (state.signature !== next || !state.generation) {
           state.identities.clear()
           state.signature = next
-          state.generation = Hash.sha256(`${part(state.nonce)}${part(next)}`)
+          state.revision++
+          state.generation = Hash.sha256(`${part(state.nonce)}${part(String(state.revision))}${part(next)}`)
         }
         return state.generation
       },
