@@ -84,6 +84,21 @@ function sdkKey(npm: string): string | undefined {
 }
 
 // TODO: fix this stupid inefficient dogshit function
+export function toolCallID(id: string, model: Provider.Model) {
+  if (model.api.id.includes("claude")) return id.replace(/[^a-zA-Z0-9_-]/g, "_")
+  const modelID = model.api.id.toLowerCase()
+  if (
+    model.providerID === "mistral" ||
+    ["mistral", "devstral", "codestral", "pixtral", "mixtral"].some((family) => modelID.includes(family))
+  ) {
+    return id
+      .replace(/[^a-zA-Z0-9]/g, "")
+      .substring(0, 9)
+      .padEnd(9, "0")
+  }
+  return id
+}
+
 function normalizeMessages(
   msgs: ModelMessage[],
   model: Provider.Model,
@@ -208,14 +223,13 @@ function normalizeMessages(
   }
 
   if (model.api.id.includes("claude")) {
-    const scrub = (id: string) => id.replace(/[^a-zA-Z0-9_-]/g, "_")
     msgs = msgs.map((msg) => {
       if (msg.role === "assistant" && Array.isArray(msg.content)) {
         return {
           ...msg,
           content: msg.content.map((part) => {
             if (part.type === "tool-call" || part.type === "tool-result") {
-              return { ...part, toolCallId: scrub(part.toolCallId) }
+              return { ...part, toolCallId: toolCallID(part.toolCallId, model) }
             }
             return part
           }),
@@ -226,7 +240,7 @@ function normalizeMessages(
           ...msg,
           content: msg.content.map((part) => {
             if (part.type === "tool-result") {
-              return { ...part, toolCallId: scrub(part.toolCallId) }
+              return { ...part, toolCallId: toolCallID(part.toolCallId, model) }
             }
             return part
           }),
@@ -241,12 +255,6 @@ function normalizeMessages(
     model.providerID === "mistral" ||
     ["mistral", "devstral", "codestral", "pixtral", "mixtral"].some((family) => modelID.includes(family))
   ) {
-    const scrub = (id: string) => {
-      return id
-        .replace(/[^a-zA-Z0-9]/g, "") // Remove non-alphanumeric characters
-        .substring(0, 9) // Take first 9 characters
-        .padEnd(9, "0") // Pad with zeros if less than 9 characters
-    }
     const result: ModelMessage[] = []
     for (let i = 0; i < msgs.length; i++) {
       const msg = msgs[i]
@@ -255,7 +263,7 @@ function normalizeMessages(
       if (msg.role === "assistant" && Array.isArray(msg.content)) {
         msg.content = msg.content.map((part) => {
           if (part.type === "tool-call" || part.type === "tool-result") {
-            return { ...part, toolCallId: scrub(part.toolCallId) }
+            return { ...part, toolCallId: toolCallID(part.toolCallId, model) }
           }
           return part
         })
@@ -263,7 +271,7 @@ function normalizeMessages(
       if (msg.role === "tool" && Array.isArray(msg.content)) {
         msg.content = msg.content.map((part) => {
           if (part.type === "tool-result") {
-            return { ...part, toolCallId: scrub(part.toolCallId) }
+            return { ...part, toolCallId: toolCallID(part.toolCallId, model) }
           }
           return part
         })

@@ -18,6 +18,8 @@ import {
 } from "@opencode-ai/llm"
 import type { LLMClientShape } from "@opencode-ai/llm/route"
 import { LLMNative } from "./native-request"
+import { ContextFolding, type RequestPurpose, type Snapshot as ContextFoldingSnapshot } from "../context-folding"
+import type { SystemTransmission } from "@opencode-ai/core/session/context-folding"
 
 export type RuntimeStatus =
   | { readonly type: "supported"; readonly apiKey: string; readonly baseURL?: string }
@@ -41,6 +43,12 @@ type StreamInput = {
   readonly providerOptions?: Record<string, any>
   readonly headers: Record<string, string>
   readonly abort: AbortSignal
+  readonly contextFolding?: {
+    readonly enabled: boolean
+    readonly purpose: RequestPurpose
+    readonly snapshot?: ContextFoldingSnapshot
+    readonly system: SystemTransmission
+  }
 }
 
 export function status(input: Pick<StreamInput, "model" | "provider" | "auth">): RuntimeStatus {
@@ -87,7 +95,7 @@ export function stream(input: StreamInput): StreamResult {
   // — if a field ever needs to differ between the two surfaces, the
   // translation belongs here, not split across both packages.
   const tools = nativeTools(input.tools, input)
-  const request = LLMNative.request({
+  const canonical = LLMNative.request({
     model: input.model,
     apiKey: current.apiKey,
     baseURL: current.baseURL,
@@ -100,6 +108,31 @@ export function stream(input: StreamInput): StreamResult {
     providerOptions: ProviderTransform.providerOptions(input.model, input.providerOptions ?? {}),
     headers: { ...providerHeaders(input.provider.options.headers), ...input.headers },
   })
+  const folding = input.contextFolding
+  const projection =
+    folding?.enabled && folding.snapshot && folding.purpose === "conversation"
+      ? ContextFolding.projectNative({
+          model: input.model,
+          purpose: folding.purpose,
+          snapshot: folding.snapshot,
+          request: canonical,
+          tools: input.tools,
+          toolChoice: input.toolChoice,
+          maxOutputTokens: input.maxOutputTokens,
+          params: {
+            temperature: input.temperature,
+            topP: input.topP,
+            topK: input.topK,
+            maxOutputTokens: input.maxOutputTokens,
+            providerOptions: input.providerOptions,
+          },
+          system: folding.system,
+        })
+      : undefined
+  const request =
+    projection?.applied === true
+      ? LLMRequest.update(canonical, { messages: projection.request.messages as typeof canonical.messages })
+      : canonical
   const stream = Stream.scoped(
     Stream.unwrap(
       Effect.gen(function* () {

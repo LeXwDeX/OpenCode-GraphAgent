@@ -44,7 +44,13 @@ const resolveIt = testEffect(
     pluginLayer,
     Layer.mock(Permission.Service, { ask: () => Effect.void }),
     Layer.mock(MCP.Service, { clients: () => Effect.succeed({}), tools: () => Effect.succeed({}) }),
-    Layer.mock(ToolRegistry.Service, { tools: () => Effect.succeed([memoryDefinition]) }),
+    Layer.mock(ToolRegistry.Service, {
+      tools: () => Effect.succeed([memoryDefinition]),
+      registrations: () =>
+        Effect.succeed([
+          { definition: memoryDefinition, sourceKind: "host-builtin", registrationID: "test:memory_search" },
+        ]),
+    }),
   ),
 )
 

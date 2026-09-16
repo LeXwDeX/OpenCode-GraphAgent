@@ -29,6 +29,9 @@ import * as OtelTracer from "@effect/opentelemetry/Tracer"
 import { LLMAISDK } from "./llm/ai-sdk"
 import { LLMNativeRuntime } from "./llm/native-runtime"
 import { LLMRequestPrep } from "./llm/request"
+import { ContextFolding, type RequestPurpose, type Snapshot as ContextFoldingSnapshot } from "./context-folding"
+import { ConfigCompaction } from "@opencode-ai/core/config/compaction"
+import { Flag } from "@opencode-ai/core/flag/flag"
 
 export const OUTPUT_TOKEN_MAX = ProviderTransform.OUTPUT_TOKEN_MAX
 
@@ -45,6 +48,8 @@ export type StreamInput = {
   tools: Record<string, Tool>
   retries?: number
   toolChoice?: "auto" | "required" | "none"
+  purpose?: RequestPurpose
+  contextFolding?: ContextFoldingSnapshot
 }
 
 export type StreamRequest = StreamInput & {
@@ -111,6 +116,21 @@ const live: Layer.Layer<
         flags,
         isWorkflow,
       })
+      const dynamicFolding = ConfigCompaction.resolveDynamic({
+        disabledByEnvironment: Flag.OPENCODE_DISABLE_PRUNE,
+        dynamic: cfg.compaction?.dynamic,
+        prune: cfg.compaction?.prune,
+        knownExternalDcp: "unknown",
+      })
+      const folding = {
+        enabled: dynamicFolding.enabled,
+        purpose: input.purpose ?? ("unknown" as const),
+        snapshot: input.contextFolding,
+        system:
+          prepared.params.options.instructions === undefined
+            ? ({ kind: "messages" } as const)
+            : ({ kind: "instructions", value: prepared.params.options.instructions } as const),
+      }
 
       // Wire up toolExecutor for DWS workflow models so that tool calls
       // from the workflow service are executed via opencode's tool system
@@ -239,6 +259,7 @@ const live: Layer.Layer<
           providerOptions: prepared.params.options,
           headers: prepared.headers,
           abort: input.abort,
+          contextFolding: folding,
         })
         if (native.type === "supported") {
           yield* Effect.logInfo("llm runtime selected", {
@@ -329,12 +350,28 @@ const live: Layer.Layer<
                 specificationVersion: "v3" as const,
                 async transformParams(args) {
                   if (args.type === "stream") {
-                    // @ts-expect-error
-                    args.params.prompt = ProviderTransform.message(
+                    const transformed = ProviderTransform.message(
                       args.params.prompt,
                       input.model,
                       prepared.messageTransformOptions,
                     )
+                    let outbound = transformed
+                    if (folding.enabled && folding.snapshot && folding.purpose === "conversation") {
+                      const projected = ContextFolding.projectAISDK({
+                        model: input.model,
+                        purpose: folding.purpose,
+                        snapshot: folding.snapshot,
+                        messages: transformed,
+                        tools: prepared.tools,
+                        toolChoice: input.toolChoice,
+                        maxOutputTokens: prepared.params.maxOutputTokens,
+                        params: prepared.params,
+                        system: folding.system,
+                      })
+                      if (projected.applied) outbound = projected.request.messages
+                    }
+                    // @ts-expect-error
+                    args.params.prompt = outbound
                   }
                   return args.params
                 },

@@ -441,6 +441,7 @@ export const layer = Layer.effect(
           },
         ],
         model,
+        purpose: "compaction",
       })
 
       if (result === "compact") {

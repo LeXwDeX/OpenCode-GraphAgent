@@ -35,6 +35,7 @@ import { isMedia } from "@/util/media"
 import type { SystemError } from "bun"
 import type { Provider } from "@/provider/provider"
 import { Effect, Schema } from "effect"
+import { ContextFolding } from "./context-folding"
 
 export const node = LayerNode.group([Database.node])
 
@@ -415,6 +416,8 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
     ),
   )
 })
+
+export const contextFoldingHistory = ContextFolding.history
 
 export function toModelMessages(
   input: WithParts[],
