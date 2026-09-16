@@ -1,6 +1,13 @@
 import { Hash } from "../../util/hash"
 import { normalizeParameters, type NormalizedParameters } from "./normalize"
 import { ContextFoldingPolicy } from "./policy"
+import {
+  consumeContainerEntries,
+  consumeOutputCharacters,
+  consumeString,
+  createWorkBudget,
+  type WorkBudget,
+} from "./work-budget"
 import type {
   CandidateExclusion,
   CandidateResult,
@@ -45,12 +52,12 @@ const emptyPlan = (
 const nonEmpty = (value: unknown): value is string => typeof value === "string" && value.length > 0
 const exactlyTrue = (value: unknown): value is true => value === true
 
-const normalizeComparisonMetadata = (result: CandidateResult): NormalizedParameters => {
+const normalizeComparisonMetadata = (result: CandidateResult, budget: WorkBudget): NormalizedParameters => {
   try {
     const descriptor = Object.getOwnPropertyDescriptor(result, "comparisonMetadata")
     if (!descriptor) return { ok: true, value: "absent;" }
     if (!("value" in descriptor)) return { ok: false }
-    const normalized = normalizeParameters(descriptor.value)
+    const normalized = normalizeParameters(descriptor.value, budget)
     if (!normalized.ok) return normalized
     return { ok: true, value: `present:${normalized.value}` }
   } catch {
@@ -58,7 +65,8 @@ const normalizeComparisonMetadata = (result: CandidateResult): NormalizedParamet
   }
 }
 
-const refKey = (ref: FoldRef) => JSON.stringify([ref.messageID, ref.partID, ref.callID])
+const identityPart = (value: string) => `${value.length}:${value}`
+const refKey = (ref: FoldRef) => `${identityPart(ref.messageID)}${identityPart(ref.partID)}${identityPart(ref.callID)}`
 
 const stepIDsOrEmpty = (steps: readonly FoldStep[]): readonly string[] => {
   try {
@@ -68,18 +76,31 @@ const stepIDsOrEmpty = (steps: readonly FoldStep[]): readonly string[] => {
   }
 }
 
-const validateStructure = (steps: readonly FoldStep[]): PlanSkipReason | undefined => {
+const validateStructure = (steps: readonly FoldStep[], budget: WorkBudget): PlanSkipReason | undefined => {
   if (!Array.isArray(steps)) return "invalid-structure"
+  if (steps.length > ContextFoldingPolicy.maximumSteps || !consumeContainerEntries(budget, steps.length)) {
+    return "work-limit"
+  }
 
   const stepIDs = new Set<string>()
   const refs = new Set<string>()
+  let candidateCount = 0
 
   try {
     for (const step of steps) {
       if (!nonEmpty(step.id) || stepIDs.has(step.id) || !Array.isArray(step.candidates)) return "invalid-structure"
+      if (!consumeString(budget, step.id)) return "work-limit"
       stepIDs.add(step.id)
 
       if (!Number.isSafeInteger(step.estimatedTokens) || step.estimatedTokens < 0) return "unknown-step-tokens"
+      candidateCount += step.candidates.length
+      if (
+        !Number.isSafeInteger(candidateCount) ||
+        candidateCount > ContextFoldingPolicy.maximumCandidates ||
+        !consumeContainerEntries(budget, step.candidates.length)
+      ) {
+        return "work-limit"
+      }
 
       for (const candidate of step.candidates) {
         if (
@@ -91,13 +112,20 @@ const validateStructure = (steps: readonly FoldStep[]): PlanSkipReason | undefin
         ) {
           return "invalid-structure"
         }
+        if (
+          !consumeString(budget, candidate.ref.messageID) ||
+          !consumeString(budget, candidate.ref.partID) ||
+          !consumeString(budget, candidate.ref.callID)
+        ) {
+          return "work-limit"
+        }
         const key = refKey(candidate.ref)
         if (refs.has(key)) return "invalid-structure"
         refs.add(key)
       }
     }
   } catch {
-    return "invalid-structure"
+    return budget.exceeded ? "work-limit" : "invalid-structure"
   }
 
   return undefined
@@ -165,10 +193,30 @@ const exclusionReason = (candidate: FoldCandidate): CandidateSkipReason | undefi
   return undefined
 }
 
-const exactIdentity = (prepared: PreparedCandidate): string => {
+const chargeCandidateStrings = (candidate: FoldCandidate, budget: WorkBudget) => {
+  const values = [
+    candidate.toolName,
+    candidate.source.sessionID,
+    candidate.source.assistantMessageID,
+    candidate.source.callID,
+    candidate.source.toolName,
+    candidate.source.sourceKind,
+    candidate.source.registrationID,
+    candidate.source.registrationGeneration,
+    candidate.status,
+    candidate.safety.attachments,
+    candidate.safety.instructions,
+    String(candidate.safety.providerExecuted),
+  ]
+  if (typeof candidate.targetPath === "string") values.push(candidate.targetPath)
+  if (candidate.result.kind === "text") values.push(candidate.result.text)
+  return values.every((value) => consumeString(budget, value))
+}
+
+const exactIdentity = (prepared: PreparedCandidate, budget: WorkBudget): string | undefined => {
   const { candidate, normalizedInput, normalizedResultMetadata } = prepared
   if (candidate.result.kind !== "text") throw new Error("prepared candidate must contain text")
-  return JSON.stringify([
+  const parts = [
     candidate.toolName,
     candidate.source.sessionID,
     candidate.source.sourceKind,
@@ -177,15 +225,19 @@ const exactIdentity = (prepared: PreparedCandidate): string => {
     normalizedInput,
     normalizedResultMetadata,
     candidate.result.text,
-  ])
+  ]
+  const length = parts.reduce((total, part) => total + String(part.length).length + 1 + part.length, 0)
+  if (!Number.isSafeInteger(length) || !consumeOutputCharacters(budget, length)) return undefined
+  return parts.map(identityPart).join("")
 }
 
 /**
  * Finds safe duplicate relationships without applying them. The caller remains responsible for S03 budget selection,
  * placeholder construction, mapping validation, and atomic request projection.
  */
-export const planContextFolding = (steps: readonly FoldStep[], dependencies: PlannerDependencies = {}): FoldPlan => {
-  const structureError = validateStructure(steps)
+const plan = (steps: readonly FoldStep[], dependencies: PlannerDependencies): FoldPlan => {
+  const budget = createWorkBudget(ContextFoldingPolicy.workLimits)
+  const structureError = validateStructure(steps, budget)
   if (structureError) {
     const protectedStepIDs = structureError === "unknown-step-tokens" ? stepIDsOrEmpty(steps) : []
     return emptyPlan(structureError, protectedStepIDs)
@@ -201,6 +253,7 @@ export const planContextFolding = (steps: readonly FoldStep[], dependencies: Pla
 
   for (let stepIndex = 0; stepIndex < steps.length; stepIndex++) {
     for (const candidate of steps[stepIndex].candidates) {
+      if (!chargeCandidateStrings(candidate, budget)) return emptyPlan("work-limit", protectedStepIDs, exclusions)
       const reason = exclusionReason(candidate)
       if (reason) {
         exclusions.push({ ref: copyRef(candidate.ref), reason })
@@ -211,12 +264,13 @@ export const planContextFolding = (steps: readonly FoldStep[], dependencies: Pla
       let normalizedInput: NormalizedParameters
       let normalizedResultMetadata: NormalizedParameters
       try {
-        normalizedInput = normalizeParameters(candidate.input)
-        normalizedResultMetadata = normalizeComparisonMetadata(candidate.result)
+        normalizedInput = normalizeParameters(candidate.input, budget)
+        normalizedResultMetadata = normalizeComparisonMetadata(candidate.result, budget)
       } catch {
         normalizedInput = { ok: false }
         normalizedResultMetadata = { ok: false }
       }
+      if (budget.exceeded) return emptyPlan("work-limit", protectedStepIDs, exclusions)
       if (!normalizedInput.ok || !normalizedResultMetadata.ok) {
         exclusions.push({ ref: copyRef(candidate.ref), reason: "normalization-failed" })
         sequence++
@@ -236,12 +290,23 @@ export const planContextFolding = (steps: readonly FoldStep[], dependencies: Pla
 
   const fingerprint = dependencies.fingerprint ?? Hash.sha256
   const buckets = new Map<string, Map<string, PreparedCandidate[]>>()
+  const bucketEntries = new Map<string, number>()
 
   try {
     for (const item of prepared) {
       // The fingerprint only narrows the bucket. The complete identity string (including the full body) is compared next.
-      const identity = exactIdentity(item)
+      const identity = exactIdentity(item, budget)
+      if (identity === undefined) return emptyPlan("work-limit", protectedStepIDs, exclusions)
       const hash = fingerprint(identity)
+      if (typeof hash !== "string") throw new Error("fingerprint must be a string")
+      if (hash.length > ContextFoldingPolicy.maximumFingerprintCharacters) {
+        return emptyPlan("work-limit", protectedStepIDs, exclusions)
+      }
+      const nextBucketEntries = (bucketEntries.get(hash) ?? 0) + 1
+      if (nextBucketEntries > ContextFoldingPolicy.maximumFingerprintBucketEntries) {
+        return emptyPlan("work-limit", protectedStepIDs, exclusions)
+      }
+      bucketEntries.set(hash, nextBucketEntries)
       const bucket = buckets.get(hash) ?? new Map<string, PreparedCandidate[]>()
       const group = bucket.get(identity) ?? []
       group.push(item)
@@ -249,7 +314,7 @@ export const planContextFolding = (steps: readonly FoldStep[], dependencies: Pla
       buckets.set(hash, bucket)
     }
   } catch {
-    return emptyPlan("fingerprint-failed", protectedStepIDs, exclusions)
+    return emptyPlan(budget.exceeded ? "work-limit" : "fingerprint-failed", protectedStepIDs, exclusions)
   }
 
   const replacements: Array<FoldReplacement & { readonly sequence: number }> = []
@@ -286,5 +351,13 @@ export const planContextFolding = (steps: readonly FoldStep[], dependencies: Pla
     protectedStepIDs,
     exclusions,
     skipReason: undefined,
+  }
+}
+
+export const planContextFolding = (steps: readonly FoldStep[], dependencies: PlannerDependencies = {}): FoldPlan => {
+  try {
+    return plan(steps, dependencies)
+  } catch {
+    return emptyPlan("invalid-structure")
   }
 }
