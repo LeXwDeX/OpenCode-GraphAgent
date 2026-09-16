@@ -5,7 +5,6 @@ import {
   LLMEvent,
   Model,
   PreparedRequest,
-  TransportReason,
   type LLMClientShape,
   type LLMRequest,
 } from "@opencode-ai/llm"
@@ -518,6 +517,11 @@ describe("SessionRunnerLLM hot path", () => {
     Effect.gen(function* () {
       yield* setup
       const session = yield* SessionV2.Service
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Record one side effect" }), resume: false })
+      responses = [toolTurn, textTurn("side-effect-done", "recorded")]
+      yield* session.resume(sessionID)
+      expect(executions).toEqual(["Hi"])
+
       const calls = [
         { id: "call-read-source", name: "read" as const, input: { path: "notes.txt", offset: 1, limit: 200 } },
         { id: "call-read-witness", name: "read" as const, input: { path: "notes.txt", offset: 1, limit: 200 } },
@@ -644,6 +648,40 @@ describe("SessionRunnerLLM hot path", () => {
       expect(disabledResult("call-grep-source")).toContain(grepBody)
       expect(disabledResult("call-glob-source")).toContain("/project/src/generated/000-")
       expect(JSON.stringify(outboundBodies[0])).not.toContain("Duplicate tool output folded")
+      expect(executions).toEqual(["Hi"])
+
+      const events = yield* EventV2.Service
+      const compactionID = SessionMessage.ID.create()
+      yield* events.publish(SessionEvent.Compaction.Started, {
+        sessionID,
+        messageID: compactionID,
+        timestamp: DateTime.makeUnsafe(10),
+        reason: "manual",
+      })
+      yield* events.publish(SessionEvent.Compaction.Ended, {
+        sessionID,
+        messageID: compactionID,
+        timestamp: DateTime.makeUnsafe(11),
+        reason: "manual",
+        text: "S08 manual summary",
+        recent: "",
+      })
+      yield* session.prompt({
+        sessionID,
+        prompt: Prompt.make({ text: "Continue after manual compaction" }),
+        resume: false,
+      })
+      response = textTurn("post-compaction", "continued")
+      responses = undefined
+      requests.length = 0
+      preparedBodies.length = 0
+      outboundBodies.length = 0
+      yield* session.resume(sessionID)
+
+      expect(outboundBodies).toHaveLength(1)
+      expect(JSON.stringify(outboundBodies[0])).toContain("S08 manual summary")
+      expect(JSON.stringify(outboundBodies[0])).not.toContain("Duplicate tool output folded")
+      expect(executions).toEqual(["Hi"])
     }),
   )
 
