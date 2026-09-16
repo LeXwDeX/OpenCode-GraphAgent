@@ -13,6 +13,7 @@ export type {
   ContextFoldingProjectionInput,
   ContextFoldingProjectionPlan,
   ContextFoldingProjectionResult,
+  ContextFoldingRequestFingerprintInput,
   FoldCandidate,
   FoldPlan,
   FoldRef,

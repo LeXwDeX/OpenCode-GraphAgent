@@ -143,12 +143,16 @@ export type WirePathSegment = string | number
 export type WireCallMapping = Readonly<{
   ref: FoldRef
   visibleCallID: string
+  /** Path of the actual provider-visible call ID in the final request. */
+  visibleCallIDPath: readonly WirePathSegment[]
   ordinal: number
 }>
 
 export type WireResultMapping = Readonly<{
   ref: FoldRef
   visibleCallID: string
+  /** Path of the actual provider-visible result call ID in the final request. */
+  visibleCallIDPath: readonly WirePathSegment[]
   ordinal: number
   bodyPath: readonly WirePathSegment[]
   complete: boolean
@@ -187,9 +191,18 @@ export type ContextFoldingProjectionPlan = Readonly<{
   skipReason: ProjectionSkipReason | undefined
 }>
 
+/** Immutable planning snapshot fingerprinted separately from the live request projection input. */
+export type ContextFoldingRequestFingerprintInput = Readonly<{
+  request: unknown
+  /** Current model, provider, runtime, adapter, and request-purpose identity. */
+  identity: unknown
+  /** Current limits, output reserve, system placement, messages, tools, and protocol overhead. */
+  budget: PreparedRequestBudgetInput
+}>
+
 export type ContextFoldingProjectionInput<Request> = Readonly<{
   request: Request
-  /** Serializable model/runtime/system/messages/tools identity captured when the duplicate plan was prepared. */
+  /** Current model/provider/runtime/adapter identity; request and budget are fingerprinted by the shared API itself. */
   identity: unknown
   expectedRequestFingerprint: string
   duplicatePlan: FoldPlan
