@@ -50,6 +50,20 @@ const SUPPORTED_MCP_RESOURCE_ATTACHMENT_MIMES = new Set([
 ])
 const ROOT_ONLY_TOOLS = new Set([MemorySearch.MemorySearchTool.id, TaskTool.id, "workflow"])
 
+const hookAddsInstructions = (result: TriggerResult) =>
+  (result.additionalContexts?.length ?? 0) > 0 ||
+  (result.systemMessages?.length ?? 0) > 0 ||
+  result.blocked !== undefined ||
+  result.preventContinuation === true
+
+const outputFingerprint = (value: unknown) => {
+  try {
+    return Hash.sha256(JSON.stringify(value))
+  } catch {
+    return undefined
+  }
+}
+
 export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
   agent: Agent.Info
   model: Provider.Model
@@ -187,6 +201,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
               )
               // SettingsHook PreToolUse
               let preContexts: string[] = []
+              let dynamicInstructions = false
               // Native todo surfacing (#429): once per assistant turn, before
               // any non-todowrite tool result, re-show the uncompleted list.
               const todoReminder = yield* TodoReminders.preToolCall({
@@ -250,6 +265,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
                   }
                 }
                 preContexts = preResult.additionalContexts ?? []
+                dynamicInstructions ||= hookAddsInstructions(preResult)
                 // effectiveArgs reflects any PreToolUse updatedInput rewrite (shallow merge).
                 args = decision.effectiveArgs
               }
@@ -271,13 +287,16 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
               // gate/reminder before the tool result (mirrors PostToolUse surfacing below).
               const preLines = [todoReminder, ...preContexts].filter((line): line is string => Boolean(line))
               if (preLines.length) {
+                dynamicInstructions = true
                 output.output = `${preLines.join("\n\n")}\n\n${output.output ?? ""}`
               }
+              const beforePlugin = outputFingerprint(output)
               yield* plugin.trigger(
                 "tool.execute.after",
                 { tool: item.id, sessionID: ctx.sessionID, callID: ctx.callID, args },
                 output,
               )
+              dynamicInstructions ||= beforePlugin === undefined || beforePlugin !== outputFingerprint(output)
               // SettingsHook PostToolUse
               if (settingsHook) {
                 const postResult = yield* settingsHook
@@ -295,6 +314,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
                     Effect.catch(() => Effect.succeed<TriggerResult>({ additionalContexts: [], systemMessages: [] })),
                   )
                 yield* SettingsHook.landSystemMessages(postResult, { sessionID: ctx.sessionID })
+                dynamicInstructions ||= hookAddsInstructions(postResult)
                 output.output = withHookFeedback(output.output ?? "", postResult)
               }
               if (settingsHook) {
@@ -310,8 +330,18 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
                       Effect.catch(() => Effect.succeed<TriggerResult>({ additionalContexts: [], systemMessages: [] })),
                     )
                   yield* SettingsHook.landSystemMessages(fileResult, { sessionID: ctx.sessionID })
+                  dynamicInstructions ||= hookAddsInstructions(fileResult)
                   output.output = withHookFeedback(output.output ?? "", fileResult)
                 }
+              }
+              dynamicInstructions ||=
+                output.output?.includes("<system-reminder>") ||
+                (isRecord(output.metadata) &&
+                  Array.isArray(output.metadata.loaded) &&
+                  output.metadata.loaded.length > 0)
+              output.metadata = {
+                ...(isRecord(output.metadata) ? output.metadata : {}),
+                contextFoldingInstructions: dynamicInstructions ? "dynamic" : "none",
               }
               yield* recordSettlement(item.id, options.toolCallId, registration)
               if (options.abortSignal?.aborted) {

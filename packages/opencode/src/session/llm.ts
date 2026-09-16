@@ -14,7 +14,6 @@ import { GitLabWorkflowLanguageModel } from "gitlab-ai-provider"
 import { ProviderTransform } from "@/provider/transform"
 import { Config } from "@/config/config"
 import type { Agent } from "@/agent/agent"
-import type { MessageV2 } from "./message-v2"
 import { Plugin } from "@/plugin"
 import { Permission } from "@/permission"
 import { EventV2Bridge } from "@/event-v2-bridge"
@@ -29,7 +28,11 @@ import * as OtelTracer from "@effect/opentelemetry/Tracer"
 import { LLMAISDK } from "./llm/ai-sdk"
 import { LLMNativeRuntime } from "./llm/native-runtime"
 import { LLMRequestPrep } from "./llm/request"
-import { ContextFolding, type RequestPurpose, type Snapshot as ContextFoldingSnapshot } from "./context-folding"
+import {
+  ContextFolding,
+  type HistorySnapshot as ContextFoldingHistorySnapshot,
+  type RequestPurpose,
+} from "./context-folding"
 import { ConfigCompaction } from "@opencode-ai/core/config/compaction"
 import { Flag } from "@opencode-ai/core/flag/flag"
 
@@ -49,7 +52,7 @@ export type StreamInput = {
   retries?: number
   toolChoice?: "auto" | "required" | "none"
   purpose?: RequestPurpose
-  contextFolding?: ContextFoldingSnapshot
+  contextFolding?: ContextFoldingHistorySnapshot
 }
 
 export type StreamRequest = StreamInput & {
@@ -125,7 +128,7 @@ const live: Layer.Layer<
       const folding = {
         enabled: dynamicFolding.enabled,
         purpose: input.purpose ?? ("unknown" as const),
-        snapshot: input.contextFolding,
+        history: input.contextFolding,
         system:
           prepared.params.options.instructions === undefined
             ? ({ kind: "messages" } as const)
@@ -350,18 +353,25 @@ const live: Layer.Layer<
                 specificationVersion: "v3" as const,
                 async transformParams(args) {
                   if (args.type === "stream") {
+                    const sourceMessages = ContextFolding.copyModelMessages(args.params.prompt)
                     const transformed = ProviderTransform.message(
                       args.params.prompt,
                       input.model,
                       prepared.messageTransformOptions,
                     )
                     let outbound = transformed
-                    if (folding.enabled && folding.snapshot && folding.purpose === "conversation") {
+                    const snapshot =
+                      folding.enabled && folding.history && folding.purpose === "conversation" && sourceMessages
+                        ? ContextFolding.bindModelMessages(folding.history, sourceMessages)
+                        : undefined
+                    if (snapshot) {
                       const projected = ContextFolding.projectAISDK({
                         model: input.model,
                         purpose: folding.purpose,
-                        snapshot: folding.snapshot,
+                        snapshot,
                         messages: transformed,
+                        sourceMessages: sourceMessages ?? [],
+                        messageTransformOptions: prepared.messageTransformOptions,
                         tools: prepared.tools,
                         toolChoice: input.toolChoice,
                         maxOutputTokens: prepared.params.maxOutputTokens,

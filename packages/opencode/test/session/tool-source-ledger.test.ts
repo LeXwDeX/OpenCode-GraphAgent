@@ -32,6 +32,8 @@ const assistant = (input: {
   filler?: string
   truncated?: boolean
   providerExecuted?: boolean
+  loaded?: unknown
+  instructionMarker?: "none" | "dynamic"
 }): SessionV1.WithParts => ({
   info: {
     id: input.messageID,
@@ -67,7 +69,13 @@ const assistant = (input: {
             input: { filePath: "/workspace/source.ts" },
             output: input.output ?? "same complete output",
             title: "source.ts",
-            metadata: input.truncated ? { truncated: true } : {},
+            metadata: {
+              ...(input.truncated ? { truncated: true } : {}),
+              ...(input.loaded === undefined ? { loaded: [] } : { loaded: input.loaded }),
+              ...(input.instructionMarker === undefined
+                ? { contextFoldingInstructions: "none" }
+                : { contextFoldingInstructions: input.instructionMarker }),
+            },
             time: { start: 0, end: 1 },
           },
           metadata: input.providerExecuted ? { providerExecuted: true } : undefined,
@@ -282,6 +290,59 @@ describe("session tool-source ledger", () => {
       })
       expect(providerExecuted.duplicatePlan.replacements).toEqual([])
       expect(providerExecuted.duplicatePlan.exclusions.some((item) => item.reason === "provider-executed")).toBe(true)
+    }),
+  )
+
+  it.instance("protects dynamic and unknown instruction-bearing results as both source and witness", () =>
+    Effect.gen(function* () {
+      const ledger = yield* ToolSourceLedger.Service
+      yield* registerPair(ledger)
+
+      for (const messages of [
+        [
+          assistant({
+            messageID: "msg_source",
+            partID: "prt_source",
+            callID: "call_source",
+            loaded: ["/workspace/AGENTS.md"],
+          }),
+          assistant({
+            messageID: "msg_witness",
+            partID: "prt_witness",
+            callID: "call_witness",
+            loaded: ["/workspace/AGENTS.md"],
+          }),
+        ],
+        [
+          assistant({
+            messageID: "msg_source",
+            partID: "prt_source",
+            callID: "call_source",
+            loaded: "unknown-shape",
+          }),
+          assistant({
+            messageID: "msg_witness",
+            partID: "prt_witness",
+            callID: "call_witness",
+            loaded: "unknown-shape",
+          }),
+        ],
+      ]) {
+        const result = yield* MessageV2.contextFoldingHistory({
+          messages: [
+            ...messages,
+            ...Array.from({ length: 4 }, (_, index) =>
+              assistant({ messageID: `msg_recent_${index}`, partID: `prt_recent_${index}` }),
+            ),
+          ],
+          ledger,
+        })
+        expect(result.duplicatePlan.replacements).toEqual([])
+        expect(result.duplicatePlan.exclusions.map((item) => item.reason)).toEqual([
+          "instruction-content",
+          "instruction-content",
+        ])
+      }
     }),
   )
 })

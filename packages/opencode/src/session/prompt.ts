@@ -2049,7 +2049,7 @@ export const layer = Layer.effect(
               hooksDocs,
               memoryDocs,
               modelMsgs,
-              contextFolding,
+              contextFoldingHistory,
             ] = yield* Effect.all(
               [
                 sys.skills(agent),
@@ -2090,7 +2090,7 @@ export const layer = Layer.effect(
               model,
               toolChoice: format.type === "json_schema" ? "required" : undefined,
               purpose: "conversation",
-              contextFolding,
+              contextFolding: contextFoldingHistory,
             })
 
             if (structured !== undefined) {

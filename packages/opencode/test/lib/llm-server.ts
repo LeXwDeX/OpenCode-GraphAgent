@@ -509,8 +509,7 @@ export class Reply {
     return this
   }
 
-  tool(name: string, input: unknown) {
-    const id = this.#id()
+  tool(name: string, input: unknown, id = this.#id()) {
     const args = JSON.stringify(input)
     this.#tail = [...this.#tail, toolStartLine(id, name), toolArgsLine(args)]
     return this.toolCalls()

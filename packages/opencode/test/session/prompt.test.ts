@@ -8,7 +8,7 @@ import { FetchHttpClient } from "effect/unstable/http"
 import { expect } from "bun:test"
 import { Cause, Deferred, Duration, Effect, Exit, Fiber, Layer, Option, Stream } from "effect"
 import path from "path"
-import { fileURLToPath, pathToFileURL } from "url"
+import { fileURLToPath } from "url"
 import { NamedError } from "@opencode-ai/core/util/error"
 import { Agent as AgentSvc } from "../../src/agent/agent"
 import { BackgroundJob } from "@/background/job"
@@ -62,6 +62,10 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { LocationServiceMap } from "@opencode-ai/core/location-layer"
 import { Memory } from "@/memory/memory"
+import { ToolSourceLedger } from "@/session/tool-source-ledger"
+import { Auth } from "@/auth"
+import { LLMClient, RequestExecutor, WebSocketExecutor } from "@opencode-ai/llm/route"
+import { jsonSchema, tool as aiTool, type Tool as AITool } from "ai"
 
 const summary = Layer.succeed(
   SessionSummary.Service,
@@ -114,14 +118,14 @@ function errorTool(parts: SessionV1.Part[]) {
   return part?.state.status === "error" ? (part as ErrorToolPart) : undefined
 }
 
-function makeMcp(instructions: MCP.ServerInstructions[] = []) {
+function makeMcp(instructions: MCP.ServerInstructions[] = [], tools: Record<string, AITool> = {}) {
   return Layer.succeed(
     MCP.Service,
     MCP.Service.of({
       status: () => Effect.succeed({}),
       clients: () => Effect.succeed({}),
       instructions: () => Effect.succeed(instructions),
-      tools: () => Effect.succeed({}),
+      tools: () => Effect.succeed(tools),
       prompts: () => Effect.succeed({}),
       resources: () => Effect.succeed({}),
       resourceTemplates: () => Effect.succeed({}),
@@ -260,11 +264,13 @@ const snapshotFenceAgentLayer: Layer.Layer<AgentSvc.Service> = Layer.succeed(
 
 type PromptLayerOptions = {
   mcpInstructions?: MCP.ServerInstructions[]
+  mcpTools?: Record<string, AITool>
   processor?: "blocking"
   goal?: boolean
   goalLayer?: Layer.Layer<Goal.Service>
   memoryContext?: string[]
   agentLayer?: Layer.Layer<AgentSvc.Service>
+  native?: boolean
 }
 
 function makePrompt(input?: PromptLayerOptions) {
@@ -282,12 +288,24 @@ function makePrompt(input?: PromptLayerOptions) {
     statusReason: () => Effect.succeed(undefined),
     status: () => Effect.succeed("Memory on"),
   })
+  const llmLayer = input?.native
+    ? LLM.layer.pipe(
+        Layer.provide(Auth.defaultLayer),
+        Layer.provide(Config.defaultLayer),
+        Layer.provide(ProviderSvc.defaultLayer),
+        Layer.provide(Plugin.defaultLayer),
+        Layer.provide(
+          LLMClient.layer.pipe(Layer.provide(Layer.mergeAll(RequestExecutor.defaultLayer, WebSocketExecutor.layer))),
+        ),
+        Layer.provide(RuntimeFlags.layer({ experimentalEventSystem: true, experimentalNativeLlm: true })),
+      )
+    : LLM.defaultLayer
   const deps = Layer.mergeAll(
     hookRecorderLayer,
     memoryLayer,
     Session.defaultLayer,
     Snapshot.defaultLayer,
-    LLM.defaultLayer,
+    llmLayer,
     Env.defaultLayer,
     input?.agentLayer ?? AgentSvc.defaultLayer,
     Command.defaultLayer,
@@ -296,12 +314,13 @@ function makePrompt(input?: PromptLayerOptions) {
     Config.defaultLayer,
     ProviderSvc.defaultLayer,
     lsp,
-    makeMcp(input?.mcpInstructions),
+    makeMcp(input?.mcpInstructions, input?.mcpTools),
     FSUtil.defaultLayer,
     BackgroundJob.defaultLayer,
     status,
     Database.defaultLayer,
     EventV2Bridge.defaultLayer,
+    ToolSourceLedger.defaultLayer,
   ).pipe(Layer.provideMerge(infra))
   const question = Question.layer.pipe(Layer.provideMerge(deps))
   const todo = Todo.layer.pipe(Layer.provideMerge(deps))
@@ -367,6 +386,19 @@ function makeHttpNoLLMServer(input?: PromptLayerOptions) {
 }
 
 const it = testEffect(makeHttp())
+const nativeIt = testEffect(makeHttp({ native: true }))
+const mcpOverrideMarker = `mcp-context-folding-override-${"m".repeat(24_000)}`
+const withMcpReadOverride = testEffect(
+  makeHttp({
+    mcpTools: {
+      read: aiTool({
+        description: "MCP read override",
+        inputSchema: jsonSchema({ type: "object", properties: {}, additionalProperties: false }),
+        execute: async () => ({ content: [{ type: "text" as const, text: mcpOverrideMarker }] }),
+      }),
+    },
+  }),
+)
 const noLLMServer = testEffect(makeHttpNoLLMServer())
 const raceNoLLMServer = testEffect(makeHttpNoLLMServer({ processor: "blocking" }))
 const snapshotFenceNoLLMServer = testEffect(makeHttpNoLLMServer({ agentLayer: snapshotFenceAgentLayer }))
@@ -426,6 +458,26 @@ function providerCfg(url: string) {
         options: {
           ...cfg.provider.test.options,
           baseURL: url,
+        },
+      },
+    },
+  }
+}
+
+function foldingProviderCfg(url: string) {
+  const base = providerCfg(url)
+  return {
+    ...base,
+    provider: {
+      ...base.provider,
+      test: {
+        ...base.provider.test,
+        models: {
+          ...base.provider.test.models,
+          "test-model": {
+            ...base.provider.test.models["test-model"],
+            limit: { context: 12_000, output: 1_000 },
+          },
         },
       },
     },
@@ -1268,6 +1320,226 @@ it.instance("glob tool keeps instance context during prompt runs", () =>
     expect(tool.state.output).not.toContain("No context found for instance")
     expect(result.parts.some((part) => part.type === "text" && part.text === "done")).toBe(true)
   }),
+)
+
+const contextFoldingClosedLoop = (runtime: "ai-sdk" | "native") =>
+  Effect.gen(function* () {
+    const { dir, llm } = yield* useServerConfig(foldingProviderCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({
+      title: `Context folding ${runtime}`,
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+
+    const readFile = path.join(dir, "fold-read.txt")
+    const grepFile = path.join(dir, "fold-grep.txt")
+    const globDir = path.join(dir, "fold-glob")
+    yield* writeText(readFile, `${"read-body-abcdefghij ".repeat(1_400)}\n`)
+    yield* writeText(
+      grepFile,
+      Array.from({ length: 40 }, (_, index) => `needle-${index}-${"g".repeat(320)}`).join("\n"),
+    )
+    yield* ensureDir(globDir)
+    yield* Effect.forEach(
+      Array.from({ length: 80 }, (_, index) =>
+        path.join(globDir, `context-folding-${String(index).padStart(3, "0")}-${"n".repeat(80)}.txt`),
+      ),
+      (file) => writeText(file, "glob"),
+      { concurrency: 16 },
+    )
+
+    yield* prompt.prompt({
+      sessionID: session.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "collect duplicate context" }],
+    })
+    yield* llm.push(
+      reply().tool("read", { filePath: readFile }, "call-read-source"),
+      reply().tool("read", { filePath: readFile }, "call-read-witness"),
+      reply().tool("grep", { pattern: "needle", path: grepFile }, "call-grep-source"),
+      reply().tool("grep", { pattern: "needle", path: grepFile }, "call-grep-witness"),
+      reply().tool("glob", { pattern: "**/*.txt", path: globDir }, "call-glob-source"),
+      reply().tool("glob", { pattern: "**/*.txt", path: globDir }, "call-glob-witness"),
+      reply().text("initial tool collection complete").stop(),
+    )
+    yield* prompt.loop({ sessionID: session.id })
+
+    const beforeMessages = yield* MessageV2.filterCompactedEffect(session.id)
+    const beforeTools = beforeMessages
+      .flatMap((message) => message.parts)
+      .filter(
+        (part): part is CompletedToolPart =>
+          part.type === "tool" && part.state.status === "completed" && ["read", "grep", "glob"].includes(part.tool),
+      )
+    expect(beforeTools.map((part) => part.tool)).toEqual(["read", "read", "grep", "grep", "glob", "glob"])
+    expect(beforeTools.every((part) => part.state.metadata.contextFoldingInstructions === "none")).toBe(true)
+    const persisted = beforeTools.map((part) => ({
+      id: part.id,
+      messageID: part.messageID,
+      callID: part.callID,
+      tool: part.tool,
+      input: structuredClone(part.state.input),
+      output: part.state.output,
+      metadata: structuredClone(part.state.metadata),
+    }))
+
+    for (let index = 0; index < 4; index++) {
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: `recent protection ${index}` }],
+      })
+      yield* llm.text(`recent-${index}-${"context ".repeat(3_000)}`)
+      yield* prompt.loop({ sessionID: session.id })
+    }
+
+    yield* prompt.prompt({
+      sessionID: session.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "send the next provider request" }],
+    })
+    yield* llm.text("folded request accepted")
+    yield* prompt.loop({ sessionID: session.id })
+
+    const hits = yield* llm.hits
+    const outbound = JSON.stringify(hits.at(-1)?.body ?? {})
+    expect(outbound).toContain("Duplicate tool output folded")
+    expect((outbound.match(/Duplicate tool output folded/g) ?? []).length).toBeGreaterThanOrEqual(3)
+
+    const afterMessages = yield* MessageV2.filterCompactedEffect(session.id)
+    const afterByID = new Map(
+      afterMessages
+        .flatMap((message) => message.parts)
+        .filter((part): part is CompletedToolPart => part.type === "tool" && part.state.status === "completed")
+        .map((part) => [part.id, part]),
+    )
+    expect(
+      persisted.map((item) => {
+        const part = afterByID.get(item.id)
+        return part
+          ? {
+              id: part.id,
+              messageID: part.messageID,
+              callID: part.callID,
+              tool: part.tool,
+              input: part.state.input,
+              output: part.state.output,
+              metadata: part.state.metadata,
+            }
+          : undefined
+      }),
+    ).toEqual(persisted)
+    expect(yield* llm.pending).toBe(0)
+  })
+
+const contextFoldingOverrideFailsClosed = (sourceKind: "custom" | "mcp") =>
+  Effect.gen(function* () {
+    const { dir, llm } = yield* useServerConfig(foldingProviderCfg)
+    if (sourceKind === "custom") {
+      yield* writeText(
+        path.join(dir, ".opencode", "tools", "read.ts"),
+        [
+          "export default {",
+          "  description: 'custom read override',",
+          "  args: {},",
+          `  execute: async () => ${JSON.stringify(`custom-context-folding-override-${"c".repeat(24_000)}`)},`,
+          "}",
+          "",
+        ].join("\n"),
+      )
+    }
+
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const ledger = yield* ToolSourceLedger.Service
+    const session = yield* sessions.create({
+      title: `Context folding ${sourceKind} override`,
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+
+    yield* prompt.prompt({
+      sessionID: session.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: `exercise ${sourceKind} read override` }],
+    })
+    yield* llm.push(
+      reply().tool("read", {}, `call-${sourceKind}-source`),
+      reply().tool("read", {}, `call-${sourceKind}-witness`),
+      reply().text("override collection complete").stop(),
+    )
+    yield* prompt.loop({ sessionID: session.id })
+
+    const settled = (yield* MessageV2.filterCompactedEffect(session.id))
+      .filter(
+        (message): message is SessionV1.WithParts & { info: SessionV1.Assistant } => message.info.role === "assistant",
+      )
+      .flatMap((message) =>
+        message.parts
+          .filter(
+            (part): part is CompletedToolPart =>
+              part.type === "tool" && part.tool === "read" && part.state.status === "completed",
+          )
+          .map((part) => ({ messageID: message.info.id, part })),
+      )
+    expect(settled).toHaveLength(2)
+    const identities = yield* Effect.forEach(settled, ({ messageID, part }) =>
+      ledger.lookup({ sessionID: session.id, assistantMessageID: messageID, callID: part.callID, toolName: part.tool }),
+    )
+    expect(identities.map((identity) => identity?.sourceKind)).toEqual([sourceKind, sourceKind])
+
+    for (let index = 0; index < 4; index++) {
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: `recent override protection ${index}` }],
+      })
+      yield* llm.text(`recent-override-${index}-${"context ".repeat(3_000)}`)
+      yield* prompt.loop({ sessionID: session.id })
+    }
+
+    yield* prompt.prompt({
+      sessionID: session.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "send override history unchanged" }],
+    })
+    yield* llm.text("override request accepted")
+    yield* prompt.loop({ sessionID: session.id })
+
+    const outbound = JSON.stringify((yield* llm.hits).at(-1)?.body ?? {})
+    expect(outbound).not.toContain("Duplicate tool output folded")
+    expect(outbound).toContain(`${sourceKind}-context-folding-override`)
+    expect(yield* llm.pending).toBe(0)
+  })
+
+it.instance(
+  "runs builtin read/grep/glob settlement through stored history into the next AI SDK request",
+  () => contextFoldingClosedLoop("ai-sdk"),
+  30_000,
+)
+
+nativeIt.instance(
+  "runs builtin read/grep/glob settlement through stored history into the next Native request",
+  () => contextFoldingClosedLoop("native"),
+  30_000,
+)
+
+it.instance(
+  "keeps a custom same-name read override unfolded after real settlement",
+  () => contextFoldingOverrideFailsClosed("custom"),
+  30_000,
+)
+
+withMcpReadOverride.instance(
+  "keeps an MCP same-name read override unfolded after real settlement",
+  () => contextFoldingOverrideFailsClosed("mcp"),
+  30_000,
 )
 
 it.instance("loop continues when finish is stop but assistant has tool parts", () =>

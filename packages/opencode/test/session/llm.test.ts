@@ -28,7 +28,7 @@ import { Session as SessionNs } from "@/session/session"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderError } from "@/provider/error"
-import type { ContextFolding } from "@/session/context-folding"
+import { ContextFolding } from "@/session/context-folding"
 import { Flag } from "@opencode-ai/core/flag/flag"
 
 type ConfigModel = NonNullable<NonNullable<ConfigV1.Info["provider"]>[string]["models"]>[string]
@@ -804,31 +804,45 @@ const foldingMessages = (): ModelMessage[] => [
   { role: "user", content: "Continue." },
 ]
 
-const foldingSnapshot = (): ContextFolding.Snapshot => ({
-  duplicatePlan: {
-    replacements: [
+const foldingSnapshot = (): ContextFolding.HistorySnapshot => {
+  const input = { filePath: "/workspace/source.ts" }
+  const evidence = {
+    input,
+    result: foldingBody,
+    comparisonMetadata: {
+      title: "context-folding.txt",
+      metadata: { loaded: [], contextFoldingInstructions: "none" },
+    },
+    outerMetadata: undefined,
+  }
+  return {
+    duplicatePlan: {
+      replacements: [
+        {
+          source: { messageID: "msg-fold-source", partID: "prt-fold-source", callID: "call-fold-source" },
+          witness: { messageID: "msg-fold-witness", partID: "prt-fold-witness", callID: "call-fold-witness" },
+        },
+      ],
+      protectedStepIDs: [],
+      exclusions: [],
+      skipReason: undefined,
+    },
+    references: [
       {
-        source: { messageID: "msg-fold-source", partID: "prt-fold-source", callID: "call-fold-source" },
-        witness: { messageID: "msg-fold-witness", partID: "prt-fold-witness", callID: "call-fold-witness" },
+        ref: { messageID: "msg-fold-source", partID: "prt-fold-source", callID: "call-fold-source" },
+        toolName: "read",
+        complete: true,
+        evidence,
+      },
+      {
+        ref: { messageID: "msg-fold-witness", partID: "prt-fold-witness", callID: "call-fold-witness" },
+        toolName: "read",
+        complete: true,
+        evidence,
       },
     ],
-    protectedStepIDs: [],
-    exclusions: [],
-    skipReason: undefined,
-  },
-  references: [
-    {
-      ref: { messageID: "msg-fold-source", partID: "prt-fold-source", callID: "call-fold-source" },
-      toolName: "read",
-      complete: true,
-    },
-    {
-      ref: { messageID: "msg-fold-witness", partID: "prt-fold-witness", callID: "call-fold-witness" },
-      toolName: "read",
-      complete: true,
-    },
-  ],
-})
+  }
+}
 
 const foldingTool = () =>
   tool({
