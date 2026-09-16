@@ -9,8 +9,8 @@ import { Location } from "../location"
 import { PermissionV2 } from "../permission"
 import { Ripgrep } from "../ripgrep"
 import { RelativePath } from "../schema"
+import { ContextFoldingBuiltins } from "./context-folding-builtins"
 import { Tool } from "./tool"
-import { Tools } from "./tools"
 
 export const name = "grep"
 
@@ -50,7 +50,7 @@ export const toModelOutput = (output: ModelOutput) => {
 /** Grep leaf that defaults its filesystem root to the active Location. */
 export const layer = Layer.effectDiscard(
   Effect.gen(function* () {
-    const tools = yield* Tools.Service
+    const tools = yield* ContextFoldingBuiltins.Service
     const fs = yield* FSUtil.Service
     const ripgrep = yield* Ripgrep.Service
     const location = yield* Location.Service

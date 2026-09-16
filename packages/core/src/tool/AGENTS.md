@@ -29,7 +29,7 @@ Leaves own resolution, permission, and side-effect ordering. Translate only expe
 
 ## Registration
 
-Built-ins register through `Tools.Service.register({ [name]: tool })`. Application tools register through `ApplicationTools.Service.register(...)`, exposed publicly as `opencode.tools.register(...)`.
+Most built-ins register through `Tools.Service.register({ [name]: tool })`. The shipped context-folding built-ins (`read`, `grep`, and `glob`) use the host-internal `ContextFoldingBuiltins.Service`; this capability, rather than a tool name or public `Tool.make` option, grants `host-builtin` provenance. Ordinary `Tools.Service`, `ToolRegistry.Service.register`, and `ApplicationTools.Service` registrations remain untrusted/custom even when they shadow a built-in name or declare context-folding-safe output.
 
 Both are scoped:
 

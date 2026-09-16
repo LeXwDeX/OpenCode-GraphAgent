@@ -8,8 +8,8 @@ import { Location } from "../location"
 import { Ripgrep } from "../ripgrep"
 import { RelativePath } from "../schema"
 import { PermissionV2 } from "../permission"
+import { ContextFoldingBuiltins } from "./context-folding-builtins"
 import { Tool } from "./tool"
-import { Tools } from "./tools"
 
 export const name = "glob"
 
@@ -35,7 +35,7 @@ export const toModelOutput = (output: ModelOutput) => {
 /** Glob leaf that defaults its filesystem root to the active Location. */
 export const layer = Layer.effectDiscard(
   Effect.gen(function* () {
-    const tools = yield* Tools.Service
+    const tools = yield* ContextFoldingBuiltins.Service
     const ripgrep = yield* Ripgrep.Service
     const location = yield* Location.Service
     const permission = yield* PermissionV2.Service

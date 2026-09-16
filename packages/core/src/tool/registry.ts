@@ -20,6 +20,7 @@ import {
   type RegistrationError,
 } from "./tool"
 import { Tools } from "./tools"
+import { ContextFoldingBuiltins } from "./context-folding-builtins"
 
 export type ExecuteInput = {
   readonly sessionID: SessionSchema.ID
@@ -28,10 +29,16 @@ export type ExecuteInput = {
   readonly call: ToolCall
 }
 
+type Register = (tools: Readonly<Record<string, AnyTool>>) => Effect.Effect<void, RegistrationError, Scope.Scope>
+
+const registerContextFoldingBuiltin: unique symbol = Symbol("ToolRegistry.registerContextFoldingBuiltin")
+
 export interface Interface {
   readonly materialize: (permissions?: PermissionV2.Ruleset) => Effect.Effect<Materialization>
-  /** Internal registration capability exposed publicly only through Tools.Service. */
-  readonly register: (tools: Readonly<Record<string, AnyTool>>) => Effect.Effect<void, RegistrationError, Scope.Scope>
+  /** Ordinary Location registration. It never grants host-builtin provenance. */
+  readonly register: Register
+  /** Unavailable through the ordinary string-keyed service surface; exposed only through the host-internal layer below. */
+  readonly [registerContextFoldingBuiltin]: Register
 }
 
 export interface Materialization {
@@ -60,6 +67,40 @@ const registryLayer = Layer.effect(
       readonly registrationID: string
     }
     const local = new Map<string, Array<{ readonly token: object; readonly registration: Registration }>>()
+
+    const register = (sourceKind: Registration["sourceKind"], operation: string): Register =>
+      Effect.fn(operation)(function* (tools) {
+        const entries = Object.entries(tools)
+        if (entries.length === 0) return
+        yield* Effect.forEach(entries, ([name]) => validateName(name), { discard: true })
+        yield* Effect.uninterruptible(
+          Effect.gen(function* () {
+            const token = {}
+            for (const [name, tool] of entries)
+              local.set(name, [
+                ...(local.get(name) ?? []),
+                {
+                  token,
+                  registration: {
+                    identity: {},
+                    tool,
+                    sourceKind,
+                    registrationID: crypto.randomUUID(),
+                  },
+                },
+              ])
+            yield* Effect.addFinalizer(() =>
+              Effect.sync(() => {
+                for (const [name] of entries) {
+                  const registrations = local.get(name)?.filter((registration) => registration.token !== token) ?? []
+                  if (registrations.length > 0) local.set(name, registrations)
+                  else local.delete(name)
+                }
+              }),
+            )
+          }),
+        )
+      })
 
     const settleWith = Effect.fn("ToolRegistry.settle")(function* (
       input: ExecuteInput,
@@ -117,38 +158,8 @@ const registryLayer = Layer.effect(
     })
 
     return Service.of({
-      register: Effect.fn("ToolRegistry.register")(function* (tools) {
-        const entries = Object.entries(tools)
-        if (entries.length === 0) return
-        yield* Effect.forEach(entries, ([name]) => validateName(name), { discard: true })
-        yield* Effect.uninterruptible(
-          Effect.gen(function* () {
-            const token = {}
-            for (const [name, tool] of entries)
-              local.set(name, [
-                ...(local.get(name) ?? []),
-                {
-                  token,
-                  registration: {
-                    identity: {},
-                    tool,
-                    sourceKind: "host-builtin",
-                    registrationID: crypto.randomUUID(),
-                  },
-                },
-              ])
-            yield* Effect.addFinalizer(() =>
-              Effect.sync(() => {
-                for (const [name] of entries) {
-                  const registrations = local.get(name)?.filter((registration) => registration.token !== token) ?? []
-                  if (registrations.length > 0) local.set(name, registrations)
-                  else local.delete(name)
-                }
-              }),
-            )
-          }),
-        )
-      }),
+      register: register("custom", "ToolRegistry.register"),
+      [registerContextFoldingBuiltin]: register("host-builtin", "ToolRegistry.registerContextFoldingBuiltin"),
       materialize: Effect.fn("ToolRegistry.materialize")(function* (permissions = []) {
         const registrations = new Map<string, Registration>(applications.entries())
         for (const [name, entries] of local) {
@@ -181,9 +192,17 @@ const registryLayer = Layer.effect(
 
 const ledgerRegistryLayer = registryLayer.pipe(Layer.provideMerge(ContextFoldingToolSourceLedger.layer))
 
-export const layer = Layer.effect(
-  Tools.Service,
-  Service.use((registry) => Effect.succeed(Tools.Service.of({ register: registry.register }))),
+export const layer = Layer.mergeAll(
+  Layer.effect(
+    Tools.Service,
+    Service.use((registry) => Effect.succeed(Tools.Service.of({ register: registry.register }))),
+  ),
+  Layer.effect(
+    ContextFoldingBuiltins.Service,
+    Service.use((registry) =>
+      Effect.succeed(ContextFoldingBuiltins.Service.of({ register: registry[registerContextFoldingBuiltin] })),
+    ),
+  ),
 ).pipe(Layer.provideMerge(ledgerRegistryLayer))
 
 function whollyDisabled(action: string, rules: PermissionV2.Ruleset) {

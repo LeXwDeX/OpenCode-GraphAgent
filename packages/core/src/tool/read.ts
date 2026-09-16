@@ -9,7 +9,7 @@ import { PermissionV2 } from "../permission"
 import { AbsolutePath } from "../schema"
 import { ReadToolFileSystem } from "./read-filesystem"
 import { Tool } from "./tool"
-import { Tools } from "./tools"
+import { ContextFoldingBuiltins } from "./context-folding-builtins"
 
 export const name = "read"
 const SUPPORTED_IMAGE_MIMES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"])
@@ -27,7 +27,7 @@ const Output = Schema.Union([FileSystem.Content, ReadToolFileSystem.TextPage, Re
 
 export const layer = Layer.effectDiscard(
   Effect.gen(function* () {
-    const tools = yield* Tools.Service
+    const tools = yield* ContextFoldingBuiltins.Service
     const reader = yield* ReadToolFileSystem.Service
     const mutation = yield* LocationMutation.Service
     const image = yield* Image.Service
