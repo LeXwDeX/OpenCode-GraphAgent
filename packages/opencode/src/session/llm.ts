@@ -35,6 +35,7 @@ import {
 } from "./context-folding"
 import { ConfigCompaction } from "@opencode-ai/core/config/compaction"
 import { Flag } from "@opencode-ai/core/flag/flag"
+import { contextFoldingDiagnostic, type ContextFoldingProjectionPlan } from "@opencode-ai/core/session/context-folding"
 
 export const OUTPUT_TOKEN_MAX = ProviderTransform.OUTPUT_TOKEN_MAX
 
@@ -119,11 +120,12 @@ const live: Layer.Layer<
         flags,
         isWorkflow,
       })
+      const compatibility = yield* plugin.contextFoldingCompatibility()
       const dynamicFolding = ConfigCompaction.resolveDynamic({
         disabledByEnvironment: Flag.OPENCODE_DISABLE_PRUNE,
         dynamic: cfg.compaction?.dynamic,
         prune: cfg.compaction?.prune,
-        knownExternalDcp: "unknown",
+        knownExternalDcp: compatibility.knownExternalDcp,
       })
       const folding = {
         enabled: dynamicFolding.enabled,
@@ -265,6 +267,16 @@ const live: Layer.Layer<
           contextFolding: folding,
         })
         if (native.type === "supported") {
+          yield* Effect.logInfo(
+            "context folding",
+            contextFoldingDiagnostic({
+              runtime: "opencode-native",
+              requestPurpose: folding.purpose,
+              resolution: dynamicFolding,
+              duplicatePlan: folding.history?.duplicatePlan,
+              projectionPlan: native.contextFoldingPlan,
+            }),
+          )
           yield* Effect.logInfo("llm runtime selected", {
             "llm.runtime": "native",
             "llm.provider": input.model.providerID,
@@ -360,6 +372,7 @@ const live: Layer.Layer<
                       prepared.messageTransformOptions,
                     )
                     let outbound = transformed
+                    let projectionPlan: ContextFoldingProjectionPlan | undefined
                     const snapshot =
                       folding.enabled && folding.history && folding.purpose === "conversation" && sourceMessages
                         ? ContextFolding.bindModelMessages(folding.history, sourceMessages)
@@ -378,8 +391,21 @@ const live: Layer.Layer<
                         params: prepared.params,
                         system: folding.system,
                       })
+                      projectionPlan = projected.plan
                       if (projected.applied) outbound = projected.request.messages
                     }
+                    await bridge.promise(
+                      Effect.logInfo(
+                        "context folding",
+                        contextFoldingDiagnostic({
+                          runtime: "opencode-ai-sdk",
+                          requestPurpose: folding.purpose,
+                          resolution: dynamicFolding,
+                          duplicatePlan: folding.history?.duplicatePlan,
+                          projectionPlan,
+                        }),
+                      ),
+                    )
                     // @ts-expect-error
                     args.params.prompt = outbound
                   }

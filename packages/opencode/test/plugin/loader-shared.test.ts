@@ -43,6 +43,9 @@ function load(dir: string, flags?: Parameters<typeof RuntimeFlags.layer>[0]) {
     return yield* Effect.gen(function* () {
       const plugin = yield* Plugin.Service
       yield* plugin.list()
+      const first = yield* plugin.contextFoldingCompatibility()
+      const second = yield* plugin.contextFoldingCompatibility()
+      return { first, second }
     }).pipe(
       Effect.provide(
         Plugin.layer.pipe(
@@ -66,6 +69,136 @@ function load(dir: string, flags?: Parameters<typeof RuntimeFlags.layer>[0]) {
 }
 
 describe("plugin.loader.shared", () => {
+  it.live("defers built-in folding only after the exact npm DCP package applies and notifies once per instance", () =>
+    withTmp(
+      async (dir) => {
+        const mod = path.join(dir, "mods", "dcp")
+        await fs.mkdir(mod, { recursive: true })
+        await Bun.write(
+          path.join(mod, "package.json"),
+          JSON.stringify({
+            name: "@lexwdex-org/opencode-dcp",
+            type: "module",
+            exports: { "./server": "./server.js" },
+          }),
+        )
+        await Bun.write(path.join(mod, "server.js"), "export default async () => ({})\n")
+        await Bun.write(
+          path.join(dir, "opencode.json"),
+          JSON.stringify({ plugin: ["@lexwdex-org/opencode-dcp@6.0.3"] }),
+        )
+        return { mod }
+      },
+      (tmp) =>
+        Effect.gen(function* () {
+          const install = spyOn(Npm, "add").mockResolvedValue({ directory: tmp.extra.mod, entrypoint: undefined })
+          try {
+            expect(yield* load(tmp.path)).toEqual({
+              first: { knownExternalDcp: "loaded", migrationNotice: "notified" },
+              second: { knownExternalDcp: "loaded", migrationNotice: "already-notified" },
+            })
+            yield* Effect.promise(() => disposeAllInstances())
+            expect(yield* load(tmp.path)).toEqual({
+              first: { knownExternalDcp: "loaded", migrationNotice: "notified" },
+              second: { knownExternalDcp: "loaded", migrationNotice: "already-notified" },
+            })
+          } finally {
+            install.mockRestore()
+          }
+        }),
+    ),
+  )
+
+  it.live("recognizes an exact file package only after apply succeeds", () =>
+    withTmp(
+      async (dir) => {
+        const file = path.join(dir, "server.js")
+        await Bun.write(
+          path.join(dir, "package.json"),
+          JSON.stringify({ name: "@lexwdex-org/opencode-dcp", type: "module" }),
+        )
+        await Bun.write(file, "export default async () => ({})\n")
+        await Bun.write(path.join(dir, "opencode.json"), JSON.stringify({ plugin: [pathToFileURL(file).href] }))
+      },
+      (tmp) =>
+        Effect.gen(function* () {
+          expect(yield* load(tmp.path)).toEqual({
+            first: { knownExternalDcp: "loaded", migrationNotice: "notified" },
+            second: { knownExternalDcp: "loaded", migrationNotice: "already-notified" },
+          })
+        }),
+    ),
+  )
+
+  it.live("does not infer DCP from substrings, missing metadata, apply failures, install failures, or pure mode", () =>
+    withTmp(
+      async (dir) => {
+        const exact = path.join(dir, "exact")
+        const substring = path.join(dir, "substring")
+        const legacy = path.join(dir, "legacy-dcp.js")
+        await fs.mkdir(exact, { recursive: true })
+        await fs.mkdir(substring, { recursive: true })
+        await Bun.write(
+          path.join(exact, "package.json"),
+          JSON.stringify({
+            name: "@lexwdex-org/opencode-dcp",
+            type: "module",
+            exports: { "./server": "./server.js" },
+          }),
+        )
+        await Bun.write(path.join(exact, "server.js"), 'export default async () => { throw new Error("boom") }\n')
+        await Bun.write(
+          path.join(substring, "package.json"),
+          JSON.stringify({
+            name: "not-@lexwdex-org/opencode-dcp-copy",
+            type: "module",
+            exports: { "./server": "./server.js" },
+          }),
+        )
+        await Bun.write(path.join(substring, "server.js"), "export default async () => ({})\n")
+        await Bun.write(legacy, "export default async () => ({})\n")
+        return { exact, substring, legacy }
+      },
+      (tmp) =>
+        Effect.gen(function* () {
+          const install = spyOn(Npm, "add").mockImplementation(async (pkg) => {
+            if (pkg.startsWith("@lexwdex-org/opencode-dcp"))
+              return { directory: tmp.extra.exact, entrypoint: undefined }
+            if (pkg.startsWith("not-dcp")) return { directory: tmp.extra.substring, entrypoint: undefined }
+            throw new Error("install failed")
+          })
+          try {
+            for (const test of [
+              { plugin: ["@lexwdex-org/opencode-dcp@6.0.3"] },
+              { plugin: ["not-dcp@1.0.0"] },
+              { plugin: ["missing-dcp@1.0.0"] },
+              { plugin: [pathToFileURL(tmp.extra.legacy).href] },
+            ]) {
+              yield* Effect.promise(() => Bun.write(path.join(tmp.path, "opencode.json"), JSON.stringify(test)))
+              expect(yield* load(tmp.path)).toEqual({
+                first: { knownExternalDcp: "unknown", migrationNotice: "not-applicable" },
+                second: { knownExternalDcp: "unknown", migrationNotice: "not-applicable" },
+              })
+              yield* Effect.promise(() => disposeAllInstances())
+            }
+
+            yield* Effect.promise(() =>
+              Bun.write(
+                path.join(tmp.path, "opencode.json"),
+                JSON.stringify({ plugin: ["@lexwdex-org/opencode-dcp@6.0.3"] }),
+              ),
+            )
+            expect(yield* load(tmp.path, { pure: true })).toEqual({
+              first: { knownExternalDcp: "unknown", migrationNotice: "not-applicable" },
+              second: { knownExternalDcp: "unknown", migrationNotice: "not-applicable" },
+            })
+          } finally {
+            install.mockRestore()
+          }
+        }),
+    ),
+  )
+
   it.live("loads a file:// plugin function export", () =>
     withTmp(
       async (dir) => {

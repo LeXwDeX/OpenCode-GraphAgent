@@ -33,6 +33,7 @@ import { ApplicationTools } from "@opencode-ai/core/tool/application-tools"
 import { AgentV2 } from "@opencode-ai/core/agent"
 import { Config } from "@opencode-ai/core/config"
 import { ConfigAgent } from "@opencode-ai/core/config/agent"
+import { ConfigCompaction } from "@opencode-ai/core/config/compaction"
 import { Tool } from "@opencode-ai/core/tool/tool"
 import { ReadTool } from "@opencode-ai/core/tool/read"
 import { ReadToolFileSystem } from "@opencode-ai/core/tool/read-filesystem"
@@ -621,6 +622,28 @@ describe("SessionRunnerLLM hot path", () => {
       expect(result("call-grep-witness")).toContain(grepBody)
       expect(result("call-glob-source")).toBe(placeholder("call-glob-witness"))
       expect(result("call-glob-witness")).toContain("/project/src/generated/000-")
+
+      configEntries = [
+        new Config.Document({
+          type: "document",
+          info: new Config.Info({ compaction: new ConfigCompaction.Info({ dynamic: false }) }),
+        }),
+      ]
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Final answer without folding" }), resume: false })
+      response = textTurn("final-answer-disabled", "complete")
+      requests.length = 0
+      preparedBodies.length = 0
+      outboundBodies.length = 0
+      yield* session.resume(sessionID)
+
+      expect(outboundBodies).toHaveLength(1)
+      const disabledMessages = outboundMessages(outboundBodies[0])
+      const disabledResult = (id: string) =>
+        disabledMessages.find((message) => message.role === "tool" && message.tool_call_id === id)?.content
+      expect(JSON.parse(disabledResult("call-read-source") ?? "null")).toMatchObject({ content: readBody })
+      expect(disabledResult("call-grep-source")).toContain(grepBody)
+      expect(disabledResult("call-glob-source")).toContain("/project/src/generated/000-")
+      expect(JSON.stringify(outboundBodies[0])).not.toContain("Duplicate tool output folded")
     }),
   )
 

@@ -24,12 +24,17 @@ import {
   type RequestPurpose,
 } from "../context-folding"
 import type { SystemTransmission } from "@opencode-ai/core/session/context-folding"
+import type { ContextFoldingProjectionPlan } from "@opencode-ai/core/session/context-folding"
 
 export type RuntimeStatus =
   | { readonly type: "supported"; readonly apiKey: string; readonly baseURL?: string }
   | { readonly type: "unsupported"; readonly reason: string }
 export type StreamResult =
-  | { readonly type: "supported"; readonly stream: Stream.Stream<LLMEvent, unknown> }
+  | {
+      readonly type: "supported"
+      readonly stream: Stream.Stream<LLMEvent, unknown>
+      readonly contextFoldingPlan: ContextFoldingProjectionPlan | undefined
+    }
   | { readonly type: "unsupported"; readonly reason: string }
 
 type StreamInput = {
@@ -198,6 +203,7 @@ export function stream(input: StreamInput): StreamResult {
 
   return {
     ...current,
+    contextFoldingPlan: projection?.plan,
     stream: fetch ? stream.pipe(Stream.provideService(FetchHttpClient.Fetch, fetch)) : stream,
   }
 }

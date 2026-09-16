@@ -1410,7 +1410,7 @@ describe("session.llm.stream", () => {
   )
 
   it.instance(
-    "folds only the AI SDK outbound wire request and keeps caller messages unchanged",
+    "folds only the AI SDK outbound wire request when automatic full compaction is disabled",
     () =>
       Effect.gen(function* () {
         const model = loadFixture(foldingFixture.providerID, foldingFixture.modelID).model
@@ -1454,7 +1454,7 @@ describe("session.llm.stream", () => {
         expect(wire).toContain(foldingBody)
         expect(JSON.stringify(messages)).toBe(before)
       }),
-    { config: foldingConfig },
+    { config: () => ({ ...foldingConfig(), compaction: { auto: false } }) },
   )
 
   it.instance(
@@ -1681,6 +1681,61 @@ describe("session.llm.stream", () => {
         expect(JSON.stringify(messages)).toBe(before)
       }),
     { config: foldingConfig },
+  )
+
+  it.instance(
+    "keeps Native canonical output unchanged when dynamic folding is disabled",
+    () =>
+      Effect.gen(function* () {
+        const model = loadFixture(foldingFixture.providerID, foldingFixture.modelID).model
+        const request = waitRequest("/chat/completions", foldingResponse())
+        const resolved = yield* Provider.use.getModel(
+          ProviderV2.ID.make(foldingFixture.providerID),
+          ModelV2.ID.make(model.id),
+        )
+        const sessionID = SessionID.make("session-test-folding-native-disabled")
+        const agent = {
+          name: "test",
+          mode: "primary",
+          options: {},
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        } satisfies Agent.Info
+
+        yield* drainWith(
+          llmLayerWithExecutor(RequestExecutor.defaultLayer, {
+            experimentalNativeLlm: true,
+            outputTokenMax: 8_192,
+          }),
+          {
+            user: {
+              id: MessageID.make("msg_user-folding-native-disabled"),
+              sessionID,
+              role: "user",
+              time: { created: Date.now() },
+              agent: agent.name,
+              model: { providerID: ProviderV2.ID.make(foldingFixture.providerID), modelID: resolved.id },
+            } satisfies SessionV1.User,
+            sessionID,
+            model: resolved,
+            agent,
+            system: [],
+            messages: foldingMessages(),
+            tools: { read: foldingTool() },
+            purpose: "conversation",
+            contextFolding: foldingSnapshot(),
+          },
+        )
+
+        const wire = JSON.stringify((yield* Effect.promise(() => request)).body)
+        expect(wire).not.toContain("Duplicate tool output folded")
+        expect(wire.match(new RegExp(foldingBody.slice(0, 100), "g"))?.length).toBeGreaterThanOrEqual(2)
+      }),
+    {
+      config: () => ({
+        ...foldingConfig(),
+        compaction: { dynamic: false },
+      }),
+    },
   )
 
   it.instance(
