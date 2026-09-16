@@ -1,0 +1,366 @@
+import { Hash } from "../../util/hash"
+import { Token } from "../../util/token"
+import { estimateContextFoldingBudget } from "./budget"
+import { ContextFoldingPolicy } from "./policy"
+import type {
+  ContextFoldingProjectionInput,
+  ContextFoldingProjectionPlan,
+  ContextFoldingProjectionResult,
+  FoldRef,
+  ProjectionDependencies,
+  ProjectionSkipReason,
+  SelectedFoldReplacement,
+  WirePathSegment,
+  WireProjectionSnapshot,
+  WireResultMapping,
+} from "./types"
+import { cloneWireValue, readWirePath, serializeWireValue, writeWirePath } from "./wire-value"
+import { consumeContainerEntries, consumeString, createWorkBudget, type WorkBudget } from "./work-budget"
+
+const PLACEHOLDER_PREFIX = "[Duplicate tool output folded. Identical full output is retained in later tool call "
+const PLACEHOLDER_SUFFIX = ".]"
+
+const refKey = (ref: FoldRef) => JSON.stringify([ref.messageID, ref.partID, ref.callID])
+const pathKey = (path: readonly WirePathSegment[]) =>
+  JSON.stringify(path.map((segment) => [typeof segment === "number" ? "n" : "s", segment]))
+
+const emptyProjectionPlan = (
+  skipReason: ProjectionSkipReason,
+  budget?: ReturnType<typeof estimateContextFoldingBudget>,
+): ContextFoldingProjectionPlan => ({
+  replacements: [],
+  estimatedBefore: budget?.estimatedInputTokens,
+  estimatedAfter: budget?.estimatedInputTokens,
+  targetTokens: budget?.targetTokens,
+  overBudget: budget?.overBudget,
+  skipReason,
+})
+
+const unchanged = <Request>(
+  request: Request,
+  skipReason: ProjectionSkipReason,
+  budget?: ReturnType<typeof estimateContextFoldingBudget>,
+): ContextFoldingProjectionResult<Request> => ({
+  request,
+  applied: false,
+  plan: emptyProjectionPlan(skipReason, budget),
+})
+
+const validRef = (ref: FoldRef) =>
+  !!ref &&
+  typeof ref.messageID === "string" &&
+  ref.messageID.length > 0 &&
+  typeof ref.partID === "string" &&
+  ref.partID.length > 0 &&
+  typeof ref.callID === "string" &&
+  ref.callID.length > 0
+
+const utf8BytesAtMost = (value: string, limit: number) => {
+  if (value.length > limit) return false
+  let bytes = 0
+  for (let index = 0; index < value.length; index++) {
+    const code = value.charCodeAt(index)
+    if (code <= 0x7f) bytes += 1
+    else if (code <= 0x7ff) bytes += 2
+    else if (code >= 0xd800 && code <= 0xdbff && index + 1 < value.length) {
+      const next = value.charCodeAt(index + 1)
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        bytes += 4
+        index++
+      } else bytes += 3
+    } else bytes += 3
+    if (bytes > limit) return false
+  }
+  return true
+}
+
+const placeholder = (visibleCallID: string) => {
+  if (visibleCallID.length === 0 || !utf8BytesAtMost(visibleCallID, ContextFoldingPolicy.maximumVisibleCallIDBytes)) {
+    return undefined
+  }
+  return `${PLACEHOLDER_PREFIX}${JSON.stringify(visibleCallID)}${PLACEHOLDER_SUFFIX}`
+}
+
+export const fingerprintContextFoldingRequest = (identity: unknown) => {
+  const serialized = serializeWireValue(identity)
+  if (!serialized.ok) return serialized
+  return {
+    ok: true as const,
+    value: Hash.sha256(serialized.value),
+    inputBytes: serialized.inputBytes,
+  }
+}
+
+type ValidatedReplacement = SelectedFoldReplacement &
+  Readonly<{
+    sourcePath: readonly WirePathSegment[]
+    witnessPath: readonly WirePathSegment[]
+    sourceBody: string
+    witnessBody: string
+    sourceOrdinal: number
+  }>
+
+type MappingValidation =
+  | Readonly<{ ok: true; replacements: readonly ValidatedReplacement[] }>
+  | Readonly<{ ok: false; reason: "already-projected" | "invalid-reference" | "mapping-mismatch" | "work-limit" }>
+
+const validOrdinal = (value: number) => Number.isSafeInteger(value) && value >= 0
+
+const consumeRef = (ref: FoldRef, budget: WorkBudget) =>
+  consumeString(budget, ref.messageID) && consumeString(budget, ref.partID) && consumeString(budget, ref.callID)
+
+const consumePath = (path: readonly WirePathSegment[], budget: WorkBudget) =>
+  consumeContainerEntries(budget, path.length) &&
+  path.every((segment) => typeof segment !== "string" || consumeString(budget, segment))
+
+const validateMapping = <Request>(
+  request: Request,
+  snapshot: WireProjectionSnapshot,
+  replacements: ContextFoldingProjectionInput<Request>["duplicatePlan"]["replacements"],
+): MappingValidation => {
+  if (!Array.isArray(snapshot.calls) || !Array.isArray(snapshot.results))
+    return { ok: false, reason: "mapping-mismatch" }
+  if (
+    snapshot.calls.length > ContextFoldingPolicy.maximumCandidates ||
+    snapshot.results.length > ContextFoldingPolicy.maximumCandidates ||
+    replacements.length > ContextFoldingPolicy.maximumCandidates
+  ) {
+    return { ok: false, reason: "work-limit" }
+  }
+
+  const budget = createWorkBudget(ContextFoldingPolicy.workLimits)
+  if (!consumeContainerEntries(budget, snapshot.calls.length + snapshot.results.length + replacements.length)) {
+    return { ok: false, reason: "work-limit" }
+  }
+
+  const callsByRef = new Map<string, (typeof snapshot.calls)[number]>()
+  const callsByID = new Set<string>()
+  const callOrdinals = new Set<number>()
+  for (const call of snapshot.calls) {
+    if (
+      !validRef(call.ref) ||
+      typeof call.visibleCallID !== "string" ||
+      call.visibleCallID.length === 0 ||
+      !validOrdinal(call.ordinal)
+    ) {
+      return { ok: false, reason: "mapping-mismatch" }
+    }
+    if (!consumeRef(call.ref, budget) || !consumeString(budget, call.visibleCallID)) {
+      return { ok: false, reason: "work-limit" }
+    }
+    const key = refKey(call.ref)
+    if (callsByRef.has(key) || callsByID.has(call.visibleCallID) || callOrdinals.has(call.ordinal)) {
+      return { ok: false, reason: "mapping-mismatch" }
+    }
+    callsByRef.set(key, call)
+    callsByID.add(call.visibleCallID)
+    callOrdinals.add(call.ordinal)
+  }
+
+  const resultsByRef = new Map<string, WireResultMapping>()
+  const resultsByID = new Set<string>()
+  const resultOrdinals = new Set<number>()
+  const paths = new Set<string>()
+  for (const result of snapshot.results) {
+    if (
+      !validRef(result.ref) ||
+      typeof result.visibleCallID !== "string" ||
+      result.visibleCallID.length === 0 ||
+      !validOrdinal(result.ordinal) ||
+      (result.complete !== true && result.complete !== false) ||
+      !Array.isArray(result.bodyPath) ||
+      result.bodyPath.length === 0 ||
+      result.bodyPath.length > ContextFoldingPolicy.workLimits.maxDepth ||
+      result.bodyPath.some(
+        (segment: unknown) =>
+          (typeof segment !== "string" && typeof segment !== "number") ||
+          (typeof segment === "number" && (!Number.isSafeInteger(segment) || segment < 0)),
+      )
+    ) {
+      return { ok: false, reason: "mapping-mismatch" }
+    }
+    if (
+      !consumeRef(result.ref, budget) ||
+      !consumeString(budget, result.visibleCallID) ||
+      !consumePath(result.bodyPath, budget)
+    ) {
+      return { ok: false, reason: "work-limit" }
+    }
+    const key = refKey(result.ref)
+    const bodyPathKey = pathKey(result.bodyPath)
+    if (
+      resultsByRef.has(key) ||
+      resultsByID.has(result.visibleCallID) ||
+      resultOrdinals.has(result.ordinal) ||
+      paths.has(bodyPathKey)
+    ) {
+      return { ok: false, reason: "mapping-mismatch" }
+    }
+    const call = callsByRef.get(key)
+    if (!call || call.visibleCallID !== result.visibleCallID) return { ok: false, reason: "mapping-mismatch" }
+    const body = readWirePath(request, result.bodyPath)
+    if (!body.ok || typeof body.value !== "string") return { ok: false, reason: "mapping-mismatch" }
+    resultsByRef.set(key, result)
+    resultsByID.add(result.visibleCallID)
+    resultOrdinals.add(result.ordinal)
+    paths.add(bodyPathKey)
+  }
+
+  if (callsByRef.size !== resultsByRef.size || callsByID.size !== resultsByID.size) {
+    return { ok: false, reason: "mapping-mismatch" }
+  }
+
+  const sourceRefs = new Set<string>()
+  const witnessRefs = new Set<string>()
+  for (const replacement of replacements) {
+    const source = refKey(replacement.source)
+    const witness = refKey(replacement.witness)
+    if (source === witness || sourceRefs.has(source)) return { ok: false, reason: "mapping-mismatch" }
+    sourceRefs.add(source)
+    witnessRefs.add(witness)
+  }
+  if ([...witnessRefs].some((witness) => sourceRefs.has(witness))) return { ok: false, reason: "mapping-mismatch" }
+
+  const validated: ValidatedReplacement[] = []
+  let previousSourceOrdinal = -1
+  for (const replacement of replacements) {
+    const source = resultsByRef.get(refKey(replacement.source))
+    const witness = resultsByRef.get(refKey(replacement.witness))
+    if (!source || !witness || !source.complete || !witness.complete || source.ordinal >= witness.ordinal) {
+      return { ok: false, reason: "mapping-mismatch" }
+    }
+    if (source.ordinal <= previousSourceOrdinal) return { ok: false, reason: "mapping-mismatch" }
+    previousSourceOrdinal = source.ordinal
+
+    const sourceBody = readWirePath(request, source.bodyPath)
+    const witnessBody = readWirePath(request, witness.bodyPath)
+    if (
+      !sourceBody.ok ||
+      !witnessBody.ok ||
+      typeof sourceBody.value !== "string" ||
+      typeof witnessBody.value !== "string"
+    ) {
+      return { ok: false, reason: "mapping-mismatch" }
+    }
+    if (sourceBody.value.startsWith(PLACEHOLDER_PREFIX)) return { ok: false, reason: "already-projected" }
+    if (sourceBody.value !== witnessBody.value) return { ok: false, reason: "mapping-mismatch" }
+
+    const folded = placeholder(witness.visibleCallID)
+    if (folded === undefined) return { ok: false, reason: "invalid-reference" }
+    const estimatedSavings = Token.estimate(JSON.stringify(sourceBody.value)) - Token.estimate(JSON.stringify(folded))
+    validated.push({
+      source: replacement.source,
+      witness: replacement.witness,
+      placeholder: folded,
+      estimatedSavings,
+      sourcePath: [...source.bodyPath],
+      witnessPath: [...witness.bodyPath],
+      sourceBody: sourceBody.value,
+      witnessBody: witnessBody.value,
+      sourceOrdinal: source.ordinal,
+    })
+  }
+
+  return { ok: true, replacements: validated }
+}
+
+/**
+ * Validates a final-wire mapping, selects old duplicate sources by budget, and applies all replacements to a private
+ * serializable copy. Every failure returns the exact original request object.
+ */
+const project = <Request>(
+  input: ContextFoldingProjectionInput<Request>,
+  dependencies: ProjectionDependencies = {},
+): ContextFoldingProjectionResult<Request> => {
+  const budget = estimateContextFoldingBudget(input.budget)
+  if (budget.skipReason) return unchanged(input.request, budget.skipReason, budget)
+
+  const currentFingerprint = fingerprintContextFoldingRequest(input.identity)
+  if (!currentFingerprint.ok) return unchanged(input.request, currentFingerprint.reason, budget)
+  if (
+    !input.expectedRequestFingerprint ||
+    currentFingerprint.value !== input.expectedRequestFingerprint ||
+    input.mapping.requestFingerprint !== currentFingerprint.value
+  ) {
+    return unchanged(input.request, "stale-request", budget)
+  }
+
+  if (input.duplicatePlan.replacements.length === 0) {
+    return unchanged(input.request, input.duplicatePlan.skipReason ?? "no-eligible-duplicates", budget)
+  }
+  if (input.duplicatePlan.skipReason !== undefined) return unchanged(input.request, "mapping-mismatch", budget)
+
+  const mapping = validateMapping(input.request, input.mapping, input.duplicatePlan.replacements)
+  if (!mapping.ok) return unchanged(input.request, mapping.reason, budget)
+
+  const selected: ValidatedReplacement[] = []
+  let estimatedAfter = budget.estimatedInputTokens!
+  for (const replacement of mapping.replacements) {
+    if (replacement.estimatedSavings < ContextFoldingPolicy.minimumNetSavingsTokens) continue
+    selected.push(replacement)
+    estimatedAfter = Math.max(0, estimatedAfter - replacement.estimatedSavings)
+    if (estimatedAfter <= budget.targetTokens!) break
+  }
+  if (selected.length === 0) return unchanged(input.request, "insufficient-savings", budget)
+
+  const copy = cloneWireValue(input.request)
+  if (!copy.ok)
+    return unchanged(input.request, copy.reason === "work-limit" ? "work-limit" : "projection-failed", budget)
+
+  try {
+    for (const [index, replacement] of selected.entries()) {
+      if (!writeWirePath(copy.value, replacement.sourcePath, replacement.placeholder)) {
+        return unchanged(input.request, "projection-failed", budget)
+      }
+      dependencies.afterReplacement?.(index)
+    }
+
+    for (const replacement of selected) {
+      const projectedSource = readWirePath(copy.value, replacement.sourcePath)
+      const projectedWitness = readWirePath(copy.value, replacement.witnessPath)
+      const originalSource = readWirePath(input.request, replacement.sourcePath)
+      const originalWitness = readWirePath(input.request, replacement.witnessPath)
+      if (
+        !projectedSource.ok ||
+        projectedSource.value !== replacement.placeholder ||
+        !projectedWitness.ok ||
+        projectedWitness.value !== replacement.witnessBody ||
+        !originalSource.ok ||
+        originalSource.value !== replacement.sourceBody ||
+        !originalWitness.ok ||
+        originalWitness.value !== replacement.witnessBody
+      ) {
+        return unchanged(input.request, "projection-failed", budget)
+      }
+    }
+  } catch {
+    return unchanged(input.request, "projection-failed", budget)
+  }
+
+  const publicReplacements: SelectedFoldReplacement[] = selected.map(
+    ({ source, witness, placeholder, estimatedSavings }) => ({ source, witness, placeholder, estimatedSavings }),
+  )
+  return {
+    request: copy.value,
+    applied: true,
+    plan: {
+      replacements: publicReplacements,
+      estimatedBefore: budget.estimatedInputTokens,
+      estimatedAfter,
+      targetTokens: budget.targetTokens,
+      overBudget: estimatedAfter > budget.targetTokens!,
+      skipReason: undefined,
+    },
+  }
+}
+
+export const projectContextFoldingRequest = <Request>(
+  input: ContextFoldingProjectionInput<Request>,
+  dependencies: ProjectionDependencies = {},
+): ContextFoldingProjectionResult<Request> => {
+  try {
+    return project(input, dependencies)
+  } catch {
+    return unchanged(input.request, "projection-failed")
+  }
+}
