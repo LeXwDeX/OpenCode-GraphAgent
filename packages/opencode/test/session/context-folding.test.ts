@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import type { FoldRef } from "@opencode-ai/core/session/context-folding"
 import { jsonSchema, tool, type ModelMessage } from "ai"
-import { ContextFolding, type Snapshot } from "@/session/context-folding"
+import { ContextFolding, type HistorySnapshot, type Snapshot } from "@/session/context-folding"
 import { LLMNative } from "@/session/llm/native-request"
 import { ProviderTransform } from "@/provider/transform"
 import { ProviderTest } from "../fake/provider"
@@ -32,7 +32,16 @@ function model(apiID = "gpt-5.2", providerID = "openai") {
   })
 }
 
-function snapshot(sourceRef = source, witnessRef = witness): Snapshot {
+function historySnapshot(sourceRef = source, witnessRef = witness): HistorySnapshot {
+  const evidence = {
+    input: { filePath: "/tmp/a.txt" },
+    result: body,
+    comparisonMetadata: {
+      title: "a.txt",
+      metadata: { loaded: [], contextFoldingInstructions: "none" },
+    },
+    outerMetadata: undefined,
+  }
   return {
     duplicatePlan: {
       replacements: [{ source: sourceRef, witness: witnessRef }],
@@ -41,13 +50,27 @@ function snapshot(sourceRef = source, witnessRef = witness): Snapshot {
       skipReason: undefined,
     },
     references: [
-      { ref: sourceRef, toolName: "read", complete: true },
-      { ref: witnessRef, toolName: "read", complete: true },
+      { ref: sourceRef, toolName: "read", complete: true, evidence },
+      { ref: witnessRef, toolName: "read", complete: true, evidence },
     ],
   }
 }
 
-function messages(sourceID = source.callID, witnessID = witness.callID, sharedOutput?: object): ModelMessage[] {
+function snapshot(
+  sourceRef = source,
+  witnessRef = witness,
+  sourceMessages = messages(sourceRef.callID, witnessRef.callID),
+): Snapshot {
+  const result = ContextFolding.bindModelMessages(historySnapshot(sourceRef, witnessRef), sourceMessages)
+  if (!result) throw new Error("failed to bind context-folding test snapshot")
+  return result
+}
+
+function messages(
+  sourceID = source.callID,
+  witnessID = witness.callID,
+  sharedOutput?: { type: "text"; value: string },
+): ModelMessage[] {
   const output = sharedOutput ?? { type: "text", value: body }
   return [
     {
@@ -68,7 +91,7 @@ function messages(sourceID = source.callID, witnessID = witness.callID, sharedOu
           type: "tool-result",
           toolCallId: sourceID,
           toolName: "read",
-          output: output as { type: "text"; value: string },
+          output,
         },
       ],
     },
@@ -90,11 +113,29 @@ function messages(sourceID = source.callID, witnessID = witness.callID, sharedOu
           type: "tool-result",
           toolCallId: witnessID,
           toolName: "read",
-          output: output as { type: "text"; value: string },
+          output,
         },
       ],
     },
   ]
+}
+
+function toolCallAt(value: ModelMessage[], index: number) {
+  const message = value[index]
+  if (!message || message.role !== "assistant" || !Array.isArray(message.content))
+    throw new Error(`expected assistant tool call at ${index}`)
+  const part = message.content[0]
+  if (!part || part.type !== "tool-call") throw new Error(`expected tool call at ${index}`)
+  return part
+}
+
+function toolResultAt(value: ModelMessage[], index: number) {
+  const message = value[index]
+  if (!message || message.role !== "tool" || !Array.isArray(message.content))
+    throw new Error(`expected tool result at ${index}`)
+  const part = message.content[0]
+  if (!part || part.type !== "tool-result") throw new Error(`expected tool result at ${index}`)
+  return part
 }
 
 function aiProjection(input: {
@@ -103,15 +144,18 @@ function aiProjection(input: {
   preparedMessages?: ModelMessage[]
   snapshot?: Snapshot
   purpose?: "conversation" | "compaction" | "auxiliary" | "unknown"
+  sourceMessages?: ModelMessage[]
 }) {
   const selected = input.model ?? model()
-  const transformed =
-    input.preparedMessages ?? ProviderTransform.message(input.messages ?? messages(), selected, {})
+  const sourceMessages = input.sourceMessages ?? input.messages ?? messages()
+  const transformed = input.preparedMessages ?? ProviderTransform.message(structuredClone(sourceMessages), selected, {})
   return ContextFolding.projectAISDK({
     model: selected,
     purpose: input.purpose ?? "conversation",
-    snapshot: input.snapshot ?? snapshot(),
+    snapshot: input.snapshot ?? snapshot(source, witness, sourceMessages),
     messages: transformed,
+    sourceMessages,
+    messageTransformOptions: {},
     tools,
     maxOutputTokens: 512,
     params: { maxOutputTokens: 512 },
@@ -150,7 +194,7 @@ describe("session.context-folding OpenCode wire adapters", () => {
   })
 
   test("duplicates shared host aliases into an independent wire tree before projection", () => {
-    const shared = { type: "text", value: body }
+    const shared = { type: "text" as const, value: body }
     const original = messages(source.callID, witness.callID, shared)
     const projected = aiProjection({ messages: original })
 
@@ -218,6 +262,9 @@ describe("session.context-folding OpenCode wire adapters", () => {
       purpose: "conversation",
       snapshot: snapshot(),
       request: canonical,
+      transformedMessages: ProviderTransform.message(structuredClone(messages()), selected, {}),
+      sourceMessages: messages(),
+      messageTransformOptions: {},
       tools,
       maxOutputTokens: 512,
       params: { maxOutputTokens: 512 },
@@ -248,5 +295,124 @@ describe("session.context-folding OpenCode wire adapters", () => {
     const projected = aiProjection({ snapshot: incomplete })
     expect(projected.applied).toBe(false)
     expect(projected.plan.skipReason).toBe("mapping-mismatch")
+  })
+
+  test("fails closed when bound history metadata evidence changes", () => {
+    const complete = snapshot()
+    for (const key of ["comparisonMetadataFingerprint", "outerMetadataFingerprint"] as const) {
+      const changed: ContextFolding.Snapshot = {
+        ...complete,
+        references: complete.references.map((reference, index) =>
+          index === 0 ? { ...reference, [key]: `${reference[key]}-changed` } : reference,
+        ),
+      }
+      const projected = aiProjection({ snapshot: changed })
+      expect(projected.applied).toBe(false)
+      expect(projected.plan.skipReason).toBe("mapping-mismatch")
+    }
+  })
+
+  test("fails closed when final AI SDK input, body, outer fields or order differ from the bound history", () => {
+    const mutations = [
+      (value: ModelMessage[]) => {
+        toolCallAt(value, 2).input = { filePath: "/DIFFERENT" }
+      },
+      (value: ModelMessage[]) => {
+        toolResultAt(value, 3).output = { type: "text", value: "different body" }
+      },
+      (value: ModelMessage[]) => {
+        toolCallAt(value, 0).providerOptions = { unknown: { changed: true } }
+      },
+      (value: ModelMessage[]) => {
+        value.splice(0, value.length, ...value.slice(2), ...value.slice(0, 2))
+      },
+    ]
+    for (const mutate of mutations) {
+      const sourceMessages = messages()
+      const final = ProviderTransform.message(structuredClone(sourceMessages), model(), {})
+      mutate(final)
+      const projected = aiProjection({
+        sourceMessages,
+        preparedMessages: final,
+        snapshot: snapshot(source, witness, sourceMessages),
+      })
+      expect(projected.applied).toBe(false)
+      expect(projected.plan.skipReason).toBe("mapping-mismatch")
+    }
+  })
+
+  test("fails closed for a full-request visible ID collision across different tool names", () => {
+    const sourceMessages = messages()
+    const final = ProviderTransform.message(structuredClone(sourceMessages), model(), {})
+    final.push(
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "tool-call",
+            toolCallId: source.callID,
+            toolName: "grep",
+            input: { pattern: "x" },
+          },
+        ],
+      },
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: source.callID,
+            toolName: "grep",
+            output: { type: "text", value: body },
+          },
+        ],
+      },
+    )
+    const projected = aiProjection({
+      sourceMessages,
+      preparedMessages: final,
+      snapshot: snapshot(source, witness, sourceMessages),
+    })
+    expect(projected.applied).toBe(false)
+    expect(projected.plan.skipReason).toBe("mapping-mismatch")
+  })
+
+  test("fails closed when final Native input, body or order differs from the bound history", () => {
+    const selected = model()
+    for (const mutate of [
+      (value: ModelMessage[]) => {
+        toolCallAt(value, 2).input = { filePath: "/DIFFERENT" }
+      },
+      (value: ModelMessage[]) => {
+        toolResultAt(value, 3).output = { type: "text", value: "different body" }
+      },
+      (value: ModelMessage[]) => value.splice(0, value.length, ...value.slice(2), ...value.slice(0, 2)),
+    ]) {
+      const sourceMessages = messages()
+      const transformed = ProviderTransform.message(structuredClone(sourceMessages), selected, {})
+      mutate(transformed)
+      const canonical = LLMNative.request({
+        model: selected,
+        apiKey: "test-key",
+        messages: transformed,
+        tools,
+        maxOutputTokens: 512,
+      })
+      const projected = ContextFolding.projectNative({
+        model: selected,
+        purpose: "conversation",
+        snapshot: snapshot(source, witness, sourceMessages),
+        request: canonical,
+        transformedMessages: transformed,
+        sourceMessages,
+        messageTransformOptions: {},
+        tools,
+        maxOutputTokens: 512,
+        params: { maxOutputTokens: 512 },
+        system: { kind: "messages" },
+      })
+      expect(projected.applied).toBe(false)
+      expect(projected.plan.skipReason).toBe("mapping-mismatch")
+    }
   })
 })

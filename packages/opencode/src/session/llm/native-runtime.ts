@@ -18,7 +18,11 @@ import {
 } from "@opencode-ai/llm"
 import type { LLMClientShape } from "@opencode-ai/llm/route"
 import { LLMNative } from "./native-request"
-import { ContextFolding, type RequestPurpose, type Snapshot as ContextFoldingSnapshot } from "../context-folding"
+import {
+  ContextFolding,
+  type HistorySnapshot as ContextFoldingHistorySnapshot,
+  type RequestPurpose,
+} from "../context-folding"
 import type { SystemTransmission } from "@opencode-ai/core/session/context-folding"
 
 export type RuntimeStatus =
@@ -46,7 +50,7 @@ type StreamInput = {
   readonly contextFolding?: {
     readonly enabled: boolean
     readonly purpose: RequestPurpose
-    readonly snapshot?: ContextFoldingSnapshot
+    readonly history?: ContextFoldingHistorySnapshot
     readonly system: SystemTransmission
   }
 }
@@ -95,11 +99,14 @@ export function stream(input: StreamInput): StreamResult {
   // — if a field ever needs to differ between the two surfaces, the
   // translation belongs here, not split across both packages.
   const tools = nativeTools(input.tools, input)
+  const sourceMessages = ContextFolding.copyModelMessages(input.messages)
+  const transformInput = ContextFolding.copyModelMessages(input.messages) ?? input.messages
+  const transformedMessages = ProviderTransform.message(transformInput, input.model, input.providerOptions ?? {})
   const canonical = LLMNative.request({
     model: input.model,
     apiKey: current.apiKey,
     baseURL: current.baseURL,
-    messages: ProviderTransform.message(input.messages, input.model, input.providerOptions ?? {}),
+    messages: transformedMessages,
     toolChoice: input.toolChoice,
     temperature: input.temperature,
     topP: input.topP,
@@ -109,13 +116,20 @@ export function stream(input: StreamInput): StreamResult {
     headers: { ...providerHeaders(input.provider.options.headers), ...input.headers },
   })
   const folding = input.contextFolding
+  const snapshot =
+    folding?.enabled && folding.history && folding.purpose === "conversation" && sourceMessages
+      ? ContextFolding.bindModelMessages(folding.history, sourceMessages)
+      : undefined
   const projection =
-    folding?.enabled && folding.snapshot && folding.purpose === "conversation"
+    folding?.enabled && snapshot && folding.purpose === "conversation"
       ? ContextFolding.projectNative({
           model: input.model,
           purpose: folding.purpose,
-          snapshot: folding.snapshot,
+          snapshot,
           request: canonical,
+          transformedMessages,
+          sourceMessages: sourceMessages ?? [],
+          messageTransformOptions: input.providerOptions ?? {},
           tools: input.tools,
           toolChoice: input.toolChoice,
           maxOutputTokens: input.maxOutputTokens,

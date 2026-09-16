@@ -21,6 +21,7 @@ import { isRecord } from "@/util/record"
 import { asSchema, type ModelMessage, type Tool } from "ai"
 import { Effect } from "effect"
 import type { Interface as ToolSourceLedgerInterface } from "./tool-source-ledger"
+import { LLMNative } from "./llm/native-request"
 
 const PROTOCOL_OVERHEAD_TOKENS = 64
 const MAX_COPY_DEPTH = 64
@@ -32,11 +33,33 @@ export type HistoryReference = Readonly<{
   ref: FoldRef
   toolName: string
   complete: boolean
+  evidence: Readonly<{
+    input: unknown
+    result: unknown
+    comparisonMetadata: unknown
+    outerMetadata: unknown
+  }>
+}>
+
+export type HistorySnapshot = Readonly<{
+  duplicatePlan: FoldPlan
+  references: readonly HistoryReference[]
+}>
+
+export type PreparedReference = Readonly<{
+  ref: FoldRef
+  toolName: string
+  complete: boolean
+  inputFingerprint: string
+  resultFingerprint: string
+  comparisonMetadataFingerprint: string
+  outerMetadataFingerprint: string
 }>
 
 export type Snapshot = Readonly<{
   duplicatePlan: FoldPlan
-  references: readonly HistoryReference[]
+  references: readonly PreparedReference[]
+  historyBindingFingerprint: string
 }>
 
 type ProjectionInput = Readonly<{
@@ -48,6 +71,8 @@ type ProjectionInput = Readonly<{
   maxOutputTokens: number | undefined
   params: unknown
   system: PreparedRequestBudgetInput["system"]
+  sourceMessages: ModelMessage[]
+  messageTransformOptions: Record<string, unknown>
 }>
 
 type PlainCopy<T = unknown> = Readonly<{ ok: true; value: T }> | Readonly<{ ok: false }>
@@ -129,6 +154,48 @@ const estimateStep = (parts: readonly SessionV1.Part[]) => {
   }
 }
 
+const wireFingerprint = (value: unknown) => {
+  const copy = independentWireCopy(value)
+  if (!copy.ok) return { ok: false as const, reason: "unknown-content" as const }
+  return fingerprintContextFoldingRequest({
+    request: copy.value,
+    identity: null,
+    budget: {
+      contextLimit: 0,
+      inputLimit: { kind: "absent" },
+      outputReserve: 0,
+      system: { kind: "none" },
+      messages: [],
+      tools: [],
+      protocolOverheadTokens: 0,
+      media: "none",
+    },
+  })
+}
+
+const sameWireValue = (left: unknown, right: unknown) => {
+  const leftFingerprint = wireFingerprint(left)
+  const rightFingerprint = wireFingerprint(right)
+  return leftFingerprint.ok && rightFingerprint.ok && leftFingerprint.value === rightFingerprint.value
+}
+
+const evidenceFingerprint = (value: unknown) =>
+  wireFingerprint(value === undefined ? { kind: "absent" } : { kind: "present", value })
+
+function instructionSafety(part: SessionV1.ToolPart): "none" | "dynamic" | "unknown" {
+  if (part.state.status !== "completed") return "unknown"
+  const metadata = part.state.metadata
+  if (!isRecord(metadata)) return "unknown"
+  const marker = metadata.contextFoldingInstructions
+  if (marker !== "none" && marker !== "dynamic") return "unknown"
+  if (typeof part.state.output !== "string") return "unknown"
+  if (part.state.output.includes("<system-reminder>")) return "dynamic"
+  if (part.tool !== "read") return marker
+  if (!Object.hasOwn(metadata, "loaded")) return "unknown"
+  if (!Array.isArray(metadata.loaded) || !metadata.loaded.every((item) => typeof item === "string")) return "unknown"
+  return metadata.loaded.length > 0 ? "dynamic" : marker
+}
+
 export const history = Effect.fn("ContextFolding.history")(function* (input: {
   messages: readonly SessionV1.WithParts[]
   ledger: ToolSourceLedgerInterface
@@ -165,7 +232,19 @@ export const history = Effect.fn("ContextFolding.history")(function* (input: {
             completedState.metadata.truncated !== true &&
             typeof completedState.metadata.outputPath !== "string"
           const ref = { messageID: part.messageID, partID: part.id, callID: part.callID }
-          references.push({ ref, toolName: part.tool, complete })
+          references.push({
+            ref,
+            toolName: part.tool,
+            complete,
+            evidence: {
+              input: part.state.input,
+              result: completedState?.output,
+              comparisonMetadata: completedState
+                ? { title: completedState.title, metadata: completedState.metadata }
+                : undefined,
+              outerMetadata: part.metadata,
+            },
+          })
           candidates.push({
             ref,
             toolName: part.tool,
@@ -182,7 +261,7 @@ export const history = Effect.fn("ContextFolding.history")(function* (input: {
               : { kind: "unknown" as const },
             safety: {
               attachments,
-              instructions: "none" as const,
+              instructions: instructionSafety(part),
               providerExecuted: part.metadata?.providerExecuted === true,
             },
             ...(part.tool === "read" && typeof part.state.input.filePath === "string"
@@ -201,10 +280,122 @@ export const history = Effect.fn("ContextFolding.history")(function* (input: {
     yield* flush()
   }
 
-  return { duplicatePlan: planContextFolding(steps), references } satisfies Snapshot
+  return { duplicatePlan: planContextFolding(steps), references } satisfies HistorySnapshot
 })
 
-function selectedReferences(snapshot: Snapshot) {
+type ModelLocated = Readonly<{
+  id: string
+  name: string
+  kind: "call" | "result"
+  ordinal: number
+  input?: unknown
+  result?: unknown
+}>
+
+function locateModelMessages(messages: readonly ModelMessage[]): ModelLocated[] {
+  const located: ModelLocated[] = []
+  let callOrdinal = 0
+  let resultOrdinal = 0
+  for (const message of messages) {
+    if (!Array.isArray(message.content)) continue
+    for (const part of message.content) {
+      const item: unknown = part
+      if (!isRecord(item) || typeof item.toolCallId !== "string" || typeof item.toolName !== "string") continue
+      if (item.type === "tool-call") {
+        located.push({
+          id: item.toolCallId,
+          name: item.toolName,
+          kind: "call",
+          ordinal: callOrdinal++,
+          input: item.input,
+        })
+      }
+      if (item.type === "tool-result") {
+        const output = isRecord(item.output) ? item.output : undefined
+        const result = output && (output.type === "text" || output.type === "error-text") ? output.value : undefined
+        located.push({
+          id: item.toolCallId,
+          name: item.toolName,
+          kind: "result",
+          ordinal: resultOrdinal++,
+          result,
+        })
+      }
+    }
+  }
+  return located
+}
+
+function uniqueByVisibleID(located: readonly ModelLocated[], id: string, kind: ModelLocated["kind"]) {
+  const matches = located.filter((item) => item.kind === kind && item.id === id)
+  return matches.length === 1 ? matches[0] : undefined
+}
+
+export function bindModelMessages(input: HistorySnapshot, messages: ModelMessage[]): Snapshot | undefined {
+  const selected = selectedReferences(input)
+  const located = locateModelMessages(messages)
+  const prepared: PreparedReference[] = []
+  for (const reference of input.references) {
+    const inputFingerprint = evidenceFingerprint(reference.evidence.input)
+    const resultFingerprint = evidenceFingerprint(reference.evidence.result)
+    const comparisonMetadataFingerprint = evidenceFingerprint(reference.evidence.comparisonMetadata)
+    const outerMetadataFingerprint = evidenceFingerprint(reference.evidence.outerMetadata)
+    if (
+      !inputFingerprint.ok ||
+      !resultFingerprint.ok ||
+      !comparisonMetadataFingerprint.ok ||
+      !outerMetadataFingerprint.ok
+    )
+      return undefined
+    if (selected.includes(reference)) {
+      const call = uniqueByVisibleID(located, reference.ref.callID, "call")
+      const result = uniqueByVisibleID(located, reference.ref.callID, "result")
+      if (
+        !call ||
+        !result ||
+        call.name !== reference.toolName ||
+        result.name !== reference.toolName ||
+        !sameWireValue(call.input, reference.evidence.input) ||
+        !sameWireValue(result.result, reference.evidence.result)
+      )
+        return undefined
+    }
+    prepared.push({
+      ref: reference.ref,
+      toolName: reference.toolName,
+      complete: reference.complete,
+      inputFingerprint: inputFingerprint.value,
+      resultFingerprint: resultFingerprint.value,
+      comparisonMetadataFingerprint: comparisonMetadataFingerprint.value,
+      outerMetadataFingerprint: outerMetadataFingerprint.value,
+    })
+  }
+  for (const replacement of input.duplicatePlan.replacements) {
+    const source = uniqueByVisibleID(located, replacement.source.callID, "result")
+    const witness = uniqueByVisibleID(located, replacement.witness.callID, "result")
+    if (!source || !witness || source.ordinal >= witness.ordinal) return undefined
+  }
+  const historyBindingFingerprint = wireFingerprint({
+    duplicatePlan: input.duplicatePlan,
+    references: prepared,
+    sourceMessages: messages,
+  })
+  if (!historyBindingFingerprint.ok) return undefined
+  return {
+    duplicatePlan: input.duplicatePlan,
+    references: prepared,
+    historyBindingFingerprint: historyBindingFingerprint.value,
+  }
+}
+
+export function copyModelMessages(messages: ModelMessage[]): ModelMessage[] | undefined {
+  const copy = independentWireCopy(messages)
+  return copy.ok ? copy.value : undefined
+}
+
+function selectedReferences(snapshot: HistorySnapshot): readonly HistoryReference[]
+function selectedReferences(snapshot: Snapshot): readonly PreparedReference[]
+function selectedReferences(snapshot: HistorySnapshot | Snapshot): readonly (HistoryReference | PreparedReference)[] {
   const selected = new Set<string>()
   for (const replacement of snapshot.duplicatePlan.replacements) {
     selected.add(JSON.stringify(replacement.source))
@@ -277,18 +468,27 @@ type Located = Readonly<{
   id: string
   name: string
   kind: "call" | "result"
+  ordinal: number
 }>
 
 function locateAISDK(request: unknown): Located[] {
   if (!isRecord(request) || !Array.isArray(request.messages)) return []
   const located: Located[] = []
+  let callOrdinal = 0
+  let resultOrdinal = 0
   request.messages.forEach((message, messageIndex) => {
     if (!isRecord(message) || !Array.isArray(message.content)) return
     message.content.forEach((part, partIndex) => {
       if (!isRecord(part) || typeof part.toolCallId !== "string" || typeof part.toolName !== "string") return
       const base = ["messages", messageIndex, "content", partIndex] as const
       if (part.type === "tool-call") {
-        located.push({ path: [...base, "toolCallId"], id: part.toolCallId, name: part.toolName, kind: "call" })
+        located.push({
+          path: [...base, "toolCallId"],
+          id: part.toolCallId,
+          name: part.toolName,
+          kind: "call",
+          ordinal: callOrdinal++,
+        })
       }
       if (
         part.type === "tool-result" &&
@@ -302,6 +502,7 @@ function locateAISDK(request: unknown): Located[] {
           id: part.toolCallId,
           name: part.toolName,
           kind: "result",
+          ordinal: resultOrdinal++,
         })
       }
     })
@@ -312,13 +513,21 @@ function locateAISDK(request: unknown): Located[] {
 function locateNative(request: unknown): Located[] {
   if (!isRecord(request) || !Array.isArray(request.messages)) return []
   const located: Located[] = []
+  let callOrdinal = 0
+  let resultOrdinal = 0
   request.messages.forEach((message, messageIndex) => {
     if (!isRecord(message) || !Array.isArray(message.content)) return
     message.content.forEach((part, partIndex) => {
       if (!isRecord(part) || typeof part.id !== "string" || typeof part.name !== "string") return
       const base = ["messages", messageIndex, "content", partIndex] as const
       if (part.type === "tool-call") {
-        located.push({ path: [...base, "id"], id: part.id, name: part.name, kind: "call" })
+        located.push({
+          path: [...base, "id"],
+          id: part.id,
+          name: part.name,
+          kind: "call",
+          ordinal: callOrdinal++,
+        })
       }
       if (part.type !== "tool-result") return
       if (typeof part.result === "string") {
@@ -328,6 +537,7 @@ function locateNative(request: unknown): Located[] {
           id: part.id,
           name: part.name,
           kind: "result",
+          ordinal: resultOrdinal++,
         })
       } else if (isRecord(part.result) && typeof part.result.value === "string") {
         located.push({
@@ -336,6 +546,7 @@ function locateNative(request: unknown): Located[] {
           id: part.id,
           name: part.name,
           kind: "result",
+          ordinal: resultOrdinal++,
         })
       }
     })
@@ -350,29 +561,30 @@ function mapping(
 ): WireProjectionSnapshot {
   const calls: WireCallMapping[] = []
   const results: WireResultMapping[] = []
-  let callOrdinal = 0
-  let resultOrdinal = 0
   for (const reference of selectedReferences(input.snapshot)) {
     const expectedID = ProviderTransform.toolCallID(reference.ref.callID, input.model)
-    const call = located.filter(
-      (item) => item.kind === "call" && item.id === expectedID && item.name === reference.toolName,
+    const call = located.filter((item) => item.kind === "call" && item.id === expectedID)
+    const result = located.filter((item) => item.kind === "result" && item.id === expectedID)
+    if (
+      call.length !== 1 ||
+      result.length !== 1 ||
+      call[0].name !== reference.toolName ||
+      result[0].name !== reference.toolName ||
+      !result[0].bodyPath
     )
-    const result = located.filter(
-      (item) => item.kind === "result" && item.id === expectedID && item.name === reference.toolName,
-    )
-    if (call.length !== 1 || result.length !== 1 || !result[0].bodyPath) continue
+      continue
     calls.push({
       ref: reference.ref,
       visibleCallID: call[0].id,
       visibleCallIDPath: call[0].path,
-      ordinal: callOrdinal++,
+      ordinal: call[0].ordinal,
     })
     results.push({
       ref: reference.ref,
       visibleCallID: result[0].id,
       visibleCallIDPath: result[0].path,
       bodyPath: result[0].bodyPath,
-      ordinal: resultOrdinal++,
+      ordinal: result[0].ordinal,
       complete: reference.complete,
     })
   }
@@ -385,6 +597,7 @@ function project<Request>(
   runtime: "ai-sdk" | "native",
   preparedBudget: PreparedRequestBudgetInput,
   locate: (request: Request) => Located[],
+  expectedMessages: unknown,
   allowedClasses: ReadonlySet<string> = new Set(),
 ): ContextFoldingProjectionResult<Request> {
   const unchanged = (skipReason: ProjectionSkipReason) =>
@@ -406,6 +619,10 @@ function project<Request>(
   const copiedBudget = independentWireCopy(preparedBudget, allowedClasses)
   if (!copiedBudget.ok) return unchanged("unknown-content")
   const tree = copy.value
+  const expectedCopy = independentWireCopy(expectedMessages, allowedClasses)
+  if (!expectedCopy.ok || !sameWireValue(expectedCopy.value, isRecord(tree) ? tree.messages : undefined)) {
+    return unchanged("mapping-mismatch")
+  }
   const finalBudget = copiedBudget.value
   const copiedIdentity = independentWireCopy(identity(input, runtime), allowedClasses)
   if (!copiedIdentity.ok) return unchanged("unknown-content")
@@ -416,34 +633,78 @@ function project<Request>(
     budget: finalBudget,
   })
   if (!fingerprint.ok) return unchanged(fingerprint.reason)
+  const wireMapping = mapping(fingerprint.value, input, locate(tree))
   return projectContextFoldingRequest({
     request: tree,
     identity: requestIdentity,
     expectedRequestFingerprint: fingerprint.value,
     duplicatePlan: input.snapshot.duplicatePlan,
     budget: finalBudget,
-    mapping: mapping(fingerprint.value, input, locate(tree)),
+    mapping: wireMapping,
   })
 }
 
+function expectedTransformedMessages(input: ProjectionInput) {
+  const historyBindingFingerprint = wireFingerprint({
+    duplicatePlan: input.snapshot.duplicatePlan,
+    references: input.snapshot.references,
+    sourceMessages: input.sourceMessages,
+  })
+  if (!historyBindingFingerprint.ok || historyBindingFingerprint.value !== input.snapshot.historyBindingFingerprint)
+    return undefined
+  const copy = copyModelMessages(input.sourceMessages)
+  if (!copy) return undefined
+  try {
+    return ProviderTransform.message(copy, input.model, input.messageTransformOptions)
+  } catch {
+    return undefined
+  }
+}
+
 export function projectAISDK(input: ProjectionInput & { messages: ModelMessage[] }) {
+  const expected = expectedTransformedMessages(input)
+  if (!expected) {
+    return project(
+      { messages: input.messages },
+      input,
+      "ai-sdk",
+      budget(input, input.messages, toolWire(input.tools)),
+      locateAISDK,
+      [],
+    )
+  }
   const request = { messages: input.messages }
-  return project(request, input, "ai-sdk", budget(input, input.messages, toolWire(input.tools)), locateAISDK)
+  return project(request, input, "ai-sdk", budget(input, input.messages, toolWire(input.tools)), locateAISDK, expected)
 }
 
 export function projectNative(
   input: ProjectionInput & {
     request: { readonly system: unknown; readonly messages: unknown; readonly tools: unknown }
+    transformedMessages: ModelMessage[]
   },
 ) {
+  const expected = expectedTransformedMessages(input)
   const request = { messages: input.request.messages }
   const transmitted = { system: input.request.system, messages: input.request.messages }
+  const expectedNative = expected ? LLMNative.convertMessages(expected).messages : []
+  if (!expected || !sameWireValue(expected, input.transformedMessages)) {
+    return project(
+      request,
+      input,
+      "native",
+      budget(input, transmitted, input.request.tools, input.request.messages),
+      locateNative,
+      [],
+      new Set(["Message", "SystemPart", "ToolDefinition"]),
+    )
+  }
   return project(
     request,
     input,
     "native",
     budget(input, transmitted, input.request.tools, input.request.messages),
     locateNative,
+    expectedNative,
     new Set(["Message", "SystemPart", "ToolDefinition"]),
   )
 }

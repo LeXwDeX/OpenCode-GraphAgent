@@ -102,7 +102,7 @@ const contentPart = (part: unknown) => {
 const content = (value: ModelMessage["content"]) =>
   typeof value === "string" ? [{ type: "text" as const, text: value }] : value.map(contentPart)
 
-const messages = (input: readonly ModelMessage[]) => {
+export const convertMessages = (input: readonly ModelMessage[]) => {
   const system = input.flatMap((message) => (message.role === "system" ? [SystemPart.make(message.content)] : []))
   const messages = input.flatMap((message) => {
     if (message.role === "system") return []
@@ -179,7 +179,7 @@ export const model = (input: Provider.Model | RequestInput, headers?: Record<str
 }
 
 export const request = (input: RequestInput) => {
-  const converted = messages(input.messages)
+  const converted = convertMessages(input.messages)
   // This is the only native adapter boundary that should construct canonical
   // @opencode-ai/llm request objects from opencode's session/AI SDK-shaped data.
   return LLM.request({
