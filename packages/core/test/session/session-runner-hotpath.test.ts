@@ -4,6 +4,7 @@ import {
   LLMError,
   LLMEvent,
   Model,
+  PreparedRequest,
   TransportReason,
   type LLMClientShape,
   type LLMRequest,
@@ -15,7 +16,7 @@ import { EventTable } from "@opencode-ai/core/event/sql"
 import { PermissionV2 } from "@opencode-ai/core/permission"
 import { Project } from "@opencode-ai/core/project"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
-import { AbsolutePath } from "@opencode-ai/core/schema"
+import { AbsolutePath, RelativePath } from "@opencode-ai/core/schema"
 import { SessionV2 } from "@opencode-ai/core/session"
 import { LocationServiceMap } from "@opencode-ai/core/location-layer"
 import { Snapshot } from "@opencode-ai/core/snapshot"
@@ -33,6 +34,15 @@ import { AgentV2 } from "@opencode-ai/core/agent"
 import { Config } from "@opencode-ai/core/config"
 import { ConfigAgent } from "@opencode-ai/core/config/agent"
 import { Tool } from "@opencode-ai/core/tool/tool"
+import { ReadTool } from "@opencode-ai/core/tool/read"
+import { ReadToolFileSystem } from "@opencode-ai/core/tool/read-filesystem"
+import { GrepTool } from "@opencode-ai/core/tool/grep"
+import { GlobTool } from "@opencode-ai/core/tool/glob"
+import { FileSystem as CoreFileSystem } from "@opencode-ai/core/filesystem"
+import { FSUtil } from "@opencode-ai/core/fs-util"
+import { Ripgrep } from "@opencode-ai/core/ripgrep"
+import { LocationMutation } from "@opencode-ai/core/location-mutation"
+import { Image } from "@opencode-ai/core/image"
 import { SessionEvent } from "@opencode-ai/core/session/event"
 import { SessionMessage } from "@opencode-ai/core/session/message"
 import { SessionTable } from "@opencode-ai/core/session/sql"
@@ -42,29 +52,67 @@ import { SystemContextRegistry } from "@opencode-ai/core/system-context/registry
 import { SkillGuidance } from "@opencode-ai/core/skill/guidance"
 import { ReferenceGuidance } from "@opencode-ai/core/reference/guidance"
 import { Location } from "@opencode-ai/core/location"
-import { Cause, DateTime, Deferred, Duration, Effect, Exit, Fiber, Layer, Schema, Stream } from "effect"
+import {
+  Cause,
+  DateTime,
+  Deferred,
+  Duration,
+  Effect,
+  Exit,
+  Fiber,
+  FileSystem,
+  Layer,
+  Option,
+  Schema,
+  Stream,
+} from "effect"
 import { and, asc, eq } from "drizzle-orm"
 import * as TestClock from "effect/testing/TestClock"
 import { testEffect } from "../lib/effect"
 
 const sessionID = SessionV2.ID.make("ses_runner_hotpath")
 const requests: LLMRequest[] = []
+const preparedBodies: unknown[] = []
+const outboundBodies: unknown[] = []
 let response: LLMEvent[] = []
 let responses: LLMEvent[][] | undefined
 let responseStream: Stream.Stream<LLMEvent, LLMError> | undefined
+const prepareRequest = (request: LLMRequest) =>
+  request.model.route.body.from(request).pipe(
+    Effect.map(
+      (body) =>
+        new PreparedRequest({
+          id: request.id ?? "request",
+          route: request.model.route.id,
+          protocol: request.model.route.protocol,
+          model: request.model,
+          body,
+        }),
+    ),
+  )
+const trackedPrepare = (request: LLMRequest) =>
+  prepareRequest(request).pipe(Effect.tap((prepared) => Effect.sync(() => preparedBodies.push(prepared.body))))
 const client = Layer.succeed(
   LLMClient.Service,
   LLMClient.Service.of({
-    prepare: () => Effect.die("unused"),
-    stream: ((request: LLMRequest) => {
-      requests.push(request)
-      if (responseStream) {
-        const stream = responseStream
-        responseStream = undefined
-        return stream
-      }
-      return Stream.fromIterable(responses === undefined ? response : (responses.shift() ?? []))
-    }) as unknown as LLMClientShape["stream"],
+    // The production interface deliberately lets callers select the prepared body type; this test records unknown bodies.
+    // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion
+    prepare: trackedPrepare as unknown as LLMClientShape["prepare"],
+    stream: ((request: LLMRequest) =>
+      Stream.unwrap(
+        prepareRequest(request).pipe(
+          Effect.map((prepared) => {
+            requests.push(request)
+            outboundBodies.push(prepared.body)
+            if (responseStream) {
+              const stream = responseStream
+              responseStream = undefined
+              return stream
+            }
+            return Stream.fromIterable(responses === undefined ? response : (responses.shift() ?? []))
+          }),
+        ),
+      )) as unknown as LLMClientShape["stream"],
     generate: () => Effect.die("unused"),
   }),
 )
@@ -95,7 +143,12 @@ const events = Layer.effect(
 
 // Scripted snapshots: capture returns the next queued tree ID (default "tree-1",
 // i.e. an unchanged tree), files records the compared pair.
-const probe = { captures: new Array<string | undefined>(), captureCalls: 0, filesCalls: 0, filesPairs: [] as string[][] }
+const probe = {
+  captures: new Array<string | undefined>(),
+  captureCalls: 0,
+  filesCalls: 0,
+  filesPairs: [] as string[][],
+}
 const snapshot = Layer.succeed(
   Snapshot.Service,
   Snapshot.Service.of({
@@ -124,7 +177,7 @@ const snapshot = Layer.succeed(
 const executions: string[] = []
 let toolExecutionGate: Deferred.Deferred<void> | undefined
 const permission = Layer.mock(PermissionV2.Service, {
-  assert: () => Effect.die("unused"),
+  assert: () => Effect.void,
   ask: () => Effect.die("unused"),
   reply: () => Effect.die("unused"),
   get: () => Effect.die("unused"),
@@ -156,10 +209,109 @@ const echo = Layer.effectDiscard(
   ),
 ).pipe(Layer.provide(registry))
 const agents = AgentV2.layer
-const model = Model.make({ id: "fake-model", provider: "fake", route: OpenAIChat.route })
+const model = Model.make({
+  id: "fake-model",
+  provider: "fake",
+  route: OpenAIChat.route,
+  defaults: { limits: { context: 100_000, output: 1_000 } },
+})
 const models = SessionRunnerModel.layerWith(() => Effect.succeed(model))
 const systemContext = SystemContextRegistry.layer
 const location = Location.layer({ directory: AbsolutePath.make("/project") }).pipe(Layer.provide(Project.defaultLayer))
+const readBody = "read-output:" + "r".repeat(16_000)
+const grepBody = "grep-output:" + "g".repeat(16_000)
+const globEntries = Array.from({ length: 120 }, (_, index) =>
+  CoreFileSystem.Entry.make({
+    path: RelativePath.make(`generated/${String(index).padStart(3, "0")}-${"p".repeat(120)}.txt`),
+    type: "file",
+  }),
+)
+const readFileSystem = Layer.mock(ReadToolFileSystem.Service, {
+  inspect: () => Effect.succeed("file" as const),
+  read: () =>
+    Effect.succeed(
+      new ReadToolFileSystem.TextPage({
+        type: "text-page",
+        content: readBody,
+        mime: "text/plain",
+        offset: 1,
+        truncated: false,
+        next: 2,
+      }),
+    ),
+  list: () => Effect.die("unused"),
+})
+const mutation = Layer.mock(LocationMutation.Service, {
+  resolve: ({ path }) =>
+    Effect.succeed({
+      canonical: `/project/${path}`,
+      resource: path,
+    }),
+})
+const image = Layer.mock(Image.Service, { normalize: () => Effect.die("unused") })
+const directoryInfo: FileSystem.File.Info = {
+  type: "Directory",
+  mtime: Option.none(),
+  atime: Option.none(),
+  birthtime: Option.none(),
+  dev: 0,
+  ino: Option.none(),
+  mode: 0,
+  nlink: Option.none(),
+  uid: Option.none(),
+  gid: Option.none(),
+  rdev: Option.none(),
+  size: FileSystem.Size(0),
+  blksize: Option.none(),
+  blocks: Option.none(),
+}
+const searchFileSystem = Layer.effect(
+  FSUtil.Service,
+  FSUtil.Service.use((fs) =>
+    Effect.succeed(
+      FSUtil.Service.of({
+        ...fs,
+        stat: () => Effect.succeed(directoryInfo),
+      }),
+    ),
+  ),
+).pipe(Layer.provide(FSUtil.defaultLayer))
+const ripgrep = Layer.mock(Ripgrep.Service, {
+  find: () => Effect.die("unused"),
+  grep: () =>
+    Effect.succeed([
+      CoreFileSystem.Match.make({
+        entry: CoreFileSystem.Entry.make({ path: RelativePath.make("src/result.ts"), type: "file" }),
+        line: 1,
+        offset: 0,
+        text: grepBody,
+        submatches: [],
+      }),
+    ]),
+  glob: () => Effect.succeed(globEntries),
+})
+const foldingBuiltins = Layer.mergeAll(
+  ReadTool.layer.pipe(
+    Layer.provide(registry),
+    Layer.provide(readFileSystem),
+    Layer.provide(mutation),
+    Layer.provide(image),
+    Layer.provide(permission),
+  ),
+  GrepTool.layer.pipe(
+    Layer.provide(registry),
+    Layer.provide(searchFileSystem),
+    Layer.provide(ripgrep),
+    Layer.provide(location),
+    Layer.provide(permission),
+  ),
+  GlobTool.layer.pipe(
+    Layer.provide(registry),
+    Layer.provide(ripgrep),
+    Layer.provide(location),
+    Layer.provide(permission),
+  ),
+)
 const skillGuidance = Layer.mock(SkillGuidance.Service, { load: () => Effect.succeed(SystemContext.empty) })
 const referenceGuidance = Layer.mock(ReferenceGuidance.Service, { load: () => Effect.succeed(SystemContext.empty) })
 // Config documents are read lazily per turn by the runner, so tests can set
@@ -215,6 +367,12 @@ const it = testEffect(
     agents,
     registry,
     echo,
+    readFileSystem,
+    mutation,
+    image,
+    searchFileSystem,
+    ripgrep,
+    foldingBuiltins,
     models,
     systemContext,
     location,
@@ -246,6 +404,19 @@ const toolTurn: LLMEvent[] = [
   LLMEvent.finish({ reason: "tool-calls" }),
 ]
 
+const foldingToolTurn = (id: string, name: "read" | "grep" | "glob", input: unknown): LLMEvent[] => {
+  const text = JSON.stringify(input)
+  return [
+    LLMEvent.stepStart({ index: 0 }),
+    LLMEvent.toolInputStart({ id, name }),
+    LLMEvent.toolInputDelta({ id, name, text }),
+    LLMEvent.toolInputEnd({ id, name }),
+    LLMEvent.toolCall({ id, name, input }),
+    LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
+    LLMEvent.finish({ reason: "tool-calls" }),
+  ]
+}
+
 const insertSession = (id: SessionV2.ID) =>
   Effect.gen(function* () {
     const { db } = yield* Database.Service
@@ -270,6 +441,8 @@ const setup = Effect.gen(function* () {
   responses = undefined
   responseStream = undefined
   requests.length = 0
+  preparedBodies.length = 0
+  outboundBodies.length = 0
   counts.publish = 0
   counts.publishMany = 0
   probe.captures = []
@@ -318,11 +491,139 @@ const stepEndedData = (id: SessionV2.ID) =>
 const waitUntil = <R>(check: Effect.Effect<boolean, never, R>, message: string) =>
   Effect.gen(function* () {
     while (!(yield* check)) yield* Effect.yieldNow
-  }).pipe(
-    Effect.timeoutOrElse({ duration: "5 seconds", orElse: () => Effect.fail(new Error(message)) }),
-  )
+  }).pipe(Effect.timeoutOrElse({ duration: "5 seconds", orElse: () => Effect.fail(new Error(message)) }))
+
+type OutboundMessage = Readonly<{ role: string; tool_call_id?: string; content?: string }>
+const outboundMessages = (body: unknown): OutboundMessage[] => {
+  if (typeof body !== "object" || body === null || !Object.hasOwn(body, "messages"))
+    throw new Error("expected provider message body")
+  const messages = Reflect.get(body, "messages")
+  if (!Array.isArray(messages)) throw new Error("expected provider messages")
+  return messages.map((message) => {
+    if (typeof message !== "object" || message === null) throw new Error("expected provider message")
+    const role = Reflect.get(message, "role")
+    const toolCallID = Reflect.get(message, "tool_call_id")
+    const content = Reflect.get(message, "content")
+    if (typeof role !== "string") throw new Error("expected provider message role")
+    if (role !== "tool") return { role }
+    if (typeof toolCallID !== "string") throw new Error("invalid provider tool call ID")
+    if (typeof content !== "string") throw new Error("invalid provider message content")
+    return { role, tool_call_id: toolCallID, content }
+  })
+}
 
 describe("SessionRunnerLLM hot path", () => {
+  it.effect("folds duplicate built-in read, grep, and glob outputs only in the final outbound request", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const session = yield* SessionV2.Service
+      const calls = [
+        { id: "call-read-source", name: "read" as const, input: { path: "notes.txt", offset: 1, limit: 200 } },
+        { id: "call-read-witness", name: "read" as const, input: { path: "notes.txt", offset: 1, limit: 200 } },
+        {
+          id: "call-grep-source",
+          name: "grep" as const,
+          input: { pattern: "needle", path: "src", include: "*.ts", limit: 10 },
+        },
+        {
+          id: "call-grep-witness",
+          name: "grep" as const,
+          input: { pattern: "needle", path: "src", include: "*.ts", limit: 10 },
+        },
+        { id: "call-glob-source", name: "glob" as const, input: { pattern: "**/*.ts", path: "src", limit: 200 } },
+        { id: "call-glob-witness", name: "glob" as const, input: { pattern: "**/*.ts", path: "src", limit: 200 } },
+      ]
+
+      for (const [index, item] of calls.entries()) {
+        yield* session.prompt({
+          sessionID,
+          prompt: Prompt.make({ text: `Run ${item.name} ${index}` }),
+          resume: false,
+        })
+        responses = [foldingToolTurn(item.id, item.name, item.input), textTurn(`tool-done-${index}`, "done")]
+        yield* session.resume(sessionID)
+      }
+
+      const filler = "recent-context:" + "z".repeat(55_000)
+      for (let index = 0; index < 4; index++) {
+        yield* session.prompt({ sessionID, prompt: Prompt.make({ text: `Keep context ${index}` }), resume: false })
+        response = textTurn(`recent-${index}`, `${filler}:${index}`)
+        responses = undefined
+        yield* session.resume(sessionID)
+      }
+
+      const callIDs = new Set(calls.map((item) => item.id))
+      const selectStoredTools = (messages: readonly SessionMessage.Message[]) =>
+        messages.flatMap((message) =>
+          message.type === "assistant"
+            ? message.content.filter(
+                (part): part is SessionMessage.AssistantTool => part.type === "tool" && callIDs.has(part.id),
+              )
+            : [],
+        )
+      const storedBefore = selectStoredTools(yield* session.context(sessionID))
+      expect(storedBefore).toHaveLength(6)
+      expect(storedBefore[0]).toMatchObject({
+        id: "call-read-source",
+        name: "read",
+        state: {
+          status: "completed",
+          input: { path: "notes.txt", offset: 1, limit: 200 },
+          structured: {
+            type: "text-page",
+            content: readBody,
+            mime: "text/plain",
+            offset: 1,
+            truncated: false,
+            next: 2,
+          },
+        },
+      })
+      const durableBefore = JSON.stringify(storedBefore)
+
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Final answer" }), resume: false })
+      response = textTurn("final-answer", "complete")
+      requests.length = 0
+      preparedBodies.length = 0
+      outboundBodies.length = 0
+      yield* session.resume(sessionID)
+
+      expect(requests).toHaveLength(1)
+      expect(preparedBodies).toHaveLength(2)
+      expect(outboundBodies).toHaveLength(1)
+      expect(JSON.stringify(selectStoredTools(yield* session.context(sessionID)))).toBe(durableBefore)
+
+      const messages = outboundMessages(outboundBodies[0])
+      const result = (id: string) =>
+        messages.find((message) => message.role === "tool" && message.tool_call_id === id)?.content
+      const placeholder = (witness: string) =>
+        `[Duplicate tool output folded. Identical full output is retained in later tool call ${JSON.stringify(witness)}.]`
+
+      const readSource: unknown = JSON.parse(result("call-read-source") ?? "null")
+      const readWitness: unknown = JSON.parse(result("call-read-witness") ?? "null")
+      expect(readSource).toEqual({
+        type: "text-page",
+        content: placeholder("call-read-witness"),
+        mime: "text/plain",
+        offset: 1,
+        truncated: false,
+        next: 2,
+      })
+      expect(readWitness).toEqual({
+        type: "text-page",
+        content: readBody,
+        mime: "text/plain",
+        offset: 1,
+        truncated: false,
+        next: 2,
+      })
+      expect(result("call-grep-source")).toBe(placeholder("call-grep-witness"))
+      expect(result("call-grep-witness")).toContain(grepBody)
+      expect(result("call-glob-source")).toBe(placeholder("call-glob-witness"))
+      expect(result("call-glob-witness")).toContain("/project/src/generated/000-")
+    }),
+  )
+
   it.effect("batches durable publishes and preserves order across incremental turns", () =>
     Effect.gen(function* () {
       yield* setup
@@ -346,7 +647,10 @@ describe("SessionRunnerLLM hot path", () => {
       const gate = yield* Deferred.make<void>()
       toolExecutionGate = gate
       const run = yield* session.resume(sessionID).pipe(Effect.forkChild)
-      yield* waitUntil(Effect.sync(() => executions.length >= 1), "echo tool never started")
+      yield* waitUntil(
+        Effect.sync(() => executions.length >= 1),
+        "echo tool never started",
+      )
       const { db } = yield* Database.Service
       const committed = (yield* db
         .select({ id: EventTable.id })
@@ -382,7 +686,10 @@ describe("SessionRunnerLLM hot path", () => {
         { type: "user", text: "First" },
         { type: "assistant", finish: "stop", content: [{ type: "text", text: "Hello" }] },
         { type: "user", text: "Second" },
-        { type: "assistant", content: [{ type: "tool", id: "call-echo", name: "echo", state: { status: "completed" } }] },
+        {
+          type: "assistant",
+          content: [{ type: "tool", id: "call-echo", name: "echo", state: { status: "completed" } }],
+        },
         { type: "assistant", finish: "stop", content: [{ type: "text", text: "Done" }] },
       ])
 
@@ -451,9 +758,9 @@ describe("SessionRunnerLLM hot path", () => {
       const userTexts = requests[0]!.messages
         .filter((message) => message.role === "user")
         .flatMap((message) =>
-          message.content.filter((content): content is { type: "text"; text: string } => content.type === "text").map(
-            (content) => content.text,
-          ),
+          message.content
+            .filter((content): content is { type: "text"; text: string } => content.type === "text")
+            .map((content) => content.text),
         )
       expect(userTexts[0]).toContain("<conversation-checkpoint>")
       expect(userTexts[0]).toContain("summary")
@@ -507,7 +814,10 @@ describe("SessionRunnerLLM hot path", () => {
       yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "First" }), resume: false })
       responseStream = Stream.never
       const run = yield* session.resume(sessionID).pipe(Effect.forkChild)
-      yield* waitUntil(Effect.sync(() => requests.length >= 1), "provider stream never started")
+      yield* waitUntil(
+        Effect.sync(() => requests.length >= 1),
+        "provider stream never started",
+      )
       yield* TestClock.adjust(Duration.minutes(11))
       const exit = yield* Fiber.await(run)
 
@@ -536,18 +846,26 @@ describe("SessionRunnerLLM hot path", () => {
       yield* setup
       // 1-second turn deadline via the `agents.build.timeout` config field
       // (seconds); the DAG-default mirror is 10 minutes when unset.
-      configEntries = [new Config.Document({ type: "document", info: { agents: { build: new ConfigAgent.Info({ timeout: 1 }) } } })]
+      configEntries = [
+        new Config.Document({ type: "document", info: { agents: { build: new ConfigAgent.Info({ timeout: 1 }) } } }),
+      ]
       const session = yield* SessionV2.Service
       yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "First" }), resume: false })
       response = toolTurn
       const gate = yield* Deferred.make<void>()
       toolExecutionGate = gate
       const run = yield* session.resume(sessionID).pipe(Effect.forkChild)
-      yield* waitUntil(Effect.sync(() => requests.length >= 1), "provider stream never started")
+      yield* waitUntil(
+        Effect.sync(() => requests.length >= 1),
+        "provider stream never started",
+      )
       expect(Duration.toSeconds(requests[0]!.http!.timeout!)).toBe(1)
       // The tool call started and is stuck on the never-released gate; the
       // provider stream itself has finished (only the tool wait remains).
-      yield* waitUntil(Effect.sync(() => executions.length >= 1), "echo tool never started")
+      yield* waitUntil(
+        Effect.sync(() => executions.length >= 1),
+        "echo tool never started",
+      )
       yield* TestClock.adjust(Duration.seconds(2))
       const exit = yield* Fiber.await(run)
 
@@ -572,7 +890,13 @@ describe("SessionRunnerLLM hot path", () => {
               type: "tool",
               id: "call-echo",
               name: "echo",
-              state: { status: "error", error: { type: "unknown", message: "Tool execution failed: SessionRunner.stream: Tool execution timed out" } },
+              state: {
+                status: "error",
+                error: {
+                  type: "unknown",
+                  message: "Tool execution failed: SessionRunner.stream: Tool execution timed out",
+                },
+              },
             },
           ],
         },

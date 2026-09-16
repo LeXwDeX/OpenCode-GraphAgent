@@ -3,6 +3,7 @@ export { normalizeParameters } from "./normalize"
 export { planContextFolding } from "./plan"
 export { ContextFoldingPolicy } from "./policy"
 export { fingerprintContextFoldingRequest, projectContextFoldingRequest } from "./projection"
+export { ContextFoldingToolSourceLedger } from "./tool-source-ledger"
 export type {
   BudgetSkipReason,
   CandidateExclusion,

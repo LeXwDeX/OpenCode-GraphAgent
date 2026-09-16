@@ -1,7 +1,7 @@
 # 内置动态上下文折叠：开发步骤
 
 - 日期：2026-09-16。
-- 状态：S01–S03 已通过父任务独立审计；S04 已实现并完成本分支复验，等待父任务审计；S05–S10 均未实施、未验收。
+- 状态：S01–S03 已通过父任务独立审计；S04–S06 已实现并完成各自分支复验，等待父任务审计；S07–S10 均未实施、未验收。
 - 规格依据：[开发设计与验收规格](native-context-folding-design.md)。发生冲突时先修订规格，不在实现中暗改规则。
 - 本文中的 U/I 编号对应规格第 11 节验收矩阵。
 - 初始规划阶段仅编写计划；进入实施后已按 SpecGit 2 建立 Issue #605。S01 不提交产品实现、不部署、不合并。
@@ -235,8 +235,8 @@ S02/S03 与 S04 在依赖上可分别开展；S05 与 S06 可以分别审查。�
 | S02  | 父审计通过   | `ac3b5c92e0c7a727eccad9a313f94e5ec1677b65`                           | [S02 证据](context-folding/evidence/S02.md) | 纯策略与测试；尚未接入产品请求              |
 | S03  | 父审计通过   | `e6467528fc6e4bdaba45358a6bce2539d706dbcf`                           | [S03 证据](context-folding/evidence/S03.md) | 共享预算/投影契约；具体宿主接线仍留 S05/S06 |
 | S04  | 待父任务审计 | `feat/native-context-folding-s04` 当前 head（最终 SHA 见父审计记录） | [S04 证据](context-folding/evidence/S04.md) | 宿主接线及外部插件加载态/诊断仍留 S05/S07   |
-| S05  | 未开始       | —                                                                    | —                                           | 当前 OpenCode 接入                          |
-| S06  | 未开始       | —                                                                    | —                                           | Core runner 接入                            |
+| S05  | 待父任务审计 | `f7ac15155b1e5819548baf5fe0255b8054e463b2`                           | [S05 证据](context-folding/evidence/S05.md) | 外部插件加载态与迁移诊断仍留 S07            |
+| S06  | 待父任务审计 | `feat/native-context-folding-s06` 当前 head（最终 SHA 见父审计记录） | [S06 证据](context-folding/evidence/S06.md) | S07–S10 未实施；尚未形成完整兼容交付        |
 | S07  | 未开始       | —                                                                    | —                                           | 旧逻辑迁移与诊断                            |
 | S08  | 未开始       | —                                                                    | —                                           | 真实宿主契约回归                            |
 | S09  | 未开始       | —                                                                    | —                                           | 质量与性能对照                              |
