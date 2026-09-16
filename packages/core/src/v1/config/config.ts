@@ -148,8 +148,11 @@ export const Info = Schema.Struct({
       auto: Schema.optional(Schema.Boolean).annotate({
         description: "Enable automatic compaction when context is full (default: true)",
       }),
+      dynamic: Schema.optional(Schema.Boolean).annotate({
+        description: "Fold strictly duplicate older tool outputs in model requests (default: true)",
+      }),
       prune: Schema.optional(Schema.Boolean).annotate({
-        description: "Enable pruning of old tool outputs (default: false)",
+        description: "@deprecated Use 'dynamic'. Enable pruning of old tool outputs when dynamic is omitted.",
       }),
       tail_turns: Schema.optional(NonNegativeInt).annotate({
         description:
