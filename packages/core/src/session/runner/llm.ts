@@ -42,6 +42,7 @@ import { CoreContextFolding } from "./context-folding"
 import { MAX_STEPS_PROMPT } from "./max-steps"
 import { Snapshot } from "../../snapshot"
 import { Flag } from "../../flag/flag"
+import { contextFoldingDiagnostic } from "../context-folding"
 
 // Runner-level per-turn provider deadline. This is the runner's own cutoff
 // (10 minutes); it is independent of the DAG node timeout
@@ -140,18 +141,21 @@ export const layer = Layer.effect(
     const db = (yield* Database.Service).db
     const configEntries = yield* config.entries()
     const compaction = SessionCompaction.make({ events, llm, config: configEntries })
-    let configuredDynamic: boolean | undefined
-    let configuredPrune: boolean | undefined
-    for (const entry of configEntries) {
-      if (entry.type !== "document" || entry.info.compaction === undefined) continue
-      if (entry.info.compaction.dynamic !== undefined) configuredDynamic = entry.info.compaction.dynamic
-      if (entry.info.compaction.prune !== undefined) configuredPrune = entry.info.compaction.prune
-    }
-    const dynamicFolding = ConfigCompaction.resolveDynamic({
-      disabledByEnvironment: Flag.OPENCODE_DISABLE_PRUNE,
-      dynamic: configuredDynamic,
-      prune: configuredPrune,
-      knownExternalDcp: "unknown",
+    const resolveDynamicFolding = Effect.fnUntraced(function* () {
+      let dynamic: boolean | undefined
+      let prune: boolean | undefined
+      for (const entry of yield* config.entries()) {
+        if (entry.type !== "document" || entry.info.compaction === undefined) continue
+        if (entry.info.compaction.dynamic !== undefined) dynamic = entry.info.compaction.dynamic
+        if (entry.info.compaction.prune !== undefined) prune = entry.info.compaction.prune
+      }
+      return ConfigCompaction.resolveDynamic({
+        disabledByEnvironment: Flag.OPENCODE_DISABLE_PRUNE,
+        dynamic,
+        prune,
+        // Core owns no server-plugin loader. Unknown is explicit and must never be promoted to loaded by inference.
+        knownExternalDcp: "unknown",
+      })
     })
     const getSession = Effect.fn("SessionRunner.getSession")(function* (sessionID: SessionSchema.ID) {
       const session = yield* store.get(sessionID)
@@ -365,6 +369,7 @@ export const layer = Layer.effect(
         tools: toolMaterialization?.definitions ?? [],
         toolChoice: isLastStep ? "none" : undefined,
       })
+      const dynamicFolding = yield* resolveDynamicFolding()
       const folding = yield* CoreContextFolding.project({
         enabled: dynamicFolding.enabled,
         purpose: "conversation",
@@ -377,6 +382,15 @@ export const layer = Layer.effect(
         ledger: toolSources,
         prepare: (request) => llm.prepare(request),
       })
+      yield* Effect.logInfo(
+        "context folding",
+        contextFoldingDiagnostic({
+          runtime: "core-runner",
+          requestPurpose: "conversation",
+          resolution: dynamicFolding,
+          projectionPlan: folding.plan,
+        }),
+      )
       const request = folding.request
       if (yield* compaction.compactIfNeeded({ sessionID: session.id, entries, model, request }))
         return yield* Effect.die(continueAfterCompaction(currentStep))

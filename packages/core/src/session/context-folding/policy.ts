@@ -1,4 +1,5 @@
 export const ContextFoldingPolicy = {
+  version: "strict-duplicate-v1",
   allowedTools: ["read", "grep", "glob"] as const,
   protectedInstructionBasenames: ["agents.md", "agents.override.md", "claude.md", "context.md", "skill.md"] as const,
   protectRecentSteps: 4,

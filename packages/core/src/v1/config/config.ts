@@ -149,11 +149,12 @@ export const Info = Schema.Struct({
         description: "Enable automatic compaction when context is full (default: true)",
       }),
       dynamic: Schema.optional(Schema.Boolean).annotate({
-        description: "Fold strictly duplicate older tool outputs in model requests (default: true)",
+        description:
+          "Fold strictly duplicate older tool outputs only in prepared model requests (default: true). Stored history is unchanged; this is independent from automatic or manual full compaction.",
       }),
       prune: Schema.optional(Schema.Boolean).annotate({
         description:
-          "@deprecated Compatibility fallback for 'dynamic'. Used only when 'dynamic' is omitted to control strict duplicate-output folding in prepared model requests; original history is preserved.",
+          "@deprecated Compatibility alias for 'dynamic'. Used only when 'dynamic' is omitted; it no longer marks or clears stored tool output.",
       }),
       tail_turns: Schema.optional(NonNegativeInt).annotate({
         description:

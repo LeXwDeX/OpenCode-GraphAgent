@@ -35,6 +35,8 @@ const pluginLayer = Layer.succeed(
     init: () => Effect.void,
     list: () => Effect.succeed([]),
     trigger,
+    contextFoldingCompatibility: () =>
+      Effect.succeed({ knownExternalDcp: "unknown", migrationNotice: "not-applicable" }),
   }),
 )
 const resolveIt = testEffect(

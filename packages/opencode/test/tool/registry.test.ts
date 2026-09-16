@@ -33,6 +33,8 @@ const brokenPluginLayer = Layer.succeed(
   Plugin.Service.of({
     init: () => Effect.void,
     trigger,
+    contextFoldingCompatibility: () =>
+      Effect.succeed({ knownExternalDcp: "unknown", migrationNotice: "not-applicable" }),
     list: () =>
       Effect.succeed([
         {

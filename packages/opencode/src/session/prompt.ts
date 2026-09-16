@@ -1818,7 +1818,6 @@ export const layer = Layer.effect(
               forceContinue = false
               turnStopped = false
             } else {
-              yield* compaction.prune({ sessionID }).pipe(Effect.ignore, Effect.forkIn(scope))
               yield* Effect.logInfo("exiting loop", { "session.id": sessionID })
               // SettingsHook: Stop on clean turn exit, StopFailure when it ended in error.
               if (settingsHook) {
