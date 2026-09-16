@@ -7,6 +7,7 @@ import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { disposeAllInstances, provideInstance, testInstanceStoreLayer, tmpdirScoped } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
+import { logLines } from "effect/testing/TestConsole"
 
 const { Plugin } = await import("../../src/plugin/index")
 const { PluginLoader } = await import("../../src/plugin/loader")
@@ -82,7 +83,10 @@ describe("plugin.loader.shared", () => {
             exports: { "./server": "./server.js" },
           }),
         )
-        await Bun.write(path.join(mod, "server.js"), "export default async () => ({})\n")
+        await Bun.write(
+          path.join(mod, "server.js"),
+          'export default async () => ({ "experimental.chat.messages.transform": async () => {} })\n',
+        )
         await Bun.write(
           path.join(dir, "opencode.json"),
           JSON.stringify({ plugin: ["@lexwdex-org/opencode-dcp@6.0.3"] }),
@@ -97,11 +101,13 @@ describe("plugin.loader.shared", () => {
               first: { knownExternalDcp: "loaded", migrationNotice: "notified" },
               second: { knownExternalDcp: "loaded", migrationNotice: "already-notified" },
             })
+            expect(JSON.stringify(yield* logLines).match(/registered active context-folding hooks/g)).toHaveLength(1)
             yield* Effect.promise(() => disposeAllInstances())
             expect(yield* load(tmp.path)).toEqual({
               first: { knownExternalDcp: "loaded", migrationNotice: "notified" },
               second: { knownExternalDcp: "loaded", migrationNotice: "already-notified" },
             })
+            expect(JSON.stringify(yield* logLines).match(/registered active context-folding hooks/g)).toHaveLength(2)
           } finally {
             install.mockRestore()
           }
@@ -117,7 +123,78 @@ describe("plugin.loader.shared", () => {
           path.join(dir, "package.json"),
           JSON.stringify({ name: "@lexwdex-org/opencode-dcp", type: "module" }),
         )
-        await Bun.write(file, "export default async () => ({})\n")
+        await Bun.write(
+          file,
+          'export default async () => ({ "experimental.chat.messages.transform": async () => {} })\n',
+        )
+        await Bun.write(path.join(dir, "opencode.json"), JSON.stringify({ plugin: [pathToFileURL(file).href] }))
+      },
+      (tmp) =>
+        Effect.gen(function* () {
+          expect(yield* load(tmp.path)).toEqual({
+            first: { knownExternalDcp: "loaded", migrationNotice: "notified" },
+            second: { knownExternalDcp: "loaded", migrationNotice: "already-notified" },
+          })
+        }),
+    ),
+  )
+
+  it.live("keeps built-in folding eligible when exact DCP returns empty hooks for either disabled config path", () =>
+    withTmp(
+      async (dir) => {
+        const file = path.join(dir, "server.js")
+        await Bun.write(
+          path.join(dir, "package.json"),
+          JSON.stringify({ name: "@lexwdex-org/opencode-dcp", type: "module" }),
+        )
+        await Bun.write(
+          file,
+          [
+            "export default async (_input, options) => {",
+            "  if (options.enabled === false || options.dtc?.enabled === false) return {}",
+            '  return { "experimental.chat.messages.transform": async () => {} }',
+            "}",
+            "",
+          ].join("\n"),
+        )
+        return { file }
+      },
+      (tmp) =>
+        Effect.gen(function* () {
+          for (const options of [{ enabled: false }, { enabled: true, dtc: { enabled: false } }]) {
+            yield* Effect.promise(() =>
+              Bun.write(
+                path.join(tmp.path, "opencode.json"),
+                JSON.stringify({ plugin: [[pathToFileURL(tmp.extra.file).href, options]] }),
+              ),
+            )
+            expect(yield* load(tmp.path)).toEqual({
+              first: { knownExternalDcp: "unknown", migrationNotice: "not-applicable" },
+              second: { knownExternalDcp: "unknown", migrationNotice: "not-applicable" },
+            })
+            yield* Effect.promise(() => disposeAllInstances())
+          }
+          expect(JSON.stringify(yield* logLines)).not.toContain("registered active context-folding hooks")
+        }),
+    ),
+  )
+
+  it.live("retreats when an exact legacy DCP retains a transform before a later export fails", () =>
+    withTmp(
+      async (dir) => {
+        const file = path.join(dir, "server.js")
+        await Bun.write(
+          path.join(dir, "package.json"),
+          JSON.stringify({ name: "@lexwdex-org/opencode-dcp", type: "module" }),
+        )
+        await Bun.write(
+          file,
+          [
+            'export const aActive = async () => ({ "experimental.chat.messages.transform": async () => {} })',
+            'export const zFail = async () => { throw new Error("later apply failure") }',
+            "",
+          ].join("\n"),
+        )
         await Bun.write(path.join(dir, "opencode.json"), JSON.stringify({ plugin: [pathToFileURL(file).href] }))
       },
       (tmp) =>

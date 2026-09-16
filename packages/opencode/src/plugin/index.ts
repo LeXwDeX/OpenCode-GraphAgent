@@ -145,6 +145,21 @@ function knownExternalDcp(load: PluginLoader.Loaded): State["knownExternalDcp"] 
   }
 }
 
+function hasContextFoldingHook(hook: Hooks) {
+  return (
+    typeof hook["experimental.chat.messages.transform"] === "function" ||
+    typeof hook["experimental.session.compacting"] === "function"
+  )
+}
+
+function activeKnownExternalDcp(
+  load: PluginLoader.Loaded,
+  registeredHooks: readonly Hooks[],
+): State["knownExternalDcp"] {
+  if (!registeredHooks.some(hasContextFoldingHook)) return
+  return knownExternalDcp(load)
+}
+
 export const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
@@ -243,7 +258,8 @@ export const layer = Layer.effect(
 
           // Keep plugin execution sequential so hook registration and execution
           // order remains deterministic across plugin runs.
-          const applied = yield* Effect.tryPromise({
+          const hookStart = hooks.length
+          yield* Effect.tryPromise({
             try: () => applyPlugin(load, input, hooks),
             catch: (err) => {
               const message = errorMessage(err)
@@ -253,9 +269,10 @@ export const layer = Layer.effect(
             Effect.tapError((error) => Effect.logError("failed to load plugin", { path: load.spec, error })),
             Effect.option,
           )
-          if (applied._tag === "Some") {
-            knownExternalDcpDescriptor ??= knownExternalDcp(load)
-          }
+          // Derive compatibility from hooks that actually remain registered. An
+          // empty successful return means DCP is disabled; a retained hook from a
+          // partially failed legacy module is still active and must stay exclusive.
+          knownExternalDcpDescriptor ??= activeKnownExternalDcp(load, hooks.slice(hookStart))
         }
 
         // Notify plugins of current config
@@ -279,7 +296,10 @@ export const layer = Layer.effect(
             hooks,
             (hook) =>
               Effect.tryPromise({
-                try: () => Promise.resolve(hook["event"]?.({ event: { id: event.id, type: event.type, properties: event.data } as any })),
+                try: () =>
+                  Promise.resolve(
+                    hook["event"]?.({ event: { id: event.id, type: event.type, properties: event.data } as any }),
+                  ),
                 catch: errorMessage,
               }).pipe(
                 Effect.tapError((error) => Effect.logError("plugin event hook failed", { type: event.type, error })),
@@ -348,11 +368,11 @@ export const layer = Layer.effect(
       // Set the lifecycle guard before yielding so concurrent first requests cannot emit duplicate notices.
       s.externalDcpMigrationNotified = true
       yield* Effect.logWarning(
-        `Known external context-pruning plugin ${s.knownExternalDcp.packageName} is loaded; built-in dynamic context folding is disabled. Remove the external plugin and restart this instance to use the built-in capability.`,
+        `Known external context-pruning plugin ${s.knownExternalDcp.packageName} registered active context-folding hooks; built-in dynamic context folding is disabled. Remove or disable the external plugin and restart this instance to use the built-in capability.`,
         {
-          compatibility: "external-dcp",
+          compatibility: "external-dcp-active",
           source: s.knownExternalDcp.source,
-          migration: "remove-plugin-and-restart",
+          migration: "remove-or-disable-plugin-and-restart",
         },
       )
       return {
