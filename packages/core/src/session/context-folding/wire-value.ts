@@ -163,13 +163,7 @@ export const serializeWireValue = (value: unknown): WireValueResult<string> => {
 const CLONE_FAILED = Symbol("context-folding-clone-failed")
 type CloneValue = null | boolean | number | string | object | typeof CLONE_FAILED
 
-const clone = (
-  value: unknown,
-  ancestors: Set<object>,
-  copies: WeakMap<object, CloneValue>,
-  budget: WorkBudget,
-  depth: number,
-): CloneValue => {
+const clone = (value: unknown, seen: WeakSet<object>, budget: WorkBudget, depth: number): CloneValue => {
   if (!consumeNode(budget, depth)) return CLONE_FAILED
   if (value === null) return null
 
@@ -189,10 +183,10 @@ const clone = (
       break
   }
 
-  if (ancestors.has(value)) return CLONE_FAILED
-  const existing = copies.get(value)
-  if (existing !== undefined) return existing
-  ancestors.add(value)
+  // Final provider requests must be trees. Reject cycles and shared aliases so a selected write can never mutate an
+  // unselected path in the private copy.
+  if (seen.has(value)) return CLONE_FAILED
+  seen.add(value)
 
   try {
     const prototype = Object.getPrototypeOf(value)
@@ -202,11 +196,10 @@ const clone = (
       if (ownKeys.length !== value.length + 1 || ownKeys.some((key) => typeof key === "symbol")) return CLONE_FAILED
       const result: unknown[] = []
       result.length = value.length
-      copies.set(value, result)
       for (let index = 0; index < value.length; index++) {
         const descriptor = Object.getOwnPropertyDescriptor(value, String(index))
         if (!descriptor || !("value" in descriptor)) return CLONE_FAILED
-        const item = clone(descriptor.value, ancestors, copies, budget, depth + 1)
+        const item = clone(descriptor.value, seen, budget, depth + 1)
         if (item === CLONE_FAILED) return CLONE_FAILED
         result[index] = item
       }
@@ -217,20 +210,22 @@ const clone = (
     const ownKeys = Reflect.ownKeys(value)
     if (!consumeContainerEntries(budget, ownKeys.length)) return CLONE_FAILED
     const result: Record<string, unknown> = prototype === null ? Object.create(null) : {}
-    copies.set(value, result)
     for (const key of ownKeys) {
       if (typeof key !== "string" || !consumeString(budget, key)) return CLONE_FAILED
       const descriptor = Object.getOwnPropertyDescriptor(value, key)
       if (!descriptor || !("value" in descriptor)) return CLONE_FAILED
-      const item = clone(descriptor.value, ancestors, copies, budget, depth + 1)
+      const item = clone(descriptor.value, seen, budget, depth + 1)
       if (item === CLONE_FAILED) return CLONE_FAILED
-      result[key] = item
+      Object.defineProperty(result, key, {
+        value: item,
+        enumerable: descriptor.enumerable,
+        writable: true,
+        configurable: true,
+      })
     }
     return result
   } catch {
     return CLONE_FAILED
-  } finally {
-    ancestors.delete(value)
   }
 }
 
@@ -238,7 +233,7 @@ export function cloneWireValue<Value>(value: Value): WireValueResult<Value>
 export function cloneWireValue(value: unknown): WireValueResult<unknown> {
   const budget = createWorkBudget(ContextFoldingPolicy.workLimits)
   try {
-    const copy = clone(value, new Set(), new WeakMap(), budget, 0)
+    const copy = clone(value, new WeakSet(), budget, 0)
     if (copy === CLONE_FAILED) return failure(budget)
     return { ok: true, value: copy, inputBytes: budget.inputBytes }
   } catch {
@@ -247,6 +242,271 @@ export function cloneWireValue(value: unknown): WireValueResult<unknown> {
 }
 
 export type WirePathSegment = string | number
+
+export type WireValueChange = Readonly<{
+  path: readonly WirePathSegment[]
+  before: string
+  after: string
+}>
+
+type ChangeTrie = {
+  readonly children: Map<string, Readonly<{ segment: WirePathSegment; node: ChangeTrie }>>
+  change?: WireValueChange
+}
+
+const emptyChangeTrie = (): ChangeTrie => ({ children: new Map() })
+const EMPTY_CHANGE_TRIE = emptyChangeTrie()
+const segmentKey = (segment: WirePathSegment) =>
+  typeof segment === "number" ? `n:${segment}` : `s:${segment.length}:${segment}`
+
+const buildChangeTrie = (changes: readonly WireValueChange[], budget: WorkBudget): ChangeTrie | undefined => {
+  if (!consumeContainerEntries(budget, changes.length)) return undefined
+  const root = emptyChangeTrie()
+
+  for (const change of changes) {
+    if (
+      !Array.isArray(change.path) ||
+      change.path.length === 0 ||
+      change.path.length > budget.limits.maxDepth ||
+      !consumeContainerEntries(budget, change.path.length) ||
+      !consumeString(budget, change.before) ||
+      !consumeString(budget, change.after)
+    ) {
+      return undefined
+    }
+
+    let node = root
+    for (const segment of change.path) {
+      if (
+        (typeof segment !== "string" && typeof segment !== "number") ||
+        (typeof segment === "number" && (!Number.isSafeInteger(segment) || segment < 0)) ||
+        (typeof segment === "string" && !consumeString(budget, segment)) ||
+        node.change
+      ) {
+        return undefined
+      }
+      const key = segmentKey(segment)
+      let child = node.children.get(key)
+      if (!child) {
+        child = { segment, node: emptyChangeTrie() }
+        node.children.set(key, child)
+      }
+      node = child.node
+    }
+    if (node.change || node.children.size > 0) return undefined
+    node.change = change
+  }
+
+  return root
+}
+
+const sameWireValue = (
+  original: unknown,
+  projected: unknown,
+  trie: ChangeTrie,
+  originalSeen: WeakSet<object>,
+  projectedSeen: WeakSet<object>,
+  originalBudget: WorkBudget,
+  projectedBudget: WorkBudget,
+  depth: number,
+  matched: { count: number },
+): boolean => {
+  if (!consumeNode(originalBudget, depth) || !consumeNode(projectedBudget, depth)) return false
+
+  if (trie.change) {
+    if (trie.children.size > 0 || original !== trie.change.before || projected !== trie.change.after) return false
+    if (
+      typeof original !== "string" ||
+      typeof projected !== "string" ||
+      !consumeString(originalBudget, original) ||
+      !consumeString(projectedBudget, projected)
+    ) {
+      return false
+    }
+    matched.count++
+    return true
+  }
+
+  if (original === null || projected === null) return original === projected && trie.children.size === 0
+  if (typeof original !== typeof projected) return false
+
+  switch (typeof original) {
+    case "boolean":
+      return original === projected && trie.children.size === 0
+    case "number":
+      return Object.is(original, projected) && Number.isFinite(original) && trie.children.size === 0
+    case "string":
+      return (
+        original === projected &&
+        trie.children.size === 0 &&
+        consumeString(originalBudget, original) &&
+        consumeString(projectedBudget, projected)
+      )
+    case "bigint":
+    case "function":
+    case "symbol":
+    case "undefined":
+      return false
+    case "object":
+      break
+  }
+
+  if (!projected || typeof projected !== "object" || originalSeen.has(original) || projectedSeen.has(projected)) {
+    return false
+  }
+  originalSeen.add(original)
+  projectedSeen.add(projected)
+
+  try {
+    const originalPrototype = Object.getPrototypeOf(original)
+    const projectedPrototype = Object.getPrototypeOf(projected)
+    if (originalPrototype !== projectedPrototype) return false
+
+    if (Array.isArray(original)) {
+      if (
+        !Array.isArray(projected) ||
+        originalPrototype !== Array.prototype ||
+        original.length !== projected.length ||
+        !consumeContainerEntries(originalBudget, original.length) ||
+        !consumeContainerEntries(projectedBudget, projected.length)
+      ) {
+        return false
+      }
+      const originalKeys = Reflect.ownKeys(original)
+      const projectedKeys = Reflect.ownKeys(projected)
+      if (originalKeys.length !== original.length + 1 || projectedKeys.length !== projected.length + 1) return false
+
+      let visitedChildren = 0
+      for (let index = 0; index < original.length; index++) {
+        const originalDescriptor = Object.getOwnPropertyDescriptor(original, String(index))
+        const projectedDescriptor = Object.getOwnPropertyDescriptor(projected, String(index))
+        if (
+          !originalDescriptor ||
+          !("value" in originalDescriptor) ||
+          !projectedDescriptor ||
+          !("value" in projectedDescriptor) ||
+          originalDescriptor.enumerable !== projectedDescriptor.enumerable
+        ) {
+          return false
+        }
+        const child = trie.children.get(segmentKey(index))
+        if (child) visitedChildren++
+        if (
+          !sameWireValue(
+            originalDescriptor.value,
+            projectedDescriptor.value,
+            child?.node ?? EMPTY_CHANGE_TRIE,
+            originalSeen,
+            projectedSeen,
+            originalBudget,
+            projectedBudget,
+            depth + 1,
+            matched,
+          )
+        ) {
+          return false
+        }
+      }
+      return visitedChildren === trie.children.size
+    }
+
+    if (Array.isArray(projected) || (originalPrototype !== Object.prototype && originalPrototype !== null)) return false
+    const originalKeys = Reflect.ownKeys(original)
+    const projectedKeys = Reflect.ownKeys(projected)
+    if (
+      originalKeys.length !== projectedKeys.length ||
+      !consumeContainerEntries(originalBudget, originalKeys.length) ||
+      !consumeContainerEntries(projectedBudget, projectedKeys.length)
+    ) {
+      return false
+    }
+
+    let visitedChildren = 0
+    for (let index = 0; index < originalKeys.length; index++) {
+      const key = originalKeys[index]
+      const projectedKey = projectedKeys[index]
+      if (
+        typeof key !== "string" ||
+        projectedKey !== key ||
+        !consumeString(originalBudget, key) ||
+        !consumeString(projectedBudget, key)
+      ) {
+        return false
+      }
+      const originalDescriptor = Object.getOwnPropertyDescriptor(original, key)
+      const projectedDescriptor = Object.getOwnPropertyDescriptor(projected, key)
+      if (
+        !originalDescriptor ||
+        !("value" in originalDescriptor) ||
+        !projectedDescriptor ||
+        !("value" in projectedDescriptor) ||
+        originalDescriptor.enumerable !== projectedDescriptor.enumerable
+      ) {
+        return false
+      }
+      const child = trie.children.get(segmentKey(key))
+      if (child) visitedChildren++
+      if (
+        !sameWireValue(
+          originalDescriptor.value,
+          projectedDescriptor.value,
+          child?.node ?? EMPTY_CHANGE_TRIE,
+          originalSeen,
+          projectedSeen,
+          originalBudget,
+          projectedBudget,
+          depth + 1,
+          matched,
+        )
+      ) {
+        return false
+      }
+    }
+    return visitedChildren === trie.children.size
+  } catch {
+    return false
+  }
+}
+
+/** Verifies every non-selected field and prototype while allowing only the declared string replacements. */
+export const verifyWireValueChanges = (
+  original: unknown,
+  projected: unknown,
+  changes: readonly WireValueChange[],
+): WireValueResult<boolean> => {
+  const pathBudget = createWorkBudget(ContextFoldingPolicy.workLimits)
+  const originalBudget = createWorkBudget(ContextFoldingPolicy.workLimits)
+  const projectedBudget = createWorkBudget(ContextFoldingPolicy.workLimits)
+
+  try {
+    const trie = buildChangeTrie(changes, pathBudget)
+    if (!trie) return failure(pathBudget)
+    const matched = { count: 0 }
+    const same = sameWireValue(
+      original,
+      projected,
+      trie,
+      new WeakSet(),
+      new WeakSet(),
+      originalBudget,
+      projectedBudget,
+      0,
+      matched,
+    )
+    if (originalBudget.exceeded) return failure(originalBudget)
+    if (projectedBudget.exceeded) return failure(projectedBudget)
+    return {
+      ok: true,
+      value: same && matched.count === changes.length,
+      inputBytes: originalBudget.inputBytes + projectedBudget.inputBytes,
+    }
+  } catch {
+    if (pathBudget.exceeded) return failure(pathBudget)
+    if (originalBudget.exceeded) return failure(originalBudget)
+    if (projectedBudget.exceeded) return failure(projectedBudget)
+    return { ok: false, reason: "unknown-content" }
+  }
+}
 
 export const readWirePath = (root: unknown, path: readonly WirePathSegment[]): WireValueResult<unknown> => {
   let value = root

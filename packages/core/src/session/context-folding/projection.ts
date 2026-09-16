@@ -6,6 +6,7 @@ import type {
   ContextFoldingProjectionInput,
   ContextFoldingProjectionPlan,
   ContextFoldingProjectionResult,
+  ContextFoldingRequestFingerprintInput,
   FoldRef,
   ProjectionDependencies,
   ProjectionSkipReason,
@@ -14,7 +15,7 @@ import type {
   WireProjectionSnapshot,
   WireResultMapping,
 } from "./types"
-import { cloneWireValue, readWirePath, serializeWireValue, writeWirePath } from "./wire-value"
+import { cloneWireValue, readWirePath, serializeWireValue, verifyWireValueChanges, writeWirePath } from "./wire-value"
 import { consumeContainerEntries, consumeString, createWorkBudget, type WorkBudget } from "./work-budget"
 
 const PLACEHOLDER_PREFIX = "[Duplicate tool output folded. Identical full output is retained in later tool call "
@@ -81,13 +82,21 @@ const placeholder = (visibleCallID: string) => {
   return `${PLACEHOLDER_PREFIX}${JSON.stringify(visibleCallID)}${PLACEHOLDER_SUFFIX}`
 }
 
-export const fingerprintContextFoldingRequest = (identity: unknown) => {
-  const serialized = serializeWireValue(identity)
-  if (!serialized.ok) return serialized
+export const fingerprintContextFoldingRequest = (input: ContextFoldingRequestFingerprintInput) => {
+  const request = serializeWireValue(input.request)
+  if (!request.ok) return request
+  const identity = serializeWireValue(input.identity)
+  if (!identity.ok) return identity
+  const budget = serializeWireValue(input.budget)
+  if (!budget.ok) return budget
+  const inputBytes = request.inputBytes + identity.inputBytes + budget.inputBytes
+  if (!Number.isSafeInteger(inputBytes)) return { ok: false as const, reason: "work-limit" as const }
   return {
     ok: true as const,
-    value: Hash.sha256(serialized.value),
-    inputBytes: serialized.inputBytes,
+    value: Hash.sha256(
+      `request:${Hash.sha256(request.value)};identity:${Hash.sha256(identity.value)};budget:${Hash.sha256(budget.value)}`,
+    ),
+    inputBytes,
   }
 }
 
@@ -105,6 +114,16 @@ type MappingValidation =
   | Readonly<{ ok: false; reason: "already-projected" | "invalid-reference" | "mapping-mismatch" | "work-limit" }>
 
 const validOrdinal = (value: number) => Number.isSafeInteger(value) && value >= 0
+
+const validPath = (path: unknown): path is readonly WirePathSegment[] =>
+  Array.isArray(path) &&
+  path.length > 0 &&
+  path.length <= ContextFoldingPolicy.workLimits.maxDepth &&
+  path.every(
+    (segment: unknown) =>
+      (typeof segment === "string" || typeof segment === "number") &&
+      (typeof segment !== "number" || (Number.isSafeInteger(segment) && segment >= 0)),
+  )
 
 const consumeRef = (ref: FoldRef, budget: WorkBudget) =>
   consumeString(budget, ref.messageID) && consumeString(budget, ref.partID) && consumeString(budget, ref.callID)
@@ -136,25 +155,42 @@ const validateMapping = <Request>(
   const callsByRef = new Map<string, (typeof snapshot.calls)[number]>()
   const callsByID = new Set<string>()
   const callOrdinals = new Set<number>()
+  const wirePaths = new Set<string>()
   for (const call of snapshot.calls) {
     if (
       !validRef(call.ref) ||
       typeof call.visibleCallID !== "string" ||
       call.visibleCallID.length === 0 ||
+      !validPath(call.visibleCallIDPath) ||
       !validOrdinal(call.ordinal)
     ) {
       return { ok: false, reason: "mapping-mismatch" }
     }
-    if (!consumeRef(call.ref, budget) || !consumeString(budget, call.visibleCallID)) {
+    if (
+      !consumeRef(call.ref, budget) ||
+      !consumeString(budget, call.visibleCallID) ||
+      !consumePath(call.visibleCallIDPath, budget)
+    ) {
       return { ok: false, reason: "work-limit" }
     }
     const key = refKey(call.ref)
-    if (callsByRef.has(key) || callsByID.has(call.visibleCallID) || callOrdinals.has(call.ordinal)) {
+    const callIDPathKey = pathKey(call.visibleCallIDPath)
+    if (
+      callsByRef.has(key) ||
+      callsByID.has(call.visibleCallID) ||
+      callOrdinals.has(call.ordinal) ||
+      wirePaths.has(callIDPathKey)
+    ) {
+      return { ok: false, reason: "mapping-mismatch" }
+    }
+    const actualCallID = readWirePath(request, call.visibleCallIDPath)
+    if (!actualCallID.ok || actualCallID.value !== call.visibleCallID) {
       return { ok: false, reason: "mapping-mismatch" }
     }
     callsByRef.set(key, call)
     callsByID.add(call.visibleCallID)
     callOrdinals.add(call.ordinal)
+    wirePaths.add(callIDPathKey)
   }
 
   const resultsByRef = new Map<string, WireResultMapping>()
@@ -168,41 +204,46 @@ const validateMapping = <Request>(
       result.visibleCallID.length === 0 ||
       !validOrdinal(result.ordinal) ||
       (result.complete !== true && result.complete !== false) ||
-      !Array.isArray(result.bodyPath) ||
-      result.bodyPath.length === 0 ||
-      result.bodyPath.length > ContextFoldingPolicy.workLimits.maxDepth ||
-      result.bodyPath.some(
-        (segment: unknown) =>
-          (typeof segment !== "string" && typeof segment !== "number") ||
-          (typeof segment === "number" && (!Number.isSafeInteger(segment) || segment < 0)),
-      )
+      !validPath(result.visibleCallIDPath) ||
+      !validPath(result.bodyPath)
     ) {
       return { ok: false, reason: "mapping-mismatch" }
     }
     if (
       !consumeRef(result.ref, budget) ||
       !consumeString(budget, result.visibleCallID) ||
+      !consumePath(result.visibleCallIDPath, budget) ||
       !consumePath(result.bodyPath, budget)
     ) {
       return { ok: false, reason: "work-limit" }
     }
     const key = refKey(result.ref)
+    const resultIDPathKey = pathKey(result.visibleCallIDPath)
     const bodyPathKey = pathKey(result.bodyPath)
     if (
       resultsByRef.has(key) ||
       resultsByID.has(result.visibleCallID) ||
       resultOrdinals.has(result.ordinal) ||
+      wirePaths.has(resultIDPathKey) ||
+      wirePaths.has(bodyPathKey) ||
+      resultIDPathKey === bodyPathKey ||
       paths.has(bodyPathKey)
     ) {
       return { ok: false, reason: "mapping-mismatch" }
     }
     const call = callsByRef.get(key)
     if (!call || call.visibleCallID !== result.visibleCallID) return { ok: false, reason: "mapping-mismatch" }
+    const actualResultID = readWirePath(request, result.visibleCallIDPath)
+    if (!actualResultID.ok || actualResultID.value !== result.visibleCallID) {
+      return { ok: false, reason: "mapping-mismatch" }
+    }
     const body = readWirePath(request, result.bodyPath)
     if (!body.ok || typeof body.value !== "string") return { ok: false, reason: "mapping-mismatch" }
     resultsByRef.set(key, result)
     resultsByID.add(result.visibleCallID)
     resultOrdinals.add(result.ordinal)
+    wirePaths.add(resultIDPathKey)
+    wirePaths.add(bodyPathKey)
     paths.add(bodyPathKey)
   }
 
@@ -275,7 +316,11 @@ const project = <Request>(
   const budget = estimateContextFoldingBudget(input.budget)
   if (budget.skipReason) return unchanged(input.request, budget.skipReason, budget)
 
-  const currentFingerprint = fingerprintContextFoldingRequest(input.identity)
+  const currentFingerprint = fingerprintContextFoldingRequest({
+    request: input.request,
+    identity: input.identity,
+    budget: input.budget,
+  })
   if (!currentFingerprint.ok) return unchanged(input.request, currentFingerprint.reason, budget)
   if (
     !input.expectedRequestFingerprint ||
@@ -333,6 +378,20 @@ const project = <Request>(
         return unchanged(input.request, "projection-failed", budget)
       }
     }
+
+    const verification = verifyWireValueChanges(
+      input.request,
+      copy.value,
+      selected.map((replacement) => ({
+        path: replacement.sourcePath,
+        before: replacement.sourceBody,
+        after: replacement.placeholder,
+      })),
+    )
+    if (!verification.ok) {
+      return unchanged(input.request, verification.reason === "work-limit" ? "work-limit" : "projection-failed", budget)
+    }
+    if (!verification.value) return unchanged(input.request, "projection-failed", budget)
   } catch {
     return unchanged(input.request, "projection-failed", budget)
   }
