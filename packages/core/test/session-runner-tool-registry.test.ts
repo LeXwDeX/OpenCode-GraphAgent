@@ -4,6 +4,7 @@ import { AgentV2 } from "@opencode-ai/core/agent"
 import { ApplicationTools } from "@opencode-ai/core/tool/application-tools"
 import { SessionV2 } from "@opencode-ai/core/session"
 import { SessionMessage } from "@opencode-ai/core/session/message"
+import { ContextFoldingToolSourceLedger } from "@opencode-ai/core/session/context-folding/tool-source-ledger"
 import { ToolOutputStore } from "@opencode-ai/core/tool-output-store"
 import { ToolRegistry } from "@opencode-ai/core/tool/registry"
 import { executeTool, settleTool, toolDefinitions } from "./lib/tool"
@@ -30,6 +31,7 @@ const outputStore = Layer.mock(ToolOutputStore.Service, {
 const registry = ToolRegistry.layer.pipe(Layer.provide(ApplicationTools.layer), Layer.provide(outputStore))
 const it = testEffect(registry)
 const integrated = testEffect(Layer.mergeAll(ApplicationTools.layer, registry))
+const ledgerOnly = testEffect(ContextFoldingToolSourceLedger.layer)
 const identity = {
   agent: AgentV2.ID.make("build"),
   assistantMessageID: SessionMessage.ID.make("msg_registry"),
@@ -52,7 +54,137 @@ const make = (permission?: string) => {
   return permission ? Tool.withPermission(tool, permission) : tool
 }
 
+const foldable = () =>
+  Tool.make({
+    contextFolding: { instructions: "none" },
+    description: "Foldable echo text",
+    input: Schema.Struct({ text: Schema.String }),
+    output: Schema.Struct({ text: Schema.String }),
+    execute: ({ text }) => Effect.succeed({ text }),
+    toModelOutput: ({ output }) => [{ type: "text", text: output.text }],
+  })
+
 describe("ToolRegistry", () => {
+  ledgerOnly.effect("does not trust pre-restart history in a fresh provenance ledger", () =>
+    Effect.gen(function* () {
+      const ledger = yield* ContextFoldingToolSourceLedger.Service
+      const generation = yield* ledger.activate([
+        { toolName: "read", sourceKind: "host-builtin", registrationID: "read-before-restart", instructions: "none" },
+      ])
+      yield* ledger.record({
+        sessionID,
+        assistantMessageID: identity.assistantMessageID,
+        callID: "call-before-restart",
+        toolName: "read",
+        source: {
+          sourceKind: "host-builtin",
+          registrationID: "read-before-restart",
+          registrationGeneration: generation,
+          instructions: "none",
+        },
+      })
+      expect(
+        yield* ledger.lookup({
+          sessionID,
+          assistantMessageID: identity.assistantMessageID,
+          callID: "call-before-restart",
+          toolName: "read",
+        }),
+      ).toBeDefined()
+
+      const restarted = yield* Effect.gen(function* () {
+        const fresh = yield* ContextFoldingToolSourceLedger.Service
+        return yield* fresh.lookup({
+          sessionID,
+          assistantMessageID: identity.assistantMessageID,
+          callID: "call-before-restart",
+          toolName: "read",
+        })
+      }).pipe(Effect.provide(ContextFoldingToolSourceLedger.layer.pipe(Layer.fresh)))
+      expect(restarted).toBeUndefined()
+    }),
+  )
+
+  integrated.effect(
+    "records actual application and local settlement provenance and invalidates overridden history",
+    () =>
+      Effect.gen(function* () {
+        const applications = yield* ApplicationTools.Service
+        const service = yield* ToolRegistry.Service
+        const ledger = yield* ContextFoldingToolSourceLedger.Service
+        yield* applications.register({ echo: foldable() })
+
+        const applicationTurn = yield* service.materialize()
+        yield* applicationTurn.settle(call("echo", "call-application"))
+        expect(
+          yield* ledger.lookup({
+            sessionID,
+            assistantMessageID: identity.assistantMessageID,
+            callID: "call-application",
+            toolName: "echo",
+          }),
+        ).toMatchObject({ identity: { sourceKind: "custom" }, instructions: "none" })
+
+        yield* service.register({ echo: foldable() })
+        const localTurn = yield* service.materialize()
+        expect(
+          yield* ledger.lookup({
+            sessionID,
+            assistantMessageID: identity.assistantMessageID,
+            callID: "call-application",
+            toolName: "echo",
+          }),
+        ).toBeUndefined()
+        yield* localTurn.settle(call("echo", "call-local"))
+        expect(
+          yield* ledger.lookup({
+            sessionID,
+            assistantMessageID: identity.assistantMessageID,
+            callID: "call-local",
+            toolName: "echo",
+          }),
+        ).toMatchObject({ identity: { sourceKind: "host-builtin" }, instructions: "none" })
+      }),
+  )
+
+  it.effect("fails closed for missing provenance and invalidates recorded history after a generation change", () =>
+    Effect.gen(function* () {
+      const service = yield* ToolRegistry.Service
+      const ledger = yield* ContextFoldingToolSourceLedger.Service
+      expect(
+        yield* ledger.lookup({
+          sessionID,
+          assistantMessageID: identity.assistantMessageID,
+          callID: "call-missing",
+          toolName: "echo",
+        }),
+      ).toBeUndefined()
+
+      yield* service.register({ echo: foldable() })
+      const first = yield* service.materialize()
+      yield* first.settle(call("echo", "call-old-generation"))
+      expect(
+        yield* ledger.lookup({
+          sessionID,
+          assistantMessageID: identity.assistantMessageID,
+          callID: "call-old-generation",
+          toolName: "echo",
+        }),
+      ).toBeDefined()
+
+      yield* service.register({ another: foldable() })
+      yield* service.materialize()
+      expect(
+        yield* ledger.lookup({
+          sessionID,
+          assistantMessageID: identity.assistantMessageID,
+          callID: "call-old-generation",
+          toolName: "echo",
+        }),
+      ).toBeUndefined()
+    }),
+  )
+
   it.effect("filters disabled tools with edit aliases and ordered wildcard precedence", () =>
     Effect.gen(function* () {
       const service = yield* ToolRegistry.Service
