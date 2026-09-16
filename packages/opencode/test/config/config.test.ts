@@ -1,5 +1,7 @@
 import { test, expect, describe, afterEach, beforeEach, spyOn } from "bun:test"
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
+import { ConfigCompaction } from "@opencode-ai/core/config/compaction"
+import { Flag } from "@opencode-ai/core/flag/flag"
 import { Cause, Effect, Exit, Layer, Option } from "effect"
 import { NamedError } from "@opencode-ai/core/util/error"
 import { FetchHttpClient, HttpClient, HttpClientResponse } from "effect/unstable/http"
@@ -1021,6 +1023,114 @@ it.effect("global config remains global when project config is disabled", () =>
     ),
   ),
 )
+
+describe("dynamic compaction configuration", () => {
+  const resolve = (config: ConfigV1.Info) =>
+    ConfigCompaction.resolveDynamic({
+      disabledByEnvironment: false,
+      dynamic: config.compaction?.dynamic,
+      prune: config.compaction?.prune,
+      knownExternalDcp: "unknown",
+    })
+
+  it.instance("defaults on after loading without manufacturing explicit config", () =>
+    Effect.gen(function* () {
+      const config = yield* Config.use.get()
+      expect(config.compaction?.dynamic).toBeUndefined()
+      expect(config.compaction?.prune).toBeUndefined()
+      expect(resolve(config)).toMatchObject({ enabled: true, source: "default", deprecatedPrune: false })
+    }),
+  )
+
+  it.effect("lets project dynamic override the global dynamic value", () =>
+    withConfigTree(
+      {
+        global: { compaction: { dynamic: false } },
+        project: { compaction: { dynamic: true } },
+      },
+      Effect.gen(function* () {
+        const config = yield* Config.use.get()
+        expect(config.compaction?.dynamic).toBe(true)
+        expect(resolve(config)).toMatchObject({ enabled: true, source: "dynamic" })
+      }),
+    ),
+  )
+
+  it.effect("lets project dynamic disable override the global value", () =>
+    withConfigTree(
+      {
+        global: { compaction: { dynamic: true } },
+        project: { compaction: { dynamic: false } },
+      },
+      Effect.gen(function* () {
+        const config = yield* Config.use.get()
+        expect(config.compaction?.dynamic).toBe(false)
+        expect(resolve(config)).toMatchObject({ enabled: false, source: "dynamic", skipped: "disabled" })
+      }),
+    ),
+  )
+
+  it.effect("resolves new and legacy fields only after layered merge", () =>
+    withConfigTree(
+      {
+        global: { compaction: { dynamic: false } },
+        project: { compaction: { prune: true } },
+      },
+      Effect.gen(function* () {
+        const config = yield* Config.use.get()
+        expect(config.compaction).toMatchObject({ dynamic: false, prune: true })
+        expect(resolve(config)).toMatchObject({ enabled: false, source: "dynamic", deprecatedPrune: false })
+      }),
+    ),
+  )
+
+  it.instance(
+    "lets OPENCODE_DISABLE_PRUNE override explicit dynamic enablement",
+    Effect.acquireUseRelease(
+      Effect.sync(() => {
+        const previous = Flag.OPENCODE_DISABLE_PRUNE
+        Flag.OPENCODE_DISABLE_PRUNE = true
+        return previous
+      }),
+      () =>
+        Effect.gen(function* () {
+          const config = yield* Config.use.get()
+          expect(config.compaction).toMatchObject({ dynamic: false, prune: false })
+        }),
+      (previous) => Effect.sync(() => void (Flag.OPENCODE_DISABLE_PRUNE = previous)),
+    ),
+    { config: { compaction: { dynamic: true, prune: true } } },
+  )
+
+  it.instance(
+    "keeps automatic full compaction independent from dynamic folding",
+    Effect.gen(function* () {
+      const config = yield* Config.use.get()
+      expect(config.compaction?.auto).toBe(false)
+      expect(resolve(config)).toMatchObject({ enabled: true, source: "default" })
+    }),
+    { config: { compaction: { auto: false } } },
+  )
+
+  it.instance(
+    "keeps OPENCODE_DISABLE_AUTOCOMPACT independent from dynamic folding",
+    Effect.acquireUseRelease(
+      Effect.sync(() => {
+        const previous = Flag.OPENCODE_DISABLE_AUTOCOMPACT
+        Flag.OPENCODE_DISABLE_AUTOCOMPACT = true
+        return previous
+      }),
+      () =>
+        Effect.gen(function* () {
+          const config = yield* Config.use.get()
+          expect(config.compaction).toMatchObject({ auto: false, dynamic: true })
+          expect(resolve(config)).toMatchObject({ enabled: true, source: "dynamic" })
+        }),
+      (previous) => Effect.sync(() => void (Flag.OPENCODE_DISABLE_AUTOCOMPACT = previous)),
+    ),
+    { config: { compaction: { auto: true, dynamic: true } } },
+  )
+})
 
 it.instance("does not error when only custom agent is a subagent", () =>
   Effect.gen(function* () {
