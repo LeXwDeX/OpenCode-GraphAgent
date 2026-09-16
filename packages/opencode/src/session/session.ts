@@ -50,6 +50,7 @@ import { SessionStatus } from "./status"
 import { Dag } from "@/dag/dag"
 import { isWorkflowTerminalStatus } from "@opencode-ai/core/dag/core/types"
 import { landSystemMessages } from "@/hook/trigger-result"
+import { ToolSourceLedger } from "./tool-source-ledger"
 
 const runtime = makeRuntime(Database.Service, Database.defaultLayer)
 
@@ -549,6 +550,7 @@ export const layer: Layer.Layer<
     const goal = yield* Goal.Service
     const dag = yield* Dag.Service
     const automation = yield* SessionAutomationLease.Service
+    const toolSources = Option.getOrUndefined(yield* Effect.serviceOption(ToolSourceLedger.Service))
 
     const createNext = Effect.fn("Session.createNext")(function* (input: {
       id?: SessionID
@@ -737,6 +739,7 @@ export const layer: Layer.Layer<
         )
         // Session-row deletion (projector, inside this publish's transaction)
         // comes LAST, after every cleanup step above.
+        if (toolSources) yield* toolSources.clearSession(sessionID)
         yield* events.publish(SessionV1.Event.Deleted, { sessionID, info: session })
         yield* events.remove(sessionID)
         // #524: scrub the related dag event aggregates after the session
@@ -1091,6 +1094,7 @@ export const defaultLayer = layer.pipe(
   Layer.provide(Goal.defaultLayer),
   Layer.provide(SessionAutomationLease.defaultLayer),
   Layer.provide(Dag.defaultLayer),
+  Layer.provide(ToolSourceLedger.defaultLayer),
 )
 
 const cancelBackgroundJobs = Effect.fn("Session.cancelBackgroundJobs")(function* (

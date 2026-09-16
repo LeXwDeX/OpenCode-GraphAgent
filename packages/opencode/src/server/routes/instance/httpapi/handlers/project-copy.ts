@@ -49,6 +49,7 @@ export const projectCopyHandlers = HttpApiBuilder.group(InstanceHttpApi, "projec
           sessionID,
           retries: 2,
           messages: [{ role: "user", content: `Generate a short 2-3 word name that describes this task:\n${text}` }],
+          purpose: "auxiliary",
         })
         .pipe(
           Stream.filter(LLMEvent.is.textDelta),

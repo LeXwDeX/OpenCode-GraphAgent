@@ -45,7 +45,11 @@ const layers = Layer.mergeAll(
   Layer.mock(Permission.Service, { ask: () => Effect.void }),
   Layer.mock(MCP.Service, { clients: () => Effect.succeed({}), tools: () => Effect.succeed({}) }),
   Layer.mock(Truncate.Service, {}),
-  Layer.mock(ToolRegistry.Service, { tools: () => Effect.succeed([writeDefinition]) }),
+  Layer.mock(ToolRegistry.Service, {
+    tools: () => Effect.succeed([writeDefinition]),
+    registrations: () =>
+      Effect.succeed([{ definition: writeDefinition, sourceKind: "host-builtin", registrationID: "test:write" }]),
+  }),
 )
 const it = testEffect(layers)
 const resolve = (id: any, dir: string) =>
