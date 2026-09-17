@@ -8,7 +8,7 @@ inputs:
     description: Exact GitHub job name whose successful conclusion must be confirmed
     required: true
   runner-label:
-    description: Runner label which must appear in the source job's platform evidence
+    description: Runner label(s) which must appear in the source job's platform evidence; every comma-separated label must be present
     required: true
 outputs:
   reused:
