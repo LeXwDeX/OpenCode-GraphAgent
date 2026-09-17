@@ -4,6 +4,10 @@ Blocks are the high-level interface for assembling a one-off workflow YAML
 file. The tool compiles them into ordinary durable DAG nodes before validation
 and persistence. Existing node-based YAML remains compatible.
 
+Use blocks when a DAG serves the task. The examples are optional compositions,
+not a checklist or a minimum number of stages. Selecting a block does opt into
+its actual compiler and output contracts described below.
+
 ## Authoring contract
 
 Never infer or invent a YAML field. Copy the envelope for the intended action

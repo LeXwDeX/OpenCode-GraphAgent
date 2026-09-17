@@ -102,16 +102,20 @@ describe("legacy command registry", () => {
     }),
   )
 
-  it.effect("routes template-first and never mentions platform delivery", () =>
+  it.effect("offers optional DAG references while preserving requested scope", () =>
     Effect.sync(() => {
       const expanded = SessionPrompt.expandCommandTemplate(
         CommandPlugin.DagAutoContent,
         "Use @security-reviewer to review this project. Do not modify files.",
       )
 
-      expect(expanded).toContain("workflow(action=\"list\")")
-      expect(expanded).toContain("never ask the user to pick a route")
+      expect(expanded).toContain('workflow(action="list")')
+      expect(expanded).toContain("Saved workflows are optional references")
       expect(expanded).toContain("ultra-flow-route")
+      expect(expanded).toContain("not the default")
+      expect(expanded).toContain("Use @security-reviewer to review this project. Do not modify files.")
+      expect(expanded).toContain("explicit request for direct work or no DAG takes precedence")
+      expect(expanded).not.toContain("Template-first for every route")
       expect(expanded).not.toContain("dag-init")
       expect(expanded).not.toContain("`gh ")
       expect(expanded).not.toContain("Ordered merge")

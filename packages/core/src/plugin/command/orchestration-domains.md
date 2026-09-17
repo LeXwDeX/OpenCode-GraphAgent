@@ -1,10 +1,10 @@
 # Cross-domain Workflow Composition
 
 The resident Orchestration Router and the live workflow library own route and
-`full`/`lite` selection. This guide resolves only requests where several domain
-references appear relevant. Keep one primary reference and one workflow.
+execution choices. This guide offers examples when several domain references
+seem useful after choosing a DAG. Domain overlap does not itself require one.
 
-## Pick the backbone by the final artifact
+## Match examples to the final artifact
 
 - The requested deliverable is a product decision: keep product planning as
   the backbone; technical feasibility is evidence, not a second design route.
@@ -19,17 +19,16 @@ references appear relevant. Keep one primary reference and one workflow.
   domains, and technical design when the object is a proposed system or
   migration.
 
-Security, performance, and review are secondary assurance when the requested
-artifact remains implementation or repair. They become primary only when the
-requested artifact is their report or verdict. A secondary concern is never a
-second workflow for the same objective.
+Security, performance, and review can provide secondary assurance when the
+requested artifact remains implementation or repair. Their checks may fit the
+existing work without a separate workflow. Choose what addresses the evidence
+gap rather than attaching every plausible domain's full process.
 
 ## Add the smallest assurance slice
 
-Read the primary reference first. Read a secondary reference only to identify
-the minimum evidence lane or gate that changes acceptance. Put those blocks in
-one task-local YAML and retarget every copied instruction to the same scope and
-acceptance criteria. Do not append a complete second reference.
+A primary reference can keep the objective clear. Secondary references can
+suggest a focused evidence lane or gate. Retarget borrowed instructions to the
+same scope and acceptance; a reference need not be copied wholesale.
 
 - A security-sensitive feature keeps the development backbone and adds scoped
   threat, authorization, secret, or supply-chain checks before final review.
@@ -40,16 +39,17 @@ acceptance criteria. Do not append a complete second reference.
 - A review of a dependency or release change keeps the review backbone and adds
   only the relevant upstream provenance and reachability evidence.
 
-Reuse one exploration result across consumers. Keep one verification fan-in
-for the final implementation fingerprint and one final review or synthesis;
-duplicate explore, verify, and verdict blocks are evidence drift, not extra
-assurance. Unordered writers still share one workspace, so give them disjoint
-write sets or serialize them with real dependencies.
+Reuse exploration and verification evidence while it remains valid. Extra
+review or synthesis nodes are useful when they resolve uncertainty, not as
+ceremonial endpoints. Unordered writers still share one workspace, so give
+them disjoint write sets or serialize them with real dependencies. Compiler-bound
+implementation reviews retain their fingerprint and verification contracts.
 
 ## Preserve lifecycle contracts
 
 Composition does not redefine block fields, verdicts, repair, or recovery.
 Load `guide(topic="blocks")` for YAML shapes and block semantics, and
 `guide(topic="policy")` for admission, verdict disposal, pause-first replan,
-and bounded repair. A non-ACCEPT verdict remains actionable in the same wake
-turn; do not invent a domain-specific retry loop.
+and bounded repair. Interpret non-ACCEPT results against the user's requested
+outcome: a report, direct follow-up, or graph adaptation may be appropriate.
+Changing domains does not reset runtime budgets or authorize new work.
