@@ -60,7 +60,7 @@ jobs:
         uses: ./.github/actions/setup-bun
 
       - name: Test CI verification fingerprint
-        run: node --test script/ci-fingerprint.test.mjs script/ci-evidence.test.mjs script/ci-runner-routing.test.mjs
+        run: node --test script/ci-fingerprint.test.mjs script/ci-evidence.test.mjs script/ci-runner-routing.test.mjs script/ci-runner-smoke.test.mjs
 
       - name: Run lint
         if: steps.evidence.outputs.reused != 'true'
