@@ -32,7 +32,6 @@ import { ApplicationTools } from "@opencode-ai/core/tool/application-tools"
 import { AgentV2 } from "@opencode-ai/core/agent"
 import { Config } from "@opencode-ai/core/config"
 import { ConfigAgent } from "@opencode-ai/core/config/agent"
-import { ConfigCompaction } from "@opencode-ai/core/config/compaction"
 import { Tool } from "@opencode-ai/core/tool/tool"
 import { ReadTool } from "@opencode-ai/core/tool/read"
 import { ReadToolFileSystem } from "@opencode-ai/core/tool/read-filesystem"
@@ -212,8 +211,7 @@ const agents = AgentV2.layer
 const model = Model.make({
   id: "fake-model",
   provider: "fake",
-  route: OpenAIChat.route,
-  defaults: { limits: { context: 100_000, output: 1_000 } },
+  route: OpenAIChat.route.with({ limits: { context: 100_000, output: 1_000 } }),
 })
 const models = SessionRunnerModel.layerWith(() => Effect.succeed(model))
 const systemContext = SystemContextRegistry.layer
@@ -512,175 +510,194 @@ const outboundMessages = (body: unknown): OutboundMessage[] => {
   })
 }
 
-describe("SessionRunnerLLM hot path", () => {
-  it.effect("folds duplicate built-in read, grep, and glob outputs only in the final outbound request", () =>
-    Effect.gen(function* () {
-      yield* setup
-      const session = yield* SessionV2.Service
-      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Record one side effect" }), resume: false })
-      responses = [toolTurn, textTurn("side-effect-done", "recorded")]
-      yield* session.resume(sessionID)
-      expect(executions).toEqual(["Hi"])
-
-      const calls = [
-        { id: "call-read-source", name: "read" as const, input: { path: "notes.txt", offset: 1, limit: 200 } },
-        { id: "call-read-witness", name: "read" as const, input: { path: "notes.txt", offset: 1, limit: 200 } },
-        {
-          id: "call-grep-source",
-          name: "grep" as const,
-          input: { pattern: "needle", path: "src", include: "*.ts", limit: 10 },
-        },
-        {
-          id: "call-grep-witness",
-          name: "grep" as const,
-          input: { pattern: "needle", path: "src", include: "*.ts", limit: 10 },
-        },
-        { id: "call-glob-source", name: "glob" as const, input: { pattern: "**/*.ts", path: "src", limit: 200 } },
-        { id: "call-glob-witness", name: "glob" as const, input: { pattern: "**/*.ts", path: "src", limit: 200 } },
-      ]
-
-      for (const [index, item] of calls.entries()) {
-        yield* session.prompt({
-          sessionID,
-          prompt: Prompt.make({ text: `Run ${item.name} ${index}` }),
-          resume: false,
-        })
-        responses = [foldingToolTurn(item.id, item.name, item.input), textTurn(`tool-done-${index}`, "done")]
-        yield* session.resume(sessionID)
-      }
-
-      const filler = "recent-context:" + "z".repeat(55_000)
-      for (let index = 0; index < 4; index++) {
-        yield* session.prompt({ sessionID, prompt: Prompt.make({ text: `Keep context ${index}` }), resume: false })
-        response = textTurn(`recent-${index}`, `${filler}:${index}`)
-        responses = undefined
-        yield* session.resume(sessionID)
-      }
-
-      const callIDs = new Set(calls.map((item) => item.id))
-      const selectStoredTools = (messages: readonly SessionMessage.Message[]) =>
-        messages.flatMap((message) =>
-          message.type === "assistant"
-            ? message.content.filter(
-                (part): part is SessionMessage.AssistantTool => part.type === "tool" && callIDs.has(part.id),
-              )
-            : [],
+const foldingCalls = [
+  { id: "call-read-source", name: "read" as const, input: { path: "notes.txt", offset: 1, limit: 200 } },
+  { id: "call-read-witness", name: "read" as const, input: { path: "notes.txt", offset: 1, limit: 200 } },
+  {
+    id: "call-grep-source",
+    name: "grep" as const,
+    input: { pattern: "needle", path: "src", include: "*.ts", limit: 10 },
+  },
+  {
+    id: "call-grep-witness",
+    name: "grep" as const,
+    input: { pattern: "needle", path: "src", include: "*.ts", limit: 10 },
+  },
+  { id: "call-glob-source", name: "glob" as const, input: { pattern: "**/*.ts", path: "src", limit: 200 } },
+  { id: "call-glob-witness", name: "glob" as const, input: { pattern: "**/*.ts", path: "src", limit: 200 } },
+]
+const foldingCallIDs = new Set(foldingCalls.map((item) => item.id))
+const selectStoredFoldingTools = (messages: readonly SessionMessage.Message[]) =>
+  messages.flatMap((message) =>
+    message.type === "assistant"
+      ? message.content.filter(
+          (part): part is SessionMessage.AssistantTool => part.type === "tool" && foldingCallIDs.has(part.id),
         )
-      const storedBefore = selectStoredTools(yield* session.context(sessionID))
-      expect(storedBefore).toHaveLength(6)
-      expect(storedBefore[0]).toMatchObject({
-        id: "call-read-source",
-        name: "read",
-        state: {
-          status: "completed",
-          input: { path: "notes.txt", offset: 1, limit: 200 },
-          structured: {
-            type: "text-page",
-            content: readBody,
-            mime: "text/plain",
-            offset: 1,
-            truncated: false,
-            next: 2,
-          },
-        },
-      })
-      const durableBefore = JSON.stringify(storedBefore)
+      : [],
+  )
 
-      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Final answer" }), resume: false })
-      response = textTurn("final-answer", "complete")
-      requests.length = 0
-      preparedBodies.length = 0
-      outboundBodies.length = 0
-      yield* session.resume(sessionID)
+const seedFoldedCoreHistory = Effect.fn("test.seedFoldedCoreHistory")(function* (session: SessionV2.Interface) {
+  yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Record one side effect" }), resume: false })
+  responses = [toolTurn, textTurn("side-effect-done", "recorded")]
+  yield* session.resume(sessionID)
+  expect(executions).toEqual(["Hi"])
 
-      expect(requests).toHaveLength(1)
-      expect(preparedBodies).toHaveLength(2)
-      expect(outboundBodies).toHaveLength(1)
-      expect(JSON.stringify(selectStoredTools(yield* session.context(sessionID)))).toBe(durableBefore)
+  for (const [index, item] of foldingCalls.entries()) {
+    yield* session.prompt({
+      sessionID,
+      prompt: Prompt.make({ text: `Run ${item.name} ${index}` }),
+      resume: false,
+    })
+    responses = [foldingToolTurn(item.id, item.name, item.input), textTurn(`tool-done-${index}`, "done")]
+    yield* session.resume(sessionID)
+  }
 
-      const messages = outboundMessages(outboundBodies[0])
-      const result = (id: string) =>
-        messages.find((message) => message.role === "tool" && message.tool_call_id === id)?.content
-      const placeholder = (witness: string) =>
-        `[Duplicate tool output folded. Identical full output is retained in later tool call ${JSON.stringify(witness)}.]`
+  const filler = "recent-context:" + "z".repeat(55_000)
+  for (let index = 0; index < 4; index++) {
+    yield* session.prompt({ sessionID, prompt: Prompt.make({ text: `Keep context ${index}` }), resume: false })
+    response = textTurn(`recent-${index}`, `${filler}:${index}`)
+    responses = undefined
+    yield* session.resume(sessionID)
+  }
 
-      const readSource: unknown = JSON.parse(result("call-read-source") ?? "null")
-      const readWitness: unknown = JSON.parse(result("call-read-witness") ?? "null")
-      expect(readSource).toEqual({
-        type: "text-page",
-        content: placeholder("call-read-witness"),
-        mime: "text/plain",
-        offset: 1,
-        truncated: false,
-        next: 2,
-      })
-      expect(readWitness).toEqual({
+  const storedBefore = selectStoredFoldingTools(yield* session.context(sessionID))
+  expect(storedBefore).toHaveLength(6)
+  expect(storedBefore[0]).toMatchObject({
+    id: "call-read-source",
+    name: "read",
+    state: {
+      status: "completed",
+      input: { path: "notes.txt", offset: 1, limit: 200 },
+      structured: {
         type: "text-page",
         content: readBody,
         mime: "text/plain",
         offset: 1,
         truncated: false,
         next: 2,
-      })
-      expect(result("call-grep-source")).toBe(placeholder("call-grep-witness"))
-      expect(result("call-grep-witness")).toContain(grepBody)
-      expect(result("call-glob-source")).toBe(placeholder("call-glob-witness"))
-      expect(result("call-glob-witness")).toContain("/project/src/generated/000-")
+      },
+    },
+  })
+  const durableBefore = JSON.stringify(storedBefore)
 
-      configEntries = [
-        new Config.Document({
-          type: "document",
-          info: new Config.Info({ compaction: new ConfigCompaction.Info({ dynamic: false }) }),
-        }),
-      ]
-      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Final answer without folding" }), resume: false })
-      response = textTurn("final-answer-disabled", "complete")
-      requests.length = 0
-      preparedBodies.length = 0
-      outboundBodies.length = 0
-      yield* session.resume(sessionID)
+  yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Observe folded history" }), resume: false })
+  response = textTurn("folded-observation", "complete")
+  requests.length = 0
+  preparedBodies.length = 0
+  outboundBodies.length = 0
+  yield* session.resume(sessionID)
 
-      expect(outboundBodies).toHaveLength(1)
-      const disabledMessages = outboundMessages(outboundBodies[0])
-      const disabledResult = (id: string) =>
-        disabledMessages.find((message) => message.role === "tool" && message.tool_call_id === id)?.content
-      expect(JSON.parse(disabledResult("call-read-source") ?? "null")).toMatchObject({ content: readBody })
-      expect(disabledResult("call-grep-source")).toContain(grepBody)
-      expect(disabledResult("call-glob-source")).toContain("/project/src/generated/000-")
-      expect(JSON.stringify(outboundBodies[0])).not.toContain("Duplicate tool output folded")
-      expect(executions).toEqual(["Hi"])
+  expect(requests).toHaveLength(1)
+  expect(preparedBodies).toHaveLength(2)
+  expect(outboundBodies).toHaveLength(1)
+  expect(JSON.stringify(selectStoredFoldingTools(yield* session.context(sessionID)))).toBe(durableBefore)
 
-      const events = yield* EventV2.Service
-      const compactionID = SessionMessage.ID.create()
-      yield* events.publish(SessionEvent.Compaction.Started, {
-        sessionID,
-        messageID: compactionID,
-        timestamp: DateTime.makeUnsafe(10),
-        reason: "manual",
-      })
-      yield* events.publish(SessionEvent.Compaction.Ended, {
-        sessionID,
-        messageID: compactionID,
-        timestamp: DateTime.makeUnsafe(11),
-        reason: "manual",
-        text: "S08 manual summary",
-        recent: "",
-      })
+  const messages = outboundMessages(outboundBodies[0])
+  const result = (id: string) =>
+    messages.find((message) => message.role === "tool" && message.tool_call_id === id)?.content
+  const placeholder = (witness: string) =>
+    `[Duplicate tool output folded. Identical full output is retained in later tool call ${JSON.stringify(witness)}.]`
+  const readSource: unknown = JSON.parse(result("call-read-source") ?? "null")
+  const readWitness: unknown = JSON.parse(result("call-read-witness") ?? "null")
+  expect(readSource).toEqual({
+    type: "text-page",
+    content: placeholder("call-read-witness"),
+    mime: "text/plain",
+    offset: 1,
+    truncated: false,
+    next: 2,
+  })
+  expect(readWitness).toEqual({
+    type: "text-page",
+    content: readBody,
+    mime: "text/plain",
+    offset: 1,
+    truncated: false,
+    next: 2,
+  })
+  expect(result("call-grep-source")).toBe(placeholder("call-grep-witness"))
+  expect(result("call-grep-witness")).toContain(grepBody)
+  expect(result("call-glob-source")).toBe(placeholder("call-glob-witness"))
+  expect(result("call-glob-witness")).toContain("/project/src/generated/000-")
+
+  return { durableBefore }
+})
+
+const expectBoundedOriginalCoreSummary = (request: LLMRequest) => {
+  const body = JSON.stringify(request.messages)
+  expect(body).not.toContain("Duplicate tool output folded")
+  expect((body.match(/read-output:/g) ?? []).length).toBeGreaterThanOrEqual(2)
+  expect((body.match(/grep-output:/g) ?? []).length).toBeGreaterThanOrEqual(2)
+  expect((body.match(/generated\/000-/g) ?? []).length).toBeGreaterThanOrEqual(2)
+  expect((body.match(/\[truncated\]/g) ?? []).length).toBeGreaterThanOrEqual(4)
+}
+
+describe("SessionRunnerLLM hot path", () => {
+  it.effect("folds duplicate built-in read, grep, and glob outputs only in the final outbound request", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const session = yield* SessionV2.Service
+      const { durableBefore } = yield* seedFoldedCoreHistory(session)
       yield* session.prompt({
         sessionID,
-        prompt: Prompt.make({ text: "Continue after manual compaction" }),
+        prompt: Prompt.make({ text: `Trigger actual automatic compaction ${"a".repeat(80_000)}` }),
         resume: false,
       })
-      response = textTurn("post-compaction", "continued")
-      responses = undefined
+      responses = [
+        textTurn("automatic-summary", "## Goal\n- Preserve folded history"),
+        textTurn("post-compaction", "continued"),
+      ]
       requests.length = 0
       preparedBodies.length = 0
       outboundBodies.length = 0
       yield* session.resume(sessionID)
 
-      expect(outboundBodies).toHaveLength(1)
-      expect(JSON.stringify(outboundBodies[0])).toContain("S08 manual summary")
-      expect(JSON.stringify(outboundBodies[0])).not.toContain("Duplicate tool output folded")
+      expect(requests).toHaveLength(2)
+      expectBoundedOriginalCoreSummary(requests[0])
+      expect(JSON.stringify(outboundBodies[1])).toContain("## Goal\\n- Preserve folded history")
+      expect(JSON.stringify(outboundBodies[1])).not.toContain("Duplicate tool output folded")
+      expect(JSON.stringify(selectStoredFoldingTools(yield* session.messages({ sessionID, order: "asc" })))).toBe(
+        durableBefore,
+      )
+      expect(yield* session.context(sessionID)).toMatchObject([
+        { type: "compaction", summary: "## Goal\n- Preserve folded history" },
+        { type: "assistant", finish: "stop" },
+      ])
+      expect(executions).toEqual(["Hi"])
+    }),
+  )
+
+  it.effect("bounds a second provider overflow after summarizing the original folded history", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const session = yield* SessionV2.Service
+      const { durableBefore } = yield* seedFoldedCoreHistory(session)
+      const overflow = () => [
+        LLMEvent.providerError({ message: "prompt too long", classification: "context-overflow" }),
+      ]
+      yield* session.prompt({
+        sessionID,
+        prompt: Prompt.make({ text: "Trigger bounded overflow recovery" }),
+        resume: false,
+      })
+      responses = [overflow(), textTurn("overflow-summary", "## Goal\n- Preserve folded overflow history"), overflow()]
+      requests.length = 0
+      preparedBodies.length = 0
+      outboundBodies.length = 0
+      yield* session.resume(sessionID)
+
+      expect(requests).toHaveLength(3)
+      expect(JSON.stringify(outboundBodies[0])).toContain("Duplicate tool output folded")
+      expectBoundedOriginalCoreSummary(requests[1])
+      expect(JSON.stringify(outboundBodies[2])).toContain("## Goal\\n- Preserve folded overflow history")
+      expect(JSON.stringify(outboundBodies[2])).not.toContain("Duplicate tool output folded")
+      expect(JSON.stringify(selectStoredFoldingTools(yield* session.messages({ sessionID, order: "asc" })))).toBe(
+        durableBefore,
+      )
+      expect(yield* session.context(sessionID)).toMatchObject([
+        { type: "compaction", summary: "## Goal\n- Preserve folded overflow history" },
+        { type: "assistant", finish: "error", error: { message: "prompt too long" } },
+      ])
       expect(executions).toEqual(["Hi"])
     }),
   )
