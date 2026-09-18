@@ -235,6 +235,17 @@ describe("CommandPlugin.Plugin", () => {
     }),
   )
 
+  it.effect("scopes standalone validation to start envelopes", () =>
+    Effect.sync(() => {
+      const facts = CommandPlugin.WorkflowFactsContent.replace(/\s+/g, " ")
+      const blocks = CommandPlugin.WorkflowBlocksContent.replace(/\s+/g, " ")
+      expect(facts).toContain("Standalone `validate` accepts start files only")
+      expect(facts).toContain("validate their own strict envelopes before any workflow mutation")
+      expect(blocks).toContain("`validate` decodes a start envelope only")
+      expect(blocks).toContain("standalone preflight for those envelopes is not supported")
+    }),
+  )
+
   it.effect("publishes an exact block YAML authoring contract", () =>
     Effect.sync(() => {
       expect(CommandPlugin.WorkflowBlocksContent).toContain("Never infer or invent a YAML field")

@@ -92,3 +92,50 @@ CI work remains in its separate stash; context-folding work is untouched.
 SpecGit inspection was blocked by an old branch's local delivery checkpoint
 (`ownership_conflict`). That checkpoint was not altered; no Issue association,
 commit, push, PR or release is claimed by this local patch.
+
+## CI lint repair evidence (2026-09-18)
+
+CI run 35198733659 failed `oxlint --max-warnings=4850` with 4857 warnings on
+3090 files while local runs at e173e48 reported 4833/4834 on 3085 files.
+The compared trees differ: CI checked out a merge with dev, not the PR head.
+Source inspection and local merge-tree reconstruction identified:
+
+- +13 `no-floating-promises` on dev-side merge-tree content that landed with
+  PR609 (dev f86985a7b1 after this branch's merge base 49853e16):
+  `script/ci-runner-routing.test.mjs` (5) and
+  `script/ci-runner-smoke.test.mjs` (5) do not exist in this checkout, and
+  dev's edit to `script/ci-evidence.test.mjs` adds 3 over this branch's copy
+  (13 to 16).
+- +10 across three tracked dot-dir files — `.opencode/plugins/tui-smoke.tsx`,
+  `.opencode/tool/github-triage.ts`, `.opencode/tool/github-pr-search.ts` —
+  which were omitted by the observed local file walk but included in the
+  reconstructed merge tree. These are source files, not generated artifacts.
+  The exact reason for the local file-walk difference remains unresolved.
+
+A local reconstruction used dev f86985a7b1 plus the eleven PR611 files at
+e173e48 and reused root and nested package dependency trees. Repeated runs
+reported 4856-4857 warnings, zero errors and 3090 files. This is a local
+reproduction of the failing gate, not proof of exact CI warning-multiset
+identity; the counts vary between runs and complete per-file CI diagnostics
+were not established by this investigation.
+
+The proposed exclusion of the three tracked dot-dir files was rejected and
+its uncommitted configuration change reverted. The original lint coverage,
+rules and 4850 cap remain unchanged. The causal source repair for the thirteen
+new floating-promise sites is tracked separately on the dev-based
+`fix/ci-node-test-floating-promises` branch; its local results do not establish
+native CI or merge acceptance. Model-decision replay remains outstanding.
+
+## chg-4: describe the supported validation envelope
+
+Owner: workflow tool-use guides (`workflow-blocks.md` and `workflow.md`).
+Observed failure: an `objective`/`blocks` extension was rejected by `validate`,
+while wrapping it in `config` passed `validate` but was rejected by `extend`.
+`WorkflowTool` validates with authoring action `start`; extend and replan
+validate their own strict envelopes before mutating the graph.
+
+The guides now limit standalone preflight to start files and state the
+extension/replan validation boundary. No runtime schema or API is changed.
+Prediction: agents stop alternating between incompatible wrappers to preflight
+extensions. A content contract guards the distinction; a rebuilt-runtime
+behavior replay is still needed to test the prediction itself.

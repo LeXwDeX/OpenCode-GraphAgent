@@ -26,7 +26,9 @@ Before `start`, `extend`, `control(replan)`, or `validate`, write the graph to a
 `.yaml` or `.yml` file and pass only `spec_path`. A one-off graph may use a
 task-local file such as `.opencode/.dag-specs/<name>.yaml`; it does not need to
 become a saved library workflow. After a validation failure, edit that same
-file and retry with the same path.
+file and retry with the same path. Standalone `validate` accepts start files
+only; `extend` and `control(replan)` validate their own strict envelopes before
+any workflow mutation.
 
 Before a deep start, qualify the request interactively in the parent session.
 The start spec places `mode: deep`, a versioned `READY` or informed `WAIVED`
@@ -553,11 +555,13 @@ fields, then start the returned `spec_path`.
 (gates, admission, recovery), or `patterns` (cross-domain playbooks); omit it
 for the compact index. Load only the topic needed for the current decision.
 
-**validate** — Pre-flight one spec without creating a workflow. Pass
+**validate** — Pre-flight a start file without creating a workflow. Pass
 `spec_path` and an optional `profile` (`portable` for distributable-template
 checks, `environment` to additionally resolve prompts, workers, and models in
 this project; builtin specs default to portable, everything else to
-environment). Returns diagnostics with per-error paths, never a workflow ID.
+environment). Extend and replan files are validated by their respective
+mutation actions, not by this start-only preflight. Returns diagnostics with
+per-error paths, never a workflow ID.
 
 **extend** — Add nodes to a running workflow. Existing nodes are unaffected;
 new nodes are immediately eligible for scheduling if their dependencies are
