@@ -18,7 +18,7 @@ function section(name) {
   return (end === -1 ? rest : rest.slice(0, end)).join("\n")
 }
 
-test("runner smoke is dispatch-only with a required linux/windows choice", () => {
+await test("runner smoke is dispatch-only with a required linux/windows choice", () => {
   const trigger = section("on")
   assert(trigger.includes("workflow_dispatch:"), "manual dispatch trigger")
   assert(trigger.includes("required: true"), "platform input is required")
@@ -29,7 +29,7 @@ test("runner smoke is dispatch-only with a required linux/windows choice", () =>
     assert(!trigger.includes(forbidden), `forbidden trigger: ${forbidden}`)
 })
 
-test("runner smoke selects exactly one standard self-hosted platform per dispatch", () => {
+await test("runner smoke selects exactly one standard self-hosted platform per dispatch", () => {
   const routes = workflow.split("\n").filter((line) => line.includes("runs-on:"))
   assert.equal(routes.length, 2, "one route per platform")
   assert(
@@ -45,7 +45,7 @@ test("runner smoke selects exactly one standard self-hosted platform per dispatc
   assert(workflow.includes("if: inputs.platform == 'windows'"), "windows guard")
 })
 
-test("runner smoke runs no repository or third-party code and holds no token", () => {
+await test("runner smoke runs no repository or third-party code and holds no token", () => {
   assert(!/\buses:/.test(workflow), "no action can run")
   assert(!workflow.includes("actions/checkout"), "no repository checkout")
   assert(!workflow.includes("secrets."), "no secret reference")
@@ -55,12 +55,12 @@ test("runner smoke runs no repository or third-party code and holds no token", (
   assert.equal((workflow.match(/permissions: \{\}/g) ?? []).length, 2, "each job disables the token")
 })
 
-test("runner smoke is bounded and only reports attribution evidence", () => {
+await test("runner smoke is bounded and only reports attribution evidence", () => {
   assert.equal((workflow.match(/timeout-minutes: 10/g) ?? []).length, 2, "ten minute bound per job")
   for (const evidence of ["RUNNER_NAME", "RUNNER_ENVIRONMENT", "hostname", "whoami"])
     assert(workflow.includes(evidence), `missing attribution evidence: ${evidence}`)
 })
 
-test("the typecheck job executes the smoke contract test", () => {
+await test("the typecheck job executes the smoke contract test", () => {
   assert(typecheck.includes("script/ci-runner-smoke.test.mjs"), "smoke test wired into typecheck")
 })

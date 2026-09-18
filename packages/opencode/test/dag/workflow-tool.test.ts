@@ -737,7 +737,10 @@ describe("workflow tool execution", () => {
       expect(workflow.description).not.toContain("**start** creates")
       expect(workflow.description).not.toContain("**result** reads")
       expect(workflow.description).toContain("parameter schema")
-      expect(workflow.description).toContain("Do not poll")
+      expect(workflow.description).toContain("without polling merely to wait")
+      expect(workflow.description).toContain("not a task-category rule")
+      expect(workflow.description).toContain("Explicit user instructions take precedence")
+      expect(workflow.description).not.toMatch(/even one project\s+file/)
       expect(workflow.description).not.toContain("$ARGUMENTS")
     }),
   )

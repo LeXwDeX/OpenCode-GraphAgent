@@ -1,62 +1,58 @@
-You are running `/dag-auto`: the routing and workflow-composition driver of
-the `/dag-*` command family. Its essence: classify the request, match a
-saved DAG route, retarget it to the real task, validate, and start it.
-Routing decisions stay in this parent conversation; children receive
-concrete work. That is ALL this command does — it never touches platform
-delivery: no issues, no PRs, no CI watching, no merge or release mechanics.
+You are running `/dag-auto`: routing and workflow-composition assistance for
+the user's request. An explicit invocation expresses a preference for DAG
+orchestration, not for a particular template, number of agents, or sequence of
+stages. An explicit request for direct work or no DAG takes precedence.
+Routing decisions stay in the parent conversation; children receive bounded
+work. Platform delivery is outside this command: no issues, no PRs, no CI
+watching, no merge or release mechanics.
 
 Arguments: $ARGUMENTS
 
-## Phase 1 — Entry classification
+## Choose a useful shape
 
-Classify the request; never ask the user to pick a route:
+Judge the task from its evidence, dependencies, uncertainty, and coordination
+cost. A broad request does not automatically need an end-to-end pipeline; a
+narrow request does not need several reviewers merely to qualify as a DAG.
+If orchestration adds little value, explain that briefly and offer direct
+execution rather than manufacture stages.
 
-- **Broad completion request** ("把这件事做完", an end-to-end feature/fix,
-  a goal stated without a stage) → start the **ultra-flow**: use the
-  `ultra-flow-route` template, retarget every stage to the real task, remove
-  `stage-release` (+ its checkpoint) when the project has no release
-  mechanics, write the retargeted YAML to `.opencode/.dag-specs/<task>.yaml`,
-  then `workflow(action="validate")` and `workflow(action="start")`.
-- **Narrow single-block request** ("review this diff", "grill this plan",
-  "decide X", "只做设计阶段") → run ONLY the matching domain route
-  (`product-planning`, `technical-design`, `project-development`,
-  `code-review`, `debug-repair`, `security-audit`, `performance-audit` —
-  full/lite by risk) or the single ultra-flow stage, and end on its report.
+Saved workflows are optional references. Use `workflow(action="list")` and
+`read` when a reference would help, then retarget it; names come from tool
+results, not guesses. `ultra-flow-route`, when available, is one possible
+reference for genuinely end-to-end work, not the default for "finish this".
+Custom task-local graphs are equally valid. Keep only phases that add evidence
+or advance the requested result. A review request does not authorize repairs
+or a release phase.
 
-Template-first for every route: `workflow(action="list")` → `read` →
-retarget → validate → start; create from scratch only when nothing fits.
+For a selected DAG, draft the spec or write it to a task-local path such as
+`.opencode/.dag-specs/<task>.yaml`, use `workflow(action="validate")`, and then
+`workflow(action="start")`. A draft or validation response is not execution.
 
-## Phase 2 — Driving the graph
+## Adapt to results
 
-**Auto contract.** Drive each stage/checkpoint wake to completion and
-advance automatically. Do not pause to ask "shall I continue". The ONLY
-interruptions allowed are user-owned decisions (the product decision
-checkpoint below) or a cap exceeded (retries / replan loops). Everything
-else advances on its own.
+Continue authorized work without unnecessary approval rounds. Checkpoint
+results can justify a targeted repair, direct follow-up, a changed graph, or a
+report of limitations. Prefer reusing valid evidence to repeating completed
+work. Respect configured budgets; a repeated failure is a reason to reconsider
+the cause and approach, not to add more identical attempts.
 
-**Checkpoint wakes.** Every checkpoint node carries a verdict
-`{verdict: continue|replan, findings, target?}` reporting direction
-correctness:
-- `continue` → do nothing; the graph already advances by itself.
-- `replan` → use the findings + target to add correction nodes via
-  `workflow(action="control", operation="replan")` (never restart the flow
-  from scratch). The loop is bounded: at most **3 back-edges**; on the
-  third, stop and hand the user ONE decision point with the complete state
-  (findings, attempts, diffs).
+Read each checkpoint's actual output contract rather than assuming every
+template uses the same verdict shape. A child reports evidence; the parent
+chooses control actions. Stop or isolate child writers before taking over work
+directly. Do not leave a live graph running after deciding to stop the task.
 
-**Product decision checkpoint.** Force a user decision when the flow hits:
-a new external dependency, a breaking change, a public API change, or an
-irreversible data migration — plus your own classification of anything that
-materially changes behavior, scope, or acceptance. Present the recommended
-answer and wait for one combined confirmation; write the result into the
-retargeted objective/instructions, never into child prompts.
+**Product decision checkpoint.** Ask when an unresolved choice changes the
+authorized scope, acceptance, or an irreversible boundary. Explain the
+recommended option and material alternatives; do not re-ask decisions the user
+already made. Carry confirmed scope into the objective and relevant child
+instructions without granting additional permissions.
 
-## Phase 3 — Completion report
+## Completion report
 
-End with ONE consolidated summary: the route chosen (saved template name or
-task-local graph), stages executed (incl. skipped with reason), checkpoint
-verdicts and replan passes used, the exact Workflow ID, and any gate
-waiting on the user.
+Give one concise summary of what actually ran, the evidence and remaining
+limitations, and the Workflow ID if one was started. Distinguish a saved
+reference, an authored graph, and completed execution. Do not imply that
+choosing a route or passing one check proves the requested outcome.
 
 ## Rules
 

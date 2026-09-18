@@ -13,7 +13,7 @@ const TRUSTED =
 
 const workflow = (name) => readFileSync(new URL(`../.github/workflows/${name}`, import.meta.url), "utf8")
 
-test("self-hosted routes are gated by the trusted-event predicate and keep a hosted fallback", () => {
+await test("self-hosted routes are gated by the trusted-event predicate and keep a hosted fallback", () => {
   for (const file of ["ci-typecheck.yml", "ci-test.yml"]) {
     const lines = workflow(file).split("\n")
     const routes = lines.filter((line) => line.trimStart().startsWith("runs-on:"))
@@ -40,7 +40,7 @@ test("self-hosted routes are gated by the trusted-event predicate and keep a hos
   }
 })
 
-test("the typecheck job selects the standard self-hosted Linux labels only when trusted", () => {
+await test("the typecheck job selects the standard self-hosted Linux labels only when trusted", () => {
   const typecheck = workflow("ci-typecheck.yml")
   assert(
     typecheck.includes(`runs-on: \${{ ${TRUSTED} && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}`),
@@ -52,7 +52,7 @@ test("the typecheck job selects the standard self-hosted Linux labels only when 
   )
 })
 
-test("the test matrix keeps names and OS keys while carrying standard self-hosted label arrays", () => {
+await test("the test matrix keeps names and OS keys while carrying standard self-hosted label arrays", () => {
   const file = workflow("ci-test.yml")
   assert(file.includes(`runs-on: \${{ ${TRUSTED} && matrix.settings.selfHosted || matrix.settings.host }}`))
   for (const line of [
@@ -67,7 +67,7 @@ test("the test matrix keeps names and OS keys while carrying standard self-hoste
   assert.equal(file.split("selfHosted: [self-hosted, Windows, X64]").length - 1, 1, "windows matrix row")
 })
 
-test("self-hosted Linux jobs never require sudo: prerequisites are checked and fail actionably", () => {
+await test("self-hosted Linux jobs never require sudo: prerequisites are checked and fail actionably", () => {
   const file = workflow("ci-test.yml")
   assert(!file.includes("run: sudo apt-get"), "a step still installs with sudo directly")
   assert(file.includes('if [ "$RUNNER_ENVIRONMENT" = "self-hosted" ]; then'), "ripgrep self-hosted branch")
@@ -93,7 +93,7 @@ test("self-hosted Linux jobs never require sudo: prerequisites are checked and f
   )
 })
 
-test("privileged release and issue automation stay on GitHub-hosted runners", () => {
+await test("privileged release and issue automation stay on GitHub-hosted runners", () => {
   for (const file of ["release-fork.yml", "dev-issue-autoclose.yml"]) {
     const content = workflow(file)
     assert(content.includes("runs-on: ubuntu-latest"), `${file}: hosted runner lost`)

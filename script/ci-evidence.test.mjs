@@ -122,7 +122,7 @@ test("the source job must use the expected runner label", () => {
   assert.equal(verifyEvidence(e.locator, e.expected, e.source), false)
 })
 
-test("every comma-separated required runner label must appear", () => {
+await test("every comma-separated required runner label must appear", () => {
   const e = evidence()
   e.expected.runner = "self-hosted,Linux,X64"
   e.jobs[0].labels = ["self-hosted", "Linux", "X64"]
@@ -133,14 +133,14 @@ test("every comma-separated required runner label must appear", () => {
   assert.equal(verifyEvidence(e.locator, e.expected, e.source), false)
 })
 
-test("a coerced array value never verifies as a platform label string", () => {
+await test("a coerced array value never verifies as a platform label string", () => {
   const e = evidence()
   e.expected.runner = '["self-hosted","Linux","X64"]'
   e.jobs[0].labels = ["self-hosted", "Linux", "X64"]
   assert.equal(verifyEvidence(e.locator, e.expected, e.source), false)
 })
 
-test("empty required runner labels fail closed", () => {
+await test("empty required runner labels fail closed", () => {
   const e = evidence()
   e.expected.runner = "self-hosted, ,Linux"
   assert.equal(verifyEvidence(e.locator, e.expected, e.source), false)

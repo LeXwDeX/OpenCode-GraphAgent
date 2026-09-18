@@ -15,7 +15,7 @@ import orchestrationPolicy from "./command/orchestration-policy.md" with { type:
 import orchestrationDomains from "./command/orchestration-domains.md" with { type: "text" }
 
 export const DagAutoDescription =
-  "Route a requirement to a composed DAG workflow: classify, match a saved route, retarget, validate, start"
+  "Assess useful DAG orchestration for a request and adapt the graph to its evidence and dependencies"
 export const WorkflowFactsContent = workflowContent
 export const WorkflowBlocksContent = workflowBlocks
 export const OrchestrationPolicyContent = orchestrationPolicy
