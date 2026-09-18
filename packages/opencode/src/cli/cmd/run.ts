@@ -25,6 +25,7 @@ import { Filesystem } from "@/util/filesystem"
 import { createOpencodeClient, type OpencodeClient, type ToolPart } from "@opencode-ai/sdk/v2"
 import { FormatError, FormatUnknownError } from "../error"
 import { INTERACTIVE_INPUT_ERROR, resolveInteractiveStdin } from "./run/runtime.stdin"
+import { DagHold } from "./run/dag-hold"
 
 type ModelInput = Parameters<OpencodeClient["session"]["prompt"]>[0]["model"]
 
@@ -680,6 +681,11 @@ export const RunCommand = effectCmd({
         async function loop(client: OpencodeClient, events: Awaited<ReturnType<typeof sdk.event.subscribe>>) {
           const toggles = new Map<string, boolean>()
           let error: string | undefined
+          // Issue 614: consumer-only DAG hold. Poll dag.bySession on the
+          // busy/idle transitions of the target session and keep consuming
+          // events while a session workflow may still owe a wake turn. Attach
+          // mode keeps today's break-on-first-idle exit.
+          const dagHold = args.attach ? undefined : DagHold.createDagHold(() => DagHold.dagWorkflowsBySession(client, sessionID))
 
           for await (const event of events.stream) {
             if (
@@ -768,12 +774,13 @@ export const RunCommand = effectCmd({
               UI.error(err)
             }
 
-            if (
-              event.type === "session.status" &&
-              event.properties.sessionID === sessionID &&
-              event.properties.status.type === "idle"
-            ) {
-              break
+            if (event.type === "session.status" && event.properties.sessionID === sessionID) {
+              if (event.properties.status.type === "busy") {
+                await dagHold?.onBusy()
+              }
+              if (event.properties.status.type === "idle" && (await dagHold?.onIdle()) !== "hold") {
+                break
+              }
             }
 
             if (event.type === "permission.asked") {
