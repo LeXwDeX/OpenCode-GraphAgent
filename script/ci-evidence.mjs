@@ -3,6 +3,16 @@ import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import { pathToFileURL } from "node:url"
 import { fingerprint } from "./ci-fingerprint.mjs"
 
+// A required runner label is a non-empty string; a comma-separated list
+// requires every listed label (the self-hosted platform labels are separate
+// entries in the jobs API). Non-string or empty entries fail closed so a
+// coerced array value can never verify as a platform string.
+function requiredRunnerLabels(value) {
+  if (typeof value !== "string") return []
+  const labels = value.split(",").map((label) => label.trim())
+  return labels.length > 0 && labels.every((label) => label.length > 0) ? labels : []
+}
+
 export function verifyEvidence(locator, expected, source) {
   if (!Number.isSafeInteger(locator.run) || locator.run <= 0) return false
   if (!Number.isSafeInteger(locator.attempt) || locator.attempt <= 0) return false
@@ -15,7 +25,9 @@ export function verifyEvidence(locator, expected, source) {
   const jobs = source.jobs(locator.run, locator.attempt).filter((job) => job.name === expected.job)
   if (jobs.length !== 1 || jobs[0].status !== "completed" || jobs[0].conclusion !== "success") return false
   if (jobs[0].started_at?.slice(0, 10) !== expected.day) return false
-  if (!jobs[0].labels?.includes(expected.runner)) return false
+  const labels = requiredRunnerLabels(expected.runner)
+  if (labels.length === 0) return false
+  if (!labels.every((label) => jobs[0].labels?.includes(label))) return false
   const artifact = source.artifact(locator.artifact)
   if (artifact.expired || artifact.size_in_bytes > 10000) return false
   if (artifact.name !== `${expected.artifactPrefix}-${locator.attempt}`) return false

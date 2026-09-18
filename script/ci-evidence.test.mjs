@@ -122,6 +122,34 @@ test("the source job must use the expected runner label", () => {
   assert.equal(verifyEvidence(e.locator, e.expected, e.source), false)
 })
 
+await test("every comma-separated required runner label must appear", () => {
+  const e = evidence()
+  e.expected.runner = "self-hosted,Linux,X64"
+  e.jobs[0].labels = ["self-hosted", "Linux", "X64"]
+  assert.equal(verifyEvidence(e.locator, e.expected, e.source), true)
+  e.jobs[0].labels = ["self-hosted", "Linux", "ARM64"]
+  assert.equal(verifyEvidence(e.locator, e.expected, e.source), false)
+  e.jobs[0].labels = ["self-hosted", "Linux"]
+  assert.equal(verifyEvidence(e.locator, e.expected, e.source), false)
+})
+
+await test("a coerced array value never verifies as a platform label string", () => {
+  const e = evidence()
+  e.expected.runner = '["self-hosted","Linux","X64"]'
+  e.jobs[0].labels = ["self-hosted", "Linux", "X64"]
+  assert.equal(verifyEvidence(e.locator, e.expected, e.source), false)
+})
+
+await test("empty required runner labels fail closed", () => {
+  const e = evidence()
+  e.expected.runner = "self-hosted, ,Linux"
+  assert.equal(verifyEvidence(e.locator, e.expected, e.source), false)
+  e.expected.runner = ""
+  assert.equal(verifyEvidence(e.locator, e.expected, e.source), false)
+  e.expected.runner = undefined
+  assert.equal(verifyEvidence(e.locator, e.expected, e.source), false)
+})
+
 test("an artifact from another run or job cannot be borrowed", () => {
   const e = evidence()
   e.artifact.workflow_run.id = 99
