@@ -337,6 +337,8 @@ jobs:
 
       - name: Generate SHA256SUMS
         working-directory: release-assets
+        env:
+          SELECTED_PLATFORMS: ${{ inputs.platforms }}
         run: |
           shopt -s nullglob
           assets=(opencode-*.tar.gz opencode-*.zip dag-templates.tar.gz dag-template-provenance.json)
@@ -344,7 +346,7 @@ jobs:
             echo "::error::Release candidate is incomplete: expected templates, provenance, and at least one CLI archive."
             exit 1
           fi
-          selected="${{ inputs.platforms }}"
+          selected="$SELECTED_PLATFORMS"
           require_archive() {
             local platform="$1"
             local pattern="$2"
