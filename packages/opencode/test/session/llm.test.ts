@@ -28,6 +28,9 @@ import { Session as SessionNs } from "@/session/session"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderError } from "@/provider/error"
+import { ContextFolding } from "@/session/context-folding"
+import { Flag } from "@opencode-ai/core/flag/flag"
+import { logLines } from "effect/testing/TestConsole"
 
 type ConfigModel = NonNullable<NonNullable<ConfigV1.Info["provider"]>[string]["models"]>[string]
 
@@ -86,6 +89,16 @@ function llmLayerWithExecutor(executor: Layer.Layer<RequestExecutor.Service>, fl
     Layer.provide(RuntimeFlags.layer(flags)),
   )
 }
+
+const nativeFoldingIt = testEffect(
+  Layer.mergeAll(
+    llmLayerWithExecutor(RequestExecutor.defaultLayer, {
+      experimentalNativeLlm: true,
+      outputTokenMax: 8_192,
+    }),
+    Provider.defaultLayer,
+  ),
+)
 
 describe("session.llm.hasToolCalls", () => {
   test("returns false for empty messages array", () => {
@@ -753,9 +766,255 @@ function createEventResponse(chunks: unknown[], includeDone = false) {
   })
 }
 
+const foldingBody = "abcdefghij ".repeat(55_000)
+const foldingMessages = (): ModelMessage[] => [
+  {
+    role: "assistant",
+    content: [
+      {
+        type: "tool-call",
+        toolCallId: "call-fold-source",
+        toolName: "read",
+        input: { filePath: "/workspace/source.ts" },
+      },
+    ],
+  },
+  {
+    role: "tool",
+    content: [
+      {
+        type: "tool-result",
+        toolCallId: "call-fold-source",
+        toolName: "read",
+        output: { type: "text", value: foldingBody },
+      },
+    ],
+  },
+  {
+    role: "assistant",
+    content: [
+      {
+        type: "tool-call",
+        toolCallId: "call-fold-witness",
+        toolName: "read",
+        input: { filePath: "/workspace/source.ts" },
+      },
+    ],
+  },
+  {
+    role: "tool",
+    content: [
+      {
+        type: "tool-result",
+        toolCallId: "call-fold-witness",
+        toolName: "read",
+        output: { type: "text", value: foldingBody },
+      },
+    ],
+  },
+  { role: "user", content: "Continue." },
+]
+
+const foldingSnapshot = (): ContextFolding.HistorySnapshot => {
+  const input = { filePath: "/workspace/source.ts" }
+  const evidence = {
+    input,
+    result: foldingBody,
+    comparisonMetadata: {
+      title: "context-folding.txt",
+      metadata: { loaded: [], contextFoldingInstructions: "none" },
+    },
+    outerMetadata: undefined,
+  }
+  return {
+    duplicatePlan: {
+      replacements: [
+        {
+          source: { messageID: "msg-fold-source", partID: "prt-fold-source", callID: "call-fold-source" },
+          witness: { messageID: "msg-fold-witness", partID: "prt-fold-witness", callID: "call-fold-witness" },
+        },
+      ],
+      protectedStepIDs: [],
+      exclusions: [],
+      skipReason: undefined,
+    },
+    references: [
+      {
+        ref: { messageID: "msg-fold-source", partID: "prt-fold-source", callID: "call-fold-source" },
+        toolName: "read",
+        complete: true,
+        evidence,
+      },
+      {
+        ref: { messageID: "msg-fold-witness", partID: "prt-fold-witness", callID: "call-fold-witness" },
+        toolName: "read",
+        complete: true,
+        evidence,
+      },
+    ],
+  }
+}
+
+const foldingTool = () =>
+  tool({
+    description: "Read a file",
+    inputSchema: z.object({ filePath: z.string() }),
+    execute: async () => ({ output: "unused" }),
+  })
+
+const foldingFixture = { providerID: "alibaba", modelID: "qwen3-235b-a22b" }
+const foldingResponse = () =>
+  new Response(createChatStream("done"), {
+    status: 200,
+    headers: { "Content-Type": "text/event-stream" },
+  })
+const foldingConfig = (): Partial<ConfigV1.Info> => ({
+  enabled_providers: [foldingFixture.providerID],
+  provider: {
+    [foldingFixture.providerID]: {
+      options: { apiKey: "test-key", baseURL: `${state.server!.url.origin}/v1` },
+    },
+  },
+})
+
+const loadedDcpCases = [
+  {
+    name: "active DCP",
+    packageName: "@lexwdex-org/opencode-dcp",
+    options: {},
+    builtInFolding: false,
+    migrationNotice: true,
+  },
+  {
+    name: "DCP with enabled false",
+    packageName: "@lexwdex-org/opencode-dcp",
+    options: { enabled: false },
+    builtInFolding: true,
+    migrationNotice: false,
+  },
+  {
+    name: "DCP with dtc enabled false",
+    packageName: "@lexwdex-org/opencode-dcp",
+    options: { enabled: true, dtc: { enabled: false } },
+    builtInFolding: true,
+    migrationNotice: false,
+  },
+  {
+    name: "failed DCP",
+    packageName: "@lexwdex-org/opencode-dcp",
+    options: { fail: true },
+    builtInFolding: true,
+    migrationNotice: false,
+  },
+  {
+    name: "non-DCP transformer",
+    packageName: "not-@lexwdex-org/opencode-dcp-copy",
+    options: {},
+    builtInFolding: true,
+    migrationNotice: false,
+  },
+] as const
+
+function loadedDcpConfig(testCase: (typeof loadedDcpCases)[number]): Partial<ConfigV1.Info> {
+  return {
+    ...foldingConfig(),
+    compaction: { auto: false },
+    plugin: [["./dcp-plugin.js", testCase.options]],
+  }
+}
+
+function initLoadedDcp(testCase: (typeof loadedDcpCases)[number]) {
+  return (directory: string) =>
+    Effect.promise(async () => {
+      await Bun.write(
+        path.join(directory, "package.json"),
+        JSON.stringify({ name: testCase.packageName, type: "module" }),
+      )
+      await Bun.write(
+        path.join(directory, "dcp-plugin.js"),
+        [
+          "export default async (_input, options) => {",
+          '  if (options.fail) throw new Error("apply failed")',
+          "  if (options.enabled === false || options.dtc?.enabled === false) return {}",
+          '  return { "experimental.chat.messages.transform": async () => {} }',
+          "}",
+          "",
+        ].join("\n"),
+      )
+    })
+}
+
 describe("session.llm.stream", () => {
   const vivgridFixture = { providerID: "vivgrid", modelID: "gemini-3.1-pro-preview" }
   const opencodeFixture = { providerID: "opencode-test", modelID: vivgridFixture.modelID }
+
+  for (const runtime of [
+    { name: "AI SDK", runner: it },
+    { name: "Native", runner: nativeFoldingIt },
+  ] as const) {
+    for (const testCase of loadedDcpCases) {
+      runtime.runner.instance(
+        `${runtime.name} uses actual plugin-loader state for ${testCase.name}`,
+        () =>
+          Effect.gen(function* () {
+            const model = loadFixture(foldingFixture.providerID, foldingFixture.modelID).model
+            const resolved = yield* Provider.use.getModel(
+              ProviderV2.ID.make(foldingFixture.providerID),
+              ModelV2.ID.make(model.id),
+            )
+            const agent = {
+              name: "test",
+              mode: "primary",
+              options: {},
+              permission: [{ permission: "*", pattern: "*", action: "allow" }],
+            } satisfies Agent.Info
+            const send = (suffix: string) => {
+              const sessionID = SessionID.make(`session-test-loaded-dcp-${runtime.name}-${testCase.name}-${suffix}`)
+              return drain({
+                user: {
+                  id: MessageID.make(`msg_user-loaded-dcp-${runtime.name}-${testCase.name}-${suffix}`),
+                  sessionID,
+                  role: "user",
+                  time: { created: Date.now() },
+                  agent: agent.name,
+                  model: { providerID: ProviderV2.ID.make(foldingFixture.providerID), modelID: resolved.id },
+                } satisfies SessionV1.User,
+                sessionID,
+                model: resolved,
+                agent,
+                system: [],
+                messages: foldingMessages(),
+                tools: { read: foldingTool() },
+                purpose: "conversation",
+                contextFolding: foldingSnapshot(),
+              })
+            }
+
+            const firstRequest = waitRequest("/chat/completions", foldingResponse())
+            yield* send("first")
+            const firstWire = JSON.stringify((yield* Effect.promise(() => firstRequest)).body)
+            if (testCase.builtInFolding) {
+              expect(firstWire).toContain("Duplicate tool output folded")
+            } else {
+              expect(firstWire).not.toContain("Duplicate tool output folded")
+              expect(firstWire.match(new RegExp(foldingBody.slice(0, 100), "g"))?.length).toBeGreaterThanOrEqual(2)
+            }
+
+            if (testCase.migrationNotice) {
+              const secondRequest = waitRequest("/chat/completions", foldingResponse())
+              yield* send("second")
+              yield* Effect.promise(() => secondRequest)
+            }
+            const notices = JSON.stringify(yield* logLines).match(/registered active context-folding hooks/g) ?? []
+            expect(notices).toHaveLength(testCase.migrationNotice ? 1 : 0)
+          }),
+        {
+          config: () => loadedDcpConfig(testCase),
+          init: initLoadedDcp(testCase),
+        },
+      )
+    }
+  }
 
   it.instance(
     "sends the parent session header for opencode providers",
@@ -1297,6 +1556,159 @@ describe("session.llm.stream", () => {
   )
 
   it.instance(
+    "folds only the AI SDK outbound wire request when automatic full compaction is disabled",
+    () =>
+      Effect.gen(function* () {
+        const model = loadFixture(foldingFixture.providerID, foldingFixture.modelID).model
+        const request = waitRequest("/chat/completions", foldingResponse())
+        const resolved = yield* Provider.use.getModel(
+          ProviderV2.ID.make(foldingFixture.providerID),
+          ModelV2.ID.make(model.id),
+        )
+        const sessionID = SessionID.make("session-test-folding-ai-sdk")
+        const agent = {
+          name: "test",
+          mode: "primary",
+          options: {},
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        } satisfies Agent.Info
+        const messages = foldingMessages()
+        const before = JSON.stringify(messages)
+
+        yield* drainWith(llmLayerWithExecutor(RequestExecutor.defaultLayer, { outputTokenMax: 8_192 }), {
+          user: {
+            id: MessageID.make("msg_user-folding-ai-sdk"),
+            sessionID,
+            role: "user",
+            time: { created: Date.now() },
+            agent: agent.name,
+            model: { providerID: ProviderV2.ID.make(foldingFixture.providerID), modelID: resolved.id },
+          } satisfies SessionV1.User,
+          sessionID,
+          model: resolved,
+          agent,
+          system: [],
+          messages,
+          tools: { read: foldingTool() },
+          purpose: "conversation",
+          contextFolding: foldingSnapshot(),
+        })
+
+        const capture = yield* Effect.promise(() => request)
+        const wire = JSON.stringify(capture.body)
+        expect(wire).toContain("Duplicate tool output folded")
+        expect(wire).toContain(foldingBody)
+        expect(JSON.stringify(messages)).toBe(before)
+      }),
+    { config: () => ({ ...foldingConfig(), compaction: { auto: false } }) },
+  )
+
+  it.instance(
+    "keeps AI SDK wire output unchanged when dynamic folding is disabled in config",
+    () =>
+      Effect.gen(function* () {
+        const model = loadFixture(foldingFixture.providerID, foldingFixture.modelID).model
+        const request = waitRequest("/chat/completions", foldingResponse())
+        const resolved = yield* Provider.use.getModel(
+          ProviderV2.ID.make(foldingFixture.providerID),
+          ModelV2.ID.make(model.id),
+        )
+        const sessionID = SessionID.make("session-test-folding-disabled")
+        const agent = {
+          name: "test",
+          mode: "primary",
+          options: {},
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        } satisfies Agent.Info
+        const messages = foldingMessages()
+
+        yield* drainWith(llmLayerWithExecutor(RequestExecutor.defaultLayer, { outputTokenMax: 8_192 }), {
+          user: {
+            id: MessageID.make("msg_user-folding-disabled"),
+            sessionID,
+            role: "user",
+            time: { created: Date.now() },
+            agent: agent.name,
+            model: { providerID: ProviderV2.ID.make(foldingFixture.providerID), modelID: resolved.id },
+          } satisfies SessionV1.User,
+          sessionID,
+          model: resolved,
+          agent,
+          system: [],
+          messages,
+          tools: { read: foldingTool() },
+          purpose: "conversation",
+          contextFolding: foldingSnapshot(),
+        })
+
+        const capture = yield* Effect.promise(() => request)
+        const wire = JSON.stringify(capture.body)
+        expect(wire).not.toContain("Duplicate tool output folded")
+        expect(wire.match(new RegExp(foldingBody.slice(0, 100), "g"))?.length).toBeGreaterThanOrEqual(2)
+      }),
+    {
+      config: () => ({
+        ...foldingConfig(),
+        compaction: { dynamic: false },
+      }),
+    },
+  )
+
+  it.instance(
+    "lets OPENCODE_DISABLE_PRUNE disable the real outbound folding path",
+    Effect.acquireUseRelease(
+      Effect.sync(() => {
+        const previous = Flag.OPENCODE_DISABLE_PRUNE
+        Flag.OPENCODE_DISABLE_PRUNE = true
+        return previous
+      }),
+      () =>
+        Effect.gen(function* () {
+          const model = loadFixture(foldingFixture.providerID, foldingFixture.modelID).model
+          const request = waitRequest("/chat/completions", foldingResponse())
+          const resolved = yield* Provider.use.getModel(
+            ProviderV2.ID.make(foldingFixture.providerID),
+            ModelV2.ID.make(model.id),
+          )
+          const sessionID = SessionID.make("session-test-folding-environment-disabled")
+          const agent = {
+            name: "test",
+            mode: "primary",
+            options: {},
+            permission: [{ permission: "*", pattern: "*", action: "allow" }],
+          } satisfies Agent.Info
+
+          yield* drainWith(llmLayerWithExecutor(RequestExecutor.defaultLayer, { outputTokenMax: 8_192 }), {
+            user: {
+              id: MessageID.make("msg_user-folding-environment-disabled"),
+              sessionID,
+              role: "user",
+              time: { created: Date.now() },
+              agent: agent.name,
+              model: { providerID: ProviderV2.ID.make(foldingFixture.providerID), modelID: resolved.id },
+            } satisfies SessionV1.User,
+            sessionID,
+            model: resolved,
+            agent,
+            system: [],
+            messages: foldingMessages(),
+            tools: { read: foldingTool() },
+            purpose: "conversation",
+            contextFolding: foldingSnapshot(),
+          })
+
+          expect(JSON.stringify((yield* Effect.promise(() => request)).body)).not.toContain(
+            "Duplicate tool output folded",
+          )
+        }),
+      (previous) => Effect.sync(() => void (Flag.OPENCODE_DISABLE_PRUNE = previous)),
+    ),
+    {
+      config: () => ({ ...foldingConfig(), compaction: { dynamic: true } }),
+    },
+  )
+
+  it.instance(
     "streams OpenAI through native runtime when opted in",
     () =>
       Effect.gen(function* () {
@@ -1361,6 +1773,115 @@ describe("session.llm.stream", () => {
         expect(capture.body.input).toContainEqual({ role: "user", content: [{ type: "input_text", text: "Hello" }] })
       }),
     { config: () => openAIConfig(loadFixture("openai", "gpt-5.2").model, `${state.server!.url.origin}/v1`) },
+  )
+
+  it.instance(
+    "folds only the Native canonical outbound request and keeps caller messages unchanged",
+    () =>
+      Effect.gen(function* () {
+        const model = loadFixture(foldingFixture.providerID, foldingFixture.modelID).model
+        const request = waitRequest("/chat/completions", foldingResponse())
+        const resolved = yield* Provider.use.getModel(
+          ProviderV2.ID.make(foldingFixture.providerID),
+          ModelV2.ID.make(model.id),
+        )
+        const sessionID = SessionID.make("session-test-folding-native")
+        const agent = {
+          name: "test",
+          mode: "primary",
+          options: {},
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        } satisfies Agent.Info
+        const messages = foldingMessages()
+        const before = JSON.stringify(messages)
+
+        yield* drainWith(
+          llmLayerWithExecutor(RequestExecutor.defaultLayer, {
+            experimentalNativeLlm: true,
+            outputTokenMax: 8_192,
+          }),
+          {
+            user: {
+              id: MessageID.make("msg_user-folding-native"),
+              sessionID,
+              role: "user",
+              time: { created: Date.now() },
+              agent: agent.name,
+              model: { providerID: ProviderV2.ID.make(foldingFixture.providerID), modelID: resolved.id },
+            } satisfies SessionV1.User,
+            sessionID,
+            model: resolved,
+            agent,
+            system: [],
+            messages,
+            tools: { read: foldingTool() },
+            purpose: "conversation",
+            contextFolding: foldingSnapshot(),
+          },
+        )
+
+        const capture = yield* Effect.promise(() => request)
+        const wire = JSON.stringify(capture.body)
+        expect(wire).toContain("Duplicate tool output folded")
+        expect(wire).toContain(foldingBody)
+        expect(JSON.stringify(messages)).toBe(before)
+      }),
+    { config: foldingConfig },
+  )
+
+  it.instance(
+    "keeps Native canonical output unchanged when dynamic folding is disabled",
+    () =>
+      Effect.gen(function* () {
+        const model = loadFixture(foldingFixture.providerID, foldingFixture.modelID).model
+        const request = waitRequest("/chat/completions", foldingResponse())
+        const resolved = yield* Provider.use.getModel(
+          ProviderV2.ID.make(foldingFixture.providerID),
+          ModelV2.ID.make(model.id),
+        )
+        const sessionID = SessionID.make("session-test-folding-native-disabled")
+        const agent = {
+          name: "test",
+          mode: "primary",
+          options: {},
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        } satisfies Agent.Info
+
+        yield* drainWith(
+          llmLayerWithExecutor(RequestExecutor.defaultLayer, {
+            experimentalNativeLlm: true,
+            outputTokenMax: 8_192,
+          }),
+          {
+            user: {
+              id: MessageID.make("msg_user-folding-native-disabled"),
+              sessionID,
+              role: "user",
+              time: { created: Date.now() },
+              agent: agent.name,
+              model: { providerID: ProviderV2.ID.make(foldingFixture.providerID), modelID: resolved.id },
+            } satisfies SessionV1.User,
+            sessionID,
+            model: resolved,
+            agent,
+            system: [],
+            messages: foldingMessages(),
+            tools: { read: foldingTool() },
+            purpose: "conversation",
+            contextFolding: foldingSnapshot(),
+          },
+        )
+
+        const wire = JSON.stringify((yield* Effect.promise(() => request)).body)
+        expect(wire).not.toContain("Duplicate tool output folded")
+        expect(wire.match(new RegExp(foldingBody.slice(0, 100), "g"))?.length).toBeGreaterThanOrEqual(2)
+      }),
+    {
+      config: () => ({
+        ...foldingConfig(),
+        compaction: { dynamic: false },
+      }),
+    },
   )
 
   it.instance(

@@ -9,8 +9,8 @@ import { Location } from "../location"
 import { PermissionV2 } from "../permission"
 import { Ripgrep } from "../ripgrep"
 import { RelativePath } from "../schema"
+import { ContextFoldingBuiltins } from "./context-folding-builtins"
 import { Tool } from "./tool"
-import { Tools } from "./tools"
 
 export const name = "grep"
 
@@ -50,7 +50,7 @@ export const toModelOutput = (output: ModelOutput) => {
 /** Grep leaf that defaults its filesystem root to the active Location. */
 export const layer = Layer.effectDiscard(
   Effect.gen(function* () {
-    const tools = yield* Tools.Service
+    const tools = yield* ContextFoldingBuiltins.Service
     const fs = yield* FSUtil.Service
     const ripgrep = yield* Ripgrep.Service
     const location = yield* Location.Service
@@ -59,6 +59,7 @@ export const layer = Layer.effectDiscard(
     yield* tools
       .register({
         [name]: Tool.make({
+          contextFolding: { instructions: "none" },
           description:
             "Search file contents by regular expression within the active Location or an absolute managed tool-output file. Use a path to narrow the search, include to filter files by glob, and limit to bound the match count. Returns concise file resources, line numbers, and bounded line previews.",
           input: Input,

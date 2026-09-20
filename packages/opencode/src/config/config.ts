@@ -675,7 +675,7 @@ export const layer = Layer.effect(
           result.compaction = { ...result.compaction, auto: false }
         }
         if (Flag.OPENCODE_DISABLE_PRUNE) {
-          result.compaction = { ...result.compaction, prune: false }
+          result.compaction = { ...result.compaction, dynamic: false, prune: false }
         }
 
         return {

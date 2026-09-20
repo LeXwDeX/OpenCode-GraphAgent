@@ -14,7 +14,6 @@ import { GitLabWorkflowLanguageModel } from "gitlab-ai-provider"
 import { ProviderTransform } from "@/provider/transform"
 import { Config } from "@/config/config"
 import type { Agent } from "@/agent/agent"
-import type { MessageV2 } from "./message-v2"
 import { Plugin } from "@/plugin"
 import { Permission } from "@/permission"
 import { EventV2Bridge } from "@/event-v2-bridge"
@@ -29,6 +28,14 @@ import * as OtelTracer from "@effect/opentelemetry/Tracer"
 import { LLMAISDK } from "./llm/ai-sdk"
 import { LLMNativeRuntime } from "./llm/native-runtime"
 import { LLMRequestPrep } from "./llm/request"
+import {
+  ContextFolding,
+  type HistorySnapshot as ContextFoldingHistorySnapshot,
+  type RequestPurpose,
+} from "./context-folding"
+import { ConfigCompaction } from "@opencode-ai/core/config/compaction"
+import { Flag } from "@opencode-ai/core/flag/flag"
+import { contextFoldingDiagnostic, type ContextFoldingProjectionPlan } from "@opencode-ai/core/session/context-folding"
 
 export const OUTPUT_TOKEN_MAX = ProviderTransform.OUTPUT_TOKEN_MAX
 
@@ -45,6 +52,8 @@ export type StreamInput = {
   tools: Record<string, Tool>
   retries?: number
   toolChoice?: "auto" | "required" | "none"
+  purpose?: RequestPurpose
+  contextFolding?: ContextFoldingHistorySnapshot
 }
 
 export type StreamRequest = StreamInput & {
@@ -111,6 +120,22 @@ const live: Layer.Layer<
         flags,
         isWorkflow,
       })
+      const compatibility = yield* plugin.contextFoldingCompatibility()
+      const dynamicFolding = ConfigCompaction.resolveDynamic({
+        disabledByEnvironment: Flag.OPENCODE_DISABLE_PRUNE,
+        dynamic: cfg.compaction?.dynamic,
+        prune: cfg.compaction?.prune,
+        knownExternalDcp: compatibility.knownExternalDcp,
+      })
+      const folding = {
+        enabled: dynamicFolding.enabled,
+        purpose: input.purpose ?? ("unknown" as const),
+        history: input.contextFolding,
+        system:
+          prepared.params.options.instructions === undefined
+            ? ({ kind: "messages" } as const)
+            : ({ kind: "instructions", value: prepared.params.options.instructions } as const),
+      }
 
       // Wire up toolExecutor for DWS workflow models so that tool calls
       // from the workflow service are executed via opencode's tool system
@@ -239,8 +264,19 @@ const live: Layer.Layer<
           providerOptions: prepared.params.options,
           headers: prepared.headers,
           abort: input.abort,
+          contextFolding: folding,
         })
         if (native.type === "supported") {
+          yield* Effect.logInfo(
+            "context folding",
+            contextFoldingDiagnostic({
+              runtime: "opencode-native",
+              requestPurpose: folding.purpose,
+              resolution: dynamicFolding,
+              duplicatePlan: folding.history?.duplicatePlan,
+              projectionPlan: native.contextFoldingPlan,
+            }),
+          )
           yield* Effect.logInfo("llm runtime selected", {
             "llm.runtime": "native",
             "llm.provider": input.model.providerID,
@@ -329,12 +365,49 @@ const live: Layer.Layer<
                 specificationVersion: "v3" as const,
                 async transformParams(args) {
                   if (args.type === "stream") {
-                    // @ts-expect-error
-                    args.params.prompt = ProviderTransform.message(
+                    const sourceMessages = ContextFolding.copyModelMessages(args.params.prompt)
+                    const transformed = ProviderTransform.message(
                       args.params.prompt,
                       input.model,
                       prepared.messageTransformOptions,
                     )
+                    let outbound = transformed
+                    let projectionPlan: ContextFoldingProjectionPlan | undefined
+                    const snapshot =
+                      folding.enabled && folding.history && folding.purpose === "conversation" && sourceMessages
+                        ? ContextFolding.bindModelMessages(folding.history, sourceMessages)
+                        : undefined
+                    if (snapshot) {
+                      const projected = ContextFolding.projectAISDK({
+                        model: input.model,
+                        purpose: folding.purpose,
+                        snapshot,
+                        messages: transformed,
+                        sourceMessages: sourceMessages ?? [],
+                        messageTransformOptions: prepared.messageTransformOptions,
+                        tools: prepared.tools,
+                        toolChoice: input.toolChoice,
+                        maxOutputTokens: prepared.params.maxOutputTokens,
+                        params: prepared.params,
+                        system: folding.system,
+                      })
+                      projectionPlan = projected.plan
+                      if (projected.applied) outbound = projected.request.messages
+                    }
+                    await bridge.promise(
+                      Effect.logInfo(
+                        "context folding",
+                        contextFoldingDiagnostic({
+                          runtime: "opencode-ai-sdk",
+                          requestPurpose: folding.purpose,
+                          resolution: dynamicFolding,
+                          duplicatePlan: folding.history?.duplicatePlan,
+                          projectionPlan,
+                        }),
+                      ),
+                    )
+                    // @ts-expect-error
+                    args.params.prompt = outbound
                   }
                   return args.params
                 },

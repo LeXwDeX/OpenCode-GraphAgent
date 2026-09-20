@@ -27,7 +27,13 @@ import { TodoReminders } from "./todo-reminders"
 import { EffectBridge } from "@/effect/bridge"
 import { SessionContext } from "@/effect/session-context"
 import { ModelV2 } from "@opencode-ai/core/model"
+import { Hash } from "@opencode-ai/core/util/hash"
 import { isRecord } from "@/util/record"
+import {
+  ToolSourceLedger,
+  type Interface as ToolSourceLedgerInterface,
+  type Registration as ToolSourceRegistration,
+} from "./tool-source-ledger"
 
 const MCP_RESOURCE_TOOLS = {
   list: "list_mcp_resources",
@@ -44,6 +50,20 @@ const SUPPORTED_MCP_RESOURCE_ATTACHMENT_MIMES = new Set([
 ])
 const ROOT_ONLY_TOOLS = new Set([MemorySearch.MemorySearchTool.id, TaskTool.id, "workflow"])
 
+const hookAddsInstructions = (result: TriggerResult) =>
+  (result.additionalContexts?.length ?? 0) > 0 ||
+  (result.systemMessages?.length ?? 0) > 0 ||
+  result.blocked !== undefined ||
+  result.preventContinuation === true
+
+const outputFingerprint = (value: unknown) => {
+  try {
+    return Hash.sha256(JSON.stringify(value))
+  } catch {
+    return undefined
+  }
+}
+
 export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
   agent: Agent.Info
   model: Provider.Model
@@ -53,6 +73,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
   messages: SessionV1.WithParts[]
   promptOps: TaskPromptOps
   hooks?: SettingsHook.Interface
+  sourceLedger?: ToolSourceLedgerInterface
 }) {
   const tools: Record<string, AITool> = {}
   const run = yield* EffectBridge.make()
@@ -61,7 +82,61 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
   const registry = yield* ToolRegistry.Service
   const mcp = yield* MCP.Service
   const truncate = yield* Truncate.Service
+  const sourceLedger =
+    input.sourceLedger ??
+    Option.getOrUndefined(yield* Effect.serviceOption(ToolSourceLedger.Service)) ??
+    ToolSourceLedger.unavailable
   const hooks = input.hooks ?? Option.getOrUndefined(yield* Effect.serviceOption(SettingsHook.Service))
+
+  const registryContext = {
+    modelID: ModelV2.ID.make(input.model.api.id),
+    providerID: input.model.providerID,
+    agent: input.agent,
+  }
+  const registryItems = yield* registry.registrations(registryContext)
+  const mcpItems = yield* mcp.tools()
+  const hasMcpResourceServer = Object.values(yield* mcp.clients()).some(
+    (client) => !!client.getServerCapabilities()?.resources,
+  )
+  const effectiveSources = new Map<string, ToolSourceRegistration>()
+  for (const item of registryItems) {
+    effectiveSources.set(item.definition.id, {
+      sourceKind: item.sourceKind,
+      registrationID: item.registrationID,
+    })
+  }
+  if (hasMcpResourceServer) {
+    effectiveSources.set(MCP_RESOURCE_TOOLS.list, {
+      sourceKind: "mcp",
+      registrationID: `mcp-resource:${MCP_RESOURCE_TOOLS.list}`,
+    })
+    effectiveSources.set(MCP_RESOURCE_TOOLS.listTemplates, {
+      sourceKind: "mcp",
+      registrationID: `mcp-resource:${MCP_RESOURCE_TOOLS.listTemplates}`,
+    })
+    effectiveSources.set(MCP_RESOURCE_TOOLS.read, {
+      sourceKind: "mcp",
+      registrationID: `mcp-resource:${MCP_RESOURCE_TOOLS.read}`,
+    })
+  }
+  for (const key of Object.keys(mcpItems).toSorted()) {
+    effectiveSources.set(key, { sourceKind: "mcp", registrationID: `mcp:${key}` })
+  }
+  const activeRegistrations = [...effectiveSources.entries()]
+    .toSorted(([left], [right]) => left.localeCompare(right))
+    .map(([, source]) => source)
+  let registrationGeneration = "inactive"
+
+  const recordSettlement = (toolName: string, callID: string, source: ToolSourceRegistration) =>
+    sourceLedger.record({
+      sessionID: input.session.id,
+      assistantMessageID: input.processor.message.id,
+      callID,
+      toolName,
+      sourceKind: source.sourceKind,
+      registrationID: source.registrationID,
+      registrationGeneration,
+    })
 
   const context = (args: Record<string, unknown>, options: ToolExecutionOptions): Tool.Context => ({
     sessionID: input.session.id,
@@ -96,11 +171,8 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
         .pipe(Effect.orDie),
   })
 
-  for (const item of yield* registry.tools({
-    modelID: ModelV2.ID.make(input.model.api.id),
-    providerID: input.model.providerID,
-    agent: input.agent,
-  })) {
+  for (const registration of registryItems) {
+    const item = registration.definition
     if (input.session.parentID && ROOT_ONLY_TOOLS.has(item.id)) continue
     if (
       item.id === MemorySearch.MemorySearchTool.id &&
@@ -129,6 +201,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
               )
               // SettingsHook PreToolUse
               let preContexts: string[] = []
+              let dynamicInstructions = false
               // Native todo surfacing (#429): once per assistant turn, before
               // any non-todowrite tool result, re-show the uncompleted list.
               const todoReminder = yield* TodoReminders.preToolCall({
@@ -192,6 +265,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
                   }
                 }
                 preContexts = preResult.additionalContexts ?? []
+                dynamicInstructions ||= hookAddsInstructions(preResult)
                 // effectiveArgs reflects any PreToolUse updatedInput rewrite (shallow merge).
                 args = decision.effectiveArgs
               }
@@ -213,13 +287,16 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
               // gate/reminder before the tool result (mirrors PostToolUse surfacing below).
               const preLines = [todoReminder, ...preContexts].filter((line): line is string => Boolean(line))
               if (preLines.length) {
+                dynamicInstructions = true
                 output.output = `${preLines.join("\n\n")}\n\n${output.output ?? ""}`
               }
+              const beforePlugin = outputFingerprint(output)
               yield* plugin.trigger(
                 "tool.execute.after",
                 { tool: item.id, sessionID: ctx.sessionID, callID: ctx.callID, args },
                 output,
               )
+              dynamicInstructions ||= beforePlugin === undefined || beforePlugin !== outputFingerprint(output)
               // SettingsHook PostToolUse
               if (settingsHook) {
                 const postResult = yield* settingsHook
@@ -237,6 +314,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
                     Effect.catch(() => Effect.succeed<TriggerResult>({ additionalContexts: [], systemMessages: [] })),
                   )
                 yield* SettingsHook.landSystemMessages(postResult, { sessionID: ctx.sessionID })
+                dynamicInstructions ||= hookAddsInstructions(postResult)
                 output.output = withHookFeedback(output.output ?? "", postResult)
               }
               if (settingsHook) {
@@ -252,9 +330,20 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
                       Effect.catch(() => Effect.succeed<TriggerResult>({ additionalContexts: [], systemMessages: [] })),
                     )
                   yield* SettingsHook.landSystemMessages(fileResult, { sessionID: ctx.sessionID })
+                  dynamicInstructions ||= hookAddsInstructions(fileResult)
                   output.output = withHookFeedback(output.output ?? "", fileResult)
                 }
               }
+              dynamicInstructions ||=
+                output.output?.includes("<system-reminder>") ||
+                (isRecord(output.metadata) &&
+                  Array.isArray(output.metadata.loaded) &&
+                  output.metadata.loaded.length > 0)
+              output.metadata = {
+                ...(isRecord(output.metadata) ? output.metadata : {}),
+                contextFoldingInstructions: dynamicInstructions ? "dynamic" : "none",
+              }
+              yield* recordSettlement(item.id, options.toolCallId, registration)
               if (options.abortSignal?.aborted) {
                 yield* input.processor.completeToolCall(options.toolCallId, output)
               }
@@ -297,9 +386,6 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
     })
   }
 
-  const hasMcpResourceServer = Object.values(yield* mcp.clients()).some(
-    (client) => !!client.getServerCapabilities()?.resources,
-  )
   if (hasMcpResourceServer) {
     tools[MCP_RESOURCE_TOOLS.list] = tool({
       description:
@@ -374,6 +460,10 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
               { tool: MCP_RESOURCE_TOOLS.list, sessionID: ctx.sessionID, callID: opts.toolCallId, args },
               output,
             )
+            yield* recordSettlement(MCP_RESOURCE_TOOLS.list, opts.toolCallId, {
+              sourceKind: "mcp",
+              registrationID: `mcp-resource:${MCP_RESOURCE_TOOLS.list}`,
+            })
             if (opts.abortSignal?.aborted) {
               yield* input.processor.completeToolCall(opts.toolCallId, output)
             }
@@ -457,6 +547,10 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
               { tool: MCP_RESOURCE_TOOLS.listTemplates, sessionID: ctx.sessionID, callID: opts.toolCallId, args },
               output,
             )
+            yield* recordSettlement(MCP_RESOURCE_TOOLS.listTemplates, opts.toolCallId, {
+              sourceKind: "mcp",
+              registrationID: `mcp-resource:${MCP_RESOURCE_TOOLS.listTemplates}`,
+            })
             if (opts.abortSignal?.aborted) {
               yield* input.processor.completeToolCall(opts.toolCallId, output)
             }
@@ -539,6 +633,10 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
               { tool: MCP_RESOURCE_TOOLS.read, sessionID: ctx.sessionID, callID: opts.toolCallId, args },
               output,
             )
+            yield* recordSettlement(MCP_RESOURCE_TOOLS.read, opts.toolCallId, {
+              sourceKind: "mcp",
+              registrationID: `mcp-resource:${MCP_RESOURCE_TOOLS.read}`,
+            })
             if (opts.abortSignal?.aborted) {
               yield* input.processor.completeToolCall(opts.toolCallId, output)
             }
@@ -549,7 +647,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
     })
   }
 
-  for (const [key, item] of Object.entries(yield* mcp.tools())) {
+  for (const [key, item] of Object.entries(mcpItems)) {
     const execute = item.execute
     if (!execute) continue
 
@@ -718,6 +816,10 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
             yield* SettingsHook.landSystemMessages(postResult, { sessionID: ctx.sessionID })
             output.output = withHookFeedback(output.output ?? "", postResult)
           }
+          yield* recordSettlement(key, opts.toolCallId, {
+            sourceKind: "mcp",
+            registrationID: `mcp:${key}`,
+          })
           if (opts.abortSignal?.aborted) {
             yield* input.processor.completeToolCall(opts.toolCallId, output)
           }
@@ -755,8 +857,38 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
     tools[key] = item
   }
 
+  registrationGeneration = yield* sourceLedger.activate(
+    activeRegistrations,
+    materializationSignature(input.model, tools),
+  )
   return tools
 })
+
+function materializationSignature(model: Provider.Model, tools: Record<string, AITool>) {
+  try {
+    return Hash.sha256(
+      JSON.stringify({
+        model: {
+          providerID: model.providerID,
+          modelID: model.id,
+          apiID: model.api.id,
+          npm: model.api.npm,
+        },
+        tools: Object.entries(tools)
+          .toSorted(([left], [right]) => left.localeCompare(right))
+          .map(([name, item]) => ({
+            name,
+            description: item.description ?? "",
+            inputSchema: asSchema(item.inputSchema).jsonSchema,
+            ...(item.strict === undefined ? {} : { strict: item.strict }),
+          })),
+      }),
+    )
+  } catch {
+    // An unstable or unserializable tool shape must not reuse prior provenance.
+    return `unknown:${crypto.randomUUID()}`
+  }
+}
 
 // Cancel hooks independently so tools that finalize partial output on abort can
 // still persist that output through completeToolCall.

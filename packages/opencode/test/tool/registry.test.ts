@@ -33,6 +33,8 @@ const brokenPluginLayer = Layer.succeed(
   Plugin.Service.of({
     init: () => Effect.void,
     trigger,
+    contextFoldingCompatibility: () =>
+      Effect.succeed({ knownExternalDcp: "unknown", migrationNotice: "not-applicable" }),
     list: () =>
       Effect.succeed([
         {
@@ -124,6 +126,40 @@ describe("tool.registry", () => {
       const registry = yield* ToolRegistry.Service
       const ids = yield* registry.ids()
       expect(ids).toContain("hello")
+    }),
+  )
+
+  it.instance("keeps immutable provenance when a custom tool shadows a built-in name", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const tools = path.join(test.directory, ".opencode", "tools")
+      yield* Effect.promise(() => fs.mkdir(tools, { recursive: true }))
+      yield* Effect.promise(() =>
+        Bun.write(
+          path.join(tools, "read.ts"),
+          [
+            "export default {",
+            "  description: 'custom read',",
+            "  args: {},",
+            "  execute: async () => 'custom',",
+            "}",
+            "",
+          ].join("\n"),
+        ),
+      )
+
+      const registry = yield* ToolRegistry.Service
+      const agents = yield* Agent.Service
+      const context = {
+        providerID: ProviderV2.ID.opencode,
+        modelID: ModelV2.ID.make("test"),
+        agent: yield* agents.defaultInfo(),
+      }
+      const registrations = (yield* registry.registrations(context)).filter((item) => item.definition.id === "read")
+
+      expect(registrations.map((item) => item.sourceKind)).toEqual(["host-builtin", "custom"])
+      expect(registrations[0].registrationID).not.toBe(registrations[1].registrationID)
+      expect((yield* registry.tools(context)).findLast((item) => item.id === "read")?.description).toBe("custom read")
     }),
   )
 

@@ -88,6 +88,12 @@ export const serializeToolContent = (content: SessionMessage.ToolStateCompleted[
     )
     .join("\n")
 
+export const serializeCompletedToolState = (state: SessionMessage.ToolStateCompleted) => {
+  const content = serializeToolContent(state.content)
+  if (content) return content
+  return Object.keys(state.structured).length === 0 ? "" : JSON.stringify(state.structured)
+}
+
 const serialize = (message: SessionMessage.Message) => {
   if (message.type === "user") {
     const files = message.files?.map((file) => `[Attached ${file.mime}: ${file.name ?? file.uri}]`) ?? []
@@ -102,7 +108,7 @@ const serialize = (message: SessionMessage.Message) => {
         if (part.state.status === "completed")
           return [
             `[Assistant tool call]: ${part.name}(${input})`,
-            `[Tool result]: ${truncate(serializeToolContent(part.state.content))}`,
+            `[Tool result]: ${truncate(serializeCompletedToolState(part.state))}`,
           ]
         if (part.state.status === "error")
           return [`[Assistant tool call]: ${part.name}(${input})`, `[Tool error]: ${part.state.error.message}`]

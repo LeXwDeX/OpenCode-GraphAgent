@@ -4,10 +4,31 @@ import { AgentV2 } from "@opencode-ai/core/agent"
 import { ApplicationTools } from "@opencode-ai/core/tool/application-tools"
 import { SessionV2 } from "@opencode-ai/core/session"
 import { SessionMessage } from "@opencode-ai/core/session/message"
+import { ContextFoldingToolSourceLedger } from "@opencode-ai/core/session/context-folding/tool-source-ledger"
 import { ToolOutputStore } from "@opencode-ai/core/tool-output-store"
 import { ToolRegistry } from "@opencode-ai/core/tool/registry"
+import { ContextFoldingBuiltins } from "@opencode-ai/core/tool/context-folding-builtins"
+import { CoreContextFolding } from "@opencode-ai/core/session/runner/context-folding"
+import { toLLMMessagesWithBindings } from "@opencode-ai/core/session/runner/to-llm-message"
+import { ModelV2 } from "@opencode-ai/core/model"
+import { ProviderV2 } from "@opencode-ai/core/provider"
+import { Model } from "@opencode-ai/llm"
+import * as OpenAIChat from "@opencode-ai/llm/protocols/openai-chat"
 import { executeTool, settleTool, toolDefinitions } from "./lib/tool"
-import { Cause, Deferred, Effect, Exit, Fiber, Layer, Option, Schema, SchemaGetter, SchemaIssue, Scope } from "effect"
+import {
+  Cause,
+  DateTime,
+  Deferred,
+  Effect,
+  Exit,
+  Fiber,
+  Layer,
+  Option,
+  Schema,
+  SchemaGetter,
+  SchemaIssue,
+  Scope,
+} from "effect"
 import { testEffect } from "./lib/effect"
 
 const bounds: ToolOutputStore.BoundInput[] = []
@@ -30,11 +51,20 @@ const outputStore = Layer.mock(ToolOutputStore.Service, {
 const registry = ToolRegistry.layer.pipe(Layer.provide(ApplicationTools.layer), Layer.provide(outputStore))
 const it = testEffect(registry)
 const integrated = testEffect(Layer.mergeAll(ApplicationTools.layer, registry))
+const ledgerOnly = testEffect(ContextFoldingToolSourceLedger.layer)
 const identity = {
   agent: AgentV2.ID.make("build"),
   assistantMessageID: SessionMessage.ID.make("msg_registry"),
 }
 const sessionID = SessionV2.ID.make("ses_registry")
+const foldingModel = Model.make({ id: "registry-model", provider: "registry-provider", route: OpenAIChat.route })
+const foldingModelRef = {
+  id: ModelV2.ID.make(String(foldingModel.id)),
+  providerID: ProviderV2.ID.make(String(foldingModel.provider)),
+}
+const now = DateTime.makeUnsafe(1)
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value)
 const call = (name: string, id = `call-${name}`): ToolRegistry.ExecuteInput => ({
   sessionID,
   ...identity,
@@ -52,7 +82,316 @@ const make = (permission?: string) => {
   return permission ? Tool.withPermission(tool, permission) : tool
 }
 
+const foldable = () =>
+  Tool.make({
+    contextFolding: { instructions: "none" },
+    description: "Foldable echo text",
+    input: Schema.Struct({ text: Schema.String }),
+    output: Schema.Struct({ text: Schema.String }),
+    execute: ({ text }) => Effect.succeed({ text }),
+    toModelOutput: ({ output }) => [{ type: "text", text: output.text }],
+  })
+
+const settledMessage = Effect.fnUntraced(function* (
+  turn: ToolRegistry.Materialization,
+  messageID: string,
+  callID: string,
+) {
+  const input = { text: "same structured content" }
+  const settled = yield* turn.settle({
+    sessionID,
+    agent: identity.agent,
+    assistantMessageID: SessionMessage.ID.make(messageID),
+    call: { type: "tool-call", id: callID, name: "grep", input },
+  })
+  if (!settled.output || !isRecord(settled.output.structured)) return yield* Effect.die("expected successful output")
+  return {
+    id: SessionMessage.ID.make(messageID),
+    type: "assistant" as const,
+    agent: identity.agent,
+    model: foldingModelRef,
+    time: { created: now, completed: now },
+    content: [
+      {
+        type: "tool" as const,
+        id: callID,
+        name: "grep",
+        state: {
+          status: "completed" as const,
+          input,
+          structured: settled.output.structured,
+          content: settled.output.content,
+        },
+        time: { created: now, ran: now, completed: now },
+      },
+    ],
+  } satisfies SessionMessage.Assistant
+})
+
+const recent = (prefix: string) =>
+  Array.from({ length: 4 }, (_, index) =>
+    SessionMessage.Assistant.make({
+      id: SessionMessage.ID.make(`msg_${prefix}_recent_${index}`),
+      type: "assistant",
+      agent: identity.agent,
+      model: foldingModelRef,
+      time: { created: now, completed: now },
+      content: [{ type: "text", id: `${prefix}-text-${index}`, text: "recent".repeat(4_000) }],
+    }),
+  )
+
+const foldingHistory = Effect.fnUntraced(function* (
+  messages: readonly SessionMessage.Message[],
+  ledger: ContextFoldingToolSourceLedger.Interface,
+) {
+  const conversion = toLLMMessagesWithBindings(messages, foldingModel)
+  return yield* CoreContextFolding.history({ sessionID, messages, conversion, model: foldingModel, ledger })
+})
+
 describe("ToolRegistry", () => {
+  ledgerOnly.effect("does not trust pre-restart history in a fresh provenance ledger", () =>
+    Effect.gen(function* () {
+      const ledger = yield* ContextFoldingToolSourceLedger.Service
+      const generation = yield* ledger.activate([
+        { toolName: "read", sourceKind: "host-builtin", registrationID: "read-before-restart", instructions: "none" },
+      ])
+      yield* ledger.record({
+        sessionID,
+        assistantMessageID: identity.assistantMessageID,
+        callID: "call-before-restart",
+        toolName: "read",
+        source: {
+          sourceKind: "host-builtin",
+          registrationID: "read-before-restart",
+          registrationGeneration: generation,
+          instructions: "none",
+        },
+      })
+      expect(
+        yield* ledger.lookup({
+          sessionID,
+          assistantMessageID: identity.assistantMessageID,
+          callID: "call-before-restart",
+          toolName: "read",
+        }),
+      ).toBeDefined()
+
+      const restarted = yield* Effect.gen(function* () {
+        const fresh = yield* ContextFoldingToolSourceLedger.Service
+        return yield* fresh.lookup({
+          sessionID,
+          assistantMessageID: identity.assistantMessageID,
+          callID: "call-before-restart",
+          toolName: "read",
+        })
+      }).pipe(Effect.provide(ContextFoldingToolSourceLedger.layer.pipe(Layer.fresh)))
+      expect(restarted).toBeUndefined()
+    }),
+  )
+
+  integrated.effect(
+    "keeps application and ordinary local settlement provenance untrusted and invalidates overridden history",
+    () =>
+      Effect.gen(function* () {
+        const applications = yield* ApplicationTools.Service
+        const service = yield* ToolRegistry.Service
+        const ledger = yield* ContextFoldingToolSourceLedger.Service
+        yield* applications.register({ echo: foldable() })
+
+        const applicationTurn = yield* service.materialize()
+        yield* applicationTurn.settle(call("echo", "call-application"))
+        expect(
+          yield* ledger.lookup({
+            sessionID,
+            assistantMessageID: identity.assistantMessageID,
+            callID: "call-application",
+            toolName: "echo",
+          }),
+        ).toMatchObject({ identity: { sourceKind: "custom" }, instructions: "none" })
+
+        yield* service.register({ echo: foldable() })
+        const localTurn = yield* service.materialize()
+        expect(
+          yield* ledger.lookup({
+            sessionID,
+            assistantMessageID: identity.assistantMessageID,
+            callID: "call-application",
+            toolName: "echo",
+          }),
+        ).toBeUndefined()
+        yield* localTurn.settle(call("echo", "call-local"))
+        expect(
+          yield* ledger.lookup({
+            sessionID,
+            assistantMessageID: identity.assistantMessageID,
+            callID: "call-local",
+            toolName: "echo",
+          }),
+        ).toMatchObject({ identity: { sourceKind: "custom" }, instructions: "none" })
+      }),
+  )
+
+  it.effect(
+    "rejects same-name public overrides and restores trusted builtins only for fresh-generation settlements",
+    () =>
+      Effect.gen(function* () {
+        const service = yield* ToolRegistry.Service
+        const builtins = yield* ContextFoldingBuiltins.Service
+        const ledger = yield* ContextFoldingToolSourceLedger.Service
+        yield* builtins.register({ grep: foldable() })
+
+        const originalTurn = yield* service.materialize()
+        yield* settledMessage(originalTurn, "msg_original_builtin", "call-original-builtin")
+        expect(
+          yield* ledger.lookup({
+            sessionID,
+            assistantMessageID: "msg_original_builtin",
+            callID: "call-original-builtin",
+            toolName: "grep",
+          }),
+        ).toMatchObject({ identity: { sourceKind: "host-builtin" }, instructions: "none" })
+
+        const overrideScope = yield* Scope.make()
+        yield* service.register({ grep: foldable() }).pipe(Scope.provide(overrideScope))
+        const overrideTurn = yield* service.materialize()
+        expect(
+          yield* ledger.lookup({
+            sessionID,
+            assistantMessageID: "msg_original_builtin",
+            callID: "call-original-builtin",
+            toolName: "grep",
+          }),
+        ).toBeUndefined()
+
+        const customMessages = [
+          yield* settledMessage(overrideTurn, "msg_custom_source", "call-custom-source"),
+          yield* settledMessage(overrideTurn, "msg_custom_witness", "call-custom-witness"),
+          ...recent("custom"),
+        ]
+        for (const [messageID, callID] of [
+          ["msg_custom_source", "call-custom-source"],
+          ["msg_custom_witness", "call-custom-witness"],
+        ] as const)
+          expect(
+            yield* ledger.lookup({ sessionID, assistantMessageID: messageID, callID, toolName: "grep" }),
+          ).toMatchObject({ identity: { sourceKind: "custom" }, instructions: "none" })
+        const customHistory = yield* foldingHistory(customMessages, ledger)
+        expect(customHistory.duplicatePlan.replacements).toEqual([])
+        expect(customHistory.duplicatePlan.exclusions).toEqual(
+          expect.arrayContaining([
+            {
+              ref: { messageID: "msg_custom_source", partID: "call-custom-source", callID: "call-custom-source" },
+              reason: "untrusted-source",
+            },
+            {
+              ref: {
+                messageID: "msg_custom_witness",
+                partID: "call-custom-witness",
+                callID: "call-custom-witness",
+              },
+              reason: "untrusted-source",
+            },
+          ]),
+        )
+
+        yield* Scope.close(overrideScope, Exit.void)
+        const restoredTurn = yield* service.materialize()
+        expect(
+          yield* ledger.lookup({
+            sessionID,
+            assistantMessageID: "msg_custom_source",
+            callID: "call-custom-source",
+            toolName: "grep",
+          }),
+        ).toBeUndefined()
+
+        yield* originalTurn.settle({
+          sessionID,
+          agent: identity.agent,
+          assistantMessageID: SessionMessage.ID.make("msg_stale_generation"),
+          call: {
+            type: "tool-call",
+            id: "call-stale-generation",
+            name: "grep",
+            input: { text: "same structured content" },
+          },
+        })
+        expect(
+          yield* ledger.lookup({
+            sessionID,
+            assistantMessageID: "msg_stale_generation",
+            callID: "call-stale-generation",
+            toolName: "grep",
+          }),
+        ).toBeUndefined()
+
+        const builtinMessages = [
+          yield* settledMessage(restoredTurn, "msg_builtin_source", "call-builtin-source"),
+          yield* settledMessage(restoredTurn, "msg_builtin_witness", "call-builtin-witness"),
+          ...recent("builtin"),
+        ]
+        for (const [messageID, callID] of [
+          ["msg_builtin_source", "call-builtin-source"],
+          ["msg_builtin_witness", "call-builtin-witness"],
+        ] as const)
+          expect(
+            yield* ledger.lookup({ sessionID, assistantMessageID: messageID, callID, toolName: "grep" }),
+          ).toMatchObject({ identity: { sourceKind: "host-builtin" }, instructions: "none" })
+        expect((yield* foldingHistory(builtinMessages, ledger)).duplicatePlan.replacements).toEqual([
+          {
+            source: {
+              messageID: "msg_builtin_source",
+              partID: "call-builtin-source",
+              callID: "call-builtin-source",
+            },
+            witness: {
+              messageID: "msg_builtin_witness",
+              partID: "call-builtin-witness",
+              callID: "call-builtin-witness",
+            },
+          },
+        ])
+      }),
+  )
+
+  it.effect("fails closed for missing provenance and invalidates recorded history after a generation change", () =>
+    Effect.gen(function* () {
+      const service = yield* ToolRegistry.Service
+      const ledger = yield* ContextFoldingToolSourceLedger.Service
+      expect(
+        yield* ledger.lookup({
+          sessionID,
+          assistantMessageID: identity.assistantMessageID,
+          callID: "call-missing",
+          toolName: "echo",
+        }),
+      ).toBeUndefined()
+
+      yield* service.register({ echo: foldable() })
+      const first = yield* service.materialize()
+      yield* first.settle(call("echo", "call-old-generation"))
+      expect(
+        yield* ledger.lookup({
+          sessionID,
+          assistantMessageID: identity.assistantMessageID,
+          callID: "call-old-generation",
+          toolName: "echo",
+        }),
+      ).toBeDefined()
+
+      yield* service.register({ another: foldable() })
+      yield* service.materialize()
+      expect(
+        yield* ledger.lookup({
+          sessionID,
+          assistantMessageID: identity.assistantMessageID,
+          callID: "call-old-generation",
+          toolName: "echo",
+        }),
+      ).toBeUndefined()
+    }),
+  )
+
   it.effect("filters disabled tools with edit aliases and ordered wildcard precedence", () =>
     Effect.gen(function* () {
       const service = yield* ToolRegistry.Service

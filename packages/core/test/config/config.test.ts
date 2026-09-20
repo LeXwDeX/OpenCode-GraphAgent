@@ -87,6 +87,20 @@ describe("Config", () => {
     }),
   )
 
+  it.effect("preserves explicit dynamic compaction intent without inventing a default", () =>
+    Effect.sync(() => {
+      const missing = Schema.decodeUnknownSync(ConfigV1.Info)({ compaction: {} })
+      expect(missing.compaction?.dynamic).toBeUndefined()
+      expect(Schema.decodeUnknownSync(Config.Info)({ compaction: {} }).compaction?.dynamic).toBeUndefined()
+
+      const migrated = ConfigMigrateV1.migrate(
+        Schema.decodeUnknownSync(ConfigV1.Info)({ compaction: { auto: false, dynamic: false, prune: true } }),
+      )
+      expect(migrated.compaction).toMatchObject({ auto: false, dynamic: false, prune: true })
+      expect(Schema.decodeUnknownSync(Config.Info)(migrated).compaction?.dynamic).toBe(false)
+    }),
+  )
+
   it.effect("migrates v1 provider setup options into AISDK settings", () =>
     Effect.sync(() => {
       const migrated = ConfigMigrateV1.migrate({

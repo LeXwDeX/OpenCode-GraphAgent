@@ -9,6 +9,7 @@ import { SessionID, MessageID, PartID } from "../../src/session/schema"
 import { Question } from "../../src/question"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
+import { InvalidRequestReason, LLMError, LLMEvent } from "@opencode-ai/llm"
 
 const sessionID = SessionID.make("session")
 const providerID = ProviderV2.ID.make("test")
@@ -1364,6 +1365,48 @@ describe("session.message-v2.toModelMessage", () => {
 })
 
 describe("session.message-v2.fromError", () => {
+  test("serializes classified native provider-error events as ContextOverflowError", () => {
+    const result = MessageV2.fromError(
+      LLMEvent.providerError({ message: "request entity too large", classification: "context-overflow" }),
+      { providerID },
+    )
+
+    expect(result).toStrictEqual({
+      name: "ContextOverflowError",
+      data: { message: "request entity too large" },
+    })
+  })
+
+  test("serializes classified native transport failures as ContextOverflowError", () => {
+    const result = MessageV2.fromError(
+      new LLMError({
+        module: "RequestExecutor",
+        method: "execute",
+        reason: new InvalidRequestReason({
+          message: "Provider request failed with HTTP 413",
+          classification: "context-overflow",
+        }),
+      }),
+      { providerID },
+    )
+
+    expect(result).toStrictEqual({
+      name: "ContextOverflowError",
+      data: { message: "RequestExecutor.execute: Provider request failed with HTTP 413" },
+    })
+  })
+
+  test("preserves native provider error retryability", () => {
+    const result = MessageV2.fromError(LLMEvent.providerError({ message: "provider busy", retryable: true }), {
+      providerID,
+    })
+
+    expect(result).toStrictEqual({
+      name: "APIError",
+      data: { message: "provider busy", isRetryable: true },
+    })
+  })
+
   test("serializes context_length_exceeded as ContextOverflowError", () => {
     const input = {
       type: "error",

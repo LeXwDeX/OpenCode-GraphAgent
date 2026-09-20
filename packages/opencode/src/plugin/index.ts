@@ -32,9 +32,23 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { InstallationChannel } from "@opencode-ai/core/installation/version"
 
+export const KNOWN_EXTERNAL_DCP_PACKAGE = "@lexwdex-org/opencode-dcp"
+
 type State = {
   hooks: Hooks[]
+  knownExternalDcp:
+    | Readonly<{
+        packageName: typeof KNOWN_EXTERNAL_DCP_PACKAGE
+        source: PluginLoader.Loaded["source"]
+      }>
+    | undefined
+  externalDcpMigrationNotified: boolean
 }
+
+export type ContextFoldingCompatibility = Readonly<{
+  knownExternalDcp: "unknown" | "loaded"
+  migrationNotice: "not-applicable" | "notified" | "already-notified"
+}>
 
 // Hook names that follow the (input, output) => Promise<void> trigger pattern
 type TriggerName = {
@@ -52,6 +66,7 @@ export interface Interface {
     output: Output,
   ) => Effect.Effect<Output>
   readonly list: () => Effect.Effect<Hooks[]>
+  readonly contextFoldingCompatibility: () => Effect.Effect<ContextFoldingCompatibility>
   readonly init: () => Effect.Effect<void>
 }
 
@@ -120,6 +135,31 @@ async function applyPlugin(load: PluginLoader.Loaded, input: PluginInput, hooks:
   }
 }
 
+function knownExternalDcp(load: PluginLoader.Loaded): State["knownExternalDcp"] {
+  if (load.source === "npm" && parsePluginSpecifier(load.spec).pkg === KNOWN_EXTERNAL_DCP_PACKAGE) {
+    return { packageName: KNOWN_EXTERNAL_DCP_PACKAGE, source: load.source }
+  }
+  const name = load.pkg?.json.name
+  if (load.source === "file" && typeof name === "string" && name.trim() === KNOWN_EXTERNAL_DCP_PACKAGE) {
+    return { packageName: KNOWN_EXTERNAL_DCP_PACKAGE, source: load.source }
+  }
+}
+
+function hasContextFoldingHook(hook: Hooks) {
+  return (
+    typeof hook["experimental.chat.messages.transform"] === "function" ||
+    typeof hook["experimental.session.compacting"] === "function"
+  )
+}
+
+function activeKnownExternalDcp(
+  load: PluginLoader.Loaded,
+  registeredHooks: readonly Hooks[],
+): State["knownExternalDcp"] {
+  if (!registeredHooks.some(hasContextFoldingHook)) return
+  return knownExternalDcp(load)
+}
+
 export const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
@@ -130,6 +170,7 @@ export const layer = Layer.effect(
     const state = yield* InstanceState.make<State>(
       Effect.fn("Plugin.state")(function* (ctx) {
         const hooks: Hooks[] = []
+        let knownExternalDcpDescriptor: State["knownExternalDcp"]
         const bridge = yield* EffectBridge.make()
 
         function publishPluginError(message: string) {
@@ -217,6 +258,7 @@ export const layer = Layer.effect(
 
           // Keep plugin execution sequential so hook registration and execution
           // order remains deterministic across plugin runs.
+          const hookStart = hooks.length
           yield* Effect.tryPromise({
             try: () => applyPlugin(load, input, hooks),
             catch: (err) => {
@@ -225,16 +267,12 @@ export const layer = Layer.effect(
             },
           }).pipe(
             Effect.tapError((error) => Effect.logError("failed to load plugin", { path: load.spec, error })),
-            Effect.catch(() => {
-              // TODO: make proper events for this
-              // events.publish(Session.Event.Error, {
-              //   error: new NamedError.Unknown({
-              //     message: `Failed to load plugin ${load.spec}: ${message}`,
-              //   }).toObject(),
-              // })
-              return Effect.void
-            }),
+            Effect.option,
           )
+          // Derive compatibility from hooks that actually remain registered. An
+          // empty successful return means DCP is disabled; a retained hook from a
+          // partially failed legacy module is still active and must stay exclusive.
+          knownExternalDcpDescriptor ??= activeKnownExternalDcp(load, hooks.slice(hookStart))
         }
 
         // Notify plugins of current config
@@ -258,7 +296,10 @@ export const layer = Layer.effect(
             hooks,
             (hook) =>
               Effect.tryPromise({
-                try: () => Promise.resolve(hook["event"]?.({ event: { id: event.id, type: event.type, properties: event.data } as any })),
+                try: () =>
+                  Promise.resolve(
+                    hook["event"]?.({ event: { id: event.id, type: event.type, properties: event.data } as any }),
+                  ),
                 catch: errorMessage,
               }).pipe(
                 Effect.tapError((error) => Effect.logError("plugin event hook failed", { type: event.type, error })),
@@ -285,7 +326,7 @@ export const layer = Layer.effect(
           ),
         )
 
-        return { hooks }
+        return { hooks, knownExternalDcp: knownExternalDcpDescriptor, externalDcpMigrationNotified: false }
       }),
     )
 
@@ -309,11 +350,42 @@ export const layer = Layer.effect(
       return s.hooks
     })
 
+    const contextFoldingCompatibility = Effect.fn("Plugin.contextFoldingCompatibility")(function* () {
+      const s = yield* InstanceState.get(state)
+      if (!s.knownExternalDcp) {
+        return {
+          knownExternalDcp: "unknown",
+          migrationNotice: "not-applicable",
+        } as const
+      }
+      if (s.externalDcpMigrationNotified) {
+        return {
+          knownExternalDcp: "loaded",
+          migrationNotice: "already-notified",
+        } as const
+      }
+
+      // Set the lifecycle guard before yielding so concurrent first requests cannot emit duplicate notices.
+      s.externalDcpMigrationNotified = true
+      yield* Effect.logWarning(
+        `Known external context-pruning plugin ${s.knownExternalDcp.packageName} registered active context-folding hooks; built-in dynamic context folding is disabled. Remove or disable the external plugin and restart this instance to use the built-in capability.`,
+        {
+          compatibility: "external-dcp-active",
+          source: s.knownExternalDcp.source,
+          migration: "remove-or-disable-plugin-and-restart",
+        },
+      )
+      return {
+        knownExternalDcp: "loaded",
+        migrationNotice: "notified",
+      } as const
+    })
+
     const init = Effect.fn("Plugin.init")(function* () {
       yield* InstanceState.get(state)
     })
 
-    return Service.of({ trigger, list, init })
+    return Service.of({ trigger, list, contextFoldingCompatibility, init })
   }),
 )
 

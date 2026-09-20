@@ -145,6 +145,14 @@ jobs:
             turbo-${{ runner.os }}-${{ hashFiles('turbo.json', '**/package.json') }}-
             turbo-${{ runner.os }}-
 
+      - name: Run context-folding lifecycle preflight
+        if: steps.evidence.outputs.reused != 'true' && (runner.os == 'Linux')
+        working-directory: packages/opencode
+        timeout-minutes: 3
+        run: |
+          bun test --timeout 30000 --only-failures test/session/prompt.test.ts \
+            --test-name-pattern '^(runs builtin read/grep/glob settlement through stored history into the next (AI SDK|Native) request|automatically compacts (AI SDK|Native) folded history at the token threshold|recovers (AI SDK|Native) overflow through an unprojected summary and a continued turn|terminates (AI SDK|Native) overflow when the full compaction request is also rejected)$'
+
       - name: Run unit tests
         if: steps.evidence.outputs.reused != 'true'
         # opencode:test alone (244 files / 3048 tests, many spawning real CLI

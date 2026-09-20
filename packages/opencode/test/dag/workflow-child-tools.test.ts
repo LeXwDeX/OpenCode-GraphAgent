@@ -43,7 +43,14 @@ const it = testEffect(
     }),
     Layer.mock(Permission.Service, { ask: () => Effect.void }),
     Layer.mock(MCP.Service, { clients: () => Effect.succeed({}), tools: () => Effect.succeed({}) }),
-    Layer.mock(ToolRegistry.Service, { tools: () => Effect.succeed([workflowDefinition, taskDefinition]) }),
+    Layer.mock(ToolRegistry.Service, {
+      tools: () => Effect.succeed([workflowDefinition, taskDefinition]),
+      registrations: () =>
+        Effect.succeed([
+          { definition: workflowDefinition, sourceKind: "host-builtin", registrationID: "test:workflow" },
+          { definition: taskDefinition, sourceKind: "host-builtin", registrationID: "test:task" },
+        ]),
+    }),
   ),
 )
 

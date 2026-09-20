@@ -63,6 +63,7 @@ import { SessionReminders } from "./reminders"
 import { Todo } from "./todo"
 import { TodoReminders } from "./todo-reminders"
 import { SessionTools } from "./tools"
+import { ToolSourceLedger } from "./tool-source-ledger"
 import { LLMEvent } from "@opencode-ai/llm"
 import { SettingsHook, HOOK_REWAKE_SENTINEL, type TriggerResult } from "@/hook/settings"
 import { applyPreHookDecision } from "@/hook/pre-hook-decision"
@@ -196,6 +197,8 @@ export const layer = Layer.effect(
     const lsp = yield* LSP.Service
     const registry = yield* ToolRegistry.Service
     const truncate = yield* Truncate.Service
+    const toolSources =
+      Option.getOrUndefined(yield* Effect.serviceOption(ToolSourceLedger.Service)) ?? ToolSourceLedger.unavailable
     const image = yield* Image.Service
     const todoSvc = yield* Todo.Service
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner
@@ -461,6 +464,7 @@ export const layer = Layer.effect(
           sessionID: input.session.id,
           retries: 2,
           messages: [{ role: "user", content: "Generate a title for this conversation:\n" }, ...msgs],
+          purpose: "auxiliary",
         })
         .pipe(
           Stream.filter(LLMEvent.is.textDelta),
@@ -1814,7 +1818,6 @@ export const layer = Layer.effect(
               forceContinue = false
               turnStopped = false
             } else {
-              yield* compaction.prune({ sessionID }).pipe(Effect.ignore, Effect.forkIn(scope))
               yield* Effect.logInfo("exiting loop", { "session.id": sessionID })
               // SettingsHook: Stop on clean turn exit, StopFailure when it ended in error.
               if (settingsHook) {
@@ -2013,6 +2016,7 @@ export const layer = Layer.effect(
               messages: msgs,
               promptOps,
               hooks: settingsHook,
+              sourceLedger: toolSources,
             }).pipe(
               Effect.provideService(Plugin.Service, plugin),
               Effect.provideService(Permission.Service, permission),
@@ -2035,20 +2039,30 @@ export const layer = Layer.effect(
 
             yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
 
-            const [skills, env, instructions, mcpInstructions, goalDocs, hooksDocs, memoryDocs, modelMsgs] =
-              yield* Effect.all(
-                [
-                  sys.skills(agent),
-                  sys.environment(model),
-                  instruction.system().pipe(Effect.orDie),
-                  sys.mcp(agent, session.permission),
-                  sys.goal(sessionID),
-                  sys.hooks(),
-                  sys.memory({ sessionID, messages: msgs, main: !session.parentID }),
-                  MessageV2.toModelMessagesEffect(msgs, model),
-                ],
-                { concurrency: "unbounded" },
-              )
+            const [
+              skills,
+              env,
+              instructions,
+              mcpInstructions,
+              goalDocs,
+              hooksDocs,
+              memoryDocs,
+              modelMsgs,
+              contextFoldingHistory,
+            ] = yield* Effect.all(
+              [
+                sys.skills(agent),
+                sys.environment(model),
+                instruction.system().pipe(Effect.orDie),
+                sys.mcp(agent, session.permission),
+                sys.goal(sessionID),
+                sys.hooks(),
+                sys.memory({ sessionID, messages: msgs, main: !session.parentID }),
+                MessageV2.toModelMessagesEffect(msgs, model),
+                MessageV2.contextFoldingHistory({ messages: msgs, ledger: toolSources }),
+              ],
+              { concurrency: "unbounded" },
+            )
             const system = [
               ...env,
               ...instructions,
@@ -2074,6 +2088,8 @@ export const layer = Layer.effect(
               tools,
               model,
               toolChoice: format.type === "json_schema" ? "required" : undefined,
+              purpose: "conversation",
+              contextFolding: contextFoldingHistory,
             })
 
             if (structured !== undefined) {
@@ -2558,6 +2574,7 @@ export const defaultLayer = Layer.suspend(() =>
         HookStartContext.defaultLayer,
         SettingsHook.defaultLayer,
         Todo.defaultLayer,
+        ToolSourceLedger.defaultLayer,
       ),
     ),
   ),
@@ -2717,6 +2734,7 @@ export const node = LayerNode.make(layer, [
   HookStartContext.node,
   SettingsHook.node,
   Goal.node,
+  ToolSourceLedger.node,
 ])
 
 export function admitIfIdle(
