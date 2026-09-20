@@ -257,6 +257,7 @@ run(
           tui.write("_DONE", "append-q1")
           tui.write("\r", "submit-edit-q1")
           yield* Effect.promise(() => tui.waitForText(Q1_EDITED))
+          yield* Effect.promise(() => tui.waitForTextAbsent("Edit queued message"))
 
           const q1After = message(
             sdkData(yield* Effect.promise(() => sdk.session.message({ sessionID, messageID: q1.info.id }))),
