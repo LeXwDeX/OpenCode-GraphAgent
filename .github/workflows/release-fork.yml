@@ -321,6 +321,14 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Verify GitHub CLI
+        run: |
+          if ! command -v gh >/dev/null 2>&1; then
+            echo "::error::GitHub CLI (gh) is required on the trusted Linux release runner. Provision it on the host; the workflow does not install privileged host tools."
+            exit 1
+          fi
+          gh --version
+
       - name: Download Artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -336,6 +344,20 @@ jobs:
             echo "::error::Release candidate is incomplete: expected templates, provenance, and at least one CLI archive."
             exit 1
           fi
+          selected="${{ inputs.platforms }}"
+          require_archive() {
+            local platform="$1"
+            local pattern="$2"
+            if [[ -z "$selected" || "$selected" == *"$platform"* ]]; then
+              if ! compgen -G "$pattern" >/dev/null; then
+                echo "::error::Release candidate is missing the selected $platform archive ($pattern)."
+                exit 1
+              fi
+            fi
+          }
+          require_archive linux "opencode-linux-*.tar.gz"
+          require_archive macos "opencode-darwin-*.zip"
+          require_archive windows "opencode-windows-*.zip"
           if command -v shasum >/dev/null 2>&1; then
             shasum -a 256 "${assets[@]}" > SHA256SUMS
           elif command -v sha256sum >/dev/null 2>&1; then
@@ -431,6 +453,7 @@ jobs:
             release-assets/dag-template-provenance.json
           )
           gh release create "${{ needs.version.outputs.tag }}" \
+            --repo "${{ github.repository }}" \
             --title "OpenCode GraphAgent v${{ needs.version.outputs.version }}" \
             --notes-file "release-assets/RELEASE_NOTES.md" \
             --target "${{ github.sha }}" \
