@@ -18,12 +18,23 @@ import {
 } from "@opencode-ai/llm"
 import type { LLMClientShape } from "@opencode-ai/llm/route"
 import { LLMNative } from "./native-request"
+import {
+  ContextFolding,
+  type HistorySnapshot as ContextFoldingHistorySnapshot,
+  type RequestPurpose,
+} from "../context-folding"
+import type { SystemTransmission } from "@opencode-ai/core/session/context-folding"
+import type { ContextFoldingProjectionPlan } from "@opencode-ai/core/session/context-folding"
 
 export type RuntimeStatus =
   | { readonly type: "supported"; readonly apiKey: string; readonly baseURL?: string }
   | { readonly type: "unsupported"; readonly reason: string }
 export type StreamResult =
-  | { readonly type: "supported"; readonly stream: Stream.Stream<LLMEvent, unknown> }
+  | {
+      readonly type: "supported"
+      readonly stream: Stream.Stream<LLMEvent, unknown>
+      readonly contextFoldingPlan: ContextFoldingProjectionPlan | undefined
+    }
   | { readonly type: "unsupported"; readonly reason: string }
 
 type StreamInput = {
@@ -41,6 +52,12 @@ type StreamInput = {
   readonly providerOptions?: Record<string, any>
   readonly headers: Record<string, string>
   readonly abort: AbortSignal
+  readonly contextFolding?: {
+    readonly enabled: boolean
+    readonly purpose: RequestPurpose
+    readonly history?: ContextFoldingHistorySnapshot
+    readonly system: SystemTransmission
+  }
 }
 
 export function status(input: Pick<StreamInput, "model" | "provider" | "auth">): RuntimeStatus {
@@ -87,11 +104,14 @@ export function stream(input: StreamInput): StreamResult {
   // — if a field ever needs to differ between the two surfaces, the
   // translation belongs here, not split across both packages.
   const tools = nativeTools(input.tools, input)
-  const request = LLMNative.request({
+  const sourceMessages = ContextFolding.copyModelMessages(input.messages)
+  const transformInput = ContextFolding.copyModelMessages(input.messages) ?? input.messages
+  const transformedMessages = ProviderTransform.message(transformInput, input.model, input.providerOptions ?? {})
+  const canonical = LLMNative.request({
     model: input.model,
     apiKey: current.apiKey,
     baseURL: current.baseURL,
-    messages: ProviderTransform.message(input.messages, input.model, input.providerOptions ?? {}),
+    messages: transformedMessages,
     toolChoice: input.toolChoice,
     temperature: input.temperature,
     topP: input.topP,
@@ -100,6 +120,38 @@ export function stream(input: StreamInput): StreamResult {
     providerOptions: ProviderTransform.providerOptions(input.model, input.providerOptions ?? {}),
     headers: { ...providerHeaders(input.provider.options.headers), ...input.headers },
   })
+  const folding = input.contextFolding
+  const snapshot =
+    folding?.enabled && folding.history && folding.purpose === "conversation" && sourceMessages
+      ? ContextFolding.bindModelMessages(folding.history, sourceMessages)
+      : undefined
+  const projection =
+    folding?.enabled && snapshot && folding.purpose === "conversation"
+      ? ContextFolding.projectNative({
+          model: input.model,
+          purpose: folding.purpose,
+          snapshot,
+          request: canonical,
+          transformedMessages,
+          sourceMessages: sourceMessages ?? [],
+          messageTransformOptions: input.providerOptions ?? {},
+          tools: input.tools,
+          toolChoice: input.toolChoice,
+          maxOutputTokens: input.maxOutputTokens,
+          params: {
+            temperature: input.temperature,
+            topP: input.topP,
+            topK: input.topK,
+            maxOutputTokens: input.maxOutputTokens,
+            providerOptions: input.providerOptions,
+          },
+          system: folding.system,
+        })
+      : undefined
+  const request =
+    projection?.applied === true
+      ? LLMRequest.update(canonical, { messages: projection.request.messages as typeof canonical.messages })
+      : canonical
   const stream = Stream.scoped(
     Stream.unwrap(
       Effect.gen(function* () {
@@ -151,6 +203,7 @@ export function stream(input: StreamInput): StreamResult {
 
   return {
     ...current,
+    contextFoldingPlan: projection?.plan,
     stream: fetch ? stream.pipe(Stream.provideService(FetchHttpClient.Fetch, fetch)) : stream,
   }
 }

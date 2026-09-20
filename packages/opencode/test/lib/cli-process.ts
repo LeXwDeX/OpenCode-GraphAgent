@@ -23,6 +23,9 @@ import { AppProcess } from "@opencode-ai/core/process"
 import { Deferred, Duration, Effect, Layer, Queue, Schedule, Scope, Stream } from "effect"
 import { FetchHttpClient, HttpClient } from "effect/unstable/http"
 import { ChildProcess } from "effect/unstable/process"
+import { createHash } from "node:crypto"
+import { constants } from "node:fs"
+import { access, readFile, realpath, stat } from "node:fs/promises"
 import path from "node:path"
 import { TestLLMServer } from "./llm-server"
 import { testProviderConfig } from "./test-provider"
@@ -32,6 +35,83 @@ const opencodeRoot = path.resolve(import.meta.dir, "../../")
 const cliEntry = path.join(opencodeRoot, "src/index.ts")
 
 export const testModelID = "test/test-model"
+
+export const sourceCliTarget = { mode: "source" } as const
+
+export type CliTarget =
+  | typeof sourceCliTarget
+  | {
+      readonly mode: "artifact"
+      readonly executable: string
+    }
+
+export type ResolvedCliTarget =
+  | {
+      readonly mode: "source"
+      readonly executable: "bun"
+      readonly entrypoint: string
+    }
+  | {
+      readonly mode: "artifact"
+      readonly requestedExecutable: string
+      readonly executable: string
+      readonly sha256: string
+    }
+
+export type CliCommand = {
+  readonly executable: string
+  readonly args: readonly string[]
+}
+
+export function artifactCliTarget(executable: string): CliTarget {
+  if (!path.isAbsolute(executable)) {
+    throw new Error(`artifact CLI target must be an absolute path: ${executable}`)
+  }
+  return { mode: "artifact", executable }
+}
+
+async function inspectArtifact(executable: string) {
+  if (!path.isAbsolute(executable)) {
+    throw new Error(`artifact CLI target must be an absolute path: ${executable}`)
+  }
+  const resolved = await realpath(executable)
+  const info = await stat(resolved)
+  if (!info.isFile()) throw new Error(`artifact CLI target is not a regular file: ${resolved}`)
+  await access(resolved, constants.X_OK)
+  const sha256 = createHash("sha256")
+    .update(await readFile(resolved))
+    .digest("hex")
+  return { executable: resolved, sha256 }
+}
+
+export async function resolveCliTarget(target: CliTarget): Promise<ResolvedCliTarget> {
+  if (target.mode === "source") return { mode: "source", executable: "bun", entrypoint: cliEntry }
+  const inspected = await inspectArtifact(target.executable)
+  return {
+    mode: "artifact",
+    requestedExecutable: target.executable,
+    executable: inspected.executable,
+    sha256: inspected.sha256,
+  }
+}
+
+export async function verifyCliTarget(target: ResolvedCliTarget): Promise<void> {
+  if (target.mode === "source") return
+  const current = await inspectArtifact(target.requestedExecutable)
+  if (current.executable !== target.executable || current.sha256 !== target.sha256) {
+    throw new Error(
+      `artifact CLI target identity changed: expected ${target.executable} sha256=${target.sha256}, ` +
+        `got ${current.executable} sha256=${current.sha256}`,
+    )
+  }
+}
+
+export function cliCommand(target: ResolvedCliTarget, args: readonly string[]): CliCommand {
+  if (target.mode === "source") {
+    return { executable: target.executable, args: ["run", "--conditions=browser", target.entrypoint, ...args] }
+  }
+  return { executable: target.executable, args: [...args] }
+}
 
 // Wrap a Bun subprocess pipe (or any ReadableStream<Uint8Array>) as a Stream.
 // Centralizes the `evaluate` + `onError` boilerplate and tags errors with the
@@ -80,6 +160,7 @@ export type RunResult = {
   readonly stdout: string
   readonly stderr: string
   readonly durationMs: number
+  readonly target: ResolvedCliTarget
 }
 
 export type RunHandle = {
@@ -151,6 +232,7 @@ export type AcpHandle = {
 }
 
 export type OpencodeCli = {
+  readonly target: ResolvedCliTarget
   // High-level: run a single prompt against the test model. Short-lived.
   readonly run: (message: string, opts?: RunOpts) => Effect.Effect<RunResult>
   readonly startRun: (message: string, opts?: RunOpts) => Effect.Effect<RunHandle, never, Scope.Scope>
@@ -177,7 +259,9 @@ export type OpencodeCli = {
 export type CliFixture = {
   readonly llm: TestLLMServer["Service"]
   readonly home: string
+  readonly env: Readonly<Record<string, string>>
   readonly opencode: OpencodeCli
+  readonly target: ResolvedCliTarget
 }
 
 // Provisions a TestLLMServer + tmpdir + spawn helper and invokes fn. Cleans
@@ -186,11 +270,18 @@ export type CliFixture = {
 // the surrounding Scope.
 export function withCliFixture<A, E>(
   fn: (input: CliFixture) => Effect.Effect<A, E, Scope.Scope | HttpClient.HttpClient>,
+  requestedTarget: CliTarget = sourceCliTarget,
 ): Effect.Effect<A, E | unknown, Scope.Scope> {
   return Effect.gen(function* () {
     const llm = yield* TestLLMServer
     const fs = yield* FSUtil.Service
     const appProc = yield* AppProcess.Service
+    const target = yield* Effect.promise(() => resolveCliTarget(requestedTarget))
+    if (target.mode === "artifact") {
+      // This line is the durable test-log binding between a run and the exact
+      // installed artifact. Source-mode tests stay silent and unchanged.
+      process.stderr.write(`[cli-target] mode=artifact executable=${target.executable} sha256=${target.sha256}\n`)
+    }
 
     const home = yield* fs.makeTempDirectory({ prefix: "oc-cli-" })
     yield* Effect.addFinalizer(() =>
@@ -200,7 +291,7 @@ export function withCliFixture<A, E>(
     )
 
     const configJson = JSON.stringify(testProviderConfig(llm.url))
-    const env = isolatedEnv(home, configJson)
+    const env: Readonly<Record<string, string>> = Object.freeze({ ...isolatedEnv(home, configJson) })
     const memoryConfigDir = path.join(home, ".config/opencode")
     yield* fs.makeDirectory(memoryConfigDir, { recursive: true })
     // CLI tests own the provider response queue, while dedicated MEMORY tests
@@ -229,7 +320,9 @@ export function withCliFixture<A, E>(
       // on `Bun.stdin.text()` (see src/cli/cmd/run.ts — non-TTY stdin is
       // consumed as the prompt). The old Process.run wrapper defaulted to
       // ignore; ChildProcess.make defaults to pipe, so we set it explicitly.
-      const command = ChildProcess.make("bun", ["run", "--conditions=browser", cliEntry, ...args], {
+      yield* Effect.promise(() => verifyCliTarget(target))
+      const invocation = cliCommand(target, args)
+      const command = ChildProcess.make(invocation.executable, invocation.args, {
         cwd: home,
         env: { ...env, ...opts?.env },
         extendEnv: true,
@@ -263,6 +356,7 @@ export function withCliFixture<A, E>(
         stdout: normalizeLines(result.stdout.toString()),
         stderr: normalizeLines(result.stderr.toString()),
         durationMs: Date.now() - start,
+        target,
       }
     })
 
@@ -299,9 +393,11 @@ export function withCliFixture<A, E>(
     const startRun = Effect.fn("opencode.startRun")(function* (message: string, opts?: RunOpts) {
       const start = Date.now()
       const options = runOpts(opts)
+      yield* Effect.promise(() => verifyCliTarget(target))
+      const invocation = cliCommand(target, runArgs(message, opts))
       const proc = yield* Effect.acquireRelease(
         Effect.sync(() =>
-          Bun.spawn(["bun", "run", "--conditions=browser", cliEntry, ...runArgs(message, opts)], {
+          Bun.spawn([invocation.executable, ...invocation.args], {
             cwd: home,
             env: { ...process.env, ...env, ...options?.env },
             stdin: "ignore",
@@ -325,6 +421,7 @@ export function withCliFixture<A, E>(
           stdout: normalizeLines(await stdout),
           stderr: normalizeLines(await stderr),
           durationMs: Date.now() - start,
+          target,
         })),
       } satisfies RunHandle
     })
@@ -336,13 +433,15 @@ export function withCliFixture<A, E>(
       argv.push("--port", String(opts?.port ?? 0))
       if (opts?.hostname) argv.push("--hostname", opts.hostname)
       if (opts?.extraArgs) argv.push(...opts.extraArgs)
+      yield* Effect.promise(() => verifyCliTarget(target))
+      const invocation = cliCommand(target, argv)
 
       // Acquire the subprocess; release sends SIGTERM and awaits exit on
       // scope close. Wrapped in Effect.ignore so a flaky kill doesn't surface
       // as a finalizer error during test teardown.
       const proc = yield* Effect.acquireRelease(
         Effect.sync(() =>
-          Bun.spawn(["bun", "run", "--conditions=browser", cliEntry, ...argv], {
+          Bun.spawn([invocation.executable, ...invocation.args], {
             cwd: home,
             env: { ...process.env, ...env, ...opts?.env },
             stdout: "pipe",
@@ -407,13 +506,15 @@ export function withCliFixture<A, E>(
       const argv = ["acp"]
       if (opts?.cwd) argv.push("--cwd", opts.cwd)
       if (opts?.extraArgs) argv.push(...opts.extraArgs)
+      yield* Effect.promise(() => verifyCliTarget(target))
+      const invocation = cliCommand(target, argv)
 
       // Acquire the subprocess. Release ends stdin (clean shutdown — ACP exits
       // on stdin EOF) and falls back to SIGTERM if it doesn't exit promptly.
       // Either way we await proc.exited so the test scope doesn't leak.
       const proc = yield* Effect.acquireRelease(
         Effect.sync(() =>
-          Bun.spawn(["bun", "run", "--conditions=browser", cliEntry, ...argv], {
+          Bun.spawn([invocation.executable, ...invocation.args], {
             cwd: opts?.cwd ?? home,
             env: { ...process.env, ...env, ...opts?.env },
             stdin: "pipe",
@@ -482,9 +583,9 @@ export function withCliFixture<A, E>(
       } satisfies AcpHandle
     })
 
-    const opencode: OpencodeCli = { run, startRun, serve, acp, spawn, expectExit, parseJsonEvents }
+    const opencode: OpencodeCli = { target, run, startRun, serve, acp, spawn, expectExit, parseJsonEvents }
 
-    return yield* fn({ llm, home, opencode })
+    return yield* fn({ llm, home, env, opencode, target })
     // FetchHttpClient is provided so test bodies can `yield* HttpClient.HttpClient`
     // and hit endpoints on `opencode.serve()` without rolling their own fetch.
   }).pipe(
@@ -530,23 +631,24 @@ function expectExit(result: RunResult, expected: number, label = "opencode") {
 // Body's R is `Scope.Scope | never` so tests can yield* scope-requiring
 // resources (e.g. `opencode.serve`) without an extra `Effect.scoped` wrapper —
 // `withCliFixture`'s outer scope is the natural lifetime.
-export const cliIt = {
-  live: <A, E>(
-    name: string,
-    body: (input: CliFixture) => Effect.Effect<A, E, Scope.Scope | HttpClient.HttpClient>,
-    opts?: number | TestOptions,
-  ) => it.live(name, () => withCliFixture(body), opts),
-  // NOTE: despite the `.concurrent` name, these run SERIALLY on every platform.
-  // Each test spawns a real `bun run` CLI subprocess (transpile + boot + a model
-  // turn); running N of them concurrently starves the host under CI load and
-  // surfaces as pre-timeout failures that look like hangs (concurrency-amplified
-  // contention, NOT a 120s timeout). win32 was already serial for this reason;
-  // the same applies to Linux CI. The name is kept for API stability across the
-  // 11 consumer suites — if you re-enable parallelism, gate it behind a real
-  // concurrency cap, not bare test.concurrent.
-  concurrent: <A, E>(
-    name: string,
-    body: (input: CliFixture) => Effect.Effect<A, E, Scope.Scope | HttpClient.HttpClient>,
-    opts?: number | TestOptions,
-  ) => test(name, () => Effect.runPromise(Effect.scoped(withCliFixture(body))), opts),
+export function cliItFor(target: CliTarget) {
+  return {
+    live: <A, E>(
+      name: string,
+      body: (input: CliFixture) => Effect.Effect<A, E, Scope.Scope | HttpClient.HttpClient>,
+      opts?: number | TestOptions,
+    ) => it.live(name, () => withCliFixture(body, target), opts),
+    // NOTE: despite the `.concurrent` name, these run SERIALLY on every platform.
+    // Each test spawns a real bun or artifact CLI subprocess and a model turn;
+    // running N of them concurrently starves the host under CI load and surfaces
+    // as pre-timeout failures that look like hangs. The name is kept for API
+    // stability across consumer suites.
+    concurrent: <A, E>(
+      name: string,
+      body: (input: CliFixture) => Effect.Effect<A, E, Scope.Scope | HttpClient.HttpClient>,
+      opts?: number | TestOptions,
+    ) => test(name, () => Effect.runPromise(Effect.scoped(withCliFixture(body, target))), opts),
+  }
 }
+
+export const cliIt = cliItFor(sourceCliTarget)

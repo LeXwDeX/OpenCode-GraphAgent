@@ -15,6 +15,8 @@ type Draft = {
 export interface Entry {
   readonly identity: object
   readonly tool: Tool.AnyTool
+  readonly sourceKind: "custom"
+  readonly registrationID: string
 }
 
 export interface Interface {
@@ -43,7 +45,10 @@ export const layer = Layer.effect(
         const entries = Object.entries(tools)
         if (entries.length === 0) return
         yield* Effect.forEach(entries, ([name]) => Tool.validateName(name), { discard: true })
-        const registrations = entries.map(([name, tool]) => [name, { identity: {}, tool }] as const)
+        const registrations = entries.map(
+          ([name, tool]) =>
+            [name, { identity: {}, tool, sourceKind: "custom" as const, registrationID: crypto.randomUUID() }] as const,
+        )
         yield* state.transform((draft) => {
           for (const [name, entry] of registrations) draft.set(name, entry)
         })

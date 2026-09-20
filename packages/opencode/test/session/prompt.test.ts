@@ -1,4 +1,5 @@
 import { NodeFileSystem } from "@effect/platform-node"
+import { createHash } from "node:crypto"
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Database } from "@opencode-ai/core/database/database"
@@ -8,7 +9,7 @@ import { FetchHttpClient } from "effect/unstable/http"
 import { expect } from "bun:test"
 import { Cause, Deferred, Duration, Effect, Exit, Fiber, Layer, Option, Stream } from "effect"
 import path from "path"
-import { fileURLToPath, pathToFileURL } from "url"
+import { fileURLToPath } from "url"
 import { NamedError } from "@opencode-ai/core/util/error"
 import { Agent as AgentSvc } from "../../src/agent/agent"
 import { BackgroundJob } from "@/background/job"
@@ -56,12 +57,16 @@ import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { Format } from "../../src/format"
 import { TestInstance } from "../fixture/fixture"
 import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
-import { reply, TestLLMServer } from "../lib/llm-server"
+import { raw, reply, TestLLMServer } from "../lib/llm-server"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { LocationServiceMap } from "@opencode-ai/core/location-layer"
 import { Memory } from "@/memory/memory"
+import { ToolSourceLedger } from "@/session/tool-source-ledger"
+import { Auth } from "@/auth"
+import { LLMClient, RequestExecutor, WebSocketExecutor } from "@opencode-ai/llm/route"
+import { jsonSchema, tool as aiTool, type Tool as AITool } from "ai"
 
 const summary = Layer.succeed(
   SessionSummary.Service,
@@ -114,14 +119,14 @@ function errorTool(parts: SessionV1.Part[]) {
   return part?.state.status === "error" ? (part as ErrorToolPart) : undefined
 }
 
-function makeMcp(instructions: MCP.ServerInstructions[] = []) {
+function makeMcp(instructions: MCP.ServerInstructions[] = [], tools: Record<string, AITool> = {}) {
   return Layer.succeed(
     MCP.Service,
     MCP.Service.of({
       status: () => Effect.succeed({}),
       clients: () => Effect.succeed({}),
       instructions: () => Effect.succeed(instructions),
-      tools: () => Effect.succeed({}),
+      tools: () => Effect.succeed(tools),
       prompts: () => Effect.succeed({}),
       resources: () => Effect.succeed({}),
       resourceTemplates: () => Effect.succeed({}),
@@ -186,6 +191,8 @@ let stopAdditionalContexts: string[] = []
 let subagentStopBlockAlways = false
 let userPromptAdmissionStarted: Deferred.Deferred<void> | undefined
 let userPromptAdmissionGate: Deferred.Deferred<void> | undefined
+let snapshotFenceStarted: Deferred.Deferred<void> | undefined
+let snapshotFenceGate: Deferred.Deferred<void> | undefined
 const hookRecorderLayer = Layer.succeed(
   SettingsHook.Service,
   SettingsHook.Service.of({
@@ -193,10 +200,10 @@ const hookRecorderLayer = Layer.succeed(
       Effect.gen(function* () {
         hookRecorded.push(payload)
         if (
-          payload.event === "UserPromptSubmit"
-          && payload.prompt.includes("hold-human-admission")
-          && userPromptAdmissionStarted
-          && userPromptAdmissionGate
+          payload.event === "UserPromptSubmit" &&
+          payload.prompt.includes("hold-human-admission") &&
+          userPromptAdmissionStarted &&
+          userPromptAdmissionGate
         ) {
           yield* Deferred.succeed(userPromptAdmissionStarted, undefined).pipe(Effect.ignore)
           yield* Deferred.await(userPromptAdmissionGate)
@@ -232,12 +239,40 @@ const blockingProcessor = Layer.succeed(
   }),
 )
 
+const fencedAgent: AgentSvc.Info = {
+  name: "build",
+  mode: "primary",
+  permission: [],
+  options: {},
+}
+const snapshotFenceAgentLayer: Layer.Layer<AgentSvc.Service> = Layer.succeed(
+  AgentSvc.Service,
+  AgentSvc.Service.of({
+    get: () =>
+      Effect.gen(function* () {
+        if (snapshotFenceStarted && snapshotFenceGate) {
+          yield* Deferred.succeed(snapshotFenceStarted, undefined).pipe(Effect.ignore)
+          yield* Deferred.await(snapshotFenceGate)
+        }
+        return fencedAgent
+      }),
+    list: () => Effect.succeed([fencedAgent]),
+    defaultInfo: () => Effect.succeed(fencedAgent),
+    defaultAgent: () => Effect.succeed("build"),
+    generate: () => Effect.die("not used by snapshot fence regression"),
+  }),
+)
+
 type PromptLayerOptions = {
   mcpInstructions?: MCP.ServerInstructions[]
+  mcpTools?: Record<string, AITool>
   processor?: "blocking"
   goal?: boolean
   goalLayer?: Layer.Layer<Goal.Service>
   memoryContext?: string[]
+  agentLayer?: Layer.Layer<AgentSvc.Service>
+  ripgrepLayer?: Layer.Layer<Ripgrep.Service>
+  native?: boolean
 }
 
 function makePrompt(input?: PromptLayerOptions) {
@@ -255,26 +290,39 @@ function makePrompt(input?: PromptLayerOptions) {
     statusReason: () => Effect.succeed(undefined),
     status: () => Effect.succeed("Memory on"),
   })
+  const llmLayer = input?.native
+    ? LLM.layer.pipe(
+        Layer.provide(Auth.defaultLayer),
+        Layer.provide(Config.defaultLayer),
+        Layer.provide(ProviderSvc.defaultLayer),
+        Layer.provide(Plugin.defaultLayer),
+        Layer.provide(
+          LLMClient.layer.pipe(Layer.provide(Layer.mergeAll(RequestExecutor.defaultLayer, WebSocketExecutor.layer))),
+        ),
+        Layer.provide(RuntimeFlags.layer({ experimentalEventSystem: true, experimentalNativeLlm: true })),
+      )
+    : LLM.defaultLayer
   const deps = Layer.mergeAll(
     hookRecorderLayer,
     memoryLayer,
     Session.defaultLayer,
     Snapshot.defaultLayer,
-    LLM.defaultLayer,
+    llmLayer,
     Env.defaultLayer,
-    AgentSvc.defaultLayer,
+    input?.agentLayer ?? AgentSvc.defaultLayer,
     Command.defaultLayer,
     Permission.defaultLayer,
     Plugin.defaultLayer,
     Config.defaultLayer,
     ProviderSvc.defaultLayer,
     lsp,
-    makeMcp(input?.mcpInstructions),
+    makeMcp(input?.mcpInstructions, input?.mcpTools),
     FSUtil.defaultLayer,
     BackgroundJob.defaultLayer,
     status,
     Database.defaultLayer,
     EventV2Bridge.defaultLayer,
+    ToolSourceLedger.defaultLayer,
   ).pipe(Layer.provideMerge(infra))
   const question = Question.layer.pipe(Layer.provideMerge(deps))
   const todo = Todo.layer.pipe(Layer.provideMerge(deps))
@@ -284,7 +332,7 @@ function makePrompt(input?: PromptLayerOptions) {
     Layer.provide(FetchHttpClient.layer),
     Layer.provide(CrossSpawnSpawner.defaultLayer),
     Layer.provide(Git.defaultLayer),
-    Layer.provide(Ripgrep.defaultLayer),
+    Layer.provide(input?.ripgrepLayer ?? Ripgrep.defaultLayer),
     Layer.provide(Format.defaultLayer),
     Layer.provide(RuntimeFlags.layer({ experimentalEventSystem: true })),
     Layer.provideMerge(todo),
@@ -339,9 +387,42 @@ function makeHttpNoLLMServer(input?: PromptLayerOptions) {
   return makePrompt(input)
 }
 
+// Real rg file enumeration order varies by platform; positive folding fixtures require byte-identical glob output.
+const stableGlobRipgrepLayer = Layer.effect(
+  Ripgrep.Service,
+  Effect.gen(function* () {
+    const ripgrep = yield* Ripgrep.Service
+    return Ripgrep.Service.of({
+      ...ripgrep,
+      glob: (input) =>
+        ripgrep.glob(input).pipe(
+          Effect.map((entries) =>
+            [...entries].sort((left, right) => (left.path < right.path ? -1 : left.path > right.path ? 1 : 0)),
+          ),
+        ),
+    })
+  }),
+).pipe(Layer.provide(Ripgrep.defaultLayer))
+
 const it = testEffect(makeHttp())
+const nativeIt = testEffect(makeHttp({ native: true }))
+const stableFoldingIt = testEffect(makeHttp({ ripgrepLayer: stableGlobRipgrepLayer }))
+const stableNativeFoldingIt = testEffect(makeHttp({ native: true, ripgrepLayer: stableGlobRipgrepLayer }))
+const mcpOverrideMarker = `mcp-context-folding-override-${"m".repeat(24_000)}`
+const withMcpReadOverride = testEffect(
+  makeHttp({
+    mcpTools: {
+      read: aiTool({
+        description: "MCP read override",
+        inputSchema: jsonSchema({ type: "object", properties: {}, additionalProperties: false }),
+        execute: async () => ({ content: [{ type: "text" as const, text: mcpOverrideMarker }] }),
+      }),
+    },
+  }),
+)
 const noLLMServer = testEffect(makeHttpNoLLMServer())
 const raceNoLLMServer = testEffect(makeHttpNoLLMServer({ processor: "blocking" }))
+const snapshotFenceNoLLMServer = testEffect(makeHttpNoLLMServer({ agentLayer: snapshotFenceAgentLayer }))
 const withMcpInstructions = testEffect(
   makeHttp({
     mcpInstructions: [
@@ -353,7 +434,9 @@ const withMcpInstructions = testEffect(
     ],
   }),
 )
-const withMemoryContext = testEffect(makeHttp({ memoryContext: ["<project_memory_data>project-memory-probe</project_memory_data>"] }))
+const withMemoryContext = testEffect(
+  makeHttp({ memoryContext: ["<project_memory_data>project-memory-probe</project_memory_data>"] }),
+)
 const unix = process.platform !== "win32" ? it.instance : it.instance.skip
 const unixNoLLMServer = process.platform !== "win32" ? noLLMServer.instance : noLLMServer.instance.skip
 
@@ -404,10 +487,96 @@ function providerCfg(url: string) {
   }
 }
 
+function foldingProviderCfg(url: string) {
+  const base = providerCfg(url)
+  return {
+    ...base,
+    compaction: { auto: false },
+    provider: {
+      ...base.provider,
+      test: {
+        ...base.provider.test,
+        models: {
+          ...base.provider.test.models,
+          "test-model": {
+            ...base.provider.test.models["test-model"],
+            limit: { context: 12_000, output: 1_000 },
+          },
+        },
+      },
+    },
+  }
+}
+
+function foldingAutoProviderCfg(url: string) {
+  return {
+    ...foldingProviderCfg(url),
+    compaction: { auto: true, dynamic: true },
+  }
+}
+
 const writeText = Effect.fn("test.writeText")(function* (file: string, text: string) {
   const fs = yield* FSUtil.Service
   yield* fs.writeWithDirs(file, text)
 })
+
+const foldingReadBody = (marker: string) =>
+  `${Array.from({ length: 28 }, (_, index) => `${marker}${String(index).padStart(2, "0")}-${"r".repeat(960)}`).join("\n")}\n`
+
+const record = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null
+
+const outboundToolResult = (body: unknown, callID: string) => {
+  if (!record(body) || !Array.isArray(body.messages)) return undefined
+  const matches: string[] = []
+  for (const message of body.messages) {
+    if (
+      record(message) &&
+      message.role === "tool" &&
+      message.tool_call_id === callID &&
+      typeof message.content === "string"
+    ) {
+      matches.push(message.content)
+    }
+  }
+  return matches.length === 1 ? matches[0] : undefined
+}
+
+const foldedPlaceholder = (witnessCallID: string) =>
+  `[Duplicate tool output folded. Identical full output is retained in later tool call ${JSON.stringify(witnessCallID)}.]`
+
+const outputFingerprint = (output: string | undefined) =>
+  output === undefined
+    ? "missing"
+    : `bytes=${Buffer.byteLength(output, "utf8")} sha256=${createHash("sha256").update(output).digest("hex")}`
+
+const expectFoldedBuiltinPair = (input: {
+  tool: "read" | "grep" | "glob"
+  body: unknown
+  sourceCallID: string
+  sourceOutput: string
+  witnessCallID: string
+  witnessOutput: string
+}) => {
+  const outboundSource = outboundToolResult(input.body, input.sourceCallID)
+  const outboundWitness = outboundToolResult(input.body, input.witnessCallID)
+  const expectedSource = foldedPlaceholder(input.witnessCallID)
+  const storedIdentical = input.sourceOutput === input.witnessOutput
+  const sourceFolded = outboundSource === expectedSource
+  const witnessIntact = outboundWitness === input.witnessOutput
+  if (storedIdentical && sourceFolded && witnessIntact) return
+  throw new Error(
+    [
+      `context folding ${input.tool} pair mismatch`,
+      `storedIdentical=${storedIdentical}`,
+      `sourceFolded=${sourceFolded}`,
+      `witnessIntact=${witnessIntact}`,
+      `storedSource(${outputFingerprint(input.sourceOutput)})`,
+      `storedWitness(${outputFingerprint(input.witnessOutput)})`,
+      `outboundSource(${outputFingerprint(outboundSource)})`,
+      `outboundWitness(${outputFingerprint(outboundWitness)})`,
+    ].join("; "),
+  )
+}
 
 const ensureDir = Effect.fn("test.ensureDir")(function* (dir: string) {
   const fs = yield* FSUtil.Service
@@ -566,43 +735,45 @@ noLLMServer.instance(
   { config: cfg },
 )
 
-it.instance("loop runs the model when the newest user message sorts below the pre-wrap assistant id (cross-era wrap)", () =>
-  Effect.gen(function* () {
-    const { llm } = yield* useServerConfig(providerCfg)
-    const prompt = yield* SessionPrompt.Service
-    const sessions = yield* Session.Service
-    const chat = yield* sessions.create({ title: "Pinned" })
-    const assistantID = MessageID.make("msg_fffac212c001")
-    yield* sessions.updateMessage({
-      id: assistantID,
-      role: "assistant",
-      parentID: MessageID.make("msg_fffac212c000"),
-      sessionID: chat.id,
-      mode: "build",
-      agent: "build",
-      cost: 0,
-      path: { cwd: "/tmp", root: "/tmp" },
-      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
-      modelID: ref.modelID,
-      providerID: ref.providerID,
-      time: { created: 1786700000000 },
-      finish: "stop",
-    } satisfies SessionV1.Assistant)
-    yield* sessions.updatePart({
-      id: PartID.ascending(),
-      messageID: assistantID,
-      sessionID: chat.id,
-      type: "text",
-      text: "pre-wrap answer",
-    })
-    yield* user(chat.id, "hello after the wrap")
-    yield* llm.text("world")
+it.instance(
+  "loop runs the model when the newest user message sorts below the pre-wrap assistant id (cross-era wrap)",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
+      const assistantID = MessageID.make("msg_fffac212c001")
+      yield* sessions.updateMessage({
+        id: assistantID,
+        role: "assistant",
+        parentID: MessageID.make("msg_fffac212c000"),
+        sessionID: chat.id,
+        mode: "build",
+        agent: "build",
+        cost: 0,
+        path: { cwd: "/tmp", root: "/tmp" },
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        modelID: ref.modelID,
+        providerID: ref.providerID,
+        time: { created: 1786700000000 },
+        finish: "stop",
+      } satisfies SessionV1.Assistant)
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: assistantID,
+        sessionID: chat.id,
+        type: "text",
+        text: "pre-wrap answer",
+      })
+      yield* user(chat.id, "hello after the wrap")
+      yield* llm.text("world")
 
-    const result = yield* prompt.loop({ sessionID: chat.id })
-    expect(result.info.role).toBe("assistant")
-    expect(result.info.id).not.toBe(assistantID)
-    expect(yield* llm.hits).toHaveLength(1)
-  }),
+      const result = yield* prompt.loop({ sessionID: chat.id })
+      expect(result.info.role).toBe("assistant")
+      expect(result.info.id).not.toBe(assistantID)
+      expect(yield* llm.hits).toHaveLength(1)
+    }),
 )
 
 it.instance("loop exits without an LLM request for interrupted orphan tool calls", () =>
@@ -825,50 +996,48 @@ const stopPayloads = (slice: HookPayload[]) => slice.filter((p): p is StopPayloa
 // hooks-api-fidelity: stop_hook_active anti-loop signal. A blocked Stop drives a
 // continuation turn; the second Stop carries stop_hook_active=true. A fresh user
 // prompt starts a new turn so the signal resets to false.
-unix(
-  "stop_hook_active: false → block-continue → true → new input resets to false",
-  () =>
-    Effect.gen(function* () {
-      const { llm } = yield* useServerConfig((url) => providerCfg(url))
-      const prompt = yield* SessionPrompt.Service
-      const sessions = yield* Session.Service
-      const chat = yield* sessions.create({ title: "stop-hook-active" })
+unix("stop_hook_active: false → block-continue → true → new input resets to false", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig((url) => providerCfg(url))
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "stop-hook-active" })
 
-      // Turn 1: two model replies queued — the first finishes and is blocked by
-      // the Stop hook, the continuation turn consumes the second and is allowed.
-      yield* llm.text("first reply")
-      yield* llm.text("continuation reply")
-      yield* prompt.prompt({
-        sessionID: chat.id,
-        agent: "build",
-        noReply: true,
-        parts: [{ type: "text", text: "go" }],
-      })
-      stopBlockNext = 1
-      const before = hookRecorded.length
-      yield* prompt.loop({ sessionID: chat.id })
-      const turn1 = stopPayloads(hookRecorded.slice(before))
-      // First Stop (stop_hook_active=false) blocked → continuation → second Stop
-      // (stop_hook_active=true) allowed.
-      expect(turn1).toHaveLength(2)
-      expect(turn1[0].stopHookActive).toBe(false)
-      expect(turn1[1].stopHookActive).toBe(true)
-      stopBlockNext = 0
+    // Turn 1: two model replies queued — the first finishes and is blocked by
+    // the Stop hook, the continuation turn consumes the second and is allowed.
+    yield* llm.text("first reply")
+    yield* llm.text("continuation reply")
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "go" }],
+    })
+    stopBlockNext = 1
+    const before = hookRecorded.length
+    yield* prompt.loop({ sessionID: chat.id })
+    const turn1 = stopPayloads(hookRecorded.slice(before))
+    // First Stop (stop_hook_active=false) blocked → continuation → second Stop
+    // (stop_hook_active=true) allowed.
+    expect(turn1).toHaveLength(2)
+    expect(turn1[0].stopHookActive).toBe(false)
+    expect(turn1[1].stopHookActive).toBe(true)
+    stopBlockNext = 0
 
-      // Turn 2: a new user prompt resets the signal — the Stop is false again.
-      yield* llm.text("third reply")
-      yield* prompt.prompt({
-        sessionID: chat.id,
-        agent: "build",
-        noReply: true,
-        parts: [{ type: "text", text: "again" }],
-      })
-      const before2 = hookRecorded.length
-      yield* prompt.loop({ sessionID: chat.id })
-      const turn2 = stopPayloads(hookRecorded.slice(before2))
-      expect(turn2).toHaveLength(1)
-      expect(turn2[0].stopHookActive).toBe(false)
-    }),
+    // Turn 2: a new user prompt resets the signal — the Stop is false again.
+    yield* llm.text("third reply")
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "again" }],
+    })
+    const before2 = hookRecorded.length
+    yield* prompt.loop({ sessionID: chat.id })
+    const turn2 = stopPayloads(hookRecorded.slice(before2))
+    expect(turn2).toHaveLength(1)
+    expect(turn2[0].stopHookActive).toBe(false)
+  }),
 )
 
 // hooks-stop-continuation-fidelity: Stop block reason injection, hard limit, and
@@ -884,129 +1053,121 @@ const syntheticTexts = (sessionID: SessionID) =>
       .map((p) => p.text)
   })
 
-unix(
-  "Stop block continuation injects the block reason as a synthetic text part",
-  () =>
-    Effect.gen(function* () {
-      const { llm } = yield* useServerConfig(providerCfg)
-      const prompt = yield* SessionPrompt.Service
-      const sessions = yield* Session.Service
-      const chat = yield* sessions.create({ title: "stop-reason-inject" })
-      yield* Effect.addFinalizer(() =>
-        Effect.sync(() => {
-          stopBlockNext = 0
-        }),
-      )
+unix("Stop block continuation injects the block reason as a synthetic text part", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "stop-reason-inject" })
+    yield* Effect.addFinalizer(() =>
+      Effect.sync(() => {
+        stopBlockNext = 0
+      }),
+    )
 
-      yield* llm.text("first reply")
-      yield* llm.text("continuation reply")
-      yield* prompt.prompt({
-        sessionID: chat.id,
-        agent: "build",
-        noReply: true,
-        parts: [{ type: "text", text: "go" }],
-      })
-      stopBlockNext = 1
-      yield* prompt.loop({ sessionID: chat.id })
+    yield* llm.text("first reply")
+    yield* llm.text("continuation reply")
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "go" }],
+    })
+    stopBlockNext = 1
+    yield* prompt.loop({ sessionID: chat.id })
 
-      // The blocked Stop's reason is injected as a synthetic text part so the
-      // continuation turn carries it in context (mirrors task.ts SubagentStop).
-      expect(yield* syntheticTexts(chat.id)).toContain("test: stop-hook block")
-    }),
+    // The blocked Stop's reason is injected as a synthetic text part so the
+    // continuation turn carries it in context (mirrors task.ts SubagentStop).
+    expect(yield* syntheticTexts(chat.id)).toContain("test: stop-hook block")
+  }),
 )
 
-unix(
-  "Stop hard limit: a hook that always blocks is capped at MAX_STOP_CONTINUATIONS",
-  () =>
-    Effect.gen(function* () {
-      const { llm } = yield* useServerConfig(providerCfg)
-      const prompt = yield* SessionPrompt.Service
-      const sessions = yield* Session.Service
-      const chat = yield* sessions.create({ title: "stop-hard-limit" })
-      yield* Effect.addFinalizer(() =>
-        Effect.sync(() => {
-          stopBlockAlways = false
-        }),
-      )
+unix("Stop hard limit: a hook that always blocks is capped at MAX_STOP_CONTINUATIONS", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "stop-hard-limit" })
+    yield* Effect.addFinalizer(() =>
+      Effect.sync(() => {
+        stopBlockAlways = false
+      }),
+    )
 
-      const max = SettingsHook.MAX_STOP_CONTINUATIONS
-      // One reply per turn: the initial turn plus MAX continuation turns.
-      for (let i = 0; i <= max; i++) yield* llm.text(`reply ${i}`)
-      yield* prompt.prompt({
-        sessionID: chat.id,
-        agent: "build",
-        noReply: true,
-        parts: [{ type: "text", text: "go" }],
-      })
-      stopBlockAlways = true
-      const before = hookRecorded.length
-      yield* prompt.loop({ sessionID: chat.id })
-      const stops = stopPayloads(hookRecorded.slice(before))
+    const max = SettingsHook.MAX_STOP_CONTINUATIONS
+    // One reply per turn: the initial turn plus MAX continuation turns.
+    for (let i = 0; i <= max; i++) yield* llm.text(`reply ${i}`)
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "go" }],
+    })
+    stopBlockAlways = true
+    const before = hookRecorded.length
+    yield* prompt.loop({ sessionID: chat.id })
+    const stops = stopPayloads(hookRecorded.slice(before))
 
-      // 1 initial Stop (stop_hook_active=false) + MAX continuation Stops (true),
-      // then the hard limit forces exit — no infinite loop.
-      expect(stops).toHaveLength(max + 1)
-      expect(stops[0]!.stopHookActive).toBe(false)
-      for (let i = 1; i <= max; i++) expect(stops[i]!.stopHookActive).toBe(true)
-    }),
+    // 1 initial Stop (stop_hook_active=false) + MAX continuation Stops (true),
+    // then the hard limit forces exit — no infinite loop.
+    expect(stops).toHaveLength(max + 1)
+    expect(stops[0]!.stopHookActive).toBe(false)
+    for (let i = 1; i <= max; i++) expect(stops[i]!.stopHookActive).toBe(true)
+  }),
 )
 
-unix(
-  "Stop hook systemMessage is landed as a synthetic text part (no silent drop)",
-  () =>
-    Effect.gen(function* () {
-      const { llm } = yield* useServerConfig(providerCfg)
-      const prompt = yield* SessionPrompt.Service
-      const sessions = yield* Session.Service
-      const chat = yield* sessions.create({ title: "stop-sysmsg" })
-      yield* Effect.addFinalizer(() =>
-        Effect.sync(() => {
-          stopSystemMessages = []
-        }),
-      )
+unix("Stop hook systemMessage is landed as a synthetic text part (no silent drop)", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "stop-sysmsg" })
+    yield* Effect.addFinalizer(() =>
+      Effect.sync(() => {
+        stopSystemMessages = []
+      }),
+    )
 
-      yield* llm.text("done reply")
-      yield* prompt.prompt({
-        sessionID: chat.id,
-        agent: "build",
-        noReply: true,
-        parts: [{ type: "text", text: "go" }],
-      })
-      stopSystemMessages = ["SYSMSG-MARKER-123"]
-      yield* prompt.loop({ sessionID: chat.id })
+    yield* llm.text("done reply")
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "go" }],
+    })
+    stopSystemMessages = ["SYSMSG-MARKER-123"]
+    yield* prompt.loop({ sessionID: chat.id })
 
-      // The Stop path lands systemMessages via the shared outlet (log + inject
-      // here), so the marker reaches the conversation rather than being dropped.
-      expect(yield* syntheticTexts(chat.id)).toContain("SYSMSG-MARKER-123")
-    }),
+    // The Stop path lands systemMessages via the shared outlet (log + inject
+    // here), so the marker reaches the conversation rather than being dropped.
+    expect(yield* syntheticTexts(chat.id)).toContain("SYSMSG-MARKER-123")
+  }),
 )
 
-unix(
-  "Stop hook additionalContext is consumed (not dropped) on the Stop path",
-  () =>
-    Effect.gen(function* () {
-      const { llm } = yield* useServerConfig(providerCfg)
-      const prompt = yield* SessionPrompt.Service
-      const sessions = yield* Session.Service
-      const chat = yield* sessions.create({ title: "stop-addctx" })
-      yield* Effect.addFinalizer(() =>
-        Effect.sync(() => {
-          stopAdditionalContexts = []
-        }),
-      )
+unix("Stop hook additionalContext is consumed (not dropped) on the Stop path", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "stop-addctx" })
+    yield* Effect.addFinalizer(() =>
+      Effect.sync(() => {
+        stopAdditionalContexts = []
+      }),
+    )
 
-      yield* llm.text("done reply")
-      yield* prompt.prompt({
-        sessionID: chat.id,
-        agent: "build",
-        noReply: true,
-        parts: [{ type: "text", text: "go" }],
-      })
-      stopAdditionalContexts = ["ADDCTX-MARKER-456"]
-      yield* prompt.loop({ sessionID: chat.id })
+    yield* llm.text("done reply")
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "go" }],
+    })
+    stopAdditionalContexts = ["ADDCTX-MARKER-456"]
+    yield* prompt.loop({ sessionID: chat.id })
 
-      expect(yield* syntheticTexts(chat.id)).toContain("ADDCTX-MARKER-456")
-    }),
+    expect(yield* syntheticTexts(chat.id)).toContain("ADDCTX-MARKER-456")
+  }),
 )
 
 unix(
@@ -1240,6 +1401,847 @@ it.instance("glob tool keeps instance context during prompt runs", () =>
     expect(tool.state.output).not.toContain("No context found for instance")
     expect(result.parts.some((part) => part.type === "text" && part.text === "done")).toBe(true)
   }),
+)
+
+const contextFoldingClosedLoop = (runtime: "ai-sdk" | "native") =>
+  Effect.gen(function* () {
+    const { dir, llm } = yield* useServerConfig(foldingProviderCfg)
+    const readFile = path.join(dir, "fold-read.txt")
+    const uniqueFile = path.join(dir, "fold-unique.txt")
+    const grepFile = path.join(dir, "fold-grep.txt")
+    const globDir = path.join(dir, "fold-glob")
+    const probeLedger = path.join(dir, "s08-probe-ledger.ndjson")
+    const probeTool = path.join(dir, ".opencode", "tools", "s08_probe.ts")
+    const uniqueMarker = `unique-tool-output-${runtime}-`
+    yield* writeText(readFile, foldingReadBody("read-body-abcdefghij-"))
+    yield* writeText(uniqueFile, `${uniqueMarker}${"u".repeat(4_000)}\n`)
+    yield* writeText(
+      grepFile,
+      Array.from({ length: 40 }, (_, index) => `needle-${index}-${"g".repeat(320)}`).join("\n"),
+    )
+    yield* writeText(
+      probeTool,
+      [
+        "export default {",
+        "  description: 'S08 deterministic side-effect and lifecycle probe',",
+        "  args: { mode: { type: 'string' } },",
+        "  execute: async ({ mode }, ctx) => {",
+        "    const { appendFile } = await import('node:fs/promises')",
+        `    const ledger = ${JSON.stringify(probeLedger)}`,
+        "    await appendFile(ledger, JSON.stringify({ mode, event: 'start' }) + '\\n')",
+        "    if (mode === 'fail') throw new Error('s08 expected probe failure')",
+        "    if (mode === 'slow') {",
+        "      await new Promise((_resolve, reject) => {",
+        "        const abort = async () => {",
+        "          await appendFile(ledger, JSON.stringify({ mode, event: 'abort' }) + '\\n')",
+        "          reject(new Error('s08 probe cancelled'))",
+        "        }",
+        "        if (ctx.abort.aborted) void abort()",
+        "        else ctx.abort.addEventListener('abort', () => void abort(), { once: true })",
+        "      })",
+        "    }",
+        "    await appendFile(ledger, JSON.stringify({ mode, event: 'complete' }) + '\\n')",
+        "    return `s08-probe-${mode}-complete`",
+        "  },",
+        "}",
+        "",
+      ].join("\n"),
+    )
+    yield* ensureDir(globDir)
+    yield* Effect.forEach(
+      Array.from({ length: 80 }, (_, index) =>
+        path.join(globDir, `context-folding-${String(index).padStart(3, "0")}-${"n".repeat(80)}.txt`),
+      ),
+      (file) => writeText(file, "glob"),
+      { concurrency: 16 },
+    )
+
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const compaction = yield* SessionCompaction.Service
+    const session = yield* sessions.create({
+      title: `Context folding ${runtime}`,
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+
+    const parallelProbe = raw({
+      chunks: [
+        {
+          id: `chatcmpl-s08-${runtime}`,
+          object: "chat.completion.chunk",
+          choices: [
+            {
+              index: 0,
+              delta: {
+                role: "assistant",
+                tool_calls: ["success", "fail"].map((mode, index) => ({
+                  index,
+                  id: `call-probe-${mode}`,
+                  type: "function",
+                  function: { name: "s08_probe", arguments: JSON.stringify({ mode }) },
+                })),
+              },
+              finish_reason: "tool_calls",
+            },
+          ],
+        },
+      ],
+    })
+
+    yield* prompt.prompt({
+      sessionID: session.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "collect duplicate context" }],
+    })
+    yield* llm.push(
+      parallelProbe,
+      reply().tool("read", { filePath: uniqueFile }, "call-read-unique"),
+      reply().tool("read", { filePath: readFile }, "call-read-source"),
+      reply().tool("read", { filePath: readFile }, "call-read-witness"),
+      reply().tool("grep", { pattern: "needle", path: grepFile }, "call-grep-source"),
+      reply().tool("grep", { pattern: "needle", path: grepFile }, "call-grep-witness"),
+      reply().tool("glob", { pattern: "**/*.txt", path: globDir }, "call-glob-source"),
+      reply().tool("glob", { pattern: "**/*.txt", path: globDir }, "call-glob-witness"),
+      reply().text("initial tool collection complete").stop(),
+    )
+    yield* prompt.loop({ sessionID: session.id })
+
+    const beforeMessages = yield* MessageV2.filterCompactedEffect(session.id)
+    const probeParts = beforeMessages
+      .flatMap((message) => message.parts)
+      .filter((part): part is SessionV1.ToolPart => part.type === "tool" && part.tool === "s08_probe")
+    expect(probeParts.map((part) => ({ callID: part.callID, status: part.state.status }))).toEqual([
+      { callID: "call-probe-success", status: "completed" },
+      { callID: "call-probe-fail", status: "error" },
+    ])
+    const beforeTools = beforeMessages
+      .flatMap((message) => message.parts)
+      .filter(
+        (part): part is CompletedToolPart =>
+          part.type === "tool" && part.state.status === "completed" && ["read", "grep", "glob"].includes(part.tool),
+      )
+    expect(beforeTools.map((part) => part.tool)).toEqual(["read", "read", "read", "grep", "grep", "glob", "glob"])
+    expect(beforeTools.every((part) => part.state.metadata.contextFoldingInstructions === "none")).toBe(true)
+    const beforeByCallID = new Map(beforeTools.map((part) => [part.callID, part]))
+    for (const callID of ["call-read-source", "call-read-witness"]) {
+      const part = beforeByCallID.get(callID)
+      expect(part).toBeDefined()
+      if (!part) throw new Error(`missing stored read result ${callID}`)
+      expect(part.state.output.length).toBeGreaterThan(20_000)
+      expect(part.state.output).not.toContain("(line truncated to 2000 chars)")
+      expect(part.state.metadata.truncated).toBe(false)
+    }
+    const persisted = beforeTools.map((part) => ({
+      id: part.id,
+      messageID: part.messageID,
+      callID: part.callID,
+      tool: part.tool,
+      input: structuredClone(part.state.input),
+      output: part.state.output,
+      metadata: structuredClone(part.state.metadata),
+    }))
+
+    for (let index = 0; index < 4; index++) {
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: `recent protection ${index}` }],
+      })
+      yield* llm.text(`recent-${index}-${"context ".repeat(3_000)}`)
+      yield* prompt.loop({ sessionID: session.id })
+    }
+
+    yield* prompt.prompt({
+      sessionID: session.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "send the next provider request" }],
+    })
+    yield* llm.text("folded request accepted")
+    yield* prompt.loop({ sessionID: session.id })
+
+    const hits = yield* llm.hits
+    const outboundBody = hits.at(-1)?.body ?? {}
+    const outbound = JSON.stringify(outboundBody)
+    expect(outbound).toContain("Duplicate tool output folded")
+    for (const [tool, marker] of [
+      ["read", "read-body-abcdefghij"],
+      ["grep", "needle-39-"],
+      ["glob", "context-folding-079-"],
+    ] as const) {
+      const sourceCallID = `call-${tool}-source`
+      const witnessCallID = `call-${tool}-witness`
+      const source = beforeByCallID.get(sourceCallID)
+      const witness = beforeByCallID.get(witnessCallID)
+      expect(source).toBeDefined()
+      expect(witness).toBeDefined()
+      if (!source) throw new Error(`missing stored ${tool} source`)
+      if (!witness) throw new Error(`missing stored ${tool} witness`)
+      expect(witness.state.output).toContain(marker)
+      expectFoldedBuiltinPair({
+        tool,
+        body: outboundBody,
+        sourceCallID,
+        sourceOutput: source.state.output,
+        witnessCallID,
+        witnessOutput: witness.state.output,
+      })
+    }
+    expect((outbound.match(/Duplicate tool output folded/g) ?? []).length).toBeGreaterThanOrEqual(3)
+    expect(outbound).toContain(uniqueMarker)
+    expect(outbound).toContain("read-body-abcdefghij")
+    expect(outbound).toContain("needle-39-")
+    expect(outbound).toContain("context-folding-079-")
+    for (const witness of ["call-read-witness", "call-grep-witness", "call-glob-witness"])
+      expect(outbound).toContain(witness)
+    expect(outbound.indexOf("call-read-source")).toBeLessThan(outbound.indexOf("call-read-witness"))
+
+    const afterMessages = yield* MessageV2.filterCompactedEffect(session.id)
+    const afterByID = new Map(
+      afterMessages
+        .flatMap((message) => message.parts)
+        .filter((part): part is CompletedToolPart => part.type === "tool" && part.state.status === "completed")
+        .map((part) => [part.id, part]),
+    )
+    expect(
+      persisted.map((item) => {
+        const part = afterByID.get(item.id)
+        return part
+          ? {
+              id: part.id,
+              messageID: part.messageID,
+              callID: part.callID,
+              tool: part.tool,
+              input: part.state.input,
+              output: part.state.output,
+              metadata: part.state.metadata,
+            }
+          : undefined
+      }),
+    ).toEqual(persisted)
+    const probeEvents = (yield* Effect.promise(() => Bun.file(probeLedger).text()))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { mode: string; event: string })
+    expect(probeEvents.filter((event) => event.mode === "success")).toEqual(
+      expect.arrayContaining([
+        { mode: "success", event: "start" },
+        { mode: "success", event: "complete" },
+      ]),
+    )
+    expect(probeEvents.filter((event) => event.mode === "fail")).toEqual([{ mode: "fail", event: "start" }])
+    expect(probeEvents.filter((event) => event.mode === "success" && event.event === "start")).toHaveLength(1)
+    expect(probeEvents.filter((event) => event.mode === "fail" && event.event === "start")).toHaveLength(1)
+
+    const preCompactionHits = hits.length
+    yield* compaction.create({ sessionID: session.id, agent: "build", model: ref, auto: false })
+    yield* llm.text(`s08-manual-summary-${runtime}`)
+    const compacted = yield* prompt.loop({ sessionID: session.id })
+    expect(compacted.info.role).toBe("assistant")
+    const compactionHits = (yield* llm.hits).slice(preCompactionHits)
+    expect(compactionHits).toHaveLength(1)
+    expectBoundedOriginalOpenCodeSummary(compactionHits[0]?.body ?? {}, {
+      read: "read-body-abcdefghij",
+      grep: "needle-0-",
+      glob: "context-folding-",
+    })
+
+    yield* prompt.prompt({
+      sessionID: session.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "continue after the manual full compaction" }],
+    })
+    yield* llm.text(`s08-post-compaction-${runtime}`)
+    yield* prompt.loop({ sessionID: session.id })
+    const afterCompaction = JSON.stringify((yield* llm.hits).at(-1)?.body ?? {})
+    expect(afterCompaction).toContain(`s08-manual-summary-${runtime}`)
+    expect(afterCompaction).not.toContain("Duplicate tool output folded")
+
+    yield* prompt.prompt({
+      sessionID: session.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "start the cancellable lifecycle probe" }],
+    })
+    yield* llm.tool("s08_probe", { mode: "slow" })
+    const slowRun = yield* prompt.loop({ sessionID: session.id }).pipe(Effect.forkChild)
+    yield* pollWithTimeout(
+      Effect.gen(function* () {
+        if (!(yield* Effect.promise(() => Bun.file(probeLedger).exists()))) return
+        const text = yield* Effect.promise(() => Bun.file(probeLedger).text())
+        return text.includes('{"mode":"slow","event":"start"}') ? true : undefined
+      }),
+      "S08 slow probe did not start",
+      "10 seconds",
+    )
+    yield* prompt.cancel(session.id)
+    expect(Exit.isSuccess(yield* Fiber.await(slowRun))).toBe(true)
+    const cancelled = (yield* MessageV2.filterCompactedEffect(session.id))
+      .flatMap((message) => message.parts)
+      .findLast((part): part is SessionV1.ToolPart => part.type === "tool" && part.tool === "s08_probe")
+    expect(cancelled?.state.status).toBe("error")
+
+    yield* prompt.prompt({
+      sessionID: session.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "resume after cancellation" }],
+    })
+    yield* llm.text(`s08-cancel-recovered-${runtime}`)
+    const recovered = yield* prompt.loop({ sessionID: session.id })
+    expect(recovered.info.role).toBe("assistant")
+    expect(recovered.parts).toEqual(
+      expect.arrayContaining([expect.objectContaining({ type: "text", text: `s08-cancel-recovered-${runtime}` })]),
+    )
+    const finalProbeEvents = (yield* Effect.promise(() => Bun.file(probeLedger).text()))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { mode: string; event: string })
+    expect(finalProbeEvents.filter((event) => event.mode === "success" && event.event === "start")).toHaveLength(1)
+    expect(finalProbeEvents.filter((event) => event.mode === "fail" && event.event === "start")).toHaveLength(1)
+    expect(finalProbeEvents.filter((event) => event.mode === "slow" && event.event === "start")).toHaveLength(1)
+    expect(finalProbeEvents.filter((event) => event.mode === "slow" && event.event === "abort")).toHaveLength(1)
+    const finalTools = new Map(
+      (yield* sessions.messages({ sessionID: session.id }))
+        .flatMap((message) => message.parts)
+        .filter((part): part is CompletedToolPart => part.type === "tool" && part.state.status === "completed")
+        .map((part) => [part.id, part]),
+    )
+    expect(
+      persisted.map((item) => {
+        const part = finalTools.get(item.id)
+        return part
+          ? {
+              id: part.id,
+              messageID: part.messageID,
+              callID: part.callID,
+              tool: part.tool,
+              input: part.state.input,
+              output: part.state.output,
+              metadata: part.state.metadata,
+            }
+          : undefined
+      }),
+    ).toEqual(persisted)
+    expect("prune" in compaction).toBe(false)
+    expect(
+      (yield* sessions.messages({ sessionID: session.id })).some((message) =>
+        message.parts.some(
+          (part) =>
+            part.type === "tool" && part.state.status === "completed" && part.state.time.compacted !== undefined,
+        ),
+      ),
+    ).toBe(false)
+    expect(yield* llm.pending).toBe(0)
+  })
+
+const contextFoldingOverrideFailsClosed = (sourceKind: "custom" | "mcp") =>
+  Effect.gen(function* () {
+    const { dir, llm } = yield* useServerConfig(foldingProviderCfg)
+    if (sourceKind === "custom") {
+      yield* writeText(
+        path.join(dir, ".opencode", "tools", "read.ts"),
+        [
+          "export default {",
+          "  description: 'custom read override',",
+          "  args: {},",
+          `  execute: async () => ${JSON.stringify(`custom-context-folding-override-${"c".repeat(24_000)}`)},`,
+          "}",
+          "",
+        ].join("\n"),
+      )
+    }
+
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const ledger = yield* ToolSourceLedger.Service
+    const session = yield* sessions.create({
+      title: `Context folding ${sourceKind} override`,
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+
+    yield* prompt.prompt({
+      sessionID: session.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: `exercise ${sourceKind} read override` }],
+    })
+    yield* llm.push(
+      reply().tool("read", {}, `call-${sourceKind}-source`),
+      reply().tool("read", {}, `call-${sourceKind}-witness`),
+      reply().text("override collection complete").stop(),
+    )
+    yield* prompt.loop({ sessionID: session.id })
+
+    const settled = (yield* MessageV2.filterCompactedEffect(session.id))
+      .filter(
+        (message): message is SessionV1.WithParts & { info: SessionV1.Assistant } => message.info.role === "assistant",
+      )
+      .flatMap((message) =>
+        message.parts
+          .filter(
+            (part): part is CompletedToolPart =>
+              part.type === "tool" && part.tool === "read" && part.state.status === "completed",
+          )
+          .map((part) => ({ messageID: message.info.id, part })),
+      )
+    expect(settled).toHaveLength(2)
+    const identities = yield* Effect.forEach(settled, ({ messageID, part }) =>
+      ledger.lookup({ sessionID: session.id, assistantMessageID: messageID, callID: part.callID, toolName: part.tool }),
+    )
+    expect(identities.map((identity) => identity?.sourceKind)).toEqual([sourceKind, sourceKind])
+
+    for (let index = 0; index < 4; index++) {
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: `recent override protection ${index}` }],
+      })
+      yield* llm.text(`recent-override-${index}-${"context ".repeat(3_000)}`)
+      yield* prompt.loop({ sessionID: session.id })
+    }
+
+    yield* prompt.prompt({
+      sessionID: session.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "send override history unchanged" }],
+    })
+    yield* llm.text("override request accepted")
+    yield* prompt.loop({ sessionID: session.id })
+
+    const outbound = JSON.stringify((yield* llm.hits).at(-1)?.body ?? {})
+    expect(outbound).not.toContain("Duplicate tool output folded")
+    expect(outbound).toContain(`${sourceKind}-context-folding-override`)
+    expect(yield* llm.pending).toBe(0)
+  })
+
+const contextFoldingDisabledClosedLoop = (runtime: "ai-sdk" | "native") =>
+  Effect.gen(function* () {
+    const { dir, llm } = yield* useServerConfig((url) => ({
+      ...foldingProviderCfg(url),
+      compaction: { auto: false, dynamic: false },
+    }))
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({
+      title: `Context folding disabled ${runtime}`,
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    const file = path.join(dir, "fold-disabled.txt")
+    const marker = `disabled-full-output-${runtime}-`
+    yield* writeText(file, `${marker}${"d".repeat(28_000)}\n`)
+
+    yield* prompt.prompt({
+      sessionID: session.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "collect disabled duplicate context" }],
+    })
+    yield* llm.push(
+      reply().tool("read", { filePath: file }, "call-disabled-source"),
+      reply().tool("read", { filePath: file }, "call-disabled-witness"),
+      reply().text("disabled collection complete").stop(),
+    )
+    yield* prompt.loop({ sessionID: session.id })
+
+    for (let index = 0; index < 4; index++) {
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: `disabled recent protection ${index}` }],
+      })
+      yield* llm.text(`disabled-recent-${index}-${"context ".repeat(3_000)}`)
+      yield* prompt.loop({ sessionID: session.id })
+    }
+
+    yield* prompt.prompt({
+      sessionID: session.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "send disabled history unchanged" }],
+    })
+    yield* llm.text("disabled request accepted")
+    yield* prompt.loop({ sessionID: session.id })
+
+    const outbound = JSON.stringify((yield* llm.hits).at(-1)?.body ?? {})
+    expect(outbound).not.toContain("Duplicate tool output folded")
+    expect((outbound.match(new RegExp(marker, "g")) ?? []).length).toBeGreaterThanOrEqual(2)
+    const stored = (yield* MessageV2.filterCompactedEffect(session.id))
+      .flatMap((message) => message.parts)
+      .filter(
+        (part): part is CompletedToolPart =>
+          part.type === "tool" && part.tool === "read" && part.state.status === "completed",
+      )
+    expect(stored).toHaveLength(2)
+    expect(stored.every((part) => part.state.output.includes(marker))).toBe(true)
+    expect(yield* llm.pending).toBe(0)
+  })
+
+const occurrences = (value: string, marker: string) => value.split(marker).length - 1
+
+const expectBoundedOriginalOpenCodeSummary = (body: unknown, markers: { read: string; grep: string; glob: string }) => {
+  const text = JSON.stringify(body)
+  expect(text).not.toContain("Duplicate tool output folded")
+  expect(occurrences(text, markers.read)).toBeGreaterThanOrEqual(2)
+  expect(occurrences(text, markers.grep)).toBeGreaterThanOrEqual(2)
+  expect(occurrences(text, markers.glob)).toBeGreaterThanOrEqual(2)
+  expect(occurrences(text, "Tool output truncated for compaction")).toBeGreaterThanOrEqual(4)
+}
+
+const lifecycleSnapshot = (messages: SessionV1.WithParts[]) =>
+  messages
+    .flatMap((message) => message.parts)
+    .filter(
+      (part): part is CompletedToolPart =>
+        part.type === "tool" &&
+        part.state.status === "completed" &&
+        ["read", "grep", "glob"].includes(part.tool) &&
+        part.callID.startsWith("call-lifecycle-"),
+    )
+    .map((part) => ({
+      id: part.id,
+      messageID: part.messageID,
+      callID: part.callID,
+      tool: part.tool,
+      input: part.state.input,
+      output: part.state.output,
+      metadata: part.state.metadata,
+    }))
+
+const lifecycleLedger = (file: string) =>
+  Effect.promise(() => Bun.file(file).text()).pipe(
+    Effect.map((text) =>
+      text
+        .trim()
+        .split("\n")
+        .filter(Boolean)
+        .map((line): { event: string } => JSON.parse(line)),
+    ),
+  )
+
+const seedFoldedOpenCodeLifecycle = Effect.fn("test.seedFoldedOpenCodeLifecycle")(function* (input: {
+  runtime: "ai-sdk" | "native"
+}) {
+  const { dir, llm } = yield* useServerConfig(foldingAutoProviderCfg)
+  const prompt = yield* SessionPrompt.Service
+  const sessions = yield* Session.Service
+  const session = yield* sessions.create({
+    title: `Context folding lifecycle ${input.runtime}`,
+    permission: [{ permission: "*", pattern: "*", action: "allow" }],
+  })
+  const readFile = path.join(dir, "lifecycle-read.txt")
+  const grepFile = path.join(dir, "lifecycle-grep.txt")
+  const globDir = path.join(dir, "lifecycle-glob")
+  const ledger = path.join(dir, "s08-lifecycle-ledger.ndjson")
+  const toolFile = path.join(dir, ".opencode", "tools", "s08_lifecycle.ts")
+  const markers = {
+    read: `lifecycle-read-${input.runtime}-`,
+    grep: `lifecycle-needle-0-${input.runtime}-`,
+    glob: "lifecycle-glob-",
+  }
+
+  yield* writeText(readFile, foldingReadBody(markers.read))
+  yield* writeText(
+    grepFile,
+    Array.from({ length: 40 }, (_, index) => `lifecycle-needle-${index}-${input.runtime}-${"g".repeat(320)}`).join(
+      "\n",
+    ),
+  )
+  yield* writeText(
+    toolFile,
+    [
+      "export default {",
+      "  description: 'S08 lifecycle side-effect probe',",
+      "  args: {},",
+      "  execute: async () => {",
+      "    const { appendFile } = await import('node:fs/promises')",
+      `    const ledger = ${JSON.stringify(ledger)}`,
+      "    await appendFile(ledger, JSON.stringify({ event: 'start' }) + '\\n')",
+      "    await appendFile(ledger, JSON.stringify({ event: 'complete' }) + '\\n')",
+      "    return 's08-lifecycle-complete'",
+      "  },",
+      "}",
+      "",
+    ].join("\n"),
+  )
+  yield* ensureDir(globDir)
+  yield* Effect.forEach(
+    Array.from({ length: 80 }, (_, index) =>
+      path.join(globDir, `lifecycle-glob-${String(index).padStart(3, "0")}-${input.runtime}-${"n".repeat(80)}.txt`),
+    ),
+    (file) => writeText(file, "glob"),
+    { concurrency: 16 },
+  )
+
+  yield* prompt.prompt({
+    sessionID: session.id,
+    agent: "build",
+    noReply: true,
+    parts: [{ type: "text", text: "collect lifecycle duplicate context" }],
+  })
+  yield* llm.push(
+    reply().tool("s08_lifecycle", {}, "call-lifecycle-side-effect"),
+    reply().tool("read", { filePath: readFile }, "call-lifecycle-read-source"),
+    reply().tool("read", { filePath: readFile }, "call-lifecycle-read-witness"),
+    reply().tool("grep", { pattern: "lifecycle-needle", path: grepFile }, "call-lifecycle-grep-source"),
+    reply().tool("grep", { pattern: "lifecycle-needle", path: grepFile }, "call-lifecycle-grep-witness"),
+    reply().tool("glob", { pattern: "**/*.txt", path: globDir }, "call-lifecycle-glob-source"),
+    reply().tool("glob", { pattern: "**/*.txt", path: globDir }, "call-lifecycle-glob-witness"),
+    reply().text("lifecycle collection complete").stop(),
+  )
+  yield* prompt.loop({ sessionID: session.id })
+
+  for (let index = 0; index < 4; index++) {
+    yield* prompt.prompt({
+      sessionID: session.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: `lifecycle recent protection ${index}` }],
+    })
+    yield* llm.text(`lifecycle-recent-${index}-${"context ".repeat(3_000)}`)
+    yield* prompt.loop({ sessionID: session.id })
+  }
+
+  const persisted = lifecycleSnapshot(yield* MessageV2.filterCompactedEffect(session.id))
+  expect(persisted).toHaveLength(6)
+  expect(persisted.every((part) => part.output.includes(input.runtime))).toBe(true)
+  const persistedByCallID = new Map(persisted.map((part) => [part.callID, part]))
+  for (const callID of ["call-lifecycle-read-source", "call-lifecycle-read-witness"]) {
+    const part = persistedByCallID.get(callID)
+    expect(part).toBeDefined()
+    if (!part) throw new Error(`missing stored lifecycle read result ${callID}`)
+    expect(part.output.length).toBeGreaterThan(20_000)
+    expect(part.output).not.toContain("(line truncated to 2000 chars)")
+    expect(part.metadata.truncated).toBe(false)
+  }
+  const sideEffects = yield* lifecycleLedger(ledger)
+  expect(sideEffects).toEqual([{ event: "start" }, { event: "complete" }])
+
+  yield* prompt.prompt({
+    sessionID: session.id,
+    agent: "build",
+    noReply: true,
+    parts: [{ type: "text", text: "observe folded lifecycle history" }],
+  })
+  yield* llm.text(`lifecycle-folded-${input.runtime}`)
+  yield* prompt.loop({ sessionID: session.id })
+  const foldedBody = (yield* llm.hits).at(-1)?.body ?? {}
+  const foldedText = JSON.stringify(foldedBody)
+  for (const [tool, marker] of [
+    ["read", markers.read],
+    ["grep", `lifecycle-needle-39-${input.runtime}-`],
+    ["glob", `lifecycle-glob-079-${input.runtime}-`],
+  ] as const) {
+    const sourceCallID = `call-lifecycle-${tool}-source`
+    const witnessCallID = `call-lifecycle-${tool}-witness`
+    const source = persistedByCallID.get(sourceCallID)
+    const witness = persistedByCallID.get(witnessCallID)
+    expect(source).toBeDefined()
+    expect(witness).toBeDefined()
+    if (!source) throw new Error(`missing stored lifecycle ${tool} source`)
+    if (!witness) throw new Error(`missing stored lifecycle ${tool} witness`)
+    expect(witness.output).toContain(marker)
+    expectFoldedBuiltinPair({
+      tool,
+      body: foldedBody,
+      sourceCallID,
+      sourceOutput: source.output,
+      witnessCallID,
+      witnessOutput: witness.output,
+    })
+  }
+  expect(occurrences(foldedText, "Duplicate tool output folded")).toBeGreaterThanOrEqual(3)
+  expect(foldedText).toContain("call-lifecycle-read-witness")
+  expect(foldedText).toContain("call-lifecycle-grep-witness")
+  expect(foldedText).toContain("call-lifecycle-glob-witness")
+  expect(foldedText).toContain(markers.read)
+  expect(foldedText).toContain(`lifecycle-needle-39-${input.runtime}-`)
+  expect(foldedText).toContain(`lifecycle-glob-079-${input.runtime}-`)
+
+  return { llm, prompt, sessions, session, ledger, markers, persisted }
+})
+
+const assertOpenCodeLifecycleDurability = Effect.fn("test.assertOpenCodeLifecycleDurability")(function* (input: {
+  sessions: Session.Interface
+  sessionID: SessionID
+  ledger: string
+  persisted: ReturnType<typeof lifecycleSnapshot>
+}) {
+  expect(lifecycleSnapshot(yield* input.sessions.messages({ sessionID: input.sessionID }))).toEqual(input.persisted)
+  expect(yield* lifecycleLedger(input.ledger)).toEqual([{ event: "start" }, { event: "complete" }])
+})
+
+const contextFoldingAutomaticLifecycle = (runtime: "ai-sdk" | "native") =>
+  Effect.gen(function* () {
+    const fixture = yield* seedFoldedOpenCodeLifecycle({ runtime })
+    const before = (yield* fixture.llm.hits).length
+    yield* fixture.prompt.prompt({
+      sessionID: fixture.session.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "trigger threshold automatic compaction" }],
+    })
+    yield* fixture.llm.text(`s08-threshold-trigger-${runtime}`, { usage: { input: 11_500, output: 10 } })
+    yield* fixture.llm.text(`s08-threshold-summary-${runtime}`)
+    yield* fixture.llm.text(`s08-threshold-continued-${runtime}`)
+    const result = yield* fixture.prompt.loop({ sessionID: fixture.session.id })
+    const hits = (yield* fixture.llm.hits).slice(before)
+
+    expect(hits).toHaveLength(3)
+    expect(JSON.stringify(hits[0]?.body ?? {})).toContain("Duplicate tool output folded")
+    expectBoundedOriginalOpenCodeSummary(hits[1]?.body ?? {}, fixture.markers)
+    expect(JSON.stringify(hits[2]?.body ?? {})).toContain(`s08-threshold-summary-${runtime}`)
+    expect(JSON.stringify(hits[2]?.body ?? {})).not.toContain("Duplicate tool output folded")
+    expect(result.info.role).toBe("assistant")
+    if (result.info.role === "assistant") expect(result.info.finish).toBe("stop")
+    expect(
+      (yield* fixture.sessions.messages({ sessionID: fixture.session.id })).some(
+        (message) => message.info.role === "assistant" && message.info.summary === true,
+      ),
+    ).toBe(true)
+    yield* assertOpenCodeLifecycleDurability({
+      sessions: fixture.sessions,
+      sessionID: fixture.session.id,
+      ledger: fixture.ledger,
+      persisted: fixture.persisted,
+    })
+    expect(yield* fixture.llm.pending).toBe(0)
+  })
+
+const contextFoldingOverflowLifecycle = (runtime: "ai-sdk" | "native", recovery: "success" | "terminal") =>
+  Effect.gen(function* () {
+    const fixture = yield* seedFoldedOpenCodeLifecycle({ runtime })
+    yield* fixture.prompt.prompt({
+      sessionID: fixture.session.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: `trigger ${recovery} context overflow` }],
+    })
+    const before = (yield* fixture.llm.hits).length
+    yield* fixture.llm.error(413, { error: { message: "request entity too large" } })
+    if (recovery === "success") {
+      yield* fixture.llm.text(`s08-auto-summary-${runtime}`)
+      yield* fixture.llm.text(`s08-overflow-recovered-${runtime}`)
+    } else {
+      yield* fixture.llm.error(413, { error: { message: "request entity too large during summary" } })
+    }
+
+    const result = yield* fixture.prompt.loop({ sessionID: fixture.session.id })
+    const hits = (yield* fixture.llm.hits).slice(before)
+    expect(JSON.stringify(hits[0]?.body ?? {})).toContain("Duplicate tool output folded")
+    if (recovery === "success") {
+      expect(hits).toHaveLength(3)
+      expectBoundedOriginalOpenCodeSummary(hits[1]?.body ?? {}, fixture.markers)
+      expect(JSON.stringify(hits[2]?.body ?? {})).toContain(`s08-auto-summary-${runtime}`)
+      expect(JSON.stringify(hits[2]?.body ?? {})).not.toContain("Duplicate tool output folded")
+      expect(result.info.role).toBe("assistant")
+      if (result.info.role === "assistant") {
+        expect(result.info.finish).toBe("stop")
+        expect(result.info.error).toBeUndefined()
+      }
+      expect(
+        (yield* fixture.sessions.messages({ sessionID: fixture.session.id })).some(
+          (message) => message.info.role === "assistant" && message.info.summary === true,
+        ),
+      ).toBe(true)
+    } else {
+      expect(hits).toHaveLength(2)
+      expectBoundedOriginalOpenCodeSummary(hits[1]?.body ?? {}, fixture.markers)
+      expect(result.info.role).toBe("assistant")
+      const terminal = (yield* fixture.sessions.messages({ sessionID: fixture.session.id })).findLast(
+        (message) => message.info.role === "assistant" && message.info.summary === true,
+      )
+      expect(terminal?.info.role).toBe("assistant")
+      if (terminal?.info.role === "assistant") {
+        expect(terminal.info.finish).toBe("error")
+        expect(terminal.info.error?.name).toBe("ContextOverflowError")
+      }
+    }
+    yield* assertOpenCodeLifecycleDurability({
+      sessions: fixture.sessions,
+      sessionID: fixture.session.id,
+      ledger: fixture.ledger,
+      persisted: fixture.persisted,
+    })
+    expect(yield* fixture.llm.pending).toBe(0)
+  })
+
+stableFoldingIt.instance(
+  "runs builtin read/grep/glob settlement through stored history into the next AI SDK request",
+  () => contextFoldingClosedLoop("ai-sdk"),
+  30_000,
+)
+
+stableNativeFoldingIt.instance(
+  "runs builtin read/grep/glob settlement through stored history into the next Native request",
+  () => contextFoldingClosedLoop("native"),
+  30_000,
+)
+
+it.instance(
+  "keeps the full AI SDK outbound history when dynamic folding is disabled",
+  () => contextFoldingDisabledClosedLoop("ai-sdk"),
+  30_000,
+)
+
+nativeIt.instance(
+  "keeps the full Native outbound history when dynamic folding is disabled",
+  () => contextFoldingDisabledClosedLoop("native"),
+  30_000,
+)
+
+stableFoldingIt.instance(
+  "automatically compacts AI SDK folded history at the token threshold",
+  () => contextFoldingAutomaticLifecycle("ai-sdk"),
+  30_000,
+)
+
+stableNativeFoldingIt.instance(
+  "automatically compacts Native folded history at the token threshold",
+  () => contextFoldingAutomaticLifecycle("native"),
+  30_000,
+)
+
+stableFoldingIt.instance(
+  "recovers AI SDK overflow through an unprojected summary and a continued turn",
+  () => contextFoldingOverflowLifecycle("ai-sdk", "success"),
+  30_000,
+)
+
+stableNativeFoldingIt.instance(
+  "recovers Native overflow through an unprojected summary and a continued turn",
+  () => contextFoldingOverflowLifecycle("native", "success"),
+  30_000,
+)
+
+stableFoldingIt.instance(
+  "terminates AI SDK overflow when the full compaction request is also rejected",
+  () => contextFoldingOverflowLifecycle("ai-sdk", "terminal"),
+  30_000,
+)
+
+stableNativeFoldingIt.instance(
+  "terminates Native overflow when the full compaction request is also rejected",
+  () => contextFoldingOverflowLifecycle("native", "terminal"),
+  30_000,
+)
+
+it.instance(
+  "keeps a custom same-name read override unfolded after real settlement",
+  () => contextFoldingOverrideFailsClosed("custom"),
+  30_000,
+)
+
+withMcpReadOverride.instance(
+  "keeps an MCP same-name read override unfolded after real settlement",
+  () => contextFoldingOverrideFailsClosed("mcp"),
+  30_000,
 )
 
 it.instance("loop continues when finish is stop but assistant has tool parts", () =>
@@ -1781,10 +2783,7 @@ it.instance("idle-only synthetic admission cannot overtake a concurrent human pr
         parts: [{ type: "text", text: "hold-human-admission" }],
       })
       .pipe(Effect.forkChild({ startImmediately: true }))
-    yield* awaitWithTimeout(
-      Deferred.await(admissionStarted),
-      "human prompt did not enter admission",
-    )
+    yield* awaitWithTimeout(Deferred.await(admissionStarted), "human prompt did not enter admission")
 
     const wake = yield* prompt
       .promptIfIdle({
@@ -1840,10 +2839,7 @@ it.instance("interrupting idle-only admission releases the reserved runner", () 
         parts: [{ type: "text", text: "hold-human-admission", synthetic: true }],
       })
       .pipe(Effect.forkChild({ startImmediately: true }))
-    yield* awaitWithTimeout(
-      Deferred.await(admissionStarted),
-      "idle-only prompt did not enter admission",
-    )
+    yield* awaitWithTimeout(Deferred.await(admissionStarted), "idle-only prompt did not enter admission")
 
     yield* Fiber.interrupt(wake)
     yield* pollWithTimeout(
@@ -1866,9 +2862,12 @@ it.instance("idle-only prompt resolves only after the full provider turn complet
     const sessions = yield* Session.Service
     const chat = yield* sessions.create({ title: "Pinned" })
     let releaseTurn: (value: unknown) => void = () => {}
-    yield* llm.hold("wake handled", new Promise((resolve) => {
-      releaseTurn = resolve
-    }))
+    yield* llm.hold(
+      "wake handled",
+      new Promise((resolve) => {
+        releaseTurn = resolve
+      }),
+    )
 
     const wake = yield* prompt
       .promptIfIdle({
@@ -1891,10 +2890,7 @@ it.instance("idle-only prompt resolves only after the full provider turn complet
     expect(early).toBe("still-running")
 
     releaseTurn(undefined)
-    const result = yield* awaitWithTimeout(
-      Fiber.join(wake),
-      "idle-only prompt did not resolve after turn completion",
-    )
+    const result = yield* awaitWithTimeout(Fiber.join(wake), "idle-only prompt did not resolve after turn completion")
     expect(result._tag).toBe("Some")
   }),
 )
@@ -1906,16 +2902,21 @@ it.instance("idle-only preparation keeps the provider stopped until activation",
     const sessions = yield* Session.Service
     const chat = yield* sessions.create({ title: "Pinned" })
     let releaseTurn: (value: unknown) => void = () => {}
-    yield* llm.hold("wake handled", new Promise((resolve) => {
-      releaseTurn = resolve
-    }))
+    yield* llm.hold(
+      "wake handled",
+      new Promise((resolve) => {
+        releaseTurn = resolve
+      }),
+    )
 
-    const prepared = Option.getOrThrow(yield* prompt.prepareIfIdle({
-      sessionID: chat.id,
-      agent: "build",
-      model: ref,
-      parts: [{ type: "text", text: "fenced synthetic wake", synthetic: true }],
-    }))
+    const prepared = Option.getOrThrow(
+      yield* prompt.prepareIfIdle({
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        parts: [{ type: "text", text: "fenced synthetic wake", synthetic: true }],
+      }),
+    )
     const beforeActivation = yield* llm.wait(1).pipe(
       Effect.as("provider-started" as const),
       Effect.timeoutOrElse({
@@ -1975,6 +2976,19 @@ it.instance("prompt submitted during an active run is included in the next LLM i
       "timed out waiting for second prompt to save",
     )
 
+    const queued = (yield* sessions.messages({ sessionID: chat.id })).find((message) => message.info.id === id)
+    const queuedText = queued?.parts.find((part): part is SessionV1.TextPart => part.type === "text")
+    if (!queued || !queuedText) throw new Error("expected queued text message")
+    const edited = yield* prompt.editQueuedMessage({
+      sessionID: chat.id,
+      messageID: id,
+      partID: queuedText.id,
+      expectedText: queuedText.text,
+      expectedPartIDs: queued.parts.map((part) => part.id),
+      text: "edited second",
+    })
+    expect(edited.parts).toEqual(expect.arrayContaining([expect.objectContaining({ text: "edited second" })]))
+
     yield* Deferred.succeed(gate, void 0)
 
     const [ea, eb] = yield* Effect.all([Fiber.await(a), Fiber.await(b)])
@@ -1994,7 +3008,242 @@ it.instance("prompt submitted during an active run is included in the next LLM i
     expect(inputs).toHaveLength(2)
     const messages = inputs.at(-1)?.messages
     if (!Array.isArray(messages)) throw new Error("expected LLM messages")
-    expect(messages.at(-1)).toEqual({ role: "user", content: "second" })
+    expect(messages.at(-1)).toEqual({ role: "user", content: "edited second" })
+  }),
+)
+
+it.instance("deleting a queued prompt removes it from the next LLM input", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const gate = yield* Deferred.make<void>()
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Queued delete" })
+
+    yield* llm.hold("first", deferredAsPromise(gate))
+    yield* llm.text("second")
+    const run = yield* prompt
+      .prompt({
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        parts: [{ type: "text", text: "first" }],
+      })
+      .pipe(Effect.forkChild)
+    yield* llm.wait(1)
+
+    const removed = yield* user(chat.id, "delete before next request")
+    yield* user(chat.id, "keep for next request")
+    const queued = (yield* sessions.messages({ sessionID: chat.id })).find((message) => message.info.id === removed.id)
+    const queuedText = queued?.parts.find((part): part is SessionV1.TextPart => part.type === "text")
+    if (!queued || !queuedText) throw new Error("expected removable queued message")
+    expect(
+      yield* prompt.deleteQueuedMessage({
+        sessionID: chat.id,
+        messageID: removed.id,
+        partID: queuedText.id,
+        expectedText: queuedText.text,
+        expectedPartIDs: queued.parts.map((part) => part.id),
+      }),
+    ).toBeTrue()
+
+    yield* Deferred.succeed(gate, undefined)
+    yield* Fiber.await(run)
+
+    const secondInput = JSON.stringify((yield* llm.inputs).at(-1)?.messages ?? [])
+    expect(secondInput).toContain("keep for next request")
+    expect(secondInput).not.toContain("delete before next request")
+  }),
+)
+
+snapshotFenceNoLLMServer.instance("rejects queued mutations after claim and before assistant persistence", () =>
+  Effect.gen(function* () {
+    const started = yield* Deferred.make<void>()
+    const gate = yield* Deferred.make<void>()
+    snapshotFenceStarted = started
+    snapshotFenceGate = gate
+    yield* Effect.addFinalizer(() =>
+      Deferred.succeed(gate, undefined).pipe(
+        Effect.ignore,
+        Effect.andThen(
+          Effect.sync(() => {
+            snapshotFenceStarted = undefined
+            snapshotFenceGate = undefined
+          }),
+        ),
+      ),
+    )
+
+    const { directory } = yield* TestInstance
+    yield* writeConfig(directory, cfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Admission fence" })
+    const first = yield* user(chat.id, "first")
+    yield* sessions.updateMessage({
+      id: MessageID.ascending(),
+      role: "assistant",
+      parentID: first.id,
+      sessionID: chat.id,
+      mode: "build",
+      agent: "build",
+      cost: 0,
+      path: { cwd: directory, root: directory },
+      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      modelID: ref.modelID,
+      providerID: ref.providerID,
+      time: { created: Date.now() },
+    } satisfies SessionV1.Assistant)
+    const target = yield* user(chat.id, "queued")
+    const run = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+    yield* awaitWithTimeout(Deferred.await(started), "snapshot fence did not open")
+
+    const claimed = (yield* sessions.messages({ sessionID: chat.id })).find((message) => message.info.id === target.id)
+    const text = claimed?.parts.find((part): part is SessionV1.TextPart => part.type === "text")
+    if (claimed?.info.role !== "user" || !text) throw new Error("expected claimed queued message")
+    expect(claimed.info.time.consumed).toBeNumber()
+    expect(
+      (yield* sessions.messages({ sessionID: chat.id })).some(
+        (message) => message.info.role === "assistant" && message.info.parentID === target.id,
+      ),
+    ).toBeFalse()
+
+    const assertConsumedConflict = <A>(exit: Exit.Exit<A, SessionPrompt.QueuedMessageError>) => {
+      expect(Exit.isFailure(exit)).toBeTrue()
+      if (Exit.isFailure(exit)) {
+        expect(Cause.squash(exit.cause)).toMatchObject({
+          _tag: "QueuedMessageConflict",
+          kind: "already_consumed",
+        })
+      }
+    }
+    assertConsumedConflict(
+      yield* prompt
+        .editQueuedMessage({
+          sessionID: chat.id,
+          messageID: target.id,
+          partID: text.id,
+          expectedText: text.text,
+          expectedPartIDs: claimed.parts.map((part) => part.id),
+          text: "must not edit",
+        })
+        .pipe(Effect.exit),
+    )
+    assertConsumedConflict(
+      yield* prompt
+        .deleteQueuedMessage({
+          sessionID: chat.id,
+          messageID: target.id,
+          partID: text.id,
+          expectedText: text.text,
+          expectedPartIDs: claimed.parts.map((part) => part.id),
+        })
+        .pipe(Effect.exit),
+    )
+
+    yield* prompt.cancel(chat.id)
+    yield* Deferred.succeed(gate, undefined)
+    yield* Fiber.await(run)
+  }),
+)
+
+it.instance("claims every user in a snapshot before the provider and preserves claims after abort", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const firstGate = yield* Deferred.make<void>()
+    const secondGate = yield* Deferred.make<void>()
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Snapshot claims" })
+
+    yield* llm.hold("first", deferredAsPromise(firstGate))
+    yield* llm.hold("second", deferredAsPromise(secondGate))
+
+    const run = yield* prompt
+      .prompt({
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        parts: [{ type: "text", text: "first" }],
+      })
+      .pipe(Effect.forkChild)
+    yield* llm.wait(1)
+
+    const earlier = yield* user(chat.id, "queued earlier")
+    const latest = yield* user(chat.id, "queued latest")
+    const staleEarlier = { ...earlier, time: { ...earlier.time } }
+    yield* Deferred.succeed(firstGate, void 0)
+    yield* llm.wait(2)
+
+    const claimed = yield* sessions.messages({ sessionID: chat.id })
+    const claimedEarlier = claimed.find((message) => message.info.id === earlier.id)
+    const claimedLatest = claimed.find((message) => message.info.id === latest.id)
+    if (claimedEarlier?.info.role !== "user" || claimedLatest?.info.role !== "user") {
+      throw new Error("expected both queued users")
+    }
+    expect(claimedEarlier.info.time.consumed).toBeNumber()
+    expect(claimedLatest.info.time.consumed).toBeNumber()
+    expect(
+      claimed.some((message) => message.info.role === "assistant" && message.info.parentID === earlier.id),
+    ).toBeFalse()
+
+    const earlierText = claimedEarlier.parts.find((part): part is SessionV1.TextPart => part.type === "text")
+    if (!earlierText) throw new Error("expected earlier queued text")
+    const rejected = yield* prompt
+      .editQueuedMessage({
+        sessionID: chat.id,
+        messageID: earlier.id,
+        partID: earlierText.id,
+        expectedText: earlierText.text,
+        expectedPartIDs: claimedEarlier.parts.map((part) => part.id),
+        text: "must not replace consumed input",
+      })
+      .pipe(Effect.exit)
+    expect(Exit.isFailure(rejected)).toBeTrue()
+    if (Exit.isFailure(rejected)) {
+      expect(Cause.squash(rejected.cause)).toMatchObject({
+        _tag: "QueuedMessageConflict",
+        kind: "already_consumed",
+      })
+    }
+
+    yield* sessions.updateMessage(staleEarlier)
+    yield* prompt.cancel(chat.id)
+    yield* Deferred.succeed(secondGate, void 0)
+    yield* Fiber.await(run)
+
+    const afterAbort = (yield* sessions.messages({ sessionID: chat.id })).find(
+      (message) => message.info.id === earlier.id,
+    )
+    expect(afterAbort?.info.role === "user" && afterAbort.info.time.consumed).toBe(claimedEarlier.info.time.consumed)
+  }),
+)
+
+it.instance("claims ordinary users before a manual compaction request", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const compaction = yield* SessionCompaction.Service
+    const chat = yield* sessions.create({ title: "Compaction claims" })
+
+    yield* user(chat.id, "establish history")
+    yield* llm.text("history established")
+    yield* prompt.loop({ sessionID: chat.id })
+
+    const earlier = yield* user(chat.id, "queued before compaction")
+    const latest = yield* user(chat.id, "also queued before compaction")
+    yield* compaction.create({ sessionID: chat.id, agent: "build", model: ref, auto: false })
+    yield* llm.text("summary")
+    yield* prompt.loop({ sessionID: chat.id })
+
+    const messages = yield* sessions.messages({ sessionID: chat.id })
+    for (const id of [earlier.id, latest.id]) {
+      const message = messages.find((item) => item.info.id === id)
+      expect(message?.info.role === "user" && message.info.time.consumed).toBeNumber()
+    }
+    const compactionMessage = messages.find((message) => message.parts.some((part) => part.type === "compaction"))
+    expect(compactionMessage?.info.role === "user" && compactionMessage.info.time.consumed).toBeUndefined()
   }),
 )
 
@@ -2368,9 +3617,7 @@ it.instance("stores the slash invocation as visible text and hides the expanded 
     const user = (yield* sessions.messages({ sessionID: chat.id })).find((message) => message.info.role === "user")
     const texts = user?.parts.filter((part): part is SessionV1.TextPart => part.type === "text") ?? []
 
-    expect(texts.filter((part) => !part.synthetic).map((part) => part.text)).toEqual([
-      "/probe inspect layout",
-    ])
+    expect(texts.filter((part) => !part.synthetic).map((part) => part.text)).toEqual(["/probe inspect layout"])
     expect(texts.filter((part) => part.synthetic).map((part) => part.text)).toContain(
       "Expanded command instructions:\ninspect layout",
     )
@@ -2378,35 +3625,39 @@ it.instance("stores the slash invocation as visible text and hides the expanded 
   }),
 )
 
-noLLMServer.instance("dispatches /memory on, off, and status without running a model turn", () =>
-  Effect.gen(function* () {
-    const { prompt, sessions, chat } = yield* boot()
+noLLMServer.instance(
+  "dispatches /memory on, off, and status without running a model turn",
+  () =>
+    Effect.gen(function* () {
+      const { prompt, sessions, chat } = yield* boot()
 
-    const off = yield* prompt.command({ sessionID: chat.id, command: "memory", arguments: "off" })
-    const on = yield* prompt.command({ sessionID: chat.id, command: "memory", arguments: "on" })
-    // #396: a non-on/off argument is a status query — the reply must reflect
-    // the service's true state instead of the old hardcoded "remains off".
-    const status = yield* prompt.command({ sessionID: chat.id, command: "memory", arguments: "" })
-    const unsupported = yield* prompt.command({ sessionID: chat.id, command: "memory", arguments: "topic 20" })
+      const off = yield* prompt.command({ sessionID: chat.id, command: "memory", arguments: "off" })
+      const on = yield* prompt.command({ sessionID: chat.id, command: "memory", arguments: "on" })
+      // #396: a non-on/off argument is a status query — the reply must reflect
+      // the service's true state instead of the old hardcoded "remains off".
+      const status = yield* prompt.command({ sessionID: chat.id, command: "memory", arguments: "" })
+      const unsupported = yield* prompt.command({ sessionID: chat.id, command: "memory", arguments: "topic 20" })
 
-    expect(off.parts.filter((part) => part.type === "text").map((part) => part.text)).toEqual([
-      "/memory off",
-      "Memory off",
-    ])
-    expect(on.parts.filter((part) => part.type === "text").map((part) => part.text)).toEqual([
-      "/memory on",
-      "Memory on",
-    ])
-    expect(status.parts.filter((part) => part.type === "text").map((part) => part.text)).toEqual([
-      "/memory",
-      "Memory on",
-    ])
-    expect(unsupported.parts.filter((part) => part.type === "text").map((part) => part.text)).toEqual([
-      "/memory topic 20",
-      "Memory on",
-    ])
-    expect((yield* sessions.messages({ sessionID: chat.id })).every((message) => message.info.role === "user")).toBe(true)
-  }),
+      expect(off.parts.filter((part) => part.type === "text").map((part) => part.text)).toEqual([
+        "/memory off",
+        "Memory off",
+      ])
+      expect(on.parts.filter((part) => part.type === "text").map((part) => part.text)).toEqual([
+        "/memory on",
+        "Memory on",
+      ])
+      expect(status.parts.filter((part) => part.type === "text").map((part) => part.text)).toEqual([
+        "/memory",
+        "Memory on",
+      ])
+      expect(unsupported.parts.filter((part) => part.type === "text").map((part) => part.text)).toEqual([
+        "/memory topic 20",
+        "Memory on",
+      ])
+      expect((yield* sessions.messages({ sessionID: chat.id })).every((message) => message.info.role === "user")).toBe(
+        true,
+      )
+    }),
   { config: cfg },
 )
 

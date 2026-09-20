@@ -58,6 +58,7 @@ import { BackgroundJob } from "@/background/job"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
+import type { ToolSourceKind } from "@opencode-ai/core/session/context-folding"
 
 export function webSearchEnabled(providerID: ProviderV2.ID, flags = { exa: false, parallel: false }) {
   return providerID === ProviderV2.ID.opencode || flags.exa || flags.parallel
@@ -92,7 +93,18 @@ export interface Interface {
     modelID: ModelV2.ID
     agent: Agent.Info
   }) => Effect.Effect<Tool.Def[]>
+  readonly registrations: (model: {
+    providerID: ProviderV2.ID
+    modelID: ModelV2.ID
+    agent: Agent.Info
+  }) => Effect.Effect<RegisteredTool[]>
 }
+
+export type RegisteredTool = Readonly<{
+  definition: Tool.Def
+  sourceKind: Extract<ToolSourceKind, "host-builtin" | "custom">
+  registrationID: string
+}>
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/ToolRegistry") {}
 
@@ -294,8 +306,21 @@ export const layer = Layer.effect(
       return [options.heading, description].join("\n")
     })
 
-    const tools: Interface["tools"] = Effect.fn("ToolRegistry.tools")(function* (input) {
-      const filtered = (yield* all()).filter((tool) => {
+    const registrations: Interface["registrations"] = Effect.fn("ToolRegistry.registrations")(function* (input) {
+      const s = yield* InstanceState.get(state)
+      const registered: RegisteredTool[] = [
+        ...s.builtin.map((definition, index) => ({
+          definition,
+          sourceKind: "host-builtin" as const,
+          registrationID: `builtin:${index}:${definition.id}`,
+        })),
+        ...s.custom.map((definition, index) => ({
+          definition,
+          sourceKind: "custom" as const,
+          registrationID: `custom:${index}:${definition.id}`,
+        })),
+      ]
+      const filtered = registered.filter(({ definition: tool }) => {
         if (tool.id === WebSearchTool.id) {
           return webSearchEnabled(input.providerID, { exa: flags.enableExa, parallel: flags.enableParallel })
         }
@@ -310,7 +335,8 @@ export const layer = Layer.effect(
 
       return yield* Effect.forEach(
         filtered,
-        Effect.fnUntraced(function* (tool: Tool.Def) {
+        Effect.fnUntraced(function* (registration) {
+          const tool = registration.definition
           const output = {
             description: tool.description,
             parameters: tool.parameters,
@@ -322,35 +348,42 @@ export const layer = Layer.effect(
               ? output.jsonSchema
               : undefined
           return {
-            id: tool.id,
-            description: [
-              output.description,
-              tool.id === TaskTool.id
-                ? yield* describeAgents(input.agent, {
-                    heading: "Available agent types and the tools they have access to:",
-                    includeHidden: true,
-                    includeModelState: false,
-                  })
-                : undefined,
-              tool.id === WorkflowTool.id
-                ? yield* describeAgents(input.agent, {
-                    heading: "Available workflow worker_type values:",
-                    includeHidden: false,
-                    includeModelState: true,
-                    includePrimary: true,
-                  })
-                : undefined,
-            ]
-              .filter(Boolean)
-              .join("\n"),
-            parameters: output.parameters,
-            jsonSchema,
-            execute: tool.execute,
-            formatValidationError: tool.formatValidationError,
+            ...registration,
+            definition: {
+              id: tool.id,
+              description: [
+                output.description,
+                tool.id === TaskTool.id
+                  ? yield* describeAgents(input.agent, {
+                      heading: "Available agent types and the tools they have access to:",
+                      includeHidden: true,
+                      includeModelState: false,
+                    })
+                  : undefined,
+                tool.id === WorkflowTool.id
+                  ? yield* describeAgents(input.agent, {
+                      heading: "Available workflow worker_type values:",
+                      includeHidden: false,
+                      includeModelState: true,
+                      includePrimary: true,
+                    })
+                  : undefined,
+              ]
+                .filter(Boolean)
+                .join("\n"),
+              parameters: output.parameters,
+              jsonSchema,
+              execute: tool.execute,
+              formatValidationError: tool.formatValidationError,
+            },
           }
         }),
         { concurrency: "unbounded" },
       )
+    })
+
+    const tools: Interface["tools"] = Effect.fn("ToolRegistry.tools")(function* (input) {
+      return (yield* registrations(input)).map((item) => item.definition)
     })
 
     const named: Interface["named"] = Effect.fn("ToolRegistry.named")(function* () {
@@ -358,7 +391,7 @@ export const layer = Layer.effect(
       return { task: s.task, read: s.read }
     })
 
-    return Service.of({ ids, all, named, tools })
+    return Service.of({ ids, all, named, tools, registrations })
   }),
 )
 

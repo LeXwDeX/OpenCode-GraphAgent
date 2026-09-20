@@ -12,6 +12,7 @@ import {
 import { Cause, DateTime, Deferred, Duration, Effect, FiberSet, Layer, Option, Semaphore, Stream } from "effect"
 import { AgentV2 } from "../../agent"
 import { Config } from "../../config"
+import { ConfigCompaction } from "../../config/compaction"
 import { Database } from "../../database/database"
 import { EventV2 } from "../../event"
 import { Location } from "../../location"
@@ -23,6 +24,7 @@ import { SystemContextRegistry } from "../../system-context/registry"
 import { SkillGuidance } from "../../skill/guidance"
 import { ReferenceGuidance } from "../../reference/guidance"
 import { ToolRegistry } from "../../tool/registry"
+import { ContextFoldingToolSourceLedger } from "../context-folding/tool-source-ledger"
 import { ToolOutputStore } from "../../tool-output-store"
 import { SessionContextEpoch } from "../context-epoch"
 import { SessionCompaction } from "../compaction"
@@ -35,9 +37,12 @@ import { SessionStore } from "../store"
 import { type RunError, Service } from "./index"
 import { SessionRunnerModel } from "./model"
 import { createLLMEventPublisher } from "./publish-llm-event"
-import { toLLMMessages } from "./to-llm-message"
+import { toLLMMessagesWithBindings } from "./to-llm-message"
+import { CoreContextFolding } from "./context-folding"
 import { MAX_STEPS_PROMPT } from "./max-steps"
 import { Snapshot } from "../../snapshot"
+import { Flag } from "../../flag/flag"
+import { contextFoldingDiagnostic } from "../context-folding"
 
 // Runner-level per-turn provider deadline. This is the runner's own cutoff
 // (10 minutes); it is independent of the DAG node timeout
@@ -124,6 +129,7 @@ export const layer = Layer.effect(
     const llm = yield* LLMClient.Service
     const agents = yield* AgentV2.Service
     const tools = yield* ToolRegistry.Service
+    const toolSources = yield* ContextFoldingToolSourceLedger.Service
     const models = yield* SessionRunnerModel.Service
     const store = yield* SessionStore.Service
     const location = yield* Location.Service
@@ -133,7 +139,24 @@ export const layer = Layer.effect(
     const config = yield* Config.Service
     const snapshots = yield* Snapshot.Service
     const db = (yield* Database.Service).db
-    const compaction = SessionCompaction.make({ events, llm, config: yield* config.entries() })
+    const configEntries = yield* config.entries()
+    const compaction = SessionCompaction.make({ events, llm, config: configEntries })
+    const resolveDynamicFolding = Effect.fnUntraced(function* () {
+      let dynamic: boolean | undefined
+      let prune: boolean | undefined
+      for (const entry of yield* config.entries()) {
+        if (entry.type !== "document" || entry.info.compaction === undefined) continue
+        if (entry.info.compaction.dynamic !== undefined) dynamic = entry.info.compaction.dynamic
+        if (entry.info.compaction.prune !== undefined) prune = entry.info.compaction.prune
+      }
+      return ConfigCompaction.resolveDynamic({
+        disabledByEnvironment: Flag.OPENCODE_DISABLE_PRUNE,
+        dynamic,
+        prune,
+        // Core owns no server-plugin loader. Unknown is explicit and must never be promoted to loaded by inference.
+        knownExternalDcp: "unknown",
+      })
+    })
     const getSession = Effect.fn("SessionRunner.getSession")(function* (sessionID: SessionSchema.ID) {
       const session = yield* store.get(sessionID)
       if (!session) return yield* Effect.die(`Session not found: ${sessionID}`)
@@ -333,17 +356,42 @@ export const layer = Layer.effect(
       const isLastStep = agent.info?.steps !== undefined && currentStep >= agent.info.steps
       const toolMaterialization = isLastStep ? undefined : yield* tools.materialize(agent.info?.permissions)
       const promptCacheKey = /^ses_[0-9a-f]{64}$/.test(session.id) ? session.id.slice(4) : session.id
-      const request = LLM.request({
+      const conversion = toLLMMessagesWithBindings(context, model)
+      const expectedMessages = [...conversion.messages, ...(isLastStep ? [Message.assistant(MAX_STEPS_PROMPT)] : [])]
+      const preparedRequest = LLM.request({
         model,
         providerOptions: { openai: { promptCacheKey } },
         http: { timeout: turnTimeout },
         system: [agent.info?.system, system.baseline]
           .filter((part): part is string => part !== undefined && part.length > 0)
           .map(SystemPart.make),
-        messages: [...toLLMMessages(context, model), ...(isLastStep ? [Message.assistant(MAX_STEPS_PROMPT)] : [])],
+        messages: expectedMessages,
         tools: toolMaterialization?.definitions ?? [],
         toolChoice: isLastStep ? "none" : undefined,
       })
+      const dynamicFolding = yield* resolveDynamicFolding()
+      const folding = yield* CoreContextFolding.project({
+        enabled: dynamicFolding.enabled,
+        purpose: "conversation",
+        sessionID: session.id,
+        sourceMessages: context,
+        conversion,
+        expectedMessages,
+        model,
+        request: preparedRequest,
+        ledger: toolSources,
+        prepare: (request) => llm.prepare(request),
+      })
+      yield* Effect.logInfo(
+        "context folding",
+        contextFoldingDiagnostic({
+          runtime: "core-runner",
+          requestPurpose: "conversation",
+          resolution: dynamicFolding,
+          projectionPlan: folding.plan,
+        }),
+      )
+      const request = folding.request
       if (yield* compaction.compactIfNeeded({ sessionID: session.id, entries, model, request }))
         return yield* Effect.die(continueAfterCompaction(currentStep))
       const startSnapshot = yield* Snapshot.captureDeduped(history.snapshots, snapshots.capture)

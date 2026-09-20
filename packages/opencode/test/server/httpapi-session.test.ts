@@ -99,6 +99,27 @@ function createTextMessage(sessionID: SessionIDType, text: string) {
   })
 }
 
+function createPendingAssistant(sessionID: SessionIDType, parentID: MessageID) {
+  return Session.Service.pipe(
+    Effect.flatMap((svc) =>
+      svc.updateMessage({
+        id: MessageID.ascending(),
+        role: "assistant",
+        parentID,
+        sessionID,
+        mode: "build",
+        agent: "build",
+        cost: 0,
+        path: { cwd: "/tmp", root: "/tmp" },
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        modelID: ModelV2.ID.make("test"),
+        providerID: ProviderV2.ID.make("test"),
+        time: { created: Date.now() },
+      }),
+    ),
+  )
+}
+
 const localAdapter = (directory: string): WorkspaceAdapter => ({
   name: "Local Test",
   description: "Create a local test workspace",
@@ -899,6 +920,132 @@ describe("session HttpApi", () => {
             { method: "DELETE", headers },
           ),
         ).toBe(true)
+      }),
+    { git: true, config: { formatter: false, lsp: false } },
+  )
+
+  it.instance(
+    "maps queued message validation and conflicts to declared HTTP errors",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const headers = { "x-opencode-directory": test.directory, "content-type": "application/json" }
+        const session = yield* createSession({ title: "queued message errors" })
+        const first = yield* createTextMessage(session.id, "first")
+        const pending = yield* createPendingAssistant(session.id, first.info.id)
+        const queued = yield* createTextMessage(session.id, "queued")
+        const route = pathFor(SessionPaths.queuedMessage, { sessionID: session.id, messageID: queued.info.id })
+        const expected = {
+          partID: queued.part.id,
+          expectedText: queued.part.text,
+          expectedPartIDs: [queued.part.id],
+        }
+
+        const malformed = yield* request(route, {
+          method: "PATCH",
+          headers,
+          body: JSON.stringify({ ...expected, expectedPartIDs: undefined, text: "edited" }),
+        })
+        expect(malformed.status).toBe(400)
+
+        const missing = yield* request(
+          pathFor(SessionPaths.queuedMessage, { sessionID: session.id, messageID: MessageID.ascending() }),
+          { method: "DELETE", headers, body: JSON.stringify(expected) },
+        )
+        expect(missing.status).toBe(404)
+
+        const invalid = yield* request(
+          pathFor(SessionPaths.queuedMessage, { sessionID: session.id, messageID: pending.id }),
+          { method: "DELETE", headers, body: JSON.stringify(expected) },
+        )
+        expect(invalid.status).toBe(400)
+
+        const removable = yield* createTextMessage(session.id, "edit then delete")
+        const removableRoute = pathFor(SessionPaths.queuedMessage, {
+          sessionID: session.id,
+          messageID: removable.info.id,
+        })
+        const removableExpected = {
+          partID: removable.part.id,
+          expectedText: removable.part.text,
+          expectedPartIDs: [removable.part.id],
+        }
+        const edited = yield* request(removableRoute, {
+          method: "PATCH",
+          headers,
+          body: JSON.stringify({ ...removableExpected, text: "edited before delete" }),
+        })
+        expect(edited.status).toBe(200)
+        const removed = yield* request(removableRoute, {
+          method: "DELETE",
+          headers,
+          body: JSON.stringify({ ...removableExpected, expectedText: "edited before delete" }),
+        })
+        expect(removed.status).toBe(200)
+
+        const sessions = yield* Session.Service
+        yield* sessions.updateMessage({ ...queued.info, time: { ...queued.info.time, consumed: Date.now() } })
+        const conflict = yield* request(route, {
+          method: "PATCH",
+          headers,
+          body: JSON.stringify({ ...expected, text: "edited" }),
+        })
+        expect(conflict.status).toBe(409)
+        expect(yield* responseJson(conflict)).toMatchObject({
+          _tag: "ConflictError",
+          resource: "already_consumed",
+        })
+      }),
+    { git: true, config: { formatter: false, lsp: false } },
+  )
+
+  it.instance(
+    "rejects stale queued message snapshots without overwriting text or attachments",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const headers = { "x-opencode-directory": test.directory, "content-type": "application/json" }
+        const session = yield* createSession({ title: "queued message stale" })
+        const first = yield* createTextMessage(session.id, "first")
+        yield* createPendingAssistant(session.id, first.info.id)
+        const queued = yield* createTextMessage(session.id, "queued")
+        const route = pathFor(SessionPaths.queuedMessage, { sessionID: session.id, messageID: queued.info.id })
+        const expected = {
+          partID: queued.part.id,
+          expectedText: queued.part.text,
+          expectedPartIDs: [queued.part.id],
+        }
+        const sessions = yield* Session.Service
+        yield* sessions.updatePart({ ...queued.part, text: "changed elsewhere" })
+        const file = yield* sessions.updatePart({
+          id: PartID.ascending(),
+          sessionID: session.id,
+          messageID: queued.info.id,
+          type: "file",
+          mime: "text/plain",
+          filename: "new.txt",
+          url: "data:text/plain,new",
+        })
+
+        const staleEdit = yield* request(route, {
+          method: "PATCH",
+          headers,
+          body: JSON.stringify({ ...expected, text: "overwritten" }),
+        })
+        expect(staleEdit.status).toBe(409)
+
+        const staleDelete = yield* request(route, {
+          method: "DELETE",
+          headers,
+          body: JSON.stringify(expected),
+        })
+        expect(staleDelete.status).toBe(409)
+
+        const current = (yield* sessions.messages({ sessionID: session.id })).find(
+          (message) => message.info.id === queued.info.id,
+        )
+        expect(current?.parts).toEqual(expect.arrayContaining([expect.objectContaining({ id: file.id })]))
+        expect(current?.parts).toEqual(expect.arrayContaining([expect.objectContaining({ text: "changed elsewhere" })]))
       }),
     { git: true, config: { formatter: false, lsp: false } },
   )

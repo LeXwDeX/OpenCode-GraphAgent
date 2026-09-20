@@ -42,10 +42,19 @@ function expectedFinalLine(source: { previousTag: string; tag: string; repo: str
 
 function defaultSections(): Section[] {
   return [
-    { heading: headings[0], body: "- **Notes harness**: Series files render through a validator that fails closed on every rule." },
+    {
+      heading: headings[0],
+      body: "- **Notes harness**: Series files render through a validator that fails closed on every rule.",
+    },
     { heading: headings[1], body: "- **Placeholder notes**: Releases no longer publish a placeholder body." },
-    { heading: headings[2], body: "- **Renderer**: One script renders and validates the series file before the release exists." },
-    { heading: headings[3], body: "- The release job renders notes from the committed series file before creating the release." },
+    {
+      heading: headings[2],
+      body: "- **Renderer**: One script renders and validates the series file before the release exists.",
+    },
+    {
+      heading: headings[3],
+      body: "- The release job renders notes from the committed series file before creating the release.",
+    },
     { heading: headings[4], body: "- No dependency changes in this series." },
     {
       heading: headings[5],
@@ -287,19 +296,21 @@ describe("release notes template and workflow wiring", () => {
     expect(template).toContain("/compare/{previous_tag}...{current_tag})")
   })
 
-  test("release job renders and validates notes before gh release create", async () => {
+  test("candidate preparation renders notes before the isolated publish job", async () => {
     const workflow = await Bun.file(new URL("../../../.github/workflows/release-fork.yml", import.meta.url)).text()
-    const releaseJob = workflow.slice(workflow.indexOf("\n  release:"))
+    const prepare = workflow.slice(workflow.indexOf("\n  prepare-release:"), workflow.indexOf("\n  publish-release:"))
+    const publish = workflow.slice(workflow.indexOf("\n  publish-release:"), workflow.indexOf("\n  # No-op job"))
 
     expect(workflow).not.toContain('--notes "GraphAgent release from branch')
-    expect(releaseJob).toContain("script/release-notes.ts")
-    expect(releaseJob).toContain('--notes-dir ".github/releases"')
-    expect(releaseJob).toContain("--previous-tag")
-    expect(releaseJob).toContain("needs.version.outputs.previous_tag")
-    expect(releaseJob).toContain('--out "$RUNNER_TEMP/RELEASE_NOTES.md"')
-    expect(releaseJob.indexOf("release-notes.ts")).toBeLessThan(releaseJob.indexOf("gh release create"))
-    expect(releaseJob).toContain('gh release create "${{ needs.version.outputs.tag }}"')
-    expect(releaseJob).toContain('--notes-file "$RUNNER_TEMP/RELEASE_NOTES.md"')
-    expect(releaseJob).toContain("./.github/actions/setup-bun")
+    expect(prepare).toContain("script/release-notes.ts")
+    expect(prepare).toContain('--notes-dir ".github/releases"')
+    expect(prepare).toContain("--previous-tag")
+    expect(prepare).toContain("needs.version.outputs.previous_tag")
+    expect(prepare).toContain('--out "$GITHUB_WORKSPACE/release-assets/RELEASE_NOTES.md"')
+    expect(prepare).toContain("./.github/actions/setup-bun")
+    expect(prepare).not.toContain("gh release create")
+    expect(publish).toContain('gh release create "${{ needs.version.outputs.tag }}"')
+    expect(publish).toContain('--notes-file "release-assets/RELEASE_NOTES.md"')
+    expect(publish).toContain("needs: [version, prepare-release]")
   })
 })

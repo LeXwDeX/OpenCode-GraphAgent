@@ -5,9 +5,12 @@ source of truth for the GitHub Release body. The `dev` prereleases
 (`X.Y.Z-dev.1 … dev.N`) and the `main` stable promotion (`X.Y.Z`) of a series
 all render the **same** file; only the channel word differs.
 
-The release job (`.github/workflows/release-fork.yml`) renders and validates
-the file **before** `gh release create` and fails closed on any violation — a
-release can never ship with placeholder notes.
+The read-only `prepare-release` job (`.github/workflows/release-fork.yml`)
+renders and validates the file, generates and verifies `SHA256SUMS`, and
+uploads one release-candidate artifact on every manual dispatch. The separate
+`publish-release` job receives the workflow's only `contents: write`
+permission and runs only when `create_release=true`. A missing or invalid notes
+file therefore blocks both a non-publishing candidate and a real release.
 
 ## Lifecycle
 
@@ -27,13 +30,13 @@ release can never ship with placeholder notes.
 
 Five tokens are machine-substituted at render time:
 
-| Token                | Replaced with                                              |
-| -------------------- | --------------------------------------------------------- |
-| `{VERSION}`          | bare semver, e.g. `1.0.10` (no `v` prefix)                 |
-| `{Prerelease/Stable}` | `Prerelease` on `dev`, `Stable` on `main`                 |
-| `{branch}`           | releasing branch name (`dev` or `main`)                    |
-| `{previous_tag}`     | latest existing stable tag, e.g. `graphagent-v1.0.9`       |
-| `{current_tag}`      | the tag being released, e.g. `graphagent-v1.0.10`          |
+| Token                 | Replaced with                                        |
+| --------------------- | ---------------------------------------------------- |
+| `{VERSION}`           | bare semver, e.g. `1.0.10` (no `v` prefix)           |
+| `{Prerelease/Stable}` | `Prerelease` on `dev`, `Stable` on `main`            |
+| `{branch}`            | releasing branch name (`dev` or `main`)              |
+| `{previous_tag}`      | latest existing stable tag, e.g. `graphagent-v1.0.9` |
+| `{current_tag}`       | the tag being released, e.g. `graphagent-v1.0.10`    |
 
 The template also contains authoring-guidance braces (`{Feature name}`,
 `{module}`, `{One-sentence summary …}`). These are **not** substituted —

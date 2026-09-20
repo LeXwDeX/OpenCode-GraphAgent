@@ -50,6 +50,7 @@
     "@types/yargs": "17.0.33",
     "@typescript/native-preview": "catalog:",
     "drizzle-orm": "catalog:",
+    "ghostty-web": "github:anomalyco/ghostty-web#83c0a07b8628b748aed073b232cb4b52a6ca11c1",
     "prettier": "3.6.2",
     "typescript": "catalog:",
     "vscode-languageserver-types": "3.17.5",

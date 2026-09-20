@@ -1,76 +1,50 @@
 # Orchestration Policy
 
-This guide owns tiering, admission, checkpoints, and recovery after the
-resident Orchestration Router selects an execution mode. It does not revisit
-that selection.
+This guide describes composition choices and runtime contracts after a DAG is
+selected. The model can reconsider execution mode as evidence changes; the
+profiles below are examples, not prerequisites for completing a task.
 
-## Tiered Orchestration Doctrine
-
-Every non-trivial orchestration is a tiered division of labor:
-
-- **Advanced-tier nodes** own the decisions that must be correct: task
-  decomposition, gates, claim verification, arbitration, final synthesis.
-- **Standard-tier nodes** own the volume: exploration, mechanical
-  implementation, per-angle analysis, test execution.
+## Model Tiers and Evidence
 
 Tier placement is mechanical, not a model-ID choice: `required: true` nodes
 and `review`/`review-*` workers resolve to the advanced model tier of
-`dag.jsonc`; every other node resolves to standard. Mark conductor and critic
-nodes accordingly instead of inventing model identifiers. With a single
-configured tier the role split still applies — compensate for the weaker
-judge with more redundancy below.
+`dag.jsonc`; every other node resolves to standard. This mapping does not
+prescribe who may analyze, implement, or summarize. Set `required` according to
+whether execution failure should stop the workflow, not to manufacture roles.
 
-The standard tier buys accuracy with redundancy on two axes:
+Stronger reasoning can help with ambiguous decisions; faster workers can help
+with independent well-specified work. Either tier's claims need evidence.
+Repeated opinions from more agents are not a substitute for source or tests.
 
-- **Breadth (space for accuracy)**: independent slices fan out concurrently —
-  work packages, hypotheses, review dimensions, or N samples of the same
-  question when one cheap pass is unreliable — and fan in to one
-  advanced-tier arbiter.
-- **Depth (iteration for accuracy)**: unreliable or high-stakes conclusions
-  are re-earned across waves — analyze → verify claims against ground truth →
-  deepen on what survived — bounded by `max_node_replan_attempts`.
+## Choosing Depth
 
-Hard rules:
-
-1. The advanced tier MUST NOT do bulk work the standard tier can fan out.
-2. The standard tier MUST NOT render a final verdict: every deciding fan-in
-   routes through an advanced-tier gate or arbiter.
-3. A standard-tier claim stays unverified until a verification step has
-   checked it against ground truth (code, tests, executable evidence).
-
-## Depth Ladder
-
-Hard minimums by target size; user constraints may lower them only when
-explicit ("quick pass", "single agent", a stated budget) — a bare task phrase
-like "review X" never does.
-
-- **File or function scope**: one analysis wave plus one synthesis node.
-- **Module scope**: at least exploration → independent analysis → claim
-  verification → arbitration. A single wave of parallel opinions is not a
-  review; it is a poll.
-- **Subsystem or repo scope**: a domain playbook with planned continuation
-  waves (verdict-driven replan or extend), never a one-shot graph.
+Add depth when a material uncertainty remains, not to meet a phase count.
+Independent perspectives can expose blind spots; targeted verification can
+resolve conflicting claims. A short task may need neither an extra reviewer
+nor a synthesis node. A broad task may benefit from both. Reuse sound evidence
+and stop expanding when the requested acceptance is supported, or report what
+cannot be verified within the available scope and budget.
 
 ## Parent and Child Ownership
 
 The parent conversation owns user interaction, requirement and admission
 decisions, the macro plan, workflow controls, checkpoint interpretation, and
-the final user-facing synthesis. Once work is classified for delegation, the
-parent MUST NOT perform executable leaf work itself.
+the final user-facing synthesis. The parent may execute work directly, including
+bounded follow-up after a child result. Do not duplicate active child work;
+stop or isolate a child writer before taking over its files.
 
-The resident Router owns direct, `task`, and `workflow` selection, explicit
-opt-outs, and consolidation under one workflow ID. This guide only constrains
-the selected graph. Preserve read-only scope, named roles, exact model
+The resident Router describes direct, `task`, and `workflow` choices and explicit
+opt-outs. Preserve read-only scope, named roles, exact model
 assignments, scope limits, and prohibited actions in every node prompt.
 
 ## Deep Admission QA
 
 `standard` remains the compatibility default and may start without admission.
-Simple or already-bounded work stays `standard` and MUST NOT be forced through
-deep admission QA. Recommend `deep` only when the request has at least two deep-complexity signals: independent workstreams, cross-domain uncertainty,
-high blast radius, conflicting constraints, evidence gathering, or multiple
-verification perspectives. Explicit `deep` intent still requires admission; it
-selects the mode, not a bypass.
+Consider `deep` when its explicit admission and review contracts help manage
+the task's uncertainty or consequences. There is no complexity-signal quota.
+Explicit `deep` intent still requires admission; it selects the mode, not a
+bypass. These admission fields are specific to deep workflows, not a mandatory
+planning ritual for direct work or standard DAGs.
 
 Run admission before constructing or starting the graph. Questions belong to
 the existing parent-session question interaction because the answers define the
@@ -149,12 +123,12 @@ after recovery.
 
 ## Role Resolution
 
-Profiles declare capability slots, not fixed agent names. Resolve each slot in this order:
+Profiles describe possible capabilities, not mandatory roles. When delegating,
+honor an eligible explicit `@agent` assignment. Other useful matches include:
 
-1. an eligible explicit `@agent` assignment from the user;
-2. an eligible configured agent whose name or description matches the capability;
-3. a compatible documented built-in role;
-4. a compatible `explore`, `build`, or `general` fallback.
+1. a configured agent whose name or description matches the work;
+2. a compatible documented built-in role;
+3. a compatible `explore`, `build`, or `general` fallback.
 
 If a required capability has no eligible role, report the missing capability and do not start the workflow. You MUST NOT invent a `worker_type`.
 
@@ -167,9 +141,10 @@ runtime configuration, not the workflow graph:
 
 Qualitative labels such as "strong", "fast", or "cheap" guide tier placement,
 but you MUST NOT invent a model identifier. If every configured source is
-missing, the workflow tool starts parent-session QA and does not create the
-workflow. Ask the user to configure a `dag.jsonc` tier, the selected agent, or
-the parent-session model, then retry.
+missing, the workflow tool returns a blocked diagnostic and does not create the
+workflow. Consider authorized, reversible recovery; if configuration changes
+need permission, report the blocker and ask the user. Do not silently replace
+models or bypass provider constraints.
 
 Prefer expressing "strong model for judgment, fast model for volume" through
 tier placement — `required: true` and `review`/`review-*` workers resolve to
@@ -178,32 +153,25 @@ graph-level model fields.
 
 ## Profile: Brainstorm
 
-Use capability slots such as `scope_explorer`, `viewpoint_generator`, `skeptic`, `constraint_analyst`, and `synthesizer`. Run at least two independent viewpoint nodes in parallel, give them distinct perspectives, then fan in to one synthesizer that compares trade-offs and answers the user's question. The profile is read-only by default.
+Distinct viewpoints can help when alternatives or assumptions genuinely
+compete. Possible roles include an explorer, generator, skeptic, or synthesizer;
+use only those that contribute. One analysis or a direct conversation can be
+enough. Brainstorming does not authorize implementation; the profile is
+read-only by default.
 
 ## Profile: Review
 
-Scale the graph with the Depth Ladder before compiling, then wire the
-verdict's continuation path.
+Review dimensions such as intent, correctness, testing, and security help
+locate evidence gaps; they need not be separate agents or waves. Independent
+reviewers are useful for distinct expertise or disputed conclusions. An
+arbiter helps when reports disagree, not simply because the target is a module.
 
-- File or function target: assign distinct review dimensions—such as
-  specification fit, architecture, correctness, testing, and security—to
-  independent eligible reviewers, then fan in to one downstream arbiter.
-- Module target or larger, four waves minimum:
-  1. scope exploration fanning out over the target's real structure;
-  2. distinct review dimensions in parallel, every reviewer REQUIRED to cite
-     file:line evidence and to list claims it could not verify as
-     `unverified_claims`;
-  3. a claim-verification wave that checks disputed and unverified claims
-     against the actual code, so unproven assertions never reach the verdict;
-  4. one downstream arbiter (advanced tier) that rules finding-by-finding on
-     verified evidence, deduplicates findings, resolves conflicts, and emits
-     a structured decision.
-- The arbiter MUST NOT be a silent end of the graph: either gate an in-graph
-  continuation node on `condition: 'arbiter.output.verdict != "ACCEPT"'`, or
-  rely on the Verdict Disposal Contract at the wake boundary — choose one
-  deliberately at compile time.
-
-The profile is read-only by default.
+Findings need a concrete trigger, impact, and source or runtime evidence.
+Keep `unverified_claims` separate from confirmed defects; verify consequential
+claims before using them to decide acceptance. The parent can perform that
+check directly or delegate it. A requested review may end with findings and
+limitations; it does not automatically authorize repair. The profile is
+read-only by default. See the Verdict Disposal Contract for follow-up choices.
 
 ## Profile: Develop
 
@@ -228,7 +196,7 @@ strategy. It may appear in the flow `design review → implementation`, but it
 MUST NOT claim implementation-diff assurance, code-correctness verification, or
 executed-test evidence.
 
-A production implementation review uses:
+A compiler-bound implementation review uses:
 `implementation → verification(PASS) → diff review → final gate/audit`.
 The implementation supplies an actual diff or changed-file artifact and an
 implementation fingerprint. Verification consumes that implementation and must
@@ -253,53 +221,24 @@ Declare `output_schema` for gates and arbiters and normalize `verdict` to `ACCEP
 
 ## Verdict Disposal Contract
 
-**持续核验至上线标准 · Verify to the delivery bar.** Implementation is not the
-finish line: after implementation, keep iterating verification until the
-delivery bar the user demanded is genuinely met — 实现之后，持续迭代核验，直至
-达成用户要求的上线标准。The Router owns every judgment on that loop: verdict
-`replan` when the evidence is insufficient, reorganize the flow (a correction
-wave via `extend`, a reshape via `replan`) when the outcome deviates, and a
-new DAG when the current graph is exhausted. Neither a completed node nor a
-green build closes the loop on its own — only the user's delivery standard
-does.
+A verdict is evidence for the parent's next decision, not automatic permission
+to expand the task. Compare it with the user's requested outcome: reporting
+findings may complete a review, while an implementation request may still need
+repair and verification. A green build alone does not prove acceptance.
 
-A gate, arbiter, or auditor verdict is a work order, not a summary. When a
-checkpoint reports `REVISE`, `REJECT`, or `BLOCKED`, the parent MUST dispose
-of it in the same wake turn with exactly one of:
+Useful follow-ups include a direct bounded repair, one delegated check, a
+targeted `extend`, or a paused `control(replan)` when dependencies need to
+change. Reuse valid outputs where useful. A new workflow is an option when the
+existing graph cannot represent the work, not a requirement of a changed risk
+label. A non-`ACCEPT` verdict does not mandate more agents or a full template.
 
-1. `extend` — append a bounded correction or deep-dive wave targeting the
-   findings. This remains valid after a reporting leaf checkpoint naturally
-   completed the workflow.
-2. `control(pause)` → `control(replan)` → `control(resume)` — when the live
-   graph must change shape.
-3. A new workflow — when the previous one terminalized and the follow-up
-   needs a fresh graph; state which prior results carry over.
-4. A reasoned stop — tell the user, finding by finding, why no further wave
-   is warranted. Silence is not a stop decision.
-
-Classify the findings first; the class selects the option:
-
-| Finding nature | Disposal |
-| --- | --- |
-| Bounded within the current scope | Option 1, same graph, tier unchanged |
-| Reveals cross-module, contract, persistence, or boundary risk the current shape cannot cover | Option 1 escalated: append full-shaped assurance lanes (broader review axes, extra verification) instead of the lite correction alone |
-| The situation itself was misclassified (a change assumed, an unknown-cause defect found; a repair assumed, a design gap found) | Option 3 only — the single legitimate route switch; start the workflow whose backbone matches the real deliverable and name which prior evidence carries over |
-| Unbounded or foggy — findings that no bounded wave can discharge | Option 4, or escalate to the user with a decision request; do not launder fog into a speculative wave |
-
-Route reselection is never the default: same-objective work stays in one
-workflow, and escalation keeps additive semantics — full-shaped assurance
-lanes are appended waves, not replacement graphs. The tier discriminator is
-risk only (reversibility, module span, public contracts, concurrency,
-persistence, migration, identity, authorization, upstream executables,
-CI/release). Role or block count never selects a tier.
-
-Merely summarizing a non-ACCEPT verdict and ending the turn is an
-orchestration failure. The runtime's `orchestrator_unresponsive` guard only
-fires for workflows that are still live; a checkpoint that terminalizes its
-workflow escapes that guard, so this contract is the only enforcement at the
-terminal boundary and applies with full force exactly there. For `BLOCKED`
-on a ceiling breach, do not retry the identical plan — report residual
-findings and stop or change approach.
+Report blockers and the actual workflow state when stopping or asking for a
+decision. Do not claim rejected work passed. The runtime's
+`orchestrator_unresponsive` guard applies to stalled live workflows; if ending
+the work, settle live scheduling rather than abandoning active children.
+Naturally completed workflows can be extended, but cannot be paused or replanned.
+For a ceiling breach, do not retry the identical plan; report the remaining
+findings and stop or change approach within the user's authorization.
 
 ## Actionable Checkpoints
 
@@ -318,11 +257,16 @@ The child reports evidence and required actions only. The parent interprets
 the verdict and chooses any workflow control action under the Verdict Disposal
 Contract.
 
-Do not poll `status` merely to wait. Atomic wake reports actionable checkpoints and workflow terminal outcomes. Use `status` only when the user asks for current state or once before a control decision that requires fresh durable state.
+Do not poll `status` merely to wait. Wakes report checkpoints and terminal
+outcomes. Use `status` when fresh durable state is needed for diagnosis, a
+control decision, or an accurate user-facing report.
 
 ## Bounded Repair
 
-Implement review-and-repair with finite `extend` or `control(replan)` operations. Target only the nodes and findings that require repair. You MUST NOT create cyclic `depends_on`, predeclare unbounded speculative repair waves, or start an unrelated replacement workflow.
+When graph-based repair helps, use finite `extend` or `control(replan)`
+operations targeting the remaining findings. Direct repair may be simpler once
+child writers have stopped. You MUST NOT create cyclic `depends_on` or bypass
+runtime budgets. Additional waves need a concrete evidence gap, not a quota.
 
 Declare a finite `max_node_replan_attempts`. When the ceiling is exhausted, stop with `BLOCKED`, report the remaining findings, and do not retry the identical plan.
 
@@ -330,9 +274,12 @@ Declare a finite `max_node_replan_attempts`. When the ceiling is exhausted, stop
 
 A replan fragment takes real time to compose — template rendering, model reasoning, node rewiring. While you compose it, the workflow keeps scheduling and can reach a terminal status, after which replan is rejected (terminal workflows are immutable). Freeze first, then think:
 
-1. On any user cancel/replan/model-change intent, IMMEDIATELY issue `control(pause)` in the same turn. Pause needs no fragment, applies in milliseconds, and stops new node spawns.
+1. For a live graph that needs replanning, pause scheduling before composing the fragment. For an explicit cancellation, use `control(cancel)` instead. Pause stops new node spawns.
 2. Pause does not interrupt nodes that are already running. Decide their disposition inside the fragment: `restart: true` re-spawns a running node with the new definition (its in-flight child session is hard-aborted at re-spawn), `cancel: true` terminates it, absence keeps it running to completion.
 3. Compose the fragment, then issue `control(replan)` — replan is valid while paused.
 4. A successful replan auto-resumes the workflow. Issue `control(resume)` manually only when the replan output reports the automatic resume raced with another control op and the workflow is still paused; never resume a workflow the output says was already resumed.
 
-If the workflow terminalized before you paused, do not force the replan: start a new workflow carrying the updated definitions, and state which prior results are superseded.
+If the workflow terminalized before you paused, replan is unavailable. Depending
+on the remaining work, consider supported recovery, extension, a new workflow,
+or direct execution. State which results remain valid rather than silently
+treating superseded attempts as current.

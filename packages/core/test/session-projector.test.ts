@@ -21,7 +21,13 @@ import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { SessionExecution } from "@opencode-ai/core/session/execution"
 import { SessionInput } from "@opencode-ai/core/session/input"
 import { SessionStore } from "@opencode-ai/core/session/store"
-import { PartTable, SessionInputTable, SessionMessageTable, SessionTable } from "@opencode-ai/core/session/sql"
+import {
+  MessageTable,
+  PartTable,
+  SessionInputTable,
+  SessionMessageTable,
+  SessionTable,
+} from "@opencode-ai/core/session/sql"
 import { testEffect } from "./lib/effect"
 import { Snapshot } from "@opencode-ai/core/snapshot"
 
@@ -80,6 +86,70 @@ describe("SessionProjector", () => {
         },
       })
       expect(yield* db.select().from(PartTable).all().pipe(Effect.orDie)).toEqual([])
+    }),
+  )
+
+  it.effect("preserves consumed time across stale user message updates", () =>
+    Effect.gen(function* () {
+      const { db } = yield* Database.Service
+      yield* db
+        .insert(ProjectTable)
+        .values({ id: Project.ID.global, worktree: AbsolutePath.make("/project"), sandboxes: [] })
+        .run()
+        .pipe(Effect.orDie)
+      yield* db
+        .insert(SessionTable)
+        .values({
+          id: sessionID,
+          project_id: Project.ID.global,
+          slug: "test",
+          directory: "/project",
+          title: "test",
+          version: "test",
+        })
+        .run()
+        .pipe(Effect.orDie)
+      const events = yield* EventV2.Service
+      const id = SessionV1.MessageID.make("msg_consumed")
+      const base = {
+        id,
+        sessionID: SessionID.make(sessionID),
+        role: "user" as const,
+        agent: "build",
+        model: { providerID: ProviderV2.ID.make("provider"), modelID: ModelV2.ID.make("model") },
+      }
+
+      yield* events.publish(SessionV1.Event.MessageUpdated, {
+        sessionID: SessionID.make(sessionID),
+        info: { ...base, time: { created: 1, consumed: 20 } },
+      })
+      yield* events.publish(SessionV1.Event.MessageUpdated, {
+        sessionID: SessionID.make(sessionID),
+        info: { ...base, time: { created: 1 } },
+      })
+      yield* events.publish(SessionV1.Event.MessageUpdated, {
+        sessionID: SessionID.make(sessionID),
+        info: { ...base, time: { created: 1, consumed: 10 } },
+      })
+
+      const row = yield* db.select({ data: MessageTable.data }).from(MessageTable).where(eq(MessageTable.id, id)).get()
+      expect(row?.data).toMatchObject({ role: "user", time: { created: 1, consumed: 20 } })
+
+      const zeroID = SessionV1.MessageID.make("msg_consumed_zero")
+      yield* events.publish(SessionV1.Event.MessageUpdated, {
+        sessionID: SessionID.make(sessionID),
+        info: { ...base, id: zeroID, time: { created: 1, consumed: 0 } },
+      })
+      yield* events.publish(SessionV1.Event.MessageUpdated, {
+        sessionID: SessionID.make(sessionID),
+        info: { ...base, id: zeroID, time: { created: 1 } },
+      })
+      const zero = yield* db
+        .select({ data: MessageTable.data })
+        .from(MessageTable)
+        .where(eq(MessageTable.id, zeroID))
+        .get()
+      expect(zero?.data).toMatchObject({ role: "user", time: { created: 1, consumed: 0 } })
     }),
   )
 

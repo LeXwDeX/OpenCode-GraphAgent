@@ -240,6 +240,23 @@ const fragmentFailureEnv = LayerNode.buildLayer(root, {
 })
 const itFragmentFailure = testEffect(fragmentFailureEnv)
 
+const classifiedProviderErrorLLM = Layer.succeed(
+  LLM.Service,
+  LLM.Service.of({
+    stream: () =>
+      Stream.make(
+        LLMEvent.providerError({ message: "request entity too large", classification: "context-overflow" }),
+      ),
+  }),
+)
+const classifiedProviderErrorEnv = LayerNode.buildLayer(
+  LayerNode.group([root, LayerNode.make(TestLLMServer.layer, [])]),
+  {
+    replacements: [...replacements, LayerNode.replace(LLM.node, classifiedProviderErrorLLM)],
+  },
+)
+const itClassifiedProviderError = testEffect(classifiedProviderErrorEnv)
+
 const boot = Effect.fn("test.boot")(function* () {
   const processors = yield* SessionProcessor.Service
   const session = yield* Session.Service
@@ -776,6 +793,41 @@ it.live("session.processor effect tests compact on structured context overflow",
 
         expect(value).toBe("compact")
         expect(yield* llm.calls).toBe(1)
+        expect(handle.message.error).toBeUndefined()
+      }),
+    { config: (url) => providerCfg(url) },
+  ),
+)
+
+itClassifiedProviderError.live("session.processor preserves classified native provider-error events", () =>
+  provideTmpdirServer(
+    ({ dir }) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "compact native provider event")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+
+        const value = yield* handle.process({
+          user: {
+            id: parent.id,
+            sessionID: chat.id,
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies SessionV1.User,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "compact native provider event" }],
+          tools: {},
+        })
+
+        expect(value).toBe("compact")
         expect(handle.message.error).toBeUndefined()
       }),
     { config: (url) => providerCfg(url) },

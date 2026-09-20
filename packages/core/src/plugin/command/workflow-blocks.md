@@ -4,6 +4,10 @@ Blocks are the high-level interface for assembling a one-off workflow YAML
 file. The tool compiles them into ordinary durable DAG nodes before validation
 and persistence. Existing node-based YAML remains compatible.
 
+Use blocks when a DAG serves the task. The examples are optional compositions,
+not a checklist or a minimum number of stages. Selecting a block does opt into
+its actual compiler and output contracts described below.
+
 ## Authoring contract
 
 Never infer or invent a YAML field. Copy the envelope for the intended action
@@ -105,10 +109,15 @@ author-written admission shape instead of guessing fields.
 
 Use these exact calls after writing the file:
 
-- validate: `{ action: "validate", spec_path: "workflow.yaml", profile: "portable" }`
+- validate (start files only): `{ action: "validate", spec_path: "workflow.yaml", profile: "portable" }`
 - start: `{ action: "start", spec_path: "workflow.yaml" }`
 - extend: `{ action: "extend", workflow_id: "dag_...", spec_path: "extend.yaml" }`
 - replan: `{ action: "control", operation: "replan", workflow_id: "dag_...", spec_path: "replan.yaml" }`
+
+`validate` decodes a start envelope only. Extend and replan files are validated
+by `extend` and `control(replan)` before any workflow mutation; standalone
+preflight for those envelopes is not supported. A `config` wrapper that passes
+start validation is not a valid extension file.
 
 This guide owns the author-written block fields and semantics. The action
 schema stays shallow and accepts only `spec_path`; the YAML validator rejects

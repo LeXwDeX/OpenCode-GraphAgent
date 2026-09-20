@@ -63,6 +63,7 @@ import { DagSummaryPublisher } from "@/dag/runtime/summary-publisher"
 import { DagSupervisionSweep } from "@/dag/runtime/supervision-sweep"
 import { EventResidueSweep } from "@opencode-ai/core/event/residue-sweep"
 import { Memory } from "@/memory/memory"
+import { ToolSourceLedger } from "@/session/tool-source-ledger"
 
 export const AppLayer = Layer.mergeAll(
   Layer.mergeAll(
@@ -87,6 +88,7 @@ export const AppLayer = Layer.mergeAll(
     Todo.defaultLayer,
     Goal.defaultLayer,
     Memory.defaultLayer,
+    ToolSourceLedger.defaultLayer,
     Session.defaultLayer,
     SessionStatus.defaultLayer,
     BackgroundJob.defaultLayer,

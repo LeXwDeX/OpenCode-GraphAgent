@@ -1,0 +1,21 @@
+export const ContextFoldingPolicy = {
+  version: "strict-duplicate-v1",
+  allowedTools: ["read", "grep", "glob"] as const,
+  protectedInstructionBasenames: ["agents.md", "agents.override.md", "claude.md", "context.md", "skill.md"] as const,
+  protectRecentSteps: 4,
+  protectRecentTokens: 16_000,
+  softTargetRatio: 0.7,
+  minimumNetSavingsTokens: 512,
+  maximumVisibleCallIDBytes: 128,
+  maximumSteps: 4_096,
+  maximumCandidates: 4_096,
+  maximumFingerprintBucketEntries: 1_024,
+  maximumFingerprintCharacters: 256,
+  workLimits: {
+    maxInputBytes: 8 * 1_024 * 1_024,
+    maxOutputCharacters: 64 * 1_024 * 1_024,
+    maxNodes: 131_072,
+    maxContainerEntries: 131_072,
+    maxDepth: 64,
+  },
+} as const

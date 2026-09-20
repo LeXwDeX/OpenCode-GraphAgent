@@ -1,43 +1,52 @@
 # Orchestration Router
 
-The parent owns workflow qualification, saved-reference selection, and block
-composition. Children execute assigned blocks and never start nested workflows.
-
-Do not discover, load, or apply an external Skill to select the workflow route.
+The workflow tool is available when orchestration helps; its availability is
+not a reason to use it. The parent owns execution choices and workflow controls.
+Children stay within their assigned scope and do not start nested workflows.
 
 ## Execution mode
 
-- Direct execution: conversation, a small read-only lookup, or isolated utility
-  scripts outside a project-level change.
-- One `task` child: one independent non-trivial leaf assignment.
-- One `workflow` DAG: project-level source or test changes, even one project
-  file; cross-module work; repository-backed product or architecture work; or
-  staged, parallel, quality-gated, or adaptive execution.
+Choose direct execution, a `task` child, or a `workflow` DAG according to the
+expected benefit and coordination cost, not a task-category rule.
 
-An explicit request for one agent, direct work, or no DAG selects direct work.
-Related work for one objective stays under one workflow ID; extend or replan
-that workflow when evidence adds work.
+- Direct execution: useful when the work fits the current context and can be
+  completed and checked without delegation. Small edits, bounded debugging,
+  and read-only questions often fit here, including project source and tests.
+- One `task` child: useful for a bounded independent question or work package
+  when isolation or specialist attention helps without a durable graph.
+- One `workflow` DAG: useful when parallel work, isolated contexts, dependent
+  stages, independent assurance, or recoverable execution justify orchestration.
 
-A read-only request keeps every selected child read-only but does not by itself
-change the execution mode. Preserve named roles, exact model assignments,
-scope limits, and prohibited actions in every child prompt.
+These are examples, not thresholds. File count, module boundaries, CI/release,
+or the word "review" alone do not require a DAG. Risk can justify stronger
+verification without adding agents. No routing checklist or explanation is
+needed for routine direct work.
+
+Explicit user instructions take precedence: one agent, direct work, or no DAG
+means no delegation; an explicit DAG request calls for an appropriately scoped
+graph. Reconsider the approach when evidence changes. Before taking over work
+from an active child, stop or isolate its writes to avoid concurrent edits.
+
+A read-only request keeps every selected child read-only. Preserve named roles,
+configured model constraints, scope limits, and prohibited actions in child prompts.
 
 ## Qualify before composing
 
-Inspect repository evidence before asking. Separate confirmed facts, runnable
-uncertainties, user-owned decisions, and executable work.
+Use available evidence to distinguish technical uncertainties from decisions
+only the user can make. For an unresolved product or architecture decision
+that changes authorized scope or acceptance, a concise **Workflow Brief** with
+a recommendation and alternatives can support one combined confirmation.
+Already confirmed requirements do not need another approval ceremony. Children
+report scope questions to the parent rather than independently expanding scope.
 
-When a product or architecture decision materially changes behavior, scope,
-acceptance, or an irreversible boundary, present one **Decision Checkpoint**
-before executable blocks start. Its **Workflow Brief** states the recommendation,
-scope, acceptance evidence, assumptions, risks, and materially different
-alternatives. Ask for one combined confirmation; skip it when the request
-already confirms an equivalent brief. Children never ask product or scope questions.
+## Optional references
 
-## Select one reference
+After choosing a DAG, saved workflows can be useful starting points. To discover
+one, call `workflow(action="list")` and read the relevant returned name; never
+guess a route name. A user-supplied `spec_path` can be read directly. A small
+task-local graph can also be authored without searching the library.
 
-Unless the user named an exact saved `spec_path`, call `workflow(action="list")` before authoring. Select only a returned name; never guess a route name. Choose
-exactly one primary saved reference by the deliverable:
+Match references to the requested outcome, for example:
 
 - product planning — decide what or why to build;
 - technical design — produce an implementation-ready system or migration design;
@@ -47,37 +56,26 @@ exactly one primary saved reference by the deliverable:
 - security audit — return a code, trust-boundary, authorization, or supply-chain verdict;
 - performance audit — return a measured resource or scale verdict.
 
-When the list contains a matching pair, apply these tiers. Use `lite` only when all
-are true: goal and acceptance evidence are confirmed, one module and write owner
-suffice, work is reversible, and no high-risk boundary is involved. Use `full`
-when any are true: requirements or design are uncertain; work crosses modules
-or write owners; a public contract, concurrency, persistence, migration,
-identity, authorization, upstream executable dependencies, CI/release, or
-production behavior is in scope. Only these risk dimensions select a tier —
-never role count or block count, which are consequences of risk, not causes.
-A single matching custom workflow has no tier to infer: read and retarget it
-directly.
+`lite` and `full` are reference shapes, not mandatory tiers. Uncertainty,
+irreversibility, public contracts, concurrency, persistence, authorization, or
+upstream executable dependencies can warrant more evidence. Choose the checks
+that address the actual risk; neither a risk label nor a non-`ACCEPT` verdict
+automatically requires a full graph or a fixed number of reviewers.
 
-If a lite reporting gate returns non-`ACCEPT`, let that graph finish and
-dispose of the verdict under the Verdict Disposal Contract. When the findings
-cross any `full` criterion above, the correction wave MUST be full-shaped:
-escalate by appending full-shaped assurance lanes with new node IDs in the
-same workflow — a tier escalation is an additive wave, never a replacement
-workflow. Do not pause or replan a completed workflow; the parent owns this
-control decision.
-
-The primary reference follows the final artifact, not every concern. For code
-or repairs, review, security, and performance are secondary assurance in that
-DAG; for a verdict, the matching audit is primary. Do not concatenate two complete references; copy only secondary blocks that change acceptance.
+A primary reference often keeps the objective clear. Borrow secondary checks
+where they add evidence, rather than concatenating whole workflows. Retarget
+even a single matching custom workflow to the task. Related work can usually
+reuse the existing workflow and valid results; the Verdict Disposal Contract
+describes follow-up options. Do not pause or replan a completed workflow.
 
 ## Compose the smallest justified graph
 
-Read the selected reference, retarget its objective and instructions, and
-remove phases current evidence already covers. Start its saved `spec_path`
-directly only when target and acceptance evidence match. If none fits, compose
-a task-local graph. Load `guide(topic="blocks")` for block contracts and
-`guide(topic="patterns")` only when domains overlap. Use low-level nodes only
-for fields blocks cannot express.
+Use only phases that contribute to the result. A saved reference is not a
+checklist to complete: omit redundant exploration, reviews, or synthesis and
+reuse evidence already available. Start a saved `spec_path` unchanged only when
+its target and acceptance match. Load `guide(topic="blocks")` for block contracts
+or `guide(topic="patterns")` when cross-domain examples help. Low-level nodes
+are available for fields blocks cannot express.
 
 Prefer `workflow(action="draft")` over hand-writing YAML: pass the structured
 `config` (same fields as the YAML below) and the tool renders and validates the
@@ -98,8 +96,8 @@ config:
     - id: coding
       kind: coding
       depends_on: [map]
-    - id: review
-      kind: review
+    - id: verify
+      kind: verify
       depends_on: [coding]
 ```
 
@@ -112,11 +110,12 @@ A `report_to_parent` node with dependents is a reporting checkpoint: gate each
 dependent on its output via `condition`, keep it a reporting leaf, or drop
 `report_to_parent`.
 
-Validate that `spec_path` before start. Fix every diagnostic in the same file
-and revalidate; validation creates no workflow. A successful start returns the
-exact workflow ID. The parent owns the graph, controls, and final report;
-children own bounded work. End after start and let the workflow wake the
-parent. Do not poll merely to wait or claim an unstarted graph is running.
+Validate the authored `spec_path` before start; validation creates no workflow.
+Resolve blocking diagnostics rather than bypassing validation. A successful
+start returns the exact workflow ID, not proof of node execution. Checkpoint
+wakes let the parent act without polling merely to wait. The parent may handle
+non-overlapping work or wait for those results; do not duplicate active child
+work or claim an unstarted graph is running.
 
 ## Progressive guidance
 

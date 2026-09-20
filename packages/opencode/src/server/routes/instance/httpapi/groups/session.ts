@@ -21,7 +21,7 @@ import {
   WorkspaceRoutingQuery,
   WorkspaceRoutingQueryFields,
 } from "../middleware/workspace-routing"
-import { ApiNotFoundError, PermissionNotFoundError, SessionBusyError } from "../errors"
+import { ApiNotFoundError, ConflictError, PermissionNotFoundError, SessionBusyError } from "../errors"
 import { described } from "./metadata"
 import { QueryBoolean } from "./query"
 import { ProviderV2 } from "@opencode-ai/core/provider"
@@ -72,6 +72,12 @@ export const SummarizePayload = Schema.Struct({
 export const PromptPayload = Schema.Struct(Struct.omit(SessionPrompt.PromptInput.fields, ["sessionID"]))
 export const CommandPayload = Schema.Struct(Struct.omit(SessionPrompt.CommandInput.fields, ["sessionID"]))
 export const ShellPayload = Schema.Struct(Struct.omit(SessionPrompt.ShellInput.fields, ["sessionID"]))
+export const QueuedMessageEditPayload = Schema.Struct(
+  Struct.omit(SessionPrompt.QueuedMessageEditInput.fields, ["sessionID", "messageID"]),
+)
+export const QueuedMessageDeletePayload = Schema.Struct(
+  Struct.omit(SessionPrompt.QueuedMessageDeleteInput.fields, ["sessionID", "messageID"]),
+)
 export const RevertPayload = Schema.Struct(Struct.omit(SessionRevert.RevertInput.fields, ["sessionID"]))
 export const PermissionResponsePayload = Schema.Struct({
   response: PermissionV1.Reply,
@@ -143,6 +149,7 @@ export const SessionPaths = {
   deleteMessage: `${root}/:sessionID/message/:messageID`,
   deletePart: `${root}/:sessionID/message/:messageID/part/:partID`,
   updatePart: `${root}/:sessionID/message/:messageID/part/:partID`,
+  queuedMessage: `${root}/:sessionID/message/:messageID/queued`,
 } as const
 
 export const SessionApi = HttpApi.make("session")
@@ -508,6 +515,32 @@ export const SessionApi = HttpApi.make("session")
             summary: "Delete message",
             description:
               "Permanently delete a specific message and all of its parts from a session without reverting file changes.",
+          }),
+        ),
+        HttpApiEndpoint.patch("editQueuedMessage", SessionPaths.queuedMessage, {
+          params: { sessionID: SessionID, messageID: MessageID },
+          query: WorkspaceRoutingQuery,
+          payload: QueuedMessageEditPayload,
+          success: described(SessionV1.WithParts, "Updated queued message"),
+          error: [HttpApiError.BadRequest, ApiNotFoundError, ConflictError],
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "session.editQueuedMessage",
+            summary: "Edit queued message",
+            description: "Atomically edit a user prompt that has not been claimed by a model request.",
+          }),
+        ),
+        HttpApiEndpoint.delete("deleteQueuedMessage", SessionPaths.queuedMessage, {
+          params: { sessionID: SessionID, messageID: MessageID },
+          query: WorkspaceRoutingQuery,
+          payload: QueuedMessageDeletePayload,
+          success: described(Schema.Boolean, "Deleted queued message"),
+          error: [HttpApiError.BadRequest, ApiNotFoundError, ConflictError],
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "session.deleteQueuedMessage",
+            summary: "Delete queued message",
+            description: "Atomically delete a user prompt that has not been claimed by a model request.",
           }),
         ),
         HttpApiEndpoint.delete("deletePart", SessionPaths.deletePart, {

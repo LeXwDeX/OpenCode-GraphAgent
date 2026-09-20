@@ -87,4 +87,18 @@ describe("GraphAgent release versions", () => {
     expect(workflow).toContain("previous_tag: ${{ steps.release-version.outputs.previous_tag }}")
     expect(workflow).toContain("needs.version.outputs.previous_tag")
   })
+
+  test("prepares a complete candidate even when publication is disabled", async () => {
+    const workflow = await Bun.file(new URL("../../../.github/workflows/release-fork.yml", import.meta.url)).text()
+    const prepare = workflow.slice(workflow.indexOf("\n  prepare-release:"), workflow.indexOf("\n  publish-release:"))
+    const publish = workflow.slice(workflow.indexOf("\n  publish-release:"), workflow.indexOf("\n  # No-op job"))
+
+    expect(workflow).toContain("default: false")
+    expect(prepare).toContain("Generate SHA256SUMS")
+    expect(prepare).toContain("Render Release Notes (fail closed)")
+    expect(prepare).toContain("Verify Release Candidate")
+    expect(prepare).toContain("release-candidate-${{ needs.version.outputs.version }}")
+    expect(publish).toContain("if: inputs.create_release")
+    expect(publish).toContain("name: release-candidate-${{ needs.version.outputs.version }}")
+  })
 })
