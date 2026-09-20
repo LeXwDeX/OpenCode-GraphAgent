@@ -412,7 +412,7 @@ jobs:
           retention-days: 7
 
   publish-release:
-    name: Publish GitHub Release
+    name: Create GitHub Release
     needs: [version, prepare-release]
     if: inputs.create_release
     runs-on: [self-hosted, Linux, X64]
