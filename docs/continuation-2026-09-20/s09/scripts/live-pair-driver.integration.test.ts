@@ -20,50 +20,48 @@ const sha256 = (input: string | Uint8Array) => new Bun.CryptoHasher("sha256").up
 
 async function continuationSources(root: string, name: string) {
   const sourceLedgerPath = path.join(root, `${name}-source-ledger.json`)
-  const run18FailureSummaryPath = path.join(root, `${name}-run18-failure-summary.json`)
+  const run22FailureSummaryPath = path.join(root, `${name}-run22-failure-summary.json`)
   const sourcePlan = [
-    { run: 14, kind: "one-request-preflight", arm: "enabled", maxProviderRequests: 1 },
-    { run: 15, kind: "one-request-preflight", arm: "disabled", maxProviderRequests: 1 },
-    { run: 16, kind: "task", task: "T1", arm: "disabled", maxProviderRequests: 12 },
-    { run: 17, kind: "task", task: "T1", arm: "enabled", maxProviderRequests: 12 },
-    { run: 18, kind: "task", task: "T2", arm: "disabled", maxProviderRequests: 12 },
-    { run: 19, kind: "task", task: "T2", arm: "enabled", maxProviderRequests: 12 },
-    { run: 20, kind: "task", task: "T3", arm: "disabled", maxProviderRequests: 12 },
-    { run: 21, kind: "task", task: "T3", arm: "enabled", maxProviderRequests: 12 },
-    { run: 22, kind: "task", task: "T4", arm: "disabled", maxProviderRequests: 12 },
-    { run: 23, kind: "task", task: "T4", arm: "enabled", maxProviderRequests: 12 },
+    { run: 19, kind: "task", task: "T2", arm: "disabled", maxProviderRequests: 12 },
+    { run: 20, kind: "task", task: "T2", arm: "enabled", maxProviderRequests: 12 },
+    { run: 21, kind: "task", task: "T3", arm: "disabled", maxProviderRequests: 12 },
+    { run: 22, kind: "task", task: "T3", arm: "enabled", maxProviderRequests: 12 },
+    { run: 23, kind: "task", task: "T4", arm: "disabled", maxProviderRequests: 12 },
+    { run: 24, kind: "task", task: "T4", arm: "enabled", maxProviderRequests: 12 },
   ]
   const candidate = "a".repeat(40)
   const modelIdentitySha256 = "c6068fbb297e21966010177e6464efcda67792209001636ebbc3d9dcf85e19af"
   const modelConfigSha256 = "00b8fba22722ef212f8da42ed4b64ac493479dd5802dd56d5137606714c98662"
   const sourceLedgerRaw = `${JSON.stringify({
-    schemaVersion: 4,
-    contract: "s09-user-authorized-qwen-100req-acceptance-23",
-    ceilingSessions: 23,
-    historicalConsumedSessions: 13,
+    schemaVersion: 5,
+    contract: "s09-user-authorized-qwen-100req-t2-recovery-24",
+    ceilingSessions: 24,
+    historicalConsumedSessions: 18,
     authorizedNewProviderRequestLimit: 100,
-    plannedProviderRequestMaximum: 98,
+    consumedNewProviderRequests: 25,
+    remainingNewProviderRequests: 75,
+    plannedProviderRequestMaximum: 72,
     retryBudget: 0,
     continuation: {
       sourceLedgerSha256: "d".repeat(64),
-      run13FailureSummarySha256: "e".repeat(64),
-      sourceSchemaVersion: 3,
-      sourceContract: "s09-user-authorized-autonomous-acceptance-22",
-      sourceCeilingSessions: 22,
-      sourceHistoricalConsumedSessions: 12,
-      sourceConsumedSessions: 13,
+      run18FailureSummarySha256: "e".repeat(64),
+      sourceSchemaVersion: 4,
+      sourceContract: "s09-user-authorized-qwen-100req-acceptance-23",
+      sourceCeilingSessions: 23,
+      sourceHistoricalConsumedSessions: 13,
+      sourceConsumedSessions: 18,
       sourceCandidateCommit: candidate,
       sourceModelIdentitySha256: modelIdentitySha256,
       sourceModelConfigSha256: modelConfigSha256,
       sourceContext: 81_920,
       sourceOutputReserve: 4_096,
-      consumedRun: 13,
+      consumedRun: 18,
       consumedRunState: "fail",
-      consumedRunFailureCode: "unclassified-live-run-failure",
+      consumedRunFailureCode: "external-quality-or-side-effect-failed",
     },
-    halted: { at: "2026-09-20T00:00:18.000Z", run: 18, reason: "external-quality-or-side-effect-failed" },
+    halted: { at: "2026-09-20T00:00:22.000Z", run: 22, reason: "external-quality-or-side-effect-failed" },
     runs: sourcePlan.map((entry, index) =>
-      index < 4
+      index < 3
         ? {
             ...entry,
             state: "pass",
@@ -79,15 +77,15 @@ async function continuationSources(root: string, name: string) {
               hostResolvedEvidenceSha256: String(index + 1).repeat(64),
               context: 81_920,
               outputReserve: 4_096,
-              providerRequests: [1, 1, 8, 8][index],
+              providerRequests: [7, 7, 8][index],
               resultSha256: "8".repeat(64),
             },
           }
-        : index === 4
+        : index === 3
           ? {
               ...entry,
               state: "fail",
-              lease: "stub-run18-lease",
+              lease: "stub-run22-lease",
               reservedAt: "2026-09-20T00:00:15.000Z",
               startedAt: "2026-09-20T00:00:16.000Z",
               finishedAt: "2026-09-20T00:00:18.000Z",
@@ -99,30 +97,32 @@ async function continuationSources(root: string, name: string) {
   })}\n`
   await writeFile(sourceLedgerPath, sourceLedgerRaw, { mode: 0o600 })
   await writeFile(
-    run18FailureSummaryPath,
+    run22FailureSummaryPath,
     `${JSON.stringify({
       schemaVersion: 1,
       candidate,
-      run: 18,
+      run: 22,
       status: "FAIL",
       consumed: true,
-      acceptedT2: false,
+      acceptedT3: false,
       originalLedgerFailureCode: "external-quality-or-side-effect-failed",
-      derivedClassification: "t2-answer-format-not-explicit",
-      upstream: { actualForwardedRequests: 7 },
+      derivedClassification: "t3-extra-shell-subcommand",
+      upstream: { actualForwardedRequests: 8 },
       diagnosis: {
-        failedConstraints: ["answer-needle7-count-2"],
-        trajectoryPass: true,
+        constraintsPass: true,
+        trajectoryPass: false,
+        trajectoryFailures: ["turn-3-bash:restore-version-count-0", "turn-3-group-1-step-mismatch"],
+        extraShellSubcommand: "grep",
         workspaceHashesIntact: true,
         sideEffects: 0,
       },
-      preservedPasses: [14, 15, 16, 17],
-      remainingRuns: [19, 20, 21, 22, 23],
+      preservedPasses: [19, 20, 21],
+      remainingRuns: [23, 24],
       artifacts: { "continuation-ledger.json": sha256(sourceLedgerRaw) },
     })}\n`,
     { mode: 0o600 },
   )
-  return { sourceLedgerPath, run18FailureSummaryPath }
+  return { sourceLedgerPath, run22FailureSummaryPath }
 }
 
 async function productionRecentProtection(historyPath: string) {
@@ -266,6 +266,14 @@ test("requires T2 to report computed count and path without leaking fixture answ
   expect(check("NEEDLE-7 count=2.5; NEEDLE-3 file=src/m02.md")).toBe(false)
   expect(check("NEEDLE-7 count=2; NEEDLE-3 file=src/m02.md.bak")).toBe(false)
   expect(check("NEEDLE-7 appears in src/m01.md and src/m04.md; NEEDLE-3 is in src/m02.md")).toBe(false)
+})
+
+test("requires the T3 restore group to contain exactly one shell command", () => {
+  const restorePrompt = V3_TASKS["t3-aba"].prompts[2]!
+  expect(restorePrompt.text).toContain(
+    "exactly the single shell command cp backup/version.orig.txt app/version.txt, with no appended shell subcommand",
+  )
+  expect(restorePrompt.groups[0]).toEqual([{ kind: "bash", command: "cp backup/version.orig.txt app/version.txt" }])
 })
 
 test("runs enabled and disabled preflights through the real host using only loopback providers", async () => {

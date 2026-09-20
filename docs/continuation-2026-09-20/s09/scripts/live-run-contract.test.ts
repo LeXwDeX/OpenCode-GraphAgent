@@ -14,55 +14,53 @@ import {
 } from "./live-run-contract"
 
 const sourcePlan = [
-  { run: 14, kind: "one-request-preflight", arm: "enabled", maxProviderRequests: 1 },
-  { run: 15, kind: "one-request-preflight", arm: "disabled", maxProviderRequests: 1 },
-  { run: 16, kind: "task", task: "T1", arm: "disabled", maxProviderRequests: 12 },
-  { run: 17, kind: "task", task: "T1", arm: "enabled", maxProviderRequests: 12 },
-  { run: 18, kind: "task", task: "T2", arm: "disabled", maxProviderRequests: 12 },
-  { run: 19, kind: "task", task: "T2", arm: "enabled", maxProviderRequests: 12 },
-  { run: 20, kind: "task", task: "T3", arm: "disabled", maxProviderRequests: 12 },
-  { run: 21, kind: "task", task: "T3", arm: "enabled", maxProviderRequests: 12 },
-  { run: 22, kind: "task", task: "T4", arm: "disabled", maxProviderRequests: 12 },
-  { run: 23, kind: "task", task: "T4", arm: "enabled", maxProviderRequests: 12 },
+  { run: 19, kind: "task", task: "T2", arm: "disabled", maxProviderRequests: 12 },
+  { run: 20, kind: "task", task: "T2", arm: "enabled", maxProviderRequests: 12 },
+  { run: 21, kind: "task", task: "T3", arm: "disabled", maxProviderRequests: 12 },
+  { run: 22, kind: "task", task: "T3", arm: "enabled", maxProviderRequests: 12 },
+  { run: 23, kind: "task", task: "T4", arm: "disabled", maxProviderRequests: 12 },
+  { run: 24, kind: "task", task: "T4", arm: "enabled", maxProviderRequests: 12 },
 ] as const
 
 const sha256 = (input: string) => new Bun.CryptoHasher("sha256").update(input).digest("hex")
 
 async function continuationSources(directory: string) {
   const sourceLedgerPath = path.join(directory, "source-ledger.json")
-  const run18FailureSummaryPath = path.join(directory, "run18-failure-summary.json")
+  const run22FailureSummaryPath = path.join(directory, "run22-failure-summary.json")
   const candidate = "a".repeat(40)
   const modelIdentitySha256 = "b".repeat(64)
   const modelConfigSha256 = "c".repeat(64)
   const sourceLedgerRaw = `${JSON.stringify(
     {
-      schemaVersion: 4,
-      contract: "s09-user-authorized-qwen-100req-acceptance-23",
-      ceilingSessions: 23,
-      historicalConsumedSessions: 13,
+      schemaVersion: 5,
+      contract: "s09-user-authorized-qwen-100req-t2-recovery-24",
+      ceilingSessions: 24,
+      historicalConsumedSessions: 18,
       authorizedNewProviderRequestLimit: 100,
-      plannedProviderRequestMaximum: 98,
+      consumedNewProviderRequests: 25,
+      remainingNewProviderRequests: 75,
+      plannedProviderRequestMaximum: 72,
       retryBudget: 0,
       continuation: {
         sourceLedgerSha256: "d".repeat(64),
-        run13FailureSummarySha256: "e".repeat(64),
-        sourceSchemaVersion: 3,
-        sourceContract: "s09-user-authorized-autonomous-acceptance-22",
-        sourceCeilingSessions: 22,
-        sourceHistoricalConsumedSessions: 12,
-        sourceConsumedSessions: 13,
+        run18FailureSummarySha256: "e".repeat(64),
+        sourceSchemaVersion: 4,
+        sourceContract: "s09-user-authorized-qwen-100req-acceptance-23",
+        sourceCeilingSessions: 23,
+        sourceHistoricalConsumedSessions: 13,
+        sourceConsumedSessions: 18,
         sourceCandidateCommit: candidate,
         sourceModelIdentitySha256: modelIdentitySha256,
         sourceModelConfigSha256: modelConfigSha256,
         sourceContext: 81_920,
         sourceOutputReserve: 4_096,
-        consumedRun: 13,
+        consumedRun: 18,
         consumedRunState: "fail",
-        consumedRunFailureCode: "unclassified-live-run-failure",
+        consumedRunFailureCode: "external-quality-or-side-effect-failed",
       },
-      halted: { at: "2026-09-20T00:00:18.000Z", run: 18, reason: "external-quality-or-side-effect-failed" },
+      halted: { at: "2026-09-20T00:00:22.000Z", run: 22, reason: "external-quality-or-side-effect-failed" },
       runs: sourcePlan.map((entry, index) =>
-        index < 4
+        index < 3
           ? {
               ...entry,
               state: "pass",
@@ -78,15 +76,15 @@ async function continuationSources(directory: string) {
                 hostResolvedEvidenceSha256: String(index + 1).repeat(64),
                 context: 81_920,
                 outputReserve: 4_096,
-                providerRequests: [1, 1, 8, 8][index],
+                providerRequests: [7, 7, 8][index],
                 resultSha256: "8".repeat(64),
               },
             }
-          : index === 4
+          : index === 3
             ? {
                 ...entry,
                 state: "fail",
-                lease: "stub-run18-lease",
+                lease: "stub-run22-lease",
                 reservedAt: "2026-09-20T00:00:15.000Z",
                 startedAt: "2026-09-20T00:00:16.000Z",
                 finishedAt: "2026-09-20T00:00:18.000Z",
@@ -101,30 +99,32 @@ async function continuationSources(directory: string) {
   )}\n`
   await writeFile(sourceLedgerPath, sourceLedgerRaw, { mode: 0o600 })
   await writeFile(
-    run18FailureSummaryPath,
+    run22FailureSummaryPath,
     `${JSON.stringify({
       schemaVersion: 1,
       candidate,
-      run: 18,
+      run: 22,
       status: "FAIL",
       consumed: true,
-      acceptedT2: false,
+      acceptedT3: false,
       originalLedgerFailureCode: "external-quality-or-side-effect-failed",
-      derivedClassification: "t2-answer-format-not-explicit",
-      upstream: { actualForwardedRequests: 7 },
+      derivedClassification: "t3-extra-shell-subcommand",
+      upstream: { actualForwardedRequests: 8 },
       diagnosis: {
-        failedConstraints: ["answer-needle7-count-2"],
-        trajectoryPass: true,
+        constraintsPass: true,
+        trajectoryPass: false,
+        trajectoryFailures: ["turn-3-bash:restore-version-count-0", "turn-3-group-1-step-mismatch"],
+        extraShellSubcommand: "grep",
         workspaceHashesIntact: true,
         sideEffects: 0,
       },
-      preservedPasses: [14, 15, 16, 17],
-      remainingRuns: [19, 20, 21, 22, 23],
+      preservedPasses: [19, 20, 21],
+      remainingRuns: [23, 24],
       artifacts: { "continuation-ledger.json": sha256(sourceLedgerRaw) },
     })}\n`,
     { mode: 0o600 },
   )
-  return { sourceLedgerPath, run18FailureSummaryPath }
+  return { sourceLedgerPath, run22FailureSummaryPath }
 }
 
 async function withTemp<T>(task: (directory: string) => Promise<T>) {
@@ -150,35 +150,46 @@ describe("S09 live run budget contract", () => {
     await withTemp(async (directory) => {
       const ledgerPath = path.join(directory, "ledger.json")
       await initializePrivateRunLedger(ledgerPath, await continuationSources(directory))
-      const reservation = await reserveRunSlot(ledgerPath, 19)
+      const reservation = await reserveRunSlot(ledgerPath, 25)
       await markRunStarted(ledgerPath, reservation)
       await finishRunSlot(ledgerPath, reservation, { state: "fail", failureCode: "stub-upstream-error" })
 
-      expect(String(await rejected(reserveRunSlot(ledgerPath, 20)))).toContain("model stage is halted")
+      expect(String(await rejected(reserveRunSlot(ledgerPath, 26)))).toContain("model stage is halted")
       const ledger = JSON.parse(await readFile(ledgerPath, "utf8"))
       expect(ledger).toMatchObject({
-        schemaVersion: 5,
-        contract: "s09-user-authorized-qwen-100req-t2-recovery-24",
-        ceilingSessions: 24,
-        historicalConsumedSessions: 18,
+        schemaVersion: 6,
+        contract: "s09-user-authorized-qwen-100req-t3-trajectory-recovery-28",
+        ceilingSessions: 28,
+        historicalConsumedSessions: 22,
         authorizedNewProviderRequestLimit: 100,
-        consumedNewProviderRequests: 25,
-        remainingNewProviderRequests: 75,
-        plannedProviderRequestMaximum: 72,
+        consumedNewProviderRequests: 55,
+        remainingNewProviderRequests: 45,
+        plannedProviderRequestMaximum: 44,
         continuation: {
-          sourceSchemaVersion: 4,
-          sourceContract: "s09-user-authorized-qwen-100req-acceptance-23",
-          sourceCeilingSessions: 23,
-          sourceHistoricalConsumedSessions: 13,
-          sourceConsumedSessions: 18,
-          consumedRun: 18,
+          sourceSchemaVersion: 5,
+          sourceContract: "s09-user-authorized-qwen-100req-t2-recovery-24",
+          sourceCeilingSessions: 24,
+          sourceHistoricalConsumedSessions: 18,
+          sourceConsumedSessions: 22,
+          consumedRun: 22,
           consumedRunState: "fail",
           consumedRunFailureCode: "external-quality-or-side-effect-failed",
         },
       })
-      expect(ledger.runs[0]).toMatchObject({ run: 19, state: "fail", failureCode: "stub-upstream-error" })
-      expect(ledger.runs[1]).toMatchObject({ run: 20, state: "planned" })
-      expect(ledger.halted).toMatchObject({ run: 19, reason: "stub-upstream-error" })
+      expect(ledger.runs[0]).toMatchObject({ run: 25, state: "fail", failureCode: "stub-upstream-error" })
+      expect(ledger.runs[1]).toMatchObject({ run: 26, state: "planned" })
+      expect(
+        ledger.runs.map((entry: { run: number; maxProviderRequests: number }) => [
+          entry.run,
+          entry.maxProviderRequests,
+        ]),
+      ).toEqual([
+        [25, 11],
+        [26, 11],
+        [27, 11],
+        [28, 11],
+      ])
+      expect(ledger.halted).toMatchObject({ run: 25, reason: "stub-upstream-error" })
     })
   })
 
@@ -186,16 +197,16 @@ describe("S09 live run budget contract", () => {
     await withTemp(async (directory) => {
       const ledgerPath = path.join(directory, "ledger.json")
       await initializePrivateRunLedger(ledgerPath, await continuationSources(directory))
-      await reserveRunSlot(ledgerPath, 19)
+      await reserveRunSlot(ledgerPath, 25)
 
-      expect(String(await rejected(reserveRunSlot(ledgerPath, 19)))).toContain("interrupted after reservation")
+      expect(String(await rejected(reserveRunSlot(ledgerPath, 25)))).toContain("interrupted after reservation")
       const ledger = JSON.parse(await readFile(ledgerPath, "utf8"))
       expect(ledger.runs[0]).toMatchObject({
-        run: 19,
+        run: 25,
         state: "invalid",
         failureCode: "interrupted-after-durable-reservation",
       })
-      expect(ledger.halted).toMatchObject({ run: 19 })
+      expect(ledger.halted).toMatchObject({ run: 25 })
     })
   })
 
@@ -210,13 +221,13 @@ describe("S09 live run budget contract", () => {
     })
   })
 
-  test("refuses a continuation when the run18 failure summary does not bind the source ledger", async () => {
+  test("refuses a continuation when the run22 failure summary does not bind the source ledger", async () => {
     await withTemp(async (directory) => {
       const ledgerPath = path.join(directory, "ledger.json")
       const source = await continuationSources(directory)
-      const summary = JSON.parse(await readFile(source.run18FailureSummaryPath, "utf8"))
+      const summary = JSON.parse(await readFile(source.run22FailureSummaryPath, "utf8"))
       summary.artifacts["continuation-ledger.json"] = "0".repeat(64)
-      await writeFile(source.run18FailureSummaryPath, `${JSON.stringify(summary)}\n`, { mode: 0o600 })
+      await writeFile(source.run22FailureSummaryPath, `${JSON.stringify(summary)}\n`, { mode: 0o600 })
       expect(String(await rejected(initializePrivateRunLedger(ledgerPath, source)))).toContain(
         "does not bind the source ledger",
       )
@@ -228,7 +239,7 @@ describe("S09 live run budget contract", () => {
     await withTemp(async (directory) => {
       const ledgerPath = path.join(directory, "ledger.json")
       const source = await continuationSources(directory)
-      await chmod(source.run18FailureSummaryPath, 0o644)
+      await chmod(source.run22FailureSummaryPath, 0o644)
       expect(String(await rejected(initializePrivateRunLedger(ledgerPath, source)))).toContain(
         "must be an owner-only regular file",
       )

@@ -174,7 +174,7 @@ export const V3_TASKS: Readonly<Record<V3TaskID, V3Task>> = {
         answer: "beta snapshot read",
       },
       {
-        text: `${grouped} In this order: [restore backup/version.orig.txt over app/version.txt using the shell], [read app/version.txt and filler/t01.txt together]. Use one read call per file, then state release = alpha in one line.`,
+        text: `${grouped} In this order: [restore backup/version.orig.txt over app/version.txt by running exactly the single shell command cp backup/version.orig.txt app/version.txt, with no appended shell subcommand], [read app/version.txt and filler/t01.txt together]. Use one read call per file, then state release = alpha in one line.`,
         groups: [
           [{ kind: "bash", command: "cp backup/version.orig.txt app/version.txt" }],
           [

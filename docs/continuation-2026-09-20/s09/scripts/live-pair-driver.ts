@@ -2110,17 +2110,17 @@ async function main() {
   const ledgerPath = absolutePath(requireArg("--ledger"), "--ledger")
   if (process.argv.includes("--initialize-continuation-ledger")) {
     const sourceLedgerPath = absolutePath(requireArg("--source-ledger"), "--source-ledger")
-    const run18FailureSummaryPath = absolutePath(requireArg("--run18-failure-summary"), "--run18-failure-summary")
-    await initializePrivateRunLedger(ledgerPath, { sourceLedgerPath, run18FailureSummaryPath })
+    const run22FailureSummaryPath = absolutePath(requireArg("--run22-failure-summary"), "--run22-failure-summary")
+    await initializePrivateRunLedger(ledgerPath, { sourceLedgerPath, run22FailureSummaryPath })
     console.log(
       JSON.stringify({
         status: "INITIALIZED_CONTINUATION",
-        ceilingSessions: 24,
-        historicalConsumedSessions: 18,
+        ceilingSessions: 28,
+        historicalConsumedSessions: 22,
         authorizedNewProviderRequestLimit: 100,
-        consumedNewProviderRequests: 25,
-        remainingNewProviderRequests: 75,
-        plannedProviderRequestMaximum: 72,
+        consumedNewProviderRequests: 55,
+        remainingNewProviderRequests: 45,
+        plannedProviderRequestMaximum: 44,
         fixedRuns: LIVE_RUN_PLAN.map((entry) => entry.run),
       }),
     )
