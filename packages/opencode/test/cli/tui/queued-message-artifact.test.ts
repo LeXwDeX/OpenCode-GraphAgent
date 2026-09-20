@@ -1,7 +1,7 @@
 import { expect } from "bun:test"
 import { Identifier } from "@opencode-ai/core/id/id"
 import { createOpencodeClient } from "@opencode-ai/sdk/v2"
-import { Effect } from "effect"
+import { Cause, Effect, Exit } from "effect"
 import { chmod, mkdtemp, realpath, writeFile } from "node:fs/promises"
 import { createServer } from "node:http"
 import os from "node:os"
@@ -156,7 +156,22 @@ run(
               evidenceDir,
             }),
           )
-          yield* Effect.addFinalizer(() => Effect.promise(() => tui.close({ checkpoint })).pipe(Effect.ignore))
+          yield* Effect.addFinalizer((exit) =>
+            Effect.promise(() =>
+              tui.close({
+                checkpoint,
+                ...(Exit.isFailure(exit)
+                  ? {
+                      failure: Cause.prettyErrors(exit.cause).map((error) => ({
+                        name: error.name,
+                        message: error.message,
+                        stack: error.stack,
+                      })),
+                    }
+                  : {}),
+              }),
+            ).pipe(Effect.ignore),
+          )
 
           yield* Effect.promise(() => bounded(initialSeen.promise, "the initial provider request"))
           checkpoint = "initial-provider-request-seen"
@@ -302,6 +317,7 @@ run(
           expect(textPart(q2After).text).toBe(Q2_EXTERNAL)
           expect(q2After.parts.map((part) => part.id)).toContain(externalPartID)
           expect(q2After.parts.find((part) => part.id === externalPartID)?.filename).toBe("q2-external.txt")
+          checkpoint = "q2-conflict-verified"
 
           tui.clickText(Q3)
           yield* Effect.promise(() => tui.waitForText("Message Actions"))
@@ -309,9 +325,12 @@ run(
           tui.write("\r", "open-delete-confirm-q3")
           yield* Effect.promise(() => tui.waitForText("Delete queued message"))
           tui.write("\r", "confirm-delete-q3")
+          checkpoint = "q3-delete-submitted"
           yield* Effect.promise(() => tui.waitForTextAbsent("Delete queued message"))
           const q3After = yield* Effect.promise(() => sdk.session.message({ sessionID, messageID: q3.info.id }))
           expect(q3After.response?.status).toBe(404)
+          checkpoint = "q3-delete-api-404"
+          yield* Effect.promise(() => tui.waitForTextAbsent(Q3))
           expect(tui.screen()).not.toContain(Q3)
           checkpoint = "q3-delete-verified"
 
