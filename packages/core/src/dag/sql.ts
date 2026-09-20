@@ -5,10 +5,6 @@ import { sqliteTable, text, integer, index, primaryKey, uniqueIndex } from "driz
 import { ProjectTable } from "../project/sql"
 import { SessionTable } from "../session/sql"
 import { Timestamps } from "../database/schema.sql"
-import type { DagEvent } from "@opencode-ai/schema/dag-event"
-
-type WorkflowStatus = DagEvent.WorkflowStatus
-type NodeStatus = DagEvent.NodeStatus
 
 /**
  * DAG read-model tables (CQRS projection from EventV2 events).
