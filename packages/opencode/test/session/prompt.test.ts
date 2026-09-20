@@ -186,6 +186,8 @@ let stopAdditionalContexts: string[] = []
 let subagentStopBlockAlways = false
 let userPromptAdmissionStarted: Deferred.Deferred<void> | undefined
 let userPromptAdmissionGate: Deferred.Deferred<void> | undefined
+let snapshotFenceStarted: Deferred.Deferred<void> | undefined
+let snapshotFenceGate: Deferred.Deferred<void> | undefined
 const hookRecorderLayer = Layer.succeed(
   SettingsHook.Service,
   SettingsHook.Service.of({
@@ -232,12 +234,37 @@ const blockingProcessor = Layer.succeed(
   }),
 )
 
+const fencedAgent: AgentSvc.Info = {
+  name: "build",
+  mode: "primary",
+  permission: [],
+  options: {},
+}
+const snapshotFenceAgentLayer: Layer.Layer<AgentSvc.Service> = Layer.succeed(
+  AgentSvc.Service,
+  AgentSvc.Service.of({
+    get: () =>
+      Effect.gen(function* () {
+        if (snapshotFenceStarted && snapshotFenceGate) {
+          yield* Deferred.succeed(snapshotFenceStarted, undefined).pipe(Effect.ignore)
+          yield* Deferred.await(snapshotFenceGate)
+        }
+        return fencedAgent
+      }),
+    list: () => Effect.succeed([fencedAgent]),
+    defaultInfo: () => Effect.succeed(fencedAgent),
+    defaultAgent: () => Effect.succeed("build"),
+    generate: () => Effect.die("not used by snapshot fence regression"),
+  }),
+)
+
 type PromptLayerOptions = {
   mcpInstructions?: MCP.ServerInstructions[]
   processor?: "blocking"
   goal?: boolean
   goalLayer?: Layer.Layer<Goal.Service>
   memoryContext?: string[]
+  agentLayer?: Layer.Layer<AgentSvc.Service>
 }
 
 function makePrompt(input?: PromptLayerOptions) {
@@ -262,7 +289,7 @@ function makePrompt(input?: PromptLayerOptions) {
     Snapshot.defaultLayer,
     LLM.defaultLayer,
     Env.defaultLayer,
-    AgentSvc.defaultLayer,
+    input?.agentLayer ?? AgentSvc.defaultLayer,
     Command.defaultLayer,
     Permission.defaultLayer,
     Plugin.defaultLayer,
@@ -342,6 +369,7 @@ function makeHttpNoLLMServer(input?: PromptLayerOptions) {
 const it = testEffect(makeHttp())
 const noLLMServer = testEffect(makeHttpNoLLMServer())
 const raceNoLLMServer = testEffect(makeHttpNoLLMServer({ processor: "blocking" }))
+const snapshotFenceNoLLMServer = testEffect(makeHttpNoLLMServer({ agentLayer: snapshotFenceAgentLayer }))
 const withMcpInstructions = testEffect(
   makeHttp({
     mcpInstructions: [
@@ -1975,6 +2003,19 @@ it.instance("prompt submitted during an active run is included in the next LLM i
       "timed out waiting for second prompt to save",
     )
 
+    const queued = (yield* sessions.messages({ sessionID: chat.id })).find((message) => message.info.id === id)
+    const queuedText = queued?.parts.find((part): part is SessionV1.TextPart => part.type === "text")
+    if (!queued || !queuedText) throw new Error("expected queued text message")
+    const edited = yield* prompt.editQueuedMessage({
+      sessionID: chat.id,
+      messageID: id,
+      partID: queuedText.id,
+      expectedText: queuedText.text,
+      expectedPartIDs: queued.parts.map((part) => part.id),
+      text: "edited second",
+    })
+    expect(edited.parts).toEqual(expect.arrayContaining([expect.objectContaining({ text: "edited second" })]))
+
     yield* Deferred.succeed(gate, void 0)
 
     const [ea, eb] = yield* Effect.all([Fiber.await(a), Fiber.await(b)])
@@ -1994,7 +2035,242 @@ it.instance("prompt submitted during an active run is included in the next LLM i
     expect(inputs).toHaveLength(2)
     const messages = inputs.at(-1)?.messages
     if (!Array.isArray(messages)) throw new Error("expected LLM messages")
-    expect(messages.at(-1)).toEqual({ role: "user", content: "second" })
+    expect(messages.at(-1)).toEqual({ role: "user", content: "edited second" })
+  }),
+)
+
+it.instance("deleting a queued prompt removes it from the next LLM input", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const gate = yield* Deferred.make<void>()
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Queued delete" })
+
+    yield* llm.hold("first", deferredAsPromise(gate))
+    yield* llm.text("second")
+    const run = yield* prompt
+      .prompt({
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        parts: [{ type: "text", text: "first" }],
+      })
+      .pipe(Effect.forkChild)
+    yield* llm.wait(1)
+
+    const removed = yield* user(chat.id, "delete before next request")
+    yield* user(chat.id, "keep for next request")
+    const queued = (yield* sessions.messages({ sessionID: chat.id })).find((message) => message.info.id === removed.id)
+    const queuedText = queued?.parts.find((part): part is SessionV1.TextPart => part.type === "text")
+    if (!queued || !queuedText) throw new Error("expected removable queued message")
+    expect(
+      yield* prompt.deleteQueuedMessage({
+        sessionID: chat.id,
+        messageID: removed.id,
+        partID: queuedText.id,
+        expectedText: queuedText.text,
+        expectedPartIDs: queued.parts.map((part) => part.id),
+      }),
+    ).toBeTrue()
+
+    yield* Deferred.succeed(gate, undefined)
+    yield* Fiber.await(run)
+
+    const secondInput = JSON.stringify((yield* llm.inputs).at(-1)?.messages ?? [])
+    expect(secondInput).toContain("keep for next request")
+    expect(secondInput).not.toContain("delete before next request")
+  }),
+)
+
+snapshotFenceNoLLMServer.instance("rejects queued mutations after claim and before assistant persistence", () =>
+  Effect.gen(function* () {
+    const started = yield* Deferred.make<void>()
+    const gate = yield* Deferred.make<void>()
+    snapshotFenceStarted = started
+    snapshotFenceGate = gate
+    yield* Effect.addFinalizer(() =>
+      Deferred.succeed(gate, undefined).pipe(
+        Effect.ignore,
+        Effect.andThen(
+          Effect.sync(() => {
+            snapshotFenceStarted = undefined
+            snapshotFenceGate = undefined
+          }),
+        ),
+      ),
+    )
+
+    const { directory } = yield* TestInstance
+    yield* writeConfig(directory, cfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Admission fence" })
+    const first = yield* user(chat.id, "first")
+    yield* sessions.updateMessage({
+      id: MessageID.ascending(),
+      role: "assistant",
+      parentID: first.id,
+      sessionID: chat.id,
+      mode: "build",
+      agent: "build",
+      cost: 0,
+      path: { cwd: directory, root: directory },
+      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      modelID: ref.modelID,
+      providerID: ref.providerID,
+      time: { created: Date.now() },
+    } satisfies SessionV1.Assistant)
+    const target = yield* user(chat.id, "queued")
+    const run = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+    yield* awaitWithTimeout(Deferred.await(started), "snapshot fence did not open")
+
+    const claimed = (yield* sessions.messages({ sessionID: chat.id })).find((message) => message.info.id === target.id)
+    const text = claimed?.parts.find((part): part is SessionV1.TextPart => part.type === "text")
+    if (claimed?.info.role !== "user" || !text) throw new Error("expected claimed queued message")
+    expect(claimed.info.time.consumed).toBeNumber()
+    expect(
+      (yield* sessions.messages({ sessionID: chat.id })).some(
+        (message) => message.info.role === "assistant" && message.info.parentID === target.id,
+      ),
+    ).toBeFalse()
+
+    const assertConsumedConflict = <A>(exit: Exit.Exit<A, SessionPrompt.QueuedMessageError>) => {
+      expect(Exit.isFailure(exit)).toBeTrue()
+      if (Exit.isFailure(exit)) {
+        expect(Cause.squash(exit.cause)).toMatchObject({
+          _tag: "QueuedMessageConflict",
+          kind: "already_consumed",
+        })
+      }
+    }
+    assertConsumedConflict(
+      yield* prompt
+        .editQueuedMessage({
+          sessionID: chat.id,
+          messageID: target.id,
+          partID: text.id,
+          expectedText: text.text,
+          expectedPartIDs: claimed.parts.map((part) => part.id),
+          text: "must not edit",
+        })
+        .pipe(Effect.exit),
+    )
+    assertConsumedConflict(
+      yield* prompt
+        .deleteQueuedMessage({
+          sessionID: chat.id,
+          messageID: target.id,
+          partID: text.id,
+          expectedText: text.text,
+          expectedPartIDs: claimed.parts.map((part) => part.id),
+        })
+        .pipe(Effect.exit),
+    )
+
+    yield* prompt.cancel(chat.id)
+    yield* Deferred.succeed(gate, undefined)
+    yield* Fiber.await(run)
+  }),
+)
+
+it.instance("claims every user in a snapshot before the provider and preserves claims after abort", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const firstGate = yield* Deferred.make<void>()
+    const secondGate = yield* Deferred.make<void>()
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Snapshot claims" })
+
+    yield* llm.hold("first", deferredAsPromise(firstGate))
+    yield* llm.hold("second", deferredAsPromise(secondGate))
+
+    const run = yield* prompt
+      .prompt({
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        parts: [{ type: "text", text: "first" }],
+      })
+      .pipe(Effect.forkChild)
+    yield* llm.wait(1)
+
+    const earlier = yield* user(chat.id, "queued earlier")
+    const latest = yield* user(chat.id, "queued latest")
+    const staleEarlier = { ...earlier, time: { ...earlier.time } }
+    yield* Deferred.succeed(firstGate, void 0)
+    yield* llm.wait(2)
+
+    const claimed = yield* sessions.messages({ sessionID: chat.id })
+    const claimedEarlier = claimed.find((message) => message.info.id === earlier.id)
+    const claimedLatest = claimed.find((message) => message.info.id === latest.id)
+    if (claimedEarlier?.info.role !== "user" || claimedLatest?.info.role !== "user") {
+      throw new Error("expected both queued users")
+    }
+    expect(claimedEarlier.info.time.consumed).toBeNumber()
+    expect(claimedLatest.info.time.consumed).toBeNumber()
+    expect(
+      claimed.some((message) => message.info.role === "assistant" && message.info.parentID === earlier.id),
+    ).toBeFalse()
+
+    const earlierText = claimedEarlier.parts.find((part): part is SessionV1.TextPart => part.type === "text")
+    if (!earlierText) throw new Error("expected earlier queued text")
+    const rejected = yield* prompt
+      .editQueuedMessage({
+        sessionID: chat.id,
+        messageID: earlier.id,
+        partID: earlierText.id,
+        expectedText: earlierText.text,
+        expectedPartIDs: claimedEarlier.parts.map((part) => part.id),
+        text: "must not replace consumed input",
+      })
+      .pipe(Effect.exit)
+    expect(Exit.isFailure(rejected)).toBeTrue()
+    if (Exit.isFailure(rejected)) {
+      expect(Cause.squash(rejected.cause)).toMatchObject({
+        _tag: "QueuedMessageConflict",
+        kind: "already_consumed",
+      })
+    }
+
+    yield* sessions.updateMessage(staleEarlier)
+    yield* prompt.cancel(chat.id)
+    yield* Deferred.succeed(secondGate, void 0)
+    yield* Fiber.await(run)
+
+    const afterAbort = (yield* sessions.messages({ sessionID: chat.id })).find(
+      (message) => message.info.id === earlier.id,
+    )
+    expect(afterAbort?.info.role === "user" && afterAbort.info.time.consumed).toBe(claimedEarlier.info.time.consumed)
+  }),
+)
+
+it.instance("claims ordinary users before a manual compaction request", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const compaction = yield* SessionCompaction.Service
+    const chat = yield* sessions.create({ title: "Compaction claims" })
+
+    yield* user(chat.id, "establish history")
+    yield* llm.text("history established")
+    yield* prompt.loop({ sessionID: chat.id })
+
+    const earlier = yield* user(chat.id, "queued before compaction")
+    const latest = yield* user(chat.id, "also queued before compaction")
+    yield* compaction.create({ sessionID: chat.id, agent: "build", model: ref, auto: false })
+    yield* llm.text("summary")
+    yield* prompt.loop({ sessionID: chat.id })
+
+    const messages = yield* sessions.messages({ sessionID: chat.id })
+    for (const id of [earlier.id, latest.id]) {
+      const message = messages.find((item) => item.info.id === id)
+      expect(message?.info.role === "user" && message.info.time.consumed).toBeNumber()
+    }
+    const compactionMessage = messages.find((message) => message.parts.some((part) => part.type === "compaction"))
+    expect(compactionMessage?.info.role === "user" && compactionMessage.info.time.consumed).toBeUndefined()
   }),
 )
 

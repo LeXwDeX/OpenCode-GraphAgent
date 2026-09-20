@@ -33,13 +33,15 @@ import {
   MessagesQuery,
   PermissionResponsePayload,
   PromptPayload,
+  QueuedMessageDeletePayload,
+  QueuedMessageEditPayload,
   RevertPayload,
   ShellPayload,
   SummarizePayload,
   UpdatePayload,
   SessionHookAddPayload,
 } from "../groups/session"
-import { PermissionNotFoundError, notFound } from "../errors"
+import { ConflictError, PermissionNotFoundError, notFound } from "../errors"
 import * as SessionError from "./session-errors"
 
 const tryParseJson = (text: string) =>
@@ -449,6 +451,32 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       return true
     })
 
+    const mapQueuedMessageError = (error: SessionPrompt.QueuedMessageError) => {
+      if (error._tag === "QueuedMessageNotFound") return notFound(`Message not found: ${error.messageID}`)
+      if (error._tag === "QueuedMessageInvalid") return new HttpApiError.BadRequest({})
+      return new ConflictError({ message: error.message, resource: error.kind })
+    }
+
+    const editQueuedMessage = Effect.fn("SessionHttpApi.editQueuedMessage")(function* (ctx: {
+      params: { sessionID: SessionID; messageID: MessageID }
+      payload: typeof QueuedMessageEditPayload.Type
+    }) {
+      yield* requireSession(ctx.params.sessionID)
+      return yield* promptSvc
+        .editQueuedMessage({ ...ctx.params, ...ctx.payload })
+        .pipe(Effect.mapError(mapQueuedMessageError))
+    })
+
+    const deleteQueuedMessage = Effect.fn("SessionHttpApi.deleteQueuedMessage")(function* (ctx: {
+      params: { sessionID: SessionID; messageID: MessageID }
+      payload: typeof QueuedMessageDeletePayload.Type
+    }) {
+      yield* requireSession(ctx.params.sessionID)
+      return yield* promptSvc
+        .deleteQueuedMessage({ ...ctx.params, ...ctx.payload })
+        .pipe(Effect.mapError(mapQueuedMessageError))
+    })
+
     const deletePart = Effect.fn("SessionHttpApi.deletePart")(function* (ctx: {
       params: { sessionID: SessionID; messageID: MessageID; partID: PartID }
     }) {
@@ -545,6 +573,8 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       .handle("unrevert", unrevert)
       .handle("permissionRespond", permissionRespond)
       .handle("deleteMessage", deleteMessage)
+      .handle("editQueuedMessage", editQueuedMessage)
+      .handle("deleteQueuedMessage", deleteQueuedMessage)
       .handle("deletePart", deletePart)
       .handle("updatePart", updatePart)
   }),

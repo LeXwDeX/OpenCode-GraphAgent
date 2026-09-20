@@ -12,9 +12,39 @@
 // wake line proves the hold kept the process alive for the wake turn.
 import { describe, expect } from "bun:test"
 import { Effect } from "effect"
+import { mkdir } from "node:fs/promises"
 import path from "node:path"
 import { reply } from "../../lib/llm-server"
-import { cliIt } from "../../lib/cli-process"
+import {
+  artifactCliTarget,
+  cliIt as sourceCliIt,
+  cliItFor,
+  type ResolvedCliTarget,
+  type RunResult,
+} from "../../lib/cli-process"
+
+const artifactExecutable = process.env.OPENCODE_TEST_ARTIFACT_EXECUTABLE
+const artifactEvidenceDir = process.env.OPENCODE_TEST_ARTIFACT_EVIDENCE_DIR
+if (artifactEvidenceDir && !path.isAbsolute(artifactEvidenceDir)) {
+  throw new Error(`artifact CLI evidence directory must be an absolute path: ${artifactEvidenceDir}`)
+}
+const cliIt = artifactExecutable ? cliItFor(artifactCliTarget(artifactExecutable)) : sourceCliIt
+
+function recordArtifactEvidence(
+  name: string,
+  inputs: readonly unknown[],
+  target: ResolvedCliTarget,
+  result: RunResult,
+) {
+  if (!artifactExecutable || !artifactEvidenceDir) return Effect.void
+  return Effect.promise(async () => {
+    await mkdir(artifactEvidenceDir, { recursive: true, mode: 0o700 })
+    await Bun.write(
+      path.join(artifactEvidenceDir, `${name}.json`),
+      JSON.stringify({ target, result, requests: inputs }, null, 2) + "\n",
+    )
+  })
+}
 
 const SKIP_PERMISSIONS = ["--dangerously-skip-permissions"]
 
@@ -121,12 +151,14 @@ function writeSpec(home: string, name: string, content: string) {
 describe("opencode run DAG hold (issue 614)", () => {
   cliIt.concurrent(
     "no-DAG single-turn prompt exits with the exact reply",
-    ({ llm, opencode }) =>
+    ({ llm, opencode, target }) =>
       Effect.gen(function* () {
         yield* llm.text("plain exact reply")
         const result = yield* opencode.run("just talk, start no workflow")
         opencode.expectExit(result, 0)
+        expect(result.target).toEqual(target)
         expect(result.stdout).toBe("plain exact reply\n")
+        yield* recordArtifactEvidence("no-dag", yield* llm.inputs, target, result)
       }),
     60_000,
   )
@@ -137,7 +169,7 @@ describe("opencode run DAG hold (issue 614)", () => {
   // ("ok" from the unmatched auto-reply) and the wake turn's reply, last.
   cliIt.concurrent(
     "holds through a running workflow and prints the final wake reply last",
-    ({ home, llm, opencode }) =>
+    ({ home, llm, opencode, target }) =>
       Effect.gen(function* () {
         const spec = path.join(home, "wf-s4.yaml")
         yield* writeSpec(home, "wf-s4.yaml", chainSpec)
@@ -147,7 +179,9 @@ describe("opencode run DAG hold (issue 614)", () => {
         const result = yield* opencode.run("S4 run the two node chain", { extraArgs: SKIP_PERMISSIONS })
 
         opencode.expectExit(result, 0)
+        expect(result.target).toEqual(target)
         expect(result.stdout).toBe("ok\nwake handled\n")
+        yield* recordArtifactEvidence("dag-hold", yield* llm.inputs, target, result)
       }),
     180_000,
   )

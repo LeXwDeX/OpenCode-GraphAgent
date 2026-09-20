@@ -1409,6 +1409,65 @@ const scenarios: Scenario[] = [
       }),
     ),
   http.protected
+    .patch("/session/{sessionID}/message/{messageID}/queued", "session.editQueuedMessage")
+    .mutating()
+    .seeded((ctx) =>
+      Effect.gen(function* () {
+        const session = yield* ctx.session({ title: "Queued edit validation" })
+        const message = yield* ctx.message(session.id, { text: "not queued" })
+        return { session, message }
+      }),
+    )
+    .at((ctx) => ({
+      path: route("/session/{sessionID}/message/{messageID}/queued", {
+        sessionID: ctx.state.session.id,
+        messageID: ctx.state.message.info.id,
+      }),
+      headers: ctx.headers(),
+      body: {
+        partID: ctx.state.message.part.id,
+        expectedText: ctx.state.message.part.text,
+        expectedPartIDs: [ctx.state.message.part.id],
+        text: "edited",
+      },
+    }))
+    .json(409, (body) => {
+      object(body)
+      check(
+        body._tag === "ConflictError" && body.resource === "not_queued",
+        "edit should reject a non-queued message",
+      )
+    }),
+  http.protected
+    .delete("/session/{sessionID}/message/{messageID}/queued", "session.deleteQueuedMessage")
+    .mutating()
+    .seeded((ctx) =>
+      Effect.gen(function* () {
+        const session = yield* ctx.session({ title: "Queued delete validation" })
+        const message = yield* ctx.message(session.id, { text: "not queued" })
+        return { session, message }
+      }),
+    )
+    .at((ctx) => ({
+      path: route("/session/{sessionID}/message/{messageID}/queued", {
+        sessionID: ctx.state.session.id,
+        messageID: ctx.state.message.info.id,
+      }),
+      headers: ctx.headers(),
+      body: {
+        partID: ctx.state.message.part.id,
+        expectedText: ctx.state.message.part.text,
+        expectedPartIDs: [ctx.state.message.part.id],
+      },
+    }))
+    .json(409, (body) => {
+      object(body)
+      check(
+        body._tag === "ConflictError" && body.resource === "not_queued",
+        "delete should reject a non-queued message",
+      )
+    }),
+  http.protected
     .post("/session/{sessionID}/fork", "session.fork")
     .mutating()
     .seeded((ctx) => ctx.session({ title: "Fork source" }))

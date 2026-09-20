@@ -84,6 +84,7 @@ import { getRevertDiffFiles } from "../../util/revert-diff"
 import { OPENCODE_BASE_MODE, useBindings, useCommandShortcut, useOpencodeKeymap } from "../../keymap"
 import { usePathFormatter } from "../../context/path-format"
 import { LocationProvider } from "../../context/location"
+import { isQueuedMessage, orderedBefore } from "./queued-message"
 
 addDefaultParsers(parsers.parsers)
 
@@ -97,11 +98,6 @@ const GO_UPSELL_PROVIDERS = new Set(["opencode", "opencode-go"])
 export const alwaysSeparate = new WeakSet<BoxRenderable>()
 
 type RetryAction = Extract<SessionStatus, { type: "retry" }>["action"]
-
-function orderedBefore(a: { id: string; time: { created: number } }, b: { id: string; time: { created: number } }) {
-  if (a.time.created !== b.time.created) return a.time.created < b.time.created
-  return a.id < b.id
-}
 
 function goUpsellKeys(action: RetryAction) {
   if (!action) return
@@ -1288,6 +1284,7 @@ export function Session() {
                               <DialogMessage
                                 messageID={message.id}
                                 sessionID={route.sessionID}
+                                queued={isQueuedMessage(message as UserMessage, pending())}
                                 setPrompt={(promptInfo) => prompt?.set(promptInfo)}
                               />
                             ))
@@ -1399,7 +1396,7 @@ function UserMessage(props: {
   const files = createMemo(() => props.parts.flatMap((x) => (x.type === "file" ? [x] : [])))
   const { theme } = useTheme()
   const [hover, setHover] = createSignal(false)
-  const queued = createMemo(() => props.pending && props.message.time.created > props.pending.time.created)
+  const queued = createMemo(() => isQueuedMessage(props.message, props.pending))
   const color = createMemo(() => local.agent.color(props.message.agent))
   const queuedFg = createMemo(() => selectedForeground(theme, color()))
   const metadataVisible = createMemo(() => queued() || ctx.showTimestamps())
