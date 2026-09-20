@@ -19,131 +19,98 @@ const failure = (budget: WorkBudget): WireValueResult<never> => ({
   reason: budget.exceeded ? "work-limit" : "unknown-content",
 })
 
-const escapedStringLength = (value: string) => {
-  let length = 2
-  for (let index = 0; index < value.length; index++) {
-    const code = value.charCodeAt(index)
-    if (
-      code === 0x22 ||
-      code === 0x5c ||
-      code === 0x08 ||
-      code === 0x09 ||
-      code === 0x0a ||
-      code === 0x0c ||
-      code === 0x0d
-    ) {
-      length += 2
-    } else if (
-      code <= 0x1f ||
-      (code >= 0xd800 &&
-        code <= 0xdfff &&
-        !(
-          code <= 0xdbff &&
-          index + 1 < value.length &&
-          value.charCodeAt(index + 1) >= 0xdc00 &&
-          value.charCodeAt(index + 1) <= 0xdfff
-        ))
-    ) {
-      length += 6
-    } else {
-      if (code >= 0xd800 && code <= 0xdbff) {
-        length += 2
-        index++
-      } else length += 1
-    }
-  }
-  return length
+type WireSink = { readonly chunks: string[] }
+
+// Emit canonical bytes once into a shared sink. The traversal still shares one input/node/container/depth/output budget,
+// while avoiding the old recursive construction that rebuilt and re-charged every child string at each parent level.
+const emit = (sink: WireSink, budget: WorkBudget, value: string) => {
+  if (!consumeOutputCharacters(budget, value.length)) return false
+  sink.chunks.push(value)
+  return true
 }
 
-const encodeString = (value: string, budget: WorkBudget) => {
+const encodeString = (value: string, budget: WorkBudget, sink: WireSink) => {
   if (!consumeString(budget, value)) return undefined
-  const length = escapedStringLength(value)
-  if (!consumeOutputCharacters(budget, length)) return undefined
-  return JSON.stringify(value)
+  const encoded = JSON.stringify(value)
+  return emit(sink, budget, encoded)
 }
 
-const serialize = (value: unknown, ancestors: Set<object>, budget: WorkBudget, depth: number): string | undefined => {
-  if (!consumeNode(budget, depth)) return undefined
+const serialize = (
+  value: unknown,
+  ancestors: Set<object>,
+  budget: WorkBudget,
+  sink: WireSink,
+  depth: number,
+): boolean => {
+  if (!consumeNode(budget, depth)) return false
 
   if (value === null) {
-    if (!consumeString(budget, "null") || !consumeOutputCharacters(budget, 4)) return undefined
-    return "null"
+    return consumeString(budget, "null") && emit(sink, budget, "null")
   }
 
   switch (typeof value) {
     case "boolean": {
       const result = value ? "true" : "false"
-      if (!consumeString(budget, result) || !consumeOutputCharacters(budget, result.length)) return undefined
-      return result
+      return consumeString(budget, result) && emit(sink, budget, result)
     }
     case "number": {
-      if (!Number.isFinite(value)) return undefined
+      if (!Number.isFinite(value)) return false
       const result = Object.is(value, -0) ? "0" : String(value)
-      if (!consumeString(budget, result) || !consumeOutputCharacters(budget, result.length)) return undefined
-      return result
+      return consumeString(budget, result) && emit(sink, budget, result)
     }
     case "string":
-      return encodeString(value, budget)
+      return encodeString(value, budget, sink) === true
     case "bigint":
     case "function":
     case "symbol":
     case "undefined":
-      return undefined
+      return false
     case "object":
       break
   }
 
-  if (ancestors.has(value)) return undefined
+  if (ancestors.has(value)) return false
   ancestors.add(value)
 
   try {
     const prototype = Object.getPrototypeOf(value)
     if (Array.isArray(value)) {
-      if (prototype !== Array.prototype || !consumeContainerEntries(budget, value.length)) return undefined
+      if (prototype !== Array.prototype || !consumeContainerEntries(budget, value.length)) return false
       const ownKeys = Reflect.ownKeys(value)
-      if (ownKeys.length !== value.length + 1 || ownKeys.some((key) => typeof key === "symbol")) return undefined
+      if (ownKeys.length !== value.length + 1 || ownKeys.some((key) => typeof key === "symbol")) return false
 
-      const items: string[] = []
-      let length = 2
+      if (!emit(sink, budget, "[")) return false
       for (let index = 0; index < value.length; index++) {
         const descriptor = Object.getOwnPropertyDescriptor(value, String(index))
-        if (!descriptor || !("value" in descriptor)) return undefined
-        const item = serialize(descriptor.value, ancestors, budget, depth + 1)
-        if (item === undefined) return undefined
-        items.push(item)
-        length += item.length + (index === 0 ? 0 : 1)
+        if (!descriptor || !("value" in descriptor)) return false
+        if (index > 0 && !emit(sink, budget, ",")) return false
+        if (!serialize(descriptor.value, ancestors, budget, sink, depth + 1)) return false
       }
-      if (!consumeOutputCharacters(budget, length)) return undefined
-      return `[${items.join(",")}]`
+      return emit(sink, budget, "]")
     }
 
-    if (prototype !== Object.prototype && prototype !== null) return undefined
+    if (prototype !== Object.prototype && prototype !== null) return false
     const ownKeys = Reflect.ownKeys(value)
-    if (!consumeContainerEntries(budget, ownKeys.length)) return undefined
+    if (!consumeContainerEntries(budget, ownKeys.length)) return false
     const keys: string[] = []
     for (const key of ownKeys) {
-      if (typeof key !== "string") return undefined
+      if (typeof key !== "string") return false
       keys.push(key)
     }
     keys.sort()
 
-    const entries: string[] = []
-    let length = 2
-    for (const key of keys) {
+    if (!emit(sink, budget, "{")) return false
+    for (let index = 0; index < keys.length; index++) {
+      const key = keys[index]
       const descriptor = Object.getOwnPropertyDescriptor(value, key)
-      if (!descriptor || !("value" in descriptor)) return undefined
-      const encodedKey = encodeString(key, budget)
-      const encodedValue = serialize(descriptor.value, ancestors, budget, depth + 1)
-      if (encodedKey === undefined || encodedValue === undefined) return undefined
-      const entryLength = encodedKey.length + 1 + encodedValue.length
-      if (!consumeOutputCharacters(budget, entryLength)) return undefined
-      entries.push(`${encodedKey}:${encodedValue}`)
-      length += entryLength + (entries.length === 1 ? 0 : 1)
+      if (!descriptor || !("value" in descriptor)) return false
+      if (index > 0 && !emit(sink, budget, ",")) return false
+      if (encodeString(key, budget, sink) !== true || !emit(sink, budget, ":")) return false
+      if (!serialize(descriptor.value, ancestors, budget, sink, depth + 1)) return false
     }
-    if (!consumeOutputCharacters(budget, length)) return undefined
-    return `{${entries.join(",")}}`
+    return emit(sink, budget, "}")
   } catch {
-    return undefined
+    return false
   } finally {
     ancestors.delete(value)
   }
@@ -151,9 +118,10 @@ const serialize = (value: unknown, ancestors: Set<object>, budget: WorkBudget, d
 
 export const serializeWireValue = (value: unknown): WireValueResult<string> => {
   const budget = createWorkBudget(ContextFoldingPolicy.workLimits)
+  const sink: WireSink = { chunks: [] }
   try {
-    const serialized = serialize(value, new Set(), budget, 0)
-    if (serialized === undefined) return failure(budget)
+    if (!serialize(value, new Set(), budget, sink, 0)) return failure(budget)
+    const serialized = sink.chunks.join("")
     return { ok: true, value: serialized, inputBytes: budget.inputBytes }
   } catch {
     return failure(budget)

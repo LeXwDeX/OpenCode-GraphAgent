@@ -93,13 +93,13 @@ const toolMessage = (input: {
   }
 }
 
-const recent = (index: number): SessionMessage.Assistant => ({
+const recent = (index: number, textBytes = 20_000): SessionMessage.Assistant => ({
   id: SessionMessage.ID.make(`msg_recent_${index}`),
   type: "assistant",
   agent: "build",
   model: modelRef,
   time: { created: now, completed: now },
-  content: [{ type: "text", id: `text-${index}`, text: "recent:" + "r".repeat(20_000) }],
+  content: [{ type: "text", id: `text-${index}`, text: "recent:" + "r".repeat(textBytes) }],
 })
 
 const pair = (
@@ -373,5 +373,80 @@ describe("Core runner context folding adapter", () => {
           expect(prepares, purpose).toBe(0)
         }
       }),
+  )
+
+  it.effect("projects a 7.5 MiB prepared request and still fails closed on a stale large binding", () =>
+    Effect.gen(function* () {
+      const targetBytes = 7_500_000
+      let fillerBytes = targetBytes - body.length * 2 - 2_000
+      let messages: readonly SessionMessage.Message[] = []
+      let conversion: ReturnType<typeof toLLMMessagesWithBindings> | undefined
+      let request: LLMRequest | undefined
+      let prepared: PreparedRequest | undefined
+      for (let attempt = 0; attempt < 4; attempt++) {
+        const base = Math.floor(fillerBytes / 4)
+        const remainder = fillerBytes - base * 4
+        messages = [
+          toolMessage({ messageID: "msg_large_source", callID: "call-large-source" }),
+          toolMessage({ messageID: "msg_large_witness", callID: "call-large-witness" }),
+          ...Array.from({ length: 4 }, (_, index) => recent(index, base + (index === 0 ? remainder : 0))),
+        ]
+        conversion = toLLMMessagesWithBindings(messages, model)
+        request = LLM.request({ model, messages: conversion.messages, tools: [] })
+        prepared = yield* prepare(request)
+        const delta = targetBytes - Buffer.byteLength(JSON.stringify(prepared.body))
+        if (delta === 0) break
+        fillerBytes += delta
+      }
+      if (!conversion || !request || !prepared) throw new Error("large fixture construction failed")
+      expect(Buffer.byteLength(JSON.stringify(prepared.body))).toBe(targetBytes)
+
+      const ledger = yield* ContextFoldingToolSourceLedger.Service
+      yield* provenance(ledger, messages)
+      const original = JSON.stringify({ messages, request })
+      const projected = yield* CoreContextFolding.project({
+        enabled: true,
+        purpose: "conversation",
+        sessionID: "ses_runner_adapter",
+        sourceMessages: messages,
+        conversion,
+        expectedMessages: conversion.messages,
+        model,
+        request,
+        ledger,
+        prepare,
+      })
+      expect(projected.applied).toBe(true)
+      expect(projected.plan.replacements).toHaveLength(1)
+      expect(projected.plan.skipReason).toBeUndefined()
+      expect(JSON.stringify({ messages, request })).toBe(original)
+      const projectedBody = JSON.stringify((yield* prepare(projected.request)).body)
+      expect(Buffer.byteLength(projectedBody)).toBeLessThan(targetBytes)
+      expect(projectedBody.split(body)).toHaveLength(2)
+
+      const staleExpected = structuredClone(conversion.messages)
+      const staleResult = staleExpected[3]?.content[0]
+      if (staleResult?.type !== "tool-result" || staleResult.result.type !== "json") {
+        throw new Error("expected large witness result")
+      }
+      if (!isRecord(staleResult.result.value)) throw new Error("expected large witness JSON")
+      staleResult.result.value.content = `${body}-changed`
+      const rejected = yield* CoreContextFolding.project({
+        enabled: true,
+        purpose: "conversation",
+        sessionID: "ses_runner_adapter",
+        sourceMessages: messages,
+        conversion,
+        expectedMessages: staleExpected,
+        model,
+        request,
+        ledger,
+        prepare,
+      })
+      expect(rejected.applied).toBe(false)
+      expect(rejected.request).toBe(request)
+      expect(rejected.plan).toMatchObject({ replacements: [], skipReason: "mapping-mismatch" })
+      expect(JSON.stringify({ messages, request })).toBe(original)
+    }),
   )
 })
