@@ -19,6 +19,8 @@ DEV_SHA=<dispatch-and-required-checks-sha>
 ASSET=opencode-darwin-arm64.zip
 ROOT=$(mktemp -d "${TMPDIR:-/tmp}/dag-artifact-accept.XXXXXX")
 mkdir -p "$ROOT/download" "$ROOT/unpack" "$ROOT/bin" "$ROOT/project" "$ROOT/home"
+SOURCE_ROOT=$(git rev-parse --show-toplevel)
+test "$(git -C "$SOURCE_ROOT" rev-parse HEAD)" = "$DEV_SHA"
 
 GLOBAL=/usr/local/bin/opencode
 "$GLOBAL" --version | tee "$ROOT/global-version.before"
@@ -43,6 +45,7 @@ install -m 755 "$ROOT/unpack/opencode" "$ROOT/bin/opencode"
 xattr -cr "$ROOT/bin/opencode"
 codesign -fs - "$ROOT/bin/opencode"
 codesign --verify --strict "$ROOT/bin/opencode"
+shasum -a 256 "$ROOT/bin/opencode" > "$ROOT/installed-binary.sha256"
 
 EXPECT_VERSION=${TAG#graphagent-v}
 test "$("$ROOT/bin/opencode" --version)" = "$EXPECT_VERSION"
@@ -84,22 +87,16 @@ curl -fsS -u opencode:acceptance-local -H "x-opencode-directory: $ROOT/project" 
 cleanup_server
 trap - EXIT
 
-python3 - "$ROOT/commands.json" <<'PY'
-import json, sys
+python3 - "$ROOT/commands.json" "$SOURCE_ROOT/packages/core/src/plugin/command/dag-auto.txt" <<'PY'
+import hashlib, json, pathlib, sys
 commands = json.load(open(sys.argv[1], encoding="utf-8"))
 command = next(item for item in commands if item.get("name") == "dag-auto")
 assert command.get("source") == "command"
 assert command.get("description") == "Assess useful DAG orchestration for a request and adapt the graph to its evidence and dependencies"
-template = command.get("template", "")
-for marker in (
-    "$ARGUMENTS",
-    "explicit request for direct work or no DAG takes precedence",
-    "not the default",
-    "A review request does not authorize repairs or a release phase.",
-    "Platform delivery is outside this command",
-):
-    assert marker in template, marker
-print("dag-auto artifact prompt: PASS")
+expected = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
+actual = command.get("template", "")
+assert actual == expected
+print("dag-auto artifact registry template: PASS", hashlib.sha256(actual.encode()).hexdigest())
 PY
 
 "$GLOBAL" --version | tee "$ROOT/global-version.after"
@@ -108,9 +105,54 @@ cmp "$ROOT/global-version.before" "$ROOT/global-version.after"
 cmp "$ROOT/global.sha256.before" "$ROOT/global.sha256.after"
 ```
 
-通过条件：release target、资产校验、版本/help、签名以及五个提示词标记全部通过；`commands.json`、server 输出和命令退出码均保留。最后再次比较 `global-version.before` 和 `global.sha256.before`，证明 1.0.44 全局二进制未被替换。
+通过条件：release target、资产校验、版本/help、签名以及从精确 `DEV_SHA` checkout 读取的完整 `/dag-auto` 模板逐字节相等；`commands.json`、模板 SHA256、server 输出和命令退出码均保留。最后再次比较 `global-version.before` 和 `global.sha256.before`，证明 1.0.44 全局二进制未被替换。该步骤证明 command registry 从制品加载了模板；实际 `--command dag-auto` 分发与参数展开由下一节的 provider transcript 证明。
 
-## 3. CLI hold 的验收与限制
+## 3. 提示词分发与 workflow guide 的制品验收
+
+下面的两个用例使用真实支持的 `opencode run --command dag-auto <arguments>` 路径以及真实 `workflow(action="guide")` tool call。它们由 `TestLLMServer` 捕获最终制品发出的 provider request，不调用外部模型：
+
+- `/dag-auto` 用例要求 request 包含当前 `DEV_SHA` 的完整 resident 模板，且 `$ARGUMENTS` 已替换为唯一 sentinel；
+- workflow 用例要求模型侧 tool description 的 resident 前缀逐字节等于 `workflow-routing.md`，其后只允许产品按运行时配置追加的 worker catalog；用例再依次执行四个 guide，并要求每份真实 tool output 出现在后续 provider request；
+- 两份 evidence 都记录 artifact realpath/SHA256、direct argv、stdout/stderr、退出码、完整 request transcript 及当前源码期望哈希。
+
+源码模式仅用于准备 harness，不能计作制品验收：
+
+```bash
+cd packages/opencode
+OPENCODE_TEST_DAG_PROMPTS_SOURCE=1 \
+OPENCODE_TEST_DAG_PROMPTS_EVIDENCE_DIR="$ROOT/dag-prompts-source-evidence" \
+bun test --timeout 240000 test/cli/run/dag-prompts-artifact.test.ts
+```
+
+最终制品阶段必须使用下载并隔离安装的绝对 binary：
+
+```bash
+mkdir -m 700 "$ROOT/dag-prompts-evidence"
+cd packages/opencode
+OPENCODE_TEST_ARTIFACT_EXECUTABLE="$ROOT/bin/opencode" \
+OPENCODE_TEST_DAG_PROMPTS_EVIDENCE_DIR="$ROOT/dag-prompts-evidence" \
+bun test --timeout 240000 test/cli/run/dag-prompts-artifact.test.ts \
+  2>&1 | tee "$ROOT/dag-prompts-artifact.log"
+
+test -s "$ROOT/dag-prompts-evidence/dag-auto-dispatch.json"
+test -s "$ROOT/dag-prompts-evidence/workflow-guides.json"
+python3 - "$ROOT/installed-binary.sha256" "$ROOT/dag-prompts-evidence" <<'PY'
+import json, pathlib, sys
+expected = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").split()[0]
+evidence = pathlib.Path(sys.argv[2])
+for name in ("dag-auto-dispatch.json", "workflow-guides.json"):
+    data = json.loads((evidence / name).read_text(encoding="utf-8"))
+    assert data["target"]["mode"] == "artifact", name
+    assert data["target"]["sha256"] == expected, name
+    assert data["result"]["exitCode"] == 0, name
+    assert data["requests"], name
+print("DAG resident prompt artifact transcripts: PASS")
+PY
+```
+
+这些 deterministic loopback 结果证明最终制品加载并分发了当前 checkout 的 resident 文本；它们不等同于 PR #611 的历史真实模型 5/5，也不证明模型会作出相同的启发式决策。
+
+## 4. CLI hold 的验收与限制
 
 实现位于 `packages/opencode/src/cli/cmd/run/dag-hold.ts`，由 `packages/opencode/src/cli/cmd/run.ts` 的非 attach `run` 循环调用。其契约是：`pending`/`running` 或本轮已观察到活跃工作会 hold；首次出现的 workflow ID 至少 hold 一次以等待 wake；已知且静止的 completed/failed/cancelled/archived/paused/stepping 不继续 hold；idle 轮询失败按旧行为退出；attach 模式不启用该 hold。
 
@@ -189,11 +231,11 @@ test -s "$ROOT/tui-queue-evidence/result.json"
 
 `result.json` 记录 target 模式、artifact realpath/SHA256、direct argv、终端尺寸、实际退出状态与已完成断言；`raw.ansi`、`frames.json`、`inputs.json` 和 `provider-requests.json` 分别保留原始终端输出、解析屏幕帧、输入字节和 loopback provider 请求。只有 `mode=artifact` 且 target SHA256 与本轮安装后二进制一致的成功运行，才补上真实 TUI 的制品证据。
 
-## 4. 接线与最终记录
+## 5. 接线与最终记录
 
 - 提示词来源：`packages/core/src/plugin/command/{workflow-routing.md,workflow.md,workflow-blocks.md,orchestration-policy.md,orchestration-domains.md,dag-auto.txt}`；`packages/core/src/plugin/command.ts` 导出内容，`packages/opencode/src/command/index.ts` 注册 `/dag-auto`，`packages/opencode/src/tool/workflow.ts` 注入 workflow tool description/guide。
 - 发布接线：`.github/workflows/release-fork.yml` 将经校验的配置仓库模板通过 `DAG_TEMPLATES_DIR` 交给 `packages/opencode/script/generate.ts`，再构建、打包、校验版本与 macOS 安装。该模板快照与 PR 611 的 resident heuristic prompt 是两个边界，不能用“模板已打包”替代 `/dag-auto` 加载验证。
 - 既有断言：`packages/core/test/plugin/command.test.ts`、`packages/opencode/test/command/command.test.ts`、`packages/opencode/test/dag/workflow-tool.test.ts`；hold 单元/子进程入口见上节。
-- 最终验收记录至少写入：`TAG`、`DEV_SHA`、release URL/target、平台资产名和 SHA256、安装后二进制版本、签名/help、`commands.json` 标记结果、同 SHA required checks、全局 1.0.44 前后版本/哈希、CLI target 模式/realpath/安装后二进制 SHA256、两案结果和私有 request transcript 路径、TUI 的 raw ANSI/frames/inputs/provider transcript/result 路径。未运行上述 CLI 两案和 TUI 用例时，对应制品缺口仍然存在，不能宣称完成。
+- 最终验收记录至少写入：`TAG`、`DEV_SHA`、release URL/target、平台资产名和 SHA256、安装后二进制版本、签名/help、`commands.json` 的完整模板哈希/精确相等结果、同 SHA required checks、全局 1.0.44 前后版本/哈希、DAG prompt 两案和 CLI hold 两案各自的 target 模式/realpath/安装后二进制 SHA256、结果和私有 request transcript 路径、TUI 的 raw ANSI/frames/inputs/provider transcript/result 路径。未运行 DAG prompt、CLI hold 或 TUI 用例时，对应制品缺口仍然存在，不能宣称完成。
 
 图证据使用主项目 generation `2026-09-20T01:11:31Z`、Tier 2。上述路径 coverage 均为 `no_recorded_issue`/`metadata_match`，唯 `dag-auto.txt` 的 freshness 为 `not_tracked`，已直接读取当前源码；coverage 仅是 best-effort 信号。
