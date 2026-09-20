@@ -126,7 +126,7 @@ export const V3_TASKS: Readonly<Record<V3TaskID, V3Task>> = {
         answer: "NEEDLE-7 appears in src/m01.md and src/m04.md",
       },
       {
-        text: `${grouped} In this order: [grep NEEDLE-7 under src/], [re-read src/m01.md through src/m06.md together]. Read every file fully using one read call per file. Then report two NEEDLE-7 occurrences and src/m02.md as the NEEDLE-3 file in one line.`,
+        text: `${grouped} In this order: [grep NEEDLE-7 under src/], [re-read src/m01.md through src/m06.md together]. Read every file fully using one read call per file. Then answer exactly one line using values you computed: NEEDLE-7 count=<integer>; NEEDLE-3 file=<relative-path>`,
         groups: [
           [{ kind: "grep", path: "src", pattern: "NEEDLE-7" }],
           [
@@ -137,7 +137,7 @@ export const V3_TASKS: Readonly<Record<V3TaskID, V3Task>> = {
             })),
           ],
         ],
-        answer: "2 NEEDLE-7 occurrences; NEEDLE-3 is in src/m02.md",
+        answer: "NEEDLE-7 count=2; NEEDLE-3 file=src/m02.md",
       },
     ],
     allowedChanges: [],

@@ -13,6 +13,15 @@ export type LiveRunPlan = {
 }
 
 export const LIVE_RUN_PLAN: readonly LiveRunPlan[] = [
+  { run: 19, kind: "task", task: "T2", arm: "disabled", maxProviderRequests: 12 },
+  { run: 20, kind: "task", task: "T2", arm: "enabled", maxProviderRequests: 12 },
+  { run: 21, kind: "task", task: "T3", arm: "disabled", maxProviderRequests: 12 },
+  { run: 22, kind: "task", task: "T3", arm: "enabled", maxProviderRequests: 12 },
+  { run: 23, kind: "task", task: "T4", arm: "disabled", maxProviderRequests: 12 },
+  { run: 24, kind: "task", task: "T4", arm: "enabled", maxProviderRequests: 12 },
+] as const
+
+const SOURCE_RUN_PLAN: readonly LiveRunPlan[] = [
   { run: 14, kind: "one-request-preflight", arm: "enabled", maxProviderRequests: 1 },
   { run: 15, kind: "one-request-preflight", arm: "disabled", maxProviderRequests: 1 },
   { run: 16, kind: "task", task: "T1", arm: "disabled", maxProviderRequests: 12 },
@@ -25,45 +34,34 @@ export const LIVE_RUN_PLAN: readonly LiveRunPlan[] = [
   { run: 23, kind: "task", task: "T4", arm: "enabled", maxProviderRequests: 12 },
 ] as const
 
-const SOURCE_RUN_PLAN: readonly LiveRunPlan[] = [
-  { run: 13, kind: "one-request-preflight", arm: "enabled", maxProviderRequests: 1 },
-  { run: 14, kind: "one-request-preflight", arm: "disabled", maxProviderRequests: 1 },
-  { run: 15, kind: "task", task: "T1", arm: "disabled", maxProviderRequests: 12 },
-  { run: 16, kind: "task", task: "T1", arm: "enabled", maxProviderRequests: 12 },
-  { run: 17, kind: "task", task: "T2", arm: "disabled", maxProviderRequests: 12 },
-  { run: 18, kind: "task", task: "T2", arm: "enabled", maxProviderRequests: 12 },
-  { run: 19, kind: "task", task: "T3", arm: "disabled", maxProviderRequests: 12 },
-  { run: 20, kind: "task", task: "T3", arm: "enabled", maxProviderRequests: 12 },
-  { run: 21, kind: "task", task: "T4", arm: "disabled", maxProviderRequests: 12 },
-  { run: 22, kind: "task", task: "T4", arm: "enabled", maxProviderRequests: 12 },
-] as const
-
 export const AUTHORIZED_NEW_PROVIDER_REQUEST_LIMIT = 100
-export const PLANNED_PROVIDER_REQUEST_MAXIMUM = LIVE_RUN_PLAN.reduce((total, run) => total + run.maxProviderRequests, 0)
+export const PLANNED_PROVIDER_REQUEST_MAXIMUM = 72
 
 export type RunLedgerState = "planned" | "reserved" | "started" | "pass" | "fail" | "invalid"
 export type PrivateRunLedger = {
-  schemaVersion: 4
-  contract: "s09-user-authorized-qwen-100req-acceptance-23"
-  ceilingSessions: 23
-  historicalConsumedSessions: 13
+  schemaVersion: 5
+  contract: "s09-user-authorized-qwen-100req-t2-recovery-24"
+  ceilingSessions: 24
+  historicalConsumedSessions: 18
   authorizedNewProviderRequestLimit: 100
-  plannedProviderRequestMaximum: 98
+  consumedNewProviderRequests: 25
+  remainingNewProviderRequests: 75
+  plannedProviderRequestMaximum: 72
   retryBudget: 0
   continuation: {
     sourceLedgerSha256: string
-    run13FailureSummarySha256: string
-    sourceSchemaVersion: 3
-    sourceContract: "s09-user-authorized-autonomous-acceptance-22"
-    sourceCeilingSessions: 22
-    sourceHistoricalConsumedSessions: 12
-    sourceConsumedSessions: 13
+    run18FailureSummarySha256: string
+    sourceSchemaVersion: 4
+    sourceContract: "s09-user-authorized-qwen-100req-acceptance-23"
+    sourceCeilingSessions: 23
+    sourceHistoricalConsumedSessions: 13
+    sourceConsumedSessions: 18
     sourceCandidateCommit: string
     sourceModelIdentitySha256: string
     sourceModelConfigSha256: string
     sourceContext: 81920
     sourceOutputReserve: 4096
-    consumedRun: 13
+    consumedRun: 18
     consumedRunState: "fail"
     consumedRunFailureCode: string
   }
@@ -100,12 +98,14 @@ type ContinuationAnchor = PrivateRunLedger["continuation"]
 
 function newPrivateRunLedger(anchor: ContinuationAnchor, now = isoNow()): PrivateRunLedger {
   return {
-    schemaVersion: 4,
-    contract: "s09-user-authorized-qwen-100req-acceptance-23",
-    ceilingSessions: 23,
-    historicalConsumedSessions: 13,
+    schemaVersion: 5,
+    contract: "s09-user-authorized-qwen-100req-t2-recovery-24",
+    ceilingSessions: 24,
+    historicalConsumedSessions: 18,
     authorizedNewProviderRequestLimit: 100,
-    plannedProviderRequestMaximum: 98,
+    consumedNewProviderRequests: 25,
+    remainingNewProviderRequests: 75,
+    plannedProviderRequestMaximum: 72,
     retryBudget: 0,
     continuation: anchor,
     halted: null,
@@ -117,11 +117,13 @@ function newPrivateRunLedger(anchor: ContinuationAnchor, now = isoNow()): Privat
 function validateLedger(input: unknown): PrivateRunLedger {
   if (
     !isRecord(input) ||
-    input.schemaVersion !== 4 ||
-    input.contract !== "s09-user-authorized-qwen-100req-acceptance-23" ||
-    input.ceilingSessions !== 23 ||
-    input.historicalConsumedSessions !== 13 ||
+    input.schemaVersion !== 5 ||
+    input.contract !== "s09-user-authorized-qwen-100req-t2-recovery-24" ||
+    input.ceilingSessions !== 24 ||
+    input.historicalConsumedSessions !== 18 ||
     input.authorizedNewProviderRequestLimit !== AUTHORIZED_NEW_PROVIDER_REQUEST_LIMIT ||
+    input.consumedNewProviderRequests !== 25 ||
+    input.remainingNewProviderRequests !== 75 ||
     input.plannedProviderRequestMaximum !== PLANNED_PROVIDER_REQUEST_MAXIMUM ||
     input.retryBudget !== 0 ||
     !Array.isArray(input.runs) ||
@@ -135,13 +137,13 @@ function validateLedger(input: unknown): PrivateRunLedger {
     !isRecord(continuation) ||
     typeof continuation.sourceLedgerSha256 !== "string" ||
     !/^[a-f0-9]{64}$/.test(continuation.sourceLedgerSha256) ||
-    typeof continuation.run13FailureSummarySha256 !== "string" ||
-    !/^[a-f0-9]{64}$/.test(continuation.run13FailureSummarySha256) ||
-    continuation.sourceSchemaVersion !== 3 ||
-    continuation.sourceContract !== "s09-user-authorized-autonomous-acceptance-22" ||
-    continuation.sourceCeilingSessions !== 22 ||
-    continuation.sourceHistoricalConsumedSessions !== 12 ||
-    continuation.sourceConsumedSessions !== 13 ||
+    typeof continuation.run18FailureSummarySha256 !== "string" ||
+    !/^[a-f0-9]{64}$/.test(continuation.run18FailureSummarySha256) ||
+    continuation.sourceSchemaVersion !== 4 ||
+    continuation.sourceContract !== "s09-user-authorized-qwen-100req-acceptance-23" ||
+    continuation.sourceCeilingSessions !== 23 ||
+    continuation.sourceHistoricalConsumedSessions !== 13 ||
+    continuation.sourceConsumedSessions !== 18 ||
     typeof continuation.sourceCandidateCommit !== "string" ||
     !/^[a-f0-9]{40}$/.test(continuation.sourceCandidateCommit) ||
     typeof continuation.sourceModelIdentitySha256 !== "string" ||
@@ -150,7 +152,7 @@ function validateLedger(input: unknown): PrivateRunLedger {
     !/^[a-f0-9]{64}$/.test(continuation.sourceModelConfigSha256) ||
     continuation.sourceContext !== 81_920 ||
     continuation.sourceOutputReserve !== 4_096 ||
-    continuation.consumedRun !== 13 ||
+    continuation.consumedRun !== 18 ||
     continuation.consumedRunState !== "fail" ||
     typeof continuation.consumedRunFailureCode !== "string" ||
     continuation.consumedRunFailureCode.length === 0
@@ -289,27 +291,29 @@ function validateLedger(input: unknown): PrivateRunLedger {
           reason: String(halted.reason),
         }
   return {
-    schemaVersion: 4,
-    contract: "s09-user-authorized-qwen-100req-acceptance-23",
-    ceilingSessions: 23,
-    historicalConsumedSessions: 13,
+    schemaVersion: 5,
+    contract: "s09-user-authorized-qwen-100req-t2-recovery-24",
+    ceilingSessions: 24,
+    historicalConsumedSessions: 18,
     authorizedNewProviderRequestLimit: 100,
-    plannedProviderRequestMaximum: 98,
+    consumedNewProviderRequests: 25,
+    remainingNewProviderRequests: 75,
+    plannedProviderRequestMaximum: 72,
     retryBudget: 0,
     continuation: {
       sourceLedgerSha256: continuation.sourceLedgerSha256,
-      run13FailureSummarySha256: continuation.run13FailureSummarySha256,
-      sourceSchemaVersion: 3,
-      sourceContract: "s09-user-authorized-autonomous-acceptance-22",
-      sourceCeilingSessions: 22,
-      sourceHistoricalConsumedSessions: 12,
-      sourceConsumedSessions: 13,
+      run18FailureSummarySha256: continuation.run18FailureSummarySha256,
+      sourceSchemaVersion: 4,
+      sourceContract: "s09-user-authorized-qwen-100req-acceptance-23",
+      sourceCeilingSessions: 23,
+      sourceHistoricalConsumedSessions: 13,
+      sourceConsumedSessions: 18,
       sourceCandidateCommit: continuation.sourceCandidateCommit,
       sourceModelIdentitySha256: continuation.sourceModelIdentitySha256,
       sourceModelConfigSha256: continuation.sourceModelConfigSha256,
       sourceContext: 81_920,
       sourceOutputReserve: 4_096,
-      consumedRun: 13,
+      consumedRun: 18,
       consumedRunState: "fail",
       consumedRunFailureCode: continuation.consumedRunFailureCode,
     },
@@ -373,20 +377,22 @@ function continuationAnchor(sourceLedgerRaw: string, failureSummaryRaw: string):
   const source: unknown = JSON.parse(sourceLedgerRaw)
   if (
     !isRecord(source) ||
-    source.schemaVersion !== 3 ||
-    source.contract !== "s09-user-authorized-autonomous-acceptance-22" ||
-    source.ceilingSessions !== 22 ||
-    source.historicalConsumedSessions !== 12 ||
+    source.schemaVersion !== 4 ||
+    source.contract !== "s09-user-authorized-qwen-100req-acceptance-23" ||
+    source.ceilingSessions !== 23 ||
+    source.historicalConsumedSessions !== 13 ||
+    source.authorizedNewProviderRequestLimit !== 100 ||
+    source.plannedProviderRequestMaximum !== 98 ||
     source.retryBudget !== 0 ||
     !Array.isArray(source.runs) ||
     source.runs.length !== SOURCE_RUN_PLAN.length ||
     !isRecord(source.halted) ||
-    source.halted.run !== 13 ||
+    source.halted.run !== 18 ||
     !isRecord(source.continuation) ||
-    source.continuation.sourceCeilingSessions !== 20 ||
-    source.continuation.sourceHistoricalConsumedSessions !== 10 ||
-    source.continuation.sourceConsumedSessions !== 12 ||
-    source.continuation.consumedRun !== 12 ||
+    source.continuation.sourceCeilingSessions !== 22 ||
+    source.continuation.sourceHistoricalConsumedSessions !== 12 ||
+    source.continuation.sourceConsumedSessions !== 13 ||
+    source.continuation.consumedRun !== 13 ||
     source.continuation.consumedRunState !== "fail" ||
     typeof source.continuation.sourceModelIdentitySha256 !== "string" ||
     !/^[a-f0-9]{64}$/.test(source.continuation.sourceModelIdentitySha256) ||
@@ -395,11 +401,13 @@ function continuationAnchor(sourceLedgerRaw: string, failureSummaryRaw: string):
     source.continuation.sourceContext !== 81_920 ||
     source.continuation.sourceOutputReserve !== 4_096
   )
-    throw new Error("source ledger is not the fixed failed run13 autonomous-22 contract")
+    throw new Error("source ledger is not the fixed failed run18 acceptance-23 contract")
+  let passedProviderRequests = 0
+  let candidateCommit = ""
   for (let index = 0; index < SOURCE_RUN_PLAN.length; index++) {
     const expected = SOURCE_RUN_PLAN[index]!
     const actual = source.runs[index]
-    const expectedState = index === 0 ? "fail" : "planned"
+    const expectedState = index < 4 ? "pass" : index === 4 ? "fail" : "planned"
     if (
       !isRecord(actual) ||
       actual.run !== expected.run ||
@@ -409,16 +417,36 @@ function continuationAnchor(sourceLedgerRaw: string, failureSummaryRaw: string):
       actual.maxProviderRequests !== expected.maxProviderRequests ||
       actual.state !== expectedState
     )
-      throw new Error(`source ledger does not preserve run13 failure at schedule index ${index}`)
+      throw new Error(`source ledger does not preserve accepted pairs and run18 failure at schedule index ${index}`)
+    if (expectedState === "pass") {
+      if (
+        !isRecord(actual.evidence) ||
+        typeof actual.evidence.candidateCommit !== "string" ||
+        !/^[a-f0-9]{40}$/.test(actual.evidence.candidateCommit) ||
+        actual.evidence.modelIdentitySha256 !== source.continuation.sourceModelIdentitySha256 ||
+        actual.evidence.modelConfigSha256 !== source.continuation.sourceModelConfigSha256 ||
+        actual.evidence.context !== 81_920 ||
+        actual.evidence.outputReserve !== 4_096 ||
+        !Number.isInteger(actual.evidence.providerRequests) ||
+        Number(actual.evidence.providerRequests) < 1 ||
+        Number(actual.evidence.providerRequests) > expected.maxProviderRequests
+      )
+        throw new Error(`source ledger pass evidence invalid at run ${expected.run}`)
+      if (candidateCommit && candidateCommit !== actual.evidence.candidateCommit)
+        throw new Error("source ledger pass candidates disagree")
+      candidateCommit = actual.evidence.candidateCommit
+      passedProviderRequests += Number(actual.evidence.providerRequests)
+    }
   }
-  const run13 = source.runs[0]!
+  const run18 = source.runs[4]!
   if (
-    !isRecord(run13) ||
-    typeof run13.failureCode !== "string" ||
-    run13.failureCode.length === 0 ||
-    source.halted.reason !== run13.failureCode
+    !isRecord(run18) ||
+    typeof run18.failureCode !== "string" ||
+    run18.failureCode !== "external-quality-or-side-effect-failed" ||
+    source.halted.reason !== run18.failureCode ||
+    passedProviderRequests !== 18
   )
-    throw new Error("source ledger run13 failure is inconsistent")
+    throw new Error("source ledger run18 failure or request accounting is inconsistent")
 
   const sourceLedgerSha256 = sha256(sourceLedgerRaw)
   const summary: unknown = JSON.parse(failureSummaryRaw)
@@ -426,47 +454,49 @@ function continuationAnchor(sourceLedgerRaw: string, failureSummaryRaw: string):
     !isRecord(summary) ||
     typeof summary.candidate !== "string" ||
     !/^[a-f0-9]{40}$/.test(summary.candidate) ||
-    summary.run !== 13 ||
+    summary.candidate !== candidateCommit ||
+    summary.run !== 18 ||
     summary.status !== "FAIL" ||
     summary.consumed !== true ||
-    summary.acceptedM0 !== false ||
-    summary.originalLedgerFailureCode !== run13.failureCode ||
-    summary.derivedClassification !== "provider-upstream-http-503" ||
+    summary.acceptedT2 !== false ||
+    summary.originalLedgerFailureCode !== run18.failureCode ||
+    summary.derivedClassification !== "t2-answer-format-not-explicit" ||
     !isRecord(summary.upstream) ||
-    summary.upstream.actualForwardedRequests !== 1 ||
-    summary.upstream.httpStatus !== 503 ||
-    summary.upstream.normalCompletion !== false ||
-    !isRecord(summary.guard) ||
-    summary.guard.maximum !== 1 ||
-    summary.guard.additionalUpstreamForwards !== 0 ||
-    JSON.stringify(summary.remainingRuns) !== JSON.stringify([14, 15, 16, 17, 18, 19, 20, 21, 22]) ||
+    summary.upstream.actualForwardedRequests !== 7 ||
+    !isRecord(summary.diagnosis) ||
+    JSON.stringify(summary.diagnosis.failedConstraints) !== JSON.stringify(["answer-needle7-count-2"]) ||
+    summary.diagnosis.trajectoryPass !== true ||
+    summary.diagnosis.workspaceHashesIntact !== true ||
+    summary.diagnosis.sideEffects !== 0 ||
+    JSON.stringify(summary.preservedPasses) !== JSON.stringify([14, 15, 16, 17]) ||
+    JSON.stringify(summary.remainingRuns) !== JSON.stringify([19, 20, 21, 22, 23]) ||
     !isRecord(summary.artifacts) ||
     summary.artifacts["continuation-ledger.json"] !== sourceLedgerSha256
   )
-    throw new Error("run13 failure summary does not bind the source ledger")
+    throw new Error("run18 failure summary does not bind the source ledger")
 
   return {
     sourceLedgerSha256,
-    run13FailureSummarySha256: sha256(failureSummaryRaw),
-    sourceSchemaVersion: 3,
-    sourceContract: "s09-user-authorized-autonomous-acceptance-22",
-    sourceCeilingSessions: 22,
-    sourceHistoricalConsumedSessions: 12,
-    sourceConsumedSessions: 13,
-    sourceCandidateCommit: summary.candidate,
+    run18FailureSummarySha256: sha256(failureSummaryRaw),
+    sourceSchemaVersion: 4,
+    sourceContract: "s09-user-authorized-qwen-100req-acceptance-23",
+    sourceCeilingSessions: 23,
+    sourceHistoricalConsumedSessions: 13,
+    sourceConsumedSessions: 18,
+    sourceCandidateCommit: candidateCommit,
     sourceModelIdentitySha256: source.continuation.sourceModelIdentitySha256,
     sourceModelConfigSha256: source.continuation.sourceModelConfigSha256,
     sourceContext: 81_920,
     sourceOutputReserve: 4_096,
-    consumedRun: 13,
+    consumedRun: 18,
     consumedRunState: "fail",
-    consumedRunFailureCode: run13.failureCode,
+    consumedRunFailureCode: run18.failureCode,
   }
 }
 
 export async function initializePrivateRunLedger(
   file: string,
-  source: { sourceLedgerPath: string; run13FailureSummaryPath: string },
+  source: { sourceLedgerPath: string; run18FailureSummaryPath: string },
 ) {
   return withLedgerLock(file, async () => {
     try {
@@ -475,14 +505,14 @@ export async function initializePrivateRunLedger(
     } catch (error) {
       if (error instanceof Error && error.message.includes("already exists")) throw error
       if (!isRecord(error) || error.code !== "ENOENT") throw error
-      for (const sourcePath of [source.sourceLedgerPath, source.run13FailureSummaryPath]) {
+      for (const sourcePath of [source.sourceLedgerPath, source.run18FailureSummaryPath]) {
         const sourceStat = await lstat(sourcePath)
         if (!sourceStat.isFile() || (sourceStat.mode & 0o077) !== 0)
           throw new Error("continuation source evidence must be an owner-only regular file")
       }
       const anchor = continuationAnchor(
         await readFile(source.sourceLedgerPath, "utf8"),
-        await readFile(source.run13FailureSummaryPath, "utf8"),
+        await readFile(source.run18FailureSummaryPath, "utf8"),
       )
       const ledger = newPrivateRunLedger(anchor)
       const handle = await open(file, "wx", 0o600)

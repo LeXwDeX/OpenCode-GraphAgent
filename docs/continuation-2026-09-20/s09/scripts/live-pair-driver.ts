@@ -1050,13 +1050,25 @@ const taskConstraints: Readonly<Record<V3TaskID, (input: LiveTaskConstraintInput
       { name: "answer-f02-lastword", pass: finalWord.length > 0 && new RegExp(`\\b${escaped}\\b`).test(finalText) },
     ]
   },
-  "t2-repeated-search": ({ finalText }) => [
-    {
-      name: "answer-needle7-count-2",
-      pass: /\b2\b[^.]{0,40}occurrence|occurrence[^.]{0,40}\b2\b|\b2\b[^.]{0,40}NEEDLE-7/i.test(finalText),
-    },
-    { name: "answer-needle3-file", pass: /m02\.md/.test(finalText) },
-  ],
+  "t2-repeated-search": ({ finalText, manifest }) => {
+    const needle7Count = [...manifest.values()].reduce(
+      (total, body) => total + (body.match(/NEEDLE-7/g)?.length ?? 0),
+      0,
+    )
+    const needle3Files = [...manifest.entries()].flatMap(([file, body]) => (body.includes("NEEDLE-3") ? [file] : []))
+    const needle3File = needle3Files.length === 1 ? needle3Files[0]! : ""
+    const answer = /^\s*NEEDLE-7\s+count\s*=\s*(\d+)\s*;\s*NEEDLE-3\s+file\s*=\s*([^\s;]+)\s*$/i.exec(finalText)
+    return [
+      {
+        name: "answer-needle7-count",
+        pass: answer !== null && Number(answer[1]) === needle7Count,
+      },
+      {
+        name: "answer-needle3-file",
+        pass: needle3File.length > 0 && answer !== null && answer[2] === needle3File,
+      },
+    ]
+  },
   "t3-aba": ({ finalText, files, manifest }) => [
     { name: "version-restored-exact", pass: files.get("app/version.txt") === manifest.get("app/version.txt") },
     {
@@ -1074,6 +1086,10 @@ const taskConstraints: Readonly<Record<V3TaskID, (input: LiveTaskConstraintInput
       { name: "answer-p2-lines", pass: new RegExp(`\\b${p2Lines}\\b`).test(finalText) },
     ]
   },
+}
+
+export function validateTaskAnswer(id: V3TaskID, input: LiveTaskConstraintInput) {
+  return taskConstraints[id](input)
 }
 
 export function validateTaskTrajectory(input: { id: V3TaskID; directory: string; history: unknown[] }) {
@@ -1594,7 +1610,7 @@ async function runTask(input: {
   if (Date.now() > input.runDeadline) throw new DriverFailure("task-run-timeout")
   const finalText = messageText(responses.at(-1))
   const constraints = [
-    ...taskConstraints[id]({ finalText, files, manifest }),
+    ...validateTaskAnswer(id, { finalText, files, manifest }),
     validateLiveAnswerAttribution(id, finalText, manifest),
   ]
   const trajectory = validateTaskTrajectory({ id, directory: input.directory, history })
@@ -2094,15 +2110,17 @@ async function main() {
   const ledgerPath = absolutePath(requireArg("--ledger"), "--ledger")
   if (process.argv.includes("--initialize-continuation-ledger")) {
     const sourceLedgerPath = absolutePath(requireArg("--source-ledger"), "--source-ledger")
-    const run13FailureSummaryPath = absolutePath(requireArg("--run13-failure-summary"), "--run13-failure-summary")
-    await initializePrivateRunLedger(ledgerPath, { sourceLedgerPath, run13FailureSummaryPath })
+    const run18FailureSummaryPath = absolutePath(requireArg("--run18-failure-summary"), "--run18-failure-summary")
+    await initializePrivateRunLedger(ledgerPath, { sourceLedgerPath, run18FailureSummaryPath })
     console.log(
       JSON.stringify({
         status: "INITIALIZED_CONTINUATION",
-        ceilingSessions: 23,
-        historicalConsumedSessions: 13,
+        ceilingSessions: 24,
+        historicalConsumedSessions: 18,
         authorizedNewProviderRequestLimit: 100,
-        plannedProviderRequestMaximum: 98,
+        consumedNewProviderRequests: 25,
+        remainingNewProviderRequests: 75,
+        plannedProviderRequestMaximum: 72,
         fixedRuns: LIVE_RUN_PLAN.map((entry) => entry.run),
       }),
     )

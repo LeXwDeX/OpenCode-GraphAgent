@@ -10,96 +10,119 @@ import {
   failureArtifact,
   oneRequestPreflightOverflowEvidence,
   providerNon2xxFailure,
+  validateTaskAnswer,
   type PrivateConfig,
 } from "./live-pair-driver"
-import {
-  finishRunSlot,
-  initializePrivateRunLedger,
-  LIVE_RUN_PLAN,
-  markRunStarted,
-  reserveRunSlot,
-} from "./live-run-contract"
+import { initializePrivateRunLedger, LIVE_RUN_PLAN, type LiveRunPlan } from "./live-run-contract"
+import { materializeBodiesV3, V3_TASKS } from "./task-spec-v3"
 
 const sha256 = (input: string | Uint8Array) => new Bun.CryptoHasher("sha256").update(input).digest("hex")
 
 async function continuationSources(root: string, name: string) {
   const sourceLedgerPath = path.join(root, `${name}-source-ledger.json`)
-  const run13FailureSummaryPath = path.join(root, `${name}-run13-failure-summary.json`)
+  const run18FailureSummaryPath = path.join(root, `${name}-run18-failure-summary.json`)
   const sourcePlan = [
-    { run: 13, kind: "one-request-preflight", arm: "enabled", maxProviderRequests: 1 },
-    { run: 14, kind: "one-request-preflight", arm: "disabled", maxProviderRequests: 1 },
-    { run: 15, kind: "task", task: "T1", arm: "disabled", maxProviderRequests: 12 },
-    { run: 16, kind: "task", task: "T1", arm: "enabled", maxProviderRequests: 12 },
-    { run: 17, kind: "task", task: "T2", arm: "disabled", maxProviderRequests: 12 },
-    { run: 18, kind: "task", task: "T2", arm: "enabled", maxProviderRequests: 12 },
-    { run: 19, kind: "task", task: "T3", arm: "disabled", maxProviderRequests: 12 },
-    { run: 20, kind: "task", task: "T3", arm: "enabled", maxProviderRequests: 12 },
-    { run: 21, kind: "task", task: "T4", arm: "disabled", maxProviderRequests: 12 },
-    { run: 22, kind: "task", task: "T4", arm: "enabled", maxProviderRequests: 12 },
+    { run: 14, kind: "one-request-preflight", arm: "enabled", maxProviderRequests: 1 },
+    { run: 15, kind: "one-request-preflight", arm: "disabled", maxProviderRequests: 1 },
+    { run: 16, kind: "task", task: "T1", arm: "disabled", maxProviderRequests: 12 },
+    { run: 17, kind: "task", task: "T1", arm: "enabled", maxProviderRequests: 12 },
+    { run: 18, kind: "task", task: "T2", arm: "disabled", maxProviderRequests: 12 },
+    { run: 19, kind: "task", task: "T2", arm: "enabled", maxProviderRequests: 12 },
+    { run: 20, kind: "task", task: "T3", arm: "disabled", maxProviderRequests: 12 },
+    { run: 21, kind: "task", task: "T3", arm: "enabled", maxProviderRequests: 12 },
+    { run: 22, kind: "task", task: "T4", arm: "disabled", maxProviderRequests: 12 },
+    { run: 23, kind: "task", task: "T4", arm: "enabled", maxProviderRequests: 12 },
   ]
   const candidate = "a".repeat(40)
   const modelIdentitySha256 = "c6068fbb297e21966010177e6464efcda67792209001636ebbc3d9dcf85e19af"
   const modelConfigSha256 = "00b8fba22722ef212f8da42ed4b64ac493479dd5802dd56d5137606714c98662"
   const sourceLedgerRaw = `${JSON.stringify({
-    schemaVersion: 3,
-    contract: "s09-user-authorized-autonomous-acceptance-22",
-    ceilingSessions: 22,
-    historicalConsumedSessions: 12,
+    schemaVersion: 4,
+    contract: "s09-user-authorized-qwen-100req-acceptance-23",
+    ceilingSessions: 23,
+    historicalConsumedSessions: 13,
+    authorizedNewProviderRequestLimit: 100,
+    plannedProviderRequestMaximum: 98,
     retryBudget: 0,
     continuation: {
       sourceLedgerSha256: "d".repeat(64),
-      run12FailureSummarySha256: "e".repeat(64),
-      sourceSchemaVersion: 2,
-      sourceContract: "s09-user-approved-continuation-20",
-      sourceCeilingSessions: 20,
-      sourceHistoricalConsumedSessions: 10,
-      sourceConsumedSessions: 12,
-      sourceCandidateCommit: "9".repeat(40),
+      run13FailureSummarySha256: "e".repeat(64),
+      sourceSchemaVersion: 3,
+      sourceContract: "s09-user-authorized-autonomous-acceptance-22",
+      sourceCeilingSessions: 22,
+      sourceHistoricalConsumedSessions: 12,
+      sourceConsumedSessions: 13,
+      sourceCandidateCommit: candidate,
       sourceModelIdentitySha256: modelIdentitySha256,
       sourceModelConfigSha256: modelConfigSha256,
       sourceContext: 81_920,
       sourceOutputReserve: 4_096,
-      consumedRun: 12,
+      consumedRun: 13,
       consumedRunState: "fail",
-      consumedRunFailureCode: "stub-run12-fixture-overflow",
+      consumedRunFailureCode: "unclassified-live-run-failure",
     },
-    halted: { at: "2026-09-20T00:00:04.000Z", run: 13, reason: "unclassified-live-run-failure" },
+    halted: { at: "2026-09-20T00:00:18.000Z", run: 18, reason: "external-quality-or-side-effect-failed" },
     runs: sourcePlan.map((entry, index) =>
-      index === 0
+      index < 4
         ? {
             ...entry,
-            state: "fail",
-            lease: "stub-run13-lease",
+            state: "pass",
+            lease: `stub-run${entry.run}-lease`,
             reservedAt: "2026-09-20T00:00:00.000Z",
             startedAt: "2026-09-20T00:00:01.000Z",
-            finishedAt: "2026-09-20T00:00:04.000Z",
-            failureCode: "unclassified-live-run-failure",
+            finishedAt: "2026-09-20T00:00:02.000Z",
+            evidence: {
+              candidateCommit: candidate,
+              freezeManifestSha256: "f".repeat(64),
+              modelIdentitySha256,
+              modelConfigSha256,
+              hostResolvedEvidenceSha256: String(index + 1).repeat(64),
+              context: 81_920,
+              outputReserve: 4_096,
+              providerRequests: [1, 1, 8, 8][index],
+              resultSha256: "8".repeat(64),
+            },
           }
-        : { ...entry, state: "planned" },
+        : index === 4
+          ? {
+              ...entry,
+              state: "fail",
+              lease: "stub-run18-lease",
+              reservedAt: "2026-09-20T00:00:15.000Z",
+              startedAt: "2026-09-20T00:00:16.000Z",
+              finishedAt: "2026-09-20T00:00:18.000Z",
+              failureCode: "external-quality-or-side-effect-failed",
+            }
+          : { ...entry, state: "planned" },
     ),
     updatedAt: "2026-09-20T00:00:04.000Z",
   })}\n`
   await writeFile(sourceLedgerPath, sourceLedgerRaw, { mode: 0o600 })
   await writeFile(
-    run13FailureSummaryPath,
+    run18FailureSummaryPath,
     `${JSON.stringify({
       schemaVersion: 1,
       candidate,
-      classificationPatchCandidate: "4".repeat(40),
-      run: 13,
+      run: 18,
       status: "FAIL",
       consumed: true,
-      acceptedM0: false,
-      originalLedgerFailureCode: "unclassified-live-run-failure",
-      derivedClassification: "provider-upstream-http-503",
-      upstream: { actualForwardedRequests: 1, httpStatus: 503, normalCompletion: false },
-      guard: { maximum: 1, additionalUpstreamForwards: 0 },
-      remainingRuns: [14, 15, 16, 17, 18, 19, 20, 21, 22],
+      acceptedT2: false,
+      originalLedgerFailureCode: "external-quality-or-side-effect-failed",
+      derivedClassification: "t2-answer-format-not-explicit",
+      upstream: { actualForwardedRequests: 7 },
+      diagnosis: {
+        failedConstraints: ["answer-needle7-count-2"],
+        trajectoryPass: true,
+        workspaceHashesIntact: true,
+        sideEffects: 0,
+      },
+      preservedPasses: [14, 15, 16, 17],
+      remainingRuns: [19, 20, 21, 22, 23],
       artifacts: { "continuation-ledger.json": sha256(sourceLedgerRaw) },
     })}\n`,
     { mode: 0o600 },
   )
-  return { sourceLedgerPath, run13FailureSummaryPath }
+  return { sourceLedgerPath, run18FailureSummaryPath }
 }
 
 async function productionRecentProtection(historyPath: string) {
@@ -227,6 +250,24 @@ test("classifies the first upstream non-2xx without treating blocked SDK retries
   ).toBe("provider-upstream-http-503")
 })
 
+test("requires T2 to report computed count and path without leaking fixture answers in the prompt", () => {
+  const manifest = materializeBodiesV3("t2-repeated-search")
+  const files = new Map(manifest)
+  const check = (finalText: string) =>
+    validateTaskAnswer("t2-repeated-search", { finalText, files, manifest }).every((item) => item.pass)
+
+  expect(V3_TASKS["t2-repeated-search"].prompts[1]!.text).toContain(
+    "NEEDLE-7 count=<integer>; NEEDLE-3 file=<relative-path>",
+  )
+  expect(V3_TASKS["t2-repeated-search"].prompts[1]!.text).not.toContain("NEEDLE-7 count=2")
+  expect(check("NEEDLE-7 count=2; NEEDLE-3 file=src/m02.md")).toBe(true)
+  expect(check("NEEDLE-7 count=3; NEEDLE-3 file=src/m02.md")).toBe(false)
+  expect(check("NEEDLE-7 count=2; NEEDLE-3 file=src/m03.md")).toBe(false)
+  expect(check("NEEDLE-7 count=2.5; NEEDLE-3 file=src/m02.md")).toBe(false)
+  expect(check("NEEDLE-7 count=2; NEEDLE-3 file=src/m02.md.bak")).toBe(false)
+  expect(check("NEEDLE-7 appears in src/m01.md and src/m04.md; NEEDLE-3 is in src/m02.md")).toBe(false)
+})
+
 test("runs enabled and disabled preflights through the real host using only loopback providers", async () => {
   const preserved = process.env.S09_STUB_OUTPUT
   const root = preserved ?? (await mkdtemp(path.join(os.tmpdir(), "s09-live-full-stub-")))
@@ -293,32 +334,17 @@ test("runs enabled and disabled preflights through the real host using only loop
   try {
     await initializePrivateRunLedger(ledgerPath, await continuationSources(root, "main"))
     await mkdir(outputRoot, { recursive: true, mode: 0o700 })
-    for (const plan of LIVE_RUN_PLAN.slice(0, 2)) {
-      let reservation: Awaited<ReturnType<typeof reserveRunSlot>> | undefined
+    const preflightPlans: readonly LiveRunPlan[] = [
+      { run: 90, kind: "one-request-preflight", arm: "enabled", maxProviderRequests: 1 },
+      { run: 91, kind: "one-request-preflight", arm: "disabled", maxProviderRequests: 1 },
+    ]
+    for (const plan of preflightPlans) {
       const executed = await executeLiveRun({
         config,
         ledgerPath,
         outputRoot,
         plan,
-        beforeExternal: async () => {
-          reservation = await reserveRunSlot(ledgerPath, plan.run)
-          await markRunStarted(ledgerPath, reservation)
-        },
-      })
-      if (!reservation) throw new Error("stub run reached external provider before reservation")
-      await finishRunSlot(ledgerPath, reservation, {
-        state: "pass",
-        evidence: {
-          candidateCommit: candidateSha,
-          freezeManifestSha256: config.freezeManifestSha256,
-          modelIdentitySha256: executed.proof.modelIdentitySha256,
-          modelConfigSha256: executed.proof.modelConfigSha256,
-          hostResolvedEvidenceSha256: executed.hostResolvedEvidenceSha256,
-          context: executed.proof.context,
-          outputReserve: executed.proof.outputReserve,
-          providerRequests: executed.providerRequests,
-          resultSha256: executed.resultSha256,
-        },
+        beforeExternal: async () => {},
       })
       expect(executed.providerRequests).toBe(1)
       expect(executed.summary).toMatchObject({
@@ -328,13 +354,13 @@ test("runs enabled and disabled preflights through the real host using only loop
         providerRequests: 1,
       })
     }
-    expect(await Bun.file(path.join(outputRoot, "run-14", "result.json")).exists()).toBe(true)
-    expect(await Bun.file(path.join(outputRoot, "run-15", "paired-window-proof.json")).exists()).toBe(true)
-    const enabledResult = await Bun.file(path.join(outputRoot, "run-14", "result.json")).json()
+    expect(await Bun.file(path.join(outputRoot, "run-90", "result.json")).exists()).toBe(true)
+    expect(await Bun.file(path.join(outputRoot, "run-91", "result.json")).exists()).toBe(true)
+    const enabledResult = await Bun.file(path.join(outputRoot, "run-90", "result.json")).json()
     expect(enabledResult.usage.providerReported[0]).toMatchObject({ input: 70_000, output: 21, cacheRead: 0 })
     expect(enabledResult.result.outbound.foldedSources).toBe(1)
     const protection = await productionRecentProtection(
-      path.join(outputRoot, "run-14", "rounds", "round-06-before-history.json"),
+      path.join(outputRoot, "run-90", "rounds", "round-06-before-history.json"),
     )
     expect(protection.protectedSteps).toBe(4)
     expect(protection.protectedTokens).toBeGreaterThanOrEqual(16_000)
@@ -345,38 +371,33 @@ test("runs enabled and disabled preflights through the real host using only loop
     await mkdir(overflowOutputRoot, { recursive: true, mode: 0o700 })
     promptTokens = 146_551
     const callsBeforeOverflow = upstreamCalls
-    let overflowReservation: Awaited<ReturnType<typeof reserveRunSlot>> | undefined
     let overflowError: unknown
     try {
       await executeLiveRun({
         config,
         ledgerPath: overflowLedgerPath,
         outputRoot: overflowOutputRoot,
-        plan: LIVE_RUN_PLAN[0]!,
-        beforeExternal: async () => {
-          overflowReservation = await reserveRunSlot(overflowLedgerPath, 14)
-          await markRunStarted(overflowLedgerPath, overflowReservation)
-        },
+        plan: preflightPlans[0]!,
+        beforeExternal: async () => {},
       })
     } catch (error) {
       overflowError = error
     }
-    expect(overflowReservation).toBeDefined()
     expect(overflowError).toBeDefined()
     expect(upstreamCalls - callsBeforeOverflow).toBe(1)
     expect(
-      await Bun.file(path.join(overflowOutputRoot, "run-14", "captures", "external-request-01.json")).exists(),
+      await Bun.file(path.join(overflowOutputRoot, "run-90", "captures", "external-request-01.json")).exists(),
     ).toBe(true)
     expect(
-      await Bun.file(path.join(overflowOutputRoot, "run-14", "captures", "external-request-02.json")).exists(),
+      await Bun.file(path.join(overflowOutputRoot, "run-90", "captures", "external-request-02.json")).exists(),
     ).toBe(false)
-    const overflowLog = await Bun.file(path.join(overflowOutputRoot, "run-14", "host.stderr.log")).text()
+    const overflowLog = await Bun.file(path.join(overflowOutputRoot, "run-90", "host.stderr.log")).text()
     expect(overflowLog).toContain("agent=compaction")
     expect(overflowLog).toContain("AI_APICallError: Too Many Requests")
-    const artifact = failureArtifact(14, overflowError)
+    const artifact = failureArtifact(90, overflowError)
     expect(artifact).toEqual({
       schemaVersion: 1,
-      run: 14,
+      run: 90,
       code: "provider-usage-exceeded-usable-context-auto-compaction-blocked",
       evidence: {
         schemaVersion: 1,
@@ -430,24 +451,10 @@ test("runs enabled and disabled preflights through the real host using only loop
       }),
     ).toBeUndefined()
     await writeFile(
-      path.join(overflowOutputRoot, "run-14", "failure-classification.json"),
+      path.join(overflowOutputRoot, "run-90", "failure-classification.json"),
       `${JSON.stringify(artifact, null, 2)}\n`,
       { mode: 0o600 },
     )
-    await finishRunSlot(overflowLedgerPath, overflowReservation!, {
-      state: "fail",
-      failureCode: artifact.code,
-    })
-    const overflowLedger = await Bun.file(overflowLedgerPath).json()
-    expect(overflowLedger.halted).toMatchObject({
-      run: 14,
-      reason: "provider-usage-exceeded-usable-context-auto-compaction-blocked",
-    })
-    expect(overflowLedger.runs.find((run: { run: number }) => run.run === 14)).toMatchObject({
-      run: 14,
-      state: "fail",
-      failureCode: "provider-usage-exceeded-usable-context-auto-compaction-blocked",
-    })
   } finally {
     await upstream.stop(true)
     if (!preserved) await rm(root, { recursive: true, force: true })
