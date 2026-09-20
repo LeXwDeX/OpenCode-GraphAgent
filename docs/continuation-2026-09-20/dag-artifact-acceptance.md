@@ -157,13 +157,43 @@ print("CLI hold artifact target and transcripts: PASS")
 PY
 ```
 
-该入口只证明下载并隔离安装的 binary 能通过这两个 DAG/no-DAG hold 回归。它不覆盖其余三个源码 subprocess 案例、历史 5/5 真实模型回放、外部 provider、TUI 交互或其他平台资产；这些边界必须在最终记录中保留。TestLLMServer 只监听随机 loopback 端口，harness 同时为每案建立独立 `OPENCODE_TEST_HOME`、HOME 和 XDG 子进程环境，并禁用外部插件、自动更新与模型目录抓取。
+该入口只证明下载并隔离安装的 binary 能通过这两个 DAG/no-DAG hold 回归。它不覆盖其余三个源码 subprocess 案例、历史 5/5 真实模型回放、外部 provider 或其他平台资产；这些边界必须在最终记录中保留。TestLLMServer 只监听随机 loopback 端口，harness 同时为每案建立独立 `OPENCODE_TEST_HOME`、HOME 和 XDG 子进程环境，并禁用外部插件、自动更新与模型目录抓取。
+
+真实 TUI 的排队消息编辑/冲突/删除使用独立的后台 PTY 用例。harness 通过仓库已有 `bun-pty` 驱动进程、用 `ghostty-web` 解析固定尺寸屏幕、按屏幕文字定位并发送 SGR 鼠标事件，不占用用户焦点或指针。用例验证 Q1 编辑后保留原附件 ID 和顺序、Q2 弹窗打开后外部文字与附件变化触发冲突且不被覆盖、Q3 删除后 API 返回 404；首个 provider 请求在这些操作期间保持阻塞，释放后下一请求包含 Q1/Q2 的最终文字且不含 Q3。附件身份由持久 API 读回和实际屏幕证明；provider 转换不保证保留文件名。
+
+源码模式只用于准备和回归 harness，不能计作制品验收：
+
+```bash
+cd packages/opencode
+OPENCODE_TEST_TUI_SOURCE=1 \
+OPENCODE_TEST_TUI_EVIDENCE_DIR="$ROOT/tui-source-evidence" \
+bun test --timeout 120000 test/cli/tui/queued-message-artifact.test.ts
+```
+
+最终制品阶段必须将同一用例指向下载并隔离安装的绝对 binary 路径：
+
+```bash
+mkdir -m 700 "$ROOT/tui-queue-evidence"
+cd packages/opencode
+OPENCODE_TEST_ARTIFACT_EXECUTABLE="$ROOT/bin/opencode" \
+OPENCODE_TEST_TUI_EVIDENCE_DIR="$ROOT/tui-queue-evidence" \
+bun test --timeout 120000 test/cli/tui/queued-message-artifact.test.ts \
+  2>&1 | tee "$ROOT/tui-queue-artifact.log"
+
+test -s "$ROOT/tui-queue-evidence/raw.ansi"
+test -s "$ROOT/tui-queue-evidence/frames.json"
+test -s "$ROOT/tui-queue-evidence/inputs.json"
+test -s "$ROOT/tui-queue-evidence/provider-requests.json"
+test -s "$ROOT/tui-queue-evidence/result.json"
+```
+
+`result.json` 记录 target 模式、artifact realpath/SHA256、direct argv、终端尺寸、实际退出状态与已完成断言；`raw.ansi`、`frames.json`、`inputs.json` 和 `provider-requests.json` 分别保留原始终端输出、解析屏幕帧、输入字节和 loopback provider 请求。只有 `mode=artifact` 且 target SHA256 与本轮安装后二进制一致的成功运行，才补上真实 TUI 的制品证据。
 
 ## 4. 接线与最终记录
 
 - 提示词来源：`packages/core/src/plugin/command/{workflow-routing.md,workflow.md,workflow-blocks.md,orchestration-policy.md,orchestration-domains.md,dag-auto.txt}`；`packages/core/src/plugin/command.ts` 导出内容，`packages/opencode/src/command/index.ts` 注册 `/dag-auto`，`packages/opencode/src/tool/workflow.ts` 注入 workflow tool description/guide。
 - 发布接线：`.github/workflows/release-fork.yml` 将经校验的配置仓库模板通过 `DAG_TEMPLATES_DIR` 交给 `packages/opencode/script/generate.ts`，再构建、打包、校验版本与 macOS 安装。该模板快照与 PR 611 的 resident heuristic prompt 是两个边界，不能用“模板已打包”替代 `/dag-auto` 加载验证。
 - 既有断言：`packages/core/test/plugin/command.test.ts`、`packages/opencode/test/command/command.test.ts`、`packages/opencode/test/dag/workflow-tool.test.ts`；hold 单元/子进程入口见上节。
-- 最终验收记录至少写入：`TAG`、`DEV_SHA`、release URL/target、平台资产名和 SHA256、安装后二进制版本、签名/help、`commands.json` 标记结果、同 SHA required checks、全局 1.0.44 前后版本/哈希、CLI target 模式/realpath/安装后二进制 SHA256、两案结果和私有 request transcript 路径。未运行上述两案时，CLI hold 仍是制品缺口，不能宣称完成。
+- 最终验收记录至少写入：`TAG`、`DEV_SHA`、release URL/target、平台资产名和 SHA256、安装后二进制版本、签名/help、`commands.json` 标记结果、同 SHA required checks、全局 1.0.44 前后版本/哈希、CLI target 模式/realpath/安装后二进制 SHA256、两案结果和私有 request transcript 路径、TUI 的 raw ANSI/frames/inputs/provider transcript/result 路径。未运行上述 CLI 两案和 TUI 用例时，对应制品缺口仍然存在，不能宣称完成。
 
 图证据使用主项目 generation `2026-09-20T01:11:31Z`、Tier 2。上述路径 coverage 均为 `no_recorded_issue`/`metadata_match`，唯 `dag-auto.txt` 的 freshness 为 `not_tracked`，已直接读取当前源码；coverage 仅是 best-effort 信号。

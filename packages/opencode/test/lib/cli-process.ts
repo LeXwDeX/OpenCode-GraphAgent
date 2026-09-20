@@ -259,6 +259,7 @@ export type OpencodeCli = {
 export type CliFixture = {
   readonly llm: TestLLMServer["Service"]
   readonly home: string
+  readonly env: Readonly<Record<string, string>>
   readonly opencode: OpencodeCli
   readonly target: ResolvedCliTarget
 }
@@ -290,7 +291,7 @@ export function withCliFixture<A, E>(
     )
 
     const configJson = JSON.stringify(testProviderConfig(llm.url))
-    const env = isolatedEnv(home, configJson)
+    const env: Readonly<Record<string, string>> = Object.freeze({ ...isolatedEnv(home, configJson) })
     const memoryConfigDir = path.join(home, ".config/opencode")
     yield* fs.makeDirectory(memoryConfigDir, { recursive: true })
     // CLI tests own the provider response queue, while dedicated MEMORY tests
@@ -584,7 +585,7 @@ export function withCliFixture<A, E>(
 
     const opencode: OpencodeCli = { target, run, startRun, serve, acp, spawn, expectExit, parseJsonEvents }
 
-    return yield* fn({ llm, home, opencode, target })
+    return yield* fn({ llm, home, env, opencode, target })
     // FetchHttpClient is provided so test bodies can `yield* HttpClient.HttpClient`
     // and hit endpoints on `opencode.serve()` without rolling their own fetch.
   }).pipe(
