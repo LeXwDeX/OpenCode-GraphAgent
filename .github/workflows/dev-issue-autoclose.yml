@@ -41,7 +41,8 @@ jobs:
   autoclose:
     name: Auto-close linked issues
     if: github.event.pull_request.merged == true && github.event.pull_request.base.ref == 'dev'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
+    timeout-minutes: 10
     steps:
       - name: Close linked issues referenced in the PR body
         env:

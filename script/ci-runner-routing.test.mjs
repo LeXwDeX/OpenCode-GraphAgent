@@ -93,10 +93,62 @@ await test("self-hosted Linux jobs never require sudo: prerequisites are checked
   )
 })
 
-await test("privileged release and issue automation stay on GitHub-hosted runners", () => {
-  for (const file of ["release-fork.yml", "dev-issue-autoclose.yml"]) {
-    const content = workflow(file)
-    assert(content.includes("runs-on: ubuntu-latest"), `${file}: hosted runner lost`)
-    assert(!content.includes("self-hosted"), `${file}: privileged job moved to self-hosted`)
-  }
+await test("manual release routes trusted Linux and Windows work while keeping macOS hosted", () => {
+  const file = workflow("release-fork.yml")
+
+  assert(!file.includes("pull_request:"), "release workflow must not accept pull request code")
+  assert(file.includes("if: github.event_name == 'workflow_dispatch'"), "release work is not dispatch-gated")
+  assert(file.includes("runner: [self-hosted, Linux, X64]"), "Linux build route")
+  assert(file.includes("runner: [self-hosted, Windows, X64]"), "Windows build route")
+  assert(file.includes("runner: macos-latest"), "macOS hosted route")
+  assert.equal(file.split("runs-on: [self-hosted, Linux, X64]").length - 1, 5, "trusted Linux jobs")
+  assert(!file.includes("runs-on: ubuntu-latest"), "trusted Linux job left on a hosted runner")
+})
+
+await test("release checkout credentials and third-party action versions are fixed", () => {
+  const file = workflow("release-fork.yml")
+  const checkout = "actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5"
+  const download = "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
+  const upload = "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
+
+  assert.equal(file.split(checkout).length - 1, 5, "pinned checkout steps")
+  assert.equal(file.split("persist-credentials: false").length - 1, 5, "credential-free checkout steps")
+  assert.equal(file.split(download).length - 1, 3, "pinned download steps")
+  assert.equal(file.split(upload).length - 1, 3, "pinned upload steps")
+  assert(!/actions\/(?:checkout|download-artifact|upload-artifact)@v\d/.test(file), "mutable action tag remains")
+})
+
+await test("release candidate preparation is read-only and publication owns the only write token", () => {
+  const file = workflow("release-fork.yml")
+  const prepare = file.slice(file.indexOf("\n  prepare-release:"), file.indexOf("\n  publish-release:"))
+  const publish = file.slice(file.indexOf("\n  publish-release:"), file.indexOf("\n  # No-op job"))
+
+  assert(file.includes("default: false"), "publishing must be opt-in")
+  assert(file.includes("permissions:\n  contents: read"), "workflow default permissions")
+  assert(prepare.includes("Generate SHA256SUMS"), "candidate checksum preparation")
+  assert(prepare.includes("Render Release Notes (fail closed)"), "candidate notes validation")
+  assert(prepare.includes("Verify Release Candidate"), "candidate verification")
+  assert(prepare.includes("Upload Release Candidate"), "candidate artifact upload")
+  assert(!prepare.includes("contents: write"), "prepare job gained write permission")
+  assert(!prepare.includes("GH_TOKEN"), "prepare job gained a write token")
+  assert(publish.includes("if: inputs.create_release"), "publish opt-in guard")
+  assert(publish.includes("permissions:\n      contents: write"), "publish write permission")
+  assert(publish.includes("GH_TOKEN: ${{ github.token }}"), "publish token")
+  assert.equal(file.split("contents: write").length - 1, 1, "only publish may write contents")
+  assert.equal(file.split("GH_TOKEN: ${{ github.token }}").length - 1, 1, "only publish receives GH_TOKEN")
+  assert(file.includes("set -o pipefail"), "template provenance capture must preserve packager failures")
+  assert(file.includes("Verify Template Provenance"), "template provenance validation")
+  for (const field of ["runtime_commit", "template_commit", "compat_runtime_sha"])
+    assert(file.includes(field), `template provenance field: ${field}`)
+  assert(file.includes("command -v sha256sum"), "Linux checksum fallback")
+  assert(publish.includes('"${assets[@]}"'), "publish must tolerate a selected platform subset")
+})
+
+await test("dev issue auto-close uses the trusted Linux runner without checking out PR code", () => {
+  const file = workflow("dev-issue-autoclose.yml")
+  assert(file.includes("github.event.pull_request.merged == true"), "merged-event gate")
+  assert(file.includes("github.event.pull_request.base.ref == 'dev'"), "dev-base gate")
+  assert(file.includes("runs-on: [self-hosted, Linux, X64]"), "trusted Linux route")
+  assert(file.includes("timeout-minutes: 10"), "bounded job")
+  assert(!file.includes("uses: actions/checkout"), "event helper must not check out PR code")
 })
