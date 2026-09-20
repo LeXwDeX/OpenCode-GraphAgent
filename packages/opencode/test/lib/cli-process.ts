@@ -279,8 +279,7 @@ export function withCliFixture<A, E>(
     if (target.mode === "artifact") {
       // This line is the durable test-log binding between a run and the exact
       // installed artifact. Source-mode tests stay silent and unchanged.
-      // eslint-disable-next-line no-console
-      console.error(`[cli-target] mode=artifact executable=${target.executable} sha256=${target.sha256}`)
+      process.stderr.write(`[cli-target] mode=artifact executable=${target.executable} sha256=${target.sha256}\n`)
     }
 
     const home = yield* fs.makeTempDirectory({ prefix: "oc-cli-" })
