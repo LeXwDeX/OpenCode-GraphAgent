@@ -1,4 +1,5 @@
 import { NodeFileSystem } from "@effect/platform-node"
+import { createHash } from "node:crypto"
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Database } from "@opencode-ai/core/database/database"
@@ -523,14 +524,38 @@ const outboundToolResult = (body: unknown, callID: string) => {
 const foldedPlaceholder = (witnessCallID: string) =>
   `[Duplicate tool output folded. Identical full output is retained in later tool call ${JSON.stringify(witnessCallID)}.]`
 
+const outputFingerprint = (output: string | undefined) =>
+  output === undefined
+    ? "missing"
+    : `bytes=${Buffer.byteLength(output, "utf8")} sha256=${createHash("sha256").update(output).digest("hex")}`
+
 const expectFoldedBuiltinPair = (input: {
+  tool: "read" | "grep" | "glob"
   body: unknown
   sourceCallID: string
+  sourceOutput: string
   witnessCallID: string
   witnessOutput: string
 }) => {
-  expect(outboundToolResult(input.body, input.sourceCallID)).toBe(foldedPlaceholder(input.witnessCallID))
-  expect(outboundToolResult(input.body, input.witnessCallID)).toBe(input.witnessOutput)
+  const outboundSource = outboundToolResult(input.body, input.sourceCallID)
+  const outboundWitness = outboundToolResult(input.body, input.witnessCallID)
+  const expectedSource = foldedPlaceholder(input.witnessCallID)
+  const storedIdentical = input.sourceOutput === input.witnessOutput
+  const sourceFolded = outboundSource === expectedSource
+  const witnessIntact = outboundWitness === input.witnessOutput
+  if (storedIdentical && sourceFolded && witnessIntact) return
+  throw new Error(
+    [
+      `context folding ${input.tool} pair mismatch`,
+      `storedIdentical=${storedIdentical}`,
+      `sourceFolded=${sourceFolded}`,
+      `witnessIntact=${witnessIntact}`,
+      `storedSource(${outputFingerprint(input.sourceOutput)})`,
+      `storedWitness(${outputFingerprint(input.witnessOutput)})`,
+      `outboundSource(${outputFingerprint(outboundSource)})`,
+      `outboundWitness(${outputFingerprint(outboundWitness)})`,
+    ].join("; "),
+  )
 }
 
 const ensureDir = Effect.fn("test.ensureDir")(function* (dir: string) {
@@ -1521,24 +1546,30 @@ const contextFoldingClosedLoop = (runtime: "ai-sdk" | "native") =>
     const outboundBody = hits.at(-1)?.body ?? {}
     const outbound = JSON.stringify(outboundBody)
     expect(outbound).toContain("Duplicate tool output folded")
-    expect((outbound.match(/Duplicate tool output folded/g) ?? []).length).toBeGreaterThanOrEqual(3)
     for (const [tool, marker] of [
       ["read", "read-body-abcdefghij"],
       ["grep", "needle-39-"],
       ["glob", "context-folding-079-"],
     ] as const) {
+      const sourceCallID = `call-${tool}-source`
       const witnessCallID = `call-${tool}-witness`
+      const source = beforeByCallID.get(sourceCallID)
       const witness = beforeByCallID.get(witnessCallID)
+      expect(source).toBeDefined()
       expect(witness).toBeDefined()
+      if (!source) throw new Error(`missing stored ${tool} source`)
       if (!witness) throw new Error(`missing stored ${tool} witness`)
       expect(witness.state.output).toContain(marker)
       expectFoldedBuiltinPair({
+        tool,
         body: outboundBody,
-        sourceCallID: `call-${tool}-source`,
+        sourceCallID,
+        sourceOutput: source.state.output,
         witnessCallID,
         witnessOutput: witness.state.output,
       })
     }
+    expect((outbound.match(/Duplicate tool output folded/g) ?? []).length).toBeGreaterThanOrEqual(3)
     expect(outbound).toContain(uniqueMarker)
     expect(outbound).toContain("read-body-abcdefghij")
     expect(outbound).toContain("needle-39-")
@@ -1982,24 +2013,30 @@ const seedFoldedOpenCodeLifecycle = Effect.fn("test.seedFoldedOpenCodeLifecycle"
   yield* prompt.loop({ sessionID: session.id })
   const foldedBody = (yield* llm.hits).at(-1)?.body ?? {}
   const foldedText = JSON.stringify(foldedBody)
-  expect(occurrences(foldedText, "Duplicate tool output folded")).toBeGreaterThanOrEqual(3)
   for (const [tool, marker] of [
     ["read", markers.read],
     ["grep", `lifecycle-needle-39-${input.runtime}-`],
     ["glob", `lifecycle-glob-079-${input.runtime}-`],
   ] as const) {
+    const sourceCallID = `call-lifecycle-${tool}-source`
     const witnessCallID = `call-lifecycle-${tool}-witness`
+    const source = persistedByCallID.get(sourceCallID)
     const witness = persistedByCallID.get(witnessCallID)
+    expect(source).toBeDefined()
     expect(witness).toBeDefined()
+    if (!source) throw new Error(`missing stored lifecycle ${tool} source`)
     if (!witness) throw new Error(`missing stored lifecycle ${tool} witness`)
     expect(witness.output).toContain(marker)
     expectFoldedBuiltinPair({
+      tool,
       body: foldedBody,
-      sourceCallID: `call-lifecycle-${tool}-source`,
+      sourceCallID,
+      sourceOutput: source.output,
       witnessCallID,
       witnessOutput: witness.output,
     })
   }
+  expect(occurrences(foldedText, "Duplicate tool output folded")).toBeGreaterThanOrEqual(3)
   expect(foldedText).toContain("call-lifecycle-read-witness")
   expect(foldedText).toContain("call-lifecycle-grep-witness")
   expect(foldedText).toContain("call-lifecycle-glob-witness")

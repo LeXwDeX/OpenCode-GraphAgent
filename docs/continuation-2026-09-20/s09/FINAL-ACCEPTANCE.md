@@ -86,6 +86,11 @@ Run 21 本身通过，但因对应 enabled Run 22 失败而不进入最终配对
   Linux 的精确选择差异未能在 macOS 复现；修复把相同规模正文改为每行低于 2000 字符，并增加 read 未截断、
   三类 source 精确占位和 witness 逐字完整断言。产品实现和真实模型结果没有改动，也没有新增模型调用。
   原失败日志 SHA-256 为 `1e2154503758152b17ab6723ecb9ca08c0e88ae42dbbe91158cdb9bf042c415c`。
+- 后续 head `55423042bf` 的 Linux Unit Tests 仍有相同 8 个折叠数失败，但新增的 read 长度和未截断断言已通过；
+  原有总数断言先于逐工具断言失败，尚不能据此确认缺少的是 read、grep 还是 glob。测试现先逐项核对三类工具，并且
+  只输出 source/witness 是否逐字相同以及各自长度和 SHA-256。glob 文件枚举顺序仍只是待该诊断证据验证的假设，
+  没有因此修改产品排序或折叠门槛。该次失败日志 SHA-256 为
+  `337949d236ff15c25c93fe0455a27e70a0e9f3c38cec9febe7c62064cc9ef5a4`。
 - `requestPreparationDurationMs` 不可用：当前 host diagnostic 没有发出该字段。
 - live-host RSS baseline/peak/delta 不可用：没有可靠的 live sampler；P0 RSS 没有冒充真实模型运行 RSS。
 - provider cache-write 不可用；没有把缺失值写成 0。
