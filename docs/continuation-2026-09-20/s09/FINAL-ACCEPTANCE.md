@@ -91,6 +91,12 @@ Run 21 本身通过，但因对应 enabled Run 22 失败而不进入最终配对
   只输出 source/witness 是否逐字相同以及各自长度和 SHA-256。glob 文件枚举顺序仍只是待该诊断证据验证的假设，
   没有因此修改产品排序或折叠门槛。该次失败日志 SHA-256 为
   `337949d236ff15c25c93fe0455a27e70a0e9f3c38cec9febe7c62064cc9ef5a4`。
+- head `69a80df189` 的 Linux focused preflight 随后确认 8 个失败均来自 glob：read/grep 配对先通过；glob 的
+  source/witness 字节数相同但 SHA-256 不同，source 因完整 identity 不成立而保持原文，witness 完整。结合生产
+  GlobTool 按 Ripgrep 返回顺序直接拼接、Ripgrep 调用没有排序参数，证据支持枚举顺序漂移，但哈希本身不单独证明
+  唯一差异一定是排序。正向集成 fixture 现在通过仅测试用 layer 对真实 Ripgrep glob entries 按 path 稳定排序，
+  继续覆盖 builtin GlobTool、可信 ledger、持久历史和 outbound 投影；生产实现及其严格 identity 规则不变。
+  focused 失败日志 SHA-256 为 `c103faf192ce2351d3babc0be7649d48b45ea844f4fb677ce75946e9b05743d9`。
 - `requestPreparationDurationMs` 不可用：当前 host diagnostic 没有发出该字段。
 - live-host RSS baseline/peak/delta 不可用：没有可靠的 live sampler；P0 RSS 没有冒充真实模型运行 RSS。
 - provider cache-write 不可用；没有把缺失值写成 0。

@@ -271,6 +271,7 @@ type PromptLayerOptions = {
   goalLayer?: Layer.Layer<Goal.Service>
   memoryContext?: string[]
   agentLayer?: Layer.Layer<AgentSvc.Service>
+  ripgrepLayer?: Layer.Layer<Ripgrep.Service>
   native?: boolean
 }
 
@@ -331,7 +332,7 @@ function makePrompt(input?: PromptLayerOptions) {
     Layer.provide(FetchHttpClient.layer),
     Layer.provide(CrossSpawnSpawner.defaultLayer),
     Layer.provide(Git.defaultLayer),
-    Layer.provide(Ripgrep.defaultLayer),
+    Layer.provide(input?.ripgrepLayer ?? Ripgrep.defaultLayer),
     Layer.provide(Format.defaultLayer),
     Layer.provide(RuntimeFlags.layer({ experimentalEventSystem: true })),
     Layer.provideMerge(todo),
@@ -386,8 +387,27 @@ function makeHttpNoLLMServer(input?: PromptLayerOptions) {
   return makePrompt(input)
 }
 
+// Real rg file enumeration order varies by platform; positive folding fixtures require byte-identical glob output.
+const stableGlobRipgrepLayer = Layer.effect(
+  Ripgrep.Service,
+  Effect.gen(function* () {
+    const ripgrep = yield* Ripgrep.Service
+    return Ripgrep.Service.of({
+      ...ripgrep,
+      glob: (input) =>
+        ripgrep.glob(input).pipe(
+          Effect.map((entries) =>
+            [...entries].sort((left, right) => (left.path < right.path ? -1 : left.path > right.path ? 1 : 0)),
+          ),
+        ),
+    })
+  }),
+).pipe(Layer.provide(Ripgrep.defaultLayer))
+
 const it = testEffect(makeHttp())
 const nativeIt = testEffect(makeHttp({ native: true }))
+const stableFoldingIt = testEffect(makeHttp({ ripgrepLayer: stableGlobRipgrepLayer }))
+const stableNativeFoldingIt = testEffect(makeHttp({ native: true, ripgrepLayer: stableGlobRipgrepLayer }))
 const mcpOverrideMarker = `mcp-context-folding-override-${"m".repeat(24_000)}`
 const withMcpReadOverride = testEffect(
   makeHttp({
@@ -2152,13 +2172,13 @@ const contextFoldingOverflowLifecycle = (runtime: "ai-sdk" | "native", recovery:
     expect(yield* fixture.llm.pending).toBe(0)
   })
 
-it.instance(
+stableFoldingIt.instance(
   "runs builtin read/grep/glob settlement through stored history into the next AI SDK request",
   () => contextFoldingClosedLoop("ai-sdk"),
   30_000,
 )
 
-nativeIt.instance(
+stableNativeFoldingIt.instance(
   "runs builtin read/grep/glob settlement through stored history into the next Native request",
   () => contextFoldingClosedLoop("native"),
   30_000,
@@ -2176,37 +2196,37 @@ nativeIt.instance(
   30_000,
 )
 
-it.instance(
+stableFoldingIt.instance(
   "automatically compacts AI SDK folded history at the token threshold",
   () => contextFoldingAutomaticLifecycle("ai-sdk"),
   30_000,
 )
 
-nativeIt.instance(
+stableNativeFoldingIt.instance(
   "automatically compacts Native folded history at the token threshold",
   () => contextFoldingAutomaticLifecycle("native"),
   30_000,
 )
 
-it.instance(
+stableFoldingIt.instance(
   "recovers AI SDK overflow through an unprojected summary and a continued turn",
   () => contextFoldingOverflowLifecycle("ai-sdk", "success"),
   30_000,
 )
 
-nativeIt.instance(
+stableNativeFoldingIt.instance(
   "recovers Native overflow through an unprojected summary and a continued turn",
   () => contextFoldingOverflowLifecycle("native", "success"),
   30_000,
 )
 
-it.instance(
+stableFoldingIt.instance(
   "terminates AI SDK overflow when the full compaction request is also rejected",
   () => contextFoldingOverflowLifecycle("ai-sdk", "terminal"),
   30_000,
 )
 
-nativeIt.instance(
+stableNativeFoldingIt.instance(
   "terminates Native overflow when the full compaction request is also rejected",
   () => contextFoldingOverflowLifecycle("native", "terminal"),
   30_000,
