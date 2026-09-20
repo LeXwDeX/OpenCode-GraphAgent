@@ -81,6 +81,11 @@ Run 21 本身通过，但因对应 enabled Run 22 失败而不进入最终配对
 
 ## 证据边界
 
+- 首个最终文档 head `7777af3a1d` 的 Linux Unit Tests 暴露 8 个 fixture 失败：两份 28K read 正文都是
+  单行，而生产 ReadTool 会把单行截到 2000 字符，使 read source 的估算净节省落在 512-token 门槛附近。
+  Linux 的精确选择差异未能在 macOS 复现；修复把相同规模正文改为每行低于 2000 字符，并增加 read 未截断、
+  三类 source 精确占位和 witness 逐字完整断言。产品实现和真实模型结果没有改动，也没有新增模型调用。
+  原失败日志 SHA-256 为 `1e2154503758152b17ab6723ecb9ca08c0e88ae42dbbe91158cdb9bf042c415c`。
 - `requestPreparationDurationMs` 不可用：当前 host diagnostic 没有发出该字段。
 - live-host RSS baseline/peak/delta 不可用：没有可靠的 live sampler；P0 RSS 没有冒充真实模型运行 RSS。
 - provider cache-write 不可用；没有把缺失值写成 0。

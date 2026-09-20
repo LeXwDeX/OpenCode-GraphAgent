@@ -499,6 +499,40 @@ const writeText = Effect.fn("test.writeText")(function* (file: string, text: str
   yield* fs.writeWithDirs(file, text)
 })
 
+const foldingReadBody = (marker: string) =>
+  `${Array.from({ length: 28 }, (_, index) => `${marker}${String(index).padStart(2, "0")}-${"r".repeat(960)}`).join("\n")}\n`
+
+const record = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null
+
+const outboundToolResult = (body: unknown, callID: string) => {
+  if (!record(body) || !Array.isArray(body.messages)) return undefined
+  const matches: string[] = []
+  for (const message of body.messages) {
+    if (
+      record(message) &&
+      message.role === "tool" &&
+      message.tool_call_id === callID &&
+      typeof message.content === "string"
+    ) {
+      matches.push(message.content)
+    }
+  }
+  return matches.length === 1 ? matches[0] : undefined
+}
+
+const foldedPlaceholder = (witnessCallID: string) =>
+  `[Duplicate tool output folded. Identical full output is retained in later tool call ${JSON.stringify(witnessCallID)}.]`
+
+const expectFoldedBuiltinPair = (input: {
+  body: unknown
+  sourceCallID: string
+  witnessCallID: string
+  witnessOutput: string
+}) => {
+  expect(outboundToolResult(input.body, input.sourceCallID)).toBe(foldedPlaceholder(input.witnessCallID))
+  expect(outboundToolResult(input.body, input.witnessCallID)).toBe(input.witnessOutput)
+}
+
 const ensureDir = Effect.fn("test.ensureDir")(function* (dir: string) {
   const fs = yield* FSUtil.Service
   yield* fs.ensureDir(dir)
@@ -1334,7 +1368,7 @@ const contextFoldingClosedLoop = (runtime: "ai-sdk" | "native") =>
     const probeLedger = path.join(dir, "s08-probe-ledger.ndjson")
     const probeTool = path.join(dir, ".opencode", "tools", "s08_probe.ts")
     const uniqueMarker = `unique-tool-output-${runtime}-`
-    yield* writeText(readFile, `${"read-body-abcdefghij ".repeat(1_400)}\n`)
+    yield* writeText(readFile, foldingReadBody("read-body-abcdefghij-"))
     yield* writeText(uniqueFile, `${uniqueMarker}${"u".repeat(4_000)}\n`)
     yield* writeText(
       grepFile,
@@ -1444,6 +1478,15 @@ const contextFoldingClosedLoop = (runtime: "ai-sdk" | "native") =>
       )
     expect(beforeTools.map((part) => part.tool)).toEqual(["read", "read", "read", "grep", "grep", "glob", "glob"])
     expect(beforeTools.every((part) => part.state.metadata.contextFoldingInstructions === "none")).toBe(true)
+    const beforeByCallID = new Map(beforeTools.map((part) => [part.callID, part]))
+    for (const callID of ["call-read-source", "call-read-witness"]) {
+      const part = beforeByCallID.get(callID)
+      expect(part).toBeDefined()
+      if (!part) throw new Error(`missing stored read result ${callID}`)
+      expect(part.state.output.length).toBeGreaterThan(20_000)
+      expect(part.state.output).not.toContain("(line truncated to 2000 chars)")
+      expect(part.state.metadata.truncated).toBe(false)
+    }
     const persisted = beforeTools.map((part) => ({
       id: part.id,
       messageID: part.messageID,
@@ -1475,9 +1518,27 @@ const contextFoldingClosedLoop = (runtime: "ai-sdk" | "native") =>
     yield* prompt.loop({ sessionID: session.id })
 
     const hits = yield* llm.hits
-    const outbound = JSON.stringify(hits.at(-1)?.body ?? {})
+    const outboundBody = hits.at(-1)?.body ?? {}
+    const outbound = JSON.stringify(outboundBody)
     expect(outbound).toContain("Duplicate tool output folded")
     expect((outbound.match(/Duplicate tool output folded/g) ?? []).length).toBeGreaterThanOrEqual(3)
+    for (const [tool, marker] of [
+      ["read", "read-body-abcdefghij"],
+      ["grep", "needle-39-"],
+      ["glob", "context-folding-079-"],
+    ] as const) {
+      const witnessCallID = `call-${tool}-witness`
+      const witness = beforeByCallID.get(witnessCallID)
+      expect(witness).toBeDefined()
+      if (!witness) throw new Error(`missing stored ${tool} witness`)
+      expect(witness.state.output).toContain(marker)
+      expectFoldedBuiltinPair({
+        body: outboundBody,
+        sourceCallID: `call-${tool}-source`,
+        witnessCallID,
+        witnessOutput: witness.state.output,
+      })
+    }
     expect(outbound).toContain(uniqueMarker)
     expect(outbound).toContain("read-body-abcdefghij")
     expect(outbound).toContain("needle-39-")
@@ -1834,7 +1895,7 @@ const seedFoldedOpenCodeLifecycle = Effect.fn("test.seedFoldedOpenCodeLifecycle"
     glob: "lifecycle-glob-",
   }
 
-  yield* writeText(readFile, `${markers.read}${"r".repeat(28_000)}\n`)
+  yield* writeText(readFile, foldingReadBody(markers.read))
   yield* writeText(
     grepFile,
     Array.from({ length: 40 }, (_, index) => `lifecycle-needle-${index}-${input.runtime}-${"g".repeat(320)}`).join(
@@ -1899,6 +1960,15 @@ const seedFoldedOpenCodeLifecycle = Effect.fn("test.seedFoldedOpenCodeLifecycle"
   const persisted = lifecycleSnapshot(yield* MessageV2.filterCompactedEffect(session.id))
   expect(persisted).toHaveLength(6)
   expect(persisted.every((part) => part.output.includes(input.runtime))).toBe(true)
+  const persistedByCallID = new Map(persisted.map((part) => [part.callID, part]))
+  for (const callID of ["call-lifecycle-read-source", "call-lifecycle-read-witness"]) {
+    const part = persistedByCallID.get(callID)
+    expect(part).toBeDefined()
+    if (!part) throw new Error(`missing stored lifecycle read result ${callID}`)
+    expect(part.output.length).toBeGreaterThan(20_000)
+    expect(part.output).not.toContain("(line truncated to 2000 chars)")
+    expect(part.metadata.truncated).toBe(false)
+  }
   const sideEffects = yield* lifecycleLedger(ledger)
   expect(sideEffects).toEqual([{ event: "start" }, { event: "complete" }])
 
@@ -1913,6 +1983,23 @@ const seedFoldedOpenCodeLifecycle = Effect.fn("test.seedFoldedOpenCodeLifecycle"
   const foldedBody = (yield* llm.hits).at(-1)?.body ?? {}
   const foldedText = JSON.stringify(foldedBody)
   expect(occurrences(foldedText, "Duplicate tool output folded")).toBeGreaterThanOrEqual(3)
+  for (const [tool, marker] of [
+    ["read", markers.read],
+    ["grep", `lifecycle-needle-39-${input.runtime}-`],
+    ["glob", `lifecycle-glob-079-${input.runtime}-`],
+  ] as const) {
+    const witnessCallID = `call-lifecycle-${tool}-witness`
+    const witness = persistedByCallID.get(witnessCallID)
+    expect(witness).toBeDefined()
+    if (!witness) throw new Error(`missing stored lifecycle ${tool} witness`)
+    expect(witness.output).toContain(marker)
+    expectFoldedBuiltinPair({
+      body: foldedBody,
+      sourceCallID: `call-lifecycle-${tool}-source`,
+      witnessCallID,
+      witnessOutput: witness.output,
+    })
+  }
   expect(foldedText).toContain("call-lifecycle-read-witness")
   expect(foldedText).toContain("call-lifecycle-grep-witness")
   expect(foldedText).toContain("call-lifecycle-glob-witness")
