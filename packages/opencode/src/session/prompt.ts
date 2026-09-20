@@ -130,7 +130,45 @@ export interface Interface {
   readonly shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError>
   readonly command: (input: CommandInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
   readonly resolvePromptParts: (template: string) => Effect.Effect<PromptInput["parts"]>
+  readonly editQueuedMessage: (input: QueuedMessageEditInput) => Effect.Effect<SessionV1.WithParts, QueuedMessageError>
+  readonly deleteQueuedMessage: (input: QueuedMessageDeleteInput) => Effect.Effect<boolean, QueuedMessageError>
 }
+
+export const QueuedMessageExpected = Schema.Struct({
+  partID: PartID,
+  expectedText: Schema.String,
+  expectedPartIDs: Schema.Array(PartID),
+})
+
+export const QueuedMessageEditInput = Schema.Struct({
+  sessionID: SessionID,
+  messageID: MessageID,
+  ...QueuedMessageExpected.fields,
+  text: Schema.String,
+})
+export type QueuedMessageEditInput = typeof QueuedMessageEditInput.Type
+
+export const QueuedMessageDeleteInput = Schema.Struct({
+  sessionID: SessionID,
+  messageID: MessageID,
+  ...QueuedMessageExpected.fields,
+})
+export type QueuedMessageDeleteInput = typeof QueuedMessageDeleteInput.Type
+
+export class QueuedMessageNotFound extends Schema.TaggedErrorClass<QueuedMessageNotFound>()("QueuedMessageNotFound", {
+  messageID: MessageID,
+}) {}
+
+export class QueuedMessageInvalid extends Schema.TaggedErrorClass<QueuedMessageInvalid>()("QueuedMessageInvalid", {
+  message: Schema.String,
+}) {}
+
+export class QueuedMessageConflict extends Schema.TaggedErrorClass<QueuedMessageConflict>()("QueuedMessageConflict", {
+  kind: Schema.Literals(["already_consumed", "stale", "not_queued", "history_uncertain"]),
+  message: Schema.String,
+}) {}
+
+export type QueuedMessageError = QueuedMessageNotFound | QueuedMessageInvalid | QueuedMessageConflict
 
 export interface IdleAdmission {
   readonly activate: Effect.Effect<void>
@@ -187,6 +225,141 @@ export const layer = Layer.effect(
     const startContext = Option.getOrUndefined(yield* Effect.serviceOption(HookStartContext.Service))
     const goal = Option.getOrUndefined(yield* Effect.serviceOption(Goal.Service))
     const promptLocks = KeyedMutex.makeUnsafe<SessionID>()
+
+    const ordinaryUser = (message: SessionV1.WithParts): message is SessionV1.WithParts & { info: SessionV1.User } =>
+      message.info.role === "user" &&
+      !MessageV2.isIgnoredUser(message) &&
+      !message.parts.some((part) => part.type === "compaction" || part.type === "subtask")
+
+    const claimSnapshot = Effect.fn("SessionPrompt.claimSnapshot")(function* (sessionID: SessionID) {
+      return yield* promptLocks.withLock(sessionID)(
+        Effect.gen(function* () {
+          const messages = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
+            Effect.map((items) => items.filter((message) => !MessageV2.isIgnoredUser(message))),
+            Effect.provideService(Database.Service, database),
+          )
+          const consumed = Date.now()
+          for (const message of messages) {
+            if (!ordinaryUser(message) || message.info.time.consumed !== undefined) continue
+            message.info.time.consumed = consumed
+            yield* sessions.updateMessage(message.info)
+          }
+          return messages
+        }),
+      )
+    })
+
+    const queuedMessage = Effect.fn("SessionPrompt.queuedMessage")(function* (input: QueuedMessageDeleteInput) {
+      const messages = yield* sessions
+        .messages({ sessionID: input.sessionID })
+        .pipe(Effect.catch(() => Effect.fail(new QueuedMessageNotFound({ messageID: input.messageID }))))
+      const message = messages.find((item) => item.info.id === input.messageID)
+      if (!message) return yield* new QueuedMessageNotFound({ messageID: input.messageID })
+      if (!ordinaryUser(message)) {
+        return yield* new QueuedMessageInvalid({ message: "Only ordinary user prompts can be changed while queued" })
+      }
+
+      const userByID = new Map(
+        messages
+          .filter((item): item is SessionV1.WithParts & { info: SessionV1.User } => item.info.role === "user")
+          .map((item) => [item.info.id, item.info]),
+      )
+      for (const item of messages) {
+        if (item.info.role !== "assistant") continue
+        const parent = userByID.get(item.info.parentID)
+        if (!parent) {
+          return yield* new QueuedMessageConflict({
+            kind: "history_uncertain",
+            message: "The session history cannot prove that this prompt is still queued",
+          })
+        }
+        if (message.info.time.consumed === undefined && !MessageV2.before(parent, message.info)) {
+          return yield* new QueuedMessageConflict({
+            kind: "already_consumed",
+            message: "This prompt has already been included in a model request",
+          })
+        }
+      }
+      if (message.info.time.consumed !== undefined) {
+        return yield* new QueuedMessageConflict({
+          kind: "already_consumed",
+          message: "This prompt has already been included in a model request",
+        })
+      }
+
+      let completed: SessionV1.Assistant | undefined
+      for (const item of messages) {
+        if (item.info.role !== "assistant" || item.info.time.completed === undefined) continue
+        if (!completed || MessageV2.before(completed, item.info)) completed = item.info
+      }
+      let pending: SessionV1.Assistant | undefined
+      for (const item of messages) {
+        if (item.info.role !== "assistant" || item.info.time.completed !== undefined) continue
+        if (completed && MessageV2.before(item.info, completed)) continue
+        if (!pending || MessageV2.before(pending, item.info)) pending = item.info
+      }
+      if (!pending || !MessageV2.before(pending, message.info)) {
+        return yield* new QueuedMessageConflict({
+          kind: "not_queued",
+          message: "This prompt is no longer queued",
+        })
+      }
+
+      const editable = message.parts.filter(
+        (part): part is SessionV1.TextPart => part.type === "text" && !part.synthetic && !part.ignored,
+      )
+      if (editable.length !== 1 || editable[0]!.id !== input.partID) {
+        return yield* new QueuedMessageInvalid({ message: "Queued prompts must have one editable text part" })
+      }
+      if (
+        editable[0]!.text !== input.expectedText ||
+        message.parts.length !== input.expectedPartIDs.length ||
+        message.parts.some((part, index) => part.id !== input.expectedPartIDs[index])
+      ) {
+        return yield* new QueuedMessageConflict({
+          kind: "stale",
+          message: "The queued prompt changed before this request was applied",
+        })
+      }
+      return { message, part: editable[0]! }
+    })
+
+    const editQueuedMessage: Interface["editQueuedMessage"] = Effect.fn("SessionPrompt.editQueuedMessage")((input) =>
+      promptLocks.withLock(input.sessionID)(
+        db
+          .transaction(
+            () =>
+              Effect.gen(function* () {
+                const current = yield* queuedMessage(input)
+                yield* sessions.updatePart({ ...current.part, text: input.text })
+                return yield* MessageV2.get({ sessionID: input.sessionID, messageID: input.messageID }).pipe(
+                  Effect.provideService(Database.Service, database),
+                  Effect.catch(() => Effect.fail(new QueuedMessageNotFound({ messageID: input.messageID }))),
+                )
+              }),
+            { behavior: "immediate" },
+          )
+          .pipe(Effect.catchTag("SqlError", Effect.die)),
+      ),
+    )
+
+    const deleteQueuedMessage: Interface["deleteQueuedMessage"] = Effect.fn("SessionPrompt.deleteQueuedMessage")(
+      (input) =>
+        promptLocks.withLock(input.sessionID)(
+          db
+            .transaction(
+              () =>
+                Effect.gen(function* () {
+                  yield* queuedMessage(input)
+                  yield* sessions.removeMessage({ sessionID: input.sessionID, messageID: input.messageID })
+                  return true
+                }),
+              { behavior: "immediate" },
+            )
+            .pipe(Effect.catchTag("SqlError", Effect.die)),
+        ),
+    )
+
     const ops = Effect.fn("SessionPrompt.ops")(function* () {
       return {
         cancel: (sessionID: SessionID) => cancel(sessionID),
@@ -1599,10 +1772,7 @@ export const layer = Layer.effect(
           yield* status.set(sessionID, { type: "busy" })
           yield* Effect.logInfo("loop", { "session.id": sessionID, step })
 
-          let msgs = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
-            Effect.map((messages) => messages.filter((message) => !MessageV2.isIgnoredUser(message))),
-            Effect.provideService(Database.Service, database),
-          )
+          let msgs = yield* claimSnapshot(sessionID)
 
           const { user: lastUser, assistant: lastAssistant, finished: lastFinished, tasks } = MessageV2.latest(msgs)
 
@@ -2349,6 +2519,8 @@ export const layer = Layer.effect(
       shell,
       command,
       resolvePromptParts,
+      editQueuedMessage,
+      deleteQueuedMessage,
     })
   }),
 )

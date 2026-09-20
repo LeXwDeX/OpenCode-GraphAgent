@@ -200,9 +200,13 @@ import type {
   SessionDeleteErrors,
   SessionDeleteMessageErrors,
   SessionDeleteMessageResponses,
+  SessionDeleteQueuedMessageErrors,
+  SessionDeleteQueuedMessageResponses,
   SessionDeleteResponses,
   SessionDiffErrors,
   SessionDiffResponses,
+  SessionEditQueuedMessageErrors,
+  SessionEditQueuedMessageResponses,
   SessionForkErrors,
   SessionForkResponses,
   SessionGetErrors,
@@ -4532,6 +4536,106 @@ export class Session2 extends HeyApiClient {
       url: "/session/{sessionID}/unrevert",
       ...options,
       ...params,
+    })
+  }
+
+  /**
+   * Delete queued message
+   *
+   * Atomically delete a user prompt that has not been claimed by a model request.
+   */
+  public deleteQueuedMessage<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      messageID: string
+      directory?: string
+      workspace?: string
+      partID: string
+      expectedText: string
+      expectedPartIDs: Array<string>
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "path", key: "messageID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "body", key: "partID" },
+            { in: "body", key: "expectedText" },
+            { in: "body", key: "expectedPartIDs" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).delete<
+      SessionDeleteQueuedMessageResponses,
+      SessionDeleteQueuedMessageErrors,
+      ThrowOnError
+    >({
+      url: "/session/{sessionID}/message/{messageID}/queued",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Edit queued message
+   *
+   * Atomically edit a user prompt that has not been claimed by a model request.
+   */
+  public editQueuedMessage<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      messageID: string
+      directory?: string
+      workspace?: string
+      partID: string
+      expectedText: string
+      expectedPartIDs: Array<string>
+      text: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "path", key: "messageID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "body", key: "partID" },
+            { in: "body", key: "expectedText" },
+            { in: "body", key: "expectedPartIDs" },
+            { in: "body", key: "text" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).patch<
+      SessionEditQueuedMessageResponses,
+      SessionEditQueuedMessageErrors,
+      ThrowOnError
+    >({
+      url: "/session/{sessionID}/message/{messageID}/queued",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
     })
   }
 

@@ -334,6 +334,7 @@ export const User = Schema.Struct({
   role: Schema.Literal("user"),
   time: Schema.Struct({
     created: Timestamp,
+    consumed: Schema.optional(Timestamp),
   }),
   format: Schema.optional(Format),
   summary: Schema.optional(

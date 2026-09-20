@@ -281,6 +281,28 @@ export const layer = Layer.effectDiscard(
         const id = event.data.info.id
         const sessionID = event.data.info.sessionID
         const data = messageData(event.data.info)
+        // A consumed user message is an immutable request-admission receipt. Background
+        // work can still hold an older User object and publish MessageUpdated later, so
+        // preserve the greatest recorded timestamp instead of allowing a stale whole-JSON
+        // replacement to make an already claimed prompt editable again.
+        if (data.role === "user") {
+          const previous = yield* db
+            .select({ data: MessageTable.data })
+            .from(MessageTable)
+            .where(and(eq(MessageTable.id, id), eq(MessageTable.session_id, sessionID)))
+            .get()
+            .pipe(Effect.orDie)
+          if (previous?.data.role === "user") {
+            const nextTime = data.time as SessionV1.User["time"]
+            const previousTime = previous.data.time as SessionV1.User["time"]
+            if (nextTime.consumed !== undefined || previousTime.consumed !== undefined) {
+              data.time = {
+                ...nextTime,
+                consumed: Math.max(nextTime.consumed ?? 0, previousTime.consumed ?? 0),
+              }
+            }
+          }
+        }
         yield* db
           .insert(MessageTable)
           .values({ id, session_id: sessionID, time_created, data })

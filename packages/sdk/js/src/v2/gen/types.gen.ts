@@ -246,6 +246,7 @@ export type UserMessage = {
   role: "user"
   time: {
     created: number
+    consumed?: number
   }
   format?: OutputFormat
   summary?: {
@@ -2699,6 +2700,12 @@ export type SessionBusyError = {
   message: string
 }
 
+export type ConflictError = {
+  _tag: "ConflictError"
+  message: string
+  resource?: string
+}
+
 export type EventTuiPromptAppend = {
   type: "tui.prompt.append"
   properties: {
@@ -2748,12 +2755,6 @@ export type EventTuiSessionSelect = {
      */
     sessionID: string
   }
-}
-
-export type ConflictError = {
-  _tag: "ConflictError"
-  message: string
-  resource?: string
 }
 
 export type Workspace = {
@@ -10942,6 +10943,98 @@ export type PermissionRespondResponses = {
 }
 
 export type PermissionRespondResponse = PermissionRespondResponses[keyof PermissionRespondResponses]
+
+export type SessionDeleteQueuedMessageData = {
+  body?: {
+    partID: string
+    expectedText: string
+    expectedPartIDs: Array<string>
+  }
+  path: {
+    sessionID: string
+    messageID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}/message/{messageID}/queued"
+}
+
+export type SessionDeleteQueuedMessageErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type SessionDeleteQueuedMessageError = SessionDeleteQueuedMessageErrors[keyof SessionDeleteQueuedMessageErrors]
+
+export type SessionDeleteQueuedMessageResponses = {
+  /**
+   * Deleted queued message
+   */
+  200: boolean
+}
+
+export type SessionDeleteQueuedMessageResponse =
+  SessionDeleteQueuedMessageResponses[keyof SessionDeleteQueuedMessageResponses]
+
+export type SessionEditQueuedMessageData = {
+  body?: {
+    partID: string
+    expectedText: string
+    expectedPartIDs: Array<string>
+    text: string
+  }
+  path: {
+    sessionID: string
+    messageID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}/message/{messageID}/queued"
+}
+
+export type SessionEditQueuedMessageErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type SessionEditQueuedMessageError = SessionEditQueuedMessageErrors[keyof SessionEditQueuedMessageErrors]
+
+export type SessionEditQueuedMessageResponses = {
+  /**
+   * Updated queued message
+   */
+  200: {
+    info: Message
+    parts: Array<Part>
+  }
+}
+
+export type SessionEditQueuedMessageResponse =
+  SessionEditQueuedMessageResponses[keyof SessionEditQueuedMessageResponses]
 
 export type PartDeleteData = {
   body?: never
