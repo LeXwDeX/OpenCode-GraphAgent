@@ -47,6 +47,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
+      - name: Setup GitHub CLI
+        uses: ./.github/actions/setup-gh
+
       - name: Check previously verified content
         id: evidence
         uses: ./.github/actions/verified-content
@@ -61,6 +64,9 @@ jobs:
 
       - name: Test CI verification fingerprint
         run: node --test script/ci-fingerprint.test.mjs script/ci-evidence.test.mjs script/ci-runner-routing.test.mjs script/ci-runner-smoke.test.mjs
+
+      - name: Test GitHub CLI bootstrap
+        run: bash script/setup-gh.test.sh
 
       - name: Run lint
         if: steps.evidence.outputs.reused != 'true'

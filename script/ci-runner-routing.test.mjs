@@ -12,6 +12,30 @@ const TRUSTED =
   "(github.event_name == 'push' || github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]' && github.actor != 'dependabot[bot]'))"
 
 const workflow = (name) => readFileSync(new URL(`../.github/workflows/${name}`, import.meta.url), "utf8")
+const repositoryFile = (name) => readFileSync(new URL(`../${name}`, import.meta.url), "utf8")
+
+const namedSteps = (source, name) => {
+  const marker = `      - name: ${name}\n`
+  const steps = []
+  let start = source.indexOf(marker)
+  while (start !== -1) {
+    const next = source.indexOf("\n      - name: ", start + marker.length)
+    steps.push(source.slice(start, next === -1 ? source.length : next))
+    start = source.indexOf(marker, start + marker.length)
+  }
+  return steps
+}
+
+const runBody = (step) => {
+  const marker = "\n        run: |\n"
+  const start = step.indexOf(marker)
+  assert.notEqual(start, -1, "step has no multiline run body")
+  return step
+    .slice(start + marker.length)
+    .split("\n")
+    .map((line) => line.replace(/^          /, ""))
+    .join("\n")
+}
 
 await test("self-hosted routes are gated by the trusted-event predicate and keep a hosted fallback", () => {
   for (const file of ["ci-typecheck.yml", "ci-test.yml"]) {
@@ -128,8 +152,8 @@ await test("release candidate preparation is read-only and publication owns the 
   assert(prepare.includes("Generate SHA256SUMS"), "candidate checksum preparation")
   assert(prepare.includes("Render Release Notes (fail closed)"), "candidate notes validation")
   assert(prepare.includes("Verify Release Candidate"), "candidate verification")
-  assert(prepare.includes("Verify GitHub CLI"), "read-only host tool preflight")
-  assert(prepare.includes("gh --version"), "read-only GitHub CLI probe")
+  assert(prepare.includes("Setup GitHub CLI"), "read-only GitHub CLI bootstrap")
+  assert(prepare.includes("uses: ./.github/actions/setup-gh"), "prepare uses the shared verified bootstrap")
   assert(prepare.includes("SELECTED_PLATFORMS: ${{ inputs.platforms }}"), "platform input env boundary")
   assert(prepare.includes('selected="$SELECTED_PLATFORMS"'), "shell reads the platform input from env")
   assert(!prepare.includes('selected="${{ inputs.platforms }}"'), "platform input must not be interpolated into shell")
@@ -159,4 +183,81 @@ await test("dev issue auto-close uses the trusted Linux runner without checking 
   assert(file.includes("runs-on: [self-hosted, Linux, X64]"), "trusted Linux route")
   assert(file.includes("timeout-minutes: 10"), "bounded job")
   assert(!file.includes("uses: actions/checkout"), "event helper must not check out PR code")
+})
+
+await test("verified GitHub CLI bootstrap pins supported archives and verifies before extracting", () => {
+  const action = repositoryFile(".github/actions/setup-gh/action.yml")
+  const setup = repositoryFile(".github/actions/setup-gh/setup.sh")
+  const version = "2.101.0"
+  const linuxSha = "9bca2d1c16825f109907a23307628a2f0698fbf99662b73a5cf0b020293072b8"
+  const windowsSha = "bc6c814367b193cd8e713611d61e36013c0ef843b8f516458fe3eda039192794"
+
+  for (const value of [version, linuxSha, windowsSha, `https://github.com/cli/cli/releases/download/v${version}`])
+    assert(action.includes(value), `missing immutable GitHub CLI pin: ${value}`)
+  assert(!action.includes("GH_TOKEN"), "bootstrap must download public assets anonymously")
+  assert(!action.includes("GITHUB_TOKEN"), "bootstrap must not receive a repository token")
+
+  for (const contract of [
+    "Linux:X64",
+    "Windows:X64",
+    `gh_\${GH_CLI_VERSION}_linux_amd64/bin/gh`,
+    "bin/gh.exe",
+    "Unsupported GitHub CLI bootstrap platform",
+    "archive checksum mismatch",
+    "Expand-Archive -LiteralPath",
+    "GH_CLI_ARCHIVE_WINDOWS",
+    "GH_CLI_EXTRACT_WINDOWS",
+    "cygpath -w",
+    "--connect-timeout 20 --max-time 300 --retry 3 --retry-delay 1",
+  ])
+    assert(setup.includes(contract), `bootstrap contract: ${contract}`)
+
+  const checksum = setup.indexOf('if [ "$actual" != "$expected" ]')
+  const linuxExtract = setup.indexOf('tar -xzf "$archive"')
+  const windowsExtract = setup.indexOf("Expand-Archive -LiteralPath")
+  assert(checksum !== -1 && checksum < linuxExtract, "Linux extraction must follow checksum verification")
+  assert(checksum !== -1 && checksum < windowsExtract, "Windows extraction must follow checksum verification")
+})
+
+await test("jobs that check out repository content bootstrap gh before evidence reuse", () => {
+  const typecheck = workflow("ci-typecheck.yml")
+  const tests = workflow("ci-test.yml")
+  assert.equal(typecheck.split("uses: ./.github/actions/setup-gh").length - 1, 1, "typecheck bootstrap count")
+  assert(
+    typecheck.indexOf("uses: ./.github/actions/setup-gh") <
+      typecheck.indexOf("uses: ./.github/actions/verified-content"),
+  )
+  assert(typecheck.includes("run: bash script/setup-gh.test.sh"), "bootstrap fixture test is not wired")
+
+  const testBootstraps = [...tests.matchAll(/uses: \.\/\.github\/actions\/setup-gh/g)].map((match) => match.index)
+  const evidenceSteps = [...tests.matchAll(/uses: \.\/\.github\/actions\/verified-content/g)].map(
+    (match) => match.index,
+  )
+  assert.equal(testBootstraps.length, 2, "unit/e2e bootstrap count")
+  assert.equal(evidenceSteps.length, 2, "unit/e2e evidence count")
+  for (let index = 0; index < testBootstraps.length; index++)
+    assert(testBootstraps[index] < evidenceSteps[index], `test job ${index + 1} bootstraps gh after evidence`)
+})
+
+await test("privileged no-checkout jobs share an anonymous fail-closed Linux bootstrap", () => {
+  const release = workflow("release-fork.yml")
+  const autoclose = workflow("dev-issue-autoclose.yml")
+  const publish = release.slice(release.indexOf("\n  publish-release:"), release.indexOf("\n  # No-op job"))
+  const publishSetup = namedSteps(publish, "Setup GitHub CLI")[0]
+  const autocloseSetup = namedSteps(autoclose, "Setup GitHub CLI")[0]
+
+  assert(publishSetup, "publish bootstrap missing")
+  assert(autocloseSetup, "autoclose bootstrap missing")
+  assert.equal(runBody(publishSetup), runBody(autocloseSetup), "privileged inline bootstrap implementations drifted")
+  for (const step of [publishSetup, autocloseSetup]) {
+    assert(step.includes('GH_CLI_VERSION: "2.101.0"'), "inline version pin")
+    assert(step.includes("9bca2d1c16825f109907a23307628a2f0698fbf99662b73a5cf0b020293072b8"), "inline Linux SHA pin")
+    assert(step.includes('"${RUNNER_OS:-}" != "Linux"'), "inline OS rejection")
+    assert(step.includes('"${RUNNER_ARCH:-}" != "X64"'), "inline architecture rejection")
+    assert(!step.includes("GH_TOKEN"), "bootstrap step must not receive GH_TOKEN")
+    assert(!step.includes("GITHUB_TOKEN"), "bootstrap step must not receive GITHUB_TOKEN")
+    assert(step.indexOf('if [ "$actual" != "$GH_CLI_LINUX_AMD64_SHA256" ]') < step.indexOf('tar -xzf "$archive"'))
+  }
+  assert(!publish.includes("uses: actions/checkout"), "publish must remain no-checkout")
+  assert(!autoclose.includes("uses: actions/checkout"), "autoclose must remain no-checkout")
 })
