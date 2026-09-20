@@ -44,6 +44,43 @@ jobs:
     runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 10
     steps:
+      - name: Setup GitHub CLI
+        env:
+          GH_CLI_VERSION: "2.101.0"
+          GH_CLI_LINUX_AMD64_SHA256: 9bca2d1c16825f109907a23307628a2f0698fbf99662b73a5cf0b020293072b8
+          GH_CLI_DOWNLOAD_BASE_URL: https://github.com/cli/cli/releases/download/v2.101.0
+        run: |
+          set -euo pipefail
+          if [ "${RUNNER_OS:-}" != "Linux" ] || [ "${RUNNER_ARCH:-}" != "X64" ]; then
+            echo "::error::Unsupported GitHub CLI bootstrap platform: ${RUNNER_OS:-unknown}/${RUNNER_ARCH:-unknown}" >&2
+            exit 1
+          fi
+          asset="gh_${GH_CLI_VERSION}_linux_amd64.tar.gz"
+          download_dir="$(mktemp -d "$RUNNER_TEMP/gh-cli-download.XXXXXX")"
+          install_dir="$(mktemp -d "$RUNNER_TEMP/gh-cli-install.XXXXXX")"
+          trap 'rm -rf "$download_dir"' EXIT
+          archive="$download_dir/$asset"
+          curl --fail --location --silent --show-error \
+            --connect-timeout 20 --max-time 300 --retry 3 --retry-delay 1 \
+            --output "$archive" "$GH_CLI_DOWNLOAD_BASE_URL/$asset"
+          if command -v sha256sum >/dev/null 2>&1; then
+            actual="$(sha256sum "$archive" | awk '{print $1}')"
+          elif command -v shasum >/dev/null 2>&1; then
+            actual="$(shasum -a 256 "$archive" | awk '{print $1}')"
+          else
+            echo "::error::A SHA-256 tool (sha256sum or shasum) is required." >&2
+            exit 1
+          fi
+          if [ "$actual" != "$GH_CLI_LINUX_AMD64_SHA256" ]; then
+            echo "::error::GitHub CLI archive checksum mismatch: expected $GH_CLI_LINUX_AMD64_SHA256, got $actual" >&2
+            exit 1
+          fi
+          tar -xzf "$archive" -C "$install_dir"
+          bin_dir="$install_dir/gh_${GH_CLI_VERSION}_linux_amd64/bin"
+          test -x "$bin_dir/gh"
+          printf '%s\n' "$bin_dir" >> "$GITHUB_PATH"
+          "$bin_dir/gh" --version
+
       - name: Close linked issues referenced in the PR body
         env:
           GH_TOKEN: ${{ github.token }}
