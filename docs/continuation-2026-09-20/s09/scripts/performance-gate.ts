@@ -63,11 +63,12 @@ if (!isObject(input.method)) {
   }
 }
 
+const sizeClasses = ["1MiB", "8MiB"] as const
+type SizeClass = (typeof sizeClasses)[number]
 const limits = {
   "1MiB": { minBytes: 900_000, maxBytes: 1_300_000, p95Ms: 25, rssMiB: 64, minWarmup: 5, minRepetitions: 20 },
   "8MiB": { minBytes: 7_500_000, maxBytes: 9_000_000, p95Ms: 250, rssMiB: 256, minWarmup: 3, minRepetitions: 10 },
 } as const
-type SizeClass = keyof typeof limits
 
 const rows: JsonObject[] = []
 if (!Array.isArray(input.rows)) {
@@ -124,7 +125,7 @@ const validateRow = (row: JsonObject, label: SizeClass) => {
     errors.push(`${prefix}: foldedOutputs must be a positive finite integer`)
 }
 
-for (const label of Object.keys(limits) as SizeClass[]) {
+for (const label of sizeClasses) {
   const matching = rows.filter((row) => row.class === label)
   if (matching.length !== 1) errors.push(`${label}: expected exactly one row, found ${matching.length}`)
   else validateRow(matching[0]!, label)
