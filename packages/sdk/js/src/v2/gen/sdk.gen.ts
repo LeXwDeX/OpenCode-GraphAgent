@@ -182,6 +182,8 @@ import type {
   PtyUpdateErrors,
   PtyUpdateResponses,
   QuestionAnswer,
+  QuestionInteractErrors,
+  QuestionInteractResponses,
   QuestionListErrors,
   QuestionListResponses,
   QuestionRejectErrors,
@@ -378,6 +380,8 @@ import type {
   V2SessionPermissionReplyResponses,
   V2SessionPromptErrors,
   V2SessionPromptResponses,
+  V2SessionQuestionInteractErrors,
+  V2SessionQuestionInteractResponses,
   V2SessionQuestionListErrors,
   V2SessionQuestionListResponses,
   V2SessionQuestionRejectErrors,
@@ -3099,6 +3103,38 @@ export class Question extends HeyApiClient {
     )
     return (options?.client ?? this.client).post<QuestionRejectResponses, QuestionRejectErrors, ThrowOnError>({
       url: "/question/{requestID}/reject",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Interact with question request
+   *
+   * Cancel the timeout after a user selects an option or focuses the custom answer input.
+   */
+  public interact<ThrowOnError extends boolean = false>(
+    parameters: {
+      requestID: string
+      directory?: string
+      workspace?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "requestID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<QuestionInteractResponses, QuestionInteractErrors, ThrowOnError>({
+      url: "/question/{requestID}/interact",
       ...options,
       ...params,
     })
@@ -5908,6 +5944,40 @@ export class Question2 extends HeyApiClient {
       ThrowOnError
     >({
       url: "/api/session/{sessionID}/question/{requestID}/reject",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Interact with pending question request
+   *
+   * Cancel the timeout after a user selects an option or focuses the custom answer input.
+   */
+  public interact<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      requestID: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "path", key: "requestID" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<
+      V2SessionQuestionInteractResponses,
+      V2SessionQuestionInteractErrors,
+      ThrowOnError
+    >({
+      url: "/api/session/{sessionID}/question/{requestID}/interact",
       ...options,
       ...params,
     })

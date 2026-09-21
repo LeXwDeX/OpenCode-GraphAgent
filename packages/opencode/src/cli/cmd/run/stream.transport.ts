@@ -160,6 +160,8 @@ function sid(event: Event): string | undefined {
     event.type === "question.asked" ||
     event.type === "question.replied" ||
     event.type === "question.rejected" ||
+    event.type === "question.interacted" ||
+    event.type === "question.timed_out" ||
     event.type === "session.error" ||
     event.type === "session.status"
   ) {
@@ -509,7 +511,8 @@ function createLayer(input: StreamInput) {
           if (
             event.type !== "permission.replied" &&
             event.type !== "question.replied" &&
-            event.type !== "question.rejected"
+            event.type !== "question.rejected" &&
+            event.type !== "question.timed_out"
           ) {
             return
           }

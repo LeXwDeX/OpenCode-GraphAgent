@@ -38,6 +38,7 @@ const question = Layer.succeed(
       }).pipe(Effect.andThen(reject ? Effect.fail(new QuestionV2.RejectedError()) : Effect.succeed([["Build"], []]))),
     reply: () => Effect.die("unused"),
     reject: () => Effect.die("unused"),
+    interact: () => Effect.die("unused"),
     list: () => Effect.die("unused"),
   }),
 )
@@ -45,6 +46,14 @@ const tool = QuestionTool.layer.pipe(Layer.provide(registry), Layer.provide(perm
 const it = testEffect(Layer.mergeAll(permission, registry, question, tool))
 
 describe("QuestionTool", () => {
+  it.effect("reports timeout without fabricating a user answer", () =>
+    Effect.sync(() => {
+      expect(QuestionTool.toModelOutput([], [], true)).toBe(
+        "The user is temporarily away. Analyze the available options, select the most appropriate answer yourself, and continue within the existing task authorization. Do not claim that the user selected an answer.",
+      )
+    }),
+  )
+
   it.effect("omits a denied built-in question and terminally settles a stale call", () =>
     Effect.gen(function* () {
       captured = undefined

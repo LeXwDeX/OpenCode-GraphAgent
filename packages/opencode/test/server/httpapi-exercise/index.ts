@@ -321,6 +321,13 @@ const scenarios: Scenario[] = [
     }))
     .json(404, object, "status"),
   http.protected
+    .post("/question/{requestID}/interact", "question.interact")
+    .at((ctx) => ({
+      path: route("/question/{requestID}/interact", { requestID: "que_httpapi_interact" }),
+      headers: ctx.headers(),
+    }))
+    .json(404, object, "status"),
+  http.protected
     .get("/file", "file.list")
     .seeded((ctx) => ctx.file("hello.txt", "hello\n"))
     .at((ctx) => ({ path: `/file?${new URLSearchParams({ path: "." })}`, headers: ctx.headers() }))
@@ -881,6 +888,17 @@ const scenarios: Scenario[] = [
     .seeded((ctx) => ctx.session({ title: "Question reject owner" }))
     .at((ctx) => ({
       path: route("/api/session/{sessionID}/question/{requestID}/reject", {
+        sessionID: ctx.state.id,
+        requestID: "que_httpapi_missing",
+      }),
+      headers: ctx.headers(),
+    }))
+    .json(404, object, "status"),
+  http.protected
+    .post("/api/session/{sessionID}/question/{requestID}/interact", "v2.session.question.interact")
+    .seeded((ctx) => ctx.session({ title: "Question interact owner" }))
+    .at((ctx) => ({
+      path: route("/api/session/{sessionID}/question/{requestID}/interact", {
         sessionID: ctx.state.id,
         requestID: "que_httpapi_missing",
       }),

@@ -1,10 +1,13 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { Deferred, Effect, Layer, Schema, Context } from "effect"
+import { Clock, Deferred, Effect, Layer, Schema, Context, Option as EffectOption } from "effect"
 import { InstanceState } from "@/effect/instance-state"
 import { SessionID } from "@/session/schema"
 import { QuestionID } from "./schema"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { QuestionV1 } from "@opencode-ai/schema/question-v1"
+import { Config } from "@/config/config"
+
+export const DEFAULT_TIMEOUT_SECONDS = 60
 
 export const Option = QuestionV1.Option
 export type Option = typeof Option.Type
@@ -30,6 +33,12 @@ export class RejectedError extends Schema.TaggedErrorClass<RejectedError>()("Que
   }
 }
 
+export class TimedOutError extends Schema.TaggedErrorClass<TimedOutError>()("QuestionTimedOutError", {}) {
+  override get message() {
+    return "The user is temporarily away"
+  }
+}
+
 export class NotFoundError extends Schema.TaggedErrorClass<NotFoundError>()("Question.NotFoundError", {
   requestID: QuestionID,
 }) {}
@@ -50,12 +59,13 @@ export interface Interface {
     sessionID: SessionID
     questions: ReadonlyArray<Info>
     tool?: Tool
-  }) => Effect.Effect<ReadonlyArray<Answer>, RejectedError>
+  }) => Effect.Effect<ReadonlyArray<Answer>, RejectedError | TimedOutError>
   readonly reply: (input: {
     requestID: QuestionID
     answers: ReadonlyArray<Answer>
   }) => Effect.Effect<void, NotFoundError>
   readonly reject: (requestID: QuestionID) => Effect.Effect<void, NotFoundError>
+  readonly interact: (requestID: QuestionID) => Effect.Effect<void, NotFoundError>
   readonly list: () => Effect.Effect<ReadonlyArray<Request>>
 }
 
@@ -65,6 +75,7 @@ export const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const events = yield* EventV2Bridge.Service
+    const config = EffectOption.getOrUndefined(yield* Effect.serviceOption(Config.Service))
     const state = yield* InstanceState.make<State>(
       Effect.fn("Question.state")(function* () {
         const state = {
@@ -84,32 +95,61 @@ export const layer = Layer.effect(
       }),
     )
 
-    const ask = Effect.fn("Question.ask")(function* (input: {
-      sessionID: SessionID
-      questions: ReadonlyArray<Info>
-      tool?: Tool
-    }) {
-      const pending = (yield* InstanceState.get(state)).pending
-      const id = QuestionID.ascending()
-      yield* Effect.logInfo("asking", { id, questions: input.questions.length })
+    const ask = Effect.fn("Question.ask")(
+      (input: { sessionID: SessionID; questions: ReadonlyArray<Info>; tool?: Tool }) =>
+        Effect.uninterruptibleMask((restore) =>
+          Effect.gen(function* () {
+            const pending = (yield* InstanceState.get(state)).pending
+            const id = QuestionID.ascending()
+            const timeoutSeconds = config
+              ? ((yield* config.get()).question_timeout ?? DEFAULT_TIMEOUT_SECONDS)
+              : DEFAULT_TIMEOUT_SECONDS
+            const now = yield* Clock.currentTimeMillis
+            const expiresAt = now + timeoutSeconds * 1_000
+            yield* Effect.logInfo("asking", { id, questions: input.questions.length })
 
-      const deferred = yield* Deferred.make<ReadonlyArray<Answer>, RejectedError>()
-      const info: Request = {
-        id,
-        sessionID: input.sessionID,
-        questions: input.questions,
-        tool: input.tool,
-      }
-      pending.set(id, { info, deferred })
-      yield* events.publish(Event.Asked, info)
-
-      return yield* Effect.ensuring(
-        Deferred.await(deferred),
-        Effect.sync(() => {
-          pending.delete(id)
-        }),
-      )
-    })
+            const deferred = yield* Deferred.make<ReadonlyArray<Answer>, RejectedError>()
+            const info: Request = {
+              id,
+              sessionID: input.sessionID,
+              questions: input.questions,
+              tool: input.tool,
+              expiresAt,
+            }
+            const entry = { info, deferred }
+            pending.set(id, entry)
+            return yield* events.publish(Event.Asked, info).pipe(
+              Effect.andThen(
+                restore(
+                  Effect.raceFirst(
+                    Deferred.await(deferred),
+                    Effect.gen(function* () {
+                      const current = yield* Clock.currentTimeMillis
+                      yield* Effect.sleep(Math.max(0, expiresAt - current))
+                      const timedOut = yield* Effect.uninterruptible(
+                        Effect.gen(function* () {
+                          const existing = pending.get(id)
+                          if (existing !== entry || existing.info.expiresAt === undefined) return false
+                          pending.delete(id)
+                          yield* events.publish(Event.TimedOut, { sessionID: info.sessionID, requestID: id })
+                          return true
+                        }),
+                      )
+                      if (!timedOut) return yield* Effect.never
+                      return yield* new TimedOutError()
+                    }),
+                  ),
+                ),
+              ),
+              Effect.ensuring(
+                Effect.sync(() => {
+                  pending.delete(id)
+                }),
+              ),
+            )
+          }),
+        ),
+    )
 
     const reply = Effect.fn("Question.reply")(function* (input: {
       requestID: QuestionID
@@ -119,7 +159,8 @@ export const layer = Layer.effect(
       const existing = pending.get(input.requestID)
       if (!existing) {
         yield* Effect.logWarning("reply for unknown request", { requestID: input.requestID })
-        return yield* new NotFoundError({ requestID: input.requestID })
+        yield* new NotFoundError({ requestID: input.requestID })
+        return
       }
       pending.delete(input.requestID)
       yield* Effect.logInfo("replied", { requestID: input.requestID, answers: input.answers })
@@ -136,7 +177,8 @@ export const layer = Layer.effect(
       const existing = pending.get(requestID)
       if (!existing) {
         yield* Effect.logWarning("reject for unknown request", { requestID })
-        return yield* new NotFoundError({ requestID })
+        yield* new NotFoundError({ requestID })
+        return
       }
       pending.delete(requestID)
       yield* Effect.logInfo("rejected", { requestID })
@@ -147,17 +189,32 @@ export const layer = Layer.effect(
       yield* Deferred.fail(existing.deferred, new RejectedError())
     })
 
+    const interact = Effect.fn("Question.interact")(function* (requestID: QuestionID) {
+      const pending = (yield* InstanceState.get(state)).pending
+      const existing = pending.get(requestID)
+      if (!existing) {
+        yield* new NotFoundError({ requestID })
+        return
+      }
+      if (existing.info.expiresAt === undefined) return
+      existing.info = { ...existing.info, expiresAt: undefined }
+      yield* events.publish(Event.Interacted, {
+        sessionID: existing.info.sessionID,
+        requestID: existing.info.id,
+      })
+    })
+
     const list = Effect.fn("Question.list")(function* () {
       const pending = (yield* InstanceState.get(state)).pending
       return Array.from(pending.values(), (x) => x.info)
     })
 
-    return Service.of({ ask, reply, reject, list })
+    return Service.of({ ask, reply, reject, interact, list })
   }),
 )
 
-export const defaultLayer = layer.pipe(Layer.provide(EventV2Bridge.defaultLayer))
+export const defaultLayer = layer.pipe(Layer.provide(EventV2Bridge.defaultLayer), Layer.provide(Config.defaultLayer))
 
-export const node = LayerNode.make(layer, [EventV2Bridge.node])
+export const node = LayerNode.make(layer, [EventV2Bridge.node, Config.node])
 
 export * as Question from "."

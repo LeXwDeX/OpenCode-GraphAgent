@@ -538,6 +538,21 @@ This setting applies across all interfaces: TUI, CLI (`opencode run`), desktop a
 
 ---
 
+### Question timeout
+
+Use the root-level `question_timeout` option to choose how many seconds OpenCode waits for an answer to an interactive question. The default is 60 seconds.
+
+```json title="opencode.json"
+{
+  "$schema": "https://opencode.ai/config.json",
+  "question_timeout": 120
+}
+```
+
+The value must be a positive integer. Selecting an option or focusing the custom answer input cancels the timeout for the entire request. Moving between options or question tabs does not cancel it. If the timeout expires, OpenCode tells the agent that you are temporarily away so it can analyze the choices and continue within the task's existing authorization.
+
+---
+
 ### Sharing
 
 You can configure the [share](/docs/share) feature through the `share` option.

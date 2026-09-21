@@ -1,14 +1,22 @@
 import { afterEach, expect } from "bun:test"
-import { Cause, Effect, Exit, Fiber, Layer, Queue } from "effect"
+import { Cause, Duration, Effect, Exit, Fiber, Layer, Queue } from "effect"
+import * as TestClock from "effect/testing/TestClock"
 import { Question } from "../../src/question"
 import { InstanceRef } from "../../src/effect/instance-ref"
 import { InstanceStore } from "../../src/project/instance-store"
 import { QuestionID } from "../../src/question/schema"
-import { disposeAllInstances, provideInstance, testInstanceStoreLayer, tmpdirScoped } from "../fixture/fixture"
+import {
+  disposeAllInstances,
+  provideInstance,
+  testInstanceStoreLayer,
+  tmpdirScoped,
+  withTmpdirInstance,
+} from "../fixture/fixture"
 import { SessionID } from "../../src/session/schema"
 import { testEffect } from "../lib/effect"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { EventV2Bridge } from "../../src/event-v2-bridge"
+import { Config } from "../../src/config/config"
 
 const it = testEffect(
   Layer.mergeAll(Question.layer.pipe(Layer.provideMerge(EventV2Bridge.defaultLayer)), CrossSpawnSpawner.defaultLayer),
@@ -18,6 +26,15 @@ const lifecycle = testEffect(
     Question.layer.pipe(Layer.provideMerge(EventV2Bridge.defaultLayer)),
     CrossSpawnSpawner.defaultLayer,
     testInstanceStoreLayer,
+  ),
+)
+const configured = testEffect(
+  Layer.mergeAll(
+    Question.layer.pipe(
+      Layer.provideMerge(EventV2Bridge.defaultLayer),
+      Layer.provide(Layer.mock(Config.Service, { get: () => Effect.succeed({ question_timeout: 1 }) })),
+    ),
+    CrossSpawnSpawner.defaultLayer,
   ),
 )
 
@@ -45,6 +62,11 @@ const rejectEffect = Effect.fn("QuestionTest.reject")(function* (id: QuestionID)
   yield* question.reject(id)
 })
 
+const interactEffect = Effect.fn("QuestionTest.interact")(function* (id: QuestionID) {
+  const question = yield* Question.Service
+  yield* question.interact(id)
+})
+
 afterEach(async () => {
   await disposeAllInstances()
 })
@@ -53,6 +75,94 @@ afterEach(async () => {
 const rejectAll = Effect.gen(function* () {
   yield* Effect.forEach(yield* listEffect, (req) => rejectEffect(req.id), { discard: true })
 })
+
+const sample = [
+  {
+    question: "What would you like to do?",
+    header: "Action",
+    options: [{ label: "Continue", description: "Continue" }],
+  },
+]
+
+it.effect(
+  "ask - uses the default timeout and removes the request after timeout",
+  Effect.gen(function* () {
+    const fiber = yield* askEffect({ sessionID: SessionID.make("ses_timeout"), questions: sample }).pipe(
+      Effect.forkScoped,
+    )
+    const pending = yield* waitForPending(1)
+    expect(pending[0]?.expiresAt).toBe(60_000)
+    yield* Effect.yieldNow
+    yield* TestClock.adjust(Duration.seconds(60))
+    const exit = yield* Fiber.await(fiber)
+    expect(Exit.isFailure(exit)).toBe(true)
+    if (Exit.isFailure(exit)) expect(Cause.squash(exit.cause)).toBeInstanceOf(Question.TimedOutError)
+    expect(yield* listEffect).toEqual([])
+  }).pipe(withTmpdirInstance({ git: true })),
+)
+
+configured.effect(
+  "ask - reads the configured timeout",
+  Effect.gen(function* () {
+    const fiber = yield* askEffect({ sessionID: SessionID.make("ses_configured_timeout"), questions: sample }).pipe(
+      Effect.forkScoped,
+    )
+    const pending = yield* waitForPending(1)
+    expect(pending[0]?.expiresAt).toBe(1_000)
+    yield* Effect.yieldNow
+    yield* TestClock.adjust(Duration.seconds(1))
+    const exit = yield* Fiber.await(fiber)
+    expect(Exit.isFailure(exit)).toBe(true)
+    if (Exit.isFailure(exit)) expect(Cause.squash(exit.cause)).toBeInstanceOf(Question.TimedOutError)
+  }).pipe(withTmpdirInstance({ git: true })),
+)
+
+it.effect(
+  "interact - permanently cancels the timeout for the whole request",
+  Effect.gen(function* () {
+    const question = yield* Question.Service
+    const fiber = yield* askEffect({
+      sessionID: SessionID.make("ses_interact"),
+      questions: [...sample, ...sample],
+    }).pipe(Effect.forkScoped)
+    const pending = yield* waitForPending(1)
+    yield* interactEffect(pending[0].id)
+    yield* interactEffect(pending[0].id)
+    expect((yield* listEffect)[0]?.expiresAt).toBeUndefined()
+    yield* TestClock.adjust(Duration.hours(1))
+    yield* question.reply({ requestID: pending[0].id, answers: [["Continue"], ["Continue"]] })
+    expect(yield* Fiber.join(fiber)).toEqual([["Continue"], ["Continue"]])
+  }).pipe(withTmpdirInstance({ git: true })),
+)
+
+it.effect(
+  "reply - wins before the deadline and prevents a later timeout",
+  Effect.gen(function* () {
+    const fiber = yield* askEffect({ sessionID: SessionID.make("ses_reply_race"), questions: sample }).pipe(
+      Effect.forkScoped,
+    )
+    const pending = yield* waitForPending(1)
+    yield* TestClock.adjust(Duration.seconds(59))
+    yield* replyEffect({ requestID: pending[0].id, answers: [["Continue"]] })
+    expect(yield* Fiber.join(fiber)).toEqual([["Continue"]])
+    yield* TestClock.adjust(Duration.hours(1))
+    expect(yield* listEffect).toEqual([])
+  }).pipe(withTmpdirInstance({ git: true })),
+)
+
+it.effect(
+  "ask - interruption removes the pending request and timer",
+  Effect.gen(function* () {
+    const fiber = yield* askEffect({ sessionID: SessionID.make("ses_abort"), questions: sample }).pipe(
+      Effect.forkScoped,
+    )
+    yield* waitForPending(1)
+    yield* Fiber.interrupt(fiber)
+    expect(yield* listEffect).toEqual([])
+    yield* TestClock.adjust(Duration.hours(1))
+    expect(yield* listEffect).toEqual([])
+  }).pipe(withTmpdirInstance({ git: true })),
+)
 
 const waitForPending = Effect.fn("QuestionTest.waitForPending")(function* (count: number) {
   const question = yield* Question.Service

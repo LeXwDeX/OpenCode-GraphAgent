@@ -1,5 +1,6 @@
 import { describe, expect } from "bun:test"
-import { Context, Deferred, Effect, Exit, Fiber, Layer, Scope } from "effect"
+import { Context, Deferred, Duration, Effect, Exit, Fiber, Layer, Scope } from "effect"
+import * as TestClock from "effect/testing/TestClock"
 import { Database } from "@opencode-ai/core/database/database"
 import { EventV2 } from "@opencode-ai/core/event"
 import { QuestionV2 } from "@opencode-ai/core/question"
@@ -33,6 +34,54 @@ const waitForAsk = Effect.fn("QuestionV2Test.waitForAsk")(function* (
 })
 
 describe("QuestionV2", () => {
+  it.effect("times out deterministically and removes the pending request", () =>
+    Effect.gen(function* () {
+      const service = yield* QuestionV2.Service
+      const events = yield* EventV2.Service
+      const timedOut = yield* Deferred.make<void>()
+      const unsubscribe = yield* events.listen((event) =>
+        event.type === QuestionV2.Event.TimedOut.type
+          ? Deferred.succeed(timedOut, undefined).pipe(Effect.asVoid)
+          : Effect.void,
+      )
+      yield* Effect.addFinalizer(() => unsubscribe)
+      const { fiber, request } = yield* waitForAsk(service, { sessionID, questions: [question] })
+
+      expect(request.expiresAt).toBe(60_000)
+      yield* Effect.yieldNow
+      yield* TestClock.adjust(Duration.seconds(60))
+      yield* Deferred.await(timedOut)
+
+      const exit = yield* Fiber.await(fiber)
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) expect(exit.cause.toString()).toContain("QuestionV2.TimedOutError")
+      expect(yield* service.list()).toEqual([])
+    }),
+  )
+
+  it.effect("cancels the whole request timeout after interaction and keeps it cancelled", () =>
+    Effect.gen(function* () {
+      const service = yield* QuestionV2.Service
+      const { fiber, request } = yield* waitForAsk(service, { sessionID, questions: [question, question] })
+
+      yield* service.interact(request.id)
+      yield* service.interact(request.id)
+      expect((yield* service.list())[0]?.expiresAt).toBeUndefined()
+      yield* TestClock.adjust(Duration.hours(1))
+      yield* service.reply({ requestID: request.id, answers: [["One"], ["One"]] })
+      expect(yield* Fiber.join(fiber)).toEqual([["One"], ["One"]])
+    }),
+  )
+
+  it.effect("removes a pending request when its ask fiber is interrupted", () =>
+    Effect.gen(function* () {
+      const service = yield* QuestionV2.Service
+      const { fiber } = yield* waitForAsk(service, { sessionID, questions: [question] })
+      yield* Fiber.interrupt(fiber)
+      expect(yield* service.list()).toEqual([])
+    }),
+  )
+
   it.effect("publishes lifecycle events and settles a pending reply", () =>
     Effect.gen(function* () {
       const service = yield* QuestionV2.Service

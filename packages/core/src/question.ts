@@ -1,9 +1,12 @@
 export * as QuestionV2 from "./question"
 
-import { Context, Deferred, Effect, Layer, Schema } from "effect"
+import { Clock, Context, Deferred, Effect, Layer, Option as EffectOption, Schema } from "effect"
 import { Question } from "@opencode-ai/schema/question"
 import { EventV2 } from "./event"
 import { SessionSchema } from "./session/schema"
+import { Config } from "./config"
+
+export const DEFAULT_TIMEOUT_SECONDS = 60
 
 export const ID = Question.ID
 export type ID = typeof ID.Type
@@ -37,6 +40,12 @@ export class RejectedError extends Schema.TaggedErrorClass<RejectedError>()("Que
   }
 }
 
+export class TimedOutError extends Schema.TaggedErrorClass<TimedOutError>()("QuestionV2.TimedOutError", {}) {
+  override get message() {
+    return "The user is temporarily away"
+  }
+}
+
 export class NotFoundError extends Schema.TaggedErrorClass<NotFoundError>()("QuestionV2.NotFoundError", {
   requestID: ID,
 }) {}
@@ -53,16 +62,17 @@ export interface ReplyInput {
 }
 
 export interface Interface {
-  readonly ask: (input: AskInput) => Effect.Effect<ReadonlyArray<Answer>, RejectedError>
+  readonly ask: (input: AskInput) => Effect.Effect<ReadonlyArray<Answer>, RejectedError | TimedOutError>
   readonly reply: (input: ReplyInput) => Effect.Effect<void, NotFoundError>
   readonly reject: (requestID: ID) => Effect.Effect<void, NotFoundError>
+  readonly interact: (requestID: ID) => Effect.Effect<void, NotFoundError>
   readonly list: () => Effect.Effect<ReadonlyArray<Request>>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/v2/Question") {}
 
 interface Pending {
-  readonly request: Request
+  request: Request
   readonly deferred: Deferred.Deferred<ReadonlyArray<Answer>, RejectedError>
 }
 
@@ -75,6 +85,7 @@ export const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const events = yield* EventV2.Service
+    const config = EffectOption.getOrUndefined(yield* Effect.serviceOption(Config.Service))
     const pending = new Map<ID, Pending>()
 
     yield* Effect.addFinalizer(() =>
@@ -93,11 +104,38 @@ export const layer = Layer.effect(
       Effect.uninterruptibleMask((restore) =>
         Effect.gen(function* () {
           const id = ID.ascending()
+          const timeoutSeconds = config
+            ? (Config.latest(yield* config.entries(), "question_timeout") ?? DEFAULT_TIMEOUT_SECONDS)
+            : DEFAULT_TIMEOUT_SECONDS
+          const now = yield* Clock.currentTimeMillis
+          const expiresAt = now + timeoutSeconds * 1_000
           const deferred = yield* Deferred.make<ReadonlyArray<Answer>, RejectedError>()
-          const request: Request = { id, ...input }
-          pending.set(id, { request, deferred })
+          const request: Request = { id, ...input, expiresAt }
+          const entry = { request, deferred }
+          pending.set(id, entry)
           return yield* events.publish(Event.Asked, request).pipe(
-            Effect.andThen(restore(Deferred.await(deferred))),
+            Effect.andThen(
+              restore(
+                Effect.raceFirst(
+                  Deferred.await(deferred),
+                  Effect.gen(function* () {
+                    const current = yield* Clock.currentTimeMillis
+                    yield* Effect.sleep(Math.max(0, expiresAt - current))
+                    const timedOut = yield* Effect.uninterruptible(
+                      Effect.gen(function* () {
+                        const existing = pending.get(id)
+                        if (existing !== entry || existing.request.expiresAt === undefined) return false
+                        pending.delete(id)
+                        yield* events.publish(Event.TimedOut, { sessionID: request.sessionID, requestID: id })
+                        return true
+                      }),
+                    )
+                    if (!timedOut) return yield* Effect.never
+                    return yield* new TimedOutError()
+                  }),
+                ),
+              ),
+            ),
             Effect.ensuring(
               Effect.sync(() => {
                 pending.delete(id)
@@ -112,7 +150,10 @@ export const layer = Layer.effect(
       Effect.uninterruptible(
         Effect.gen(function* () {
           const existing = pending.get(input.requestID)
-          if (!existing) return yield* new NotFoundError({ requestID: input.requestID })
+          if (!existing) {
+            yield* new NotFoundError({ requestID: input.requestID })
+            return
+          }
           yield* events.publish(Event.Replied, {
             sessionID: existing.request.sessionID,
             requestID: existing.request.id,
@@ -128,7 +169,10 @@ export const layer = Layer.effect(
       Effect.uninterruptible(
         Effect.gen(function* () {
           const existing = pending.get(requestID)
-          if (!existing) return yield* new NotFoundError({ requestID })
+          if (!existing) {
+            yield* new NotFoundError({ requestID })
+            return
+          }
           yield* events.publish(Event.Rejected, {
             sessionID: existing.request.sessionID,
             requestID: existing.request.id,
@@ -139,11 +183,29 @@ export const layer = Layer.effect(
       ),
     )
 
+    const interact = Effect.fn("QuestionV2.interact")((requestID: ID) =>
+      Effect.uninterruptible(
+        Effect.gen(function* () {
+          const existing = pending.get(requestID)
+          if (!existing) {
+            yield* new NotFoundError({ requestID })
+            return
+          }
+          if (existing.request.expiresAt === undefined) return
+          existing.request = { ...existing.request, expiresAt: undefined }
+          yield* events.publish(Event.Interacted, {
+            sessionID: existing.request.sessionID,
+            requestID: existing.request.id,
+          })
+        }),
+      ),
+    )
+
     const list = Effect.fn("QuestionV2.list")(function* () {
       return Array.from(pending.values(), (item) => item.request)
     })
 
-    return Service.of({ ask, reply, reject, list })
+    return Service.of({ ask, reply, reject, interact, list })
   }),
 )
 

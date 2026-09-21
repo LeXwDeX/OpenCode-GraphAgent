@@ -406,6 +406,7 @@ export default function LegacyLayout(props: ParentProps) {
         if (
           e.details?.type === "question.replied" ||
           e.details?.type === "question.rejected" ||
+          e.details?.type === "question.timed_out" ||
           e.details?.type === "permission.replied"
         ) {
           const props = e.details.properties as { sessionID: string }
