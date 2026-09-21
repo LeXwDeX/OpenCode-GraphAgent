@@ -817,6 +817,8 @@ export function reduceSubagentData(input: {
     event.type === "question.asked" ||
     event.type === "question.replied" ||
     event.type === "question.rejected" ||
+    event.type === "question.interacted" ||
+    event.type === "question.timed_out" ||
     event.type === "session.error" ||
     event.type === "session.status"
       ? event.properties.sessionID

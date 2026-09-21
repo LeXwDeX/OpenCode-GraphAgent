@@ -37,6 +37,9 @@ export const Request = Schema.Struct({
   sessionID: SessionID,
   questions: Schema.Array(Info).annotate({ description: "Questions to ask" }),
   tool: Schema.optional(Tool),
+  expiresAt: Schema.optional(Schema.Int).annotate({
+    description: "Unix timestamp in milliseconds when this question times out; omitted after user interaction",
+  }),
 }).annotate({ identifier: "QuestionRequest" })
 export const Answer = Schema.Array(Schema.String).annotate({ identifier: "QuestionAnswer" })
 export const Reply = Schema.Struct({
@@ -54,13 +57,23 @@ export const Replied = Schema.Struct({
 export const Rejected = Schema.Struct({ sessionID: SessionID, requestID: ID }).annotate({
   identifier: "QuestionRejected",
 })
+export const Interacted = Schema.Struct({ sessionID: SessionID, requestID: ID }).annotate({
+  identifier: "QuestionInteracted",
+})
+export const TimedOut = Schema.Struct({ sessionID: SessionID, requestID: ID }).annotate({
+  identifier: "QuestionTimedOut",
+})
 
 const Asked = define({ type: "question.asked", schema: Request.fields })
 const RepliedEvent = define({ type: "question.replied", schema: Replied.fields })
 const RejectedEvent = define({ type: "question.rejected", schema: Rejected.fields })
+const InteractedEvent = define({ type: "question.interacted", schema: Interacted.fields })
+const TimedOutEvent = define({ type: "question.timed_out", schema: TimedOut.fields })
 export const Event = {
   Asked,
   Replied: RepliedEvent,
   Rejected: RejectedEvent,
-  Definitions: inventory(Asked, RepliedEvent, RejectedEvent),
+  Interacted: InteractedEvent,
+  TimedOut: TimedOutEvent,
+  Definitions: inventory(Asked, RepliedEvent, RejectedEvent, InteractedEvent, TimedOutEvent),
 }

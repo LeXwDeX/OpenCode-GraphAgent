@@ -31,11 +31,29 @@ export const QuestionTool = Tool.define<typeof Parameters, Metadata, Question.Se
               metadata: { answers: [] },
             }
           }
-          const answers = yield* question.ask({
-            sessionID: ctx.sessionID,
-            questions: params.questions,
-            tool: ctx.callID ? { messageID: ctx.messageID, callID: ctx.callID } : undefined,
-          })
+          const result = yield* question
+            .ask({
+              sessionID: ctx.sessionID,
+              questions: params.questions,
+              tool: ctx.callID ? { messageID: ctx.messageID, callID: ctx.callID } : undefined,
+            })
+            .pipe(
+              Effect.map((answers) => ({ timedOut: false as const, answers })),
+              Effect.catchTag("QuestionTimedOutError", () =>
+                Effect.succeed({ timedOut: true as const, answers: [] as ReadonlyArray<Question.Answer> }),
+              ),
+            )
+
+          if (result.timedOut) {
+            return {
+              title: "Question timed out",
+              output:
+                "The user is temporarily away. Analyze the available options, select the most appropriate answer yourself, and continue within the existing task authorization. Do not claim that the user selected an answer.",
+              metadata: { answers: result.answers },
+            }
+          }
+
+          const answers = result.answers
 
           const formatted = params.questions
             .map((q, i) => `"${q.question}"="${answers[i]?.length ? answers[i].join(", ") : "Unanswered"}"`)

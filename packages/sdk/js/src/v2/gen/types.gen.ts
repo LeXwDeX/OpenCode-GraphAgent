@@ -68,6 +68,8 @@ export type Event =
   | EventQuestionV2Asked
   | EventQuestionV2Replied
   | EventQuestionV2Rejected
+  | EventQuestionV2Interacted
+  | EventQuestionV2TimedOut
   | EventTodoUpdated
   | EventDagWorkflowSummaryUpdated
   | EventLspUpdated
@@ -88,6 +90,8 @@ export type Event =
   | EventQuestionAsked
   | EventQuestionReplied
   | EventQuestionRejected
+  | EventQuestionInteracted
+  | EventQuestionTimedOut
   | EventSessionCompacted
   | EventVcsBranchUpdated
   | EventWorkspaceReady
@@ -1414,6 +1418,7 @@ export type GlobalEvent = {
            */
           questions: Array<QuestionV2Info>
           tool?: QuestionV2Tool
+          expiresAt?: number
         }
       }
     | {
@@ -1428,6 +1433,22 @@ export type GlobalEvent = {
     | {
         id: string
         type: "question.v2.rejected"
+        properties: {
+          sessionID: string
+          requestID: string
+        }
+      }
+    | {
+        id: string
+        type: "question.v2.interacted"
+        properties: {
+          sessionID: string
+          requestID: string
+        }
+      }
+    | {
+        id: string
+        type: "question.v2.timed_out"
         properties: {
           sessionID: string
           requestID: string
@@ -1627,6 +1648,7 @@ export type GlobalEvent = {
            */
           questions: Array<QuestionInfo>
           tool?: QuestionTool
+          expiresAt?: number
         }
       }
     | {
@@ -1641,6 +1663,22 @@ export type GlobalEvent = {
     | {
         id: string
         type: "question.rejected"
+        properties: {
+          sessionID: string
+          requestID: string
+        }
+      }
+    | {
+        id: string
+        type: "question.interacted"
+        properties: {
+          sessionID: string
+          requestID: string
+        }
+      }
+    | {
+        id: string
+        type: "question.timed_out"
         properties: {
           sessionID: string
           requestID: string
@@ -2017,6 +2055,7 @@ export type Config = {
   model?: string
   small_model?: string
   default_agent?: string
+  question_timeout?: number
   username?: string
   mode?: {
     build?: AgentConfig
@@ -2557,6 +2596,7 @@ export type QuestionRequest = {
    */
   questions: Array<QuestionInfo>
   tool?: QuestionTool
+  expiresAt?: number
 }
 
 export type QuestionNotFoundError = {
@@ -2904,6 +2944,8 @@ export type V2Event =
   | V2EventQuestionV2Asked
   | V2EventQuestionV2Replied
   | V2EventQuestionV2Rejected
+  | V2EventQuestionV2Interacted
+  | V2EventQuestionV2TimedOut
   | V2EventTodoUpdated
   | V2EventDagWorkflowSummaryUpdated
   | V2EventLspUpdated
@@ -2924,6 +2966,8 @@ export type V2Event =
   | V2EventQuestionAsked
   | V2EventQuestionReplied
   | V2EventQuestionRejected
+  | V2EventQuestionInteracted
+  | V2EventQuestionTimedOut
   | V2EventSessionCompacted
   | V2EventVcsBranchUpdated
   | V2EventWorkspaceReady
@@ -5707,6 +5751,7 @@ export type V2EventQuestionV2Asked = {
      */
     questions: Array<QuestionV2Info>
     tool?: QuestionV2Tool
+    expiresAt?: number
   }
 }
 
@@ -5741,6 +5786,42 @@ export type V2EventQuestionV2Rejected = {
   }
   location?: LocationRef
   type: "question.v2.rejected"
+  data: {
+    sessionID: string
+    requestID: string
+  }
+}
+
+export type V2EventQuestionV2Interacted = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  type: "question.v2.interacted"
+  data: {
+    sessionID: string
+    requestID: string
+  }
+}
+
+export type V2EventQuestionV2TimedOut = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  type: "question.v2.timed_out"
   data: {
     sessionID: string
     requestID: string
@@ -6120,6 +6201,7 @@ export type V2EventQuestionAsked = {
      */
     questions: Array<QuestionInfo>
     tool?: QuestionTool
+    expiresAt?: number
   }
 }
 
@@ -6154,6 +6236,42 @@ export type V2EventQuestionRejected = {
   }
   location?: LocationRef
   type: "question.rejected"
+  data: {
+    sessionID: string
+    requestID: string
+  }
+}
+
+export type V2EventQuestionInteracted = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  type: "question.interacted"
+  data: {
+    sessionID: string
+    requestID: string
+  }
+}
+
+export type V2EventQuestionTimedOut = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  type: "question.timed_out"
   data: {
     sessionID: string
     requestID: string
@@ -6323,6 +6441,7 @@ export type QuestionV2Request = {
    */
   questions: Array<QuestionV2Info>
   tool?: QuestionV2Tool
+  expiresAt?: number
 }
 
 export type QuestionV2Reply = {
@@ -7067,6 +7186,7 @@ export type EventQuestionV2Asked = {
      */
     questions: Array<QuestionV2Info>
     tool?: QuestionV2Tool
+    expiresAt?: number
   }
 }
 
@@ -7083,6 +7203,24 @@ export type EventQuestionV2Replied = {
 export type EventQuestionV2Rejected = {
   id: string
   type: "question.v2.rejected"
+  properties: {
+    sessionID: string
+    requestID: string
+  }
+}
+
+export type EventQuestionV2Interacted = {
+  id: string
+  type: "question.v2.interacted"
+  properties: {
+    sessionID: string
+    requestID: string
+  }
+}
+
+export type EventQuestionV2TimedOut = {
+  id: string
+  type: "question.v2.timed_out"
   properties: {
     sessionID: string
     requestID: string
@@ -7245,6 +7383,7 @@ export type EventQuestionAsked = {
      */
     questions: Array<QuestionInfo>
     tool?: QuestionTool
+    expiresAt?: number
   }
 }
 
@@ -7261,6 +7400,24 @@ export type EventQuestionReplied = {
 export type EventQuestionRejected = {
   id: string
   type: "question.rejected"
+  properties: {
+    sessionID: string
+    requestID: string
+  }
+}
+
+export type EventQuestionInteracted = {
+  id: string
+  type: "question.interacted"
+  properties: {
+    sessionID: string
+    requestID: string
+  }
+}
+
+export type EventQuestionTimedOut = {
+  id: string
+  type: "question.timed_out"
   properties: {
     sessionID: string
     requestID: string
@@ -9533,6 +9690,40 @@ export type QuestionRejectResponses = {
 }
 
 export type QuestionRejectResponse = QuestionRejectResponses[keyof QuestionRejectResponses]
+
+export type QuestionInteractData = {
+  body?: never
+  path: {
+    requestID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/question/{requestID}/interact"
+}
+
+export type QuestionInteractErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * QuestionNotFoundError
+   */
+  404: QuestionNotFoundError
+}
+
+export type QuestionInteractError = QuestionInteractErrors[keyof QuestionInteractErrors]
+
+export type QuestionInteractResponses = {
+  /**
+   * Question timeout cancelled successfully
+   */
+  200: boolean
+}
+
+export type QuestionInteractResponse = QuestionInteractResponses[keyof QuestionInteractResponses]
 
 export type PermissionListData = {
   body?: never
@@ -14136,6 +14327,43 @@ export type V2SessionQuestionRejectResponses = {
 }
 
 export type V2SessionQuestionRejectResponse = V2SessionQuestionRejectResponses[keyof V2SessionQuestionRejectResponses]
+
+export type V2SessionQuestionInteractData = {
+  body?: never
+  path: {
+    sessionID: string
+    requestID: string
+  }
+  query?: never
+  url: "/api/session/{sessionID}/question/{requestID}/interact"
+}
+
+export type V2SessionQuestionInteractErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * UnauthorizedError
+   */
+  401: UnauthorizedError
+  /**
+   * SessionNotFoundError | QuestionNotFoundError
+   */
+  404: QuestionNotFoundError | SessionNotFoundError
+}
+
+export type V2SessionQuestionInteractError = V2SessionQuestionInteractErrors[keyof V2SessionQuestionInteractErrors]
+
+export type V2SessionQuestionInteractResponses = {
+  /**
+   * <No Content>
+   */
+  204: void
+}
+
+export type V2SessionQuestionInteractResponse =
+  V2SessionQuestionInteractResponses[keyof V2SessionQuestionInteractResponses]
 
 export type V2ReferenceListData = {
   body?: never

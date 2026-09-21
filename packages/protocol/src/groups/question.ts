@@ -79,6 +79,21 @@ export const makeQuestionGroup = <
           }),
         ),
     )
+    .add(
+      HttpApiEndpoint.post("session.question.interact", "/api/session/:sessionID/question/:requestID/interact", {
+        params: { sessionID: Session.ID, requestID: Question.ID },
+        success: HttpApiSchema.NoContent,
+        error: [SessionNotFoundError, QuestionNotFoundError],
+      })
+        .middleware(sessionLocationMiddleware)
+        .annotateMerge(
+          OpenApi.annotations({
+            identifier: "v2.session.question.interact",
+            summary: "Interact with pending question request",
+            description: "Cancel the timeout after a user selects an option or focuses the custom answer input.",
+          }),
+        ),
+    )
     .annotateMerge(
       OpenApi.annotations({ title: "session questions", description: "Experimental session question routes." }),
     )

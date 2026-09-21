@@ -242,7 +242,8 @@ export const {
         }
 
         case "question.replied":
-        case "question.rejected": {
+        case "question.rejected":
+        case "question.timed_out": {
           const requests = store.question[event.properties.sessionID]
           if (!requests) break
           const match = search(requests, event.properties.requestID, (r) => r.id)
@@ -254,6 +255,15 @@ export const {
               draft.splice(match.index, 1)
             }),
           )
+          break
+        }
+
+        case "question.interacted": {
+          const requests = store.question[event.properties.sessionID]
+          if (!requests) break
+          const match = search(requests, event.properties.requestID, (r) => r.id)
+          if (!match.found) break
+          setStore("question", event.properties.sessionID, match.index, "expiresAt", undefined)
           break
         }
 

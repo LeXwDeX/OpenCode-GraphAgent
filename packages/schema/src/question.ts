@@ -47,6 +47,9 @@ export const Request = Schema.Struct({
   sessionID: SessionID,
   questions: Schema.Array(Info).annotate({ description: "Questions to ask" }),
   tool: Tool.pipe(Schema.optional),
+  expiresAt: Schema.Int.pipe(Schema.optional).annotate({
+    description: "Unix timestamp in milliseconds when this question times out; omitted after user interaction",
+  }),
 }).annotate({ identifier: "QuestionV2.Request" })
 export type Request = typeof Request.Type
 
@@ -76,4 +79,19 @@ const Rejected = define({
     requestID: ID,
   },
 })
-export const Event = { Asked, Replied, Rejected, Definitions: inventory(Asked, Replied, Rejected) }
+const Interacted = define({
+  type: "question.v2.interacted",
+  schema: { sessionID: SessionID, requestID: ID },
+})
+const TimedOut = define({
+  type: "question.v2.timed_out",
+  schema: { sessionID: SessionID, requestID: ID },
+})
+export const Event = {
+  Asked,
+  Replied,
+  Rejected,
+  Interacted,
+  TimedOut,
+  Definitions: inventory(Asked, Replied, Rejected, Interacted, TimedOut),
+}

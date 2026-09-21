@@ -58,5 +58,16 @@ export const QuestionHandler = HttpApiBuilder.group(Api, "server.question", (han
           return HttpApiSchema.NoContent.make()
         }),
       )
+      .handle(
+        "session.question.interact",
+        Effect.fn(function* (ctx) {
+          yield* withOwnedQuestion(ctx.params.sessionID, ctx.params.requestID, (question) =>
+            question
+              .interact(ctx.params.requestID)
+              .pipe(Effect.catchTag("QuestionV2.NotFoundError", () => missingRequest(ctx.params.requestID))),
+          )
+          return HttpApiSchema.NoContent.make()
+        }),
+      )
   }),
 )

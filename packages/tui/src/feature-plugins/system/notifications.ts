@@ -46,6 +46,10 @@ const tui: TuiPlugin = async (api) => {
     questions.delete(event.properties.requestID)
   })
 
+  api.event.on("question.timed_out", (event) => {
+    questions.delete(event.properties.requestID)
+  })
+
   api.event.on("permission.asked", (event) => {
     if (permissions.has(event.properties.id)) return
     permissions.add(event.properties.id)

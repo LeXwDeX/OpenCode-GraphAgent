@@ -286,6 +286,8 @@ export type QuestionReply = Parameters<OpencodeClient["question"]["reply"]>[0]
 
 export type QuestionReject = Parameters<OpencodeClient["question"]["reject"]>[0]
 
+export type QuestionInteract = Parameters<OpencodeClient["question"]["interact"]>[0]
+
 export type RunTuiConfig = Pick<TuiConfig.Resolved, "keybinds" | "leader_timeout" | "diff_style">
 
 // Lifecycle phase of a scrollback entry. "start" opens the entry, "progress"

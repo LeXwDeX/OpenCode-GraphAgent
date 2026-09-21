@@ -52,6 +52,17 @@ const provider = {
 }
 
 describe("Config", () => {
+  it.effect("accepts only positive integer question timeouts", () =>
+    Effect.sync(() => {
+      expect(Schema.decodeUnknownSync(ConfigV1.Info)({ question_timeout: 1 }).question_timeout).toBe(1)
+      expect(Schema.decodeUnknownSync(Config.Info)({ question_timeout: 1 }).question_timeout).toBe(1)
+      for (const question_timeout of [0, -1, 1.5]) {
+        expect(() => Schema.decodeUnknownSync(ConfigV1.Info)({ question_timeout })).toThrow()
+        expect(() => Schema.decodeUnknownSync(Config.Info)({ question_timeout })).toThrow()
+      }
+    }),
+  )
+
   it.effect("returns the latest defined scalar from priority-ordered documents", () =>
     Effect.sync(() => {
       const entries = [
@@ -172,6 +183,25 @@ describe("Config", () => {
             new Config.Directory({ type: "directory", path: AbsolutePath.make(path.join(tmp.path, "global")) }),
           ])
         }).pipe(Effect.provide(testLayer(tmp.path))),
+      ),
+    ),
+  )
+
+  it.live("loads question_timeout from opencode.json", () =>
+    Effect.acquireRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ).pipe(
+      Effect.flatMap((tmp) =>
+        Effect.gen(function* () {
+          yield* Effect.promise(() =>
+            fs.writeFile(path.join(tmp.path, "opencode.json"), JSON.stringify({ question_timeout: 2 })),
+          )
+          const entries = yield* Effect.gen(function* () {
+            return yield* (yield* Config.Service).entries()
+          }).pipe(Effect.provide(testLayer(tmp.path)))
+          expect(Config.latest(entries, "question_timeout")).toBe(2)
+        }),
       ),
     ),
   )

@@ -1,4 +1,4 @@
-import { For, Show, createMemo, onCleanup, onMount, type Component } from "solid-js"
+import { For, Show, createEffect, createMemo, onCleanup, onMount, type Component } from "solid-js"
 import { createStore } from "solid-js/store"
 import { useMutation } from "@tanstack/solid-query"
 import { Button } from "@opencode-ai/ui/button"
@@ -64,12 +64,12 @@ export const SessionQuestionDock: Component<{ request: QuestionRequest; onSubmit
   const sdk = useSDK()
   const serverSDK = useServerSDK()
   const language = useLanguage()
-  const cacheKey = ScopedKey.from(serverSDK().scope, props.request.id)
+  const cacheKey = (requestID: string = props.request.id) => ScopedKey.from(serverSDK().scope, requestID)
 
   const questions = createMemo(() => props.request.questions)
   const total = createMemo(() => questions().length)
 
-  const cached = cache.get(cacheKey)
+  const cached = cache.get(cacheKey())
   const [store, setStore] = createStore({
     tab: cached?.tab ?? 0,
     answers: cached?.answers ?? ([] as QuestionAnswer[]),
@@ -77,6 +77,8 @@ export const SessionQuestionDock: Component<{ request: QuestionRequest; onSubmit
     customOn: cached?.customOn ?? ([] as boolean[]),
     editing: false,
     focus: 0,
+    interacting: false,
+    remaining: undefined as number | undefined,
   })
 
   let root: HTMLDivElement | undefined
@@ -84,6 +86,9 @@ export const SessionQuestionDock: Component<{ request: QuestionRequest; onSubmit
   let optsRef: HTMLButtonElement[] = []
   let replied = false
   let focusFrame: number | undefined
+  let requestID = props.request.id
+  let interactedRequest: string | undefined
+  let countdownTimer: ReturnType<typeof setInterval> | undefined
 
   const question = createMemo(() => questions()[store.tab])
   const options = createMemo(() => question()?.options ?? [])
@@ -101,6 +106,100 @@ export const SessionQuestionDock: Component<{ request: QuestionRequest; onSubmit
   const customPlaceholder = () => language.t("ui.question.custom.placeholder")
 
   const last = createMemo(() => store.tab >= total() - 1)
+
+  const snapshot = () => ({
+    tab: store.tab,
+    answers: store.answers.map((answer) => (answer ? [...answer] : [])),
+    custom: store.custom.map((value) => value ?? ""),
+    customOn: store.customOn.map((value) => value ?? false),
+  })
+
+  const stopCountdown = () => {
+    if (countdownTimer !== undefined) clearInterval(countdownTimer)
+    countdownTimer = undefined
+    setStore("remaining", undefined)
+  }
+
+  const notFound = (error: unknown, response?: Response) => {
+    if (response?.status === 404) return true
+    if (typeof error === "object" && error !== null && "_tag" in error) {
+      return (error as { _tag?: unknown })._tag === "QuestionNotFoundError"
+    }
+    if (!(error instanceof Error) || typeof error.cause !== "object" || error.cause === null) return false
+    return (error.cause as { status?: unknown }).status === 404
+  }
+
+  const interactionError = (error: unknown) => {
+    if (error instanceof Error) return error
+    if (typeof error === "object" && error !== null && "message" in error) {
+      const message = (error as { message?: unknown }).message
+      if (typeof message === "string") return new Error(message)
+    }
+    return new Error("Failed to cancel the question timeout")
+  }
+
+  const interact = async () => {
+    const id = props.request.id
+    if (interactedRequest === id || store.interacting) return
+    setStore("interacting", true)
+    try {
+      const result = await sdk().client.question.interact({ requestID: id })
+      if (props.request.id !== id) return
+      if (result.error && !notFound(result.error, result.response)) {
+        fail(interactionError(result.error))
+        return
+      }
+      interactedRequest = id
+      stopCountdown()
+    } catch (error) {
+      if (props.request.id !== id) return
+      if (notFound(error)) {
+        interactedRequest = id
+        stopCountdown()
+        return
+      }
+      fail(interactionError(error))
+    } finally {
+      if (props.request.id === id) setStore("interacting", false)
+    }
+  }
+
+  createEffect(() => {
+    const id = props.request.id
+    if (requestID === id) return
+    if (!replied) cache.set(cacheKey(requestID), snapshot())
+
+    requestID = id
+    replied = false
+    interactedRequest = undefined
+    const next = cache.get(cacheKey(id))
+    setStore({
+      tab: next?.tab ?? 0,
+      answers: next?.answers ?? [],
+      custom: next?.custom ?? [],
+      customOn: next?.customOn ?? [],
+      editing: false,
+      focus: 0,
+      interacting: false,
+      remaining: undefined,
+    })
+  })
+
+  createEffect(() => {
+    const id = props.request.id
+    const expiresAt = Number(props.request.expiresAt)
+    stopCountdown()
+    if (!Number.isFinite(expiresAt) || interactedRequest === id) return
+
+    const update = () => setStore("remaining", Math.max(0, Math.ceil((expiresAt - Date.now()) / 1000)))
+    update()
+    const timer = setInterval(update, 250)
+    countdownTimer = timer
+    onCleanup(() => {
+      clearInterval(timer)
+      if (countdownTimer === timer) countdownTimer = undefined
+    })
+  })
 
   const customUpdate = (value: string, selected: boolean = on()) => {
     const prev = input().trim()
@@ -195,12 +294,7 @@ export const SessionQuestionDock: Component<{ request: QuestionRequest; onSubmit
   onCleanup(() => {
     if (focusFrame !== undefined) cancelAnimationFrame(focusFrame)
     if (replied) return
-    cache.set(cacheKey, {
-      tab: store.tab,
-      answers: store.answers.map((a) => (a ? [...a] : [])),
-      custom: store.custom.map((s) => s ?? ""),
-      customOn: store.customOn.map((b) => b ?? false),
-    })
+    cache.set(cacheKey(), snapshot())
   })
 
   const fail = (err: unknown) => {
@@ -215,7 +309,7 @@ export const SessionQuestionDock: Component<{ request: QuestionRequest; onSubmit
     },
     onSuccess: () => {
       replied = true
-      cache.delete(cacheKey)
+      cache.delete(cacheKey())
     },
     onError: fail,
   }))
@@ -227,7 +321,7 @@ export const SessionQuestionDock: Component<{ request: QuestionRequest; onSubmit
     },
     onSuccess: () => {
       replied = true
-      cache.delete(cacheKey)
+      cache.delete(cacheKey())
     },
     onError: fail,
   }))
@@ -361,6 +455,7 @@ export const SessionQuestionDock: Component<{ request: QuestionRequest; onSubmit
 
     const opt = options()[optIndex]
     if (!opt) return
+    void interact()
     if (multi()) {
       setStore("editing", false)
       toggle(opt.label)
@@ -432,6 +527,9 @@ export const SessionQuestionDock: Component<{ request: QuestionRequest; onSubmit
       header={
         <>
           <div data-slot="question-header-title">{summary()}</div>
+          <Show when={store.remaining !== undefined}>
+            <div data-slot="question-timeout">Timeout in {store.remaining}s</div>
+          </Show>
           <div data-slot="question-progress">
             <For each={questions()}>
               {(_, i) => (
@@ -548,6 +646,7 @@ export const SessionQuestionDock: Component<{ request: QuestionRequest; onSubmit
                 value={input()}
                 rows={1}
                 disabled={sending()}
+                onFocus={() => void interact()}
                 onKeyDown={(e) => {
                   if (e.key === "Escape") {
                     e.preventDefault()

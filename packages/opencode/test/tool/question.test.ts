@@ -30,6 +30,24 @@ const it = testEffect(
   ),
 )
 
+const timeoutIt = testEffect(
+  Layer.mergeAll(
+    Layer.succeed(
+      Question.Service,
+      Question.Service.of({
+        ask: () => Effect.fail(new Question.TimedOutError()),
+        reply: () => Effect.die("unused"),
+        reject: () => Effect.die("unused"),
+        interact: () => Effect.die("unused"),
+        list: () => Effect.die("unused"),
+      }),
+    ),
+    CrossSpawnSpawner.defaultLayer,
+    Truncate.defaultLayer,
+    Agent.defaultLayer,
+  ),
+)
+
 const pending = Effect.fn("QuestionToolTest.pending")(function* (question: Question.Interface) {
   const events = yield* EventV2Bridge.Service
   const asked = yield* Queue.unbounded<void>()
@@ -48,6 +66,33 @@ const pending = Effect.fn("QuestionToolTest.pending")(function* (question: Quest
 })
 
 describe("tool.question", () => {
+  timeoutIt.instance(
+    "reports timeout without fabricating a user answer",
+    () =>
+      Effect.gen(function* () {
+        const tool = yield* (yield* QuestionTool).init()
+        const result = yield* tool.execute(
+          {
+            questions: [
+              {
+                question: "What should happen?",
+                header: "Action",
+                options: [{ label: "Continue", description: "Continue independently" }],
+              },
+            ],
+          },
+          ctx,
+        )
+        expect(result).toMatchObject({
+          title: "Question timed out",
+          output:
+            "The user is temporarily away. Analyze the available options, select the most appropriate answer yourself, and continue within the existing task authorization. Do not claim that the user selected an answer.",
+          metadata: { answers: [] },
+        })
+      }),
+    { git: true },
+  )
+
   it.instance("should successfully execute with valid question parameters", () =>
     Effect.gen(function* () {
       const question = yield* Question.Service
