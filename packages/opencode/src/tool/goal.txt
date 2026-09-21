@@ -10,6 +10,8 @@ Manage the autonomous goal loop for the current session.
 
 Creating a goal does not expand the user's task scope or grant new permissions. Do not recreate goals to evade a stop or budget limit. Use the tool for these actions; printing slash-command text does not execute a command.
 
+Only the main conversation can create or resume autonomous goals. Child agents return progress to their parent task; they may still inspect, pause or complete an existing goal.
+
 ## When to use `status`
 
 `status` is OPTIONAL. While a goal is active, a live "Current Goal" block (goal text, status, turns used/remaining, subgoals, last judge verdict) is already injected into your system prompt at the start of every turn — you do not need to call `status` to discover whether a goal loop is running or how much budget remains. Reach for `status` only as a deliberate check-in:

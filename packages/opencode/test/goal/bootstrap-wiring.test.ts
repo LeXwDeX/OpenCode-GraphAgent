@@ -115,6 +115,24 @@ it.live(
                 expect(text).toContain("0/7")
                 expect((yield* goal.load(session.id))?.status).toBe("paused")
                 yield* goal.clear(session.id)
+
+                const child = yield* (yield* Session.Service).create({
+                  parentID: session.id,
+                  title: "Goal child guard",
+                })
+                const rejected = yield* goal.controlDuringTurn(child.id, { action: "create", text: "unowned loop" })
+                expect(rejected.changed).toBe(false)
+                expect(yield* goal.load(child.id)).toBeUndefined()
+                yield* goal.set(child.id, "legacy child goal", 4)
+                const pause = yield* goal.controlDuringTurn(child.id, { action: "pause", reason: "return to parent" })
+                expect(pause.changed).toBe(true)
+                const pausedChild = yield* goal.load(child.id)
+                expect((yield* goal.controlDuringTurn(child.id, { action: "resume" })).changed).toBe(false)
+                expect(yield* goal.load(child.id)).toEqual(pausedChild)
+                yield* goal.clear(child.id)
+                const create = yield* goal.controlDuringTurn(session.id, { action: "create", text: "main goal" })
+                expect(create.changed).toBe(true)
+                yield* goal.clear(session.id)
               }),
             )
           }),

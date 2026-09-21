@@ -31,6 +31,8 @@ A `goal` **tool** is also available. Use `goal(action: "complete")` to self-decl
 
 Creating a goal does not expand the user's task scope or grant new permissions. Do not recreate goals to evade a stop or budget limit. Printing slash-command text does not execute a command.
 
+Only the main conversation can create or resume autonomous goals. Child agents return progress to their parent task; they may still inspect, pause or complete an existing goal.
+
 ### When to call `goal(complete)`
 
 - When the goal produced verifiable deliverables (files written, tests passing, a diagnosis, a concrete answer) and no subgoals remain.

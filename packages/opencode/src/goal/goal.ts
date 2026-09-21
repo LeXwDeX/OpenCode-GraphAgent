@@ -634,6 +634,20 @@ const serviceLayer = Layer.effect(
       sessionID: SessionID,
       input: TurnControl,
     ) {
+      if (input.action !== "pause") {
+        const session = yield* db
+          .select({ parentID: SessionTable.parent_id })
+          .from(SessionTable)
+          .where(eq(SessionTable.id, sessionID))
+          .get()
+          .pipe(Effect.orDie)
+        if (session?.parentID) {
+          return {
+            changed: false as const,
+            reason: "Only the main conversation can create or resume autonomous goals. Return progress to the parent task.",
+          }
+        }
+      }
       const reject = (reason: string): Transition<TurnControlResult> => ({
         tag: "noop",
         value: { changed: false, reason },
