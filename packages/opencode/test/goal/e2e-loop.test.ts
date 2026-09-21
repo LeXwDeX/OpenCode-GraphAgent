@@ -98,6 +98,80 @@ const recordingPrompt = (sink: { noReply?: boolean; text: string }[]) =>
     }) as never
   })())
 
+describe("GoalLoop — model controls during an executing turn", () => {
+  let judgeCalls = 0
+  let continuationCalls = 0
+  let pauseReturned = false
+  let boundary = "created-in-model-turn"
+  const promptMock = Layer.unwrap(
+    Effect.gen(function* () {
+      const goal = yield* Goal.Service
+      return Layer.mock(SessionPrompt.Service, withIdleAdmission({
+        prompt: () => Effect.succeed(mkAssistant()),
+        promptIfIdle: (input: SessionPrompt.PromptInput) => Effect.gen(function* () {
+          continuationCalls += 1
+          const paused = yield* goal.controlDuringTurn(input.sessionID, {
+            action: "pause",
+            reason: "external dependency unavailable",
+          })
+          pauseReturned = paused.changed
+          return Option.some(mkAssistant("paused-in-model-turn"))
+        }),
+      }))
+    }),
+  )
+  const layer = GoalLoop.layer.pipe(
+    Layer.provide(Layer.mock(Session.Service, { messages: () => Effect.sync(() => [mkAssistant(boundary)]) })),
+    Layer.provide(promptMock),
+    Layer.provide(Layer.mock(Provider.Service, {})),
+    Layer.provide(Layer.succeed(GoalLoopJudgeLLM, {
+      call: () => Effect.sync(() => {
+        judgeCalls += 1
+        return JSON.stringify({ verdict: judgeCalls === 1 ? "continue" : "done", reason: "verified" })
+      }),
+    })),
+    Layer.provideMerge(Goal.defaultLayer),
+    Layer.provideMerge(SessionStatus.defaultLayer),
+    Layer.provideMerge(EventV2Bridge.defaultLayer),
+  )
+  const it = testEffect(layer)
+
+  it.instance("create waits for idle, pause returns inside continuation, resume completes at the next boundary", () =>
+    Effect.gen(function* () {
+      judgeCalls = 0
+      continuationCalls = 0
+      pauseReturned = false
+      boundary = "created-in-model-turn"
+      const goal = yield* Goal.Service
+      const status = yield* SessionStatus.Service
+      const loop = yield* GoalLoop.Service
+      yield* loop.init()
+      yield* Effect.yieldNow
+      const sid = SessionID.descending()
+      yield* status.set(sid, { type: "busy" })
+      yield* goal.controlDuringTurn(sid, { action: "create", text: "deliver feature", maxTurns: 5 })
+      expect(continuationCalls).toBe(0)
+      expect(judgeCalls).toBe(0)
+      yield* status.set(sid, { type: "idle" })
+      yield* pollWithTimeout(Effect.sync(() => pauseReturned || undefined), "pause tool did not return")
+      expect(continuationCalls).toBe(1)
+      const paused = yield* goal.load(sid)
+      expect(paused?.status).toBe("paused")
+      expect(paused?.turns_used).toBe(1)
+      yield* status.set(sid, { type: "busy" })
+      boundary = "resumed-and-completed-in-model-turn"
+      yield* goal.controlDuringTurn(sid, { action: "resume" })
+      expect(continuationCalls).toBe(1)
+      yield* status.set(sid, { type: "idle" })
+      yield* pollWithTimeout(goal.lastOutcome(sid), "resumed goal did not complete")
+      expect(yield* goal.load(sid)).toBeUndefined()
+      expect((yield* goal.lastOutcome(sid))?.goal_id).toBe(paused?.goal_id)
+      expect(judgeCalls).toBe(2)
+      expect(continuationCalls).toBe(1)
+    }),
+  )
+})
+
 describe("GoalLoop end-to-end — continue → done lifecycle (P2b)", () => {
   // Per-test mutable mock state (each it.instance runs in its own scope, but
   // these closures are shared across the single test below — fine since the

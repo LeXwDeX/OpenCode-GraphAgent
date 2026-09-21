@@ -1,12 +1,12 @@
 # Autonomous Goal System
 
-OpenCode has a built-in **autonomous goal** feature. Use `/goal <description>` to set a persistent goal that the agent will work toward autonomously across multiple turns.
+OpenCode has a built-in **autonomous goal** feature. Use `goal(action: "create", text: "...")` or `/goal <description>` to set a persistent goal that the agent will work toward autonomously across multiple turns.
 
 While a goal is active or paused, a **live "Current Goal" block** is injected into the system prompt at the start of every turn — it carries the goal text, status, turns used/remaining, subgoals, and the last judge verdict. You do not need to call a tool to learn this state; read it from the system prompt.
 
 A `goal` **tool** is also available. Use `goal(action: "complete")` to self-declare completion when the goal is genuinely done, so the loop exits immediately instead of waiting for the external judge. `goal(action: "status")` is an optional check-in (see below).
 
-## Commands (user-facing; only you or the user can issue these)
+## Commands (user-facing)
 
 - `/goal <text>` — Set a new autonomous goal. The agent will work in a loop until the goal is achieved or the turn budget is exhausted.
 - `/goal --max-turns <N> <text>` — Set a goal with a positive integer total turn budget (default 20).
@@ -23,14 +23,21 @@ A `goal` **tool** is also available. Use `goal(action: "complete")` to self-decl
 
 ## Tool (agent-facing; call this during your turn)
 
+- `goal(action: "create", text: "...", max_turns: 20)` — Create a standing goal for the user's task. Text is required; the positive integer total budget defaults to 20. Existing goals are never replaced. Continue working in this turn; automatic continuation begins at the normal turn boundary.
+- `goal(action: "resume", max_turns: N)` — Resume a paused goal without resetting used turns or subgoals. The optional total budget must exceed used turns; an exhausted goal cannot resume without a larger budget. Increase the budget only with user authorization. Respect user pause/stop until a subsequent request to continue.
+- `goal(action: "pause", reason: "...")` — Stop automatic continuation while preserving the unfinished goal. Explain the blocker or requested pause, then finish the current response. Do not resume while the same blocker remains.
 - `goal(action: "status")` — Current goal text, status, turns used/remaining, subgoals, and pause reason. This is an OPTIONAL check-in: the same live state is already in your system prompt each turn, so you do not need to call `status` to know whether a goal loop is running or how much budget remains. Use it only for a deliberate mid-turn re-check (e.g., after a long operation that may have changed state) or to inspect `pausedReason`.
 - `goal(action: "complete", reason: "...")` — Declare the goal achieved. **This bypasses the external judge and ends the loop immediately.** Pass a one-sentence summary of what was delivered (e.g., "3 tests written and passing; refactor verified."). The goal is then auto-cleared.
+
+Creating a goal does not expand the user's task scope or grant new permissions. Do not recreate goals to evade a stop or budget limit. Printing slash-command text does not execute a command.
+
+Only the main conversation can create or resume autonomous goals. Child agents return progress to their parent task; they may still inspect, pause or complete an existing goal.
 
 ### When to call `goal(complete)`
 
 - When the goal produced verifiable deliverables (files written, tests passing, a diagnosis, a concrete answer) and no subgoals remain.
 - When the goal is subjective/research-oriented and you have produced a final answer you believe is sufficient.
-- **Do not** call `complete` just because a sub-step looks done — only when the top-level goal the user set via `/goal <text>` is actually done.
+- **Do not** call `complete` just because a sub-step looks done — only when the top-level goal is actually done.
 
 ## Loop behavior
 
