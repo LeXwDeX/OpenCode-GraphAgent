@@ -1083,7 +1083,15 @@ export function reduceSessionData(input: SessionDataInput): SessionDataOutput {
     return queueOut(data, commits)
   }
 
-  if (event.type === "question.replied" || event.type === "question.rejected") {
+  if (event.type === "question.interacted") {
+    if (event.properties.sessionID !== input.sessionID) return out(data, commits)
+    const request = data.questions.find((item) => item.id === event.properties.requestID)
+    if (!request || request.expiresAt === undefined) return out(data, commits)
+    request.expiresAt = undefined
+    return queueOut(data, commits)
+  }
+
+  if (event.type === "question.replied" || event.type === "question.rejected" || event.type === "question.timed_out") {
     if (event.properties.sessionID !== input.sessionID) {
       return out(data, commits)
     }

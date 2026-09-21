@@ -54,6 +54,18 @@ export const QuestionApi = HttpApi.make("question")
             description: "Reject a question request from the AI assistant.",
           }),
         ),
+        HttpApiEndpoint.post("interact", `${root}/:requestID/interact`, {
+          params: { requestID: QuestionID },
+          query: WorkspaceRoutingQuery,
+          success: described(Schema.Boolean, "Question timeout cancelled successfully"),
+          error: [HttpApiError.BadRequest, QuestionNotFoundError],
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "question.interact",
+            summary: "Interact with question request",
+            description: "Cancel the timeout after a user selects an option or focuses the custom answer input.",
+          }),
+        ),
       )
       .annotateMerge(
         OpenApi.annotations({

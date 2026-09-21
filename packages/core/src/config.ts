@@ -8,7 +8,7 @@ import { FSUtil } from "./fs-util"
 import { Global } from "./global"
 import { Location } from "./location"
 import { Policy } from "./policy"
-import { AbsolutePath } from "./schema"
+import { AbsolutePath, PositiveInt } from "./schema"
 import { ConfigAgent } from "./config/agent"
 import { ConfigAttachments } from "./config/attachments"
 import { ConfigCompaction } from "./config/compaction"
@@ -38,10 +38,14 @@ export class Info extends Schema.Class<Info>("Config.Info")({
   default_agent: Schema.String.pipe(Schema.optional).annotate({
     description: "Default primary agent to use when no session agent is selected",
   }),
+  question_timeout: PositiveInt.pipe(Schema.optional).annotate({
+    description: "Seconds to wait for a question response before the agent continues independently (default: 60)",
+  }),
   autoupdate: Schema.Union([Schema.Boolean, Schema.Literal("notify")])
     .pipe(Schema.optional)
     .annotate({
-      description: "Notify when a new fork version is available on GitHub releases. Automatic updates are disabled; set to false to disable the notification",
+      description:
+        "Notify when a new fork version is available on GitHub releases. Automatic updates are disabled; set to false to disable the notification",
     }),
   share: Schema.Literals(["manual", "auto", "disabled"]).pipe(Schema.optional).annotate({
     description: "Control whether sessions may be shared manually, automatically, or not at all",

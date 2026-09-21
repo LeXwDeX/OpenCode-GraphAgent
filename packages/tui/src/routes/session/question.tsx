@@ -1,5 +1,5 @@
 import { createStore } from "solid-js/store"
-import { createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js"
+import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js"
 import { useRenderer, useTerminalDimensions } from "@opentui/solid"
 import type { TextareaRenderable } from "@opentui/core"
 import { selectedForeground, tint, useTheme } from "../../context/theme"
@@ -8,6 +8,7 @@ import { useSDK } from "../../context/sdk"
 import { SplitBorder } from "../../ui/border"
 import { useTuiConfig } from "../../config"
 import { useBindings, useOpencodeModeStack } from "../../keymap"
+import { useToast } from "../../ui/toast"
 
 const QUESTION_MODE = "question"
 
@@ -31,6 +32,7 @@ export function QuestionPrompt(props: { request: QuestionRequest; directory?: st
   const dimensions = useTerminalDimensions()
   const tuiConfig = useTuiConfig()
   const modeStack = useOpencodeModeStack()
+  const toast = useToast()
 
   const questions = createMemo(() => props.request.questions)
   const single = createMemo(() => questions().length === 1 && questions()[0]?.multiple !== true)
@@ -45,9 +47,14 @@ export function QuestionPrompt(props: { request: QuestionRequest; directory?: st
     custom: [] as string[],
     selected: 0,
     editing: false,
+    interacting: false,
+    remaining: undefined as number | undefined,
   })
 
   let textarea: TextareaRenderable | undefined
+  let requestID = props.request.id
+  let interactedRequest: string | undefined
+  let countdownTimer: ReturnType<typeof setInterval> | undefined
 
   const question = createMemo(() => questions()[store.tab])
   const confirm = createMemo(() => !single() && store.tab === questions().length)
@@ -60,6 +67,91 @@ export function QuestionPrompt(props: { request: QuestionRequest; directory?: st
     const value = input()
     if (!value) return false
     return store.answers[store.tab]?.includes(value) ?? false
+  })
+
+  function stopCountdown() {
+    if (countdownTimer !== undefined) clearInterval(countdownTimer)
+    countdownTimer = undefined
+    setStore("remaining", undefined)
+  }
+
+  function notFound(error: unknown, response?: Response) {
+    if (response?.status === 404) return true
+    if (typeof error === "object" && error !== null && "_tag" in error) {
+      return (error as { _tag?: unknown })._tag === "QuestionNotFoundError"
+    }
+    if (!(error instanceof Error) || typeof error.cause !== "object" || error.cause === null) return false
+    return (error.cause as { status?: unknown }).status === 404
+  }
+
+  function interactionError(error: unknown) {
+    if (error instanceof Error) return error
+    if (typeof error === "object" && error !== null && "message" in error) {
+      const message = (error as { message?: unknown }).message
+      if (typeof message === "string") return new Error(message)
+    }
+    return new Error("Failed to cancel the question timeout")
+  }
+
+  async function interact() {
+    const id = props.request.id
+    if (interactedRequest === id || store.interacting) return
+    setStore("interacting", true)
+    try {
+      const result = await sdk.client.question.interact({
+        requestID: id,
+        directory: props.directory,
+      })
+      if (props.request.id !== id) return
+      if (result.error && !notFound(result.error, result.response)) {
+        toast.error(interactionError(result.error))
+        return
+      }
+      interactedRequest = id
+      stopCountdown()
+    } catch (error) {
+      if (props.request.id !== id) return
+      if (notFound(error)) {
+        interactedRequest = id
+        stopCountdown()
+        return
+      }
+      toast.error(interactionError(error))
+    } finally {
+      if (props.request.id === id) setStore("interacting", false)
+    }
+  }
+
+  createEffect(() => {
+    const id = props.request.id
+    if (requestID === id) return
+    requestID = id
+    interactedRequest = undefined
+    setStore({
+      tab: 0,
+      answers: [],
+      custom: [],
+      selected: 0,
+      editing: false,
+      interacting: false,
+      remaining: undefined,
+    })
+  })
+
+  createEffect(() => {
+    const id = props.request.id
+    const expiresAt = Number(props.request.expiresAt)
+    stopCountdown()
+    if (!Number.isFinite(expiresAt) || interactedRequest === id) return
+
+    const update = () => setStore("remaining", Math.max(0, Math.ceil((expiresAt - Date.now()) / 1000)))
+    update()
+    const timer = setInterval(update, 250)
+    countdownTimer = timer
+    onCleanup(() => {
+      clearInterval(timer)
+      if (countdownTimer === timer) countdownTimer = undefined
+    })
   })
 
   function submit() {
@@ -127,6 +219,7 @@ export function QuestionPrompt(props: { request: QuestionRequest; directory?: st
       }
       const value = input()
       if (value && customPicked()) {
+        void interact()
         toggle(value)
         return
       }
@@ -135,6 +228,7 @@ export function QuestionPrompt(props: { request: QuestionRequest; directory?: st
     }
     const opt = options()[store.selected]
     if (!opt) return
+    void interact()
     if (multi()) {
       toggle(opt.label)
       return
@@ -448,6 +542,7 @@ export function QuestionPrompt(props: { request: QuestionRequest; directory?: st
                           queueMicrotask(() => {
                             val.focus()
                             val.gotoLineEnd()
+                            void interact()
                           })
                         }}
                         initialValue={input()}
@@ -525,6 +620,9 @@ export function QuestionPrompt(props: { request: QuestionRequest; directory?: st
             esc <span style={{ fg: theme.textMuted }}>dismiss</span>
           </text>
         </box>
+        <Show when={store.remaining !== undefined}>
+          <text fg={theme.warning}>Timeout in {store.remaining}s</text>
+        </Show>
       </box>
     </box>
   )

@@ -15,7 +15,7 @@
 /** @jsxImportSource @opentui/solid */
 import type { TextareaRenderable } from "@opentui/core"
 import { useKeyboard, useTerminalDimensions } from "@opentui/solid"
-import { For, Show, createEffect, createMemo, createSignal } from "solid-js"
+import { For, Show, createEffect, createMemo, createSignal, onCleanup } from "solid-js"
 import type { QuestionRequest } from "@opencode-ai/sdk/v2"
 import {
   createQuestionBodyState,
@@ -49,9 +49,16 @@ export function RunQuestionBody(props: {
   theme: RunFooterTheme
   onReply: (input: QuestionReply) => void | Promise<void>
   onReject: (input: QuestionReject) => void | Promise<void>
+  onInteract: (input: { requestID: string }) => void | Promise<void>
 }) {
   const dims = useTerminalDimensions()
   const [state, setState] = createSignal(createQuestionBodyState(props.request.id))
+  const [interaction, setInteraction] = createSignal<{
+    requestID: string
+    status: "idle" | "interacting" | "interacted"
+    error?: string
+  }>({ requestID: props.request.id, status: "idle" })
+  const [remaining, setRemaining] = createSignal<number | undefined>()
   const single = createMemo(() => questionSingle(props.request))
   const confirm = createMemo(() => questionConfirm(props.request, state()))
   const info = createMemo(() => questionInfo(props.request, state()))
@@ -76,9 +83,73 @@ export function RunQuestionBody(props: {
     return "confirm"
   })
   let area: TextareaRenderable | undefined
+  let countdownTimer: ReturnType<typeof setInterval> | undefined
+
+  const stopCountdown = () => {
+    if (countdownTimer !== undefined) clearInterval(countdownTimer)
+    countdownTimer = undefined
+    setRemaining(undefined)
+  }
+
+  const notFound = (error: unknown) => {
+    if (typeof error === "object" && error !== null && "_tag" in error) {
+      return (error as { _tag?: unknown })._tag === "QuestionNotFoundError"
+    }
+    if (!(error instanceof Error) || typeof error.cause !== "object" || error.cause === null) return false
+    return (error.cause as { status?: unknown }).status === 404
+  }
+
+  const message = (error: unknown) => {
+    if (error instanceof Error) return error.message
+    if (typeof error === "object" && error !== null && "message" in error) {
+      const value = (error as { message?: unknown }).message
+      if (typeof value === "string") return value
+    }
+    return "Failed to cancel the question timeout"
+  }
+
+  const interact = async () => {
+    const id = props.request.id
+    const current = interaction()
+    if (current.requestID === id && current.status !== "idle") return
+    setInteraction({ requestID: id, status: "interacting" })
+    try {
+      await props.onInteract({ requestID: id })
+      if (props.request.id !== id) return
+      setInteraction({ requestID: id, status: "interacted" })
+      stopCountdown()
+    } catch (error) {
+      if (props.request.id !== id) return
+      if (notFound(error)) {
+        setInteraction({ requestID: id, status: "interacted" })
+        stopCountdown()
+        return
+      }
+      setInteraction({ requestID: id, status: "idle", error: message(error) })
+    }
+  }
 
   createEffect(() => {
-    setState((prev) => questionSync(prev, props.request.id))
+    const id = props.request.id
+    setState((prev) => questionSync(prev, id))
+    if (interaction().requestID !== id) setInteraction({ requestID: id, status: "idle" })
+  })
+
+  createEffect(() => {
+    const id = props.request.id
+    const expiresAt = Number(props.request.expiresAt)
+    const current = interaction()
+    stopCountdown()
+    if (!Number.isFinite(expiresAt) || current.requestID !== id || current.status === "interacted") return
+
+    const update = () => setRemaining(Math.max(0, Math.ceil((expiresAt - Date.now()) / 1000)))
+    update()
+    const timer = setInterval(update, 250)
+    countdownTimer = timer
+    onCleanup(() => {
+      clearInterval(timer)
+      if (countdownTimer === timer) countdownTimer = undefined
+    })
   })
 
   const setTab = (tab: number) => {
@@ -125,6 +196,7 @@ export function RunQuestionBody(props: {
 
   const choose = (selected: number) => {
     const base = state()
+    if (questionInfo(props.request, base)?.options[selected]) void interact()
     const cur = questionSetSelected(base, selected)
     const next = questionSelect(cur, props.request)
     if (next.state !== base) {
@@ -144,6 +216,7 @@ export function RunQuestionBody(props: {
 
   const select = () => {
     const cur = state()
+    if (questionInfo(props.request, cur)?.options[cur.selected]) void interact()
     const next = questionSelect(cur, props.request)
     if (next.state !== cur) {
       setState(next.state)
@@ -264,6 +337,7 @@ export function RunQuestionBody(props: {
 
       area.focus()
       area.cursorOffset = area.plainText.length
+      void interact()
     })
   })
 
@@ -509,6 +583,10 @@ export function RunQuestionBody(props: {
             </box>
           </box>
         </Show>
+        <Show when={remaining() !== undefined}>
+          <text fg={props.theme.warning}>Timeout in {remaining()}s</text>
+        </Show>
+        <Show when={interaction().error}>{(error) => <text fg={props.theme.error}>{error()}</text>}</Show>
       </box>
 
       <box

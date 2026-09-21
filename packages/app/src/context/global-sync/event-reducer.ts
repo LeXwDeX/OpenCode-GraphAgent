@@ -32,7 +32,16 @@ const SESSION_CONTENT_EVENTS = new Set([
   "question.asked",
   "question.replied",
   "question.rejected",
+  "question.interacted",
+  "question.timed_out",
 ])
+
+function requestEventProperties(value: unknown): { sessionID: string; requestID: string } | undefined {
+  if (!value || typeof value !== "object") return undefined
+  if (!("sessionID" in value) || typeof value.sessionID !== "string") return undefined
+  if (!("requestID" in value) || typeof value.requestID !== "string") return undefined
+  return { sessionID: value.sessionID, requestID: value.requestID }
+}
 
 export function applyGlobalEvent(input: {
   event: { type: string; properties?: unknown }
@@ -354,7 +363,8 @@ export function applyDirectoryEvent(input: {
       break
     }
     case "permission.replied": {
-      const props = event.properties as { sessionID: string; requestID: string }
+      const props = requestEventProperties(event.properties)
+      if (!props) break
       const permissions = input.store.permission[props.sessionID]
       if (!permissions) break
       const result = Binary.search(permissions, props.requestID, (p) => p.id)
@@ -390,8 +400,10 @@ export function applyDirectoryEvent(input: {
       break
     }
     case "question.replied":
-    case "question.rejected": {
-      const props = event.properties as { sessionID: string; requestID: string }
+    case "question.rejected":
+    case "question.timed_out": {
+      const props = requestEventProperties(event.properties)
+      if (!props) break
       const questions = input.store.question[props.sessionID]
       if (!questions) break
       const result = Binary.search(questions, props.requestID, (q) => q.id)
@@ -403,6 +415,15 @@ export function applyDirectoryEvent(input: {
           draft.splice(result.index, 1)
         }),
       )
+      break
+    }
+    case "question.interacted": {
+      const props = requestEventProperties(event.properties)
+      if (!props) break
+      const questions = input.store.question[props.sessionID]
+      if (!questions) break
+      const result = Binary.search(questions, props.requestID, (q) => q.id)
+      if (result.found) input.setStore("question", props.sessionID, result.index, "expiresAt", undefined)
       break
     }
     case "lsp.updated": {

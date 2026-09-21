@@ -43,6 +43,7 @@ import type {
   FooterView,
   PermissionReply,
   QuestionReject,
+  QuestionInteract,
   QuestionReply,
   RunAgent,
   RunCommand,
@@ -94,6 +95,7 @@ type RunFooterViewProps = {
   onPermissionReply: (input: PermissionReply) => void | Promise<void>
   onQuestionReply: (input: QuestionReply) => void | Promise<void>
   onQuestionReject: (input: QuestionReject) => void | Promise<void>
+  onQuestionInteract: (input: QuestionInteract) => void | Promise<void>
   onCycle: () => void
   onInterrupt: (mergedDoublePress?: boolean) => boolean
   onBackground?: () => void
@@ -790,6 +792,7 @@ export function RunFooterView(props: RunFooterViewProps) {
                             theme={theme()}
                             onReply={props.onQuestionReply}
                             onReject={props.onQuestionReject}
+                            onInteract={props.onQuestionInteract}
                           />
                         </Match>
                       </Switch>

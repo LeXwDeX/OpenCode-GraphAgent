@@ -26,13 +26,17 @@ export const Input = Schema.Struct({
 
 export const Output = Schema.Struct({
   answers: Schema.Array(QuestionV2.Answer),
+  timedOut: Schema.Boolean.pipe(Schema.optional),
 })
 export type Output = typeof Output.Type
 
 export const toModelOutput = (
   questions: ReadonlyArray<QuestionV2.Prompt>,
   answers: ReadonlyArray<QuestionV2.Answer>,
+  timedOut?: boolean,
 ) => {
+  if (timedOut)
+    return "The user is temporarily away. Analyze the available options, select the most appropriate answer yourself, and continue within the existing task authorization. Do not claim that the user selected an answer."
   const formatted = questions
     .map(
       (question, index) =>
@@ -55,7 +59,7 @@ export const layer = Layer.effectDiscard(
           input: Input,
           output: Output,
           toModelOutput: ({ input, output }) => [
-            { type: "text", text: toModelOutput(input.questions, output.answers) },
+            { type: "text", text: toModelOutput(input.questions, output.answers, output.timedOut) },
           ],
           execute: (input, context) =>
             permission
@@ -75,9 +79,14 @@ export const layer = Layer.effectDiscard(
                       questions: input.questions,
                       tool: { messageID: context.assistantMessageID, callID: context.toolCallID },
                     })
-                    .pipe(Effect.orDie),
+                    .pipe(
+                      Effect.map((answers) => ({ answers })),
+                      Effect.catchTag("QuestionV2.TimedOutError", () =>
+                        Effect.succeed({ answers: [], timedOut: true as const }),
+                      ),
+                      Effect.orDie,
+                    ),
                 ),
-                Effect.map((answers) => ({ answers })),
               ),
         }),
       })

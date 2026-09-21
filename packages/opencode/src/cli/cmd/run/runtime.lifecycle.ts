@@ -23,6 +23,7 @@ import type {
   FooterApi,
   PermissionReply,
   QuestionReject,
+  QuestionInteract,
   QuestionReply,
   RunAgent,
   RunInput,
@@ -69,6 +70,7 @@ export type LifecycleInput = {
   onPermissionReply: (input: PermissionReply) => void | Promise<void>
   onQuestionReply: (input: QuestionReply) => void | Promise<void>
   onQuestionReject: (input: QuestionReject) => void | Promise<void>
+  onQuestionInteract: (input: QuestionInteract) => void | Promise<void>
   onCycleVariant?: () => CycleResult | void
   onModelSelect?: (model: NonNullable<RunInput["model"]>) => CycleResult | void | Promise<CycleResult | void>
   onVariantSelect?: (variant: string | undefined) => CycleResult | void | Promise<CycleResult | void>
@@ -249,6 +251,7 @@ export async function createRuntimeLifecycle(input: LifecycleInput): Promise<Lif
       onPermissionReply: input.onPermissionReply,
       onQuestionReply: input.onQuestionReply,
       onQuestionReject: input.onQuestionReject,
+      onQuestionInteract: input.onQuestionInteract,
       onCycleVariant: input.onCycleVariant,
       onModelSelect: input.onModelSelect,
       onVariantSelect: input.onVariantSelect,

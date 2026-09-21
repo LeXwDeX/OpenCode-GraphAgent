@@ -266,6 +266,9 @@ async function runInteractiveRuntime(input: RunRuntimeInput, deps: RunRuntimeDep
 
       await ctx.sdk.question.reject(next)
     },
+    onQuestionInteract: async (next) => {
+      await ctx.sdk.question.interact(next, { throwOnError: true })
+    },
     onCycleVariant: () => {
       if (!state.model || state.variants.length === 0) {
         return {

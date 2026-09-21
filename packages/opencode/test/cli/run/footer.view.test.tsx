@@ -204,6 +204,7 @@ async function renderFooter(
           onPermissionReply={() => {}}
           onQuestionReply={() => {}}
           onQuestionReject={() => {}}
+          onQuestionInteract={() => {}}
           onCycle={input.onCycle ?? (() => {})}
           onInterrupt={() => false}
           onEditorOpen={async () => undefined}
@@ -993,6 +994,7 @@ test("direct footer shows editable prompts and additional queued work while runn
           onPermissionReply={() => {}}
           onQuestionReply={() => {}}
           onQuestionReject={() => {}}
+          onQuestionInteract={() => {}}
           onCycle={() => {}}
           onInterrupt={() => false}
           onEditorOpen={async () => undefined}
@@ -1168,6 +1170,7 @@ test("direct question body separates single-select checkmark from label", async 
   const request = {
     id: "question-1",
     sessionID: "session-1",
+    expiresAt: Date.now() + 60_000,
     questions: [
       {
         question: "Which categorical concept is often described as a universal way to combine two objects?",
@@ -1180,6 +1183,7 @@ test("direct question body separates single-select checkmark from label", async 
     ],
   } satisfies QuestionRequest
   const replies: unknown[] = []
+  const interactions: unknown[] = []
 
   const app = await testRender(
     () => (
@@ -1191,6 +1195,9 @@ test("direct question body separates single-select checkmark from label", async 
             replies.push(input)
           }}
           onReject={() => {}}
+          onInteract={(input) => {
+            interactions.push(input)
+          }}
         />
       </box>
     ),
@@ -1201,11 +1208,68 @@ test("direct question body separates single-select checkmark from label", async 
   )
 
   try {
+    await app.renderOnce()
+    expect(app.captureCharFrame()).toContain("Timeout in ")
+
     app.mockInput.pressEnter()
     await app.renderOnce()
 
     expect(replies).toHaveLength(1)
+    expect(interactions).toEqual([{ requestID: "question-1" }])
     expect(app.captureCharFrame()).toContain("Product ✓")
+  } finally {
+    app.renderer.destroy()
+  }
+})
+
+test("direct question interaction retries after a transient failure", async () => {
+  const request = {
+    id: "question-retry",
+    sessionID: "session-1",
+    expiresAt: Date.now() + 60_000,
+    questions: [
+      {
+        question: "Which options should I use?",
+        header: "Options",
+        options: [{ label: "First", description: "The first option." }],
+        multiple: true,
+      },
+    ],
+  } satisfies QuestionRequest
+  let attempts = 0
+
+  const app = await testRender(
+    () => (
+      <box width={100} height={14}>
+        <RunQuestionBody
+          request={request}
+          theme={RUN_THEME_FALLBACK.footer}
+          onReply={() => {}}
+          onReject={() => {}}
+          onInteract={async () => {
+            attempts++
+            if (attempts === 1) throw new Error("temporarily offline")
+          }}
+        />
+      </box>
+    ),
+    { width: 100, height: 14 },
+  )
+
+  try {
+    app.mockInput.pressEnter()
+    await Promise.resolve()
+    await app.renderOnce()
+    expect(attempts).toBe(1)
+    expect(app.captureCharFrame()).toContain("temporarily offline")
+    expect(app.captureCharFrame()).toContain("Timeout in ")
+
+    app.mockInput.pressEnter()
+    await Promise.resolve()
+    await app.renderOnce()
+    expect(attempts).toBe(2)
+    expect(app.captureCharFrame()).not.toContain("temporarily offline")
+    expect(app.captureCharFrame()).not.toContain("Timeout in ")
   } finally {
     app.renderer.destroy()
   }
@@ -1243,6 +1307,7 @@ test.skip("direct custom answer submits through keymap return binding", async ()
             questions.push(input)
           }}
           onReject={() => {}}
+          onInteract={() => {}}
         />
       </OpencodeKeymapProvider>
     )

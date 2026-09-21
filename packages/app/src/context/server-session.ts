@@ -23,6 +23,13 @@ const initialMessagePageSize = 2
 const historyMessagePageSize = 200
 const sessionInfoLimit = 2_048
 
+function requestEventProperties(value: unknown): { sessionID: string; requestID: string } | undefined {
+  if (!value || typeof value !== "object") return undefined
+  if (!("sessionID" in value) || typeof value.sessionID !== "string") return undefined
+  if (!("requestID" in value) || typeof value.requestID !== "string") return undefined
+  return { sessionID: value.sessionID, requestID: value.requestID }
+}
+
 type OptimisticItem = {
   message: Message
   parts: Part[]
@@ -487,7 +494,8 @@ export function createServerSession(client: OpencodeClient) {
         return
       }
       case "permission.replied": {
-        const props = event.properties as { sessionID: string; requestID: string }
+        const props = requestEventProperties(event.properties)
+        if (!props) return
         setData(
           "permission",
           props.sessionID,
@@ -517,8 +525,10 @@ export function createServerSession(client: OpencodeClient) {
         return
       }
       case "question.replied":
-      case "question.rejected": {
-        const props = event.properties as { sessionID: string; requestID: string }
+      case "question.rejected":
+      case "question.timed_out": {
+        const props = requestEventProperties(event.properties)
+        if (!props) return
         setData(
           "question",
           props.sessionID,
@@ -528,6 +538,16 @@ export function createServerSession(client: OpencodeClient) {
             if (result.found) draft.splice(result.index, 1)
           }),
         )
+        return
+      }
+      case "question.interacted": {
+        const props = requestEventProperties(event.properties)
+        if (!props) return
+        const questions = data.question[props.sessionID]
+        if (!questions) return
+        const result = Binary.search(questions, props.requestID, (item) => item.id)
+        if (result.found) setData("question", props.sessionID, result.index, "expiresAt", undefined)
+        return
       }
     }
   }

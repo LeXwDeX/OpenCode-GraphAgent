@@ -48,6 +48,7 @@ import type {
   FooterView,
   PermissionReply,
   QuestionReject,
+  QuestionInteract,
   QuestionReply,
   RunAgent,
   RunCommand,
@@ -89,6 +90,7 @@ type RunFooterOptions = {
   onPermissionReply: (input: PermissionReply) => void | Promise<void>
   onQuestionReply: (input: QuestionReply) => void | Promise<void>
   onQuestionReject: (input: QuestionReject) => void | Promise<void>
+  onQuestionInteract: (input: QuestionInteract) => void | Promise<void>
   onCycleVariant?: () => CycleResult | void
   onModelSelect?: (model: NonNullable<RunInput["model"]>) => CycleResult | void | Promise<CycleResult | void>
   onVariantSelect?: (variant: string | undefined) => CycleResult | void | Promise<CycleResult | void>
@@ -327,6 +329,7 @@ export class RunFooter implements FooterApi {
               onPermissionReply: footer.handlePermissionReply,
               onQuestionReply: footer.handleQuestionReply,
               onQuestionReject: footer.handleQuestionReject,
+              onQuestionInteract: footer.handleQuestionInteract,
               onCycle: footer.handleCycle,
               onInterrupt: footer.handleInterrupt,
               onBackground: options.onBackground,
@@ -789,6 +792,11 @@ export class RunFooter implements FooterApi {
     }
 
     await this.options.onQuestionReject(input)
+  }
+
+  private handleQuestionInteract = async (input: QuestionInteract): Promise<void> => {
+    if (this.isClosed) return
+    await this.options.onQuestionInteract(input)
   }
 
   private handleCycle = (): void => {
