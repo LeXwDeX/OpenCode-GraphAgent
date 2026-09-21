@@ -4,11 +4,18 @@ import DESCRIPTION from "./goal.txt"
 import { Goal } from "../goal/goal"
 
 export const Parameters = Schema.Struct({
-  action: Schema.Literals(["status", "complete"]).annotate({
-    description: "`status` to query current goal state; `complete` to declare the goal achieved.",
+  action: Schema.Literals(["status", "create", "resume", "pause", "complete"]).annotate({
+    description: "Create, resume, pause, inspect, or complete the current session goal.",
+  }),
+  text: Schema.optional(Schema.String).annotate({
+    description: "Required for create. The goal to pursue; treated as literal text, not a slash command.",
+  }),
+  max_turns: Schema.optional(Schema.Number).annotate({
+    description:
+      "Positive integer total budget for create (default 20) or resume. Resume preserves used turns. Increase only with user authorization.",
   }),
   reason: Schema.optional(Schema.String).annotate({
-    description: "Required when action=complete. One-sentence summary of what was delivered.",
+    description: "Required for pause or complete. Explain the pause or summarize what was delivered.",
   }),
 })
 
@@ -77,9 +84,7 @@ export const GoalTool = Tool.define<typeof Parameters, Metadata, never>(
               `Turns: ${state.turns_used}/${state.max_turns} (${remaining} remaining)`,
               subgoals.length > 0 ? `Subgoals (${subgoals.length}):` : "Subgoals: none",
               ...subgoals.map((s, i) => `  ${i + 1}. ${s}`),
-              state.status === "paused" && state.paused_reason
-                ? `Paused because: ${state.paused_reason}`
-                : null,
+              state.status === "paused" && state.paused_reason ? `Paused because: ${state.paused_reason}` : null,
               state.last_verdict
                 ? `Last judge verdict: ${state.last_verdict}${state.last_reason ? ` — ${state.last_reason}` : ""}`
                 : null,
@@ -102,6 +107,45 @@ export const GoalTool = Tool.define<typeof Parameters, Metadata, never>(
             }
           }
 
+          if (params.action === "create" || params.action === "resume" || params.action === "pause") {
+            const input: Goal.TurnControl =
+              params.action === "create"
+                ? { action: "create", text: params.text ?? "", maxTurns: params.max_turns }
+                : params.action === "resume"
+                  ? { action: "resume", maxTurns: params.max_turns }
+                  : { action: "pause", reason: params.reason ?? "" }
+            const result = yield* goal.controlDuringTurn(ctx.sessionID, input)
+            if (!result.changed) {
+              return {
+                title: `goal ${params.action} not applied`,
+                output: `Cannot ${params.action} goal: ${result.reason} No state change was applied.`,
+                metadata: {},
+              }
+            }
+            const state = result.state
+            return {
+              title: `goal ${state.status} (${state.turns_used}/${state.max_turns})`,
+              output: [
+                `Goal: ${state.goal}`,
+                `Status: ${state.status}`,
+                `Turns: ${state.turns_used}/${state.max_turns}`,
+                state.status === "paused"
+                  ? `Paused because: ${state.paused_reason}. Automatic continuation is stopped; finish this response.`
+                  : "Continue working in this turn. The goal loop evaluates progress when this turn ends; no additional prompt was started.",
+              ].join("\n"),
+              metadata: {
+                goal: {
+                  text: state.goal,
+                  status: state.status,
+                  turnsUsed: state.turns_used,
+                  maxTurns: state.max_turns,
+                  subgoals: state.subgoals ?? [],
+                  pausedReason: state.paused_reason,
+                },
+              },
+            }
+          }
+
           // action === "complete"
           if (!params.reason || params.reason.trim().length === 0) {
             throw new Tool.InvalidArgumentsError({
@@ -113,7 +157,8 @@ export const GoalTool = Tool.define<typeof Parameters, Metadata, never>(
           if (!state || state.status !== "active") {
             return {
               title: "no active goal",
-              output: "Cannot complete goal: no active goal for this session. The loop may have already finished, been paused, or been cleared.",
+              output:
+                "Cannot complete goal: no active goal for this session. The loop may have already finished, been paused, or been cleared.",
               metadata: { goal: null },
             }
           }

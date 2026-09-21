@@ -42,7 +42,18 @@ export type RemoveSubgoalResult =
   | { tag: "noState" }
   | { tag: "outOfBounds"; size: number }
 
+export type TurnControl =
+  | { readonly action: "create"; readonly text: string; readonly maxTurns?: number }
+  | { readonly action: "resume"; readonly maxTurns?: number }
+  | { readonly action: "pause"; readonly reason: string }
+
+export type TurnControlResult =
+  | { readonly changed: true; readonly state: GoalState.Info }
+  | { readonly changed: false; readonly reason: string }
+
 export interface Interface {
+  /** Controls issued inside a model turn; never starts or interrupts a prompt. */
+  readonly controlDuringTurn: (sessionID: SessionID, input: TurnControl) => Effect.Effect<TurnControlResult>
   readonly load: (sessionID: SessionID) => Effect.Effect<GoalState.Info | undefined>
   /**
    * GOAL-FP-01-04: durable session ids whose goal_state row is still "active"
@@ -527,9 +538,9 @@ const serviceLayer = Layer.effect(
       return Schema.decodeUnknownSync(GoalState.Info)(JSON.parse(row.payload))
     })
 
-    const set = Effect.fn("Goal.set")(function* (sessionID: SessionID, goal: string, maxTurns?: number) {
+    const initialState = (goal: string, maxTurns?: number) => {
       const now = Date.now()
-      const state = new GoalState.Info({
+      return new GoalState.Info({
         goal_id: Bun.randomUUIDv7(),
         revision: GoalState.nni(0),
         goal,
@@ -541,6 +552,10 @@ const serviceLayer = Layer.effect(
         consecutive_parse_failures: GoalState.nni(0),
         subgoals: [],
       })
+    }
+
+    const set = Effect.fn("Goal.set")(function* (sessionID: SessionID, goal: string, maxTurns?: number) {
+      const state = initialState(goal, maxTurns)
       // GOAL-FP-01-08: the overwrite must stay consistent with the lease. The
       // previous id is captured from the SAME seam read that decides the
       // overwrite, and unregistered before the new id is registered — a stale
@@ -613,6 +628,72 @@ const serviceLayer = Layer.effect(
       if (updated)
         yield* automation.register(sessionID, { kind: "goal", id: updated.goal_id ?? "legacy" })
       return updated
+    })
+
+    const controlDuringTurn = Effect.fn("Goal.controlDuringTurn")(function* (
+      sessionID: SessionID,
+      input: TurnControl,
+    ) {
+      const reject = (reason: string): Transition<TurnControlResult> => ({
+        tag: "noop",
+        value: { changed: false, reason },
+      })
+      // Finish lease and provenance updates even if cancellation follows the commit.
+      return yield* Effect.uninterruptible(
+        Effect.gen(function* () {
+          const result = yield* transition<TurnControlResult>(sessionID, (current) => {
+            if (
+              input.action !== "pause" &&
+              input.maxTurns !== undefined &&
+              (!Number.isSafeInteger(input.maxTurns) || input.maxTurns < 1)
+            )
+              return reject("max_turns must be a positive safe integer.")
+
+            let next: GoalState.Info
+            if (input.action === "create") {
+              if (!input.text.trim()) return reject("text is required to create a goal.")
+              if (current)
+                return reject("A goal already exists. Resume it or let the user clear it before creating another.")
+              next = initialState(input.text.trim(), input.maxTurns)
+            } else if (input.action === "resume") {
+              if (!current || current.status !== "paused") return reject("No paused goal to resume.")
+              const maxTurns = input.maxTurns ?? current.max_turns
+              if (maxTurns <= current.turns_used)
+                return reject(
+                  `Goal budget exhausted. An explicitly authorized max_turns greater than ${current.turns_used} is required.`,
+                )
+              next = GoalState.advance(current, {
+                status: "active",
+                max_turns: GoalState.nni(maxTurns),
+                consecutive_parse_failures: GoalState.nni(0),
+                paused_reason: undefined,
+                last_turn_at: Date.now(),
+              })
+            } else {
+              if (!input.reason.trim()) return reject("reason is required to pause a goal.")
+              if (!current || current.status !== "active") return reject("No active goal to pause.")
+              next = GoalState.advance(current, {
+                status: "paused",
+                paused_reason: input.reason.trim(),
+                last_turn_at: Date.now(),
+              })
+            }
+            return { tag: "save", state: next, value: { changed: true, state: next } }
+          })
+          if (!result.changed) return result
+          const owner = { kind: "goal" as const, id: result.state.goal_id ?? "legacy" }
+          if (result.state.status === "paused") {
+            yield* automation.unregister(sessionID, owner)
+            turnDriven.delete(sessionID)
+            // The loop may be waiting for this tool's turn. Let it return
+            // normally; the paused row prevents further continuation.
+          } else {
+            yield* automation.register(sessionID, owner)
+            turnDriven.add(sessionID)
+          }
+          return result
+        }),
+      )
     })
 
     const clear = Effect.fn("Goal.clear")(function* (sessionID: SessionID) {
@@ -1003,6 +1084,7 @@ const serviceLayer = Layer.effect(
     })
 
     return Service.of({
+      controlDuringTurn,
       load,
       listActiveSessions,
       lastOutcome,

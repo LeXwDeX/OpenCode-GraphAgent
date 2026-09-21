@@ -1,9 +1,14 @@
-Interact with the autonomous goal loop that drives your session (when one is running).
+Manage the autonomous goal loop for the current session.
 
 ## Actions
 
+- `create` — Pass nonempty `text` to start a standing goal for the user's task. Optional `max_turns` sets the positive integer total budget (default 20). Existing active or paused goals are never replaced. Continue the current turn; the normal goal loop takes over at turn end.
+- `resume` — Resume the paused goal in the current turn, preserving used turns and subgoals. Optional `max_turns` changes the total budget and must exceed used turns. Without remaining budget, resumption is refused. Do not increase the budget without user authorization or undo a user's pause/stop without a subsequent request to continue.
+- `pause` — Pass a nonempty `reason` to stop automatic continuation when blocked or when the user requests it. This preserves the unfinished goal and lets the current tool call return; finish the response after explaining the pause. Do not immediately resume while the same blocker remains.
 - `status` — Query the current goal: its text, status, turns used/remaining, subgoals, and pause reason (if any). Returns clear information when no goal is active.
 - `complete` — Declare the current goal achieved. Bypasses the external judge model and ends the loop immediately. Pass `reason` as a one-sentence summary of what was delivered (e.g., "created `src/foo.ts` and all 7 tests pass"). After `complete`, the goal is auto-cleared; the next call to `status` will report "no goal".
+
+Creating a goal does not expand the user's task scope or grant new permissions. Do not recreate goals to evade a stop or budget limit. Use the tool for these actions; printing slash-command text does not execute a command.
 
 ## When to use `status`
 
@@ -15,7 +20,7 @@ Interact with the autonomous goal loop that drives your session (when one is run
 
 - When the goal produced verifiable deliverables (files written, tests passing, command succeeded) and no subgoals remain.
 - When the user's task was subjective (research, diagnosis, exploration) and you have produced an answer you believe is sufficient.
-- **Do not** call `complete` just because a sub-step looks done — call it only when the top-level goal the user set via `/goal <text>` is actually done.
+- **Do not** call `complete` just because a sub-step looks done — call it only when the top-level goal is actually done.
 
 ## When NOT to use `complete`
 
@@ -25,6 +30,9 @@ Interact with the autonomous goal loop that drives your session (when one is run
 ## Examples
 
 ```json
+{"action": "create", "text": "Implement the requested fix and verify it", "max_turns": 20}
+{"action": "pause", "reason": "Waiting for the requested access"}
+{"action": "resume"}
 {"action": "status"}
 {"action": "complete", "reason": "Goal delivered: 3 test files created, all assertions pass after refactor."}
 ```
