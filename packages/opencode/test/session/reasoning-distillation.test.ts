@@ -12,6 +12,8 @@ import {
 } from "@opencode-ai/core/session/reasoning-distillation"
 import { Hash } from "@opencode-ai/core/util/hash"
 import {
+  buildJudgePrompt,
+  buildProposePrompt,
   buildReasoningEvidence,
   buildSlotMappings,
   extractInterleavedReasoningSlots,
@@ -20,6 +22,9 @@ import {
   parseSupport,
   projectDistillationAISDK,
   resolveOrganizerTier,
+  runJudge,
+  runPropose,
+  type AuxiliaryCaller,
   type OrganizerModel,
   type ReasoningSlotObservation,
   type SpanResolver,
@@ -453,5 +458,66 @@ describe("extractInterleavedReasoningSlots (W1, §2)", () => {
       "openaiCompatible",
       "reasoning_content",
     ])
+  })
+})
+
+describe("prompt builders (§5.4.1 / §5.5.3)", () => {
+  test("propose prompt frames input as untrusted, requires Chinese output with verbatim identifiers, and embeds R/E", () => {
+    const prompt = buildProposePrompt({
+      reasoningTexts: ["原始思绪甲", "原始思绪乙"],
+      callSummary: ["bash c1 completed"],
+    })
+    expect(prompt).toContain("不可信数据")
+    expect(prompt).toContain("一律用中文")
+    expect(prompt).toContain("逐字保留")
+    expect(prompt).toContain("原始思绪甲")
+    expect(prompt).toContain("原始思绪乙")
+    expect(prompt).toContain("bash c1 completed")
+    expect(prompt).toContain("coverage")
+  })
+
+  test("propose prompt renders an empty call inventory explicitly", () => {
+    expect(buildProposePrompt({ reasoningTexts: ["x"], callSummary: [] })).toContain("（无工具调用）")
+  })
+
+  test("judge prompt is independent, lists G1-G4, and embeds the candidate claims", () => {
+    const prompt = buildJudgePrompt({
+      reasoningTexts: ["原始思绪"],
+      candidateClaims: [{ id: "c1", kind: "decision", text: "采用方案A", scope: "本次会话", status: "verified" }],
+      callSummary: [],
+    })
+    expect(prompt).toContain("独立保真审查器")
+    expect(prompt).toContain("不看整理器的自评")
+    expect(prompt).toContain("G1")
+    expect(prompt).toContain("G4")
+    expect(prompt).toContain("c1")
+    expect(prompt).toContain("采用方案A")
+  })
+})
+
+describe("runPropose / runJudge orchestration (§5.5.3)", () => {
+  test("runPropose parses a well-formed model output into a Candidate", async () => {
+    const callModel: AuxiliaryCaller = async () => validRaw
+    const candidate = await runPropose({ key: distillKey(), prompt: "p", resolveSpan: resolver, callModel })
+    expect(candidate?.claims[0].id).toBe("c1")
+  })
+
+  test("runPropose returns undefined on malformed output", async () => {
+    const callModel: AuxiliaryCaller = async () => ({ garbage: true })
+    expect(await runPropose({ key: distillKey(), prompt: "p", resolveSpan: resolver, callModel })).toBeUndefined()
+  })
+
+  test("runJudge parses support verdicts", async () => {
+    const callModel: AuxiliaryCaller = async () => ({
+      support: [{ claimID: "c1", verdict: "supported", method: "judged" }],
+    })
+    expect(await runJudge({ prompt: "p", callModel })).toEqual([
+      { claimID: "c1", result: { verdict: "supported", method: "judged" } },
+    ])
+  })
+
+  test("runJudge returns undefined on malformed output", async () => {
+    const callModel: AuxiliaryCaller = async () => "not json"
+    expect(await runJudge({ prompt: "p", callModel })).toBeUndefined()
   })
 })
