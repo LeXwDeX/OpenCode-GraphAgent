@@ -13,12 +13,19 @@ import {
   type CallResultCompleteness,
   type CallStatus,
   type Candidate,
+  type Claim,
+  type ClaimKind,
   type ClaimSupport,
+  type ClaimStatus,
   type CompatibilityRecord,
+  type CoverageEntry,
   type DistillationCallQuota,
+  type DistillationKey,
   type DistillationPlan,
   type DistillationPurpose,
   type DistillationSkipReason,
+  type EvidenceKind,
+  type EvidenceRef,
   type ExecutionTarget,
   type ExecutionVerdictContext,
   type ModelTier,
@@ -273,6 +280,190 @@ export const resolveOrganizerTier = (
     return { model, tier, organizerFingerprint: fingerprint, fallback }
   }
   return undefined
+}
+
+/**
+ * Defensive parsers for untrusted auxiliary-model output (§5.5.3). The propose/judge models are treated as untrusted
+ * data: the parsers enforce a strict shape (known enums, required fields, no reliance on free text), bind span
+ * fingerprints through a host resolver (the model cannot compute them), and return undefined on any malformed input so
+ * the host falls back to sending the original. They never execute instructions embedded in the output, and the
+ * semantic gates re-validate the parsed candidate against R afterwards.
+ */
+
+export type RawSpanRef = Readonly<{ messageID: string; partID: string; start: number; end: number }>
+export type SpanResolver = (ref: RawSpanRef) => SourceSpan | undefined
+
+const asClaimKind = (value: unknown): ClaimKind | undefined =>
+  value === "fact" ||
+  value === "constraint" ||
+  value === "decision" ||
+  value === "rejection" ||
+  value === "assumption" ||
+  value === "state_delta"
+    ? value
+    : undefined
+
+const asClaimStatus = (value: unknown): ClaimStatus | undefined =>
+  value === "verified" || value === "unverified" || value === "assumed" ? value : undefined
+
+const asEvidenceKind = (value: unknown): EvidenceKind | undefined =>
+  value === "instruction" || value === "source" || value === "tool-input" || value === "tool-result" ? value : undefined
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value)
+const isString = (value: unknown): value is string => typeof value === "string"
+const isInt = (value: unknown): value is number => typeof value === "number" && Number.isSafeInteger(value)
+
+const parseSpanRef = (value: unknown): RawSpanRef | undefined => {
+  if (!isRecord(value)) return undefined
+  const { messageID, partID, start, end } = value
+  if (!isString(messageID) || messageID.length === 0) return undefined
+  if (!isString(partID) || partID.length === 0) return undefined
+  if (!isInt(start) || start < 0) return undefined
+  if (!isInt(end) || end <= start) return undefined
+  return { messageID, partID, start, end }
+}
+
+const parseEvidenceRef = (value: unknown): EvidenceRef | undefined => {
+  if (!isRecord(value)) return undefined
+  const { messageID, partID, callID } = value
+  const kind = asEvidenceKind(value.kind)
+  if (!isString(messageID) || !isString(partID) || !kind) return undefined
+  if (callID !== undefined && !isString(callID)) return undefined
+  return { messageID, partID, kind, ...(callID === undefined ? {} : { callID }) }
+}
+
+const parseClaim = (value: unknown, resolveSpan: SpanResolver): Claim | undefined => {
+  if (!isRecord(value)) return undefined
+  const { id, text, scope, sources, evidence, supersedes } = value
+  const kind = asClaimKind(value.kind)
+  const status = asClaimStatus(value.status)
+  if (!isString(id) || id.length === 0) return undefined
+  if (!kind) return undefined
+  if (!isString(text)) return undefined
+  if (!isString(scope) || scope.length === 0) return undefined
+  if (!status) return undefined
+  if (!Array.isArray(sources) || sources.length === 0) return undefined
+  const resolvedSources: SourceSpan[] = []
+  for (const raw of sources) {
+    const ref = parseSpanRef(raw)
+    if (!ref) return undefined
+    const span = resolveSpan(ref)
+    if (!span) return undefined
+    resolvedSources.push(span)
+  }
+  if (!Array.isArray(evidence)) return undefined
+  const resolvedEvidence: EvidenceRef[] = []
+  for (const raw of evidence) {
+    const ref = parseEvidenceRef(raw)
+    if (!ref) return undefined
+    resolvedEvidence.push(ref)
+  }
+  if (supersedes !== undefined && (!isString(supersedes) || supersedes.length === 0)) return undefined
+  return {
+    id,
+    kind,
+    text,
+    scope,
+    sources: resolvedSources,
+    evidence: resolvedEvidence,
+    status,
+    ...(supersedes === undefined ? {} : { supersedes }),
+  }
+}
+
+const parseCoverageEntry = (value: unknown, resolveSpan: SpanResolver): CoverageEntry | undefined => {
+  if (!isRecord(value)) return undefined
+  const srcRef = parseSpanRef(value.source)
+  if (!srcRef) return undefined
+  const source = resolveSpan(srcRef)
+  if (!source) return undefined
+  switch (value.action) {
+    case "preserve":
+      return { source, action: "preserve" }
+    case "keep": {
+      const { claimID } = value
+      if (!isString(claimID) || claimID.length === 0) return undefined
+      return { source, action: "keep", claimID }
+    }
+    case "merge": {
+      const witnessRef = parseSpanRef(value.witness)
+      if (!witnessRef) return undefined
+      const witness = resolveSpan(witnessRef)
+      if (!witness) return undefined
+      return { source, action: "merge", witness }
+    }
+    case "drop": {
+      const { reason } = value
+      if (!isString(reason) || reason.length === 0) return undefined
+      return { source, action: "drop", reason }
+    }
+    default:
+      return undefined
+  }
+}
+
+/** Parse + structurally validate the propose model output into a Candidate; undefined on any malformed shape. */
+export const parseCandidate = (
+  raw: unknown,
+  key: DistillationKey,
+  resolveSpan: SpanResolver,
+): Candidate | undefined => {
+  if (!isRecord(raw)) return undefined
+  const { claims, preserved, coverage } = raw
+  if (!Array.isArray(claims) || !Array.isArray(preserved) || !Array.isArray(coverage)) return undefined
+  const parsedClaims: Claim[] = []
+  for (const item of claims) {
+    const claim = parseClaim(item, resolveSpan)
+    if (!claim) return undefined
+    parsedClaims.push(claim)
+  }
+  const parsedPreserved: SourceSpan[] = []
+  for (const item of preserved) {
+    const ref = parseSpanRef(item)
+    if (!ref) return undefined
+    const span = resolveSpan(ref)
+    if (!span) return undefined
+    parsedPreserved.push(span)
+  }
+  const parsedCoverage: CoverageEntry[] = []
+  for (const item of coverage) {
+    const entry = parseCoverageEntry(item, resolveSpan)
+    if (!entry) return undefined
+    parsedCoverage.push(entry)
+  }
+  return {
+    key,
+    fingerprint: Hash.sha256(JSON.stringify(raw)),
+    claims: parsedClaims,
+    preserved: parsedPreserved,
+    coverage: parsedCoverage,
+  }
+}
+
+/** Parse the judge model output into support verdicts; undefined on malformed output (host then keeps the original). */
+export const parseSupport = (raw: unknown): ClaimSupport[] | undefined => {
+  if (!isRecord(raw) || !Array.isArray(raw.support)) return undefined
+  const parsed: ClaimSupport[] = []
+  for (const item of raw.support) {
+    if (!isRecord(item)) return undefined
+    const { claimID, verdict, method, reasonCode } = item
+    if (!isString(claimID) || claimID.length === 0) return undefined
+    if (verdict === "unknown") {
+      if (!isString(reasonCode)) return undefined
+      parsed.push({ claimID, result: { verdict: "unknown", reasonCode } })
+      continue
+    }
+    if (
+      (verdict === "supported" || verdict === "contradicted") &&
+      (method === "deterministic" || method === "judged")
+    ) {
+      parsed.push({ claimID, result: { verdict, method } })
+      continue
+    }
+    return undefined
+  }
+  return parsed
 }
 
 export * as ReasoningDistillation from "./reasoning-distillation"
