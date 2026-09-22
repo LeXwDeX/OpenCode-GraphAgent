@@ -1,6 +1,20 @@
 export { assembleAudit, gateViolationToFinding, resolveExecutionMatch, resolveExecutionVerdict } from "./audit"
 export type { ExecutionVerdictInput } from "./audit"
 export {
+  admitPaidCandidate,
+  canJudge,
+  canPropose,
+  consumeJudge,
+  consumePropose,
+  emptyCallLedger,
+  emptyDiagnostics,
+  quotaIdentity,
+  usageExceedsReserve,
+} from "./budget"
+export type { CallLedger, CostEstimate, DistillationDiagnostics, IdentityUsage, UsageRecord } from "./budget"
+export { cacheInsert, cacheKeyFingerprint, cacheLookup, emptyCache, isCertificateCurrent } from "./cache"
+export type { CacheEntry, DistillationCache } from "./cache"
+export {
   claimEquivalence,
   spanKey,
   validateClaim,
