@@ -1,4 +1,4 @@
-import type { ContextFoldingBudget } from "../context-folding/types"
+import type { ContextFoldingBudget, PreparedRequestBudgetInput } from "../context-folding/types"
 
 /**
  * Data contracts for reasoning distillation (design §5.3). These are pure types; runtime schema validation
@@ -313,4 +313,26 @@ export type DistillationDependencies = Readonly<{
   /** Token estimator for the savings gate; defaults to a conservative character proxy. */
   estimateTokens?: (text: string) => number
   fingerprint?: (value: string) => string
+}>
+
+/**
+ * Input to the independent distillation projector (§5.2). It reuses the folding wire primitives (private copy, path
+ * read/write, change verification, lossless serialization, request fingerprint) but never calls
+ * projectContextFoldingRequest and never relaxes the source/witness-style guards. The request fingerprint reuses the
+ * folding budget input shape so the same primitive applies.
+ */
+export type DistillationProjectionInput<Request> = Readonly<{
+  request: Request
+  /** Current model/provider/runtime/adapter identity, fingerprinted with the request. */
+  identity: unknown
+  expectedRequestFingerprint: string
+  budget: PreparedRequestBudgetInput
+  /** The plan's eligible replacements (mapping + projection + validation + estimated savings). */
+  replacements: readonly DistillationPlanReplacement[]
+}>
+
+export type DistillationProjectionResult<Request> = Readonly<{
+  request: Request
+  applied: boolean
+  skipReason: DistillationSkipReason | undefined
 }>

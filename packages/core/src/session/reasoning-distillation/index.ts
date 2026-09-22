@@ -26,6 +26,9 @@ export { evaluateGates } from "./gates"
 export type { GateEvaluation, GateID, GateViolation } from "./gates"
 export { planReasoningDistillation } from "./plan"
 export { ReasoningDistillationPolicy } from "./policy"
+export { projectDistillationRequest } from "./projection"
+export { capabilityFingerprint, classifySlotEligibility } from "./slot"
+export type { CompatibilityRecord, SlotAssessment, SlotCapability } from "./slot"
 export type {
   AuditConfidence,
   AuditFinding,
@@ -49,6 +52,8 @@ export type {
   DistillationPlan,
   DistillationPlanInput,
   DistillationPlanReplacement,
+  DistillationProjectionInput,
+  DistillationProjectionResult,
   DistillationPurpose,
   DistillationSkipReason,
   EvidenceKind,
