@@ -466,4 +466,43 @@ export const parseSupport = (raw: unknown): ClaimSupport[] | undefined => {
   return parsed
 }
 
+/**
+ * Extract W1 interleaved reasoning slots from the provider-transformed AI-SDK messages (§2 W1). For interleaved-capable
+ * models, ProviderTransform.message joins each assistant message's reasoning parts into a single
+ * `providerOptions.openaiCompatible[field]` string (transform.ts:316-345); that string is the rewritable slot. Only
+ * non-empty assistant slots are returned. The openaiCompatible interleaved field is a plain unsigned string, so it is
+ * neither signed (P1) nor encrypted (P2); historical assistant messages in an outbound prompt are settled (P4 does not
+ * apply). messageID/partID are wire-position identifiers — binding them to persisted history refs (for stable cache
+ * keys and audit) is the host wiring step, mirroring folding's bindModelMessages.
+ */
+export const extractInterleavedReasoningSlots = (
+  messages: readonly unknown[],
+  field: string,
+  basePath: readonly (string | number)[] = ["messages"],
+): ReasoningSlotObservation[] => {
+  const slots: ReasoningSlotObservation[] = []
+  for (let index = 0; index < messages.length; index++) {
+    const message = messages[index]
+    if (!isRecord(message) || message.role !== "assistant") continue
+    const providerOptions = message.providerOptions
+    if (!isRecord(providerOptions)) continue
+    const openaiCompatible = providerOptions.openaiCompatible
+    if (!isRecord(openaiCompatible)) continue
+    const text = openaiCompatible[field]
+    if (!isString(text) || text.length === 0) continue
+    slots.push({
+      messageID: `${basePath.join(".")}.${index}`,
+      partID: field,
+      bodyPath: [...basePath, index, "providerOptions", "openaiCompatible", field],
+      text,
+      shape: "interleaved-field",
+      signed: false,
+      encrypted: false,
+      settled: true,
+      structureRewritable: true,
+    })
+  }
+  return slots
+}
+
 export * as ReasoningDistillation from "./reasoning-distillation"

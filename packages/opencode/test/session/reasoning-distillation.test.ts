@@ -14,6 +14,7 @@ import { Hash } from "@opencode-ai/core/util/hash"
 import {
   buildReasoningEvidence,
   buildSlotMappings,
+  extractInterleavedReasoningSlots,
   organizerFingerprintOf,
   parseCandidate,
   parseSupport,
@@ -395,5 +396,62 @@ describe("parseSupport", () => {
   test("rejects malformed top-level output", () => {
     expect(parseSupport([])).toBeUndefined()
     expect(parseSupport({ support: "nope" })).toBeUndefined()
+  })
+})
+
+describe("extractInterleavedReasoningSlots (W1, §2)", () => {
+  const field = "reasoning_content"
+
+  test("extracts the openaiCompatible interleaved field from an assistant message", () => {
+    const messages = [
+      { role: "user", content: [{ type: "text", text: "hi" }] },
+      { role: "assistant", content: [], providerOptions: { openaiCompatible: { reasoning_content: "思考过程" } } },
+    ]
+    const slots = extractInterleavedReasoningSlots(messages, field)
+    expect(slots).toHaveLength(1)
+    expect(slots[0]).toMatchObject({
+      bodyPath: ["messages", 1, "providerOptions", "openaiCompatible", "reasoning_content"],
+      text: "思考过程",
+      shape: "interleaved-field",
+      signed: false,
+      encrypted: false,
+      settled: true,
+      structureRewritable: true,
+    })
+  })
+
+  test("skips non-assistant messages and empty or missing fields", () => {
+    const messages = [
+      { role: "user", providerOptions: { openaiCompatible: { reasoning_content: "x" } } },
+      { role: "assistant", providerOptions: { openaiCompatible: { reasoning_content: "" } } },
+      { role: "assistant", content: [{ type: "text", text: "no reasoning field" }] },
+    ]
+    expect(extractInterleavedReasoningSlots(messages, field)).toHaveLength(0)
+  })
+
+  test("extracts multiple assistant slots with index-correct body paths", () => {
+    const messages = [
+      { role: "assistant", providerOptions: { openaiCompatible: { reasoning_content: "a" } } },
+      { role: "user", content: [] },
+      { role: "assistant", providerOptions: { openaiCompatible: { reasoning_content: "b" } } },
+    ]
+    const slots = extractInterleavedReasoningSlots(messages, field)
+    expect(slots.map((s) => s.bodyPath)).toEqual([
+      ["messages", 0, "providerOptions", "openaiCompatible", "reasoning_content"],
+      ["messages", 2, "providerOptions", "openaiCompatible", "reasoning_content"],
+    ])
+  })
+
+  test("honors a custom base path into the projection request", () => {
+    const messages = [{ role: "assistant", providerOptions: { openaiCompatible: { reasoning_content: "z" } } }]
+    const slots = extractInterleavedReasoningSlots(messages, field, ["prompt", "messages"])
+    expect(slots[0].bodyPath).toEqual([
+      "prompt",
+      "messages",
+      0,
+      "providerOptions",
+      "openaiCompatible",
+      "reasoning_content",
+    ])
   })
 })
