@@ -12,6 +12,7 @@ import {
 } from "@opencode-ai/core/session/reasoning-distillation"
 import { Hash } from "@opencode-ai/core/util/hash"
 import {
+  bindPersistedReasoningRefs,
   buildJudgePrompt,
   buildProposePrompt,
   buildReasoningEvidence,
@@ -519,5 +520,90 @@ describe("runPropose / runJudge orchestration (§5.5.3)", () => {
   test("runJudge returns undefined on malformed output", async () => {
     const callModel: AuxiliaryCaller = async () => "not json"
     expect(await runJudge({ prompt: "p", callModel })).toBeUndefined()
+  })
+})
+
+describe("bindPersistedReasoningRefs (§5.8 stable cache keys)", () => {
+  const wireSlot = (text: string, index: number): ReasoningSlotObservation => ({
+    messageID: `messages.${index}`,
+    partID: "reasoning_content",
+    bodyPath: ["messages", index, "providerOptions", "openaiCompatible", "reasoning_content"],
+    text,
+    shape: "interleaved-field",
+    signed: false,
+    encrypted: false,
+    settled: true,
+    structureRewritable: true,
+  })
+
+  test("rebinds a wire slot to its stable persisted ref by exact text match, preserving bodyPath", () => {
+    const slots = [wireSlot("思考甲", 0)]
+    const bound = bindPersistedReasoningRefs(slots, [{ messageID: "msg_abc", partID: "part_1", text: "思考甲" }])
+    expect(bound[0].messageID).toBe("msg_abc")
+    expect(bound[0].partID).toBe("part_1")
+    expect(bound[0].bodyPath).toEqual(slots[0].bodyPath)
+  })
+
+  test("an unmatched slot keeps its wire-position id", () => {
+    const slots = [wireSlot("无匹配", 2)]
+    const bound = bindPersistedReasoningRefs(slots, [{ messageID: "msg_x", partID: "part_y", text: "其他" }])
+    expect(bound[0].messageID).toBe("messages.2")
+  })
+
+  test("duplicate persisted text binds to the first occurrence (no silent mis-binding)", () => {
+    const slots = [wireSlot("重复", 0)]
+    const persisted = [
+      { messageID: "msg_first", partID: "p1", text: "重复" },
+      { messageID: "msg_second", partID: "p2", text: "重复" },
+    ]
+    expect(bindPersistedReasoningRefs(slots, persisted)[0].messageID).toBe("msg_first")
+  })
+})
+
+describe("bindPersistedReasoningRefs (§5.8 stable cache keys)", () => {
+  const wireSlot = (text: string, messageID = "wire:0"): ReasoningSlotObservation => ({
+    messageID,
+    partID: "reasoning_content",
+    bodyPath: ["messages", 0, "providerOptions", "openaiCompatible", "reasoning_content"],
+    text,
+    shape: "interleaved-field",
+    signed: false,
+    encrypted: false,
+    settled: true,
+    structureRewritable: true,
+  })
+
+  test("rebinds a wire slot to its stable persisted ref on an exact text match", () => {
+    const bound = bindPersistedReasoningRefs(
+      [wireSlot("思考")],
+      [{ messageID: "msg_abc", partID: "part_1", text: "思考" }],
+    )
+    expect(bound[0].messageID).toBe("msg_abc")
+    expect(bound[0].partID).toBe("part_1")
+    expect(bound[0].text).toBe("思考")
+  })
+
+  test("an unmatched slot keeps its wire-position id (degraded but correct)", () => {
+    const bound = bindPersistedReasoningRefs(
+      [wireSlot("思考")],
+      [{ messageID: "msg_abc", partID: "part_1", text: "其他" }],
+    )
+    expect(bound[0].messageID).toBe("wire:0")
+  })
+
+  test("duplicate persisted text binds to the first occurrence, never silently mis-binding", () => {
+    const bound = bindPersistedReasoningRefs(
+      [wireSlot("dup")],
+      [
+        { messageID: "m1", partID: "p1", text: "dup" },
+        { messageID: "m2", partID: "p2", text: "dup" },
+      ],
+    )
+    expect(bound[0].messageID).toBe("m1")
+  })
+
+  test("an empty persisted list leaves every slot on its wire id", () => {
+    const bound = bindPersistedReasoningRefs([wireSlot("a"), wireSlot("b", "wire:1")], [])
+    expect(bound.map((s) => s.messageID)).toEqual(["wire:0", "wire:1"])
   })
 })
