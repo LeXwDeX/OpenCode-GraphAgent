@@ -1,7 +1,9 @@
 import { Hash } from "../../util/hash"
-import { spanKey, validateClaimSet, validateCoverage, validateSourceSpans } from "./claims"
+import { assembleAudit, gateViolationToFinding, resolveExecutionMatch, resolveExecutionVerdict } from "./audit"
+import { evaluateGates } from "./gates"
 import { ReasoningDistillationPolicy } from "./policy"
 import type {
+  AuditFinding,
   AuditRecord,
   Claim,
   DistillationDependencies,
@@ -11,20 +13,20 @@ import type {
   DistillationSkipReason,
   ModelProjection,
   SourceSpan,
-  SupportResult,
   ValidationStamp,
   WireReasoningMapping,
 } from "./types"
 
 /**
- * Pure planning orchestrator (§5.2). Consumes host observations and explicit support verdicts; performs no I/O and
- * never disguises LLM extraction as deterministic parsing. The contract is a three-way result:
- * - applied:   replacements non-empty, extraCall "none",  skipReason undefined
+ * Pure planning orchestrator (§5.2). Consumes host observations, support verdicts, and optional execution targets;
+ * performs no I/O and never disguises LLM extraction as deterministic parsing. The result is three-way:
+ * - applied:   replacements non-empty, extraCall "none",   skipReason undefined
  * - deferred:  replacements empty,     extraCall != "none", skipReason undefined (host makes the call, then re-plans)
- * - skipped:   replacements empty,     extraCall "none",  skipReason set (terminal; send the original)
+ * - skipped:   replacements empty,     extraCall "none",   skipReason set (terminal; send the original)
  *
- * Execution-target audit (§5.5) and judge orchestration are wired in Phase 3; this layer keeps audit empty and routes
- * semantic verification through the support verdicts the host supplies.
+ * Gate evaluation (§5.4) and the conservation audit (§5.5) run on every present candidate, and the audit is recorded
+ * even when the candidate is rejected, so a fidelity failure never swallows fabricated/concealed/evidence_swap or
+ * source-agent execution findings. Judge/propose model orchestration is the host's job (Phase 3b/2 runtime).
  */
 
 const emptyPlan = (skipReason: DistillationSkipReason, audit: readonly AuditRecord[] = []): DistillationPlan => ({
@@ -59,10 +61,28 @@ const defaultRender = (
   return [...claimLines, ...preservedLines].join("\n")
 }
 
-const refKey = (messageID: string, partID: string): string => `${messageID}\u0000${partID}`
-
 const capabilityOf = (mapping: WireReasoningMapping): string | undefined =>
   mapping.eligibility.allowed ? mapping.eligibility.capabilityFingerprint : undefined
+
+/** Resolve and verdict each host-supplied execution target (§5.5); findings attribute to the source agent. */
+const auditExecutionTargets = (input: DistillationPlanInput): AuditFinding[] => {
+  const targets = input.targets ?? []
+  if (targets.length === 0) return []
+  const contextByTarget = new Map((input.executionContext ?? []).map((entry) => [entry.targetID, entry]))
+  const findings: AuditFinding[] = []
+  for (const target of targets) {
+    const match = resolveExecutionMatch(target, input.evidence)
+    const context = contextByTarget.get(target.id)
+    const finding = resolveExecutionVerdict({
+      target,
+      match,
+      sourceStatesFailure: context?.sourceStatesFailure ?? false,
+      support: context?.support ?? { verdict: "unknown", reasonCode: "no-verdict-context" },
+    })
+    if (finding) findings.push(finding)
+  }
+  return findings
+}
 
 const plan = (input: DistillationPlanInput, dependencies: DistillationDependencies): DistillationPlan => {
   // 1. Purpose gating (§5.1): auxiliary/unknown never sample, call, or apply cache.
@@ -90,68 +110,41 @@ const plan = (input: DistillationPlanInput, dependencies: DistillationDependenci
   // 5. Policy/version binding: a candidate stamped under a different policy is stale.
   if (candidate.key.policyVersion !== input.policyVersion) return emptyPlan("stale-validation")
 
-  // 6. Structural validation: spans ordered/in-bounds, claim set well-formed, coverage complete.
-  const spanReason = validateSourceSpans(input.evidence.spans)
-  if (spanReason) return emptyPlan(spanReason)
-  const claimReason = validateClaimSet(candidate.claims)
-  if (claimReason) return emptyPlan(claimReason)
-  const coverageReason = validateCoverage(candidate.coverage, input.evidence.spans, candidate.claims)
-  if (coverageReason) return emptyPlan(coverageReason)
+  // 6. Gates G1-G4 (§5.4) + conservation audit (§5.5). Diagnostics are assembled before any rejection so a fidelity
+  //    failure never hides fabricated/concealed/evidence_swap or source-agent execution findings (§5.2 step 4).
+  const gates = evaluateGates(candidate, input.evidence, input.support)
+  const distillerFindings = gates.violations.map(gateViolationToFinding)
+  const executionFindings = auditExecutionTargets(input)
+  const audit = assembleAudit(executionFindings, distillerFindings)
 
-  // 7. G1 source-binding: every claim source span must locate within R; an unbound proposition is a new assertion.
-  const rKeys = new Set<string>(input.evidence.spans.map(spanKey))
-  for (const claim of candidate.claims) {
-    for (const source of claim.sources) {
-      if (!rKeys.has(spanKey(source))) return emptyPlan("new-assertion")
-    }
-  }
+  // 7. Terminal structural failure -> reject the candidate but keep the diagnostics.
+  if (gates.skipReason) return emptyPlan(gates.skipReason, audit)
 
-  // 8. G3 reference integrity: every evidence ref must resolve to a known span or call in this snapshot.
-  const knownRefs = new Set<string>()
-  for (const span of input.evidence.spans) knownRefs.add(refKey(span.messageID, span.partID))
-  for (const call of input.evidence.calls) knownRefs.add(refKey(call.ref.messageID, call.ref.partID))
-  for (const claim of candidate.claims) {
-    for (const evidence of claim.evidence) {
-      if (!knownRefs.has(refKey(evidence.messageID, evidence.partID))) return emptyPlan("evidence-unresolved")
-    }
+  // 8. Semantic review still required -> defer to one judge call when quota remains; otherwise send the original and
+  //    retry on the next legal trigger (§5.2 step 5).
+  if (gates.needsSemanticReview) {
+    if (input.quota.judgeUsed) return emptyPlan("semantic-review-required", audit)
+    return deferredPlan("judge", audit)
   }
+  if (gates.anyJudged && input.judgeFingerprint === undefined) return emptyPlan("stale-validation", audit)
 
-  // 9. G4 support / semantic review: a verified claim needs targeted support. Missing or unknown support defers to a
-  //    judge when quota remains; otherwise the original is sent and review is retried on the next legal trigger.
-  const supportByClaim = new Map<string, SupportResult>(input.support.map((entry) => [entry.claimID, entry.result]))
-  let needsJudge = false
-  let anyJudged = false
-  for (const claim of candidate.claims) {
-    const support = supportByClaim.get(claim.id)
-    if (!support || support.verdict === "unknown") {
-      needsJudge = true
-      break
-    }
-    if (support.verdict === "contradicted") return emptyPlan("evidence-unresolved")
-    if (support.method === "judged") anyJudged = true
-  }
-  if (needsJudge) {
-    if (input.quota.judgeUsed) return emptyPlan("semantic-review-required")
-    return deferredPlan("judge")
-  }
-  if (anyJudged && input.judgeFingerprint === undefined) return emptyPlan("stale-validation")
-
-  // 10. Render the projection from validated claims and preserved spans only (§5.5.3 isolation).
+  // 9. Render the projection from validated claims and preserved spans only (§5.5.3 isolation).
   const resolveText = dependencies.resolveText ?? (() => "")
   const render = dependencies.render ?? defaultRender
   const estimateTokens = dependencies.estimateTokens ?? defaultEstimateTokens
   const fingerprint = dependencies.fingerprint ?? Hash.sha256
   const text = render(candidate.claims, candidate.preserved, resolveText)
 
-  // 11. Savings gate (§5.8): a non-positive estimate skips the projection.
-  if (input.originalTokens === undefined || !Number.isSafeInteger(input.originalTokens))
-    return emptyPlan("unknown-content")
+  // 10. Savings gate (§5.8): a non-positive estimate skips the projection.
+  if (input.originalTokens === undefined || !Number.isSafeInteger(input.originalTokens)) {
+    return emptyPlan("unknown-content", audit)
+  }
   const estimatedSavings = input.originalTokens - estimateTokens(text)
   if (estimatedSavings < ReasoningDistillationPolicy.tokens.minimumNetSavingsTokens) {
-    return emptyPlan("insufficient-net-savings")
+    return emptyPlan("insufficient-net-savings", audit)
   }
 
-  // 12. Assemble one replacement per eligible slot, each carrying its own capability-bound validation stamp.
+  // 11. Assemble one replacement per eligible slot, each carrying its own capability-bound validation stamp.
   const projection: ModelProjection = { claims: candidate.claims, preserved: candidate.preserved, text }
   const reusedCandidates: DistillationKey[] = [candidate.key]
   const replacements = eligible.flatMap((mapping) => {
@@ -162,14 +155,14 @@ const plan = (input: DistillationPlanInput, dependencies: DistillationDependenci
       evidenceFingerprint: input.evidence.inventoryFingerprint,
       capabilityFingerprint,
       validatorVersion: ReasoningDistillationPolicy.validatorVersion,
-      method: anyJudged ? "judged" : "deterministic",
-      ...(anyJudged ? { judgeFingerprint: input.judgeFingerprint! } : {}),
+      method: gates.anyJudged ? "judged" : "deterministic",
+      ...(gates.anyJudged ? { judgeFingerprint: input.judgeFingerprint! } : {}),
     }
     return [{ mapping, projection, validation, estimatedSavings }]
   })
-  if (replacements.length === 0) return emptyPlan("mapping-mismatch")
+  if (replacements.length === 0) return emptyPlan("mapping-mismatch", audit)
 
-  return { replacements, audit: [], reusedCandidates, extraCall: "none", skipReason: undefined }
+  return { replacements, audit, reusedCandidates, extraCall: "none", skipReason: undefined }
 }
 
 export const planReasoningDistillation = (

@@ -268,6 +268,17 @@ export type ClaimSupport = Readonly<{
   result: SupportResult
 }>
 
+/**
+ * Host-supplied context for auditing one execution target (§5.5). The host derives execution targets from the
+ * reasoning and supplies whether the source honestly states failure plus the targeted support verdict; the pure plan
+ * only resolves the match and the exclusive verdict.
+ */
+export type ExecutionVerdictContext = Readonly<{
+  targetID: string
+  sourceStatesFailure: boolean
+  support: SupportResult
+}>
+
 export type DistillationPlanInput = Readonly<{
   purpose: DistillationPurpose
   /** Reuses the folding budget; the trigger is overBudget === true (§5.1). */
@@ -282,6 +293,10 @@ export type DistillationPlanInput = Readonly<{
   support: readonly ClaimSupport[]
   /** Identity of the judge that produced any `judged` support; required when a validation stamp is `judged`. */
   judgeFingerprint?: string
+  /** Optional execution targets to audit (§5.5); empty means no execution audit this round. */
+  targets?: readonly ExecutionTarget[]
+  /** Per-target verdict context for the execution audit. */
+  executionContext?: readonly ExecutionVerdictContext[]
   policyVersion: string
 }>
 
