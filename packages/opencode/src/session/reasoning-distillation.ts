@@ -21,6 +21,7 @@ import {
   type DistillationSkipReason,
   type ExecutionTarget,
   type ExecutionVerdictContext,
+  type ModelTier,
   type ReasoningEvidence,
   type ReasoningSlotShape,
   type SlotAssessment,
@@ -217,6 +218,61 @@ export const projectDistillationAISDK = <Request>(
     replacements: plan.replacements,
   })
   return { request: projected.request, applied: projected.applied, plan, skipReason: projected.skipReason }
+}
+
+/**
+ * Organizer model tier resolution (§5.6). Propose and judge both resolve small -> agent -> primary, dedup identical
+ * models, and run only local availability + context-capability checks (never a probe request). The actual
+ * provider/model/variant is fingerprinted into the DistillationKey.organizerFingerprint, and the selected tier plus
+ * per-tier fallback reasons are recorded. Returns undefined when no tier is usable (-> model-tier-unresolved).
+ */
+export type OrganizerModel = Readonly<{
+  providerID: string
+  modelID: string
+  variant?: string
+  /** Context-window capability; a model below the auxiliary input+output requirement is skipped (§5.6). */
+  contextLimit?: number
+}>
+
+export type TierFallback = Readonly<{ tier: ModelTier; reason: "unavailable" | "duplicate" | "insufficient-context" }>
+
+export type TierResolution = Readonly<{
+  model: OrganizerModel
+  tier: ModelTier
+  organizerFingerprint: string
+  fallback: readonly TierFallback[]
+}>
+
+export const organizerFingerprintOf = (model: OrganizerModel): string =>
+  Hash.sha256(JSON.stringify([model.providerID, model.modelID, model.variant ?? null]))
+
+const TIER_ORDER: readonly ModelTier[] = ["small", "agent", "primary"]
+
+export const resolveOrganizerTier = (
+  tiers: Readonly<Record<ModelTier, OrganizerModel | undefined>>,
+  requiredContextTokens: number,
+): TierResolution | undefined => {
+  const fallback: TierFallback[] = []
+  const seen = new Set<string>()
+  for (const tier of TIER_ORDER) {
+    const model = tiers[tier]
+    if (!model) {
+      fallback.push({ tier, reason: "unavailable" })
+      continue
+    }
+    const fingerprint = organizerFingerprintOf(model)
+    if (seen.has(fingerprint)) {
+      fallback.push({ tier, reason: "duplicate" })
+      continue
+    }
+    seen.add(fingerprint)
+    if (model.contextLimit !== undefined && model.contextLimit < requiredContextTokens) {
+      fallback.push({ tier, reason: "insufficient-context" })
+      continue
+    }
+    return { model, tier, organizerFingerprint: fingerprint, fallback }
+  }
+  return undefined
 }
 
 export * as ReasoningDistillation from "./reasoning-distillation"
