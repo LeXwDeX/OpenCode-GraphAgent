@@ -1,6 +1,8 @@
+import type { GateViolation } from "./gates"
 import type {
   AuditConfidence,
   AuditFinding,
+  AuditRecord,
   CallObservation,
   ExecutionMatch,
   ExecutionTarget,
@@ -194,4 +196,28 @@ export const resolveExecutionVerdict = (input: ExecutionVerdictInput): AuditFind
 
   // Row 6: matched + targeted support -> no violation.
   return undefined
+}
+
+/** Convert a distiller-attributed gate violation into an audit finding (drops the gate id, keeps the reason code). */
+export const gateViolationToFinding = (violation: GateViolation): AuditFinding => ({
+  kind: violation.kind,
+  ...(violation.claimID !== undefined ? { claimID: violation.claimID } : {}),
+  evidence: violation.evidence,
+  confidence: violation.confidence,
+  reasonCode: violation.reasonCode,
+})
+
+/**
+ * Group findings into per-subject audit records (§5.5): execution violations attribute to the source agent, gate
+ * violations (fabricated/concealed/evidence_swap) attribute to the distiller. Empty subjects are omitted. Records
+ * carry only ids, reason codes, enums, and confidence — never original text or candidate bodies (§5.5.3).
+ */
+export const assembleAudit = (
+  sourceAgentFindings: readonly AuditFinding[],
+  distillerFindings: readonly AuditFinding[],
+): AuditRecord[] => {
+  const records: AuditRecord[] = []
+  if (sourceAgentFindings.length > 0) records.push({ subject: "source-agent", findings: sourceAgentFindings })
+  if (distillerFindings.length > 0) records.push({ subject: "distiller", findings: distillerFindings })
+  return records
 }

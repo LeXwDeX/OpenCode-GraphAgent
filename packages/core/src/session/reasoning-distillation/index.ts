@@ -1,4 +1,4 @@
-export { resolveExecutionMatch, resolveExecutionVerdict } from "./audit"
+export { assembleAudit, gateViolationToFinding, resolveExecutionMatch, resolveExecutionVerdict } from "./audit"
 export type { ExecutionVerdictInput } from "./audit"
 export {
   claimEquivalence,
@@ -8,6 +8,8 @@ export {
   validateCoverage,
   validateSourceSpans,
 } from "./claims"
+export { evaluateGates } from "./gates"
+export type { GateEvaluation, GateID, GateViolation } from "./gates"
 export { planReasoningDistillation } from "./plan"
 export { ReasoningDistillationPolicy } from "./policy"
 export type {
@@ -44,6 +46,7 @@ export type {
   ExecutionScope,
   ExecutionSelector,
   ExecutionTarget,
+  ExecutionVerdictContext,
   ModelProjection,
   ModelTier,
   ProtectionClass,
