@@ -320,3 +320,14 @@ describe("plan execution-target audit integration (§5.5)", () => {
     expect(distiller?.findings.some((f) => f.kind === "fabricated")).toBe(true)
   })
 })
+
+describe("plan determinism (§6.1)", () => {
+  test("identical observations and model results yield an identical pure plan", () => {
+    const { spans, cand, support: sup } = cleanFixture()
+    const input = planInput({ candidate: cand, evidence: evidence(spans), support: sup })
+    const first = planReasoningDistillation(input)
+    const second = planReasoningDistillation(input)
+    expect(first).toEqual(second)
+    expect(first.replacements).toHaveLength(1)
+  })
+})
