@@ -6,6 +6,7 @@ import {
   type ClaimSupport,
   type CompatibilityRecord,
   type DistillationCallQuota,
+  type DistillationKey,
   type SlotCapability,
   type SourceSpan,
 } from "@opencode-ai/core/session/reasoning-distillation"
@@ -14,10 +15,13 @@ import {
   buildReasoningEvidence,
   buildSlotMappings,
   organizerFingerprintOf,
+  parseCandidate,
+  parseSupport,
   projectDistillationAISDK,
   resolveOrganizerTier,
   type OrganizerModel,
   type ReasoningSlotObservation,
+  type SpanResolver,
   type ToolCallObservation,
 } from "../../src/session/reasoning-distillation"
 
@@ -194,9 +198,11 @@ const deterministicSupport: ClaimSupport[] = [
 const exhaustedQuota: DistillationCallQuota = { proposeUsed: true, judgeUsed: true }
 const freshQuota: DistillationCallQuota = { proposeUsed: false, judgeUsed: false }
 
+type WireRequest = ReturnType<typeof wireRequest>
+
 const baseInput = (
-  request: ReturnType<typeof wireRequest>,
-  overrides: Partial<Parameters<typeof projectDistillationAISDK<typeof request>>[0]> = {},
+  request: WireRequest,
+  overrides: Partial<Parameters<typeof projectDistillationAISDK<WireRequest>>[0]> = {},
 ) => ({
   request,
   identity: { model: "m", runtime: "r" },
@@ -302,5 +308,92 @@ describe("resolveOrganizerTier (§5.6)", () => {
     expect(organizerFingerprintOf(model("deepseek"))).not.toBe(
       organizerFingerprintOf(model("deepseek", { variant: "v2" })),
     )
+  })
+})
+
+const resolver: SpanResolver = (ref) =>
+  ref.end <= ref.start
+    ? undefined
+    : { ...ref, fingerprint: Hash.sha256(`${ref.messageID}:${ref.partID}:${ref.start}:${ref.end}`) }
+
+const distillKey = (): DistillationKey => ({
+  sessionID: "s1",
+  messageID: "m1",
+  partIDs: ["p1"],
+  sourceFingerprint: "sf1",
+  capabilityFingerprint: "cap1",
+  organizerFingerprint: "org1",
+  policyVersion: POLICY,
+})
+
+const validRaw = {
+  claims: [
+    {
+      id: "c1",
+      kind: "decision",
+      text: "精简结论",
+      scope: "本次会话",
+      sources: [{ messageID: "m1", partID: "p1", start: 0, end: 5 }],
+      evidence: [{ messageID: "m1", partID: "p1", kind: "source" }],
+      status: "verified",
+    },
+  ],
+  preserved: [],
+  coverage: [{ source: { messageID: "m1", partID: "p1", start: 0, end: 5 }, action: "keep", claimID: "c1" }],
+}
+
+describe("parseCandidate (§5.5.3 untrusted output)", () => {
+  test("parses a well-formed candidate and binds span fingerprints via the resolver", () => {
+    const candidate = parseCandidate(validRaw, distillKey(), resolver)
+    expect(candidate?.claims[0].sources[0].fingerprint).toBe(Hash.sha256("m1:p1:0:5"))
+    expect(candidate?.coverage[0]).toMatchObject({ action: "keep", claimID: "c1" })
+    expect(candidate?.key).toEqual(distillKey())
+  })
+  test("rejects an unknown claim kind or status", () => {
+    const badKind = { ...validRaw, claims: [{ ...validRaw.claims[0], kind: "noise" }] }
+    const badStatus = { ...validRaw, claims: [{ ...validRaw.claims[0], status: "maybe" }] }
+    expect(parseCandidate(badKind, distillKey(), resolver)).toBeUndefined()
+    expect(parseCandidate(badStatus, distillKey(), resolver)).toBeUndefined()
+  })
+  test("rejects a span the resolver cannot bind", () => {
+    const bad = {
+      ...validRaw,
+      claims: [{ ...validRaw.claims[0], sources: [{ messageID: "m1", partID: "p1", start: 5, end: 5 }] }],
+    }
+    expect(parseCandidate(bad, distillKey(), resolver)).toBeUndefined()
+  })
+  test("rejects non-record output or a missing array section", () => {
+    expect(parseCandidate(null, distillKey(), resolver)).toBeUndefined()
+    expect(parseCandidate({ claims: [], preserved: [] }, distillKey(), resolver)).toBeUndefined()
+  })
+  test("a drop entry requires a non-empty reason", () => {
+    const dropNoReason = {
+      ...validRaw,
+      coverage: [{ source: { messageID: "m1", partID: "p1", start: 0, end: 5 }, action: "drop" }],
+    }
+    expect(parseCandidate(dropNoReason, distillKey(), resolver)).toBeUndefined()
+  })
+})
+
+describe("parseSupport", () => {
+  test("parses supported/unknown verdicts", () => {
+    const support = parseSupport({
+      support: [
+        { claimID: "c1", verdict: "supported", method: "judged" },
+        { claimID: "c2", verdict: "unknown", reasonCode: "truncated" },
+      ],
+    })
+    expect(support).toEqual([
+      { claimID: "c1", result: { verdict: "supported", method: "judged" } },
+      { claimID: "c2", result: { verdict: "unknown", reasonCode: "truncated" } },
+    ])
+  })
+  test("rejects a verdict missing its method or reasonCode", () => {
+    expect(parseSupport({ support: [{ claimID: "c1", verdict: "supported" }] })).toBeUndefined()
+    expect(parseSupport({ support: [{ claimID: "c1", verdict: "unknown" }] })).toBeUndefined()
+  })
+  test("rejects malformed top-level output", () => {
+    expect(parseSupport([])).toBeUndefined()
+    expect(parseSupport({ support: "nope" })).toBeUndefined()
   })
 })
