@@ -13,7 +13,10 @@ import { Hash } from "@opencode-ai/core/util/hash"
 import {
   buildReasoningEvidence,
   buildSlotMappings,
+  organizerFingerprintOf,
   projectDistillationAISDK,
+  resolveOrganizerTier,
+  type OrganizerModel,
   type ReasoningSlotObservation,
   type ToolCallObservation,
 } from "../../src/session/reasoning-distillation"
@@ -248,5 +251,56 @@ describe("projectDistillationAISDK (§5.2)", () => {
     expect(result.applied).toBe(false)
     expect(result.plan.skipReason).toBe("below-target")
     expect(result.request).toBe(request)
+  })
+})
+
+const model = (modelID: string, overrides: Partial<OrganizerModel> = {}): OrganizerModel => ({
+  providerID: "local-proxy-compatible",
+  modelID,
+  ...overrides,
+})
+
+describe("resolveOrganizerTier (§5.6)", () => {
+  test("picks the small model first when available", () => {
+    const resolution = resolveOrganizerTier(
+      { small: model("deepseek"), agent: model("agent"), primary: model("primary") },
+      1000,
+    )
+    expect(resolution?.tier).toBe("small")
+    expect(resolution?.fallback).toEqual([])
+    expect(resolution?.organizerFingerprint).toBe(organizerFingerprintOf(model("deepseek")))
+  })
+
+  test("falls back to agent when small is unavailable, recording the reason", () => {
+    const resolution = resolveOrganizerTier(
+      { small: undefined, agent: model("agent"), primary: model("primary") },
+      1000,
+    )
+    expect(resolution?.tier).toBe("agent")
+    expect(resolution?.fallback).toEqual([{ tier: "small", reason: "unavailable" }])
+  })
+
+  test("dedups an identical model and skips one below the context requirement", () => {
+    const same = model("deepseek", { contextLimit: 500 })
+    const resolution = resolveOrganizerTier(
+      { small: same, agent: same, primary: model("primary", { contextLimit: 8000 }) },
+      1000,
+    )
+    expect(resolution?.tier).toBe("primary")
+    expect(resolution?.fallback).toEqual([
+      { tier: "small", reason: "insufficient-context" },
+      { tier: "agent", reason: "duplicate" },
+    ])
+  })
+
+  test("returns undefined when no tier is usable", () => {
+    expect(resolveOrganizerTier({ small: undefined, agent: undefined, primary: undefined }, 1000)).toBeUndefined()
+  })
+
+  test("organizerFingerprint is stable and variant-sensitive", () => {
+    expect(organizerFingerprintOf(model("deepseek"))).toBe(organizerFingerprintOf(model("deepseek")))
+    expect(organizerFingerprintOf(model("deepseek"))).not.toBe(
+      organizerFingerprintOf(model("deepseek", { variant: "v2" })),
+    )
   })
 })
