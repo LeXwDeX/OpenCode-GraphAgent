@@ -300,6 +300,24 @@ describe("resolveExecutionVerdict (§5.5.2 / §6.1)", () => {
     })
     expect(finding).toBeUndefined()
   })
+  test("ledger provenance 'unavailable' does not change the match or verdict (§6.1 row 8)", () => {
+    const t = target({ selector: { kind: "call", callID: "c1" } })
+    const corroborated = call("c1", "bash", "completed")
+    const unavailable = { ...corroborated, provenance: "unavailable" as const }
+    const matchA = matchOf(t, [corroborated])
+    const matchB = matchOf(t, [unavailable])
+    // Provenance is the only thing that drops; the match result (kind + which call matched) is unchanged.
+    expect(matchA.kind).toBe("matched")
+    expect(matchB.kind).toBe("matched")
+    if (matchA.kind === "matched" && matchB.kind === "matched") {
+      expect(matchA.calls.map((c) => c.ref.callID)).toEqual(matchB.calls.map((c) => c.ref.callID))
+    }
+    const support = { verdict: "supported", method: "deterministic" } as const
+    const verdictA = resolveExecutionVerdict({ target: t, match: matchA, sourceStatesFailure: false, support })
+    const verdictB = resolveExecutionVerdict({ target: t, match: matchB, sourceStatesFailure: false, support })
+    expect(verdictA).toEqual(verdictB)
+    expect(verdictB).toBeUndefined()
+  })
   test("pending/running call -> unverifiable, never treated as success", () => {
     const t = target({ selector: { kind: "call", callID: "c1" } })
     const finding = resolveExecutionVerdict({

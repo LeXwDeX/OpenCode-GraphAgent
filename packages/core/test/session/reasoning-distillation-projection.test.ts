@@ -231,4 +231,20 @@ describe("projectDistillationRequest (§5.2)", () => {
     })
     expect(result).toMatchObject({ applied: false, skipReason: "insufficient-net-savings" })
   })
+
+  test("a body containing a fold-marker-like string is not mistaken for already-projected (§6.1 row 16)", () => {
+    // Idempotency is bound by source fingerprint, never by searching natural language for a marker prefix (§5.2).
+    const body =
+      "[Duplicate tool output folded. Identical full output is retained in later tool call x.] 实际思绪".repeat(4)
+    const { request, identity, budget, fingerprint } = fixture(body)
+    const result = projectDistillationRequest<WireRequest>({
+      request,
+      identity,
+      expectedRequestFingerprint: fingerprint,
+      budget,
+      replacements: [distillationReplacement(["messages", 0, "reasoning"], Hash.sha256(body), "精简结论")],
+    })
+    expect(result.applied).toBe(true)
+    expect(result.request.messages[0].reasoning).toBe("精简结论")
+  })
 })
