@@ -608,4 +608,29 @@ export const runJudge = async (input: {
   return parseSupport(raw)
 }
 
+/** A persisted reasoning part with its stable identity (§5.8 cache keys must not drift with wire position). */
+export type PersistedReasoningRef = Readonly<{ messageID: string; partID: string; text: string }>
+
+/**
+ * Rebind wire-position reasoning slots to stable persisted refs (§5.8). The provider transform joins an assistant
+ * message's reasoning parts into one interleaved field, so for the common single-reasoning-part case the wire slot text
+ * equals the persisted part text and an exact match yields the stable messageID/partID. Unmatched slots keep their
+ * wire-position id (degraded cache stability, still correct); duplicate persisted text binds to the first occurrence,
+ * so an ambiguous match never silently rebinds to the wrong part. Pure and host-driven: the caller supplies the
+ * persisted refs (from SessionV1 history), keeping this unit-testable without Effect or the ledger.
+ */
+export const bindPersistedReasoningRefs = (
+  slots: readonly ReasoningSlotObservation[],
+  persisted: readonly PersistedReasoningRef[],
+): ReasoningSlotObservation[] => {
+  const byText = new Map<string, PersistedReasoningRef>()
+  for (const ref of persisted) {
+    if (!byText.has(ref.text)) byText.set(ref.text, ref)
+  }
+  return slots.map((slot) => {
+    const match = byText.get(slot.text)
+    return match ? { ...slot, messageID: match.messageID, partID: match.partID } : slot
+  })
+}
+
 export * as ReasoningDistillation from "./reasoning-distillation"
