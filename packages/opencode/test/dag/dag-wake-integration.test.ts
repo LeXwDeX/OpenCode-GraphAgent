@@ -1,9 +1,11 @@
 import { describe, expect, it } from "bun:test"
-import { createHash } from "node:crypto"
+import { createHash, randomUUID } from "node:crypto"
 import * as fs from "node:fs/promises"
 import * as os from "node:os"
 import * as path from "node:path"
-import { Deferred, Effect, Fiber, Layer, Option, Queue } from "effect"
+import { Clock, Deferred, Effect, Fiber, Layer, Option, Queue, Schema, Exit, Cause } from "effect"
+import { eq } from "drizzle-orm"
+import * as TestClock from "effect/testing/TestClock"
 import type { SessionV1 } from "@opencode-ai/core/v1/session"
 import type { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { FSUtil } from "@opencode-ai/core/fs-util"
@@ -20,19 +22,35 @@ import { SessionTable } from "@opencode-ai/core/session/sql"
 import { Model } from "@opencode-ai/schema/model"
 import { Provider } from "@opencode-ai/schema/provider"
 import { Agent } from "@/agent/agent"
+import { Provider as RuntimeProvider } from "@/provider/provider"
 import { fingerprintBrief } from "@/dag/admission"
 import { Dag, type NodeConfig } from "@/dag/dag"
-import { DagLoop } from "@/dag/runtime/loop"
+import { DagLoop, isPausedReminderDue } from "@/dag/runtime/loop"
 import { InstanceRef } from "@/effect/instance-ref"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { SessionPrompt } from "@/session/prompt"
 import { MessageID, SessionID } from "@/session/schema"
 import { Session } from "@/session/session"
 import { SessionStatus } from "@/session/status"
+import { Tool } from "@/tool/tool"
+import { Truncate } from "@/tool/truncate"
+import { WorkflowParameters, WorkflowTool } from "@/tool/workflow"
+import { ProviderTest } from "../fake/provider"
 import { pollWithTimeout, testEffect } from "../lib/effect"
 import { withIdleAdmission } from "../lib/session-prompt"
 
 const integration = testEffect(Layer.empty)
+
+describe("paused workflow reminder lease", () => {
+  it("becomes due once after five minutes and stays acknowledged across restart", () => {
+    const paused = { status: "paused", wakeReported: false, timeUpdated: 1_000 }
+    expect(isPausedReminderDue(paused, 300_999)).toBe(false)
+    expect(isPausedReminderDue(paused, 301_000)).toBe(true)
+    expect(isPausedReminderDue({ ...paused, wakeReported: true }, 1_000_000)).toBe(false)
+    expect(isPausedReminderDue({ ...paused, status: "running" }, 1_000_000)).toBe(false)
+    expect(isPausedReminderDue({ ...paused, timeUpdated: 900_000 }, 1_000_000)).toBe(false)
+  })
+})
 
 interface PromptGate {
   readonly title: string
@@ -45,9 +63,9 @@ interface ParentPromptGate {
   readonly release: Deferred.Deferred<"success" | "failure">
 }
 
-function takeWithin<A>(queue: Queue.Queue<A>, message: string) {
+function takeWithin<A>(queue: Queue.Queue<A>, message: string, timeout: "1 second" | "40 seconds" = "1 second") {
   return Queue.take(queue).pipe(
-    Effect.timeoutOption("1 second"),
+    Effect.timeoutOption(timeout),
     Effect.flatMap(Option.match({
       onNone: () => Effect.fail(new Error(message)),
       onSome: Effect.succeed,
@@ -127,7 +145,17 @@ function wakeLayer(input: {
   const childTitles = new Map<string, string>()
   const created: string[] = []
   const session = Layer.mock(Session.Service, {
-    get: () => Effect.succeed({ id: "ses_parent", permission: [], agent: "build" } as never),
+    get: () => Effect.succeed({
+      id: SessionID.make("ses_parent"),
+      slug: "parent",
+      projectID: Project.ID.make("project-1"),
+      directory: process.cwd(),
+      title: "parent",
+      agent: "build",
+      model: { providerID: Provider.ID.make("test"), id: Model.ID.make("test-model") },
+      version: "test",
+      time: { created: 0, updated: 0 },
+    }),
     create: (value) =>
       Effect.sync(() => {
         const id = `ses_child_${created.length + 1}`
@@ -169,10 +197,19 @@ function wakeLayer(input: {
       options: {},
       description: "",
       prompt: "",
-      model: { providerID: "test" as never, modelID: "test-model" as never },
+      model: { providerID: Provider.ID.make("test"), modelID: Model.ID.make("test-model") },
       tools: {},
       hooks: {},
     }),
+    list: () => Effect.succeed([{ name: "build", mode: "all", permission: [], options: {} }]),
+  })
+  const testModel = ProviderTest.model({ providerID: Provider.ID.make("test"), id: Model.ID.make("test-model") })
+  const provider = Layer.mock(RuntimeProvider.Service, {
+    list: () => Effect.succeed({ test: ProviderTest.info({}, testModel) }),
+    getModel: () => Effect.succeed(testModel),
+  })
+  const truncate = Layer.mock(Truncate.Service, {
+    output: (content) => Effect.succeed({ content, truncated: false }),
   })
   const loop = DagLoop.layer.pipe(
     Layer.provide(base),
@@ -180,7 +217,7 @@ function wakeLayer(input: {
     Layer.provide(prompt),
     Layer.provide(agent),
   )
-  return Layer.merge(base, loop)
+  return Layer.mergeAll(base, loop, session, agent, provider, truncate)
 }
 
 function runWakeTest<A>(
@@ -192,6 +229,7 @@ function runWakeTest<A>(
     readonly childPrompts: Queue.Queue<PromptGate>
     readonly parentPrompts: Queue.Queue<ParentPromptGate>
     readonly parentSettled: Queue.Queue<void>
+    readonly workflow: Tool.InferDef<typeof WorkflowTool>
   }) => Effect.Effect<A, Error>,
   beforeInit?: (services: {
     readonly database: Database.Interface
@@ -208,6 +246,7 @@ function runWakeTest<A>(
       const store = yield* DagStore.Service
       const status = yield* SessionStatus.Service
       const database = yield* Database.Service
+      const workflow = yield* Tool.init(yield* WorkflowTool)
       yield* database.db.insert(ProjectTable).values({
         id: "project-1" as never,
         worktree: process.cwd() as never,
@@ -223,7 +262,7 @@ function runWakeTest<A>(
       }).run().pipe(Effect.orDie)
       if (beforeInit) yield* beforeInit({ database })
       yield* loop.init()
-      return yield* test({ dag, loop, store, status, childPrompts, parentPrompts, parentSettled })
+      return yield* test({ dag, loop, store, status, childPrompts, parentPrompts, parentSettled, workflow })
     }).pipe(
       Effect.provide(wakeLayer({ childPrompts, parentPrompts, parentSettled, agentPermissions })),
       Effect.provideService(InstanceRef, {
@@ -237,6 +276,230 @@ function runWakeTest<A>(
 }
 
 describe("DagLoop atomic wake integration", () => {
+  it("admits an aged pause reminder from the 30-second sweep once across restart", async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const childTitles = new Map<string, string>()
+        const created: string[] = []
+        const session = Layer.mock(Session.Service, {
+          get: () =>
+            Effect.succeed({
+              id: SessionID.make("ses_parent"),
+              slug: "parent",
+              projectID: Project.ID.make("project-1"),
+              directory: process.cwd(),
+              title: "Parent",
+              version: "test",
+              time: { created: 0, updated: 0 },
+              permission: [],
+              agent: "build",
+            }),
+          create: (value) =>
+            Effect.sync(() => {
+              const id = `ses_child_${created.length + 1}`
+              created.push(id)
+              childTitles.set(id, (value?.title ?? id).replace(" (DAG node)", ""))
+              return {
+                id: SessionID.make(id),
+                slug: "child",
+                projectID: Project.ID.make("project-1"),
+                directory: process.cwd(),
+                title: value?.title ?? id,
+                version: "test",
+                time: { created: 0, updated: 0 },
+              }
+            }),
+          messages: () => Effect.succeed([]),
+        })
+        const agent = Layer.mock(Agent.Service, {
+          get: () =>
+            Effect.succeed({
+              name: "build",
+              mode: "all",
+              permission: [],
+              options: {},
+              description: "",
+              prompt: "",
+              model: { providerID: Provider.ID.make("test"), modelID: Model.ID.make("test-model") },
+              tools: {},
+              hooks: {},
+            }),
+        })
+        const deliver = (queues: {
+          readonly childPrompts: Queue.Queue<PromptGate>
+          readonly parentPrompts: Queue.Queue<ParentPromptGate>
+          readonly parentSettled: Queue.Queue<void>
+        }) =>
+          Effect.fn("test.SessionPrompt.deliver")(function* (value: SessionPrompt.PromptInput) {
+            const sessionID = value.sessionID as string
+            if (sessionID === "ses_parent") {
+              const release = yield* Deferred.make<"success" | "failure">()
+              yield* Queue.offer(queues.parentPrompts, { input: value, release })
+              const outcome = yield* Deferred.await(release).pipe(
+                Effect.ensuring(Queue.offer(queues.parentSettled, undefined)),
+              )
+              if (outcome === "failure") return yield* Effect.die(new Error("provider unavailable"))
+              return reply(sessionID, "parent handled reminder")
+            }
+            const release = yield* Deferred.make<string>()
+            yield* Queue.offer(queues.childPrompts, {
+              title: childTitles.get(sessionID) ?? sessionID,
+              input: value,
+              release,
+            })
+            return reply(sessionID, yield* Deferred.await(release))
+          })
+        const promptLayer = (queues: {
+          readonly childPrompts: Queue.Queue<PromptGate>
+          readonly parentPrompts: Queue.Queue<ParentPromptGate>
+          readonly parentSettled: Queue.Queue<void>
+        }) => Layer.mock(SessionPrompt.Service, withIdleAdmission({
+          cancel: () => Effect.void,
+          prompt: deliver(queues),
+          promptIfIdle: (value) => deliver(queues)(value).pipe(Effect.map(Option.some)),
+        }))
+
+        const database = Database.layerFromPath(":memory:")
+        const events = EventV2.layer.pipe(Layer.provide(database))
+        const bridge = EventV2Bridge.layer.pipe(Layer.provide(events))
+        const store = DagStore.layer.pipe(Layer.provide(database))
+        const status = SessionStatus.layer.pipe(Layer.provide(bridge))
+        const projector = DagProjector.layer.pipe(Layer.provide(events), Layer.provide(database))
+        const dag = Dag.layer.pipe(Layer.provide(bridge), Layer.provide(store))
+        const base = Layer.mergeAll(database, events, bridge, store, projector, dag, status)
+
+        yield* Effect.gen(function* () {
+          const storeService = yield* DagStore.Service
+          const databaseService = yield* Database.Service
+          yield* databaseService.db.insert(ProjectTable).values({
+            id: Project.ID.make("project-1"),
+            worktree: AbsolutePath.make(process.cwd()),
+            sandboxes: [],
+          }).run().pipe(Effect.orDie)
+          yield* databaseService.db.insert(SessionTable).values({
+            id: SessionID.make("ses_parent"),
+            project_id: Project.ID.make("project-1"),
+            slug: "parent",
+            directory: AbsolutePath.make(process.cwd()),
+            title: "Parent",
+            version: "test",
+          }).run().pipe(Effect.orDie)
+
+          const firstQueues = {
+            childPrompts: yield* Queue.unbounded<PromptGate>(),
+            parentPrompts: yield* Queue.unbounded<ParentPromptGate>(),
+            parentSettled: yield* Queue.unbounded<void>(),
+          }
+          let workflowID = ""
+          yield* Effect.scoped(
+            Effect.gen(function* () {
+              const dagService = yield* Dag.Service
+              const loopService = yield* DagLoop.Service
+              yield* loopService.init()
+              workflowID = yield* dagService.create({
+                projectID: "project-1",
+                sessionID: "ses_parent",
+                title: "Periodic pause reminder",
+                config: {
+                  name: "periodic-pause-reminder",
+                  nodes: [{ ...node("work"), required: false, report_to_parent: false }],
+                },
+              })
+              yield* takeWithin(firstQueues.childPrompts, "paused reminder worker did not start")
+              yield* dagService.pause(workflowID)
+              const paused = yield* storeService.getWorkflow(workflowID)
+              expect(paused?.status).toBe("paused")
+              expect(paused?.wakeReported).toBe(false)
+
+              // The startup scan has already run. Age only the persisted pause
+              // timestamp so the actual periodic 30-second sweep sees a due row.
+              const now = yield* Clock.currentTimeMillis
+              yield* databaseService.db
+                .update(WorkflowTable)
+                .set({ time_updated: now - 5 * 60_000 - 1 })
+                .where(eq(WorkflowTable.id, workflowID))
+                .run()
+
+              // Advance across the production 30-second sleep in virtual time;
+              // the actual DagLoop periodic fiber and sweep still execute.
+              yield* TestClock.adjust("30 seconds")
+              const parent = yield* takeWithin(
+                firstQueues.parentPrompts,
+                "30-second paused reminder sweep did not admit the parent prompt",
+                "40 seconds",
+              )
+              expect(promptText(parent.input)).toContain(
+                '[DAG Workflow paused] Workflow "Periodic pause reminder" has remained paused for five minutes.',
+              )
+              expect(parent.input.parts.some((part) => part.type === "text" && part.synthetic === true)).toBe(true)
+              // Simulate a process crash while the admitted parent turn remains in flight.
+              expect((yield* storeService.getWorkflow(workflowID))?.wakeReported).toBe(true)
+            }).pipe(Effect.provide(DagLoop.layer.pipe(
+              Layer.provide(session),
+              Layer.provide(promptLayer(firstQueues)),
+              Layer.provide(agent),
+            ))),
+          )
+
+          expect((yield* storeService.getWorkflow(workflowID))?.wakeReported).toBe(true)
+          expect(yield* storeService.getUnreportedWakeWorkflows("ses_parent")).toHaveLength(0)
+
+          const restartedQueues = {
+            childPrompts: yield* Queue.unbounded<PromptGate>(),
+            parentPrompts: yield* Queue.unbounded<ParentPromptGate>(),
+            parentSettled: yield* Queue.unbounded<void>(),
+          }
+          yield* Effect.scoped(
+            Effect.gen(function* () {
+              const loopService = yield* DagLoop.Service
+              yield* loopService.init()
+              // A new DagLoop InstanceState performs the startup sweep over the
+              // same durable DB. A reported reminder must not be admitted again.
+              yield* TestClock.adjust("1 second")
+              expect(Option.isNone(yield* Queue.poll(restartedQueues.parentPrompts))).toBe(true)
+            }).pipe(Effect.provide(DagLoop.layer.pipe(
+              Layer.provide(session),
+              Layer.provide(promptLayer(restartedQueues)),
+              Layer.provide(agent),
+            ))),
+          )
+        }).pipe(
+          Effect.provide(base),
+          Effect.provideService(InstanceRef, {
+            directory: process.cwd(),
+            worktree: process.cwd(),
+            project: {
+              id: Project.ID.make("project-1"),
+              worktree: AbsolutePath.make(process.cwd()),
+              time: { created: 0, updated: 0 },
+              sandboxes: [],
+            },
+          }),
+        )
+      }).pipe(Effect.scoped, Effect.provide(TestClock.layer())),
+    )
+  })
+
+  integration.live("acknowledges one paused reminder and rearms only on the next pause episode", () =>
+    runWakeTest(({ dag, store, childPrompts }) => Effect.gen(function* () {
+      const dagID = yield* dag.create({
+        projectID: "project-1", sessionID: "ses_parent", title: "Pause reminder",
+        config: { name: "pause-reminder", nodes: [node("work")] },
+      })
+      yield* takeWithin(childPrompts, "work did not start")
+      yield* dag.pause(dagID)
+      const firstPause = yield* store.getWorkflow(dagID)
+      expect(firstPause?.status).toBe("paused")
+      expect(firstPause?.wakeReported).toBe(false)
+      yield* store.markWakeBatchReported({ nodes: [], workflows: [firstPause!] })
+      expect((yield* store.getWorkflow(dagID))?.wakeReported).toBe(true)
+      yield* dag.resume(dagID)
+      yield* dag.pause(dagID)
+      expect((yield* store.getWorkflow(dagID))?.wakeReported).toBe(false)
+      yield* dag.cancel(dagID)
+    })),
+  )
+
   it("injects a bounded Requirement Brief without raw QA questions", async () => {
     await Effect.runPromise(
       runWakeTest(({ dag, store, childPrompts }) =>
@@ -753,6 +1016,8 @@ describe("DagLoop atomic wake integration", () => {
           "workflow did not early-complete",
         )
         expect((yield* store.getNode(dagID, "later"))?.errorReason).toBe("agent_complete")
+        expect((yield* store.getNode(dagID, "checkpoint"))?.status).toBe("aborted")
+        expect((yield* store.getNode(dagID, "later"))?.status).toBe("skipped")
 
         const error = yield* dag.extend(dagID, [node("repair", ["checkpoint"])]).pipe(
           Effect.catch((cause: Error) => Effect.succeed(cause)),
@@ -1052,7 +1317,7 @@ describe("DagLoop atomic wake integration", () => {
           expect(text).toContain('Node "b" completed: B')
           expect(text).toContain('Node "aggregate" completed: AB')
           expect(text).toContain('Workflow "Parallel batch" has reached terminal status')
-          expect(text).not.toContain("You MUST act")
+          expect(text).not.toContain("Act on these workflows")
           expect(text.indexOf('Node "a"')).toBeLessThan(text.indexOf('Node "b"'))
           expect(text.indexOf('Node "b"')).toBeLessThan(text.indexOf('Node "aggregate"'))
           yield* Deferred.succeed(parent.release, "success")
@@ -1802,5 +2067,67 @@ describe("DagLoop atomic wake integration", () => {
         }),
       ),
     )
+  })
+
+  it("parks a running timeout escalation after WorkflowTool rejects a replan and permits a corrected replan", async () => {
+    const invalidPath = path.join(process.cwd(), `.dag-invalid-replan-${randomUUID()}.yaml`)
+    const correctedPath = path.join(process.cwd(), `.dag-corrected-replan-${randomUUID()}.yaml`)
+    await fs.writeFile(invalidPath, JSON.stringify({ nodes: [node("repair")] }))
+    await fs.writeFile(correctedPath, JSON.stringify({ fragment: { name: "repair", nodes: [node("repair")] } }))
+    try {
+      await Effect.runPromise(
+        runWakeTest(
+          ({ dag, workflow, store, parentPrompts, parentSettled, childPrompts }) =>
+            Effect.gen(function* () {
+              const dagID = yield* dag.create({ projectID: "project-1", sessionID: "ses_parent",
+                title: "Escalated replan", config: { name: "escalated-replan", nodes: [node("anchor")] } })
+              const anchor = yield* takeWithin(childPrompts, "anchor did not start")
+              const running = yield* pollWithTimeout(store.getNode(dagID, "anchor").pipe(
+                Effect.map((current) => current?.status === "running" && current.childSessionId ? current : undefined),
+              ), "anchor did not reach running")
+              yield* dag.nodeTimeoutEscalated(dagID, "anchor", running.childSessionId!, 1)
+              const parent = yield* takeWithin(parentPrompts, "timeout escalation did not wake the parent")
+              expect(promptText(parent.input)).toContain("Act on these workflows this turn")
+              const context = {
+                sessionID: SessionID.make("ses_parent"),
+                messageID: MessageID.ascending(),
+                agent: "build",
+                abort: new AbortController().signal,
+                messages: [],
+                metadata: () => Effect.void,
+                ask: () => Effect.void,
+              } satisfies Tool.Context
+              const rejected = yield* workflow.execute(
+                Schema.decodeUnknownSync(WorkflowParameters)({ params: {
+                  action: "control", operation: "replan", workflow_id: dagID, spec_path: invalidPath,
+                }}),
+                context,
+              ).pipe(Effect.exit)
+              expect(Exit.isFailure(rejected)).toBe(true)
+              if (Exit.isFailure(rejected)) expect(Cause.pretty(rejected.cause)).toContain("Workflow state: paused")
+              expect((yield* store.getWorkflow(dagID))?.status).toBe("paused")
+
+              yield* Deferred.succeed(parent.release, "success")
+              yield* takeWithin(parentSettled, "parent did not settle after the rejected replan")
+              expect((yield* store.getWorkflow(dagID))?.status).toBe("paused")
+
+              const repaired = yield* workflow.execute(
+                Schema.decodeUnknownSync(WorkflowParameters)({ params: {
+                  action: "control", operation: "replan", workflow_id: dagID, spec_path: correctedPath,
+                }}),
+                context,
+              )
+              expect(repaired.title).toContain("Workflow replanned")
+              expect((yield* store.getWorkflow(dagID))?.status).toBe("running")
+              const child = yield* takeWithin(childPrompts, "corrective node did not start")
+              expect(child.title).toBe("repair")
+              yield* Deferred.succeed(child.release, "repaired")
+              yield* Deferred.succeed(anchor.release, "anchor done")
+            }),
+        ),
+      )
+    } finally {
+      await Promise.all([fs.rm(invalidPath, { force: true }), fs.rm(correctedPath, { force: true })])
+    }
   })
 })

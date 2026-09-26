@@ -6,16 +6,27 @@ import { DagStore } from "@opencode-ai/core/dag/store"
 import { planReplan } from "@opencode-ai/core/dag/core/replan"
 import { NodeStatus } from "@opencode-ai/core/dag/core/types"
 import { EventV2 } from "@opencode-ai/core/event"
+import { Project } from "@opencode-ai/core/project"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
 import { SessionTable } from "@opencode-ai/core/session/sql"
+import { Model } from "@opencode-ai/schema/model"
+import { Provider } from "@opencode-ai/schema/provider"
+import { Agent } from "@/agent/agent"
+import { Provider as RuntimeProvider } from "@/provider/provider"
+import { Session } from "@/session/session"
+import { MessageID, SessionID } from "@/session/schema"
+import { Tool } from "@/tool/tool"
+import { WorkflowTool } from "@/tool/workflow"
+import { ProviderTest } from "../fake/provider"
 import { Dag, type NodeConfig } from "@/dag/dag"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { InstanceRef } from "@/effect/instance-ref"
 import { reconcileWorkflow } from "@/dag/runtime/recovery"
 import { makeDeadlineWatcher } from "@/dag/runtime/spawn"
 import { SessionPrompt } from "@/session/prompt"
+import { Truncate } from "@/tool/truncate"
 import { makeNodeRow } from "./fixtures"
-import { awaitWithTimeout, pollWithTimeout } from "../lib/effect"
+import { pollWithTimeout } from "../lib/effect"
 
 function node(id: string, timeoutMs?: number): NodeConfig {
   return {
@@ -39,8 +50,8 @@ const harness = (() => {
   return Layer.mergeAll(database, events, bridge, store, projector, dag)
 })()
 
-function runTest<A>(
-  test: (services: { readonly dag: Dag.Interface; readonly store: DagStore.Interface }) => Effect.Effect<A, Error>,
+function runTest<A, R = never>(
+  test: (services: { readonly dag: Dag.Interface; readonly store: DagStore.Interface }) => Effect.Effect<A, Error, Scope.Scope | R>,
 ) {
   return Effect.gen(function* () {
     return yield* Effect.gen(function* () {
@@ -371,6 +382,123 @@ describe("Dag timeout escalation fixes (unit)", () => {
       ),
     )
   })
+
+  it("re-reads a long sleeping watcher when replan shortens the durable deadline", async () => {
+    let reads = 0
+    let escalations = 0
+    let deadlineMs = Date.now() + 60_000
+    const storeLayer = Layer.mock(DagStore.Service)({
+      getNode: () => Effect.sync(() => {
+        reads++
+        return makeNodeRow({
+          id: "a", workflowId: "dag-shortened", name: "a", status: "running",
+          deadlineMs, timeoutExtensions: 0, childSessionId: "ses_child_1",
+        })
+      }),
+    })
+    const dagLayer = Layer.unwrap(
+      Effect.map(DagStore.Service, (store) => Layer.mock(Dag.Service)({
+        store,
+        nodeTimeoutEscalated: () => Effect.sync(() => { escalations++ }),
+      })),
+    ).pipe(Layer.provide(storeLayer))
+    const promptLayer = Layer.mock(SessionPrompt.Service, { cancel: () => Effect.void })
+    await Effect.runPromise(Effect.gen(function* () {
+      const scope = yield* Scope.Scope
+      const watcher = yield* makeDeadlineWatcher({ dagID: "dag-shortened", nodeID: "a", timeoutMs: 300 }).pipe(Effect.forkIn(scope))
+      yield* pollWithTimeout(Effect.sync(() => reads > 0 ? true : undefined), "watcher did not read initial long deadline")
+      deadlineMs = Date.now() - 1
+      yield* pollWithTimeout(Effect.sync(() => escalations > 0 ? true : undefined), "shortened deadline was not enforced", "3 seconds")
+      yield* Fiber.interrupt(watcher)
+      expect(reads).toBeGreaterThan(1)
+    }).pipe(Effect.provide(dagLayer), Effect.provide(promptLayer), Effect.scoped))
+  }, 5000)
+
+  it("re-reads a long sleeping watcher after control(extend_timeout) moves the deadline earlier", async () => {
+    const promptLayer = Layer.mock(SessionPrompt.Service, { cancel: () => Effect.void })
+    const testModel = ProviderTest.model({ providerID: Provider.ID.make("test"), id: Model.ID.make("test-model") })
+    const toolDependencies = Layer.mergeAll(
+      Layer.mock(Session.Service, {
+        get: () => Effect.succeed({
+          id: SessionID.make("ses_parent"),
+          slug: "parent",
+          projectID: Project.ID.make("project-1"),
+          directory: process.cwd(),
+          title: "Parent",
+          agent: "build",
+          model: { providerID: Provider.ID.make("test"), id: Model.ID.make("test-model") },
+          version: "test",
+          time: { created: 0, updated: 0 },
+        } satisfies Session.Info),
+      }),
+      Layer.mock(Agent.Service, {
+        get: () => Effect.succeed({
+          name: "build",
+          mode: "all",
+          permission: [],
+          options: {},
+          description: "",
+          prompt: "",
+          model: { providerID: Provider.ID.make("test"), modelID: Model.ID.make("test-model") },
+        } satisfies Agent.Info),
+        list: () => Effect.succeed([] as Agent.Info[]),
+      }),
+      Layer.mock(RuntimeProvider.Service, {
+        list: () => Effect.succeed({ test: ProviderTest.info({}, testModel) }),
+        getModel: () => Effect.succeed(testModel),
+      }),
+      Layer.mock(Truncate.Service, {
+        output: (content) => Effect.succeed({ content, truncated: false }),
+      }),
+    )
+    await Effect.runPromise(
+      runTest(({ dag, store }) =>
+        Effect.gen(function* () {
+          const dagID = yield* createWorkflow(dag, "direct-extend-short-deadline", 60_000)
+          const deadline = Date.now() + 60_000
+          yield* dag.nodeQueued(dagID, "a", deadline)
+          yield* dag.nodeStarted(dagID, "a", "ses_child_1", deadline, true)
+
+          const scope = yield* Scope.Scope
+          const watcher = yield* makeDeadlineWatcher({ dagID, nodeID: "a", timeoutMs: 60_000 }).pipe(
+            Effect.provideService(Dag.Service, dag),
+            Effect.forkIn(scope),
+          )
+
+          // A delivered escalation authorizes control(extend_timeout). Move a
+          // 60-second deadline to one second from now while its watcher sleeps.
+          yield* dag.nodeTimeoutEscalated(dagID, "a", "ses_child_1", 1)
+          yield* store.markNodeWakeReported(dagID, "a")
+          const workflowTool = yield* (yield* WorkflowTool).init()
+          const result = yield* workflowTool.execute({ params: {
+            action: "control",
+            workflow_id: Dag.ID.make(dagID),
+            operation: "extend_timeout",
+            node_id: Dag.NodeID.make("a"),
+            timeout_ms: 1_000,
+          } }, {
+            sessionID: SessionID.make("ses_parent"),
+            messageID: MessageID.ascending(),
+            agent: "build",
+            abort: new AbortController().signal,
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          } satisfies Tool.Context)
+          expect(result.output).toContain('status="extended"')
+
+          yield* pollWithTimeout(
+            store.getNode(dagID, "a").pipe(
+              Effect.map((node) => node && node.timeoutExtensions >= 2 ? node : undefined),
+            ),
+            "the existing watcher did not observe and escalate the shortened direct-extension deadline",
+            "4 seconds",
+          )
+          yield* Fiber.interrupt(watcher).pipe(Effect.ignore)
+        }),
+      ).pipe(Effect.provide(toolDependencies), Effect.provide(promptLayer)),
+    )
+  }, 7000)
 
   it("continues supervision after store read retries fail (R13/F1-product)", async () => {
     let reads = 0

@@ -139,11 +139,11 @@ function serializeAndWipe(dagID: string) {
       .all()
       .pipe(Effect.orDie)
     const serialized = rows.map((r) => ({
-      id: r.id as EventV2.ID,
+      id: r.id,
       type: r.type,
       seq: r.seq,
       aggregateID: r.aggregate_id,
-      data: r.data as Record<string, unknown>,
+      data: r.data,
     }))
     yield* db.delete(EventTable).where(sql`${EventTable.aggregate_id} = ${dagID}`).run().pipe(Effect.orDie)
     yield* db.delete(EventSequenceTable).where(sql`${EventSequenceTable.aggregate_id} = ${dagID}`).run().pipe(Effect.orDie)
@@ -324,6 +324,159 @@ describe("NodeDeadlineExtended projector fold + replay (Q3)", () => {
         expect(row?.deadlineMs).toBe(50_000)
         expect(row?.output).toBe("done")
       }).pipe(Effect.provide(projectorLayer)),
+    )
+  })
+})
+
+describe("extendTimeout dedicated control command (P0-A)", () => {
+  it("audit #3/#4: extends an escalated, delivered running node — deadline moves, escalation cleared, attempt + child session + replanAttempts preserved", async () => {
+    await Effect.runPromise(
+      runTest(({ dag, store, db }) =>
+        Effect.gen(function* () {
+          const dagID = yield* createWorkflow(dag, "extend-timeout-running")
+          yield* dag.nodeQueued(dagID, "a", Date.now() - 1000)
+          yield* dag.nodeStarted(dagID, "a", "ses_child_1", Date.now() - 500, true)
+          yield* dag.nodeTimeoutEscalated(dagID, "a", "ses_child_1", 1)
+          // Q2: adjudication follows delivery.
+          yield* store.markNodeWakeReported(dagID, "a")
+
+          const before = yield* store.getNode(dagID, "a")
+          const verdict = yield* dag.extendTimeout(dagID, "a", 60_000)
+          expect(verdict.status).toBe("extended")
+          if (verdict.status !== "extended") return
+
+          const after = yield* store.getNode(dagID, "a")
+          // Deadline recomputed from now and landed as ONE durable event.
+          expect(after?.deadlineMs).toBe(verdict.deadlineMs)
+          expect(verdict.deadlineMs).toBeGreaterThan(Date.now())
+          expect(yield* deadlineExtendedCount(db, dagID, "a")).toBe(1)
+          // Adjudication consumed the escalation.
+          expect(after?.escalationPending).toBe(false)
+          expect(after?.wakeReported).toBe(true)
+          // audit #4: no restart, no replan attempt, child session preserved.
+          expect(after?.status).toBe("running")
+          expect(after?.replanAttempts).toBe(before?.replanAttempts)
+          expect(after?.replanAttempts).toBe(0)
+          expect(after?.childSessionId).toBe("ses_child_1")
+          // An extend grants time; it does NOT bump the cumulative extension count.
+          expect(after?.timeoutExtensions).toBe(before?.timeoutExtensions)
+          expect(yield* dag.extendTimeout(dagID, "a", 60_000)).toEqual({ status: "no_escalation" })
+          expect(yield* deadlineExtendedCount(db, dagID, "a")).toBe(1)
+        }),
+      ),
+    )
+  })
+
+  it("refuses a running node without a formal escalation before its deadline, no event", async () => {
+    await Effect.runPromise(
+      runTest(({ dag, store, db }) =>
+        Effect.gen(function* () {
+          const dagID = yield* createWorkflow(dag, "extend-timeout-healthy")
+          yield* dag.nodeQueued(dagID, "a", Date.now() + 120_000)
+          yield* dag.nodeStarted(dagID, "a", "ses_child_1", Date.now() + 120_000, true)
+
+          const before = yield* store.getNode(dagID, "a")
+          const verdict = yield* dag.extendTimeout(dagID, "a", 60_000)
+          expect(verdict).toEqual({ status: "no_escalation" })
+
+          const after = yield* store.getNode(dagID, "a")
+          expect(after?.deadlineMs).toBe(before?.deadlineMs)
+          expect(yield* deadlineExtendedCount(db, dagID, "a")).toBe(0)
+        }),
+      ),
+    )
+  })
+
+  it("refuses an elapsed deadline before the watcher publishes a formal escalation", async () => {
+    await Effect.runPromise(
+      runTest(({ dag, store, db }) =>
+        Effect.gen(function* () {
+          const dagID = yield* createWorkflow(dag, "extend-timeout-elapsed")
+          yield* dag.nodeQueued(dagID, "a", Date.now() - 5000)
+          yield* dag.nodeStarted(dagID, "a", "ses_child_1", Date.now() - 1000, true)
+
+          const before = yield* store.getNode(dagID, "a")
+          const verdict = yield* dag.extendTimeout(dagID, "a", 30_000)
+          expect(verdict).toEqual({ status: "no_escalation" })
+          const after = yield* store.getNode(dagID, "a")
+          expect(after?.status).toBe("running")
+          expect(after?.deadlineMs).toBe(before?.deadlineMs)
+          expect(after?.timeoutExtensions).toBe(0)
+          expect(yield* deadlineExtendedCount(db, dagID, "a")).toBe(0)
+        }),
+      ),
+    )
+  })
+
+  it("Q2 delivery gate: an undelivered escalation is escalation_undelivered, state frozen, no event", async () => {
+    await Effect.runPromise(
+      runTest(({ dag, store, db }) =>
+        Effect.gen(function* () {
+          const dagID = yield* createWorkflow(dag, "extend-timeout-undelivered")
+          yield* dag.nodeQueued(dagID, "a", Date.now() - 1000)
+          yield* dag.nodeStarted(dagID, "a", "ses_child_1", Date.now() - 500, true)
+          yield* dag.nodeTimeoutEscalated(dagID, "a", "ses_child_1", 1)
+          // NOT delivered: escalation_pending ∧ ¬wakeReported.
+
+          const verdict = yield* dag.extendTimeout(dagID, "a", 60_000)
+          expect(verdict).toEqual({ status: "escalation_undelivered" })
+
+          const after = yield* store.getNode(dagID, "a")
+          expect(after?.escalationPending).toBe(true)
+          expect(after?.wakeReported).toBe(false)
+          expect(yield* deadlineExtendedCount(db, dagID, "a")).toBe(0)
+        }),
+      ),
+    )
+  })
+
+  it("refuses a delivered escalation at the workflow cap without moving the deadline", async () => {
+    await Effect.runPromise(
+      runTest(({ dag, store, db }) =>
+        Effect.gen(function* () {
+          const dagID = yield* dag.create({
+            projectID: "project-1",
+            sessionID: "ses_parent",
+            title: "extend-timeout-cap",
+            config: { name: "extend-timeout-cap", max_timeout_extensions: 2, nodes: [node("a")] },
+          })
+          yield* dag.nodeQueued(dagID, "a", Date.now() - 1000)
+          yield* dag.nodeStarted(dagID, "a", "ses_child_1", Date.now() - 500, true)
+          yield* dag.nodeTimeoutEscalated(dagID, "a", "ses_child_1", 1)
+          yield* store.markNodeWakeReported(dagID, "a")
+          expect((yield* dag.extendTimeout(dagID, "a", 30_000)).status).toBe("extended")
+
+          // The second delivered escalation reaches this workflow's cap. The
+          // command must not defer the watcher's terminal verdict by 24 hours.
+          yield* dag.nodeTimeoutEscalated(dagID, "a", "ses_child_1", 2)
+          yield* store.markNodeWakeReported(dagID, "a")
+          const before = yield* store.getNode(dagID, "a")
+          expect(yield* dag.extendTimeout(dagID, "a", 86_400_000)).toEqual({ status: "cap_exhausted" })
+          const after = yield* store.getNode(dagID, "a")
+          expect(after?.deadlineMs).toBe(before?.deadlineMs)
+          expect(after?.timeoutExtensions).toBe(2)
+          expect(after?.escalationPending).toBe(true)
+          expect(yield* dag.nodeExtendTimeout(dagID, "a", Date.now() + 86_400_000)).toBe(-3)
+          expect(yield* deadlineExtendedCount(db, dagID, "a")).toBe(1)
+        }),
+      ),
+    )
+  })
+
+  it("not_running: a terminal node and a missing node both refuse extension, no event", async () => {
+    await Effect.runPromise(
+      runTest(({ dag, db }) =>
+        Effect.gen(function* () {
+          const dagID = yield* createWorkflow(dag, "extend-timeout-terminal")
+          yield* dag.nodeQueued(dagID, "a", Date.now() - 1000)
+          yield* dag.nodeStarted(dagID, "a", "ses_child_1", Date.now() + 60_000, true)
+          yield* dag.nodeCompleted(dagID, "a", "done")
+
+          expect(yield* dag.extendTimeout(dagID, "a", 60_000)).toEqual({ status: "not_running" })
+          expect(yield* dag.extendTimeout(dagID, "does-not-exist", 60_000)).toEqual({ status: "not_running" })
+          expect(yield* deadlineExtendedCount(db, dagID, "a")).toBe(0)
+        }),
+      ),
     )
   })
 })

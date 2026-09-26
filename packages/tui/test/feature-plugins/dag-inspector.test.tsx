@@ -745,6 +745,21 @@ describe("DagInspector", () => {
     }
   })
 
+  test("shows one completed and seven skipped nodes in narrow workflow navigation", async () => {
+    const viewer = await renderDagInspector({
+      width: 70,
+      workflows: [wfSummary({ id: "wf-1", title: "Gated workflow", status: "completed", nodeCount: 8,
+        completedNodes: 1, skippedNodes: 7 })],
+      nodes: [dagNode({ id: "gate", name: "gate", status: "completed" })],
+    })
+    try {
+      await viewer.app.waitForFrame((frame) =>
+        frame.includes("Gated workflow") && frame.includes("8/8") && frame.includes("✓1") && frame.includes("⊘7"))
+    } finally {
+      viewer.app.renderer.destroy()
+    }
+  })
+
   test("lists project workflows when the route has no session context", async () => {
     const viewer = await renderDagInspector({
       initialRoute: { name: "dag" },

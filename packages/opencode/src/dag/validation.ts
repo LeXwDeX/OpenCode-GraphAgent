@@ -42,6 +42,11 @@ export const DIAGNOSTIC_CODES = {
   // Reserved vocabulary from the design: source exclusivity is enforced by the
   // discriminated parameter schema before any diagnostic path runs.
   graphSourceConflict: "graph.source_conflict",
+  // A replan document is missing its required top-level `fragment` envelope. A
+  // dedicated code (not the generic union schemaInvalid) so the parent agent can
+  // recognize the exact mistake and retry deterministically instead of reusing a
+  // wrong conclusion across attempts.
+  replanEnvelopeMissing: "replan.envelope_missing",
   blockCompileFailed: "block.compile_failed",
   dagInvalid: "dag.invalid",
   promptUnboundVariable: "prompt.unbound_variable",
@@ -394,6 +399,37 @@ export function schemaDiagnostics(error: unknown, basePath = ""): Diagnostic[] {
       }),
     ),
   )
+}
+
+/**
+ * Replan envelope guard. A replan document must carry a top-level `fragment`
+ * wrapping the graph. When it is missing, the generic `ReplanSpec` union decode
+ * reports a misleading "blocks graphs need name+objective+blocks / nodes graphs
+ * need name+nodes" error that hides the real mistake — the absent envelope key.
+ * Surface the envelope error directly, with a targeted hint keyed on the
+ * top-level keys that ARE present. An `undefined`/`null` fragment counts as
+ * missing: legacy file normalization rewrites a fragment-less replan doc to
+ * `{ ...originalKeys, fragment: undefined }`, so the key can exist yet be empty.
+ * Returns `undefined` when the envelope is present, letting normal decode run.
+ */
+export function replanEnvelopeDiagnostic(value: unknown): Diagnostic | undefined {
+  if (isRecord(value) && value.fragment != null) return undefined
+  const keys = isRecord(value) ? Object.keys(value) : []
+  const targeted = keys.includes("blocks")
+    ? 'Move "name", "objective", and "blocks" under "fragment".'
+    : keys.includes("config")
+      ? '"config" is the start envelope; replan requires "fragment".'
+      : keys.includes("nodes")
+        ? 'Move "nodes" under "fragment".'
+        : keys.includes("name")
+          ? 'Wrap the graph in a top-level "fragment" key.'
+          : 'Wrap the graph fields in a top-level "fragment" key.'
+  return diagnostic({
+    code: DIAGNOSTIC_CODES.replanEnvelopeMissing,
+    path: "$",
+    message: 'replan file is missing required top-level key "fragment"',
+    hint: `${targeted}\n\nExpected:\n\nfragment:\n  name: workflow-name\n  nodes:\n    - id: node-id\n      ...`,
+  })
 }
 
 // ============================================================================
