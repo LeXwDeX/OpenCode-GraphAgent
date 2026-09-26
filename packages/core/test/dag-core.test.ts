@@ -171,8 +171,8 @@ describe("iron laws (transition tables)", () => {
       // P0-2: QUEUED→QUEUED idempotent re-admission, →PENDING replan reset,
       // →FAILED queue-wait timeout.
       [NodeStatus.QUEUED, [NodeStatus.QUEUED, NodeStatus.RUNNING, NodeStatus.PENDING, NodeStatus.SKIPPED, NodeStatus.FAILED]],
-      [NodeStatus.RUNNING, [NodeStatus.COMPLETED, NodeStatus.FAILED, NodeStatus.PAUSED, NodeStatus.PENDING, NodeStatus.SKIPPED]],
-      [NodeStatus.PAUSED, [NodeStatus.RUNNING, NodeStatus.SKIPPED, NodeStatus.FAILED]],
+      [NodeStatus.RUNNING, [NodeStatus.COMPLETED, NodeStatus.FAILED, NodeStatus.ABORTED, NodeStatus.PAUSED, NodeStatus.PENDING, NodeStatus.SKIPPED]],
+      [NodeStatus.PAUSED, [NodeStatus.RUNNING, NodeStatus.ABORTED, NodeStatus.SKIPPED, NodeStatus.FAILED]],
       [NodeStatus.COMPLETED, []],
       [NodeStatus.FAILED, []],
       [NodeStatus.ABORTED, []],
@@ -802,16 +802,18 @@ describe("WorkflowRuntime skipped semantics (D13)", () => {
 })
 
 describe("toSchedulingNodes mapping", () => {
-  it("keeps skipped distinguishable from satisfied", () => {
+  it("keeps skipped and aborted distinguishable from satisfied", () => {
     const rows = [
       { id: "done", status: "completed", dependsOn: [], required: true },
       { id: "gone", status: "skipped", dependsOn: [], required: true },
+      { id: "aborted", status: "aborted", dependsOn: [], required: true },
       { id: "dead", status: "failed", dependsOn: [], required: true },
       { id: "live", status: "running", dependsOn: [], required: true },
       { id: "wait", status: "queued", dependsOn: [], required: true },
     ]
     expect(toSchedulingNodes(rows).map((n) => n.status)).toEqual([
       "satisfied",
+      "skipped",
       "skipped",
       "unsatisfied",
       "running",

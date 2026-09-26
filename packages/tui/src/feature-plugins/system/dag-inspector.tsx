@@ -286,7 +286,7 @@ function DagInspector(props: { api: TuiPluginApi }) {
     const wf = (sid ? props.api.state.session.dag(sid) : []).find((w) => w.id === wfId) ??
       workflows().find((w) => w.id === wfId)
     if (!wf) return ""
-    return `${wf.nodeCount}:${wf.completedNodes}:${wf.runningNodes}:${wf.failedNodes}:${wf.graphRev}`
+    return `${wf.nodeCount}:${wf.completedNodes}:${wf.runningNodes}:${wf.failedNodes}:${wf.skippedNodes}:${wf.abortedNodes ?? 0}:${wf.graphRev}`
   }
 
   createEffect(() => {

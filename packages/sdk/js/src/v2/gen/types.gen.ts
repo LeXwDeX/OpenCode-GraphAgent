@@ -689,6 +689,7 @@ export type DagWorkflowSummary = {
   runningNodes: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
   failedNodes: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
   skippedNodes: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  abortedNodes?: number
   queuedNodes: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
   escalatedNodes: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
 }
@@ -3005,6 +3006,7 @@ export type DagWorkflowSummary1 = {
   runningNodes: number | "NaN" | "Infinity" | "-Infinity"
   failedNodes: number | "NaN" | "Infinity" | "-Infinity"
   skippedNodes: number | "NaN" | "Infinity" | "-Infinity"
+  abortedNodes?: number
   queuedNodes: number | "NaN" | "Infinity" | "-Infinity"
   escalatedNodes: number | "NaN" | "Infinity" | "-Infinity"
 }

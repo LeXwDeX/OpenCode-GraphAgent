@@ -13,7 +13,7 @@ export interface SchedulingNode {
 }
 
 /** Durable node statuses that count as output-producing success for scheduling. */
-const SATISFIED_TERMINAL = new Set(["completed", "aborted"])
+const SATISFIED_TERMINAL = new Set(["completed"])
 
 /**
  * Map durable read-model node rows into scheduling states. Shared by the live
@@ -34,7 +34,7 @@ export function toSchedulingNodes(
     required: n.required,
     status: SATISFIED_TERMINAL.has(n.status)
       ? ("satisfied" as const)
-      : n.status === "skipped"
+      : n.status === "skipped" || n.status === "aborted"
         ? ("skipped" as const)
         : n.status === "failed"
           ? ("unsatisfied" as const)

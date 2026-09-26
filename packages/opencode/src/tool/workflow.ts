@@ -3,7 +3,7 @@
 
 import { Tool } from "./tool"
 import { CommandPlugin } from "@opencode-ai/core/plugin/command"
-import { Effect, Option, Schema } from "effect"
+import { Cause, Effect, Exit, Option, Schema } from "effect"
 import { Dag } from "@/dag/dag"
 import { DagReviewLifecycle } from "@/dag/review-lifecycle"
 import { DagWorkflows } from "@/dag/workflows"
@@ -88,6 +88,18 @@ const ControlRecover = Schema.Struct({
   expected_graph_rev: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)).annotate({ description: "Exact graph_rev from workflow status; stale recovery requests are rejected" }),
   resume_cancelled: Schema.optional(Schema.Boolean).annotate({ description: "Set true only for an explicitly requested recovery of a cancelled workflow" }),
 })
+const ControlExtendTimeout = Schema.Struct({
+  action: Schema.Literal("control"),
+  operation: Schema.Literal("extend_timeout").annotate({
+    description:
+      "Grant a RUNNING (typically timeout-escalated) node more execution time without a replan — no graph rewrite, no agent restart, no replan attempt consumed. Refused for a healthy node whose deadline has not elapsed (keeps the escalation cap meaningful) and for an escalation not yet delivered to you.",
+  }),
+  workflow_id: Dag.ID.annotate({ description: "Target workflow ID" }),
+  node_id: Dag.NodeID.annotate({ description: "Running node whose deadline to extend" }),
+  timeout_ms: Schema.Int.check(Schema.isBetween({ minimum: 1_000, maximum: 86_400_000 })).annotate({
+    description: "Fresh execution timeout in milliseconds applied from now (same semantics as worker_config.timeout_ms); min 1s, max 24h per extension",
+  }),
+})
 const Status = Schema.Struct({
   action: Schema.Literal("status").annotate({ description: "Inspect durable workflow and node state" }),
   workflow_id: Dag.ID.annotate({ description: "Target workflow ID" }),
@@ -148,6 +160,7 @@ const ActionParams = Schema.Union([
   ControlReplanPath,
   ControlOther,
   ControlRecover,
+  ControlExtendTimeout,
   Status,
   Result,
   List,
@@ -204,14 +217,58 @@ export const WorkflowTool = Tool.define<
       return workflow
     })
 
-    const rejectDiagnostics = (diagnostics: Diagnostic[], context: string) =>
-      Effect.die(
-        new Error(
-          `${context} rejected by workflow validation:\n${diagnostics
-            .map((d) => `- [${d.code}] ${d.path}: ${d.message}${d.hint ? ` (${d.hint})` : ""}`)
-            .join("\n")}\n${WORKFLOW_RECOVERY.instruction}`,
-        ),
-      )
+    const parkRejectedWorkflow = (workflowID: Dag.ID) => Effect.gen(function* () {
+      const pauseExit = yield* dag.pause(workflowID).pipe(Effect.exit)
+      if (Exit.isFailure(pauseExit) && Cause.hasInterrupts(pauseExit.cause))
+        return yield* Effect.interrupt
+      if (Exit.isSuccess(pauseExit))
+        return "Workflow state: paused (durably parked). A corrected mutation can resume it."
+      const readExit = yield* dag.store.getWorkflow(workflowID).pipe(Effect.exit)
+      if (Exit.isFailure(readExit) && Cause.hasInterrupts(readExit.cause))
+        return yield* Effect.interrupt
+      const actualStatus = Exit.isSuccess(readExit) ? readExit.value?.status ?? "missing" : "unknown"
+      return actualStatus === "paused"
+        ? "Workflow state: paused (already parked). A corrected mutation can resume it."
+        : `Workflow state: ${actualStatus}. Automatic pause failed; inspect workflow status before retrying or waiting. Pause failure: ${String(Cause.squash(pauseExit.cause))}`
+    })
+
+    const runRecoverableMutation = <A>(workflowID: Dag.ID, mutation: Effect.Effect<A, Error>) =>
+      mutation.pipe(Effect.catchCause((cause) =>
+        Cause.hasInterrupts(cause)
+          ? Effect.failCause(cause)
+          : Effect.gen(function* () {
+              const workflowState = yield* parkRejectedWorkflow(workflowID)
+              return yield* Effect.die(new Error(`${String(Cause.squash(cause))}\n${workflowState}\n${WORKFLOW_RECOVERY.instruction}`))
+            }),
+      ))
+
+    const rejectDiagnostics = (diagnostics: Diagnostic[], context: string, parkWorkflowID?: Dag.ID) => {
+      // P1-F: a missing replan envelope is a deterministic, self-correcting
+      // mistake. Emit a machine-readable retry signal alongside the prose so the
+      // parent keys its next attempt off a stable error_code instead of reusing
+      // a wrong conclusion or re-guessing the YAML shape.
+      const structured = diagnostics.some((d) => d.code === DagValidation.DIAGNOSTIC_CODES.replanEnvelopeMissing)
+        ? `\nStructured retry signal (fix these fields exactly; do not re-guess the format): ${JSON.stringify({
+            error_code: "replan_envelope_missing",
+            diagnostic_code: DagValidation.DIAGNOSTIC_CODES.replanEnvelopeMissing,
+            retryable: true,
+            required_root_key: "fragment",
+          })}`
+        : ""
+      return Effect.gen(function* () {
+        // A rejected mutation parks a live workflow durably. When the pause
+        // fails, read back the actual state instead of claiming it is parked:
+        // a terminal race or a storage defect needs a different recovery path.
+        const workflowState = parkWorkflowID ? yield* parkRejectedWorkflow(parkWorkflowID) : ""
+        return yield* Effect.die(
+          new Error(
+            `${context} rejected by workflow validation:\n${diagnostics
+              .map((d) => `- [${d.code}] ${d.path}: ${d.message}${d.hint ? ` (${d.hint})` : ""}`)
+              .join("\n")}${structured}${workflowState ? `\n${workflowState}` : ""}\n${WORKFLOW_RECOVERY.instruction}`,
+          ),
+        )
+      })
+    }
 
     const authoring = WorkflowAuthoring.make({
       loadEnvironment: DagEnvironmentCatalogs.makeCatalogLoader(agents, provider),
@@ -657,10 +714,13 @@ export const WorkflowTool = Tool.define<
                 known_dependencies: knownDependencies,
                 node_defaults: workflowDefaults,
               })
-              if (!result.valid || !result.prepared) return yield* rejectDiagnostics(result.errors, "Workflow extend")
-              const r = yield* withTerminalRecovery(
-                dag.extend(params.workflow_id, result.prepared.nodes),
-                "Terminal workflows are immutable except for the additive-extend reopen, which requires the workflow to have completed naturally at a wake-eligible reporting checkpoint (fragment adds new node ids; no early control(complete); no executed node beyond the checkpoint — condition-skipped dependents are fine). For failed workflows, use control(recover) with node_ids and expected_graph_rev from status. Cancelled workflows additionally require explicit resume_cancelled: true.",
+              if (!result.valid || !result.prepared) return yield* rejectDiagnostics(result.errors, "Workflow extend", params.workflow_id)
+              const r = yield* runRecoverableMutation(
+                params.workflow_id,
+                withTerminalRecovery(
+                  dag.extend(params.workflow_id, result.prepared.nodes),
+                  "Terminal workflows are immutable except for the additive-extend reopen, which requires the workflow to have completed naturally at a wake-eligible reporting checkpoint (fragment adds new node ids; no early control(complete); no executed node beyond the checkpoint — condition-skipped dependents are fine). For failed workflows, use control(recover) with node_ids and expected_graph_rev from status. Cancelled workflows additionally require explicit resume_cancelled: true.",
+                ),
               ).pipe(Effect.orDie)
               // #381: extend shares replan's resume contract — a paused
               // workflow must resume for the added nodes to ever run (pause
@@ -731,13 +791,16 @@ export const WorkflowTool = Tool.define<
                   known_dependencies: knownDependencies,
                   node_defaults: workflowDefaults,
                 })
-                if (!result.valid || !result.prepared) return yield* rejectDiagnostics(result.errors, "Workflow replan")
+                if (!result.valid || !result.prepared) return yield* rejectDiagnostics(result.errors, "Workflow replan", wfId)
                 // The graph raced to terminal while the fragment was being
                 // composed (the pause-first protocol was skipped). Surface
                 // the recovery options instead of a bare iron-law rejection.
-                const r = yield* withTerminalRecovery(
-                  dag.replan(wfId, { nodes: result.prepared.nodes }),
-                  "The workflow reached a terminal status before the replan arrived. For a local retry of failed work, use control(recover) with current node_ids and expected_graph_rev; cancelled work also requires explicit resume_cancelled: true. Additive extend remains available after a qualifying naturally completed checkpoint. Pause live scheduling before composing a changed graph.",
+                const r = yield* runRecoverableMutation(
+                  wfId,
+                  withTerminalRecovery(
+                    dag.replan(wfId, { nodes: result.prepared.nodes }),
+                    "The workflow reached a terminal status before the replan arrived. For a local retry of failed work, use control(recover) with current node_ids and expected_graph_rev; cancelled work also requires explicit resume_cancelled: true. Additive extend remains available after a qualifying naturally completed checkpoint. Pause live scheduling before composing a changed graph.",
+                  ),
                 ).pipe(Effect.orDie)
                 // A paused workflow (explicit pause-first protocol, or the
                 // runtime's gate pause after a checkpoint replan verdict) must
@@ -771,6 +834,16 @@ export const WorkflowTool = Tool.define<
                   title: `Workflow replanned: +${r.add.length} -${r.cancel.length} ↻${r.restart.length}`,
                   output: `<workflow id="${wfId}" action="replan">\nAdded: ${r.add.join(", ")}\nCancelled: ${r.cancel.join(", ")}\nRestarted: ${r.restart.join(", ")}\nReplaced: ${r.replace.join(", ")}${ignored}${pauseNote}\n</workflow>`,
                   metadata: { workflowId: wfId, ...r } as Metadata,
+                }
+              }
+              if (params.operation === "extend_timeout") {
+                const verdict = yield* dag.extendTimeout(wfId, params.node_id, params.timeout_ms).pipe(Effect.orDie)
+                const copy = EXTEND_TIMEOUT_COPY[verdict.status]
+                const detail = verdict.status === "extended" ? ` deadline_ms="${verdict.deadlineMs}"` : ""
+                return {
+                  title: `${copy.title}: ${params.node_id}`,
+                  output: `<workflow id="${wfId}" action="extend_timeout" node="${params.node_id}" status="${verdict.status}"${detail}/>\n${copy.body}`,
+                  metadata: { workflowId: wfId, nodeId: params.node_id } as Metadata,
                 }
               }
               switch (params.operation) {
@@ -856,7 +929,32 @@ function validationOutput(result: DagValidation.ValidationResult) {
 const WORKFLOW_RECOVERY = {
   max_attempts: 2,
   instruction:
-    "Diagnose the reported cause and attempt only authorized, reversible recovery. Each retry requires a relevant change; never retry unchanged input or bypass validation, permissions, or model constraints. If no safe recovery exists or two attempts fail, stop and tell the user the cause, recovery attempted, actual workflow state, and available choices. Wait for their decision; never silently end or claim the workflow ran.",
+    "Diagnose the reported cause and attempt only authorized, reversible recovery. Each retry requires a relevant change; never retry unchanged input or bypass validation, permissions, or model constraints. A rejected replan/extend does not itself fail or cancel the workflow; inspect the reported actual state. If it was durably parked paused, a corrected mutation can resume it. If pause failed and it remains running, explicitly pause or settle it before ending the turn to avoid orchestrator_unresponsive. If it is terminal, use the applicable terminal recovery path. If no safe recovery exists or two attempts fail, stop and tell the user the cause, recovery attempted, actual workflow state, and available choices, then wait for their decision. Never cancel the whole graph just to avoid an unresponsive verdict, and never claim the workflow ran without evidence.",
+}
+
+// P0-A parent-facing copy for each extend_timeout verdict. Static data (not
+// per-verdict branches) so the dispatch stays a single covered path.
+const EXTEND_TIMEOUT_COPY: Record<Dag.ExtendTimeoutVerdict["status"], { title: string; body: string }> = {
+  extended: {
+    title: "Node deadline extended",
+    body: "The node keeps running under its existing child session and attempt; the deadline watcher picks up the new deadline on its next read. The cumulative timeout-extension count and replan attempts are unchanged, and no graph was rewritten.",
+  },
+  no_escalation: {
+    title: "No timeout escalation awaiting adjudication",
+    body: "A passed deadline alone does not authorize an extension. Wait for the formal timeout escalation to be delivered; to change the budget before escalation, replan with a new worker_config.timeout_ms.",
+  },
+  escalation_undelivered: {
+    title: "Escalation not yet delivered",
+    body: "The node's timeout escalation has not been delivered to you yet; adjudication must follow delivery. The node is still running and will re-escalate — retry the extension once you receive the timeout wake.",
+  },
+  cap_exhausted: {
+    title: "Timeout extension cap exhausted",
+    body: "The workflow's cumulative timeout-escalation cap has been reached. No new deadline was written; the watcher remains responsible for the running node's timeout verdict. Inspect workflow status before choosing a different recovery action.",
+  },
+  not_running: {
+    title: "Node not running",
+    body: "Only a RUNNING node can be extended; this node is pending, queued, missing, or already terminal. Check workflow status before extending.",
+  },
 }
 
 function blockedMetadata(diagnostics: Diagnostic[]): Metadata {

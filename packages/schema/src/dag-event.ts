@@ -291,6 +291,19 @@ export const NodeSkipped = Event.define({
 })
 export type NodeSkipped = typeof NodeSkipped.Type
 
+/** A node with an execution attempt was stopped by a workflow-level control.
+ * Legacy rows terminated before this event existed remain `skipped`. */
+export const NodeAborted = Event.define({
+  type: "dag.node.aborted",
+  ...options,
+  schema: {
+    ...Base,
+    nodeID: NodeID,
+    reason: Schema.Literals(["agent_complete", "workflow_cancelled", "workflow_failed"]),
+  },
+})
+export type NodeAborted = typeof NodeAborted.Type
+
 export const NodeCancelled = Event.define({
   type: "dag.node.cancelled",
   ...options,
@@ -368,6 +381,7 @@ export const DurableDefinitions = Event.inventory(
   NodeCompleted,
   NodeFailed,
   NodeSkipped,
+  NodeAborted,
   NodeCancelled,
   NodeRestarted,
   NodeTimeoutEscalated,

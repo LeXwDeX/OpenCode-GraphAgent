@@ -202,7 +202,10 @@ export function makeDeadlineWatcher(
         continue
       }
       if (deadline === null || deadline > now) {
-        yield* Effect.sleep(sleepUntilDeadlineMs(deadline, now, 10))
+        // A replan can replace a long deadline with a shorter one while this
+        // watcher sleeps. Bound the sleep so the durable row is re-read soon
+        // enough to enforce the new deadline without forking another watcher.
+        yield* Effect.sleep(Math.min(sleepUntilDeadlineMs(deadline, now, 10), 1_000))
         continue
       }
       const extensions = node.timeoutExtensions

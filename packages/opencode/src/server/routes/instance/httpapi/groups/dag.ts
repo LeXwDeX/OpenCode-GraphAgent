@@ -3,6 +3,7 @@
 
 import { Schema } from "effect"
 import { HttpApi, HttpApiEndpoint, HttpApiGroup, OpenApi } from "effect/unstable/httpapi"
+import { DagSummary } from "@opencode-ai/schema/dag-summary"
 import { Authorization } from "../middleware/authorization"
 import { InstanceContextMiddleware } from "../middleware/instance-context"
 import { WorkspaceRoutingMiddleware, WorkspaceRoutingQuery } from "../middleware/workspace-routing"
@@ -57,20 +58,8 @@ export const NodeResponse = Schema.Struct({
 export const DagListResponse = Schema.Array(WorkflowResponse)
 export const DagNodeListResponse = Schema.Array(NodeResponse)
 
-export const WorkflowSummaryResponse = Schema.Struct({
-  id: Schema.String,
-  title: Schema.String,
-  status: Schema.String,
-  // Topology invalidation token (#468): bumped by replan, so TUI refresh signatures can detect equal-count replans.
-  graphRev: Schema.Number,
-  nodeCount: Schema.Number,
-  completedNodes: Schema.Number,
-  runningNodes: Schema.Number,
-  failedNodes: Schema.Number,
-  skippedNodes: Schema.Number,
-  queuedNodes: Schema.Number,
-  escalatedNodes: Schema.Number,
-}).annotate({ identifier: "Dag.WorkflowSummary" })
+// Reuse the event/TUI contract so HTTP and push summaries cannot drift.
+export const WorkflowSummaryResponse = DagSummary.WorkflowSummary
 
 export const DagSummaryListResponse = Schema.Array(WorkflowSummaryResponse)
 
