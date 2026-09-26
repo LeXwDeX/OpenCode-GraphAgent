@@ -549,7 +549,7 @@ Use the root-level `question_timeout` option to choose how many seconds OpenCode
 }
 ```
 
-The value must be a positive integer. Selecting an option or focusing the custom answer input cancels the timeout for the entire request. Moving between options or question tabs does not cancel it. If the timeout expires, OpenCode tells the agent that you are temporarily away so it can analyze the choices and continue within the task's existing authorization.
+The value must be a positive integer. Selecting an option or focusing the custom answer input starts a response phase. Each interaction refreshes an inactivity timer of `question_timeout` seconds, with a five-minute maximum response phase. Moving between options or question tabs alone does not start that phase. If either timer expires, OpenCode tells the agent that you are temporarily away. It offers the first option marked "(Recommended)" as a fallback candidate, or the first option if none is marked. Even when several options are marked or multiple selections are allowed, it offers only one candidate. The agent may use that choice only when already authorized and safe. Silence never authorizes new scope or irreversible action. If no safe choice exists, the agent defers that step, continues independent authorized work, and reports the blocker. Dismissing a question also defers its dependent step and tells the agent not to ask the same question again in that turn.
 
 ---
 

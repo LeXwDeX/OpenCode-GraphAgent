@@ -40,9 +40,12 @@ import {
   questionTabs,
   questionTotal,
 } from "./question.shared"
+
 import { footerWidthPolicy } from "./footer.width"
 import type { RunFooterTheme } from "./theme"
 import type { QuestionReject, QuestionReply } from "./types"
+
+const INTERACTION_HEARTBEAT_MILLIS = 250
 
 export function RunQuestionBody(props: {
   request: QuestionRequest
@@ -84,6 +87,8 @@ export function RunQuestionBody(props: {
   })
   let area: TextareaRenderable | undefined
   let countdownTimer: ReturnType<typeof setInterval> | undefined
+  let lastInteractionSentAt = 0
+  let interactionInFlight = false
 
   const stopCountdown = () => {
     if (countdownTimer !== undefined) clearInterval(countdownTimer)
@@ -111,28 +116,40 @@ export function RunQuestionBody(props: {
   const interact = async () => {
     const id = props.request.id
     const current = interaction()
-    if (current.requestID === id && current.status !== "idle") return
-    setInteraction({ requestID: id, status: "interacting" })
+    if (interactionInFlight || Date.now() - lastInteractionSentAt < INTERACTION_HEARTBEAT_MILLIS) return
+    interactionInFlight = true
+    if (current.status === "idle") setInteraction({ requestID: id, status: "interacting" })
     try {
       await props.onInteract({ requestID: id })
       if (props.request.id !== id) return
       setInteraction({ requestID: id, status: "interacted" })
+      lastInteractionSentAt = Date.now()
       stopCountdown()
     } catch (error) {
       if (props.request.id !== id) return
       if (notFound(error)) {
         setInteraction({ requestID: id, status: "interacted" })
+        lastInteractionSentAt = Date.now()
         stopCountdown()
         return
       }
-      setInteraction({ requestID: id, status: "idle", error: message(error) })
+      setInteraction({
+        requestID: id,
+        status: current.status === "interacted" ? "interacted" : "idle",
+        error: message(error),
+      })
+    } finally {
+      interactionInFlight = false
     }
   }
 
   createEffect(() => {
     const id = props.request.id
     setState((prev) => questionSync(prev, id))
-    if (interaction().requestID !== id) setInteraction({ requestID: id, status: "idle" })
+    if (interaction().requestID !== id) {
+      lastInteractionSentAt = 0
+      setInteraction({ requestID: id, status: "idle" })
+    }
   })
 
   createEffect(() => {
@@ -153,6 +170,7 @@ export function RunQuestionBody(props: {
   })
 
   const setTab = (tab: number) => {
+    if (interaction().status === "interacted") void interact()
     setState((prev) => questionSetTab(prev, tab))
   }
 
@@ -569,6 +587,7 @@ export function RunQuestionBody(props: {
 
                               const text = area.plainText
                               setState((prev) => questionStoreCustom(prev, prev.tab, text))
+                              void interact()
                             }}
                             ref={(item) => {
                               area = item

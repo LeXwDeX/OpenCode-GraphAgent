@@ -48,6 +48,24 @@ const timeoutIt = testEffect(
   ),
 )
 
+const rejectedIt = testEffect(
+  Layer.mergeAll(
+    Layer.succeed(
+      Question.Service,
+      Question.Service.of({
+        ask: () => Effect.fail(new Question.RejectedError()),
+        reply: () => Effect.die("unused"),
+        reject: () => Effect.die("unused"),
+        interact: () => Effect.die("unused"),
+        list: () => Effect.die("unused"),
+      }),
+    ),
+    CrossSpawnSpawner.defaultLayer,
+    Truncate.defaultLayer,
+    Agent.defaultLayer,
+  ),
+)
+
 const pending = Effect.fn("QuestionToolTest.pending")(function* (question: Question.Interface) {
   const events = yield* EventV2Bridge.Service
   const asked = yield* Queue.unbounded<void>()
@@ -66,6 +84,20 @@ const pending = Effect.fn("QuestionToolTest.pending")(function* (question: Quest
 })
 
 describe("tool.question", () => {
+  rejectedIt.instance(
+    "reports dismissal to the model without treating it as consent",
+    () =>
+      Effect.gen(function* () {
+        const tool = yield* (yield* QuestionTool).init()
+        const result = yield* tool.execute({ questions: [] }, ctx)
+        expect(result.title).toBe("Question dismissed")
+        expect(result.output).toContain("Do not repeat this question")
+        expect(result.output).toContain("without answering")
+        expect(result.metadata).toMatchObject({ answers: [] })
+      }),
+    { git: true },
+  )
+
   timeoutIt.instance(
     "reports timeout without fabricating a user answer",
     () =>
@@ -83,12 +115,10 @@ describe("tool.question", () => {
           },
           ctx,
         )
-        expect(result).toMatchObject({
-          title: "Question timed out",
-          output:
-            "The user is temporarily away. Analyze the available options, select the most appropriate answer yourself, and continue within the existing task authorization. Do not claim that the user selected an answer.",
-          metadata: { answers: [] },
-        })
+        expect(result.title).toBe("Question timed out")
+        expect(result.output).toContain('fallback candidate: "Continue"')
+        expect(result.output).toContain("silence never grants new scope")
+        expect(result.metadata).toMatchObject({ answers: [] })
       }),
     { git: true },
   )
