@@ -1,5 +1,5 @@
 import type { DynamicResolution } from "../../config/compaction"
-import type { ContextFoldingProjectionPlan, FoldPlan } from "./types"
+import type { CandidateSkipReason, ContextFoldingProjectionPlan, FoldPlan } from "./types"
 import { ContextFoldingPolicy } from "./policy"
 
 export type ContextFoldingRuntime = "opencode-ai-sdk" | "opencode-native" | "core-runner"
@@ -7,6 +7,31 @@ export type ContextFoldingPurpose = "conversation" | "compaction" | "auxiliary" 
 
 type UnknownNumber = number | "unknown"
 type UnknownBoolean = boolean | "unknown"
+type ExclusionCounts = Readonly<Record<CandidateSkipReason, number>>
+
+const emptyExclusionCounts = (): Record<CandidateSkipReason, number> => ({
+  attachments: 0,
+  "incomplete-content": 0,
+  "instruction-content": 0,
+  "invalid-provenance": 0,
+  "normalization-failed": 0,
+  "provider-executed": 0,
+  "unknown-content": 0,
+  "unknown-read-target": 0,
+  unsuccessful: 0,
+  "unsupported-tool": 0,
+  "untrusted-source": 0,
+})
+
+const exclusionCounts = (plan: FoldPlan | undefined): ExclusionCounts | "unknown" => {
+  if (!plan) return "unknown"
+  const counts = emptyExclusionCounts()
+  for (const exclusion of plan.exclusions) {
+    // Only the fixed reason vocabulary can enter logs, even if a caller supplies a malformed plan.
+    if (Object.hasOwn(counts, exclusion.reason)) counts[exclusion.reason]++
+  }
+  return counts
+}
 
 export type ContextFoldingDiagnostic = Readonly<{
   policyVersion: typeof ContextFoldingPolicy.version
@@ -20,6 +45,8 @@ export type ContextFoldingDiagnostic = Readonly<{
   duplicateGroups: UnknownNumber
   foldedOutputs: number
   excludedOutputs: UnknownNumber
+  excludedByReason: ExclusionCounts | "unknown"
+  protectedSteps: UnknownNumber
   estimatedBefore: UnknownNumber
   estimatedAfter: UnknownNumber
   estimatedSavings: UnknownNumber
@@ -65,6 +92,8 @@ export function contextFoldingDiagnostic(input: {
     duplicateGroups: witnesses ?? "unknown",
     foldedOutputs: input.projectionPlan?.replacements.length ?? 0,
     excludedOutputs: input.duplicatePlan?.exclusions.length ?? "unknown",
+    excludedByReason: exclusionCounts(input.duplicatePlan),
+    protectedSteps: numberOrUnknown(input.duplicatePlan?.protectedStepIDs.length),
     estimatedBefore: numberOrUnknown(before),
     estimatedAfter: numberOrUnknown(after),
     estimatedSavings: before === undefined || after === undefined ? "unknown" : Math.max(0, before - after),

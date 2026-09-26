@@ -6,7 +6,37 @@ import { SessionV1 } from "@opencode-ai/core/v1/session"
 import os from "os"
 import { SessionID, MessageID, PartID } from "./schema"
 import { MessageV2 } from "./message-v2"
+import { Token } from "@/util/token"
+import { measured } from "./overflow"
 import { SessionRevert } from "./revert"
+
+function pendingUniqueToolOutputTokens(messages: SessionV1.WithParts[], messageIndex: number) {
+  const current = messages[messageIndex]
+  if (!current || current.info.role !== "assistant") return 0
+
+  const previous = new Set<string>()
+  for (const message of messages.slice(0, messageIndex)) {
+    for (const part of message.parts) {
+      if (part.type !== "tool") continue
+      if (part.state.status === "completed") previous.add(part.state.output)
+      if (part.state.status === "error") previous.add(part.state.error)
+    }
+  }
+
+  const pending = new Set<string>()
+  for (const part of current.parts) {
+    if (part.type !== "tool") continue
+    const content =
+      part.state.status === "completed" && part.state.time.compacted === undefined
+        ? part.state.output
+        : part.state.status === "error"
+          ? part.state.error
+          : undefined
+    if (!content || previous.has(content)) continue
+    pending.add(content)
+  }
+  return [...pending].reduce((total, content) => total + Token.estimate(content), 0)
+}
 import { SHELL_ABORT_NOTE } from "../tool/shell"
 import { Session } from "./session"
 import { Agent } from "../agent/agent"
@@ -1767,6 +1797,10 @@ export const layer = Layer.effect(
         // finished-check alone misses blocked turns whose finish is "tool-calls",
         // so this flag forces the exit path (and its Stop hook) to fire.
         let turnStopped = false
+        let nextAutoCompactionMinimum: number | undefined
+        let autoCompactionPending = false
+        let awaitingPostCompactionUsage = false
+        let consecutiveAutoCompactions = 0
         const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
         // Capture the lastAssistant helper before the loop's destructured `lastAssistant`
         // (the latest assistant info) shadows it inside the step body.
@@ -1931,13 +1965,74 @@ export const layer = Layer.effect(
             continue
           }
 
-          if (
-            lastFinished &&
-            lastFinished.summary !== true &&
-            (yield* compaction.isOverflow({ tokens: lastFinished.tokens, model }))
-          ) {
-            yield* compaction.create({ sessionID, agent: lastUser.agent, model: lastUser.model, auto: true })
-            continue
+          if (lastFinished) {
+            const switchedModel = lastFinished.providerID !== model.providerID || lastFinished.modelID !== model.id
+            const observedTokens = lastFinished.summary === true || switchedModel ? 0 : measured(lastFinished.tokens)
+            const lastFinishedIndex = msgs.findIndex((message) => message.info.id === lastFinished.id)
+            const newUsers =
+              lastFinishedIndex < 0
+                ? []
+                : msgs.slice(lastFinishedIndex + 1).filter((message) => message.info.role === "user")
+            // Same-model usage already reflects the prior prepared request, including folding. Count only new user
+            // text so duplicate tool output can still be folded before full compaction. On a model switch, estimate
+            // the active projected history. Media is stripped before either estimate and never logged.
+            const estimateMessages = switchedModel || lastFinished.summary === true ? msgs : newUsers
+            const estimatedTextTokens = estimateMessages.length
+              ? Token.estimate(
+                  JSON.stringify(yield* MessageV2.toModelMessagesEffect(estimateMessages, model, { stripMedia: true })),
+                )
+              : 0
+            // Provider usage covers the request that produced lastFinished, but not tool results that completed
+            // afterward. Count each newly unique text result once; exact repeats remain available to context folding.
+            const pendingToolOutputTokens =
+              switchedModel || lastFinished.summary === true
+                ? 0
+                : pendingUniqueToolOutputTokens(msgs, lastFinishedIndex)
+            const estimatedInputTokens =
+              switchedModel || lastFinished.summary === true
+                ? estimatedTextTokens
+                : observedTokens + estimatedTextTokens + pendingToolOutputTokens
+            if (lastFinished.summary === true && autoCompactionPending) {
+              autoCompactionPending = false
+              awaitingPostCompactionUsage = true
+            }
+            const effectiveTokens = Math.max(observedTokens, estimatedInputTokens)
+            const afterCompaction = lastFinished.summary !== true && awaitingPostCompactionUsage
+            if (afterCompaction) {
+              nextAutoCompactionMinimum = effectiveTokens + 25_000
+              awaitingPostCompactionUsage = false
+            }
+            const enoughNewContext =
+              nextAutoCompactionMinimum === undefined || effectiveTokens >= nextAutoCompactionMinimum
+            const tokens =
+              lastFinished.summary === true || switchedModel
+                ? { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } }
+                : lastFinished.tokens
+            const hardOverflow = yield* compaction.isOverflow({
+              tokens,
+              model,
+              estimatedInputTokens,
+              threshold: "model",
+            })
+            if (afterCompaction && !hardOverflow) consecutiveAutoCompactions = 0
+            const proactiveOverflow =
+              !hardOverflow &&
+              lastFinished.summary !== true &&
+              enoughNewContext &&
+              (yield* compaction.isOverflow({ tokens, model, estimatedInputTokens, threshold: "auto" }))
+            if (hardOverflow || proactiveOverflow) {
+              if (consecutiveAutoCompactions >= 3) {
+                const error = new SessionV1.ContextOverflowError({
+                  message: "Context still exceeds the model limit after repeated automatic compaction",
+                })
+                yield* events.publish(Session.Event.Error, { sessionID, error: error.toObject() })
+                throw error
+              }
+              consecutiveAutoCompactions++
+              autoCompactionPending = true
+              yield* compaction.create({ sessionID, agent: lastUser.agent, model: lastUser.model, auto: true })
+              continue
+            }
           }
 
           const agent = yield* agents.get(lastUser.agent)
