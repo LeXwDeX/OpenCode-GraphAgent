@@ -617,6 +617,46 @@ exports[`tool parameters JSON Schema (wire shape) workflow 1`] = `
         {
           "properties": {
             "action": {
+              "enum": [
+                "control",
+              ],
+              "type": "string",
+            },
+            "node_id": {
+              "description": "Running node whose deadline to extend",
+              "type": "string",
+            },
+            "operation": {
+              "description": "Grant a RUNNING (typically timeout-escalated) node more execution time without a replan — no graph rewrite, no agent restart, no replan attempt consumed. Refused for a healthy node whose deadline has not elapsed (keeps the escalation cap meaningful) and for an escalation not yet delivered to you.",
+              "enum": [
+                "extend_timeout",
+              ],
+              "type": "string",
+            },
+            "timeout_ms": {
+              "description": "Fresh execution timeout in milliseconds applied from now (same semantics as worker_config.timeout_ms); min 1s, max 24h per extension",
+              "maximum": 86400000,
+              "minimum": 1000,
+              "type": "integer",
+            },
+            "workflow_id": {
+              "description": "Target workflow ID",
+              "pattern": "^dag.*$",
+              "type": "string",
+            },
+          },
+          "required": [
+            "action",
+            "operation",
+            "workflow_id",
+            "node_id",
+            "timeout_ms",
+          ],
+          "type": "object",
+        },
+        {
+          "properties": {
+            "action": {
               "description": "Inspect durable workflow and node state",
               "enum": [
                 "status",
