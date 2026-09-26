@@ -1,5 +1,5 @@
 import { describe, expect } from "bun:test"
-import { Effect, Exit, Fiber, Layer } from "effect"
+import { Effect, Layer } from "effect"
 import { PermissionV2 } from "@opencode-ai/core/permission"
 import { QuestionV2 } from "@opencode-ai/core/question"
 import { SessionV2 } from "@opencode-ai/core/session"
@@ -48,9 +48,29 @@ const it = testEffect(Layer.mergeAll(permission, registry, question, tool))
 describe("QuestionTool", () => {
   it.effect("reports timeout without fabricating a user answer", () =>
     Effect.sync(() => {
-      expect(QuestionTool.toModelOutput([], [], true)).toBe(
-        "The user is temporarily away. Analyze the available options, select the most appropriate answer yourself, and continue within the existing task authorization. Do not claim that the user selected an answer.",
+      const output = QuestionTool.toModelOutput(
+        [
+          {
+            question: "Choose",
+            header: "Choice",
+            options: [
+              { label: "First (Recommended)", description: "First" },
+              { label: "Second (Recommended)", description: "Second" },
+            ],
+            multiple: true,
+          },
+        ],
+        [],
+        true,
       )
+      expect(output).toContain('Question 1 fallback candidate: "First (Recommended)" (single selection only).')
+      expect(output).not.toContain('fallback candidate: "Second (Recommended)"')
+      expect(output).toContain("silence never grants new scope")
+      expect(output).not.toContain("User has answered your questions")
+      expect(QuestionTool.toModelOutput([{ question: "Free form", header: "Free", options: [] }], [], true)).toContain(
+        "Question 1 has no option fallback candidate",
+      )
+      expect(QuestionTool.toModelOutput([], [], false, true)).toContain("Do not repeat this question")
     }),
   )
 
@@ -145,20 +165,19 @@ describe("QuestionTool", () => {
     }),
   )
 
-  it.effect("keeps dismissed questions out of model-facing output", () =>
+  it.effect("returns dismissed-question guidance without fabricating an answer", () =>
     Effect.gen(function* () {
       captured = undefined
       reject = true
       deny = false
       const registryService = yield* ToolRegistry.Service
-      const fiber = yield* executeTool(registryService, {
+      const result = yield* settleTool(registryService, {
         sessionID,
         ...toolIdentity,
         call: { type: "tool-call", id: "call-question", name: "question", input: { questions: [] } },
-      }).pipe(Effect.forkScoped)
-
-      const exit = yield* Fiber.await(fiber)
-      expect(Exit.isFailure(exit)).toBe(true)
+      })
+      expect(JSON.stringify(result)).toContain("Do not repeat this question")
+      expect(JSON.stringify(result)).not.toContain("User has answered")
     }),
   )
 })

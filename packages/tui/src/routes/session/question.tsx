@@ -11,6 +11,7 @@ import { useBindings, useOpencodeModeStack } from "../../keymap"
 import { useToast } from "../../ui/toast"
 
 const QUESTION_MODE = "question"
+const INTERACTION_HEARTBEAT_MILLIS = 250
 
 function truncateWidth(str: string, max: number) {
   if (Bun.stringWidth(str) <= max) return str
@@ -54,6 +55,7 @@ export function QuestionPrompt(props: { request: QuestionRequest; directory?: st
   let textarea: TextareaRenderable | undefined
   let requestID = props.request.id
   let interactedRequest: string | undefined
+  let lastInteractionSentAt = 0
   let countdownTimer: ReturnType<typeof setInterval> | undefined
 
   const question = createMemo(() => questions()[store.tab])
@@ -95,7 +97,7 @@ export function QuestionPrompt(props: { request: QuestionRequest; directory?: st
 
   async function interact() {
     const id = props.request.id
-    if (interactedRequest === id || store.interacting) return
+    if (store.interacting || Date.now() - lastInteractionSentAt < INTERACTION_HEARTBEAT_MILLIS) return
     setStore("interacting", true)
     try {
       const result = await sdk.client.question.interact({
@@ -108,11 +110,13 @@ export function QuestionPrompt(props: { request: QuestionRequest; directory?: st
         return
       }
       interactedRequest = id
+      lastInteractionSentAt = Date.now()
       stopCountdown()
     } catch (error) {
       if (props.request.id !== id) return
       if (notFound(error)) {
         interactedRequest = id
+        lastInteractionSentAt = Date.now()
         stopCountdown()
         return
       }
@@ -127,6 +131,7 @@ export function QuestionPrompt(props: { request: QuestionRequest; directory?: st
     if (requestID === id) return
     requestID = id
     interactedRequest = undefined
+    lastInteractionSentAt = 0
     setStore({
       tab: 0,
       answers: [],
@@ -207,6 +212,7 @@ export function QuestionPrompt(props: { request: QuestionRequest; directory?: st
   }
 
   function selectTab(index: number) {
+    if (interactedRequest === props.request.id) void interact()
     setStore("tab", index)
     setStore("selected", 0)
   }
@@ -546,6 +552,7 @@ export function QuestionPrompt(props: { request: QuestionRequest; directory?: st
                           })
                         }}
                         initialValue={input()}
+                        onContentChange={() => void interact()}
                         placeholder="Type your own answer"
                         placeholderColor={theme.textMuted}
                         minHeight={1}

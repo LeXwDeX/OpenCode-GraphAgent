@@ -7,6 +7,8 @@ import { SessionSchema } from "./session/schema"
 import { Config } from "./config"
 
 export const DEFAULT_TIMEOUT_SECONDS = 60
+export const MAX_RESPONSE_PHASE_SECONDS = 300
+const DEADLINE_RECHECK_MILLIS = 1_000
 
 export const ID = Question.ID
 export type ID = typeof ID.Type
@@ -74,6 +76,9 @@ export class Service extends Context.Service<Service, Interface>()("@opencode/v2
 interface Pending {
   request: Request
   readonly deferred: Deferred.Deferred<ReadonlyArray<Answer>, RejectedError>
+  deadline: number
+  readonly inactivityTimeoutMs: number
+  maximumDeadline?: number
 }
 
 /**
@@ -111,7 +116,7 @@ export const layer = Layer.effect(
           const expiresAt = now + timeoutSeconds * 1_000
           const deferred = yield* Deferred.make<ReadonlyArray<Answer>, RejectedError>()
           const request: Request = { id, ...input, expiresAt }
-          const entry = { request, deferred }
+          const entry: Pending = { request, deferred, deadline: expiresAt, inactivityTimeoutMs: timeoutSeconds * 1_000 }
           pending.set(id, entry)
           return yield* events.publish(Event.Asked, request).pipe(
             Effect.andThen(
@@ -119,19 +124,21 @@ export const layer = Layer.effect(
                 Effect.raceFirst(
                   Deferred.await(deferred),
                   Effect.gen(function* () {
-                    const current = yield* Clock.currentTimeMillis
-                    yield* Effect.sleep(Math.max(0, expiresAt - current))
-                    const timedOut = yield* Effect.uninterruptible(
-                      Effect.gen(function* () {
-                        const existing = pending.get(id)
-                        if (existing !== entry || existing.request.expiresAt === undefined) return false
-                        pending.delete(id)
-                        yield* events.publish(Event.TimedOut, { sessionID: request.sessionID, requestID: id })
-                        return true
-                      }),
-                    )
-                    if (!timedOut) return yield* Effect.never
-                    return yield* new TimedOutError()
+                    for (;;) {
+                      const current = yield* Clock.currentTimeMillis
+                      yield* Effect.sleep(Math.min(DEADLINE_RECHECK_MILLIS, Math.max(0, entry.deadline - current)))
+                      const timedOut = yield* Effect.uninterruptible(
+                        Effect.gen(function* () {
+                          if (pending.get(id) !== entry) return false
+                          if ((yield* Clock.currentTimeMillis) < entry.deadline) return false
+                          pending.delete(id)
+                          yield* events.publish(Event.TimedOut, { sessionID: request.sessionID, requestID: id })
+                          return true
+                        }),
+                      )
+                      if (timedOut) return yield* new TimedOutError()
+                      if (pending.get(id) !== entry) return yield* Effect.never
+                    }
                   }),
                 ),
               ),
@@ -154,13 +161,13 @@ export const layer = Layer.effect(
             yield* new NotFoundError({ requestID: input.requestID })
             return
           }
+          pending.delete(input.requestID)
           yield* events.publish(Event.Replied, {
             sessionID: existing.request.sessionID,
             requestID: existing.request.id,
             answers: input.answers.map((answer) => [...answer]),
           })
           yield* Deferred.succeed(existing.deferred, input.answers)
-          pending.delete(input.requestID)
         }),
       ),
     )
@@ -173,12 +180,12 @@ export const layer = Layer.effect(
             yield* new NotFoundError({ requestID })
             return
           }
+          pending.delete(requestID)
           yield* events.publish(Event.Rejected, {
             sessionID: existing.request.sessionID,
             requestID: existing.request.id,
           })
           yield* Deferred.fail(existing.deferred, new RejectedError())
-          pending.delete(requestID)
         }),
       ),
     )
@@ -191,6 +198,10 @@ export const layer = Layer.effect(
             yield* new NotFoundError({ requestID })
             return
           }
+          const now = yield* Clock.currentTimeMillis
+          if (now >= existing.deadline) return yield* new NotFoundError({ requestID })
+          existing.maximumDeadline ??= now + MAX_RESPONSE_PHASE_SECONDS * 1_000
+          existing.deadline = Math.min(now + existing.inactivityTimeoutMs, existing.maximumDeadline)
           if (existing.request.expiresAt === undefined) return
           existing.request = { ...existing.request, expiresAt: undefined }
           yield* events.publish(Event.Interacted, {

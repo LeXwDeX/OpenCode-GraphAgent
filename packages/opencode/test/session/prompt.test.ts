@@ -395,11 +395,13 @@ const stableGlobRipgrepLayer = Layer.effect(
     return Ripgrep.Service.of({
       ...ripgrep,
       glob: (input) =>
-        ripgrep.glob(input).pipe(
-          Effect.map((entries) =>
-            [...entries].sort((left, right) => (left.path < right.path ? -1 : left.path > right.path ? 1 : 0)),
+        ripgrep
+          .glob(input)
+          .pipe(
+            Effect.map((entries) =>
+              [...entries].sort((left, right) => (left.path < right.path ? -1 : left.path > right.path ? 1 : 0)),
+            ),
           ),
-        ),
     })
   }),
 ).pipe(Layer.provide(Ripgrep.defaultLayer))
@@ -596,6 +598,275 @@ const useServerConfig = Effect.fn("test.useServerConfig")(function* (config: (ur
   yield* writeConfig(dir, config(llm.url))
   return { dir, llm }
 })
+
+it.instance("compacts a large new user message before sending it on the same model", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig((url) => {
+      const config = providerCfg(url)
+      return {
+        ...config,
+        compaction: { auto: true, max_context_tokens: 25_000 },
+        provider: {
+          ...config.provider,
+          test: {
+            ...config.provider.test,
+            models: {
+              ...config.provider.test.models,
+              "test-model": {
+                ...config.provider.test.models["test-model"],
+                limit: { context: 1_000_000, output: 10_000 },
+              },
+            },
+          },
+        },
+      }
+    })
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Proactive compaction" })
+    yield* seed(chat.id, { finish: "stop" })
+    yield* user(chat.id, "large request ".repeat(10_000))
+    // An ineffective summary must not immediately re-trigger the same proactive compaction.
+    yield* llm.text("long summary ".repeat(10_000))
+    yield* llm.text("continued answer")
+
+    yield* prompt.loop({ sessionID: chat.id })
+
+    const messages = yield* sessions.messages({ sessionID: chat.id })
+    expect(messages.filter((message) => message.parts.some((part) => part.type === "compaction"))).toHaveLength(1)
+    expect(yield* llm.hits).toHaveLength(2)
+  }),
+)
+
+it.instance("compacts a large unique tool output before sending it on the same model", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig((url) => {
+      const config = providerCfg(url)
+      return {
+        ...config,
+        compaction: { auto: true, max_context_tokens: 25_000 },
+        provider: {
+          ...config.provider,
+          test: {
+            ...config.provider.test,
+            models: {
+              ...config.provider.test.models,
+              "test-model": {
+                ...config.provider.test.models["test-model"],
+                limit: { context: 1_000_000, output: 10_000 },
+              },
+            },
+          },
+        },
+      }
+    })
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Proactive tool-output compaction" })
+    const previous = yield* seed(chat.id, { finish: "tool-calls" })
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: previous.assistant.id,
+      sessionID: chat.id,
+      type: "tool",
+      callID: "unique-large-result",
+      tool: "custom_probe",
+      state: {
+        status: "completed",
+        input: {},
+        output: "unique tool result ".repeat(7_000),
+        title: "Unique large result",
+        metadata: {},
+        time: { start: 1, end: 2 },
+      },
+    })
+    yield* llm.text("compact summary")
+    yield* llm.text("continued answer")
+
+    yield* prompt.loop({ sessionID: chat.id })
+
+    const messages = yield* sessions.messages({ sessionID: chat.id })
+    expect(messages.filter((message) => message.parts.some((part) => part.type === "compaction"))).toHaveLength(1)
+    expect(yield* llm.hits).toHaveLength(2)
+  }),
+)
+
+it.instance("checks a smaller switched model after an earlier compaction summary", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig((url) => {
+      const config = providerCfg(url)
+      return {
+        ...config,
+        compaction: { auto: true, max_context_tokens: 25_000 },
+        provider: {
+          ...config.provider,
+          test: {
+            ...config.provider.test,
+            models: {
+              ...config.provider.test.models,
+              "small-model": {
+                ...config.provider.test.models["test-model"],
+                id: "small-model",
+                name: "Small Model",
+                limit: { context: 10_000, output: 1_000 },
+              },
+            },
+          },
+        },
+      }
+    })
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Model switch compaction" })
+    const previous = yield* seed(chat.id, { finish: "stop" })
+    yield* sessions.updateMessage({ ...previous.assistant, summary: true })
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: previous.assistant.id,
+      sessionID: chat.id,
+      type: "text",
+      text: "long summary ".repeat(3_000),
+    })
+    const next = yield* user(chat.id, "continue with the smaller model")
+    yield* sessions.updateMessage({
+      ...next,
+      model: { providerID: ref.providerID, modelID: ModelV2.ID.make("small-model") },
+    })
+    yield* llm.text("smaller summary")
+    yield* llm.text("continued answer")
+
+    yield* prompt.loop({ sessionID: chat.id })
+
+    const messages = yield* sessions.messages({ sessionID: chat.id })
+    expect(messages.filter((message) => message.parts.some((part) => part.type === "compaction"))).toHaveLength(1)
+    expect(yield* llm.hits).toHaveLength(2)
+  }),
+)
+
+it.instance("uses the new model projection instead of stale usage from the previous model", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig((url) => {
+      const config = providerCfg(url)
+      return {
+        ...config,
+        compaction: { auto: true, max_context_tokens: 25_000 },
+        provider: {
+          ...config.provider,
+          test: {
+            ...config.provider.test,
+            models: {
+              ...config.provider.test.models,
+              "small-model": {
+                ...config.provider.test.models["test-model"],
+                id: "small-model",
+                name: "Small Model",
+                limit: { context: 10_000, output: 1_000 },
+              },
+            },
+          },
+        },
+      }
+    })
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Model usage isolation" })
+    const previous = yield* seed(chat.id, { finish: "stop" })
+    yield* sessions.updateMessage({
+      ...previous.assistant,
+      tokens: { input: 500_000, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+    })
+    const next = yield* user(chat.id, "a short request")
+    yield* sessions.updateMessage({
+      ...next,
+      model: { providerID: ref.providerID, modelID: ModelV2.ID.make("small-model") },
+    })
+    yield* llm.text("short answer")
+
+    yield* prompt.loop({ sessionID: chat.id })
+
+    const messages = yield* sessions.messages({ sessionID: chat.id })
+    expect(messages.some((message) => message.parts.some((part) => part.type === "compaction"))).toBeFalse()
+    expect(yield* llm.hits).toHaveLength(1)
+  }),
+)
+
+it.instance("recompacts an oversized summary before sending it to a smaller model", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig((url) => {
+      const config = providerCfg(url)
+      return {
+        ...config,
+        compaction: { auto: true, max_context_tokens: 25_000 },
+        provider: {
+          ...config.provider,
+          test: {
+            ...config.provider.test,
+            models: {
+              ...config.provider.test.models,
+              "test-model": {
+                ...config.provider.test.models["test-model"],
+                limit: { context: 10_000, output: 1_000 },
+              },
+            },
+          },
+        },
+      }
+    })
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Oversized compaction summary" })
+    yield* seed(chat.id, { finish: "stop" })
+    yield* user(chat.id, "large request ".repeat(3_000))
+    yield* llm.text("oversized summary ".repeat(3_000))
+    yield* llm.text("short summary")
+    yield* llm.text("continued answer")
+
+    yield* prompt.loop({ sessionID: chat.id })
+
+    const messages = yield* sessions.messages({ sessionID: chat.id })
+    expect(messages.filter((message) => message.parts.some((part) => part.type === "compaction"))).toHaveLength(2)
+    expect(yield* llm.hits).toHaveLength(3)
+  }),
+)
+
+it.instance("stops after repeated automatic summaries remain above the model limit", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig((url) => {
+      const config = providerCfg(url)
+      return {
+        ...config,
+        compaction: { auto: true, max_context_tokens: 25_000 },
+        provider: {
+          ...config.provider,
+          test: {
+            ...config.provider.test,
+            models: {
+              ...config.provider.test.models,
+              "test-model": {
+                ...config.provider.test.models["test-model"],
+                limit: { context: 10_000, output: 1_000 },
+              },
+            },
+          },
+        },
+      }
+    })
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Bounded compaction" })
+    yield* seed(chat.id, { finish: "stop" })
+    yield* user(chat.id, "large request ".repeat(3_000))
+    for (let attempt = 0; attempt < 3; attempt++) yield* llm.text("oversized summary ".repeat(3_000))
+
+    const result = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.exit)
+
+    expect(Exit.isFailure(result)).toBeTrue()
+    if (Exit.isFailure(result)) {
+      expect(SessionV1.ContextOverflowError.isInstance(Cause.squash(result.cause))).toBeTrue()
+    }
+    expect(yield* llm.hits).toHaveLength(3)
+  }),
+)
 
 // Wait for a session's runner to enter a busy state. SessionStatus is flipped
 // inside Runner.startShell's serialized transition, so cancel can't no-op once
