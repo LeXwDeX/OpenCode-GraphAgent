@@ -35,14 +35,28 @@ export class TimeoutError extends Schema.TaggedErrorClass<TimeoutError>()("Memor
   }
 }
 
+const EMPTY_PROVIDER_ERROR = "(provider stream error with an empty message)"
+
+function defectMessage(value: unknown, seen = new Set<object>(), depth = 0): string {
+  if (typeof value === "string") return value === "" ? EMPTY_PROVIDER_ERROR : value
+  if (value instanceof Error) return value.message === "" ? EMPTY_PROVIDER_ERROR : value.message
+  if (!isRecord(value) || depth >= 4 || seen.has(value)) return String(value)
+  seen.add(value)
+  if (typeof value.message === "string") return value.message === "" ? EMPTY_PROVIDER_ERROR : value.message
+  for (const key of ["error", "cause", "data"] as const) {
+    if (value[key] !== undefined) return defectMessage(value[key], seen, depth + 1)
+  }
+  return String(value)
+}
+
 export class GenerateError extends Schema.TaggedErrorClass<GenerateError>()("MemoryModel.GenerateError", {
   cause: Schema.Defect(),
 }) {
   override get message() {
-    // openai-compatible flattens a provider SSE error event to its bare
-    // message string, which can be empty — keep the failure identifiable.
-    const cause = String(this.cause)
-    return `MEMORY model call failed: ${cause === "" ? "(provider stream error with an empty message)" : cause}`
+    // AI SDK versions may surface a provider SSE error as either its bare
+    // message or a structured { error: { message } } value. Keep an explicitly
+    // empty provider message identifiable across both representations.
+    return `MEMORY model call failed: ${defectMessage(this.cause)}`
   }
 }
 
@@ -193,10 +207,7 @@ const streamGenerate = (input: {
             model: input.language,
             system,
             prompt: input.prompt,
-            schema: Object.assign(
-              Schema.toStandardSchemaV1(input.schema),
-              Schema.toStandardJSONSchemaV1(input.schema),
-            ),
+            schema: Object.assign(Schema.toStandardSchemaV1(input.schema), Schema.toStandardJSONSchemaV1(input.schema)),
             temperature: input.temperature,
             maxOutputTokens: input.maxOutputTokens,
             abortSignal: controller.signal,

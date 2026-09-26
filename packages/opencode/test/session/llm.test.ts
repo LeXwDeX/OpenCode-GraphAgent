@@ -3,7 +3,7 @@ import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import path from "path"
-import { tool, type ModelMessage } from "ai"
+import { InvalidResponseDataError, tool, type ModelMessage } from "ai"
 import { Cause, Effect, Exit, Fiber, Layer, Stream } from "effect"
 import { InstanceRef } from "../../src/effect/instance-ref"
 import { HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
@@ -368,6 +368,43 @@ describe("session.llm.ai-sdk adapter", () => {
       message: error.message,
       error,
     })
+  })
+
+  test("preserves the pre-upgrade unknown finish contract when a stream ends without a finish reason", async () => {
+    const events = await adapt([
+      { type: "start-step", request: {}, warnings: [] },
+      {
+        type: "error",
+        error: new InvalidResponseDataError({
+          data: undefined,
+          message: "Response stream ended without a finish reason.",
+        }),
+      },
+      uncheckedAdapterEvent({ type: "finish-step", finishReason: "error", rawFinishReason: undefined }),
+      uncheckedAdapterEvent({ type: "finish", finishReason: "error", rawFinishReason: undefined }),
+    ])
+
+    expect(events).toMatchObject([
+      { type: "step-start", index: 0 },
+      { type: "step-finish", index: 0, reason: "unknown" },
+      { type: "finish", reason: "unknown" },
+    ])
+
+    const crossInstance = await adapt([
+      uncheckedAdapterEvent({
+        type: "error",
+        error: {
+          name: "AI_InvalidResponseDataError",
+          message: "Response stream ended without a finish reason.",
+        },
+      }),
+      uncheckedAdapterEvent({ type: "finish-step", finishReason: "error", rawFinishReason: undefined }),
+      uncheckedAdapterEvent({ type: "finish", finishReason: "error", rawFinishReason: undefined }),
+    ])
+    expect(crossInstance).toMatchObject([
+      { type: "step-finish", index: 0, reason: "unknown" },
+      { type: "finish", reason: "unknown" },
+    ])
   })
 
   test("emits undefined usage when every AI SDK usage field is missing", async () => {

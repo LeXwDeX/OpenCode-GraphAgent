@@ -82,6 +82,37 @@ function wrapSSE(res: Response, ms: number, ctl: AbortController) {
   })
 }
 
+function unwrapLanguageStreamErrors(language: LanguageModelV3): LanguageModelV3 {
+  return new Proxy(language, {
+    get(target, property, receiver) {
+      if (property !== "doStream") return Reflect.get(target, property, receiver)
+      const doStream = target.doStream.bind(target)
+      return async (...args: Parameters<LanguageModelV3["doStream"]>) => {
+        const result = await doStream(...args)
+        const reader = result.stream.getReader()
+        const stream = new ReadableStream({
+          async pull(controller) {
+            try {
+              const part = await reader.read()
+              if (part.done) {
+                controller.close()
+                return
+              }
+              controller.enqueue(part.value)
+            } catch (error) {
+              controller.error(ProviderError.findResponseStreamError(error) ?? error)
+            }
+          },
+          cancel(reason) {
+            return reader.cancel(reason)
+          },
+        })
+        return { ...result, stream }
+      }
+    },
+  })
+}
+
 function timeoutController(ms: number) {
   const ctl = new AbortController()
   const id = setTimeout(() => ctl.abort(new ProviderError.HeaderTimeoutError(ms)), ms)
@@ -1819,8 +1850,9 @@ export const layer = Layer.effect(
                 model,
               )
             : sdk.languageModel(model.api.id)
-          s.models.set(key, language)
-          return language
+          const normalized = unwrapLanguageStreamErrors(language)
+          s.models.set(key, normalized)
+          return normalized
         },
         (cause) =>
           cause instanceof NoSuchModelError
