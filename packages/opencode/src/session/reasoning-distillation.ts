@@ -4,7 +4,17 @@ import {
 } from "@opencode-ai/core/session/context-folding"
 import type { PreparedRequestBudgetInput } from "@opencode-ai/core/session/context-folding"
 import {
+  cacheInsert,
+  cacheKeyFingerprint,
+  cacheLookup,
+  canJudge,
+  canPropose,
+  capabilityFingerprint,
   classifySlotEligibility,
+  consumeJudge,
+  consumePropose,
+  emptyCache,
+  emptyCallLedger,
   planReasoningDistillation,
   projectDistillationRequest,
   ReasoningDistillationPolicy,
@@ -18,6 +28,7 @@ import {
   type ClaimSupport,
   type ClaimStatus,
   type CompatibilityRecord,
+  type DistillationCache,
   type CoverageEntry,
   type DistillationCallQuota,
   type DistillationKey,
@@ -29,6 +40,7 @@ import {
   type ExecutionTarget,
   type ExecutionVerdictContext,
   type ModelTier,
+  type CallLedger,
   type ReasoningEvidence,
   type ReasoningSlotShape,
   type SlotAssessment,
@@ -37,6 +49,8 @@ import {
   type WireReasoningMapping,
 } from "@opencode-ai/core/session/reasoning-distillation"
 import { Hash } from "@opencode-ai/core/util/hash"
+import type { SessionV1 } from "@opencode-ai/core/v1/session"
+import type { ModelMessage } from "ai"
 
 /**
  * Opencode runtime adapter for reasoning distillation (design §5.2). This module is the host-side bridge between the
@@ -183,6 +197,182 @@ export type DistillProjectionResult<Request> = Readonly<{
   plan: DistillationPlan
   skipReason: DistillationSkipReason | undefined
 }>
+
+export type DistillationLifecycleState = Readonly<{
+  cache: DistillationCache
+  ledger: CallLedger
+  support: Readonly<Record<string, readonly ClaimSupport[]>>
+  judgeFingerprints: Readonly<Record<string, string>>
+  callsBySession: Readonly<Record<string, number>>
+}>
+
+export const emptyLifecycleState: DistillationLifecycleState = {
+  cache: emptyCache,
+  ledger: emptyCallLedger,
+  support: {},
+  judgeFingerprints: {},
+  callsBySession: {},
+}
+
+export type DistillationCycleInput<Request> = Omit<
+  DistillProjectionInput<Request>,
+  "candidate" | "support" | "judgeFingerprint" | "quota" | "originalTokens"
+> &
+  Readonly<{
+    sessionID: string
+    organizerFingerprint: string
+    originalTokens: number | undefined
+    callPropose?: AuxiliaryCaller
+    callJudge?: AuxiliaryCaller
+    /** Persist quota consumption synchronously before an interruptible auxiliary call begins. */
+    commitState?: (state: DistillationLifecycleState) => void
+  }>
+
+export type DistillationCycleResult<Request> = Readonly<{
+  state: DistillationLifecycleState
+  projection: DistillProjectionResult<Request>
+  attempted: "none" | "propose" | "judge"
+}>
+
+const keyForSlot = (
+  sessionID: string,
+  slot: ReasoningSlotObservation,
+  capability: SlotCapability,
+  organizerFingerprint: string,
+): DistillationKey => ({
+  sessionID,
+  messageID: slot.messageID,
+  partIDs: [slot.partID],
+  sourceFingerprint: Hash.sha256(slot.text),
+  capabilityFingerprint: capabilityFingerprint(capability),
+  organizerFingerprint,
+  policyVersion: ReasoningDistillationPolicy.version,
+})
+
+const resolveSlotSpan =
+  (slot: ReasoningSlotObservation): SpanResolver =>
+  (ref) => {
+    if (ref.messageID !== slot.messageID || ref.partID !== slot.partID) return undefined
+    if (ref.start < 0 || ref.end <= ref.start || ref.end > slot.text.length) return undefined
+    const text = slot.text.slice(ref.start, ref.end)
+    return { ...ref, fingerprint: Hash.sha256(text) }
+  }
+
+const callSummary = (calls: readonly ToolCallObservation[]): string[] =>
+  calls.map((call) => `${call.toolName} ${call.callID} ${call.status}/${call.result}`)
+
+/**
+ * Execute one bounded lifecycle cycle for one source identity. A cycle can make at most one auxiliary call. Propose and
+ * judge quota is consumed before the call, failures still consume quota, and only the next ordinary request can advance
+ * from a newly proposed candidate to judge. The function is state-in/state-out so the host can serialize it per project.
+ */
+export const runDistillationCycle = async <Request>(
+  state: DistillationLifecycleState,
+  input: DistillationCycleInput<Request>,
+): Promise<DistillationCycleResult<Request>> => {
+  const slot = input.slots.length === 1 ? input.slots[0] : undefined
+  if (!slot) {
+    const projection = projectDistillationAISDK({
+      ...input,
+      candidate: undefined,
+      support: [],
+      quota: { proposeUsed: true, judgeUsed: true },
+      originalTokens: input.originalTokens,
+    })
+    return { state, projection, attempted: "none" }
+  }
+  const key = keyForSlot(input.sessionID, slot, input.capability, input.organizerFingerprint)
+  const keyFingerprint = cacheKeyFingerprint(key)
+  const cached = cacheLookup(state.cache, key)
+  const quota = { proposeUsed: !canPropose(state.ledger, key), judgeUsed: !canJudge(state.ledger, key) }
+  const initial = projectDistillationAISDK({
+    ...input,
+    candidate: cached?.candidate,
+    support: state.support[keyFingerprint] ?? [],
+    ...(state.judgeFingerprints[keyFingerprint] === undefined
+      ? {}
+      : { judgeFingerprint: state.judgeFingerprints[keyFingerprint] }),
+    quota,
+    originalTokens: input.originalTokens,
+  })
+
+  const calls = state.callsBySession[input.sessionID] ?? 0
+  const blocked = (skipReason: DistillationSkipReason): DistillationCycleResult<Request> => ({
+    state,
+    projection: {
+      ...initial,
+      applied: false,
+      plan: { ...initial.plan, replacements: [], extraCall: "none", skipReason },
+      skipReason,
+    },
+    attempted: "none",
+  })
+
+  if (initial.plan.extraCall === "propose" && input.callPropose && canPropose(state.ledger, key)) {
+    if (calls >= ReasoningDistillationPolicy.calls.maxCallsPerSession) return blocked("call-budget-exhausted")
+    const prompt = buildProposePrompt({ reasoningTexts: [slot.text], callSummary: callSummary(input.calls) })
+    if (Math.ceil(prompt.length / 4) > ReasoningDistillationPolicy.tokens.maxInputTokens) return blocked("work-limit")
+    const consumed = {
+      ...state,
+      ledger: consumePropose(state.ledger, key),
+      callsBySession: { ...state.callsBySession, [input.sessionID]: calls + 1 },
+    }
+    input.commitState?.(consumed)
+    const candidate = await runPropose({
+      key,
+      prompt,
+      resolveSpan: resolveSlotSpan(slot),
+      callModel: input.callPropose,
+    }).catch(() => undefined)
+    const cache = candidate
+      ? cacheInsert(consumed.cache, {
+          key,
+          candidate,
+          certificate: undefined,
+          derivedBodyBytes: new TextEncoder().encode(JSON.stringify(candidate)).byteLength,
+        })
+      : consumed.cache
+    return { state: { ...consumed, cache }, projection: initial, attempted: "propose" }
+  }
+
+  if (initial.plan.extraCall === "judge" && cached && input.callJudge && canJudge(state.ledger, key)) {
+    if (calls >= ReasoningDistillationPolicy.calls.maxCallsPerSession) return blocked("call-budget-exhausted")
+    const prompt = buildJudgePrompt({
+      reasoningTexts: [slot.text],
+      candidateClaims: cached.candidate.claims,
+      callSummary: callSummary(input.calls),
+    })
+    if (Math.ceil(prompt.length / 4) > ReasoningDistillationPolicy.tokens.maxInputTokens) return blocked("work-limit")
+    const consumed = {
+      ...state,
+      ledger: consumeJudge(state.ledger, key),
+      callsBySession: { ...state.callsBySession, [input.sessionID]: calls + 1 },
+    }
+    input.commitState?.(consumed)
+    const support = await runJudge({
+      prompt,
+      callModel: input.callJudge,
+    }).catch(() => undefined)
+    if (!support) return { state: consumed, projection: initial, attempted: "judge" }
+    const judgeFingerprint = Hash.sha256(JSON.stringify(support))
+    const nextState = {
+      ...consumed,
+      support: { ...state.support, [keyFingerprint]: support },
+      judgeFingerprints: { ...state.judgeFingerprints, [keyFingerprint]: judgeFingerprint },
+    }
+    const projection = projectDistillationAISDK({
+      ...input,
+      candidate: cached.candidate,
+      support,
+      judgeFingerprint,
+      quota: { proposeUsed: true, judgeUsed: true },
+      originalTokens: input.originalTokens,
+    })
+    return { state: nextState, projection, attempted: "judge" }
+  }
+
+  return { state, projection: initial, attempted: "none" }
+}
 
 export const projectDistillationAISDK = <Request>(
   input: DistillProjectionInput<Request>,
@@ -546,6 +736,59 @@ export const extractInterleavedReasoningSlots = (
 }
 
 /**
+ * Re-index AI-SDK lineage for the Native canonical message array. Native lowering removes system messages but keeps
+ * every non-system message in order, so this conversion is deterministic and does not bind by reasoning text.
+ */
+export const bindNativeInterleavedReasoningLineage = (
+  sourceMessages: readonly ModelMessage[],
+  transformedMessages: readonly ModelMessage[],
+  field: string,
+  history: ReasoningHistorySnapshot,
+): readonly InterleavedSlotLineage[] =>
+  bindInterleavedReasoningLineage(sourceMessages, transformedMessages, field, history).flatMap((entry) => {
+    const message = transformedMessages[entry.wireMessageIndex]
+    if (!message || message.role === "system") return []
+    const wireMessageIndex =
+      transformedMessages.slice(0, entry.wireMessageIndex + 1).filter((item) => item.role !== "system").length - 1
+    return wireMessageIndex < 0 ? [] : [{ ...entry, wireMessageIndex }]
+  })
+
+/** Extract the W1 slot from the final Native canonical request, immediately before protocol lowering. */
+export const extractNativeInterleavedReasoningSlots = (
+  messages: readonly unknown[],
+  field: string,
+  lineage: readonly InterleavedSlotLineage[] = [],
+): ReasoningSlotObservation[] => {
+  const slots: ReasoningSlotObservation[] = []
+  for (let index = 0; index < messages.length; index++) {
+    const message = messages[index]
+    if (!isRecord(message) || message.role !== "assistant") continue
+    const native = message.native
+    if (!isRecord(native)) continue
+    const openaiCompatible = native.openaiCompatible
+    if (!isRecord(openaiCompatible)) continue
+    const text = openaiCompatible[field]
+    if (!isString(text) || text.length === 0) continue
+    const matches = lineage.filter((entry) => entry.wireMessageIndex === index)
+    const source = matches.length === 1 && matches[0].parts.length === 1 ? matches[0].parts[0] : undefined
+    const known =
+      source !== undefined && source.text === text && source.messageID.length > 0 && source.partID.length > 0
+    slots.push({
+      messageID: known ? source.messageID : `messages.${index}`,
+      partID: known ? source.partID : field,
+      bodyPath: ["messages", index, "native", "openaiCompatible", field],
+      text,
+      shape: "interleaved-field",
+      signed: known ? source.signed : false,
+      encrypted: known ? source.encrypted : false,
+      settled: known ? source.settled : false,
+      structureRewritable: known,
+    })
+  }
+  return slots
+}
+
+/**
  * Propose/judge orchestration (§5.4.1 Chinese structured output, §5.5.3 untrusted-data isolation). The prompts frame
  * R/E/candidate as untrusted data whose embedded instructions must never change the task, trigger tools, or emit audit
  * objects, and require Chinese output with technical identifiers preserved verbatim. The model call is an injected seam
@@ -656,6 +899,160 @@ export type PersistedReasoningRef = Readonly<{
   /** Final transformed wire position, established by the host rather than inferred from text. */
   wireMessageIndex?: number
 }>
+
+export type PersistedReasoningGroup = Readonly<{
+  messageID: string
+  parts: readonly (InterleavedSourcePart & { inputFingerprint?: string })[]
+}>
+
+export type ReasoningHistorySnapshot = Readonly<{
+  groups: readonly PersistedReasoningGroup[]
+  calls: readonly ToolCallObservation[]
+  inventoryComplete: boolean
+  inventoryFingerprint: string
+}>
+
+const containsMetadataKey = (value: unknown, keys: ReadonlySet<string>, depth = 0): boolean => {
+  if (depth > 8 || !isRecord(value)) return false
+  for (const [key, item] of Object.entries(value)) {
+    if (keys.has(key) && item !== undefined && item !== null && item !== "") return true
+    if (containsMetadataKey(item, keys, depth + 1)) return true
+  }
+  return false
+}
+
+const fingerprintUnknown = (value: unknown): string | undefined => {
+  try {
+    return Hash.sha256(JSON.stringify(value))
+  } catch {
+    return undefined
+  }
+}
+
+const callStatus = (part: SessionV1.ToolPart): CallStatus => {
+  switch (part.state.status) {
+    case "pending":
+    case "running":
+    case "completed":
+    case "error":
+      return part.state.status
+  }
+}
+
+const callResult = (part: SessionV1.ToolPart): CallResultCompleteness => {
+  if (part.state.status !== "completed") return "missing"
+  if (part.state.time.compacted !== undefined) return "compacted"
+  if (part.state.metadata.truncated === true || typeof part.state.metadata.outputPath === "string") return "truncated"
+  return "complete"
+}
+
+/**
+ * Capture the persisted reasoning identities and authoritative tool-call inventory before conversion to AI-SDK
+ * messages. Text and tool payloads are never included in the inventory fingerprint; they are available only inside
+ * this in-memory request snapshot for exact lineage/evidence binding.
+ */
+export const reasoningHistory = (messages: readonly SessionV1.WithParts[]): ReasoningHistorySnapshot => {
+  const groups: PersistedReasoningGroup[] = []
+  const calls: ToolCallObservation[] = []
+  let inventoryComplete = true
+  for (const message of messages) {
+    if (message.info.role !== "assistant") continue
+    const parts: Array<InterleavedSourcePart & { inputFingerprint?: string }> = []
+    for (const part of message.parts) {
+      if (part.type === "reasoning") {
+        parts.push({
+          messageID: part.messageID,
+          partID: part.id,
+          text: part.text,
+          signed: containsMetadataKey(part.metadata, new Set(["signature", "reasoningOpaque"])),
+          encrypted: containsMetadataKey(
+            part.metadata,
+            new Set(["encrypted_content", "encryptedContent", "reasoningEncryptedContent"]),
+          ),
+          settled: part.time.end !== undefined,
+        })
+      }
+      if (part.type !== "tool") continue
+      const status = callStatus(part)
+      if (status === "pending" || status === "running") inventoryComplete = false
+      calls.push({
+        messageID: part.messageID,
+        partID: part.id,
+        callID: part.callID,
+        toolName: part.tool,
+        status,
+        result: callResult(part),
+        ...(fingerprintUnknown(part.state.input) === undefined
+          ? {}
+          : { inputFingerprint: fingerprintUnknown(part.state.input) }),
+        provenance: "unavailable",
+      })
+    }
+    if (parts.length > 0) groups.push({ messageID: message.info.id, parts })
+  }
+  const inventoryFingerprint = Hash.sha256(
+    JSON.stringify(
+      calls.map((call) => ({
+        messageID: call.messageID,
+        partID: call.partID,
+        callID: call.callID,
+        toolName: call.toolName,
+        status: call.status,
+        result: call.result,
+        inputFingerprint: call.inputFingerprint ?? null,
+        provenance: call.provenance,
+      })),
+    ),
+  )
+  return { groups, calls, inventoryComplete, inventoryFingerprint }
+}
+
+const reasoningTexts = (message: ModelMessage): readonly string[] => {
+  if (message.role !== "assistant" || !Array.isArray(message.content)) return []
+  return message.content
+    .filter(
+      (part): part is Extract<(typeof message.content)[number], { type: "reasoning" }> => part.type === "reasoning",
+    )
+    .map((part) => part.text)
+}
+
+const sameTexts = (parts: readonly InterleavedSourcePart[], texts: readonly string[]): boolean =>
+  parts.length === texts.length && parts.every((part, index) => part.text === texts[index])
+
+/**
+ * Bind persisted parts to final transformed W1 positions by ordered message conversion plus exact part sequence.
+ * Duplicate text remains safe because chronological source order, part order, and final wire index all participate;
+ * no unique identity is inferred from text alone. Any conversion drift simply yields no lineage and P4 protection.
+ */
+export const bindInterleavedReasoningLineage = (
+  sourceMessages: readonly ModelMessage[],
+  transformedMessages: readonly ModelMessage[],
+  field: string,
+  history: ReasoningHistorySnapshot,
+): InterleavedSlotLineage[] => {
+  const lineage: InterleavedSlotLineage[] = []
+  let groupIndex = 0
+  for (let wireMessageIndex = 0; wireMessageIndex < sourceMessages.length; wireMessageIndex++) {
+    const texts = reasoningTexts(sourceMessages[wireMessageIndex])
+    if (texts.length === 0) continue
+    let matched: PersistedReasoningGroup | undefined
+    while (groupIndex < history.groups.length) {
+      const group = history.groups[groupIndex++]
+      if (sameTexts(group.parts, texts)) {
+        matched = group
+        break
+      }
+    }
+    if (!matched) break
+    const transformed = transformedMessages[wireMessageIndex]
+    if (!isRecord(transformed) || transformed.role !== "assistant") continue
+    const options = isRecord(transformed.providerOptions) ? transformed.providerOptions : undefined
+    const compatible = options && isRecord(options.openaiCompatible) ? options.openaiCompatible : undefined
+    if (!compatible || compatible[field] !== texts.join("")) continue
+    lineage.push({ wireMessageIndex, parts: matched.parts })
+  }
+  return lineage
+}
 
 /**
  * Bind only a unique source ref whose explicit final wire index and text both match. Text equality alone cannot prove

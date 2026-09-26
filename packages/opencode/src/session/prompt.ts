@@ -104,6 +104,7 @@ import { Goal } from "@/goal/goal"
 import { KeyedMutex } from "@opencode-ai/core/effect/keyed-mutex"
 import { Memory } from "@/memory/memory"
 import { SessionAutomationLease } from "./automation-lease"
+import { ReasoningDistillation } from "./reasoning-distillation"
 
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -2144,6 +2145,7 @@ export const layer = Layer.effect(
               memoryDocs,
               modelMsgs,
               contextFoldingHistory,
+              reasoningDistillationHistory,
             ] = yield* Effect.all(
               [
                 sys.skills(agent),
@@ -2155,6 +2157,7 @@ export const layer = Layer.effect(
                 sys.memory({ sessionID, messages: msgs, main: !session.parentID }),
                 MessageV2.toModelMessagesEffect(msgs, model),
                 MessageV2.contextFoldingHistory({ messages: msgs, ledger: toolSources }),
+                Effect.sync(() => ReasoningDistillation.reasoningHistory(msgs)),
               ],
               { concurrency: "unbounded" },
             )
@@ -2185,6 +2188,7 @@ export const layer = Layer.effect(
               toolChoice: format.type === "json_schema" ? "required" : undefined,
               purpose: "conversation",
               contextFolding: contextFoldingHistory,
+              reasoningDistillation: reasoningDistillationHistory,
             })
 
             if (structured !== undefined) {

@@ -13,6 +13,7 @@ import { Cause, DateTime, Deferred, Duration, Effect, FiberSet, Layer, Option, S
 import { AgentV2 } from "../../agent"
 import { Config } from "../../config"
 import { ConfigCompaction } from "../../config/compaction"
+import { ConfigReasoningDistillation } from "../../config/reasoning-distillation"
 import { Database } from "../../database/database"
 import { EventV2 } from "../../event"
 import { Location } from "../../location"
@@ -39,6 +40,7 @@ import { SessionRunnerModel } from "./model"
 import { createLLMEventPublisher } from "./publish-llm-event"
 import { toLLMMessagesWithBindings } from "./to-llm-message"
 import { CoreContextFolding } from "./context-folding"
+import * as CoreReasoningDistillation from "./reasoning-distillation"
 import { MAX_STEPS_PROMPT } from "./max-steps"
 import { Snapshot } from "../../snapshot"
 import { Flag } from "../../flag/flag"
@@ -141,6 +143,7 @@ export const layer = Layer.effect(
     const db = (yield* Database.Service).db
     const configEntries = yield* config.entries()
     const compaction = SessionCompaction.make({ events, llm, config: configEntries })
+    const reasoningDistillation = CoreReasoningDistillation.make(llm)
     const resolveDynamicFolding = Effect.fnUntraced(function* () {
       let dynamic: boolean | undefined
       let prune: boolean | undefined
@@ -391,7 +394,40 @@ export const layer = Layer.effect(
           projectionPlan: folding.plan,
         }),
       )
-      const request = folding.request
+      let request = folding.request
+      const reasoningConfig = Config.latest(yield* config.entries(), "reasoningDistillation")
+      const reasoningResolution = ConfigReasoningDistillation.resolveEnabled({
+        disabledByEnvironment: Flag.OPENCODE_DISABLE_REASONING_DISTILLATION,
+        enabled: reasoningConfig?.enabled,
+      })
+      if (
+        reasoningResolution.enabled &&
+        (reasoningConfig?.compatibility?.length ?? 0) > 0 &&
+        conversion.reasoningBindings.length > 0
+      ) {
+        const prepared = Option.getOrUndefined(yield* llm.prepare(request).pipe(Effect.option))
+        if (prepared) {
+          const distilled = yield* reasoningDistillation.distill({
+            sessionID: session.id,
+            ...(session.model?.variant === undefined ? {} : { variant: session.model.variant }),
+            request,
+            prepared,
+            sourceMessages: context,
+            bindings: conversion.reasoningBindings,
+            config: reasoningConfig ?? new ConfigReasoningDistillation.Info({}),
+          })
+          request = distilled.request
+          yield* Effect.logInfo("reasoning distillation", {
+            "reasoning_distillation.runtime": "core-runner",
+            "reasoning_distillation.enabled": true,
+            "reasoning_distillation.source": reasoningResolution.source,
+            "reasoning_distillation.attempted": distilled.attempted,
+            "reasoning_distillation.applied": distilled.applied,
+            "reasoning_distillation.skip_reason": distilled.skipReason ?? "none",
+            "reasoning_distillation.slot_count": conversion.reasoningBindings.length,
+          })
+        }
+      }
       if (yield* compaction.compactIfNeeded({ sessionID: session.id, entries, model, request }))
         return yield* Effect.die(continueAfterCompaction(currentStep))
       const startSnapshot = yield* Snapshot.captureDeduped(history.snapshots, snapshots.capture)

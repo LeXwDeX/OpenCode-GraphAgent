@@ -2,6 +2,17 @@ export * as ConfigReasoningDistillation from "./reasoning-distillation"
 
 import { Schema } from "effect"
 
+export class Compatibility extends Schema.Class<Compatibility>("ConfigV2.ReasoningDistillationCompatibility")({
+  runtime: Schema.String,
+  protocol: Schema.String,
+  providerModelVariant: Schema.String,
+  endpointIdentity: Schema.String,
+  adapterVersion: Schema.String,
+  optionsFingerprint: Schema.String,
+  transportVerified: Schema.Boolean,
+  upstreamVerified: Schema.Boolean,
+}) {}
+
 /**
  * Reasoning-distillation switch (design D02: default-on, but compatibility authorization still defaults to protected).
  * The feature only ever rewrites a reasoning slot that carries a §2.1 dual-evidence compatibility record; absent that
@@ -9,6 +20,7 @@ import { Schema } from "effect"
  */
 export class Info extends Schema.Class<Info>("ConfigV2.ReasoningDistillation")({
   enabled: Schema.Boolean.pipe(Schema.optional),
+  compatibility: Compatibility.pipe(Schema.Array, Schema.optional),
 }) {}
 
 export type EnableSource = "environment" | "config" | "default"

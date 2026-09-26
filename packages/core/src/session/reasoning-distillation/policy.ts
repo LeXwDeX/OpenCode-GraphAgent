@@ -17,6 +17,8 @@ export const ReasoningDistillationPolicy = {
     maxProposePerIdentity: 1,
     maxJudgePerIdentity: 1,
     maxCallsPerIdentity: 2,
+    /** Hard project-runtime ceiling per session; failures and cancellations count. */
+    maxCallsPerSession: 32,
     /** Paid-candidate admission window: amortized over at most this many subsequent real sends (§5.8). */
     amortizationWindow: 8,
   },

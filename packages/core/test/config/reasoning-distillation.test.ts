@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test"
+import { Schema } from "effect"
 import { ConfigReasoningDistillation } from "../../src/config/reasoning-distillation"
 
 describe("ConfigReasoningDistillation.resolveEnabled (D02)", () => {
@@ -25,5 +26,25 @@ describe("ConfigReasoningDistillation.resolveEnabled (D02)", () => {
       enabled: true,
       source: "config",
     })
+  })
+
+  test("decodes exact compatibility evidence records", () => {
+    const decoded = Schema.decodeUnknownSync(ConfigReasoningDistillation.Info)({
+      enabled: true,
+      compatibility: [
+        {
+          runtime: "opencode-ai-sdk",
+          protocol: "openai-compatible",
+          providerModelVariant: "provider/model/default",
+          endpointIdentity: "endpoint-hash",
+          adapterVersion: "adapter-v1",
+          optionsFingerprint: "options-hash",
+          transportVerified: true,
+          upstreamVerified: true,
+        },
+      ],
+    })
+    expect(decoded.compatibility).toHaveLength(1)
+    expect(decoded.compatibility?.[0].upstreamVerified).toBe(true)
   })
 })

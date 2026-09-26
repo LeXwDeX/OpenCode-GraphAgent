@@ -12,23 +12,32 @@ import {
   type SourceSpan,
 } from "@opencode-ai/core/session/reasoning-distillation"
 import { Hash } from "@opencode-ai/core/util/hash"
+import type { SessionV1 } from "@opencode-ai/core/v1/session"
+import type { ModelMessage } from "ai"
 import {
+  bindInterleavedReasoningLineage,
+  bindNativeInterleavedReasoningLineage,
   bindPersistedReasoningRefs,
   buildJudgePrompt,
   buildProposePrompt,
   buildReasoningEvidence,
   buildSlotMappings,
+  emptyLifecycleState,
   extractInterleavedReasoningSlots,
+  extractNativeInterleavedReasoningSlots,
   organizerFingerprintOf,
   parseCandidate,
   parseSupport,
   projectDistillationAISDK,
+  reasoningHistory,
   resolveOrganizerTier,
   runJudge,
+  runDistillationCycle,
   runPropose,
   type AuxiliaryCaller,
   type OrganizerModel,
   type ReasoningSlotObservation,
+  type ReasoningHistorySnapshot,
   type SpanResolver,
   type ToolCallObservation,
 } from "../../src/session/reasoning-distillation"
@@ -289,6 +298,143 @@ describe("projectDistillationAISDK (§5.2)", () => {
     expect(result.applied).toBe(false)
     expect(result.plan.skipReason).toBe("below-target")
     expect(result.request).toBe(request)
+  })
+})
+
+describe("runDistillationCycle live lifecycle", () => {
+  const candidateRaw = (text: string) => ({
+    claims: [
+      {
+        id: "c1",
+        kind: "decision",
+        text: "精简结论",
+        scope: "本次会话",
+        sources: [{ messageID: "m1", partID: "p1", start: 0, end: text.length }],
+        evidence: [{ messageID: "m1", partID: "p1", kind: "source" }],
+        status: "verified",
+      },
+    ],
+    preserved: [],
+    coverage: [
+      {
+        source: { messageID: "m1", partID: "p1", start: 0, end: text.length },
+        action: "keep",
+        claimID: "c1",
+      },
+    ],
+  })
+  const cycleInput = (request: WireRequest, calls: { propose: number; judge: number }) => ({
+    request,
+    identity: { model: "m", runtime: "r" },
+    sessionID: "s1",
+    purpose: "conversation" as const,
+    budget: overBudgetInput(request.messages),
+    slots: [slot({ text: TEXT })],
+    calls: [],
+    inventoryComplete: true,
+    inventoryFingerprint: "inv1",
+    capability: capability(),
+    records: [record()],
+    organizerFingerprint: "org1",
+    originalTokens: 1000,
+    callPropose: async () => {
+      calls.propose++
+      return candidateRaw(TEXT)
+    },
+    callJudge: async () => {
+      calls.judge++
+      return { support: [{ claimID: "c1", verdict: "supported", method: "judged" }] }
+    },
+  })
+
+  test("uses one propose call in the first cycle and one judge call in the next before projecting", async () => {
+    const request = wireRequest(TEXT)
+    const calls = { propose: 0, judge: 0 }
+    const first = await runDistillationCycle(emptyLifecycleState, cycleInput(request, calls))
+    expect(first.attempted).toBe("propose")
+    expect(first.projection.applied).toBe(false)
+    expect(first.projection.request).toBe(request)
+    expect(calls).toEqual({ propose: 1, judge: 0 })
+
+    const second = await runDistillationCycle(first.state, cycleInput(request, calls))
+    expect(second.attempted).toBe("judge")
+    expect(second.projection.applied).toBe(true)
+    expect(second.projection.request.messages[0].reasoning).toContain("精简结论")
+    expect(request.messages[0].reasoning).toBe(TEXT)
+    expect(calls).toEqual({ propose: 1, judge: 1 })
+
+    const third = await runDistillationCycle(second.state, cycleInput(request, calls))
+    expect(third.attempted).toBe("none")
+    expect(third.projection.applied).toBe(true)
+    expect(calls).toEqual({ propose: 1, judge: 1 })
+  })
+
+  test("compatibility-unproven never calls an auxiliary model", async () => {
+    const request = wireRequest(TEXT)
+    const calls = { propose: 0, judge: 0 }
+    const result = await runDistillationCycle(emptyLifecycleState, {
+      ...cycleInput(request, calls),
+      records: [],
+    })
+    expect(result.projection.skipReason).toBe("compatibility-unproven")
+    expect(result.attempted).toBe("none")
+    expect(calls).toEqual({ propose: 0, judge: 0 })
+  })
+
+  test("a malformed propose result consumes quota and is not retried", async () => {
+    const request = wireRequest(TEXT)
+    let calls = 0
+    const input = {
+      ...cycleInput(request, { propose: 0, judge: 0 }),
+      callPropose: async () => {
+        calls++
+        return { malformed: true }
+      },
+    }
+    const first = await runDistillationCycle(emptyLifecycleState, input)
+    const second = await runDistillationCycle(first.state, input)
+    expect(first.attempted).toBe("propose")
+    expect(second.attempted).toBe("none")
+    expect(second.projection.skipReason).toBe("call-budget-exhausted")
+    expect(calls).toBe(1)
+  })
+
+  test("persists quota before an interruptible call can return a late result", async () => {
+    const request = wireRequest(TEXT)
+    let finish: ((value: unknown) => void) | undefined
+    let committed = emptyLifecycleState
+    const pending = runDistillationCycle(emptyLifecycleState, {
+      ...cycleInput(request, { propose: 0, judge: 0 }),
+      callPropose: () => new Promise((resolve) => void (finish = resolve)),
+      commitState: (state) => void (committed = state),
+    })
+    await Promise.resolve()
+
+    expect(committed.callsBySession.s1).toBe(1)
+    const retry = await runDistillationCycle(committed, cycleInput(request, { propose: 0, judge: 0 }))
+    expect(retry.attempted).toBe("none")
+    expect(retry.projection.skipReason).toBe("call-budget-exhausted")
+
+    finish?.({ malformed: true })
+    await pending
+  })
+
+  test("enforces the total per-session auxiliary-call ceiling", async () => {
+    const request = wireRequest(TEXT)
+    let calls = 0
+    const result = await runDistillationCycle(
+      {
+        ...emptyLifecycleState,
+        callsBySession: { s1: ReasoningDistillationPolicy.calls.maxCallsPerSession },
+      },
+      {
+        ...cycleInput(request, { propose: 0, judge: 0 }),
+        callPropose: async () => (calls++, candidateRaw(TEXT)),
+      },
+    )
+    expect(result.attempted).toBe("none")
+    expect(result.projection.skipReason).toBe("call-budget-exhausted")
+    expect(calls).toBe(0)
   })
 })
 
@@ -603,5 +749,149 @@ describe("bindPersistedReasoningRefs (§5.8 stable cache keys)", () => {
     expect(
       bindPersistedReasoningRefs(slots, [{ messageID: "msg_signed", partID: "p1", text: "重复" }])[0].messageID,
     ).toBe("messages.0")
+  })
+})
+
+describe("persisted history to final W1 lineage", () => {
+  const source = (texts: readonly string[]): ModelMessage => ({
+    role: "assistant",
+    content: texts.map((text) => ({ type: "reasoning" as const, text })),
+  })
+  const transformed = (text: string): ModelMessage => ({
+    role: "assistant",
+    content: [],
+    providerOptions: { openaiCompatible: { reasoning_content: text } },
+  })
+  const history = (groups: ReasoningHistorySnapshot["groups"]): ReasoningHistorySnapshot => ({
+    groups,
+    calls: [],
+    inventoryComplete: true,
+    inventoryFingerprint: "inventory",
+  })
+  const part = (messageID: string, partID: string, text: string) => ({
+    messageID,
+    partID,
+    text,
+    signed: false,
+    encrypted: false,
+    settled: true,
+  })
+
+  test("binds duplicate text by chronological source order and exact final wire position", () => {
+    const snapshot = history([
+      { messageID: "m1", parts: [part("m1", "p1", "重复")] },
+      { messageID: "m2", parts: [part("m2", "p2", "重复")] },
+    ])
+    const lineage = bindInterleavedReasoningLineage(
+      [source(["重复"]), { role: "user", content: "next" }, source(["重复"])],
+      [transformed("重复"), { role: "user", content: "next" }, transformed("重复")],
+      "reasoning_content",
+      snapshot,
+    )
+    expect(lineage.map((item) => [item.wireMessageIndex, item.parts[0].messageID, item.parts[0].partID])).toEqual([
+      [0, "m1", "p1"],
+      [2, "m2", "p2"],
+    ])
+  })
+
+  test("preserves multi-part lineage so the extractor can protect the joined W1 slot", () => {
+    const snapshot = history([{ messageID: "m1", parts: [part("m1", "p1", "甲"), part("m1", "p2", "乙")] }])
+    const lineage = bindInterleavedReasoningLineage(
+      [source(["甲", "乙"])],
+      [transformed("甲乙")],
+      "reasoning_content",
+      snapshot,
+    )
+    expect(lineage[0].parts.map((item) => item.partID)).toEqual(["p1", "p2"])
+    const slots = extractInterleavedReasoningSlots([transformed("甲乙")], "reasoning_content", ["messages"], lineage)
+    expect(slots[0].structureRewritable).toBe(false)
+    expect(slots[0].settled).toBe(false)
+  })
+
+  test("conversion drift produces no lineage instead of guessing by text", () => {
+    const snapshot = history([{ messageID: "m1", parts: [part("m1", "p1", "原文")] }])
+    expect(
+      bindInterleavedReasoningLineage([source(["原文"])], [transformed("被变更")], "reasoning_content", snapshot),
+    ).toEqual([])
+  })
+
+  test("re-indexes exact lineage after Native lowering removes system messages", () => {
+    const snapshot = history([{ messageID: "m1", parts: [part("m1", "p1", "原文")] }])
+    const sourceMessages: ModelMessage[] = [
+      { role: "system", content: "system" },
+      { role: "user", content: "question" },
+      source(["原文"]),
+    ]
+    const transformedMessages: ModelMessage[] = [
+      { role: "system", content: "system" },
+      { role: "user", content: "question" },
+      transformed("原文"),
+    ]
+    const lineage = bindNativeInterleavedReasoningLineage(
+      sourceMessages,
+      transformedMessages,
+      "reasoning_content",
+      snapshot,
+    )
+    expect(lineage.map((item) => item.wireMessageIndex)).toEqual([1])
+    const slots = extractNativeInterleavedReasoningSlots(
+      [
+        { role: "user", content: [] },
+        {
+          role: "assistant",
+          content: [],
+          native: { openaiCompatible: { reasoning_content: "原文" } },
+        },
+      ],
+      "reasoning_content",
+      lineage,
+    )
+    expect(slots[0]).toMatchObject({
+      messageID: "m1",
+      partID: "p1",
+      bodyPath: ["messages", 1, "native", "openaiCompatible", "reasoning_content"],
+      structureRewritable: true,
+      settled: true,
+    })
+  })
+
+  test("history records protection metadata, settlement, and incomplete tool inventory without payload leakage", () => {
+    const messages = [
+      {
+        info: { id: "m1", role: "assistant" },
+        parts: [
+          {
+            id: "r1",
+            messageID: "m1",
+            sessionID: "s1",
+            type: "reasoning",
+            text: "秘密原文",
+            metadata: { anthropic: { signature: "sig" }, openai: { reasoningEncryptedContent: "cipher" } },
+            time: { start: 1 },
+          },
+          {
+            id: "t1",
+            messageID: "m1",
+            sessionID: "s1",
+            type: "tool",
+            callID: "c1",
+            tool: "read",
+            state: { status: "running", input: { filePath: "/secret" }, time: { start: 1 } },
+          },
+        ],
+      },
+    ] as unknown as SessionV1.WithParts[]
+    const snapshot = reasoningHistory(messages)
+    expect(snapshot.groups[0].parts[0]).toMatchObject({
+      messageID: "m1",
+      partID: "r1",
+      signed: true,
+      encrypted: true,
+      settled: false,
+    })
+    expect(snapshot.inventoryComplete).toBe(false)
+    expect(snapshot.calls[0]).toMatchObject({ status: "running", result: "missing", provenance: "unavailable" })
+    expect(snapshot.inventoryFingerprint).not.toContain("秘密原文")
+    expect(snapshot.inventoryFingerprint).not.toContain("/secret")
   })
 })
