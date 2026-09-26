@@ -2945,6 +2945,18 @@ describe("ProviderTransform.message - providerOptions key remapping", () => {
     expect(result[0].providerOptions?.openai).toBeUndefined()
   })
 
+  test("omits absent provider options instead of adding undefined wire fields", () => {
+    const model = createModel("test", "@ai-sdk/openai-compatible")
+    const result = ProviderTransform.message([{ role: "user", content: [{ type: "text", text: "Hello" }] }], model, {})
+    const firstMessage = result[0]
+    if (!firstMessage) throw new Error("expected one transformed message")
+    expect(Object.hasOwn(firstMessage, "providerOptions")).toBe(false)
+    if (!Array.isArray(firstMessage.content)) throw new Error("expected transformed text content parts")
+    const firstPart = firstMessage.content[0]
+    if (!firstPart) throw new Error("expected one transformed content part")
+    expect(Object.hasOwn(firstPart, "providerOptions")).toBe(false)
+  })
+
   test("azure cognitive services remaps providerID to 'azure' key", () => {
     const model = createModel("azure-cognitive-services", "@ai-sdk/azure")
     const msgs = [
@@ -5226,4 +5238,3 @@ describe("ProviderTransform sampling defaults - DeepSeek", () => {
     expect(ProviderTransform.topK(model(providerID, id))).toBeUndefined()
   })
 })
-

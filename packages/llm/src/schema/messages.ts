@@ -276,6 +276,8 @@ export class LLMRequest extends Schema.Class<LLMRequest>("LLM.Request")({
   tools: Schema.Array(ToolDefinition),
   toolChoice: Schema.optional(ToolChoice),
   generation: Schema.optional(GenerationOptions),
+  /** Omit the provider output-token cap after route and model defaults are resolved. */
+  omitMaxTokens: Schema.optional(Schema.Boolean),
   providerOptions: Schema.optional(ProviderOptions),
   http: Schema.optional(HttpOptions),
   responseFormat: Schema.optional(ResponseFormat),
@@ -294,6 +296,7 @@ export namespace LLMRequest {
     tools: request.tools,
     toolChoice: request.toolChoice,
     generation: request.generation,
+    omitMaxTokens: request.omitMaxTokens,
     providerOptions: request.providerOptions,
     http: request.http,
     responseFormat: request.responseFormat,
