@@ -68,6 +68,15 @@ export interface Def<
     onExcessProperty?: "ignore" | "error" | "preserve"
     propertyOrder?: "none" | "original"
   }
+  /**
+   * Tool-scoped compatibility repair for provider-emitted argument shapes.
+   * Runs only when strict schema decoding fails: first the shared
+   * stringified-container repair is applied, then this hook, then the decoded
+   * value is strictly validated once. Implementations must remain
+   * schema-specific and fail closed (return the input unchanged when the
+   * shape is not recognized).
+   */
+  repairArguments?: (value: unknown) => unknown
   execute(args: Schema.Schema.Type<Parameters>, ctx: Context): Effect.Effect<ExecuteResult<M>>
   formatValidationError?(error: unknown): string
 }
@@ -175,9 +184,22 @@ function wrap<Parameters extends Schema.Decoder<unknown>, Result extends Metadat
           // decoding already failed, so legitimate string arguments that look
           // like JSON are never re-parsed.
           const strict = yield* decode(args).pipe(Effect.option)
-          const decoded = Option.isSome(strict)
-            ? strict.value
-            : yield* decode(repairStringifiedContainers(args)).pipe(Effect.mapError(invalidArguments))
+          let decoded: unknown
+          if (Option.isSome(strict)) {
+            decoded = strict.value
+          } else {
+            const repaired = toolInfo.repairArguments
+              ? toolInfo.repairArguments(repairStringifiedContainers(args))
+              : repairStringifiedContainers(args)
+            // Privacy-safe repair diagnostics (#647): emit key names with type
+            // transitions only — never argument values.
+            if (toolInfo.repairArguments) {
+              const changes = repairTypeChanges(args, repaired)
+              if (changes.length > 0)
+                yield* Effect.logInfo("tool arguments repaired", { "tool.name": id, "repair.changes": changes })
+            }
+            decoded = yield* decode(repaired).pipe(Effect.mapError(invalidArguments))
+          }
           const result = yield* execute(decoded as Schema.Schema.Type<Parameters>, ctx)
           if (result.metadata.truncated !== undefined) {
             return result
@@ -197,6 +219,27 @@ function wrap<Parameters extends Schema.Decoder<unknown>, Result extends Metadat
       }
       return toolInfo
     })
+}
+
+function valueTypeName(value: unknown): string {
+  if (value === null) return "null"
+  if (Array.isArray(value)) return "array"
+  return typeof value
+}
+
+/** Top-level key names whose value type changed between the raw arguments and
+ * the repaired arguments. Names only — values never enter the log. */
+function repairTypeChanges(before: unknown, after: unknown): string[] {
+  if (typeof before !== "object" || before === null || typeof after !== "object" || after === null) return []
+  const leftEntries = new Map(Object.entries(before))
+  const rightEntries = new Map(Object.entries(after))
+  const changes: string[] = []
+  for (const key of new Set([...leftEntries.keys(), ...rightEntries.keys()])) {
+    const left = valueTypeName(leftEntries.get(key))
+    const right = valueTypeName(rightEntries.get(key))
+    if (left !== right) changes.push(`${key}:${left}->${right}`)
+  }
+  return changes
 }
 
 // Some models string-encode a tool-argument container whose schema is a

@@ -273,9 +273,14 @@ type PromptLayerOptions = {
   agentLayer?: Layer.Layer<AgentSvc.Service>
   ripgrepLayer?: Layer.Layer<Ripgrep.Service>
   native?: boolean
+  experimentalBackgroundSubagents?: boolean
 }
 
 function makePrompt(input?: PromptLayerOptions) {
+  const flags = RuntimeFlags.layer({
+    experimentalEventSystem: true,
+    experimentalBackgroundSubagents: input?.experimentalBackgroundSubagents ?? false,
+  })
   // goal: false exercises the Goal-absent degradation path (serviceOption None)
   const goalLayer: Layer.Layer<Goal.Service> =
     input?.goal === false
@@ -334,7 +339,7 @@ function makePrompt(input?: PromptLayerOptions) {
     Layer.provide(Git.defaultLayer),
     Layer.provide(input?.ripgrepLayer ?? Ripgrep.defaultLayer),
     Layer.provide(Format.defaultLayer),
-    Layer.provide(RuntimeFlags.layer({ experimentalEventSystem: true })),
+    Layer.provide(flags),
     Layer.provideMerge(todo),
     Layer.provideMerge(question),
     Layer.provideMerge(deps),
@@ -346,11 +351,11 @@ function makePrompt(input?: PromptLayerOptions) {
       : SessionProcessor.layer.pipe(
           Layer.provide(summary),
           Layer.provide(Image.defaultLayer),
-          Layer.provide(RuntimeFlags.layer({ experimentalEventSystem: true })),
+          Layer.provide(flags),
           Layer.provideMerge(deps),
         )
   const compact = SessionCompaction.layer.pipe(
-    Layer.provide(RuntimeFlags.layer({ experimentalEventSystem: true })),
+    Layer.provide(flags),
     Layer.provideMerge(proc),
     Layer.provideMerge(deps),
   )
@@ -373,7 +378,7 @@ function makePrompt(input?: PromptLayerOptions) {
         Layer.provide(deps),
       ),
     ),
-    Layer.provide(RuntimeFlags.layer({ experimentalEventSystem: true })),
+    Layer.provide(flags),
     Layer.provideMerge(deps),
     Layer.provide(summary),
   )
@@ -408,6 +413,7 @@ const stableGlobRipgrepLayer = Layer.effect(
 
 const it = testEffect(makeHttp())
 const nativeIt = testEffect(makeHttp({ native: true }))
+const backgroundIt = testEffect(makeHttp({ experimentalBackgroundSubagents: true }))
 const stableFoldingIt = testEffect(makeHttp({ ripgrepLayer: stableGlobRipgrepLayer }))
 const stableNativeFoldingIt = testEffect(makeHttp({ native: true, ripgrepLayer: stableGlobRipgrepLayer }))
 const mcpOverrideMarker = `mcp-context-folding-override-${"m".repeat(24_000)}`
@@ -440,6 +446,7 @@ const withMemoryContext = testEffect(
   makeHttp({ memoryContext: ["<project_memory_data>project-memory-probe</project_memory_data>"] }),
 )
 const unix = process.platform !== "win32" ? it.instance : it.instance.skip
+const backgroundUnix = process.platform !== "win32" ? backgroundIt.instance : backgroundIt.instance.skip
 const unixNoLLMServer = process.platform !== "win32" ? noLLMServer.instance : noLLMServer.instance.skip
 
 // Config that registers a custom "test" provider with a "test-model" model
@@ -1489,6 +1496,49 @@ unix(
       expect(subStops).toHaveLength(max)
       expect(subStops[0]!.stopHookActive).toBe(false)
       for (let i = 1; i < max; i++) expect(subStops[i]!.stopHookActive).toBe(true)
+    }),
+  30_000,
+)
+
+backgroundUnix(
+  "task tool repairs exact string background booleans through the full AI SDK tool path (#647)",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        agent: { general: { model: "test/test-model" } },
+      }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const jobs = yield* BackgroundJob.Service
+      const chat = yield* sessions.create({
+        title: "task-background-e2e",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+
+      // The mock model emits background as the exact string "true" — the shape
+      // qwen-family providers send even though the schema declares a boolean.
+      yield* llm.tool("task", {
+        description: "background reviewer",
+        prompt: "review the change",
+        subagent_type: "general",
+        background: "true",
+      })
+      yield* llm.text("dispatched")
+      yield* llm.text("reviewer done")
+
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        parts: [{ type: "text", text: "run the reviewer in the background" }],
+      })
+
+      const kids = yield* sessions.children(chat.id)
+      expect(kids).toHaveLength(1)
+      const childSessionId = kids[0]?.id
+      if (!childSessionId) throw new Error("background task child session missing")
+      const job = yield* jobs.wait({ id: childSessionId, timeout: 30_000 })
+      expect(job.info?.output).toContain("reviewer done")
     }),
   30_000,
 )

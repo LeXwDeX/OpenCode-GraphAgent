@@ -17,6 +17,7 @@ import { SessionStatus } from "@/session/status"
 import { TaskTool, type TaskPromptOps } from "../../src/tool/task"
 import { WorkflowTool } from "../../src/tool/workflow"
 import { Truncate } from "@/tool/truncate"
+import { Tool } from "@/tool/tool"
 import { ToolRegistry } from "@/tool/registry"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { disposeAllInstances } from "../fixture/fixture"
@@ -51,6 +52,9 @@ const layer = (flags: Partial<RuntimeFlags.Info> = {}) =>
 
 const it = testEffect(layer())
 const background = testEffect(layer({ experimentalBackgroundSubagents: true }))
+const executeRaw = (execute: Tool.Def["execute"]) =>
+  // oxlint-disable-next-line typescript-eslint(no-unsafe-type-assertion) -- test shim: invoke the wrapped execute with unrepaired raw args
+  execute as unknown as (args: unknown, ctx: Tool.Context) => Effect.Effect<Tool.ExecuteResult>
 
 function defer<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void
@@ -820,12 +824,13 @@ describe("tool.task", () => {
       const tool = yield* TaskTool
       const def = yield* tool.init()
 
-      const result = yield* def.execute(
+      const execute = executeRaw(def.execute)
+      const result = yield* execute(
         {
           description: "inspect bug",
           prompt: "look into the cache key path",
           subagent_type: "general",
-          background: true,
+          background: "true",
         },
         {
           sessionID: chat.id,
@@ -848,6 +853,37 @@ describe("tool.task", () => {
       expect(result.metadata.background).toBe(true)
       expect(result.output).toContain(`state="running"`)
       expect(job?.status).toBe("running")
+    }),
+  )
+
+  it.instance("treats the exact string false as foreground task execution", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const execute = executeRaw(def.execute)
+
+      const result = yield* execute(
+        {
+          description: "inspect bug",
+          prompt: "look into the cache key path",
+          subagent_type: "general",
+          background: "false",
+        },
+        {
+          sessionID: chat.id,
+          messageID: assistant.id,
+          agent: "build",
+          abort: new AbortController().signal,
+          extra: { promptOps: stubOps({ text: "foreground done" }) },
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        },
+      )
+
+      expect(result.output).toContain('state="completed"')
+      expect(result.metadata.background).not.toBe(true)
     }),
   )
 
@@ -1160,6 +1196,114 @@ describe("tool.task", () => {
 
       expect((yield* jobs.get(child.id))?.status).toBe("cancelled")
       expect((yield* jobs.get(grandchild.id))?.status).toBe("cancelled")
+    }),
+  )
+
+  it.instance("rejects non-exact string booleans for background with the schema error", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const execute = executeRaw(def.execute)
+
+      for (const value of ["TRUE", "FALSE", " true", "true ", "1", "yes", ""]) {
+        const exit = yield* execute(
+          {
+            description: "inspect bug",
+            prompt: "look into the cache key path",
+            subagent_type: "general",
+            background: value,
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps: stubOps() },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        ).pipe(Effect.exit)
+
+        expect(Exit.isFailure(exit)).toBe(true)
+        if (Exit.isFailure(exit)) expect(Cause.pretty(exit.cause)).toContain("background")
+      }
+    }),
+  )
+
+  it.instance("ignores prototype-chain background lookalikes and runs in the foreground", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const execute = executeRaw(def.execute)
+
+      const raw = Object.assign(Object.create({ background: "true" }), {
+        description: "inspect bug",
+        prompt: "look into the cache key path",
+        subagent_type: "general",
+      })
+      const result = yield* execute(raw, {
+        sessionID: chat.id,
+        messageID: assistant.id,
+        agent: "build",
+        abort: new AbortController().signal,
+        extra: { promptOps: stubOps({ text: "foreground done" }) },
+        messages: [],
+        metadata: () => Effect.void,
+        ask: () => Effect.void,
+      })
+
+      expect(result.metadata.background).not.toBe(true)
+      expect(result.output).toContain('state="completed"')
+      expect((yield* sessions.children(chat.id))).toHaveLength(1)
+    }),
+  )
+
+  background.instance("three concurrent reviewer tasks tolerate mixed background encodings", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const execute = executeRaw(def.execute)
+      const promptOps = stubOps({ text: "reviewer done" })
+
+      const ctx = () => ({
+        sessionID: chat.id,
+        messageID: assistant.id,
+        agent: "build",
+        abort: new AbortController().signal,
+        extra: { promptOps },
+        messages: [],
+        metadata: () => Effect.void,
+        ask: () => Effect.void,
+      })
+      const argsFor = (background: unknown) => ({
+        description: "review changes",
+        prompt: "review the diff",
+        subagent_type: "general",
+        background,
+      })
+
+      const [stringTrue, stringFalse, nativeTrue] = yield* Effect.all(
+        [execute(argsFor("true"), ctx()), execute(argsFor("false"), ctx()), execute(argsFor(true), ctx())],
+        { concurrency: 3 },
+      )
+
+      expect(stringTrue.metadata.background).toBe(true)
+      expect(stringFalse.metadata.background).not.toBe(true)
+      expect(nativeTrue.metadata.background).toBe(true)
+
+      const sessionIds = new Set([stringTrue.metadata.sessionId, stringFalse.metadata.sessionId, nativeTrue.metadata.sessionId])
+      expect(sessionIds.size).toBe(3)
+      expect((yield* sessions.children(chat.id)).length).toBe(3)
+
+      yield* jobs.wait({ id: stringTrue.metadata.sessionId, timeout: 5_000 })
+      expect((yield* jobs.get(stringTrue.metadata.sessionId))?.status).toBe("completed")
     }),
   )
 })
