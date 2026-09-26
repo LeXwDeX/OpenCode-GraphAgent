@@ -34,6 +34,7 @@ import {
   runJudge,
   runDistillationCycle,
   runPropose,
+  type AuxiliaryCallResult,
   type AuxiliaryCaller,
   type OrganizerModel,
   type ReasoningSlotObservation,
@@ -339,11 +340,14 @@ describe("runDistillationCycle live lifecycle", () => {
     originalTokens: 1000,
     callPropose: async () => {
       calls.propose++
-      return candidateRaw(TEXT)
+      return { output: candidateRaw(TEXT), usageTokens: 40 }
     },
     callJudge: async () => {
       calls.judge++
-      return { support: [{ claimID: "c1", verdict: "supported", method: "judged" }] }
+      return {
+        output: { support: [{ claimID: "c1", verdict: "supported", method: "judged" }] },
+        usageTokens: 20,
+      }
     },
   })
 
@@ -388,7 +392,7 @@ describe("runDistillationCycle live lifecycle", () => {
       ...cycleInput(request, { propose: 0, judge: 0 }),
       callPropose: async () => {
         calls++
-        return { malformed: true }
+        return { output: { malformed: true }, usageTokens: 20 }
       },
     }
     const first = await runDistillationCycle(emptyLifecycleState, input)
@@ -401,7 +405,7 @@ describe("runDistillationCycle live lifecycle", () => {
 
   test("persists quota before an interruptible call can return a late result", async () => {
     const request = wireRequest(TEXT)
-    let finish: ((value: unknown) => void) | undefined
+    let finish: ((value: AuxiliaryCallResult) => void) | undefined
     let committed = emptyLifecycleState
     const pending = runDistillationCycle(emptyLifecycleState, {
       ...cycleInput(request, { propose: 0, judge: 0 }),
@@ -415,8 +419,95 @@ describe("runDistillationCycle live lifecycle", () => {
     expect(retry.attempted).toBe("none")
     expect(retry.projection.skipReason).toBe("call-budget-exhausted")
 
-    finish?.({ malformed: true })
+    finish?.({ output: { malformed: true }, usageTokens: 20 })
     await pending
+  })
+
+  test("unknown provider usage pauses later paid calls while preserving the original request", async () => {
+    const request = wireRequest(TEXT)
+    let calls = 0
+    const first = await runDistillationCycle(emptyLifecycleState, {
+      ...cycleInput(request, { propose: 0, judge: 0 }),
+      callPropose: async () => {
+        calls++
+        return { output: candidateRaw(TEXT) }
+      },
+    })
+    expect(first.state.usageBySession.s1).toMatchObject({
+      paidAdmissionPaused: true,
+      unknownUsageCalls: 1,
+    })
+
+    const second = await runDistillationCycle(first.state, cycleInput(request, { propose: 0, judge: 0 }))
+    expect(second.attempted).toBe("none")
+    expect(second.projection.request).toBe(request)
+    expect(second.projection.skipReason).toBe("call-budget-exhausted")
+    expect(calls).toBe(1)
+  })
+
+  test("processes multiple slots without starving later slots and issues at most one auxiliary call per request", async () => {
+    const secondText = "第二段原始冗长思绪".repeat(20)
+    const request = {
+      messages: [
+        { role: "assistant", reasoning: TEXT },
+        { role: "assistant", reasoning: secondText },
+      ],
+      metadata: { mutable: "original" },
+    }
+    const slots = [
+      slot({ text: TEXT }),
+      slot({ messageID: "m2", partID: "p2", bodyPath: ["messages", 1, "reasoning"], text: secondText }),
+    ]
+    const calls: string[] = []
+    const candidateFor = (text: string, messageID: string, partID: string) => ({
+      claims: [
+        {
+          id: `claim-${partID}`,
+          kind: "decision",
+          text: `精简结论-${partID}`,
+          scope: "本次会话",
+          sources: [{ messageID, partID, start: 0, end: text.length }],
+          evidence: [{ messageID, partID, kind: "source" }],
+          status: "verified",
+        },
+      ],
+      preserved: [],
+      coverage: [
+        { source: { messageID, partID, start: 0, end: text.length }, action: "keep", claimID: `claim-${partID}` },
+      ],
+    })
+    const input = {
+      ...cycleInput(request, { propose: 0, judge: 0 }),
+      budget: overBudgetInput(request.messages),
+      slots,
+      callPropose: async (prompt: string) => {
+        const selected = prompt.includes(secondText) ? [secondText, "m2", "p2"] : [TEXT, "m1", "p1"]
+        calls.push(`propose-${selected[2]}`)
+        return { output: candidateFor(selected[0], selected[1], selected[2]), usageTokens: 40 }
+      },
+      callJudge: async (prompt: string) => {
+        const partID = prompt.includes(secondText) ? "p2" : "p1"
+        calls.push(`judge-${partID}`)
+        return {
+          output: { support: [{ claimID: `claim-${partID}`, verdict: "supported", method: "judged" }] },
+          usageTokens: 20,
+        }
+      },
+    }
+
+    let state = emptyLifecycleState
+    let current = request
+    for (let index = 0; index < 4; index++) {
+      const cycle = await runDistillationCycle(state, { ...input, request: current })
+      state = cycle.state
+      current = cycle.projection.request
+    }
+
+    expect(calls).toEqual(["propose-p1", "judge-p1", "propose-p2", "judge-p2"])
+    expect(current.messages[0].reasoning).toContain("精简结论-p1")
+    expect(current.messages[1].reasoning).toContain("精简结论-p2")
+    expect(request.messages[0].reasoning).toBe(TEXT)
+    expect(request.messages[1].reasoning).toBe(secondText)
   })
 
   test("enforces the total per-session auxiliary-call ceiling", async () => {
@@ -429,7 +520,7 @@ describe("runDistillationCycle live lifecycle", () => {
       },
       {
         ...cycleInput(request, { propose: 0, judge: 0 }),
-        callPropose: async () => (calls++, candidateRaw(TEXT)),
+        callPropose: async () => (calls++, { output: candidateRaw(TEXT), usageTokens: 20 }),
       },
     )
     expect(result.attempted).toBe("none")
@@ -669,19 +760,20 @@ describe("prompt builders (§5.4.1 / §5.5.3)", () => {
 
 describe("runPropose / runJudge orchestration (§5.5.3)", () => {
   test("runPropose parses a well-formed model output into a Candidate", async () => {
-    const callModel: AuxiliaryCaller = async () => validRaw
+    const callModel: AuxiliaryCaller = async () => ({ output: validRaw, usageTokens: 20 })
     const candidate = await runPropose({ key: distillKey(), prompt: "p", resolveSpan: resolver, callModel })
     expect(candidate?.claims[0].id).toBe("c1")
   })
 
   test("runPropose returns undefined on malformed output", async () => {
-    const callModel: AuxiliaryCaller = async () => ({ garbage: true })
+    const callModel: AuxiliaryCaller = async () => ({ output: { garbage: true }, usageTokens: 20 })
     expect(await runPropose({ key: distillKey(), prompt: "p", resolveSpan: resolver, callModel })).toBeUndefined()
   })
 
   test("runJudge parses support verdicts", async () => {
     const callModel: AuxiliaryCaller = async () => ({
-      support: [{ claimID: "c1", verdict: "supported", method: "judged" }],
+      output: { support: [{ claimID: "c1", verdict: "supported", method: "judged" }] },
+      usageTokens: 20,
     })
     expect(await runJudge({ prompt: "p", callModel })).toEqual([
       { claimID: "c1", result: { verdict: "supported", method: "judged" } },
@@ -689,7 +781,7 @@ describe("runPropose / runJudge orchestration (§5.5.3)", () => {
   })
 
   test("runJudge returns undefined on malformed output", async () => {
-    const callModel: AuxiliaryCaller = async () => "not json"
+    const callModel: AuxiliaryCaller = async () => ({ output: "not json", usageTokens: 20 })
     expect(await runJudge({ prompt: "p", callModel })).toBeUndefined()
   })
 })

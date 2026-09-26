@@ -26,6 +26,11 @@ export const ReasoningDistillationPolicy = {
     /** Auxiliary input/output caps, further bounded by the selected model's smaller limit (§5.8). */
     maxInputTokens: 32_768,
     maxOutputTokens: 4_096,
+    /** Hard admission-reservation ceiling per session. State is held per
+     * sessionID inside one distillation-runner instance, so exhausting the
+     * ceiling in one session never blocks another session sharing the same
+     * runner. */
+    maxReservedTokensPerSession: 262_144,
     /** A non-positive estimated saving skips the call/projection (§5.8). */
     minimumNetSavingsTokens: 1,
   },

@@ -60,6 +60,11 @@ type LifecycleState = Readonly<{
   support: Readonly<Record<string, readonly ClaimSupport[]>>
   judgeFingerprints: Readonly<Record<string, string>>
   calls: number
+  reservedTokens: number
+  actualTokens: number
+  unknownUsageCalls: number
+  latencyMs: number
+  paidAdmissionPaused: boolean
 }>
 
 const emptyState: LifecycleState = {
@@ -68,6 +73,11 @@ const emptyState: LifecycleState = {
   support: {},
   judgeFingerprints: {},
   calls: 0,
+  reservedTokens: 0,
+  actualTokens: 0,
+  unknownUsageCalls: 0,
+  latencyMs: 0,
+  paidAdmissionPaused: false,
 }
 
 type Slot = Readonly<ReasoningMessageBinding & { structureRewritable: boolean }>
@@ -77,6 +87,13 @@ export type Result = Readonly<{
   attempted: "none" | "propose" | "judge"
   applied: boolean
   skipReason?: DistillationSkipReason
+  usage?: Readonly<{
+    reservedTokens: number
+    actualTokens: number
+    unknownUsageCalls: number
+    latencyMs: number
+    paidAdmissionPaused: boolean
+  }>
 }>
 
 type Input = Readonly<{
@@ -94,6 +111,14 @@ const unchanged = (request: LLMRequest, skipReason?: DistillationSkipReason): Re
   attempted: "none",
   applied: false,
   ...(skipReason === undefined ? {} : { skipReason }),
+})
+
+const usageSnapshot = (state: LifecycleState): NonNullable<Result["usage"]> => ({
+  reservedTokens: state.reservedTokens,
+  actualTokens: state.actualTokens,
+  unknownUsageCalls: state.unknownUsageCalls,
+  latencyMs: state.latencyMs,
+  paidAdmissionPaused: state.paidAdmissionPaused,
 })
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -432,6 +457,7 @@ const plan = (input: Input, slot: Slot, state: LifecycleState, messages: unknown
   )
   const project = (candidateState = state, support?: readonly ClaimSupport[], judgeFingerprint?: string) => {
     const candidate = cacheLookup(candidateState.cache, selectedKey)?.candidate
+    const currentJudgeFingerprint = judgeFingerprint ?? candidateState.judgeFingerprints[keyFingerprint]
     const nextPlan = planReasoningDistillation(
       {
         purpose: "conversation",
@@ -442,7 +468,7 @@ const plan = (input: Input, slot: Slot, state: LifecycleState, messages: unknown
         quota: { proposeUsed: true, judgeUsed: true },
         originalTokens: Token.estimate(slot.text),
         support: support ?? candidateState.support[keyFingerprint] ?? [],
-        ...(judgeFingerprint === undefined ? {} : { judgeFingerprint }),
+        ...(currentJudgeFingerprint === undefined ? {} : { judgeFingerprint: currentJudgeFingerprint }),
         policyVersion: ReasoningDistillationPolicy.version,
       },
       { resolveText: (span) => slot.text.slice(span.start, span.end) },
@@ -499,7 +525,10 @@ export const make = (llm: LLMClientShape) => {
         const text = LLMResponse.text(response)
         if (text.length > ReasoningDistillationPolicy.tokens.maxOutputTokens * 4) return undefined
         try {
-          return JSON.parse(text) as unknown
+          return {
+            output: JSON.parse(text) as unknown,
+            usageTokens: LLMResponse.usage(response)?.totalTokens,
+          }
         } catch {
           return undefined
         }
@@ -511,69 +540,117 @@ export const make = (llm: LLMClientShape) => {
   const distill = Effect.fn("CoreReasoningDistillation.distill")(function* (input: Input) {
     return yield* lock.withPermits(1)(
       Effect.gen(function* () {
-        const messages = plainMessages(input.request.messages)
-        if (!messages) return unchanged(input.request, "projection-failed")
         const slots: Slot[] = input.bindings.map((binding) => ({ ...binding, structureRewritable: true }))
-        const slot = slots.find((item) => item.settled && !item.signed && !item.encrypted)
-        if (!slot) return unchanged(input.request, "no-rewritable-slot")
+        const eligible = slots.filter((item) => item.settled && !item.signed && !item.encrypted)
+        if (eligible.length === 0) return unchanged(input.request, "no-rewritable-slot")
         let state = states.get(input.sessionID) ?? emptyState
-        const cycle = plan(input, slot, state, messages)
-        if (cycle.currentPlan.extraCall === "propose") {
-          if (state.calls >= ReasoningDistillationPolicy.calls.maxCallsPerSession)
-            return unchanged(input.request, "call-budget-exhausted")
-          const prompt = proposePrompt(slot, cycle.inventory)
-          if (Token.estimate(prompt) > ReasoningDistillationPolicy.tokens.maxInputTokens)
-            return unchanged(input.request, "work-limit")
-          state = { ...state, ledger: consumePropose(state.ledger, cycle.selectedKey), calls: state.calls + 1 }
-          states.set(input.sessionID, state)
-          const raw = yield* callAuxiliary(input, prompt)
-          const candidate = parseCandidate(raw, cycle.selectedKey, slot)
-          if (candidate) {
-            state = {
-              ...state,
-              cache: cacheInsert(state.cache, {
-                key: cycle.selectedKey,
-                candidate,
-                certificate: undefined,
-                derivedBodyBytes: new TextEncoder().encode(JSON.stringify(candidate)).byteLength,
-              }),
-            }
-            states.set(input.sessionID, state)
-          }
-          return { ...unchanged(input.request), attempted: "propose" as const }
-        }
-        if (cycle.currentPlan.extraCall === "judge" && cycle.cached) {
-          if (state.calls >= ReasoningDistillationPolicy.calls.maxCallsPerSession)
-            return unchanged(input.request, "call-budget-exhausted")
-          const prompt = judgePrompt(slot, cycle.cached.candidate, cycle.inventory)
-          if (Token.estimate(prompt) > ReasoningDistillationPolicy.tokens.maxInputTokens)
-            return unchanged(input.request, "work-limit")
-          state = { ...state, ledger: consumeJudge(state.ledger, cycle.selectedKey), calls: state.calls + 1 }
-          states.set(input.sessionID, state)
-          const raw = yield* callAuxiliary(input, prompt)
-          const support = parseSupport(raw)
-          if (!support) return { ...unchanged(input.request), attempted: "judge" as const }
-          const judgeFingerprint = Hash.sha256(JSON.stringify(support))
+        let request = input.request
+        let applied = false
+        let lastSkipReason: DistillationSkipReason | undefined
+
+        const reserve = (prompt: string, role: "propose" | "judge", key: DistillationKey) => {
+          const promptTokens = Token.estimate(prompt)
+          if (promptTokens > ReasoningDistillationPolicy.tokens.maxInputTokens) return "work-limit" as const
+          const reservedTokens = promptTokens + ReasoningDistillationPolicy.tokens.maxOutputTokens
+          if (
+            state.paidAdmissionPaused ||
+            state.calls >= ReasoningDistillationPolicy.calls.maxCallsPerSession ||
+            state.reservedTokens + reservedTokens > ReasoningDistillationPolicy.tokens.maxReservedTokensPerSession
+          )
+            return "call-budget-exhausted" as const
           state = {
             ...state,
-            support: { ...state.support, [cycle.keyFingerprint]: support },
-            judgeFingerprints: { ...state.judgeFingerprints, [cycle.keyFingerprint]: judgeFingerprint },
+            ledger: role === "propose" ? consumePropose(state.ledger, key) : consumeJudge(state.ledger, key),
+            calls: state.calls + 1,
+            reservedTokens: state.reservedTokens + reservedTokens,
           }
           states.set(input.sessionID, state)
-          const projected = cycle.project(state, support, judgeFingerprint)
-          return {
-            request: projected.request,
-            attempted: "judge" as const,
-            applied: projected.applied,
-            ...(projected.skipReason === undefined ? {} : { skipReason: projected.skipReason }),
-          }
+          return reservedTokens
         }
-        const projected = cycle.project(state)
+
+        const settle = (reservedTokens: number, usageTokens: number | undefined, latencyMs: number) => {
+          const actual =
+            typeof usageTokens === "number" && Number.isFinite(usageTokens) && usageTokens >= 0
+              ? Math.ceil(usageTokens)
+              : undefined
+          state = {
+            ...state,
+            actualTokens: state.actualTokens + (actual ?? 0),
+            unknownUsageCalls: state.unknownUsageCalls + (actual === undefined ? 1 : 0),
+            latencyMs: state.latencyMs + Math.max(0, latencyMs),
+            paidAdmissionPaused:
+              state.paidAdmissionPaused || actual === undefined || actual > reservedTokens,
+          }
+          states.set(input.sessionID, state)
+        }
+
+        for (const slot of eligible) {
+          const messages = plainMessages(request.messages)
+          if (!messages) return { ...unchanged(request, "projection-failed"), applied, usage: usageSnapshot(state) }
+          const cycleInput = { ...input, request }
+          const cycle = plan(cycleInput, slot, state, messages)
+          if (cycle.currentPlan.extraCall === "propose") {
+            const prompt = proposePrompt(slot, cycle.inventory)
+            const reserved = reserve(prompt, "propose", cycle.selectedKey)
+            if (typeof reserved !== "number")
+              return { ...unchanged(request, reserved), applied, usage: usageSnapshot(state) }
+            const started = Date.now()
+            const raw = yield* callAuxiliary(cycleInput, prompt)
+            settle(reserved, raw?.usageTokens, Date.now() - started)
+            const candidate = raw ? parseCandidate(raw.output, cycle.selectedKey, slot) : undefined
+            if (candidate) {
+              state = {
+                ...state,
+                cache: cacheInsert(state.cache, {
+                  key: cycle.selectedKey,
+                  candidate,
+                  certificate: undefined,
+                  derivedBodyBytes: new TextEncoder().encode(JSON.stringify(candidate)).byteLength,
+                }),
+              }
+              states.set(input.sessionID, state)
+            }
+            return { request, attempted: "propose" as const, applied, usage: usageSnapshot(state) }
+          }
+          if (cycle.currentPlan.extraCall === "judge" && cycle.cached) {
+            const prompt = judgePrompt(slot, cycle.cached.candidate, cycle.inventory)
+            const reserved = reserve(prompt, "judge", cycle.selectedKey)
+            if (typeof reserved !== "number")
+              return { ...unchanged(request, reserved), applied, usage: usageSnapshot(state) }
+            const started = Date.now()
+            const raw = yield* callAuxiliary(cycleInput, prompt)
+            settle(reserved, raw?.usageTokens, Date.now() - started)
+            const support = raw ? parseSupport(raw.output) : undefined
+            if (!support) return { request, attempted: "judge" as const, applied, usage: usageSnapshot(state) }
+            const judgeFingerprint = Hash.sha256(JSON.stringify(support))
+            state = {
+              ...state,
+              support: { ...state.support, [cycle.keyFingerprint]: support },
+              judgeFingerprints: { ...state.judgeFingerprints, [cycle.keyFingerprint]: judgeFingerprint },
+            }
+            states.set(input.sessionID, state)
+            const projected = cycle.project(state, support, judgeFingerprint)
+            request = projected.request
+            applied ||= projected.applied
+            return {
+              request,
+              attempted: "judge" as const,
+              applied,
+              usage: usageSnapshot(state),
+              ...(projected.skipReason === undefined ? {} : { skipReason: projected.skipReason }),
+            }
+          }
+          const projected = cycle.project(state)
+          request = projected.request
+          applied ||= projected.applied
+          lastSkipReason = projected.skipReason
+        }
         return {
-          request: projected.request,
+          request,
           attempted: "none" as const,
-          applied: projected.applied,
-          ...(projected.skipReason === undefined ? {} : { skipReason: projected.skipReason }),
+          applied,
+          usage: usageSnapshot(state),
+          ...(lastSkipReason === undefined ? {} : { skipReason: lastSkipReason }),
         }
       }),
     )

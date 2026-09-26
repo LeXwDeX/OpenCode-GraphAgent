@@ -425,6 +425,11 @@ export const layer = Layer.effect(
             "reasoning_distillation.applied": distilled.applied,
             "reasoning_distillation.skip_reason": distilled.skipReason ?? "none",
             "reasoning_distillation.slot_count": conversion.reasoningBindings.length,
+            "reasoning_distillation.aux_reserved_tokens": distilled.usage?.reservedTokens ?? 0,
+            "reasoning_distillation.aux_actual_tokens": distilled.usage?.actualTokens ?? 0,
+            "reasoning_distillation.aux_unknown_usage_calls": distilled.usage?.unknownUsageCalls ?? 0,
+            "reasoning_distillation.aux_latency_ms": distilled.usage?.latencyMs ?? 0,
+            "reasoning_distillation.paid_admission_paused": distilled.usage?.paidAdmissionPaused ?? false,
           })
         }
       }

@@ -204,7 +204,24 @@ export type DistillationLifecycleState = Readonly<{
   support: Readonly<Record<string, readonly ClaimSupport[]>>
   judgeFingerprints: Readonly<Record<string, string>>
   callsBySession: Readonly<Record<string, number>>
+  usageBySession: Readonly<Record<string, SessionAuxiliaryUsage>>
 }>
+
+export type SessionAuxiliaryUsage = Readonly<{
+  reservedTokens: number
+  actualTokens: number
+  unknownUsageCalls: number
+  latencyMs: number
+  paidAdmissionPaused: boolean
+}>
+
+const emptySessionAuxiliaryUsage: SessionAuxiliaryUsage = {
+  reservedTokens: 0,
+  actualTokens: 0,
+  unknownUsageCalls: 0,
+  latencyMs: 0,
+  paidAdmissionPaused: false,
+}
 
 export const emptyLifecycleState: DistillationLifecycleState = {
   cache: emptyCache,
@@ -212,6 +229,7 @@ export const emptyLifecycleState: DistillationLifecycleState = {
   support: {},
   judgeFingerprints: {},
   callsBySession: {},
+  usageBySession: {},
 }
 
 export type DistillationCycleInput<Request> = Omit<
@@ -266,7 +284,7 @@ const callSummary = (calls: readonly ToolCallObservation[]): string[] =>
  * judge quota is consumed before the call, failures still consume quota, and only the next ordinary request can advance
  * from a newly proposed candidate to judge. The function is state-in/state-out so the host can serialize it per project.
  */
-export const runDistillationCycle = async <Request>(
+const runSingleDistillationCycle = async <Request>(
   state: DistillationLifecycleState,
   input: DistillationCycleInput<Request>,
 ): Promise<DistillationCycleResult<Request>> => {
@@ -297,6 +315,7 @@ export const runDistillationCycle = async <Request>(
   })
 
   const calls = state.callsBySession[input.sessionID] ?? 0
+  const usage = state.usageBySession[input.sessionID] ?? emptySessionAuxiliaryUsage
   const blocked = (skipReason: DistillationSkipReason): DistillationCycleResult<Request> => ({
     state,
     projection: {
@@ -308,22 +327,62 @@ export const runDistillationCycle = async <Request>(
     attempted: "none",
   })
 
+  const reserve = (promptTokens: number, role: "propose" | "judge") => {
+    const reservedTokens = promptTokens + ReasoningDistillationPolicy.tokens.maxOutputTokens
+    if (
+      usage.paidAdmissionPaused ||
+      usage.reservedTokens + reservedTokens > ReasoningDistillationPolicy.tokens.maxReservedTokensPerSession
+    )
+      return undefined
+    const nextUsage = { ...usage, reservedTokens: usage.reservedTokens + reservedTokens }
+    const consumed = {
+      ...state,
+      ledger: role === "propose" ? consumePropose(state.ledger, key) : consumeJudge(state.ledger, key),
+      callsBySession: { ...state.callsBySession, [input.sessionID]: calls + 1 },
+      usageBySession: { ...state.usageBySession, [input.sessionID]: nextUsage },
+    }
+    input.commitState?.(consumed)
+    return { consumed, reservedTokens }
+  }
+
+  const settle = (
+    consumed: DistillationLifecycleState,
+    reservedTokens: number,
+    actualTokens: number | undefined,
+    latencyMs: number,
+  ): DistillationLifecycleState => {
+    const current = consumed.usageBySession[input.sessionID] ?? emptySessionAuxiliaryUsage
+    const metered =
+      typeof actualTokens === "number" && Number.isFinite(actualTokens) && actualTokens >= 0
+        ? Math.ceil(actualTokens)
+        : undefined
+    return {
+      ...consumed,
+      usageBySession: {
+        ...consumed.usageBySession,
+        [input.sessionID]: {
+          ...current,
+          actualTokens: current.actualTokens + (metered ?? 0),
+          unknownUsageCalls: current.unknownUsageCalls + (metered === undefined ? 1 : 0),
+          latencyMs: current.latencyMs + Math.max(0, latencyMs),
+          paidAdmissionPaused:
+            current.paidAdmissionPaused || metered === undefined || metered > reservedTokens,
+        },
+      },
+    }
+  }
+
   if (initial.plan.extraCall === "propose" && input.callPropose && canPropose(state.ledger, key)) {
     if (calls >= ReasoningDistillationPolicy.calls.maxCallsPerSession) return blocked("call-budget-exhausted")
     const prompt = buildProposePrompt({ reasoningTexts: [slot.text], callSummary: callSummary(input.calls) })
-    if (Math.ceil(prompt.length / 4) > ReasoningDistillationPolicy.tokens.maxInputTokens) return blocked("work-limit")
-    const consumed = {
-      ...state,
-      ledger: consumePropose(state.ledger, key),
-      callsBySession: { ...state.callsBySession, [input.sessionID]: calls + 1 },
-    }
-    input.commitState?.(consumed)
-    const candidate = await runPropose({
-      key,
-      prompt,
-      resolveSpan: resolveSlotSpan(slot),
-      callModel: input.callPropose,
-    }).catch(() => undefined)
+    const promptTokens = Math.ceil(prompt.length / 4)
+    if (promptTokens > ReasoningDistillationPolicy.tokens.maxInputTokens) return blocked("work-limit")
+    const admitted = reserve(promptTokens, "propose")
+    if (!admitted) return blocked("call-budget-exhausted")
+    const started = performance.now()
+    const result = await input.callPropose(prompt).catch(() => undefined)
+    const consumed = settle(admitted.consumed, admitted.reservedTokens, result?.usageTokens, performance.now() - started)
+    const candidate = result ? parseCandidate(result.output, key, resolveSlotSpan(slot)) : undefined
     const cache = candidate
       ? cacheInsert(consumed.cache, {
           key,
@@ -342,17 +401,14 @@ export const runDistillationCycle = async <Request>(
       candidateClaims: cached.candidate.claims,
       callSummary: callSummary(input.calls),
     })
-    if (Math.ceil(prompt.length / 4) > ReasoningDistillationPolicy.tokens.maxInputTokens) return blocked("work-limit")
-    const consumed = {
-      ...state,
-      ledger: consumeJudge(state.ledger, key),
-      callsBySession: { ...state.callsBySession, [input.sessionID]: calls + 1 },
-    }
-    input.commitState?.(consumed)
-    const support = await runJudge({
-      prompt,
-      callModel: input.callJudge,
-    }).catch(() => undefined)
+    const promptTokens = Math.ceil(prompt.length / 4)
+    if (promptTokens > ReasoningDistillationPolicy.tokens.maxInputTokens) return blocked("work-limit")
+    const admitted = reserve(promptTokens, "judge")
+    if (!admitted) return blocked("call-budget-exhausted")
+    const started = performance.now()
+    const result = await input.callJudge(prompt).catch(() => undefined)
+    const consumed = settle(admitted.consumed, admitted.reservedTokens, result?.usageTokens, performance.now() - started)
+    const support = result ? parseSupport(result.output) : undefined
     if (!support) return { state: consumed, projection: initial, attempted: "judge" }
     const judgeFingerprint = Hash.sha256(JSON.stringify(support))
     const nextState = {
@@ -372,6 +428,42 @@ export const runDistillationCycle = async <Request>(
   }
 
   return { state, projection: initial, attempted: "none" }
+}
+
+/**
+ * Process every exact reasoning slot in wire order while issuing at most one auxiliary call for the whole request.
+ * Already-validated slots may all project in one pass; after the first propose/judge attempt, later slots wait for the
+ * next ordinary request. This prevents the first stable slot from starving later slots without weakening per-slot keys.
+ */
+export const runDistillationCycle = async <Request>(
+  state: DistillationLifecycleState,
+  input: DistillationCycleInput<Request>,
+): Promise<DistillationCycleResult<Request>> => {
+  if (input.slots.length <= 1) return runSingleDistillationCycle(state, input)
+
+  let nextState = state
+  let request = input.request
+  let applied = false
+  let last: DistillationCycleResult<Request> | undefined
+  for (const slot of input.slots) {
+    const cycle = await runSingleDistillationCycle(nextState, {
+      ...input,
+      request,
+      slots: [slot],
+      originalTokens: Math.ceil(slot.text.length / 4),
+    })
+    nextState = cycle.state
+    request = cycle.projection.request
+    applied ||= cycle.projection.applied
+    last = cycle
+    if (cycle.attempted !== "none") break
+  }
+  if (!last) return runSingleDistillationCycle(state, input)
+  return {
+    state: nextState,
+    attempted: last.attempted,
+    projection: { ...last.projection, request, applied },
+  }
 }
 
 export const projectDistillationAISDK = <Request>(
@@ -868,8 +960,14 @@ ${input.candidateClaims.map((claim) => `- ${claim.id} [${claim.kind}/${claim.sta
 # E（工具调用清单）
 ${renderCalls(input.callSummary)}`
 
+export type AuxiliaryCallResult = Readonly<{
+  output: unknown
+  /** Provider-reported inclusive input + output tokens; absent means metering is unknown and pauses paid admission. */
+  usageTokens?: number
+}>
+
 /** Injected auxiliary-model caller seam; the host supplies the real Effect/model-service implementation. */
-export type AuxiliaryCaller = (prompt: string) => Promise<unknown>
+export type AuxiliaryCaller = (prompt: string) => Promise<AuxiliaryCallResult>
 
 /** Run one propose call and parse it into a Candidate; undefined on malformed/untrusted output (host sends original). */
 export const runPropose = async (input: {
@@ -878,8 +976,8 @@ export const runPropose = async (input: {
   resolveSpan: SpanResolver
   callModel: AuxiliaryCaller
 }): Promise<Candidate | undefined> => {
-  const raw = await input.callModel(input.prompt)
-  return parseCandidate(raw, input.key, input.resolveSpan)
+  const result = await input.callModel(input.prompt)
+  return parseCandidate(result.output, input.key, input.resolveSpan)
 }
 
 /** Run one judge call and parse it into support verdicts; undefined on malformed output (host keeps original). */
@@ -887,8 +985,8 @@ export const runJudge = async (input: {
   prompt: string
   callModel: AuxiliaryCaller
 }): Promise<ClaimSupport[] | undefined> => {
-  const raw = await input.callModel(input.prompt)
-  return parseSupport(raw)
+  const result = await input.callModel(input.prompt)
+  return parseSupport(result.output)
 }
 
 /** A persisted reasoning part with its stable identity (§5.8 cache keys must not drift with wire position). */
@@ -937,6 +1035,7 @@ const callStatus = (part: SessionV1.ToolPart): CallStatus => {
     case "error":
       return part.state.status
   }
+  return "error"
 }
 
 const callResult = (part: SessionV1.ToolPart): CallResultCompleteness => {

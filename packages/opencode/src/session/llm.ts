@@ -89,6 +89,18 @@ function strictJSON(text: string): unknown {
   return JSON.parse(text)
 }
 
+/** Privacy-safe failure category for distillation fallback logs: error tag or
+ * class name only — never the error message, which may echo wire content. */
+function errorCategory(cause: unknown): string {
+  if (typeof cause === "object" && cause !== null) {
+    const tag = (cause as { _tag?: unknown })._tag
+    if (typeof tag === "string") return tag
+    const name = (cause as { name?: unknown }).name
+    if (typeof name === "string") return name
+  }
+  return "unknown"
+}
+
 function plainWireMessages(messages: readonly unknown[]): unknown[] | undefined {
   try {
     const result: unknown = JSON.parse(JSON.stringify(messages))
@@ -265,7 +277,12 @@ const live: Layer.Layer<
                 if (!result) return yield* Effect.fail(new Error("reasoning distillation auxiliary call timed out"))
                 if (result.text.length > ReasoningDistillationPolicy.tokens.maxOutputTokens * 4)
                   return yield* Effect.fail(new Error("reasoning distillation auxiliary output exceeded limit"))
-                return strictJSON(result.text)
+                return {
+                  output: strictJSON(result.text),
+                  ...(typeof result.totalUsage.totalTokens === "number"
+                    ? { usageTokens: result.totalUsage.totalTokens }
+                    : {}),
+                }
               }),
             )
         : undefined
@@ -278,14 +295,14 @@ const live: Layer.Layer<
         sourceMessages: readonly ModelMessage[]
         slots: readonly ReasoningDistillation.ReasoningSlotObservation[]
       }) => {
-        const selected = args.slots.find((slot) => slot.structureRewritable && slot.settled)
-        if (!selected || !organizerResolution) return Effect.succeed(args.request)
+        const selected = args.slots.filter((slot) => slot.structureRewritable && slot.settled)
+        if (selected.length === 0 || !organizerResolution) return Effect.succeed(args.request)
         const capability = {
           runtime: args.runtime,
           protocol: input.model.api.npm === "@ai-sdk/openai-compatible" ? "openai-compatible" : input.model.api.npm,
           providerModelVariant: `${input.model.providerID}/${input.model.id}/${input.user.model.variant ?? "default"}`,
           endpointIdentity: Hash.sha256(
-            String(typeof item.options.baseURL === "string" ? item.options.baseURL : input.model.api.url),
+            typeof item.options.baseURL === "string" ? item.options.baseURL : input.model.api.url,
           ),
           adapterVersion: args.adapterVersion,
           optionsFingerprint: Hash.sha256(JSON.stringify(prepared.params.options ?? {})),
@@ -319,14 +336,14 @@ const live: Layer.Layer<
                   sessionID: input.sessionID,
                   purpose: folding.purpose,
                   budget,
-                  slots: [selected],
+                  slots: selected,
                   calls: input.reasoningDistillation?.calls ?? [],
                   inventoryComplete: input.reasoningDistillation?.inventoryComplete ?? false,
                   inventoryFingerprint: input.reasoningDistillation?.inventoryFingerprint ?? "missing-inventory",
                   capability,
                   records: cfg.reasoningDistillation?.compatibility ?? [],
                   organizerFingerprint: organizerResolution.organizerFingerprint,
-                  originalTokens: Math.ceil(selected.text.length / 4),
+                  originalTokens: Math.ceil(selected.reduce((total, slot) => total + slot.text.length, 0) / 4),
                   callPropose: callAuxiliary,
                   callJudge: callAuxiliary,
                   commitState: (next) => void (state.current = next),
@@ -336,8 +353,9 @@ const live: Layer.Layer<
             }).pipe(Effect.tap((result) => Effect.sync(() => void (state.current = result.state)))),
           ),
         ).pipe(
-          Effect.tap((cycle) =>
-            Effect.logInfo("reasoning distillation", {
+          Effect.tap((cycle) => {
+            const usage = cycle.state.usageBySession[input.sessionID]
+            return Effect.logInfo("reasoning distillation", {
               "reasoning_distillation.runtime": args.runtime,
               "reasoning_distillation.enabled": true,
               "reasoning_distillation.source": distillationResolution.source,
@@ -348,10 +366,20 @@ const live: Layer.Layer<
               "reasoning_distillation.estimated_input_tokens": estimatedBudget.estimatedInputTokens ?? "unknown",
               "reasoning_distillation.target_tokens": estimatedBudget.targetTokens ?? "unknown",
               "reasoning_distillation.budget_skip_reason": estimatedBudget.skipReason ?? "none",
-            }),
-          ),
+              "reasoning_distillation.aux_reserved_tokens": usage?.reservedTokens ?? 0,
+              "reasoning_distillation.aux_actual_tokens": usage?.actualTokens ?? 0,
+              "reasoning_distillation.aux_unknown_usage_calls": usage?.unknownUsageCalls ?? 0,
+              "reasoning_distillation.aux_latency_ms": usage?.latencyMs ?? 0,
+              "reasoning_distillation.paid_admission_paused": usage?.paidAdmissionPaused ?? false,
+            })
+          }),
           Effect.map((cycle) => cycle.projection.request),
-          Effect.catch(() => Effect.succeed(args.request)),
+          Effect.catch((cause) =>
+            Effect.logWarning("reasoning distillation failed", {
+              "reasoning_distillation.runtime": args.runtime,
+              "reasoning_distillation.error": errorCategory(cause),
+            }).pipe(Effect.as(args.request)),
+          ),
         )
       }
 
@@ -372,7 +400,7 @@ const live: Layer.Layer<
             return { result: "", error: `Unknown tool: ${toolName}` }
           }
           try {
-            const result = await t.execute!(JSON.parse(argsJson), {
+            const result = await t.execute(JSON.parse(argsJson), {
               toolCallId: _requestID,
               messages: input.messages,
               abortSignal: input.abort,
