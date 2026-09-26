@@ -450,7 +450,13 @@ export const runDistillationCycle = async <Request>(
   let request = input.request
   let applied = false
   let last: DistillationCycleResult<Request> | undefined
+  // Judge advancement first: a slot whose candidate was proposed on an earlier
+  // request must reach judge before fresh proposals starve it (live multi-slot
+  // sessions append a newest reasoning part per request, so strict list order
+  // never revisits older slots). Falls back to proposal order otherwise.
   for (const slot of input.slots) {
+    const key = keyForSlot(input.sessionID, slot, input.capability, input.organizerFingerprint)
+    if (!cacheLookup(nextState.cache, key) || !canJudge(nextState.ledger, key)) continue
     const cycle = await runSingleDistillationCycle(nextState, {
       ...input,
       request,
@@ -462,6 +468,21 @@ export const runDistillationCycle = async <Request>(
     applied ||= cycle.projection.applied
     last = cycle
     if (cycle.attempted !== "none") break
+  }
+  if (!last || last.attempted === "none") {
+    for (const slot of input.slots) {
+      const cycle = await runSingleDistillationCycle(nextState, {
+        ...input,
+        request,
+        slots: [slot],
+        originalTokens: Math.ceil(slot.text.length / 4),
+      })
+      nextState = cycle.state
+      request = cycle.projection.request
+      applied ||= cycle.projection.applied
+      last = cycle
+      if (cycle.attempted !== "none") break
+    }
   }
   if (!last) return runSingleDistillationCycle(state, input)
   return {
