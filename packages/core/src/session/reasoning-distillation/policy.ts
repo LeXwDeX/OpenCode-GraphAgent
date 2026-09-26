@@ -23,9 +23,13 @@ export const ReasoningDistillationPolicy = {
     amortizationWindow: 8,
   },
   tokens: {
-    /** Auxiliary input/output caps, further bounded by the selected model's smaller limit (§5.8). */
+    /** Auxiliary input/output caps, further bounded by the selected model's smaller limit (§5.8).
+     * maxOutputTokens must leave room for interleaved reasoning: reasoning models on
+     * openai-compatible relays spend the cap on reasoning_content before emitting the
+     * answer, so a small cap yields empty answers (observed on real qwen/deepseek/glm
+     * relays, 2026-09-27). */
     maxInputTokens: 32_768,
-    maxOutputTokens: 4_096,
+    maxOutputTokens: 24_576,
     /** Hard admission-reservation ceiling per session. State is held per
      * sessionID inside one distillation-runner instance, so exhausting the
      * ceiling in one session never blocks another session sharing the same

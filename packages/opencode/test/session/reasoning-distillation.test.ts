@@ -728,6 +728,10 @@ describe("prompt builders (§5.4.1 / §5.5.3)", () => {
   test("propose prompt frames input as untrusted, requires Chinese output with verbatim identifiers, and embeds R/E", () => {
     const prompt = buildProposePrompt({
       reasoningTexts: ["原始思绪甲", "原始思绪乙"],
+      slotRefs: [
+        { messageID: "msg_01a0def4b881TZa1qIqRrBA6u2", partID: "part_0" },
+        { messageID: "msg_01a0def4b886ucYYKbl0Nfta4E", partID: "part_1" },
+      ],
       callSummary: ["bash c1 completed"],
     })
     expect(prompt).toContain("不可信数据")
@@ -739,13 +743,24 @@ describe("prompt builders (§5.4.1 / §5.5.3)", () => {
     expect(prompt).toContain("coverage")
   })
 
+  test("propose prompt exposes the real span identities so models can cite resolvable messageID/partID values", () => {
+    const prompt = buildProposePrompt({
+      reasoningTexts: ["原始思绪甲"],
+      slotRefs: [{ messageID: "msg_01a0def4b881TZa1qIqRrBA6u2", partID: "part_0" }],
+      callSummary: [],
+    })
+    expect(prompt).toContain("(messageID=msg_01a0def4b881TZa1qIqRrBA6u2, partID=part_0)")
+    expect(prompt).toContain("逐字使用各 slot 标注的值")
+  })
+
   test("propose prompt renders an empty call inventory explicitly", () => {
-    expect(buildProposePrompt({ reasoningTexts: ["x"], callSummary: [] })).toContain("（无工具调用）")
+    expect(buildProposePrompt({ reasoningTexts: ["x"], slotRefs: [], callSummary: [] })).toContain("（无工具调用）")
   })
 
   test("judge prompt is independent, lists G1-G4, and embeds the candidate claims", () => {
     const prompt = buildJudgePrompt({
       reasoningTexts: ["原始思绪"],
+      slotRefs: [{ messageID: "msg_01a0def4b881TZa1qIqRrBA6u2", partID: "part_0" }],
       candidateClaims: [{ id: "c1", kind: "decision", text: "采用方案A", scope: "本次会话", status: "verified" }],
       callSummary: [],
     })

@@ -85,8 +85,14 @@ function wireTools(tools: Record<string, Tool>) {
     }))
 }
 
-function strictJSON(text: string): unknown {
-  return JSON.parse(text)
+export function strictJSON(text: string): unknown {
+  // Models sometimes wrap JSON in a markdown fence despite "output JSON only"
+  // instructions; strip the fence before parsing (defensive, mechanical only).
+  const trimmed = text.trim()
+  const unfenced = trimmed.startsWith("```")
+    ? trimmed.replace(/^```[a-zA-Z0-9_-]*[ \t]*\r?\n/, "").replace(/\r?\n[ \t]*```\s*$/, "")
+    : trimmed
+  return JSON.parse(unfenced)
 }
 
 /** Privacy-safe failure category for distillation fallback logs: error tag or
@@ -270,13 +276,23 @@ const live: Layer.Layer<
                       temperature: 0,
                       maxOutputTokens: ReasoningDistillationPolicy.tokens.maxOutputTokens,
                       maxRetries: 0,
+                      // Auxiliary organizers must answer inside the output budget: on real
+                      // reasoning relays the default thinking mode spends the whole cap on
+                      // reasoning_content before any answer (2026-09-27 finding). Providers
+                      // other than openai-compatible ignore this namespace.
+                      providerOptions: { openaiCompatible: { reasoningEffort: "low" } },
                       abortSignal: AbortSignal.any([signal, input.abort]),
                     }),
                   catch: (cause) => new Error(`reasoning distillation auxiliary call failed: ${String(cause)}`),
-                }).pipe(Effect.timeout("30 seconds"))
+                }).pipe(Effect.timeout(`${Flag.OPENCODE_REASONING_DISTILLATION_AUX_TIMEOUT_MS} millis`))
                 if (!result) return yield* Effect.fail(new Error("reasoning distillation auxiliary call timed out"))
                 if (result.text.length > ReasoningDistillationPolicy.tokens.maxOutputTokens * 4)
                   return yield* Effect.fail(new Error("reasoning distillation auxiliary output exceeded limit"))
+                if (typeof result.totalUsage?.totalTokens !== "number")
+                  yield* Effect.logWarning("reasoning distillation auxiliary usage unavailable", {
+                    "reasoning_distillation.aux_text_length": result.text.length,
+                    "reasoning_distillation.aux_has_total_usage": result.totalUsage !== undefined,
+                  })
                 return {
                   output: strictJSON(result.text),
                   ...(typeof result.totalUsage.totalTokens === "number"

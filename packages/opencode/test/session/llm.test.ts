@@ -8,7 +8,7 @@ import { Cause, Effect, Exit, Fiber, Layer, Stream } from "effect"
 import { InstanceRef } from "../../src/effect/instance-ref"
 import { HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
 import z from "zod"
-import { LLM } from "../../src/session/llm"
+import { LLM, strictJSON } from "../../src/session/llm"
 import { LLMClient, RequestExecutor, WebSocketExecutor } from "@opencode-ai/llm/route"
 import { Auth } from "@/auth"
 import { Config } from "@/config/config"
@@ -979,7 +979,7 @@ const distillationConfig = (runtime: "opencode-ai-sdk" | "opencode-native"): Par
             name: "DeepSeek R1",
             reasoning: true,
             interleaved: { field: "reasoning_content" },
-            limit: { context: 45_000, output: 4_096 },
+            limit: { context: 65_536, output: 4_096 },
           },
         },
         options: { apiKey: "test-key", baseURL: endpoint },
@@ -1895,7 +1895,7 @@ describe("session.llm.stream", () => {
             ProviderV2.ID.make("custom-provider"),
             ModelV2.ID.make("deepseek-test-r1"),
           )
-          expect(resolved.limit).toMatchObject({ context: 45_000, output: 4_096 })
+          expect(resolved.limit).toMatchObject({ context: 65_536, output: 4_096 })
           const sessionID = SessionID.make(`session-test-distillation-${runtime}`)
           const agent = {
             name: "test",
@@ -2828,4 +2828,19 @@ describe("session.llm.stream", () => {
       }),
     },
   )
+})
+
+describe("strictJSON", () => {
+  test("parses plain JSON", () => {
+    expect(strictJSON('{"a":1}')).toEqual({ a: 1 })
+  })
+
+  test("strips markdown fences before parsing", () => {
+    expect(strictJSON('```json\n{"a":1}\n```')).toEqual({ a: 1 })
+    expect(strictJSON('```\n{"a":1}\n```')).toEqual({ a: 1 })
+  })
+
+  test("rejects malformed content", () => {
+    expect(() => strictJSON("not json")).toThrow()
+  })
 })
