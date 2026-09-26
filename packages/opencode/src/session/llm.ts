@@ -4,10 +4,10 @@ import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Provider } from "@/provider/provider"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
-import { Context, Effect, Layer } from "effect"
+import { Context, Effect, Layer, Semaphore } from "effect"
 import * as Stream from "effect/Stream"
-import { streamText, wrapLanguageModel, type ModelMessage, type Tool } from "ai"
-import type { LLMEvent } from "@opencode-ai/llm"
+import { asSchema, generateText, streamText, wrapLanguageModel, type ModelMessage, type Tool } from "ai"
+import { LLMRequest, type LLMEvent } from "@opencode-ai/llm"
 import { LLMClient, RequestExecutor, WebSocketExecutor } from "@opencode-ai/llm/route"
 import type { LLMClientService } from "@opencode-ai/llm/route"
 import { GitLabWorkflowLanguageModel } from "gitlab-ai-provider"
@@ -34,8 +34,87 @@ import {
   type RequestPurpose,
 } from "./context-folding"
 import { ConfigCompaction } from "@opencode-ai/core/config/compaction"
+import { ConfigReasoningDistillation } from "@opencode-ai/core/config/reasoning-distillation"
 import { Flag } from "@opencode-ai/core/flag/flag"
-import { contextFoldingDiagnostic, type ContextFoldingProjectionPlan } from "@opencode-ai/core/session/context-folding"
+import {
+  contextFoldingDiagnostic,
+  estimateContextFoldingBudget,
+  type ContextFoldingProjectionPlan,
+} from "@opencode-ai/core/session/context-folding"
+import { ReasoningDistillationPolicy } from "@opencode-ai/core/session/reasoning-distillation"
+import {
+  ReasoningDistillation,
+  type ReasoningHistorySnapshot as ReasoningDistillationHistorySnapshot,
+} from "./reasoning-distillation"
+import { InstanceState } from "@/effect/instance-state"
+import { Hash } from "@opencode-ai/core/util/hash"
+
+const REASONING_DISTILLATION_ADAPTER_VERSION = "opencode-reasoning-distillation-ai-sdk-v1"
+const REASONING_DISTILLATION_NATIVE_ADAPTER_VERSION = "opencode-reasoning-distillation-native-v1"
+const REASONING_DISTILLATION_PROTOCOL_OVERHEAD = 64
+
+function hasMedia(messages: readonly ModelMessage[]): boolean {
+  for (const message of messages) {
+    if (!Array.isArray(message.content)) continue
+    for (const part of message.content) {
+      if (part.type === "file" || part.type === "image") return true
+      if (part.type !== "tool-result" || typeof part.output !== "object" || part.output === null) continue
+      if (
+        "type" in part.output &&
+        part.output.type === "content" &&
+        "value" in part.output &&
+        Array.isArray(part.output.value) &&
+        part.output.value.some(
+          (item) => typeof item === "object" && item !== null && "type" in item && item.type !== "text",
+        )
+      )
+        return true
+    }
+  }
+  return false
+}
+
+function wireTools(tools: Record<string, Tool>) {
+  return Object.entries(tools)
+    .toSorted(([left], [right]) => left.localeCompare(right))
+    .map(([name, item]) => ({
+      name,
+      description: item.description ?? "",
+      inputSchema: asSchema(item.inputSchema).jsonSchema,
+      ...(item.strict === undefined ? {} : { strict: item.strict }),
+    }))
+}
+
+export function strictJSON(text: string): unknown {
+  // Models sometimes wrap JSON in a markdown fence despite "output JSON only"
+  // instructions; strip the fence before parsing (defensive, mechanical only).
+  const trimmed = text.trim()
+  const unfenced = trimmed.startsWith("```")
+    ? trimmed.replace(/^```[a-zA-Z0-9_-]*[ \t]*\r?\n/, "").replace(/\r?\n[ \t]*```\s*$/, "")
+    : trimmed
+  return JSON.parse(unfenced)
+}
+
+/** Privacy-safe failure category for distillation fallback logs: error tag or
+ * class name only — never the error message, which may echo wire content. */
+function errorCategory(cause: unknown): string {
+  if (typeof cause === "object" && cause !== null) {
+    const tag = (cause as { _tag?: unknown })._tag
+    if (typeof tag === "string") return tag
+    const name = (cause as { name?: unknown }).name
+    if (typeof name === "string") return name
+  }
+  return "unknown"
+}
+
+function plainWireMessages(messages: readonly unknown[]): unknown[] | undefined {
+  try {
+    const result: unknown = JSON.parse(JSON.stringify(messages))
+    return Array.isArray(result) ? result : undefined
+  } catch {
+    return undefined
+  }
+}
 
 export const OUTPUT_TOKEN_MAX = ProviderTransform.OUTPUT_TOKEN_MAX
 
@@ -54,6 +133,7 @@ export type StreamInput = {
   toolChoice?: "auto" | "required" | "none"
   purpose?: RequestPurpose
   contextFolding?: ContextFoldingHistorySnapshot
+  reasoningDistillation?: ReasoningDistillationHistorySnapshot
 }
 
 export type StreamRequest = StreamInput & {
@@ -90,6 +170,12 @@ const live: Layer.Layer<
     const events = yield* EventV2Bridge.Service
     const llmClient = yield* LLMClient.Service
     const flags = yield* RuntimeFlags.Service
+    const distillationState = yield* InstanceState.make(() =>
+      Effect.succeed({
+        current: ReasoningDistillation.emptyLifecycleState,
+        lock: Semaphore.makeUnsafe(1),
+      }),
+    )
 
     const run = Effect.fn("LLM.run")(function* (input: StreamRequest) {
       yield* Effect.logInfo("stream", {
@@ -136,11 +222,186 @@ const live: Layer.Layer<
             ? ({ kind: "messages" } as const)
             : ({ kind: "instructions", value: prepared.params.options.instructions } as const),
       }
+      const distillationResolution = ConfigReasoningDistillation.resolveEnabled({
+        disabledByEnvironment: Flag.OPENCODE_DISABLE_REASONING_DISTILLATION,
+        enabled: cfg.reasoningDistillation?.enabled,
+      })
+      const interleavedField =
+        typeof input.model.capabilities.interleaved === "object"
+          ? input.model.capabilities.interleaved.field
+          : undefined
+      const organizer =
+        distillationResolution.enabled && interleavedField
+          ? ((yield* provider.getSmallModel(input.model.providerID)) ?? input.model)
+          : undefined
+      const organizerResolution = organizer
+        ? ReasoningDistillation.resolveOrganizerTier(
+            {
+              small: {
+                providerID: organizer.providerID,
+                modelID: organizer.id,
+                contextLimit: organizer.limit.context,
+              },
+              agent: {
+                providerID: input.model.providerID,
+                modelID: input.model.id,
+                variant: input.user.model.variant,
+                contextLimit: input.model.limit.context,
+              },
+              primary: {
+                providerID: input.model.providerID,
+                modelID: input.model.id,
+                variant: input.user.model.variant,
+                contextLimit: input.model.limit.context,
+              },
+            },
+            ReasoningDistillationPolicy.tokens.maxInputTokens + ReasoningDistillationPolicy.tokens.maxOutputTokens,
+          )
+        : undefined
+
+      const bridge = yield* EffectBridge.make()
+
+      const callAuxiliary = organizerResolution
+        ? async (prompt: string) =>
+            bridge.promise(
+              Effect.gen(function* () {
+                const selected = organizerResolution.tier === "small" ? organizer : input.model
+                if (!selected) return yield* Effect.fail(new Error("distillation organizer is unavailable"))
+                const organizerLanguage = yield* provider.getLanguage(selected)
+                const result = yield* Effect.tryPromise({
+                  try: (signal) =>
+                    generateText({
+                      model: organizerLanguage,
+                      prompt,
+                      temperature: 0,
+                      maxOutputTokens: ReasoningDistillationPolicy.tokens.maxOutputTokens,
+                      maxRetries: 0,
+                      // Auxiliary organizers must answer inside the output budget: on real
+                      // reasoning relays the default thinking mode spends the whole cap on
+                      // reasoning_content before any answer (2026-09-27 finding). Providers
+                      // other than openai-compatible ignore this namespace.
+                      providerOptions: { openaiCompatible: { reasoningEffort: "low" } },
+                      abortSignal: AbortSignal.any([signal, input.abort]),
+                    }),
+                  catch: (cause) => new Error(`reasoning distillation auxiliary call failed: ${String(cause)}`),
+                }).pipe(Effect.timeout(`${Flag.OPENCODE_REASONING_DISTILLATION_AUX_TIMEOUT_MS} millis`))
+                if (!result) return yield* Effect.fail(new Error("reasoning distillation auxiliary call timed out"))
+                if (result.text.length > ReasoningDistillationPolicy.tokens.maxOutputTokens * 4)
+                  return yield* Effect.fail(new Error("reasoning distillation auxiliary output exceeded limit"))
+                if (typeof result.totalUsage?.totalTokens !== "number")
+                  yield* Effect.logWarning("reasoning distillation auxiliary usage unavailable", {
+                    "reasoning_distillation.aux_text_length": result.text.length,
+                    "reasoning_distillation.aux_has_total_usage": result.totalUsage !== undefined,
+                  })
+                return {
+                  output: strictJSON(result.text),
+                  ...(typeof result.totalUsage?.totalTokens === "number"
+                    ? { usageTokens: result.totalUsage.totalTokens }
+                    : {}),
+                }
+              }),
+            )
+        : undefined
+
+      const distillRequest = <Request>(args: {
+        runtime: string
+        adapterVersion: string
+        request: Request
+        messages: readonly unknown[]
+        sourceMessages: readonly ModelMessage[]
+        slots: readonly ReasoningDistillation.ReasoningSlotObservation[]
+      }) => {
+        const selected = args.slots.filter((slot) => slot.structureRewritable && slot.settled)
+        if (selected.length === 0 || !organizerResolution) return Effect.succeed(args.request)
+        const capability = {
+          runtime: args.runtime,
+          protocol: input.model.api.npm === "@ai-sdk/openai-compatible" ? "openai-compatible" : input.model.api.npm,
+          providerModelVariant: `${input.model.providerID}/${input.model.id}/${input.user.model.variant ?? "default"}`,
+          endpointIdentity: Hash.sha256(
+            typeof item.options.baseURL === "string" ? item.options.baseURL : input.model.api.url,
+          ),
+          adapterVersion: args.adapterVersion,
+          optionsFingerprint: Hash.sha256(JSON.stringify(prepared.params.options ?? {})),
+        }
+        const budget = {
+          contextLimit: input.model.limit.context,
+          inputLimit:
+            input.model.limit.input === undefined
+              ? ({ kind: "absent" } as const)
+              : ({ kind: "value", value: input.model.limit.input } as const),
+          outputReserve: prepared.params.maxOutputTokens,
+          system: folding.system,
+          messages: args.messages,
+          tools: wireTools(prepared.tools),
+          protocolOverheadTokens: REASONING_DISTILLATION_PROTOCOL_OVERHEAD,
+          media: hasMedia(args.sourceMessages) ? ("unknown" as const) : ("none" as const),
+        }
+        const estimatedBudget = estimateContextFoldingBudget(budget)
+        return InstanceState.useEffect(distillationState, (state) =>
+          state.lock.withPermits(1)(
+            Effect.tryPromise({
+              try: async () => {
+                return ReasoningDistillation.runDistillationCycle(state.current, {
+                  request: args.request,
+                  identity: {
+                    adapter: args.adapterVersion,
+                    providerID: input.model.providerID,
+                    modelID: input.model.id,
+                    ...(input.user.model.variant === undefined ? {} : { variant: input.user.model.variant }),
+                  },
+                  sessionID: input.sessionID,
+                  purpose: folding.purpose,
+                  budget,
+                  slots: selected,
+                  calls: input.reasoningDistillation?.calls ?? [],
+                  inventoryComplete: input.reasoningDistillation?.inventoryComplete ?? false,
+                  inventoryFingerprint: input.reasoningDistillation?.inventoryFingerprint ?? "missing-inventory",
+                  capability,
+                  records: cfg.reasoningDistillation?.compatibility ?? [],
+                  organizerFingerprint: organizerResolution.organizerFingerprint,
+                  originalTokens: Math.ceil(selected.reduce((total, slot) => total + slot.text.length, 0) / 4),
+                  callPropose: callAuxiliary,
+                  callJudge: callAuxiliary,
+                  commitState: (next) => void (state.current = next),
+                })
+              },
+              catch: (cause) => cause,
+            }).pipe(Effect.tap((result) => Effect.sync(() => void (state.current = result.state)))),
+          ),
+        ).pipe(
+          Effect.tap((cycle) => {
+            const usage = cycle.state.usageBySession[input.sessionID]
+            return Effect.logInfo("reasoning distillation", {
+              "reasoning_distillation.runtime": args.runtime,
+              "reasoning_distillation.enabled": true,
+              "reasoning_distillation.source": distillationResolution.source,
+              "reasoning_distillation.attempted": cycle.attempted,
+              "reasoning_distillation.applied": cycle.projection.applied,
+              "reasoning_distillation.skip_reason": cycle.projection.skipReason ?? "none",
+              "reasoning_distillation.slot_count": args.slots.length,
+              "reasoning_distillation.estimated_input_tokens": estimatedBudget.estimatedInputTokens ?? "unknown",
+              "reasoning_distillation.target_tokens": estimatedBudget.targetTokens ?? "unknown",
+              "reasoning_distillation.budget_skip_reason": estimatedBudget.skipReason ?? "none",
+              "reasoning_distillation.aux_reserved_tokens": usage?.reservedTokens ?? 0,
+              "reasoning_distillation.aux_actual_tokens": usage?.actualTokens ?? 0,
+              "reasoning_distillation.aux_unknown_usage_calls": usage?.unknownUsageCalls ?? 0,
+              "reasoning_distillation.aux_latency_ms": usage?.latencyMs ?? 0,
+              "reasoning_distillation.paid_admission_paused": usage?.paidAdmissionPaused ?? false,
+            })
+          }),
+          Effect.map((cycle) => cycle.projection.request),
+          Effect.catch((cause) =>
+            Effect.logWarning("reasoning distillation failed", {
+              "reasoning_distillation.runtime": args.runtime,
+              "reasoning_distillation.error": errorCategory(cause),
+            }).pipe(Effect.as(args.request)),
+          ),
+        )
+      }
 
       // Wire up toolExecutor for DWS workflow models so that tool calls
       // from the workflow service are executed via opencode's tool system
       // and results sent back over the WebSocket.
-      const bridge = yield* EffectBridge.make()
       if (language instanceof GitLabWorkflowLanguageModel) {
         const workflowModel = language as GitLabWorkflowLanguageModel & {
           sessionID?: string
@@ -155,7 +416,7 @@ const live: Layer.Layer<
             return { result: "", error: `Unknown tool: ${toolName}` }
           }
           try {
-            const result = await t.execute!(JSON.parse(argsJson), {
+            const result = await t.execute(JSON.parse(argsJson), {
               toolCallId: _requestID,
               messages: input.messages,
               abortSignal: input.abort,
@@ -249,7 +510,7 @@ const live: Layer.Layer<
       // Runtime seam: native is an opt-in adapter over @opencode-ai/llm. It
       // either returns a ready LLMEvent stream or a concrete fallback reason.
       if (flags.experimentalNativeLlm) {
-        const native = LLMNativeRuntime.stream({
+        const native = yield* LLMNativeRuntime.stream({
           model: input.model,
           provider: item,
           auth: info,
@@ -265,6 +526,38 @@ const live: Layer.Layer<
           headers: prepared.headers,
           abort: input.abort,
           contextFolding: folding,
+          reasoningDistillation:
+            distillationResolution.enabled && interleavedField && organizerResolution && input.reasoningDistillation
+              ? ({ request, sourceMessages, transformedMessages }) => {
+                  const messages = plainWireMessages(request.messages)
+                  if (!messages) return Effect.succeed(request)
+                  const lineage = ReasoningDistillation.bindNativeInterleavedReasoningLineage(
+                    sourceMessages,
+                    transformedMessages,
+                    interleavedField,
+                    input.reasoningDistillation!,
+                  )
+                  const slots = ReasoningDistillation.extractNativeInterleavedReasoningSlots(
+                    messages,
+                    interleavedField,
+                    lineage,
+                  )
+                  return distillRequest({
+                    runtime: "opencode-native",
+                    adapterVersion: REASONING_DISTILLATION_NATIVE_ADAPTER_VERSION,
+                    request: { messages },
+                    messages,
+                    sourceMessages,
+                    slots,
+                  }).pipe(
+                    Effect.map((next) =>
+                      next.messages === messages
+                        ? request
+                        : LLMRequest.update(request, { messages: next.messages as typeof request.messages }),
+                    ),
+                  )
+                }
+              : undefined,
         })
         if (native.type === "supported") {
           yield* Effect.logInfo(
@@ -393,6 +686,40 @@ const live: Layer.Layer<
                       })
                       projectionPlan = projected.plan
                       if (projected.applied) outbound = projected.request.messages
+                    }
+                    if (
+                      distillationResolution.enabled &&
+                      interleavedField &&
+                      organizerResolution &&
+                      sourceMessages &&
+                      input.reasoningDistillation
+                    ) {
+                      const messages = plainWireMessages(outbound)
+                      if (messages) {
+                        const lineage = ReasoningDistillation.bindInterleavedReasoningLineage(
+                          sourceMessages,
+                          transformed,
+                          interleavedField,
+                          input.reasoningDistillation,
+                        )
+                        const observed = ReasoningDistillation.extractInterleavedReasoningSlots(
+                          messages,
+                          interleavedField,
+                          ["messages"],
+                          lineage,
+                        )
+                        const projected = await bridge.promise(
+                          distillRequest({
+                            runtime: "opencode-ai-sdk",
+                            adapterVersion: REASONING_DISTILLATION_ADAPTER_VERSION,
+                            request: { messages },
+                            messages,
+                            sourceMessages,
+                            slots: observed,
+                          }),
+                        )
+                        outbound = projected.messages as ModelMessage[]
+                      }
                     }
                     await bridge.promise(
                       Effect.logInfo(

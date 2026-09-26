@@ -20,6 +20,17 @@ export class ResponseStreamError extends Error {
   }
 }
 
+export function findResponseStreamError(input: unknown): ResponseStreamError | undefined {
+  let current = input
+  const seen = new Set<unknown>()
+  for (let depth = 0; depth < 8 && current != null && !seen.has(current); depth++) {
+    if (current instanceof ResponseStreamError) return current
+    seen.add(current)
+    if (typeof current !== "object" || !("cause" in current)) return
+    current = current.cause
+  }
+}
+
 function isOpenAiErrorRetryable(e: APICallError) {
   const status = e.statusCode
   if (!status) return e.isRetryable

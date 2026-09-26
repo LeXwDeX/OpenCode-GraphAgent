@@ -6,6 +6,11 @@ import { ProviderTransform } from "@/provider/transform"
 import type { MessageV2 } from "./message-v2"
 
 const COMPACTION_BUFFER = 20_000
+const DEFAULT_AUTO_COMPACTION_CEILING = 250_000
+
+export function measured(tokens: SessionV1.Assistant["tokens"]) {
+  return tokens.total || tokens.input + tokens.output + tokens.cache.read + tokens.cache.write
+}
 
 export function usable(input: { cfg: ConfigV1.Info; model: Provider.Model; outputTokenMax?: number }) {
   const context = input.model.limit.context
@@ -19,16 +24,28 @@ export function usable(input: { cfg: ConfigV1.Info; model: Provider.Model; outpu
     : Math.max(0, context - ProviderTransform.maxOutputTokens(input.model, input.outputTokenMax))
 }
 
+export function triggerLimit(input: {
+  cfg: ConfigV1.Info
+  model: Provider.Model
+  outputTokenMax?: number
+  threshold?: "auto" | "model"
+}) {
+  const modelLimit = usable(input)
+  const configuredLimit = input.cfg.compaction?.max_context_tokens ?? DEFAULT_AUTO_COMPACTION_CEILING
+  return input.threshold === "model" ? modelLimit : Math.min(modelLimit, configuredLimit)
+}
+
 export function isOverflow(input: {
   cfg: ConfigV1.Info
   tokens: SessionV1.Assistant["tokens"]
   model: Provider.Model
   outputTokenMax?: number
+  estimatedInputTokens?: number
+  threshold?: "auto" | "model"
 }) {
   if (input.cfg.compaction?.auto === false) return false
   if (input.model.limit.context === 0) return false
 
-  const count =
-    input.tokens.total || input.tokens.input + input.tokens.output + input.tokens.cache.read + input.tokens.cache.write
-  return count >= usable(input)
+  const count = measured(input.tokens)
+  return Math.max(count, input.estimatedInputTokens ?? 0) >= triggerLimit(input)
 }

@@ -10,7 +10,7 @@ const TEAM = {
 } as const
 
 function pick<T>(items: readonly T[]) {
-  return items[Math.floor(Math.random() * items.length)]!
+  return items[Math.floor(Math.random() * items.length)]
 }
 
 function getIssueNumber(): number {
@@ -20,13 +20,19 @@ function getIssueNumber(): number {
 }
 
 async function githubFetch(endpoint: string, options: RequestInit = {}) {
+  const extraHeaders =
+    options.headers instanceof Headers
+      ? Object.fromEntries(options.headers.entries())
+      : Array.isArray(options.headers)
+        ? Object.fromEntries(options.headers)
+        : (options.headers ?? {})
   const response = await fetch(`https://api.github.com${endpoint}`, {
     ...options,
     headers: {
       Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
       Accept: "application/vnd.github+json",
       "Content-Type": "application/json",
-      ...(options.headers instanceof Headers ? Object.fromEntries(options.headers.entries()) : options.headers),
+      ...extraHeaders,
     },
   })
   if (!response.ok) {
@@ -41,7 +47,7 @@ export default tool({
 Provide the team that should own the issue. This tool picks a random assignee from that team and does not apply labels.`,
   args: {
     team: tool.schema
-      .enum(Object.keys(TEAM) as [keyof typeof TEAM, ...(keyof typeof TEAM)[]])
+      .enum(["tui", "desktop_web", "core", "inference", "windows"] as const)
       .describe("The owning team"),
   },
   async execute(args) {
@@ -49,6 +55,7 @@ Provide the team that should own the issue. This tool picks a random assignee fr
     const owner = "anomalyco"
     const repo = "opencode"
     const assignee = pick(TEAM[args.team])
+    if (!assignee) return `No assignee available for team ${args.team}`
 
     await githubFetch(`/repos/${owner}/${repo}/issues/${issue}/assignees`, {
       method: "POST",

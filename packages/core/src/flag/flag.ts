@@ -54,6 +54,16 @@ export const Flag = {
   get OPENCODE_DISABLE_PROJECT_CONFIG() {
     return truthy("OPENCODE_DISABLE_PROJECT_CONFIG")
   },
+  get OPENCODE_DISABLE_REASONING_DISTILLATION() {
+    return truthy("OPENCODE_DISABLE_REASONING_DISTILLATION")
+  },
+  /** Auxiliary propose/judge call timeout in milliseconds (#643). Defaults to
+   * 30s; raise it when the organizer model's provider latency exceeds the
+   * default. Invalid or non-positive values fall back to the default. */
+  get OPENCODE_REASONING_DISTILLATION_AUX_TIMEOUT_MS() {
+    const parsed = Number(process.env["OPENCODE_REASONING_DISTILLATION_AUX_TIMEOUT_MS"])
+    return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : 30_000
+  },
   get OPENCODE_EXPERIMENTAL_REFERENCES() {
     return enabledByExperimental("OPENCODE_EXPERIMENTAL_REFERENCES")
   },

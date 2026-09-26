@@ -4,21 +4,13 @@ import { ToolFailure } from "@opencode-ai/llm"
 import { Effect, Layer, Schema } from "effect"
 import { PermissionV2 } from "../permission"
 import { QuestionV2 } from "../question"
+import * as QuestionGuidance from "../question-guidance"
 import { Tool } from "./tool"
 import { Tools } from "./tools"
 
 export const name = "question"
 
-export const description = `Use this tool when you need to ask the user questions during execution. This allows you to:
-1. Gather user preferences or requirements
-2. Clarify ambiguous instructions
-3. Get decisions on implementation choices as you work
-4. Offer choices to the user about what direction to take.
-
-Usage notes:
-- When \`custom\` is enabled (default), a "Type your own answer" option is added automatically; don't include "Other" or catch-all options
-- Answers are returned as arrays of labels; set \`multiple: true\` to allow selecting more than one
-- If you recommend a specific option, make that the first option in the list and add "(Recommended)" at the end of the label`
+export const description = QuestionGuidance.description
 
 export const Input = Schema.Struct({
   questions: Schema.Array(QuestionV2.Prompt).annotate({ description: "Questions to ask" }),
@@ -27,6 +19,7 @@ export const Input = Schema.Struct({
 export const Output = Schema.Struct({
   answers: Schema.Array(QuestionV2.Answer),
   timedOut: Schema.Boolean.pipe(Schema.optional),
+  rejected: Schema.Boolean.pipe(Schema.optional),
 })
 export type Output = typeof Output.Type
 
@@ -34,16 +27,11 @@ export const toModelOutput = (
   questions: ReadonlyArray<QuestionV2.Prompt>,
   answers: ReadonlyArray<QuestionV2.Answer>,
   timedOut?: boolean,
+  rejected?: boolean,
 ) => {
-  if (timedOut)
-    return "The user is temporarily away. Analyze the available options, select the most appropriate answer yourself, and continue within the existing task authorization. Do not claim that the user selected an answer."
-  const formatted = questions
-    .map(
-      (question, index) =>
-        `"${question.question}"="${answers[index]?.length ? answers[index].join(", ") : "Unanswered"}"`,
-    )
-    .join(", ")
-  return `User has answered your questions: ${formatted}. You can now continue with the user's answers in mind.`
+  if (rejected) return QuestionGuidance.rejectedOutput
+  if (timedOut) return QuestionGuidance.timeoutOutput(questions)
+  return QuestionGuidance.answeredOutput(questions, answers)
 }
 
 export const layer = Layer.effectDiscard(
@@ -59,7 +47,7 @@ export const layer = Layer.effectDiscard(
           input: Input,
           output: Output,
           toModelOutput: ({ input, output }) => [
-            { type: "text", text: toModelOutput(input.questions, output.answers, output.timedOut) },
+            { type: "text", text: toModelOutput(input.questions, output.answers, output.timedOut, output.rejected) },
           ],
           execute: (input, context) =>
             permission
@@ -83,6 +71,9 @@ export const layer = Layer.effectDiscard(
                       Effect.map((answers) => ({ answers })),
                       Effect.catchTag("QuestionV2.TimedOutError", () =>
                         Effect.succeed({ answers: [], timedOut: true as const }),
+                      ),
+                      Effect.catchTag("QuestionV2.RejectedError", () =>
+                        Effect.succeed({ answers: [], rejected: true as const }),
                       ),
                       Effect.orDie,
                     ),

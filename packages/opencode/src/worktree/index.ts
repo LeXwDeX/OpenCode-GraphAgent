@@ -223,6 +223,7 @@ export const layer: Layer.Layer<
 
     const setup = Effect.fnUntraced(function* (info: Info) {
       const ctx = yield* InstanceState.context
+      const workspaceID = yield* InstanceState.workspaceID
       const created = yield* git(
         info.branch
           ? ["worktree", "add", "--no-checkout", "-b", info.branch, info.directory]
@@ -236,14 +237,11 @@ export const layer: Layer.Layer<
       }
 
       yield* project.addSandbox(ctx.project.id, info.directory).pipe(Effect.catch(() => Effect.void))
-    })
 
-    const boot = Effect.fnUntraced(function* (info: Info, startCommand?: string) {
-      const ctx = yield* InstanceState.context
-      const workspaceID = yield* InstanceState.workspaceID
-      const projectID = ctx.project.id
-      const extra = startCommand?.trim()
-
+      // Populate the worktree while the lifecycle lock is still held. If this
+      // Git mutation lived in the interruptible bootstrap fiber, remove/reset
+      // could kill it while it owned the branch ref lock and then race branch
+      // cleanup against the stale lock file.
       const populated = yield* git(["reset", "--hard"], { cwd: info.directory })
       if (populated.code !== 0) {
         const message = populated.stderr || populated.text || "Failed to populate worktree"
@@ -254,8 +252,16 @@ export const layer: Layer.Layer<
           workspace: workspaceID,
           payload: { type: Event.Failed.type, properties: { message } },
         })
-        return
+        return false
       }
+      return true
+    })
+
+    const boot = Effect.fnUntraced(function* (info: Info, startCommand?: string) {
+      const ctx = yield* InstanceState.context
+      const workspaceID = yield* InstanceState.workspaceID
+      const projectID = ctx.project.id
+      const extra = startCommand?.trim()
 
       const booted = yield* store.load({ directory: info.directory }).pipe(
         Effect.as(true),
@@ -303,7 +309,7 @@ export const layer: Layer.Layer<
       const directory = yield* canonical(info.directory)
       yield* lifecycle.withLock(directory)(
         Effect.gen(function* () {
-          yield* setup(info)
+          if (!(yield* setup(info))) return
           yield* FiberMap.run(
             bootFibers,
             directory,

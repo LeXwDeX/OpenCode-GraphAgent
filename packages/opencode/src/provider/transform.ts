@@ -443,15 +443,19 @@ function mapProviderOptions(
   transform: (options: Record<string, any> | undefined) => Record<string, any> | undefined,
 ) {
   return msgs.map((msg) => {
-    if (!Array.isArray(msg.content)) return { ...msg, providerOptions: transform(msg.providerOptions) }
+    const { providerOptions: originalOptions, ...rest } = msg
+    const mappedOptions = transform(originalOptions)
+    const providerOptions = mappedOptions === undefined ? {} : { providerOptions: mappedOptions }
+    if (!Array.isArray(msg.content)) return { ...rest, ...providerOptions } as typeof msg
     return {
-      ...msg,
-      providerOptions: transform(msg.providerOptions),
-      content: msg.content.map((part) =>
-        part.type === "tool-approval-request" || part.type === "tool-approval-response"
-          ? part
-          : { ...part, providerOptions: transform(part.providerOptions) },
-      ),
+      ...rest,
+      ...providerOptions,
+      content: msg.content.map((part) => {
+        if (part.type === "tool-approval-request" || part.type === "tool-approval-response") return part
+        const { providerOptions: originalPartOptions, ...partRest } = part
+        const mappedPartOptions = transform(originalPartOptions)
+        return mappedPartOptions === undefined ? partRest : { ...partRest, providerOptions: mappedPartOptions }
+      }),
     } as typeof msg
   })
 }

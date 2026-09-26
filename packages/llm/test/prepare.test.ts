@@ -82,6 +82,34 @@ describe("request option precedence", () => {
     }),
   )
 
+  it.effect("omits inherited output limits only for an explicitly uncapped request", () =>
+    Effect.gen(function* () {
+      const route = OpenAIChat.route.with({
+        endpoint: { baseURL: "https://api.openai.test/v1/" },
+        auth: Auth.bearer("test"),
+        generation: { maxTokens: 10, temperature: 0.5 },
+      })
+      const model = route.model({ id: "gpt-4o-mini", defaults: { generation: { maxTokens: 20 } } })
+      const ordinary = yield* LLMClient.prepare<OpenAIChat.OpenAIChatBody>(LLM.request({ model, prompt: "one" }))
+      const uncapped = yield* LLMClient.prepare<OpenAIChat.OpenAIChatBody>(
+        LLM.request({ model, prompt: "one", omitMaxTokens: true }),
+      )
+      expect(ordinary.body.max_tokens).toBe(20)
+      expect(uncapped.body.max_tokens).toBeUndefined()
+      expect(JSON.stringify(uncapped.body)).not.toContain('"max_tokens"')
+      expect(uncapped.body.temperature).toBe(0.5)
+      const routeOnlyModel = route.model({ id: "gpt-4o-mini" })
+      const routeOnlyOrdinary = yield* LLMClient.prepare<OpenAIChat.OpenAIChatBody>(
+        LLM.request({ model: routeOnlyModel, prompt: "two" }),
+      )
+      const routeOnlyUncapped = yield* LLMClient.prepare<OpenAIChat.OpenAIChatBody>(
+        LLM.request({ model: routeOnlyModel, prompt: "two", omitMaxTokens: true }),
+      )
+      expect(routeOnlyOrdinary.body.max_tokens).toBe(10)
+      expect(JSON.stringify(routeOnlyUncapped.body)).not.toContain('"max_tokens"')
+    }),
+  )
+
   it.effect("applies model HTTP defaults before request HTTP overlays", () =>
     LLMClient.generate(
       LLM.request({

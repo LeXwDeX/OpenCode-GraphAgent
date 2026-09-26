@@ -12,6 +12,7 @@ import { AbsolutePath, PositiveInt } from "./schema"
 import { ConfigAgent } from "./config/agent"
 import { ConfigAttachments } from "./config/attachments"
 import { ConfigCompaction } from "./config/compaction"
+import { ConfigReasoningDistillation } from "./config/reasoning-distillation"
 import { ConfigCommand } from "./config/command"
 import { ConfigExperimental } from "./config/experimental"
 import { ConfigFormatter } from "./config/formatter"
@@ -89,6 +90,10 @@ export class Info extends Schema.Class<Info>("Config.Info")({
   }),
   compaction: ConfigCompaction.Info.pipe(Schema.optional).annotate({
     description: "Conversation compaction behavior",
+  }),
+  reasoningDistillation: ConfigReasoningDistillation.Info.pipe(Schema.optional).annotate({
+    description:
+      "Reasoning distillation of returned model thoughts (default-on; any rewrite is gated by per-provider compatibility evidence)",
   }),
   skills: Schema.String.pipe(Schema.Array, Schema.optional).annotate({
     description: "Additional paths or URLs to discover skills from",

@@ -3,12 +3,12 @@ import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import path from "path"
-import { tool, type ModelMessage } from "ai"
+import { InvalidResponseDataError, tool, type ModelMessage } from "ai"
 import { Cause, Effect, Exit, Fiber, Layer, Stream } from "effect"
 import { InstanceRef } from "../../src/effect/instance-ref"
 import { HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
 import z from "zod"
-import { LLM } from "../../src/session/llm"
+import { LLM, strictJSON } from "../../src/session/llm"
 import { LLMClient, RequestExecutor, WebSocketExecutor } from "@opencode-ai/llm/route"
 import { Auth } from "@/auth"
 import { Config } from "@/config/config"
@@ -30,6 +30,7 @@ import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderError } from "@/provider/error"
 import { ContextFolding } from "@/session/context-folding"
 import { Flag } from "@opencode-ai/core/flag/flag"
+import { Hash } from "@opencode-ai/core/util/hash"
 import { logLines } from "effect/testing/TestConsole"
 
 type ConfigModel = NonNullable<NonNullable<ConfigV1.Info["provider"]>[string]["models"]>[string]
@@ -75,6 +76,19 @@ const drainWith = (layer: Layer.Layer<LLM.Service>, input: LLM.StreamInput) =>
           Effect.provide(layer),
           Effect.provideService(InstanceRef, ctx),
         ),
+      ),
+    )
+  })
+
+const drainSequenceWith = (layer: Layer.Layer<LLM.Service>, inputs: readonly LLM.StreamInput[]) =>
+  Effect.gen(function* () {
+    const ctx = yield* InstanceRef
+    if (!ctx) return yield* Effect.die("InstanceRef not provided")
+    return yield* Effect.promise(() =>
+      Effect.runPromise(
+        Effect.forEach(inputs, (input) => LLM.Service.use((svc) => svc.stream(input).pipe(Stream.runDrain)), {
+          discard: true,
+        }).pipe(Effect.provide(layer), Effect.provideService(InstanceRef, ctx)),
       ),
     )
   })
@@ -368,6 +382,43 @@ describe("session.llm.ai-sdk adapter", () => {
       message: error.message,
       error,
     })
+  })
+
+  test("preserves the pre-upgrade unknown finish contract when a stream ends without a finish reason", async () => {
+    const events = await adapt([
+      { type: "start-step", request: {}, warnings: [] },
+      {
+        type: "error",
+        error: new InvalidResponseDataError({
+          data: undefined,
+          message: "Response stream ended without a finish reason.",
+        }),
+      },
+      uncheckedAdapterEvent({ type: "finish-step", finishReason: "error", rawFinishReason: undefined }),
+      uncheckedAdapterEvent({ type: "finish", finishReason: "error", rawFinishReason: undefined }),
+    ])
+
+    expect(events).toMatchObject([
+      { type: "step-start", index: 0 },
+      { type: "step-finish", index: 0, reason: "unknown" },
+      { type: "finish", reason: "unknown" },
+    ])
+
+    const crossInstance = await adapt([
+      uncheckedAdapterEvent({
+        type: "error",
+        error: {
+          name: "AI_InvalidResponseDataError",
+          message: "Response stream ended without a finish reason.",
+        },
+      }),
+      uncheckedAdapterEvent({ type: "finish-step", finishReason: "error", rawFinishReason: undefined }),
+      uncheckedAdapterEvent({ type: "finish", finishReason: "error", rawFinishReason: undefined }),
+    ])
+    expect(crossInstance).toMatchObject([
+      { type: "step-finish", index: 0, reason: "unknown" },
+      { type: "finish", reason: "unknown" },
+    ])
   })
 
   test("emits undefined usage when every AI SDK usage field is missing", async () => {
@@ -876,6 +927,84 @@ const foldingConfig = (): Partial<ConfigV1.Info> => ({
     },
   },
 })
+
+const distillationBody = "反复分析方案A与风险。".repeat(8_000)
+const distillationBackground = "背景材料。".repeat(80_000)
+const distillationMessages = (): ModelMessage[] => [
+  { role: "assistant", content: [{ type: "reasoning", text: distillationBody }] },
+  { role: "user", content: `${distillationBackground}\n继续执行。` },
+]
+const distillationHistory = (): LLM.StreamInput["reasoningDistillation"] => ({
+  groups: [
+    {
+      messageID: "msg-reasoning-source",
+      parts: [
+        {
+          messageID: "msg-reasoning-source",
+          partID: "prt-reasoning-source",
+          text: distillationBody,
+          signed: false,
+          encrypted: false,
+          settled: true,
+        },
+      ],
+    },
+  ],
+  calls: [],
+  inventoryComplete: true,
+  inventoryFingerprint: Hash.sha256("empty-inventory"),
+})
+
+const auxiliaryResponse = (content: unknown) =>
+  Response.json({
+    id: "chatcmpl-auxiliary",
+    object: "chat.completion",
+    created: 0,
+    model: "deepseek-test-r1",
+    choices: [{ index: 0, message: { role: "assistant", content: JSON.stringify(content) }, finish_reason: "stop" }],
+    usage: { prompt_tokens: 10, completion_tokens: 10, total_tokens: 20 },
+  })
+
+const distillationConfig = (runtime: "opencode-ai-sdk" | "opencode-native"): Partial<ConfigV1.Info> => {
+  const endpoint = `${state.server!.url.origin}/v1`
+  return {
+    enabled_providers: ["custom-provider"],
+    provider: {
+      "custom-provider": {
+        name: "Custom Provider",
+        npm: "@ai-sdk/openai-compatible",
+        api: endpoint,
+        models: {
+          "deepseek-test-r1": {
+            name: "DeepSeek R1",
+            reasoning: true,
+            interleaved: { field: "reasoning_content" },
+            limit: { context: 65_536, output: 4_096 },
+          },
+        },
+        options: { apiKey: "test-key", baseURL: endpoint },
+      },
+    },
+    reasoningDistillation: {
+      enabled: true,
+      compatibility: [
+        {
+          runtime,
+          protocol: "openai-compatible",
+          providerModelVariant: "custom-provider/deepseek-test-r1/default",
+          endpointIdentity: Hash.sha256(endpoint),
+          adapterVersion:
+            runtime === "opencode-native"
+              ? "opencode-reasoning-distillation-native-v1"
+              : "opencode-reasoning-distillation-ai-sdk-v1",
+          optionsFingerprint: Hash.sha256(JSON.stringify({})),
+          transportVerified: true,
+          upstreamVerified: true,
+        },
+      ],
+    },
+  }
+}
 
 const loadedDcpCases = [
   {
@@ -1707,6 +1836,119 @@ describe("session.llm.stream", () => {
       config: () => ({ ...foldingConfig(), compaction: { dynamic: true } }),
     },
   )
+
+  for (const runtime of ["opencode-ai-sdk", "opencode-native"] as const) {
+    it.instance(
+      `proposes on the first ${runtime} request and applies only after the second-cycle judge`,
+      () =>
+        Effect.gen(function* () {
+          const propose = waitRequest(
+            "/chat/completions",
+            auxiliaryResponse({
+              claims: [
+                {
+                  id: "c1",
+                  kind: "decision",
+                  text: "已确认方案A。",
+                  scope: "当前会话",
+                  sources: [
+                    {
+                      messageID: "msg-reasoning-source",
+                      partID: "prt-reasoning-source",
+                      start: 0,
+                      end: distillationBody.length,
+                    },
+                  ],
+                  evidence: [],
+                  status: "unverified",
+                },
+              ],
+              preserved: [],
+              coverage: [
+                {
+                  source: {
+                    messageID: "msg-reasoning-source",
+                    partID: "prt-reasoning-source",
+                    start: 0,
+                    end: distillationBody.length,
+                  },
+                  action: "keep",
+                  claimID: "c1",
+                },
+              ],
+            }),
+          )
+          const first = waitRequest(
+            "/chat/completions",
+            new Response(createChatStream("first"), { headers: { "Content-Type": "text/event-stream" } }),
+          )
+          const judge = waitRequest(
+            "/chat/completions",
+            auxiliaryResponse({ support: [{ claimID: "c1", verdict: "supported", method: "judged" }] }),
+          )
+          const second = waitRequest(
+            "/chat/completions",
+            new Response(createChatStream("second"), { headers: { "Content-Type": "text/event-stream" } }),
+          )
+
+          const resolved = yield* Provider.use.getModel(
+            ProviderV2.ID.make("custom-provider"),
+            ModelV2.ID.make("deepseek-test-r1"),
+          )
+          expect(resolved.limit).toMatchObject({ context: 65_536, output: 4_096 })
+          const sessionID = SessionID.make(`session-test-distillation-${runtime}`)
+          const agent = {
+            name: "test",
+            mode: "primary",
+            options: {},
+            permission: [{ permission: "*", pattern: "*", action: "allow" }],
+          } satisfies Agent.Info
+          const messages = distillationMessages()
+          const before = JSON.stringify(messages)
+          const input = (id: string): LLM.StreamInput => ({
+            user: {
+              id: MessageID.make(id),
+              sessionID,
+              role: "user",
+              time: { created: Date.now() },
+              agent: agent.name,
+              model: { providerID: ProviderV2.ID.make("custom-provider"), modelID: resolved.id },
+            } satisfies SessionV1.User,
+            sessionID,
+            model: resolved,
+            agent,
+            system: [],
+            messages,
+            tools: {},
+            purpose: "conversation",
+            reasoningDistillation: distillationHistory(),
+          })
+
+          yield* drainSequenceWith(
+            llmLayerWithExecutor(RequestExecutor.defaultLayer, {
+              experimentalNativeLlm: runtime === "opencode-native",
+              outputTokenMax: 4_096,
+            }),
+            [input("msg_user-distillation-first"), input("msg_user-distillation-second")],
+          )
+
+          const [proposeCapture, firstCapture, judgeCapture, secondCapture] = yield* Effect.promise(() =>
+            Promise.all([propose, first, judge, second]),
+          )
+          expect(proposeCapture.body.stream).not.toBe(true)
+          expect(judgeCapture.body.stream).not.toBe(true)
+          const reasoning = (capture: Capture) =>
+            (capture.body.messages as Array<Record<string, unknown>> | undefined)?.find(
+              (message) => message.role === "assistant",
+            )?.reasoning_content
+          expect(reasoning(firstCapture)).toBe(distillationBody)
+          expect(reasoning(secondCapture)).toContain("已确认方案A。")
+          expect(reasoning(secondCapture)).not.toBe(distillationBody)
+          expect(JSON.stringify(messages)).toBe(before)
+        }),
+      { config: () => distillationConfig(runtime) },
+    )
+  }
 
   it.instance(
     "streams OpenAI through native runtime when opted in",
@@ -2586,4 +2828,19 @@ describe("session.llm.stream", () => {
       }),
     },
   )
+})
+
+describe("strictJSON", () => {
+  test("parses plain JSON", () => {
+    expect(strictJSON('{"a":1}')).toEqual({ a: 1 })
+  })
+
+  test("strips markdown fences before parsing", () => {
+    expect(strictJSON('```json\n{"a":1}\n```')).toEqual({ a: 1 })
+    expect(strictJSON('```\n{"a":1}\n```')).toEqual({ a: 1 })
+  })
+
+  test("rejects malformed content", () => {
+    expect(() => strictJSON("not json")).toThrow()
+  })
 })

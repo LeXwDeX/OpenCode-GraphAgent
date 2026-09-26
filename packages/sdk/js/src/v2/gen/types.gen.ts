@@ -2142,7 +2142,9 @@ export type Config = {
     tail_turns?: number
     preserve_recent_tokens?: number
     reserved?: number
+    max_context_tokens?: number
   }
+  reasoningDistillation?: ConfigV2ReasoningDistillation
   experimental?: {
     disable_paste_summary?: boolean
     batch_tool?: boolean
@@ -3896,6 +3898,22 @@ export type ConfigV2ReferenceLocal = {
   path: string
   description?: string
   hidden?: boolean
+}
+
+export type ConfigV2ReasoningDistillationCompatibility = {
+  runtime: string
+  protocol: string
+  providerModelVariant: string
+  endpointIdentity: string
+  adapterVersion: string
+  optionsFingerprint: string
+  transportVerified: boolean
+  upstreamVerified: boolean
+}
+
+export type ConfigV2ReasoningDistillation = {
+  enabled?: boolean
+  compatibility?: Array<ConfigV2ReasoningDistillationCompatibility>
 }
 
 export type PolicyEffect = "allow" | "deny"

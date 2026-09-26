@@ -8,6 +8,8 @@ import { QuestionV1 } from "@opencode-ai/schema/question-v1"
 import { Config } from "@/config/config"
 
 export const DEFAULT_TIMEOUT_SECONDS = 60
+export const MAX_RESPONSE_PHASE_SECONDS = 300
+const DEADLINE_RECHECK_MILLIS = 1_000
 
 export const Option = QuestionV1.Option
 export type Option = typeof Option.Type
@@ -46,6 +48,9 @@ export class NotFoundError extends Schema.TaggedErrorClass<NotFoundError>()("Que
 interface PendingEntry {
   info: Request
   deferred: Deferred.Deferred<ReadonlyArray<Answer>, RejectedError>
+  deadline: number
+  readonly inactivityTimeoutMs: number
+  maximumDeadline?: number
 }
 
 interface State {
@@ -116,7 +121,12 @@ export const layer = Layer.effect(
               tool: input.tool,
               expiresAt,
             }
-            const entry = { info, deferred }
+            const entry: PendingEntry = {
+              info,
+              deferred,
+              deadline: expiresAt,
+              inactivityTimeoutMs: timeoutSeconds * 1_000,
+            }
             pending.set(id, entry)
             return yield* events.publish(Event.Asked, info).pipe(
               Effect.andThen(
@@ -124,19 +134,21 @@ export const layer = Layer.effect(
                   Effect.raceFirst(
                     Deferred.await(deferred),
                     Effect.gen(function* () {
-                      const current = yield* Clock.currentTimeMillis
-                      yield* Effect.sleep(Math.max(0, expiresAt - current))
-                      const timedOut = yield* Effect.uninterruptible(
-                        Effect.gen(function* () {
-                          const existing = pending.get(id)
-                          if (existing !== entry || existing.info.expiresAt === undefined) return false
-                          pending.delete(id)
-                          yield* events.publish(Event.TimedOut, { sessionID: info.sessionID, requestID: id })
-                          return true
-                        }),
-                      )
-                      if (!timedOut) return yield* Effect.never
-                      return yield* new TimedOutError()
+                      for (;;) {
+                        const current = yield* Clock.currentTimeMillis
+                        yield* Effect.sleep(Math.min(DEADLINE_RECHECK_MILLIS, Math.max(0, entry.deadline - current)))
+                        const timedOut = yield* Effect.uninterruptible(
+                          Effect.gen(function* () {
+                            if (pending.get(id) !== entry) return false
+                            if ((yield* Clock.currentTimeMillis) < entry.deadline) return false
+                            pending.delete(id)
+                            yield* events.publish(Event.TimedOut, { sessionID: info.sessionID, requestID: id })
+                            return true
+                          }),
+                        )
+                        if (timedOut) return yield* new TimedOutError()
+                        if (pending.get(id) !== entry) return yield* Effect.never
+                      }
                     }),
                   ),
                 ),
@@ -196,6 +208,10 @@ export const layer = Layer.effect(
         yield* new NotFoundError({ requestID })
         return
       }
+      const now = yield* Clock.currentTimeMillis
+      if (now >= existing.deadline) return yield* new NotFoundError({ requestID })
+      existing.maximumDeadline ??= now + MAX_RESPONSE_PHASE_SECONDS * 1_000
+      existing.deadline = Math.min(now + existing.inactivityTimeoutMs, existing.maximumDeadline)
       if (existing.info.expiresAt === undefined) return
       existing.info = { ...existing.info, expiresAt: undefined }
       yield* events.publish(Event.Interacted, {

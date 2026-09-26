@@ -63,6 +63,14 @@ export const Parameters = Schema.Struct({
   }),
 })
 
+function repairBackgroundArgument(value: unknown): unknown {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return value
+  if (!Object.hasOwn(value, "background")) return value
+  const background = Reflect.get(value, "background")
+  if (background !== "true" && background !== "false") return value
+  return { ...value, background: background === "true" }
+}
+
 function renderOutput(input: {
   sessionID: SessionID
   state: "running" | "completed" | "error"
@@ -444,6 +452,7 @@ export const TaskTool = Tool.define(
         ? [DESCRIPTION, BACKGROUND_DESCRIPTION].join("\n\n")
         : DESCRIPTION,
       parameters: Parameters,
+      repairArguments: repairBackgroundArgument,
       jsonSchema: flags.experimentalBackgroundSubagents ? undefined : ToolJsonSchema.fromSchema(BaseParameters),
       execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context) =>
         run(params, ctx).pipe(Effect.orDie),

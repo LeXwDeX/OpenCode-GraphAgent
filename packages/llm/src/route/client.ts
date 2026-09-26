@@ -167,10 +167,29 @@ export class Service extends Context.Service<Service, Interface>()("@opencode/LL
 const resolveRequestOptions = (request: LLMRequest) => {
   const routeDefaults = request.model.route.defaults
   const modelDefaults = request.model.defaults
-  const generation = mergeGenerationOptions(routeDefaults.generation, modelDefaults?.generation, request.generation)
+  const mergedGeneration = mergeGenerationOptions(
+    routeDefaults.generation,
+    modelDefaults?.generation,
+    request.generation,
+  )
+  const generation = request.omitMaxTokens
+    ? new GenerationOptions({
+        temperature: mergedGeneration?.temperature,
+        topP: mergedGeneration?.topP,
+        topK: mergedGeneration?.topK,
+        frequencyPenalty: mergedGeneration?.frequencyPenalty,
+        presencePenalty: mergedGeneration?.presencePenalty,
+        seed: mergedGeneration?.seed,
+        stop: mergedGeneration?.stop,
+      })
+    : mergedGeneration
   return LLMRequest.update(request, {
     generation: generation ?? new GenerationOptions({}),
-    providerOptions: mergeProviderOptions(routeDefaults.providerOptions, modelDefaults?.providerOptions, request.providerOptions),
+    providerOptions: mergeProviderOptions(
+      routeDefaults.providerOptions,
+      modelDefaults?.providerOptions,
+      request.providerOptions,
+    ),
     http: mergeHttpOptions(routeDefaults.http, modelDefaults?.http, request.http),
   })
 }

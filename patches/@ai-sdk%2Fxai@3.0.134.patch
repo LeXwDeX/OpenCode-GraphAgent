@@ -1,0 +1,105 @@
+diff --git a/dist/index.js b/dist/index.js
+--- a/dist/index.js
++++ b/dist/index.js
+@@ -1157,6 +1157,24 @@ async function convertToXaiResponsesInput({
+                     detail: filePartOptions.imageDetail
+                   }
+                 });
++              } else if (block.mediaType === "application/pdf") {
++                if (block.data instanceof URL) {
++                  contentParts.push({
++                    type: "input_file",
++                    file_url: block.data.toString()
++                  });
++                } else if (typeof block.data === "string" && block.data.startsWith("file-")) {
++                  contentParts.push({
++                    type: "input_file",
++                    file_id: block.data
++                  });
++                } else {
++                  contentParts.push({
++                    type: "input_file",
++                    filename: block.filename ?? "file",
++                    file_data: `data:application/pdf;base64,${(0, import_provider_utils5.convertToBase64)(block.data)}`
++                  });
++                }
+               } else if (block.data instanceof URL) {
+                 contentParts.push({
+                   type: "input_file",
+diff --git a/dist/index.mjs b/dist/index.mjs
+--- a/dist/index.mjs
++++ b/dist/index.mjs
+@@ -1160,6 +1160,24 @@ async function convertToXaiResponsesInput({
+                     detail: filePartOptions.imageDetail
+                   }
+                 });
++              } else if (block.mediaType === "application/pdf") {
++                if (block.data instanceof URL) {
++                  contentParts.push({
++                    type: "input_file",
++                    file_url: block.data.toString()
++                  });
++                } else if (typeof block.data === "string" && block.data.startsWith("file-")) {
++                  contentParts.push({
++                    type: "input_file",
++                    file_id: block.data
++                  });
++                } else {
++                  contentParts.push({
++                    type: "input_file",
++                    filename: block.filename ?? "file",
++                    file_data: `data:application/pdf;base64,${convertToBase642(block.data)}`
++                  });
++                }
+               } else if (block.data instanceof URL) {
+                 contentParts.push({
+                   type: "input_file",
+diff --git a/src/responses/convert-to-xai-responses-input.ts b/src/responses/convert-to-xai-responses-input.ts
+--- a/src/responses/convert-to-xai-responses-input.ts
++++ b/src/responses/convert-to-xai-responses-input.ts
+@@ -68,6 +68,27 @@ export async function convertToXaiResponsesInput({
+                     detail: filePartOptions.imageDetail,
+                   }),
+                 });
++              } else if (block.mediaType === 'application/pdf') {
++                if (block.data instanceof URL) {
++                  contentParts.push({
++                    type: 'input_file',
++                    file_url: block.data.toString(),
++                  });
++                } else if (
++                  typeof block.data === 'string' &&
++                  block.data.startsWith('file-')
++                ) {
++                  contentParts.push({
++                    type: 'input_file',
++                    file_id: block.data,
++                  });
++                } else {
++                  contentParts.push({
++                    type: 'input_file',
++                    filename: block.filename ?? 'file',
++                    file_data: `data:application/pdf;base64,${convertToBase64(block.data)}`,
++                  });
++                }
+               } else if (block.data instanceof URL) {
+                 // xAI's Responses API accepts non-image documents (PDF, text, CSV, etc.)
+                 // via `{ type: 'input_file', file_url }`. See
+diff --git a/src/responses/xai-responses-api.ts b/src/responses/xai-responses-api.ts
+--- a/src/responses/xai-responses-api.ts
++++ b/src/responses/xai-responses-api.ts
+@@ -31,7 +31,13 @@ export type XaiResponsesUserMessageContentPart =
+       image_url: string;
+       detail?: 'low' | 'high' | 'auto';
+     }
+-  | { type: 'input_file'; file_url: string };
++  | {
++      type: 'input_file';
++      file_url?: string;
++      file_id?: string;
++      file_data?: string;
++      filename?: string;
++    };
+
+ export type XaiResponsesUserMessage = {
+   role: 'user';

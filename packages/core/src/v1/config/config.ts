@@ -3,6 +3,7 @@ export * as ConfigV1 from "./config"
 import { Schema } from "effect"
 import { NonNegativeInt, PositiveInt, type DeepMutable } from "../../schema"
 import { ConfigExperimental } from "../../config/experimental"
+import { ConfigReasoningDistillation } from "../../config/reasoning-distillation"
 import { ConfigReference } from "../../config/reference"
 import { ConfigAgentV1 } from "./agent"
 import { ConfigAttachmentV1 } from "./attachment"
@@ -169,8 +170,13 @@ export const Info = Schema.Struct({
       reserved: Schema.optional(NonNegativeInt).annotate({
         description: "Token buffer for compaction. Leaves enough window to avoid overflow during compaction.",
       }),
+      max_context_tokens: Schema.optional(PositiveInt).annotate({
+        description:
+          "Trigger automatic full compaction once the previous response reaches this token count (default: 250000), even when the model has a larger context window. The model's smaller usable limit still takes precedence.",
+      }),
     }),
   ),
+  reasoningDistillation: Schema.optional(ConfigReasoningDistillation.Info),
   experimental: Schema.optional(
     Schema.Struct({
       disable_paste_summary: Schema.optional(Schema.Boolean),
