@@ -190,20 +190,32 @@ export const projectDistillationAISDK = <Request>(
   const evidence = buildReasoningEvidence(input.slots, input.calls, input.inventoryComplete, input.inventoryFingerprint)
   const mappings = buildSlotMappings(input.slots, input.capability, input.records)
   const foldingBudget = estimateContextFoldingBudget(input.budget)
-  const plan = planReasoningDistillation({
-    purpose: input.purpose,
-    budget: foldingBudget,
-    candidate: input.candidate,
-    evidence,
-    mappings,
-    quota: input.quota,
-    originalTokens: input.originalTokens,
-    support: input.support,
-    ...(input.judgeFingerprint === undefined ? {} : { judgeFingerprint: input.judgeFingerprint }),
-    ...(input.targets === undefined ? {} : { targets: input.targets }),
-    ...(input.executionContext === undefined ? {} : { executionContext: input.executionContext }),
-    policyVersion: ReasoningDistillationPolicy.version,
-  })
+  const plan = planReasoningDistillation(
+    {
+      purpose: input.purpose,
+      budget: foldingBudget,
+      candidate: input.candidate,
+      evidence,
+      mappings,
+      quota: input.quota,
+      originalTokens: input.originalTokens,
+      support: input.support,
+      ...(input.judgeFingerprint === undefined ? {} : { judgeFingerprint: input.judgeFingerprint }),
+      ...(input.targets === undefined ? {} : { targets: input.targets }),
+      ...(input.executionContext === undefined ? {} : { executionContext: input.executionContext }),
+      policyVersion: ReasoningDistillationPolicy.version,
+    },
+    {
+      resolveText: (span) => {
+        const sources = input.slots.filter((slot) => slot.messageID === span.messageID && slot.partID === span.partID)
+        if (sources.length !== 1) return ""
+        const source = sources[0]
+        if (!source || span.start < 0 || span.end <= span.start || span.end > source.text.length) return ""
+        const original = source.text.slice(span.start, span.end)
+        return Hash.sha256(original) === span.fingerprint ? original : ""
+      },
+    },
+  )
 
   if (plan.replacements.length === 0) {
     return { request: input.request, applied: false, plan, skipReason: plan.skipReason }
@@ -470,15 +482,31 @@ export const parseSupport = (raw: unknown): ClaimSupport[] | undefined => {
  * Extract W1 interleaved reasoning slots from the provider-transformed AI-SDK messages (§2 W1). For interleaved-capable
  * models, ProviderTransform.message joins each assistant message's reasoning parts into a single
  * `providerOptions.openaiCompatible[field]` string (transform.ts:316-345); that string is the rewritable slot. Only
- * non-empty assistant slots are returned. The openaiCompatible interleaved field is a plain unsigned string, so it is
- * neither signed (P1) nor encrypted (P2); historical assistant messages in an outbound prompt are settled (P4 does not
- * apply). messageID/partID are wire-position identifiers — binding them to persisted history refs (for stable cache
- * keys and audit) is the host wiring step, mirroring folding's bindModelMessages.
+ * non-empty assistant slots are returned. The field's string shape does not prove its source was unsigned: the
+ * provider transform removes the source reasoning parts and can therefore hide an opaque signature during model
+ * switching. Only an explicit, unique final-wire-index lineage to one settled source part can authorize a slot. Missing,
+ * ambiguous, or multi-part lineage remains P4-protected until ordered multi-part evidence mapping is implemented.
  */
+export type InterleavedSourcePart = Readonly<{
+  messageID: string
+  partID: string
+  text: string
+  signed: boolean
+  encrypted: boolean
+  settled: boolean
+}>
+
+/** The host binds a final transformed assistant message index to the source parts that produced its W1 field. */
+export type InterleavedSlotLineage = Readonly<{
+  wireMessageIndex: number
+  parts: readonly InterleavedSourcePart[]
+}>
+
 export const extractInterleavedReasoningSlots = (
   messages: readonly unknown[],
   field: string,
   basePath: readonly (string | number)[] = ["messages"],
+  lineage: readonly InterleavedSlotLineage[] = [],
 ): ReasoningSlotObservation[] => {
   const slots: ReasoningSlotObservation[] = []
   for (let index = 0; index < messages.length; index++) {
@@ -490,16 +518,28 @@ export const extractInterleavedReasoningSlots = (
     if (!isRecord(openaiCompatible)) continue
     const text = openaiCompatible[field]
     if (!isString(text) || text.length === 0) continue
+    const matches = lineage.filter((entry) => entry.wireMessageIndex === index)
+    const source = matches.length === 1 && matches[0].parts.length === 1 ? matches[0].parts[0] : undefined
+    const known =
+      source !== undefined &&
+      source.text === text &&
+      typeof source.messageID === "string" &&
+      source.messageID.length > 0 &&
+      typeof source.partID === "string" &&
+      source.partID.length > 0 &&
+      typeof source.signed === "boolean" &&
+      typeof source.encrypted === "boolean" &&
+      typeof source.settled === "boolean"
     slots.push({
-      messageID: `${basePath.join(".")}.${index}`,
-      partID: field,
+      messageID: known ? source.messageID : `${basePath.join(".")}.${index}`,
+      partID: known ? source.partID : field,
       bodyPath: [...basePath, index, "providerOptions", "openaiCompatible", field],
       text,
       shape: "interleaved-field",
-      signed: false,
-      encrypted: false,
-      settled: true,
-      structureRewritable: true,
+      signed: known ? source.signed : false,
+      encrypted: known ? source.encrypted : false,
+      settled: known ? source.settled : false,
+      structureRewritable: known,
     })
   }
   return slots
@@ -609,27 +649,27 @@ export const runJudge = async (input: {
 }
 
 /** A persisted reasoning part with its stable identity (§5.8 cache keys must not drift with wire position). */
-export type PersistedReasoningRef = Readonly<{ messageID: string; partID: string; text: string }>
+export type PersistedReasoningRef = Readonly<{
+  messageID: string
+  partID: string
+  text: string
+  /** Final transformed wire position, established by the host rather than inferred from text. */
+  wireMessageIndex?: number
+}>
 
 /**
- * Rebind wire-position reasoning slots to stable persisted refs (§5.8). The provider transform joins an assistant
- * message's reasoning parts into one interleaved field, so for the common single-reasoning-part case the wire slot text
- * equals the persisted part text and an exact match yields the stable messageID/partID. Unmatched slots keep their
- * wire-position id (degraded cache stability, still correct); duplicate persisted text binds to the first occurrence,
- * so an ambiguous match never silently rebinds to the wrong part. Pure and host-driven: the caller supplies the
- * persisted refs (from SessionV1 history), keeping this unit-testable without Effect or the ledger.
+ * Bind only a unique source ref whose explicit final wire index and text both match. Text equality alone cannot prove
+ * identity: different source parts may contain the same text and have different signature/protection states.
  */
 export const bindPersistedReasoningRefs = (
   slots: readonly ReasoningSlotObservation[],
   persisted: readonly PersistedReasoningRef[],
 ): ReasoningSlotObservation[] => {
-  const byText = new Map<string, PersistedReasoningRef>()
-  for (const ref of persisted) {
-    if (!byText.has(ref.text)) byText.set(ref.text, ref)
-  }
   return slots.map((slot) => {
-    const match = byText.get(slot.text)
-    return match ? { ...slot, messageID: match.messageID, partID: match.partID } : slot
+    const index = slot.bodyPath.at(-4)
+    if (typeof index !== "number") return slot
+    const matches = persisted.filter((ref) => ref.wireMessageIndex === index && ref.text === slot.text)
+    return matches.length === 1 ? { ...slot, messageID: matches[0].messageID, partID: matches[0].partID } : slot
   })
 }
 

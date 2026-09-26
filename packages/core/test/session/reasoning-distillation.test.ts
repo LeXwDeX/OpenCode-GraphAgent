@@ -463,6 +463,67 @@ describe("planReasoningDistillation (§5.2)", () => {
     expect(plan.replacements[0].estimatedSavings).toBeGreaterThan(0)
     expect(plan.replacements[0].projection.text).toContain("采用方案 A")
   })
+  test("a candidate cannot be reused across two eligible reasoning slots", () => {
+    const spans = [span("m1", "p1", 0, 10)]
+    const cand = candidate([claim("c1", { sources: spans })], [{ source: spans[0], action: "keep", claimID: "c1" }])
+    const other = {
+      ...eligibleMapping(),
+      refs: [{ messageID: "m2", partID: "p2" }],
+      bodyPath: ["messages", 1, "content"],
+      sourceFingerprint: "sf2",
+    }
+    const result = planReasoningDistillation(
+      planInput({
+        candidate: cand,
+        evidence: evidence(spans),
+        support: [{ claimID: "c1", result: supported() }],
+        mappings: [eligibleMapping(), other],
+      }),
+    )
+    expect(result).toMatchObject({ skipReason: "mapping-mismatch", replacements: [] })
+  })
+  test("a candidate's source and capability must match the single mapped slot", () => {
+    const spans = [span("m1", "p1", 0, 10)]
+    const cand = candidate([claim("c1", { sources: spans })], [{ source: spans[0], action: "keep", claimID: "c1" }])
+    const base = planInput({
+      candidate: cand,
+      evidence: evidence(spans),
+      support: [{ claimID: "c1", result: supported() }],
+    })
+    for (const mapping of [
+      { ...eligibleMapping(), sourceFingerprint: "another-source" },
+      eligibleMapping("another-capability"),
+      { ...eligibleMapping(), refs: [{ messageID: "m1", partID: "another-part" }] },
+    ]) {
+      expect(planReasoningDistillation({ ...base, mappings: [mapping] })).toMatchObject({
+        skipReason: "mapping-mismatch",
+        replacements: [],
+      })
+    }
+  })
+  test("preserved spans require faithful original text", () => {
+    const spans = [span("m1", "p1", 0, 5), span("m1", "p1", 5, 10)]
+    const cand = candidate(
+      [claim("c1", { sources: [spans[0]] })],
+      [
+        { source: spans[0], action: "keep", claimID: "c1" },
+        { source: spans[1], action: "preserve" },
+      ],
+      { preserved: [spans[1]] },
+    )
+    const input = planInput({
+      candidate: cand,
+      evidence: evidence(spans),
+      support: [{ claimID: "c1", result: supported() }],
+    })
+    expect(planReasoningDistillation(input)).toMatchObject({ skipReason: "unknown-content", replacements: [] })
+    expect(planReasoningDistillation(input, { resolveText: () => "" })).toMatchObject({
+      skipReason: "unknown-content",
+      replacements: [],
+    })
+    const result = planReasoningDistillation(input, { resolveText: () => "不可删原文" })
+    expect(result.replacements[0]?.projection.text).toContain("不可删原文")
+  })
   test("a judged-supported candidate carries the judge fingerprint on its stamp", () => {
     const spans = [span("m1", "p1", 0, 10)]
     const cand = candidate([claim("c1", { sources: spans })], [{ source: spans[0], action: "keep", claimID: "c1" }])

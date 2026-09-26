@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test"
 import type { PreparedRequestBudgetInput } from "@opencode-ai/core/session/context-folding"
 import {
   ReasoningDistillationPolicy,
+  capabilityFingerprint,
   type Candidate,
   type ClaimSupport,
   type CompatibilityRecord,
@@ -177,8 +178,8 @@ const validCandidate = (text: string): Candidate => {
       sessionID: "s1",
       messageID: "m1",
       partIDs: ["p1"],
-      sourceFingerprint: "sf1",
-      capabilityFingerprint: "cap1",
+      sourceFingerprint: Hash.sha256(text),
+      capabilityFingerprint: capabilityFingerprint(capability()),
       organizerFingerprint: "org1",
       policyVersion: POLICY,
     },
@@ -244,6 +245,30 @@ describe("projectDistillationAISDK (§5.2)", () => {
     expect(result.request.messages[0].reasoning).toContain("精简结论")
     expect(request.messages[0].reasoning).toBe(TEXT)
     expect(result.request).not.toBe(request)
+  })
+  test("preserved source text is copied exactly or the original request is sent", () => {
+    const request = wireRequest(TEXT)
+    const preserved = spanFor(TEXT)
+    const candidate = {
+      ...validCandidate(TEXT),
+      claims: [],
+      preserved: [preserved],
+      coverage: [{ source: preserved, action: "preserve" as const }],
+    }
+    const result = projectDistillationAISDK(baseInput(request, { candidate, support: [] }))
+    expect(result.applied).toBe(false)
+    expect(result.request).toBe(request)
+    expect(result.plan.replacements[0]?.projection.text).toBe(TEXT)
+    expect(result.skipReason).toBe("insufficient-net-savings")
+
+    const stale = {
+      ...candidate,
+      preserved: [{ ...preserved, fingerprint: "wrong" }],
+      coverage: [{ source: { ...preserved, fingerprint: "wrong" }, action: "preserve" as const }],
+    }
+    const rejected = projectDistillationAISDK(baseInput(request, { candidate: stale, support: [] }))
+    expect(rejected.applied).toBe(false)
+    expect(rejected.request).toBe(request)
   })
 
   test("no cached candidate defers to one propose call and sends the original", () => {
@@ -421,8 +446,8 @@ describe("extractInterleavedReasoningSlots (W1, §2)", () => {
       shape: "interleaved-field",
       signed: false,
       encrypted: false,
-      settled: true,
-      structureRewritable: true,
+      settled: false,
+      structureRewritable: false,
     })
   })
 
@@ -536,9 +561,11 @@ describe("bindPersistedReasoningRefs (§5.8 stable cache keys)", () => {
     structureRewritable: true,
   })
 
-  test("rebinds a wire slot to its stable persisted ref by exact text match, preserving bodyPath", () => {
+  test("rebinds a wire slot only with explicit wire position and exact text, preserving bodyPath", () => {
     const slots = [wireSlot("思考甲", 0)]
-    const bound = bindPersistedReasoningRefs(slots, [{ messageID: "msg_abc", partID: "part_1", text: "思考甲" }])
+    const bound = bindPersistedReasoningRefs(slots, [
+      { messageID: "msg_abc", partID: "part_1", text: "思考甲", wireMessageIndex: 0 },
+    ])
     expect(bound[0].messageID).toBe("msg_abc")
     expect(bound[0].partID).toBe("part_1")
     expect(bound[0].bodyPath).toEqual(slots[0].bodyPath)
@@ -550,12 +577,31 @@ describe("bindPersistedReasoningRefs (§5.8 stable cache keys)", () => {
     expect(bound[0].messageID).toBe("messages.2")
   })
 
-  test("duplicate persisted text binds to the first occurrence (no silent mis-binding)", () => {
+  test("duplicate persisted text at the same wire position stays unbound", () => {
     const slots = [wireSlot("重复", 0)]
     const persisted = [
-      { messageID: "msg_first", partID: "p1", text: "重复" },
-      { messageID: "msg_second", partID: "p2", text: "重复" },
+      { messageID: "msg_first", partID: "p1", text: "重复", wireMessageIndex: 0 },
+      { messageID: "msg_second", partID: "p2", text: "重复", wireMessageIndex: 0 },
     ]
-    expect(bindPersistedReasoningRefs(slots, persisted)[0].messageID).toBe("msg_first")
+    expect(bindPersistedReasoningRefs(slots, persisted)[0].messageID).toBe("messages.0")
+  })
+
+  test("identical text at different wire positions binds to the corresponding persisted part", () => {
+    const slots = [wireSlot("重复", 0), wireSlot("重复", 2)]
+    const persisted = [
+      { messageID: "msg_first", partID: "p1", text: "重复", wireMessageIndex: 0 },
+      { messageID: "msg_second", partID: "p2", text: "重复", wireMessageIndex: 2 },
+    ]
+    expect(bindPersistedReasoningRefs(slots, persisted).map((item) => item.messageID)).toEqual([
+      "msg_first",
+      "msg_second",
+    ])
+  })
+
+  test("text match without explicit wire position cannot bind identity", () => {
+    const slots = [wireSlot("重复", 0)]
+    expect(
+      bindPersistedReasoningRefs(slots, [{ messageID: "msg_signed", partID: "p1", text: "重复" }])[0].messageID,
+    ).toBe("messages.0")
   })
 })

@@ -117,6 +117,22 @@ const plan = (input: DistillationPlanInput, dependencies: DistillationDependenci
   const executionFindings = auditExecutionTargets(input)
   const audit = assembleAudit(executionFindings, distillerFindings)
 
+  // One candidate is bound to one source slot. A second eligible slot needs its own candidate and audit.
+  if (eligible.length !== 1) return emptyPlan("mapping-mismatch", audit)
+
+  const mapping = eligible[0]
+  const mappedRef = mapping.refs[0]
+  if (
+    mapping.refs.length !== 1 ||
+    candidate.key.partIDs.length !== 1 ||
+    candidate.key.messageID !== mappedRef?.messageID ||
+    candidate.key.partIDs[0] !== mappedRef.partID ||
+    candidate.key.sourceFingerprint !== mapping.sourceFingerprint ||
+    candidate.key.capabilityFingerprint !== capabilityOf(mapping)
+  ) {
+    return emptyPlan("mapping-mismatch", audit)
+  }
+
   // 7. Terminal structural failure -> reject the candidate but keep the diagnostics.
   if (gates.skipReason) return emptyPlan(gates.skipReason, audit)
 
@@ -129,7 +145,15 @@ const plan = (input: DistillationPlanInput, dependencies: DistillationDependenci
   if (gates.anyJudged && input.judgeFingerprint === undefined) return emptyPlan("stale-validation", audit)
 
   // 9. Render the projection from validated claims and preserved spans only (§5.5.3 isolation).
-  const resolveText = dependencies.resolveText ?? (() => "")
+  const sourceResolver = dependencies.resolveText
+  if (candidate.preserved.length > 0 && !sourceResolver) return emptyPlan("unknown-content", audit)
+  const preservedText = new Map<SourceSpan, string>()
+  for (const span of candidate.preserved) {
+    const original = sourceResolver?.(span)
+    if (typeof original !== "string" || original.length === 0) return emptyPlan("unknown-content", audit)
+    preservedText.set(span, original)
+  }
+  const resolveText = (span: SourceSpan): string => preservedText.get(span) ?? ""
   const render = dependencies.render ?? defaultRender
   const estimateTokens = dependencies.estimateTokens ?? defaultEstimateTokens
   const fingerprint = dependencies.fingerprint ?? Hash.sha256
@@ -144,23 +168,18 @@ const plan = (input: DistillationPlanInput, dependencies: DistillationDependenci
     return emptyPlan("insufficient-net-savings", audit)
   }
 
-  // 11. Assemble one replacement per eligible slot, each carrying its own capability-bound validation stamp.
+  // 11. Assemble the replacement for the candidate's exact source slot.
   const projection: ModelProjection = { claims: candidate.claims, preserved: candidate.preserved, text }
   const reusedCandidates: DistillationKey[] = [candidate.key]
-  const replacements = eligible.flatMap((mapping) => {
-    const capabilityFingerprint = capabilityOf(mapping)
-    if (capabilityFingerprint === undefined) return []
-    const validation: ValidationStamp = {
-      candidateFingerprint: fingerprint(candidate.fingerprint),
-      evidenceFingerprint: input.evidence.inventoryFingerprint,
-      capabilityFingerprint,
-      validatorVersion: ReasoningDistillationPolicy.validatorVersion,
-      method: gates.anyJudged ? "judged" : "deterministic",
-      ...(gates.anyJudged ? { judgeFingerprint: input.judgeFingerprint! } : {}),
-    }
-    return [{ mapping, projection, validation, estimatedSavings }]
-  })
-  if (replacements.length === 0) return emptyPlan("mapping-mismatch", audit)
+  const validation: ValidationStamp = {
+    candidateFingerprint: fingerprint(candidate.fingerprint),
+    evidenceFingerprint: input.evidence.inventoryFingerprint,
+    capabilityFingerprint: candidate.key.capabilityFingerprint,
+    validatorVersion: ReasoningDistillationPolicy.validatorVersion,
+    method: gates.anyJudged ? "judged" : "deterministic",
+    ...(gates.anyJudged ? { judgeFingerprint: input.judgeFingerprint! } : {}),
+  }
+  const replacements = [{ mapping, projection, validation, estimatedSavings }]
 
   return { replacements, audit, reusedCandidates, extraCall: "none", skipReason: undefined }
 }
