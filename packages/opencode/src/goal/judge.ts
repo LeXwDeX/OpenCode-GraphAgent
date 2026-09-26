@@ -7,41 +7,113 @@ export interface JudgeResult {
   readonly verdict: "done" | "continue" | "blocked"
   readonly reason: string
   readonly parseFailed: boolean
+  readonly failureCategory?: JudgeFailureCategory
+}
+
+export type JudgeFailureCategory =
+  | "empty"
+  | "truncated-json"
+  | "malformed-json"
+  | "invalid-shape"
+  | "non-json"
+  | "transport-error"
+
+function verdict(value: unknown): JudgeResult | undefined {
+  if (!value || typeof value !== "object") return
+  if (
+    "verdict" in value &&
+    (value.verdict === "done" || value.verdict === "continue" || value.verdict === "blocked") &&
+    "reason" in value &&
+    typeof value.reason === "string"
+  )
+    return { verdict: value.verdict, reason: value.reason, parseFailed: false }
+  if (
+    "done" in value &&
+    typeof value.done === "boolean" &&
+    "reason" in value &&
+    typeof value.reason === "string"
+  )
+    return { verdict: value.done ? "done" : "continue", reason: value.reason, parseFailed: false }
+}
+
+function objectCandidates(input: string) {
+  const values: string[] = []
+  let start = -1
+  let depth = 0
+  let quoted = false
+  let escaped = false
+  for (let index = 0; index < input.length; index++) {
+    const char = input[index]
+    if (start < 0) {
+      if (char === "{") {
+        start = index
+        depth = 1
+      }
+      continue
+    }
+    if (quoted) {
+      if (escaped) escaped = false
+      else if (char === "\\") escaped = true
+      else if (char === '"') quoted = false
+      continue
+    }
+    if (char === '"') quoted = true
+    else if (char === "{") depth++
+    else if (char === "}" && --depth === 0) {
+      values.push(input.slice(start, index + 1))
+      start = -1
+    }
+  }
+  return { values, unclosed: start >= 0 }
+}
+
+function failed(category: JudgeFailureCategory, chars: number): JudgeResult {
+  const detail =
+    category === "empty"
+      ? "返回空响应"
+      : category === "truncated-json"
+        ? "返回疑似截断的 JSON"
+        : category === "malformed-json"
+          ? "返回格式错误的 JSON"
+          : category === "invalid-shape"
+            ? "返回 JSON，但缺少有效 verdict/reason"
+            : category === "non-json"
+              ? "返回非 JSON 内容"
+              : "调用失败（transport-error）"
+  return {
+    verdict: "continue",
+    reason: `judge ${detail}（${chars} 字符）`,
+    parseFailed: true,
+    failureCategory: category,
+  }
 }
 
 export function parseJudgeResponse(raw: string): JudgeResult {
-  // Step 1: strip markdown fences
   const stripped = raw.replace(/```(?:json)?\s*([\s\S]*?)```/g, "$1").trim()
+  if (!stripped) return failed("empty", 0)
 
-  // Step 2: try JSON.parse whole string
   try {
-    const obj = JSON.parse(stripped)
-    if (
-      (obj.verdict === "done" || obj.verdict === "continue" || obj.verdict === "blocked") &&
-      typeof obj.reason === "string"
-    )
-      return { verdict: obj.verdict, reason: obj.reason, parseFailed: false }
-    if (typeof obj.done === "boolean" && typeof obj.reason === "string")
-      return { verdict: obj.done ? "done" : "continue", reason: obj.reason, parseFailed: false }
+    return verdict(JSON.parse(stripped)) ?? failed("invalid-shape", stripped.length)
   } catch {}
 
-  // Step 3: regex extract first {...}
-  const match = stripped.match(/\{[^{}]*\}/)
-  if (match) {
+  const candidates = objectCandidates(stripped)
+  let malformed = false
+  let invalidShape = false
+  for (const candidate of candidates.values) {
     try {
-      const obj = JSON.parse(match[0])
-      if (
-        (obj.verdict === "done" || obj.verdict === "continue" || obj.verdict === "blocked") &&
-        typeof obj.reason === "string"
-      )
-        return { verdict: obj.verdict, reason: obj.reason, parseFailed: false }
-      if (typeof obj.done === "boolean" && typeof obj.reason === "string")
-        return { verdict: obj.done ? "done" : "continue", reason: obj.reason, parseFailed: false }
-    } catch {}
+      const parsed = verdict(JSON.parse(candidate))
+      if (parsed) return parsed
+      invalidShape = true
+    } catch {
+      malformed = true
+    }
   }
 
-  // Step 4: parse failed
-  return { verdict: "continue", reason: "无法解析 judge 输出", parseFailed: true }
+  if (candidates.unclosed) return failed("truncated-json", stripped.length)
+  if (invalidShape) return failed("invalid-shape", stripped.length)
+  if (malformed || stripped.includes("{") || stripped.includes("}"))
+    return failed("malformed-json", stripped.length)
+  return failed("non-json", stripped.length)
 }
 
 export const run = Effect.fn("Goal.Judge.run")(function* (
@@ -81,12 +153,6 @@ export const run = Effect.fn("Goal.Judge.run")(function* (
     // escaping here kills afterIdle invisibly (the loop stalls at 0 turns
     // with zero logs and no pause budget). catchCause folds defects into
     // the same parseFailed budget.
-    Effect.catchCause(() =>
-      Effect.succeed({
-        verdict: "continue",
-        reason: "judge transport error (timeout or network) — counting toward pause budget",
-        parseFailed: true,
-      } satisfies JudgeResult),
-    ),
+    Effect.catchCause(() => Effect.succeed(failed("transport-error", 0))),
   )
 })

@@ -3,6 +3,7 @@ import { Deferred, Effect, Fiber, Layer, Option } from "effect"
 import { Goal } from "@/goal/goal"
 import { GoalEvent } from "@/goal/events"
 import { GoalPrompts } from "@/goal/prompts"
+import { GoalJudge } from "@/goal/judge"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { SessionStatus } from "@/session/status"
 import { SessionAutomationLease } from "@/session/automation-lease"
@@ -645,6 +646,38 @@ describe("Goal fiber-safe terminal paths — do NOT touch the fiber map", () => 
 // ---------------------------------------------------------------------------
 
 describe("Goal.updateAfterJudge — transport failures trigger auto-pause (D5)", () => {
+  it.live("auto-pause preserves the actionable invalid-response category and resume resets the retry budget", () =>
+    Effect.gen(function* () {
+      const goal = yield* Goal.Service
+      const sessionID = SessionID.descending()
+      let state = yield* goal.set(sessionID, "build feature X", 10)
+      const invalid = GoalJudge.parseJudgeResponse("")
+
+      let result: Effect.Success<ReturnType<typeof goal.updateAfterJudge>>
+      for (let attempt = 0; attempt < GoalPrompts.MAX_CONSECUTIVE_PARSE_FAILURES; attempt++) {
+        result = yield* goal.updateAfterJudge(
+          sessionID,
+          invalid.verdict,
+          invalid.reason,
+          invalid.parseFailed,
+          { goalID: state.goal_id ?? "legacy", revision: state.revision ?? 0 },
+        )
+        if (result) state = result.state
+      }
+
+      expect(result?.shouldContinue).toBe(false)
+      expect(result?.message).toContain("judge 返回空响应（0 字符）")
+      expect(state.status).toBe("paused")
+      expect(state.paused_reason).toContain("judge 返回空响应（0 字符）")
+      expect(state.paused_reason).not.toContain("build feature X")
+
+      const resumed = yield* goal.resume(sessionID)
+      expect(resumed?.status).toBe("active")
+      expect(resumed?.consecutive_parse_failures).toBe(0)
+      expect(resumed?.last_reason).toBe(invalid.reason)
+    }),
+  )
+
   // §9.3a — three consecutive transport failures (parseFailed: true, simulating
   // what judge.ts now returns on timeout/network) must reach
   // MAX_CONSECUTIVE_PARSE_FAILURES (3) and auto-pause on the third.

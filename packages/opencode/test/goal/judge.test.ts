@@ -47,23 +47,47 @@ describe("parseJudgeResponse", () => {
 
   // §1.5 — unparseable input falls through all steps (step 4)
   test("unparseable prose returns continue with parseFailed true", () => {
-    const result = GoalJudge.parseJudgeResponse("I think it's done")
+    const raw = "I think it's done"
+    const result = GoalJudge.parseJudgeResponse(raw)
     expect(result).toEqual({
       verdict: "continue",
-      reason: "无法解析 judge 输出",
+      reason: `judge 返回非 JSON 内容（${raw.length} 字符）`,
       parseFailed: true,
+      failureCategory: "non-json",
     })
   })
 
-  test("empty string returns parseFailed", () => {
+  test("empty string reports an actionable privacy-safe category", () => {
     const result = GoalJudge.parseJudgeResponse("")
     expect(result.parseFailed).toBe(true)
     expect(result.verdict).toBe("continue")
+    expect(result.failureCategory).toBe("empty")
+    expect(result.reason).toBe("judge 返回空响应（0 字符）")
   })
 
-  test("valid JSON but wrong shape (missing reason) returns parseFailed", () => {
+  test("valid JSON but wrong shape reports invalid-shape", () => {
     const result = GoalJudge.parseJudgeResponse('{"done": true}')
     expect(result.parseFailed).toBe(true)
+    expect(result.failureCategory).toBe("invalid-shape")
+    expect(result.reason).toContain("缺少有效 verdict/reason")
+  })
+
+  test("truncated JSON is distinguishable without echoing response content", () => {
+    const raw = '{"verdict":"done","reason":"tests passed"'
+    const result = GoalJudge.parseJudgeResponse(raw)
+    expect(result).toEqual({
+      verdict: "continue",
+      reason: `judge 返回疑似截断的 JSON（${raw.length} 字符）`,
+      parseFailed: true,
+      failureCategory: "truncated-json",
+    })
+    expect(result.reason).not.toContain("tests passed")
+  })
+
+  test("malformed closed JSON reports malformed-json", () => {
+    const result = GoalJudge.parseJudgeResponse('{"verdict":"done",}')
+    expect(result.parseFailed).toBe(true)
+    expect(result.failureCategory).toBe("malformed-json")
   })
 
   // §1.6 — nested-brace reason. NOTE: this contradicts tasks.md §1.6, which
@@ -81,18 +105,19 @@ describe("parseJudgeResponse", () => {
     expect(result).toEqual({ verdict: "done", reason: "set up {config}", parseFailed: false })
   })
 
-  // The genuine step-3 regex limitation: verdict JSON embedded in prose where
-  // the reason itself contains a nested brace. Step 2 fails (not pure JSON),
-  // so step 3 runs. `\{[^{}]*\}` cannot span the outer object (it forbids inner
-  // braces), so it instead matches the innermost `{config}`, which is not valid
-  // verdict JSON → falls through to step 4 (parseFailed: true). A future
-  // balanced-brace extractor would fix this; locked here so the limitation is
-  // visible and a fix is detectable.
-  test("nested-brace reason embedded in prose hits the step-3 regex limitation", () => {
+  test("balanced extraction accepts nested braces inside a quoted reason", () => {
     const raw = 'Sure! {"done": true, "reason": "set up {config}"} done'
     const result = GoalJudge.parseJudgeResponse(raw)
-    expect(result.parseFailed).toBe(true)
-    expect(result.verdict).toBe("continue")
+    expect(result).toEqual({ verdict: "done", reason: "set up {config}", parseFailed: false })
+  })
+
+  test("an unclosed markdown fence with a complete object still parses safely", () => {
+    const raw = '```json\n{"verdict":"continue","reason":"more work"}'
+    expect(GoalJudge.parseJudgeResponse(raw)).toEqual({
+      verdict: "continue",
+      reason: "more work",
+      parseFailed: false,
+    })
   })
 })
 
@@ -113,6 +138,7 @@ describe("GoalJudge.run — transport failures count toward pause budget (D5)", 
       )
       expect(result.verdict).toBe("continue")
       expect(result.parseFailed).toBe(true)
+      expect(result.failureCategory).toBe("transport-error")
     }).pipe(Effect.runPromise),
   )
 
@@ -128,7 +154,7 @@ describe("GoalJudge.run — transport failures count toward pause budget (D5)", 
       // (when it eventually fires after MAX_CONSECUTIVE_PARSE_FAILURES)
       // can distinguish transport unreliability from parse failures.
       expect(result.reason).toMatch(/transport/i)
-      expect(result.reason).toMatch(/timeout|network/i)
+      expect(result.reason).toContain("judge 调用失败")
     }).pipe(Effect.runPromise),
   )
 
