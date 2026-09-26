@@ -42,6 +42,8 @@ Registry publication times were read from the public npm metadata. The lockfile 
 
 - `packages/opencode` uses the AI SDK for provider construction, message transformation, streaming, tool calls, usage, errors, and cancellation. The same-major refresh type-checks without consumer API migration. Message transformation now omits absent `providerOptions` properties instead of serializing explicit `undefined` wire fields.
 - `packages/core` and `packages/plugin` share the provider types. They are pinned to the same provider ABI to avoid duplicate or structurally incompatible model types.
+- `packages/console/function` carried three stale direct provider pins without importing them anywhere in its source.
+  They were removed rather than upgraded so the workspace does not retain unused AI SDK 6 ABI duplicates.
 - `packages/llm` is the Native/Core protocol implementation. It already normalizes OpenAI-compatible reasoning deltas and replays canonical reasoning as `reasoning_content`. A request-scoped `omitMaxTokens` option was added so reasoning distillation can intentionally remove inherited route/model output caps without losing other generation defaults.
 - Google and xAI repository patches were rebased only by package version. Google still needs empty assistant-model entry filtering; xAI still needs the repository's wider PDF URL/base64/file-id mapping. Neither patch handles reasoning text.
 - No proxy code or local model configuration was changed.
