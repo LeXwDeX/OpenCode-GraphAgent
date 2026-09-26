@@ -295,7 +295,7 @@ const live: Layer.Layer<
                   })
                 return {
                   output: strictJSON(result.text),
-                  ...(typeof result.totalUsage.totalTokens === "number"
+                  ...(typeof result.totalUsage?.totalTokens === "number"
                     ? { usageTokens: result.totalUsage.totalTokens }
                     : {}),
                 }
