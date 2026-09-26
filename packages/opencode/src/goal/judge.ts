@@ -19,21 +19,19 @@ export type JudgeFailureCategory =
   | "transport-error"
 
 function verdict(value: unknown): JudgeResult | undefined {
-  if (!value || typeof value !== "object") return
-  if (
-    "verdict" in value &&
-    (value.verdict === "done" || value.verdict === "continue" || value.verdict === "blocked") &&
-    "reason" in value &&
-    typeof value.reason === "string"
-  )
-    return { verdict: value.verdict, reason: value.reason, parseFailed: false }
-  if (
-    "done" in value &&
-    typeof value.done === "boolean" &&
-    "reason" in value &&
-    typeof value.reason === "string"
-  )
-    return { verdict: value.done ? "done" : "continue", reason: value.reason, parseFailed: false }
+  let result: JudgeResult | undefined
+  if (value && typeof value === "object") {
+    if (
+      "verdict" in value &&
+      (value.verdict === "done" || value.verdict === "continue" || value.verdict === "blocked") &&
+      "reason" in value &&
+      typeof value.reason === "string"
+    )
+      result = { verdict: value.verdict, reason: value.reason, parseFailed: false }
+    else if ("done" in value && typeof value.done === "boolean" && "reason" in value && typeof value.reason === "string")
+      result = { verdict: value.done ? "done" : "continue", reason: value.reason, parseFailed: false }
+  }
+  return result
 }
 
 function objectCandidates(input: string) {
