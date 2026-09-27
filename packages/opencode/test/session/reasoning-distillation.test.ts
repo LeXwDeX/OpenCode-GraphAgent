@@ -12,6 +12,7 @@ import {
   type SourceSpan,
 } from "@opencode-ai/core/session/reasoning-distillation"
 import { Hash } from "@opencode-ai/core/util/hash"
+import { Token } from "@/util/token"
 import type { SessionV1 } from "@opencode-ai/core/v1/session"
 import type { ModelMessage } from "ai"
 import {
@@ -34,6 +35,7 @@ import {
   runJudge,
   runDistillationCycle,
   runPropose,
+  AuxiliaryCallError,
   type AuxiliaryCallResult,
   type AuxiliaryCaller,
   type OrganizerModel,
@@ -421,6 +423,76 @@ describe("runDistillationCycle live lifecycle", () => {
 
     finish?.({ output: { malformed: true }, usageTokens: 20 })
     await pending
+  })
+
+  test("token reserves use the CJK-aware estimator for the built prompt", async () => {
+    const request = wireRequest(TEXT)
+    const prompt = buildProposePrompt({
+      reasoningTexts: [TEXT],
+      slotRefs: [{ messageID: "m1", partID: "p1" }],
+      callSummary: [],
+    })
+    const expected = Token.estimateReserve(prompt) + ReasoningDistillationPolicy.tokens.maxOutputTokens
+    expect(expected).toBeGreaterThan(Math.ceil(prompt.length / 4) + ReasoningDistillationPolicy.tokens.maxOutputTokens)
+    const result = await runDistillationCycle(emptyLifecycleState, cycleInput(request, { propose: 0, judge: 0 }))
+    expect(result.state.usageBySession.s1?.reservedTokens).toBe(expected)
+  })
+
+  test("a user abort refunds the judge attempt and never pauses paid admission", async () => {
+    const request = wireRequest(TEXT)
+    const first = await runDistillationCycle(emptyLifecycleState, cycleInput(request, { propose: 0, judge: 0 }))
+    expect(first.attempted).toBe("propose")
+    const second = await runDistillationCycle(first.state, {
+      ...cycleInput(request, { propose: 0, judge: 0 }),
+      callJudge: async () => {
+        throw new AuxiliaryCallError({ category: "abort" })
+      },
+    })
+    expect(second.attempted).toBe("judge")
+    expect(second.state.usageBySession.s1).toMatchObject({
+      paidAdmissionPaused: false,
+      abortedCalls: 1,
+      unknownUsageCalls: 0,
+    })
+    const third = await runDistillationCycle(second.state, cycleInput(request, { propose: 0, judge: 0 }))
+    expect(third.attempted).toBe("judge")
+  })
+
+  test("a transport failure refunds the quota, but unknown usage keeps paid admission paused", async () => {
+    const request = wireRequest(TEXT)
+    const first = await runDistillationCycle(emptyLifecycleState, cycleInput(request, { propose: 0, judge: 0 }))
+    expect(first.attempted).toBe("propose")
+    const second = await runDistillationCycle(first.state, {
+      ...cycleInput(request, { propose: 0, judge: 0 }),
+      callJudge: async () => {
+        throw new AuxiliaryCallError({ category: "transport" })
+      },
+    })
+    expect(second.attempted).toBe("judge")
+    expect(second.state.usageBySession.s1).toMatchObject({
+      paidAdmissionPaused: true,
+      abortedCalls: 0,
+      unknownUsageCalls: 1,
+    })
+  })
+
+  test("a parse failure with provider usage meters the tokens and does not pause", async () => {
+    const request = wireRequest(TEXT)
+    const first = await runDistillationCycle(emptyLifecycleState, cycleInput(request, { propose: 0, judge: 0 }))
+    expect(first.attempted).toBe("propose")
+    const second = await runDistillationCycle(first.state, {
+      ...cycleInput(request, { propose: 0, judge: 0 }),
+      callJudge: async () => {
+        throw new AuxiliaryCallError({ category: "parse", usageTokens: 15 })
+      },
+    })
+    expect(second.attempted).toBe("judge")
+    expect(second.state.usageBySession.s1).toMatchObject({
+      paidAdmissionPaused: false,
+      actualTokens: 55,
+      unknownUsageCalls: 0,
+      abortedCalls: 0,
+    })
   })
 
   test("unknown provider usage pauses later paid calls while preserving the original request", async () => {

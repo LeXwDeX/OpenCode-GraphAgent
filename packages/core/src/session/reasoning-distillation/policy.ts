@@ -33,7 +33,9 @@ export const ReasoningDistillationPolicy = {
     /** Hard admission-reservation ceiling per session. State is held per
      * sessionID inside one distillation-runner instance, so exhausting the
      * ceiling in one session never blocks another session sharing the same
-     * runner. */
+     * runner. Budget and pause state are process-local: a restart starts a
+     * fresh budget and clears the pause flag (deliberate; durable metering
+     * would need a schema/migration the v1 scope does not carry). */
     maxReservedTokensPerSession: 262_144,
     /** A non-positive estimated saving skips the call/projection (§5.8). */
     minimumNetSavingsTokens: 1,

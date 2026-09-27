@@ -3,6 +3,17 @@ export * as GoalJudge from "./judge"
 import { Effect } from "effect"
 import { GoalPrompts } from "./prompts"
 
+/** Privacy-safe failure category: error tag or class name only, never the message (may echo wire content). */
+const errorCategory = (cause: unknown): string => {
+  if (typeof cause === "object" && cause !== null) {
+    const tag = (cause as { _tag?: unknown })._tag
+    if (typeof tag === "string") return tag
+    const name = (cause as { name?: unknown }).name
+    if (typeof name === "string") return name
+  }
+  return "unknown"
+}
+
 export interface JudgeResult {
   readonly verdict: "done" | "continue" | "blocked"
   readonly reason: string
@@ -151,6 +162,10 @@ export const run = Effect.fn("Goal.Judge.run")(function* (
     // escaping here kills afterIdle invisibly (the loop stalls at 0 turns
     // with zero logs and no pause budget). catchCause folds defects into
     // the same parseFailed budget.
-    Effect.catchCause(() => Effect.succeed(failed("transport-error", 0))),
+    Effect.catchCause((cause) =>
+      Effect.logWarning("goal judge transport failure", {
+        "goal.judge.error_category": errorCategory(cause),
+      }).pipe(Effect.as(failed("transport-error", 0))),
+    )
   )
 })

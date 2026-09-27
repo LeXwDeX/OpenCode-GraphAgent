@@ -2,6 +2,7 @@ import {
   estimateContextFoldingBudget,
   fingerprintContextFoldingRequest,
 } from "@opencode-ai/core/session/context-folding"
+import { Token } from "@/util/token"
 import type { PreparedRequestBudgetInput } from "@opencode-ai/core/session/context-folding"
 import {
   cacheInsert,
@@ -18,6 +19,8 @@ import {
   planReasoningDistillation,
   projectDistillationRequest,
   ReasoningDistillationPolicy,
+  refundJudge,
+  refundPropose,
   type CallObservation,
   type CallProvenance,
   type CallResultCompleteness,
@@ -211,14 +214,17 @@ export type SessionAuxiliaryUsage = Readonly<{
   reservedTokens: number
   actualTokens: number
   unknownUsageCalls: number
+  abortedCalls: number
   latencyMs: number
   paidAdmissionPaused: boolean
 }>
 
+/** Counters are process-local by design: a restart starts a fresh budget and clears the pause flag. */
 const emptySessionAuxiliaryUsage: SessionAuxiliaryUsage = {
   reservedTokens: 0,
   actualTokens: 0,
   unknownUsageCalls: 0,
+  abortedCalls: 0,
   latencyMs: 0,
   paidAdmissionPaused: false,
 }
@@ -280,9 +286,12 @@ const callSummary = (calls: readonly ToolCallObservation[]): string[] =>
   calls.map((call) => `${call.toolName} ${call.callID} ${call.status}/${call.result}`)
 
 /**
- * Execute one bounded lifecycle cycle for one source identity. A cycle can make at most one auxiliary call. Propose and
- * judge quota is consumed before the call, failures still consume quota, and only the next ordinary request can advance
- * from a newly proposed candidate to judge. The function is state-in/state-out so the host can serialize it per project.
+ * Execute one bounded lifecycle cycle for one source identity. A cycle can make at most one auxiliary call. Propose
+ * and judge quota is consumed before the call. A call that fails without a usable response (user abort, timeout,
+ * transport error) refunds the role quota so its one-shot attempt is not stranded, while a response that arrives but
+ * is parse-invalid or oversize still counts; a user abort never pauses paid admission, unknown or over-reserve usage
+ * still does (§6.1). Only the next ordinary request can advance from a newly proposed candidate to judge. The
+ * function is state-in/state-out so the host can serialize it per project.
  */
 const runSingleDistillationCycle = async <Request>(
   state: DistillationLifecycleState,
@@ -348,25 +357,36 @@ const runSingleDistillationCycle = async <Request>(
   const settle = (
     consumed: DistillationLifecycleState,
     reservedTokens: number,
-    actualTokens: number | undefined,
+    outcome: AuxiliaryCallOutcome,
     latencyMs: number,
+    role: "propose" | "judge",
   ): DistillationLifecycleState => {
-    const current = consumed.usageBySession[input.sessionID] ?? emptySessionAuxiliaryUsage
+    const failed = !isAuxiliaryCallResult(outcome)
+    const category = failed ? outcome.category : undefined
+    const reported = outcome.usageTokens
     const metered =
-      typeof actualTokens === "number" && Number.isFinite(actualTokens) && actualTokens >= 0
-        ? Math.ceil(actualTokens)
-        : undefined
+      typeof reported === "number" && Number.isFinite(reported) && reported >= 0 ? Math.ceil(reported) : undefined
+    const aborted = category === "abort"
+    const refunded =
+      failed && (aborted || category === "timeout" || category === "transport")
+        ? role === "propose"
+          ? refundPropose(consumed.ledger, key)
+          : refundJudge(consumed.ledger, key)
+        : consumed.ledger
+    const current = consumed.usageBySession[input.sessionID] ?? emptySessionAuxiliaryUsage
     return {
       ...consumed,
+      ledger: refunded,
       usageBySession: {
         ...consumed.usageBySession,
         [input.sessionID]: {
           ...current,
           actualTokens: current.actualTokens + (metered ?? 0),
-          unknownUsageCalls: current.unknownUsageCalls + (metered === undefined ? 1 : 0),
+          unknownUsageCalls: current.unknownUsageCalls + (metered === undefined && !aborted ? 1 : 0),
+          abortedCalls: current.abortedCalls + (aborted ? 1 : 0),
           latencyMs: current.latencyMs + Math.max(0, latencyMs),
           paidAdmissionPaused:
-            current.paidAdmissionPaused || metered === undefined || metered > reservedTokens,
+            current.paidAdmissionPaused || (!aborted && (metered === undefined || metered > reservedTokens)),
         },
       },
     }
@@ -379,14 +399,16 @@ const runSingleDistillationCycle = async <Request>(
       slotRefs: [{ messageID: slot.messageID, partID: slot.partID }],
       callSummary: callSummary(input.calls),
     })
-    const promptTokens = Math.ceil(prompt.length / 4)
+    const promptTokens = Token.estimateReserve(prompt)
     if (promptTokens > ReasoningDistillationPolicy.tokens.maxInputTokens) return blocked("work-limit")
     const admitted = reserve(promptTokens, "propose")
     if (!admitted) return blocked("call-budget-exhausted")
     const started = performance.now()
-    const result = await input.callPropose(prompt).catch(() => undefined)
-    const consumed = settle(admitted.consumed, admitted.reservedTokens, result?.usageTokens, performance.now() - started)
-    const candidate = result ? parseCandidate(result.output, key, resolveSlotSpan(slot)) : undefined
+    const outcome = await input.callPropose(prompt).catch(auxFailureOf)
+    const consumed = settle(admitted.consumed, admitted.reservedTokens, outcome, performance.now() - started, "propose")
+    const candidate = isAuxiliaryCallResult(outcome)
+      ? parseCandidate(outcome.output, key, resolveSlotSpan(slot))
+      : undefined
     const cache = candidate
       ? cacheInsert(consumed.cache, {
           key,
@@ -406,14 +428,14 @@ const runSingleDistillationCycle = async <Request>(
       candidateClaims: cached.candidate.claims,
       callSummary: callSummary(input.calls),
     })
-    const promptTokens = Math.ceil(prompt.length / 4)
+    const promptTokens = Token.estimateReserve(prompt)
     if (promptTokens > ReasoningDistillationPolicy.tokens.maxInputTokens) return blocked("work-limit")
     const admitted = reserve(promptTokens, "judge")
     if (!admitted) return blocked("call-budget-exhausted")
     const started = performance.now()
-    const result = await input.callJudge(prompt).catch(() => undefined)
-    const consumed = settle(admitted.consumed, admitted.reservedTokens, result?.usageTokens, performance.now() - started)
-    const support = result ? parseSupport(result.output) : undefined
+    const outcome = await input.callJudge(prompt).catch(auxFailureOf)
+    const consumed = settle(admitted.consumed, admitted.reservedTokens, outcome, performance.now() - started, "judge")
+    const support = isAuxiliaryCallResult(outcome) ? parseSupport(outcome.output) : undefined
     if (!support) return { state: consumed, projection: initial, attempted: "judge" }
     const judgeFingerprint = Hash.sha256(JSON.stringify(support))
     const nextState = {
@@ -1003,6 +1025,32 @@ export type AuxiliaryCallResult = Readonly<{
   /** Provider-reported inclusive input + output tokens; absent means metering is unknown and pauses paid admission. */
   usageTokens?: number
 }>
+
+export type AuxiliaryFailureCategory = "timeout" | "abort" | "transport" | "oversize" | "parse"
+
+export type AuxiliaryCallFailure = Readonly<{
+  category: AuxiliaryFailureCategory
+  usageTokens?: number
+  textLength?: number
+}>
+
+export type AuxiliaryCallOutcome = AuxiliaryCallResult | AuxiliaryCallFailure
+
+/** Thrown by the host auxiliary seam; carries a privacy-safe category and any provider-reported usage. */
+export class AuxiliaryCallError extends Error {
+  readonly failure: AuxiliaryCallFailure
+  constructor(failure: AuxiliaryCallFailure) {
+    super(`reasoning distillation auxiliary call failed: ${failure.category}`)
+    this.name = "AuxiliaryCallError"
+    this.failure = failure
+  }
+}
+
+export const auxFailureOf = (cause: unknown): AuxiliaryCallFailure =>
+  cause instanceof AuxiliaryCallError ? cause.failure : { category: "transport" }
+
+export const isAuxiliaryCallResult = (outcome: AuxiliaryCallOutcome): outcome is AuxiliaryCallResult =>
+  !("category" in outcome)
 
 /** Injected auxiliary-model caller seam; the host supplies the real Effect/model-service implementation. */
 export type AuxiliaryCaller = (prompt: string) => Promise<AuxiliaryCallResult>
