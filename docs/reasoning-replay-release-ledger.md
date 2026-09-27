@@ -3,12 +3,12 @@
 Base: `503d84a5e350d0da4a3c08f70bc088a935350709` (dev), matching 1.0.49 runtime source.
 Branch: `fix/reasoning-replay-tui-release`. Owner authorization: implement through main/release, then retire the defective 1.0.49 Release while retaining its tag.
 
-| Work                                                                      | Issue | State        | Acceptance                                                                                                                       |
-| ------------------------------------------------------------------------- | ----- | ------------ | -------------------------------------------------------------------------------------------------------------------------------- |
-| First-turn / every-three-turn reasoning preparation and continuous replay | #656  | Implementing | First settled reasoning; turns 1/4/7; independent review; real final-wire substitution and continued execution; fail-safe replay |
-| Worker diagnostics and TUI corruption                                     | #657  | Implementing | Worker startup/runtime warnings stay in logs; packaged PTY model/tool/resize/exit smoke                                          |
-| Compatible AI SDK maintenance                                             | #658  | Implementing | ai 6.0.290 + openai-compatible 2.0.78; mature publication dates; protocol regression and full gates                              |
-| OpenTUI upgrade decision                                                  | #659  | Evaluating   | Current 0.4.3 versus 0.5.12; matched core/solid/keymap; type and native terminal tests                                           |
+| Work                                                                      | Issue | State             | Acceptance                                                                                                                       |
+| ------------------------------------------------------------------------- | ----- | ----------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| First-turn / every-three-turn reasoning preparation and continuous replay | #656  | Verified on dev   | First settled reasoning; turns 1/4/7; independent review; real final-wire substitution and continued execution; fail-safe replay |
+| Worker diagnostics and TUI corruption                                     | #657  | Verified on dev   | Worker startup/runtime warnings stay in logs; packaged PTY model/tool/resize/exit smoke                                          |
+| Compatible AI SDK maintenance                                             | #658  | Verified on dev   | ai 6.0.290 + openai-compatible 2.0.78; mature publication dates; protocol regression and full gates                              |
+| OpenTUI upgrade decision                                                  | #659  | Adopted; verified | Current 0.4.3 versus 0.5.12; matched core/solid/keymap; type and native terminal tests                                           |
 
 ## Baseline evidence
 
@@ -20,9 +20,7 @@ Branch: `fix/reasoning-replay-tui-release`. Owner authorization: implement throu
 
 ## Remaining delivery gates
 
-- Complete implementation and focused regression, then package typechecks, lint, DAG gate and required integration suites.
-- Verify actual compatible upstream replay using an authorized test endpoint; never substitute mock transport evidence for upstream acceptance.
-- Current-head PR CI/review and merge to dev; stable promotion PR with full checks to main.
+- Stable promotion PR with current-head full checks to main. Implementation, local integration, real upstream replay and dev delivery have passed.
 - Release build, artifact integrity and installed runtime acceptance; only then retire GitHub Release graphagent-v1.0.49.
 
 ## AHE evolve summary: organizer source binding
@@ -59,3 +57,11 @@ PR #660 targets dev. Additional max-variant protocol replay (`reasoning_effort=m
 - chg-5: A packaged max run cited a tool call occurring after the source reasoning, correctly rejected as future evidence. Both adapters now render only earlier tool evidence into propose/judge prompts, using ordered persisted references rather than lexicographic IDs. Preserve the full inventory for validation. Regressions cover prior evidence retained and later evidence excluded.
 - Final packaged max run: session `ses_fe5f1be36b53wln0uoOV098dyy`, proposal + independent judge, `applied=true`, actual final `reasoning_content` length 349, upstream continuation `RESULT=7`. Captured wire SHA-256: `fe469c21c7de3057c3b367b2f17afa39b85ad4cf16b4657f33a545b18a2404ed`. No original-history mutation.
 - Follow-up host/LLM regressions: 123 passed. Core Runner: 11 passed. These bounded changes supersede the previous PR head and require a fresh current-head CI result.
+
+## Stable promotion checkpoint
+
+PR #660 merged to dev as `008a0ec8dee46737e26342a6dab21b396c33c245`; Issues #656–#659 are closed. Its exact head `ec54da800e460232683f2bf38d7a3c0c895b5c70` passed Typecheck run 36340674360 and complete CI Test run 36340674363, including Linux unit/API gates and 22 E2E cases on each of Linux and Windows. CodeQL passed. Promotion and artifact retirement are tracked separately in #661.
+
+Additional packaged terminal verification sent the real XTGETTCAP `4d73` response in fragments: capability response consumed, no visible capability text, no SDK warning bytes, restored RESULT=7 visible, resize round-trip passed, exit 0. This uses a controlled PTY, not a screenshot of the user's already-running old binary.
+
+Existing Dependabot alerts #113/#114 concern Astro in the separate `packages/web` documentation site. They are not resolved by this CLI maintenance change; the embedded CLI application build comes from `packages/app`.
