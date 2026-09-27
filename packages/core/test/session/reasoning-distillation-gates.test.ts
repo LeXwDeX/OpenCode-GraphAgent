@@ -93,7 +93,7 @@ const candidate = (claims: readonly Claim[], coverage: readonly CoverageEntry[])
   },
   fingerprint: "cand1",
   claims,
-  preserved: [],
+  preserved: coverage.flatMap((entry) => (entry.action === "preserve" ? [entry.source] : [])),
   coverage,
 })
 
@@ -118,6 +118,7 @@ const planInput = (overrides: Partial<DistillationPlanInput> = {}): Distillation
   quota: { proposeUsed: true, judgeUsed: true },
   originalTokens: 1000,
   support: [],
+  retentionSupport: { verdict: "supported", method: "deterministic" },
   policyVersion: POLICY_VERSION,
   ...overrides,
 })
@@ -168,7 +169,7 @@ describe("evaluateGates (§5.4)", () => {
   test("G3: a later part proving an earlier assertion is a temporal mismatch", () => {
     const spans = [span("m1", "p1", 0, 10), span("m1", "p2", 0, 10)]
     const cand = candidate(
-      [claim("c1", { sources: [spans[0]], evidence: [{ messageID: "m1", partID: "p2", kind: "tool-result" }] })],
+      [claim("c1", { sources: [spans[0]], evidence: [{ messageID: "m1", partID: "p2", kind: "source" }] })],
       [
         { source: spans[0], action: "keep", claimID: "c1" },
         { source: spans[1], action: "preserve" },
@@ -196,7 +197,9 @@ describe("evaluateGates (§5.4)", () => {
 
   test("judge-produced support sets anyJudged and needs no further review", () => {
     const { spans, cand } = cleanFixture()
-    const result = evaluateGates(cand, evidence(spans), [support("c1", { verdict: "supported", method: "judged" })])
+    const result = evaluateGates(cand, evidence(spans), [support("c1", { verdict: "supported", method: "judged" })], {
+      retentionSupport: { verdict: "supported", method: "judged" },
+    })
     expect(result.anyJudged).toBe(true)
     expect(result.needsSemanticReview).toBe(false)
     expect(result.skipReason).toBeUndefined()
@@ -209,12 +212,23 @@ describe("evaluateGates (§5.4)", () => {
         claim("c1", {
           kind: "constraint",
           sources: spans,
-          evidence: [{ messageID: "m1", partID: "p1", kind: "instruction" }],
+          evidence: [{ messageID: "m1", partID: "instruction-1", kind: "instruction" }],
         }),
       ],
       [{ source: spans[0], action: "keep", claimID: "c1" }],
     )
-    const result = evaluateGates(cand, evidence(spans), [deterministic("c1")])
+    const result = evaluateGates(
+      cand,
+      {
+        ...evidence(spans),
+        references: [
+          { messageID: "m1", partID: "instruction-1", kind: "instruction" },
+          { messageID: "m1", partID: "p1", kind: "source" },
+        ],
+      },
+      [deterministic("c1")],
+      { retentionSupport: { verdict: "supported", method: "deterministic" } },
+    )
     expect(result.skipReason).toBeUndefined()
     expect(result.violations).toHaveLength(0)
     expect(result.needsSemanticReview).toBe(false)
@@ -222,9 +236,57 @@ describe("evaluateGates (§5.4)", () => {
 
   test("a clean, deterministically supported candidate passes all gates", () => {
     const { spans, cand, support: sup } = cleanFixture()
-    const result = evaluateGates(cand, evidence(spans), sup)
+    const result = evaluateGates(cand, evidence(spans), sup, {
+      retentionSupport: { verdict: "supported", method: "deterministic" },
+    })
     expect(result).toMatchObject({ needsSemanticReview: false, anyJudged: false, skipReason: undefined })
     expect(result.violations).toHaveLength(0)
+  })
+})
+
+describe("review regressions: authoritative evidence and retention", () => {
+  const retentionSupport = { verdict: "supported", method: "deterministic" } as const
+
+  test("claim support cannot approve omitted source information", () => {
+    const { spans, cand, support } = cleanFixture()
+    expect(evaluateGates(cand, evidence(spans), support).needsSemanticReview).toBe(true)
+    const rejected = evaluateGates(cand, evidence(spans), support, {
+      retentionSupport: { verdict: "contradicted", method: "judged" },
+    })
+    expect(rejected.skipReason).toBe("retention-contract-violated")
+    expect(rejected.violations.some((v) => v.reasonCode === "g2-retention-contradicted")).toBe(true)
+  })
+
+  test("binds exact tool identity and source chronology independently of opaque ID sorting", () => {
+    const spans = [span("aaa-later", "reason", 0, 10)]
+    const resultRef = { messageID: "zzz-earlier", partID: "result", callID: "actual", kind: "tool-result" } as const
+    const sourceRef = { messageID: "aaa-later", partID: "reason", kind: "source" } as const
+    const cand = candidate(
+      [claim("c1", { sources: spans, evidence: [resultRef] })],
+      [{ source: spans[0], action: "keep", claimID: "c1" }],
+    )
+    const snapshot: ReasoningEvidence = {
+      ...evidence(spans, [{ ...call("actual", "bash", "completed"), ref: resultRef }]),
+      references: [resultRef, sourceRef],
+    }
+    expect(evaluateGates(cand, snapshot, [deterministic("c1")], { retentionSupport }).skipReason).toBeUndefined()
+    const future = evaluateGates(cand, { ...snapshot, references: [sourceRef, resultRef] }, [deterministic("c1")], {
+      retentionSupport,
+    })
+    expect(future.violations.some((v) => v.reasonCode === "g3-future-evidence")).toBe(true)
+    for (const ref of [
+      { ...resultRef, callID: "wrong" },
+      { ...resultRef, kind: "instruction" as const },
+    ]) {
+      const altered = { ...cand, claims: [{ ...cand.claims[0], evidence: [ref] }] }
+      expect(evaluateGates(altered, snapshot, [deterministic("c1")], { retentionSupport }).skipReason).toBe(
+        "evidence-unresolved",
+      )
+    }
+    const compacted = { ...snapshot, calls: snapshot.calls.map((item) => ({ ...item, result: "compacted" as const })) }
+    expect(evaluateGates(cand, compacted, [deterministic("c1")], { retentionSupport }).skipReason).toBe(
+      "evidence-unresolved",
+    )
   })
 })
 

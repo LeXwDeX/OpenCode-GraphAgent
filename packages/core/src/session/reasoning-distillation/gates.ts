@@ -1,4 +1,4 @@
-import { spanKey, validateClaimSet, validateCoverage, validateSourceSpans } from "./claims"
+import { spanBelongsToSource, validateClaimSet, validateCoverage, validateSourceSpans } from "./claims"
 import type {
   AuditConfidence,
   AuditViolationKind,
@@ -8,6 +8,7 @@ import type {
   EvidenceRef,
   ReasoningEvidence,
   SupportResult,
+  SourceSpan,
 } from "./types"
 
 /**
@@ -59,34 +60,43 @@ export const evaluateGates = (
   candidate: Candidate,
   evidence: ReasoningEvidence,
   support: readonly ClaimSupport[],
+  options: { resolveText?: (span: SourceSpan) => string; retentionSupport?: SupportResult } = {},
 ): GateEvaluation => {
   // Structural pre-checks: malformed input is rejected, not attributed as fraud.
   const spanReason = validateSourceSpans(evidence.spans)
   if (spanReason) return noViolations(spanReason)
   const claimReason = validateClaimSet(candidate.claims)
   if (claimReason) return noViolations(claimReason)
-  const coverageReason = validateCoverage(candidate.coverage, evidence.spans, candidate.claims)
+  const coverageReason = validateCoverage(
+    candidate.coverage,
+    evidence.spans,
+    candidate.claims,
+    candidate.preserved,
+    options.resolveText,
+  )
   // A coverage shape error (unknown claim/witness, outside-R reference) is invalid input; an uncovered span is G2.
   if (coverageReason && coverageReason !== "retention-contract-violated") return noViolations(coverageReason)
 
   const violations: GateViolation[] = []
 
-  // Index R for binding and temporal checks.
-  const rSpanKeys = new Set<string>(evidence.spans.map(spanKey))
+  const references: readonly EvidenceRef[] =
+    evidence.references ??
+    evidence.spans.map((span) => ({
+      messageID: span.messageID,
+      partID: span.partID,
+      kind: "source" as const,
+    }))
   const partPosition = new Map<string, number>()
-  evidence.spans.forEach((span, index) => {
-    const key = partKey(span.messageID, span.partID)
-    const existing = partPosition.get(key)
-    if (existing === undefined || index < existing) partPosition.set(key, index)
+  references.forEach((ref, index) => {
+    const key = partKey(ref.messageID, ref.partID)
+    if (!partPosition.has(key)) partPosition.set(key, index)
   })
-  const knownParts = new Set<string>(partPosition.keys())
-  for (const call of evidence.calls) knownParts.add(partKey(call.ref.messageID, call.ref.partID))
 
   // G1 (no new proposition): every claim source span must locate within R.
   let g1Failed = false
   for (const claim of candidate.claims) {
     for (const source of claim.sources) {
-      if (!rSpanKeys.has(spanKey(source))) {
+      if (!spanBelongsToSource(source, evidence.spans, options.resolveText)) {
         g1Failed = true
         violations.push({
           gate: "G1",
@@ -101,10 +111,9 @@ export const evaluateGates = (
   }
 
   // G2 (information preservation): every R span must be covered by the candidate's coverage map.
-  const coveredKeys = new Set<string>(candidate.coverage.map((entry) => spanKey(entry.source)))
   let g2Failed = false
   for (const span of evidence.spans) {
-    if (!coveredKeys.has(spanKey(span))) {
+    if (coverageReason === "retention-contract-violated") {
       g2Failed = true
       violations.push({
         gate: "G2",
@@ -125,7 +134,24 @@ export const evaluateGates = (
     const assertionPosition = sourcePositions.length > 0 ? Math.max(...sourcePositions) : undefined
     for (const ref of claim.evidence) {
       const key = partKey(ref.messageID, ref.partID)
-      if (!knownParts.has(key)) {
+      const bound = references.some(
+        (item) =>
+          item.messageID === ref.messageID &&
+          item.partID === ref.partID &&
+          item.kind === ref.kind &&
+          item.callID === ref.callID,
+      )
+      const toolRef = ref.kind === "tool-input" || ref.kind === "tool-result"
+      const callBound =
+        !toolRef ||
+        evidence.calls.some(
+          (call) =>
+            call.ref.messageID === ref.messageID &&
+            call.ref.partID === ref.partID &&
+            call.ref.callID === ref.callID &&
+            (ref.kind !== "tool-result" || call.result === "complete"),
+        )
+      if (!bound || !callBound || assertionPosition === undefined) {
         g3Failed = true
         violations.push({
           gate: "G3",
@@ -155,8 +181,22 @@ export const evaluateGates = (
 
   // G4 (proposition support): a verified claim needs targeted support; contradiction is a violation, absence defers.
   const supportByClaim = new Map<string, SupportResult>(support.map((entry) => [entry.claimID, entry.result]))
-  let needsSemanticReview = false
-  let anyJudged = false
+  const semanticChange =
+    candidate.claims.length > 0 ||
+    candidate.coverage.some((entry) => entry.action === "drop" || entry.action === "merge")
+  const retention = options.retentionSupport
+  let needsSemanticReview = semanticChange && (!retention || retention.verdict === "unknown")
+  let anyJudged = semanticChange && retention?.verdict === "supported" && retention.method === "judged"
+  if (semanticChange && retention?.verdict === "contradicted") {
+    g2Failed = true
+    violations.push({
+      gate: "G2",
+      kind: "concealed",
+      evidence: [],
+      confidence: retention.method,
+      reasonCode: "g2-retention-contradicted",
+    })
+  }
   let g4Failed = false
   for (const claim of candidate.claims) {
     const verdict = supportByClaim.get(claim.id)
@@ -189,4 +229,16 @@ export const evaluateGates = (
         : undefined
 
   return { violations, needsSemanticReview, anyJudged, skipReason }
+}
+
+/** Parse only the independent judge's whole-source retention verdict. */
+export const parseRetention = (raw: unknown): SupportResult | undefined => {
+  if (typeof raw !== "object" || raw === null || !("retention" in raw)) return undefined
+  const value = raw.retention
+  if (typeof value !== "object" || value === null || !("verdict" in value)) return undefined
+  if (value.verdict === "supported" || value.verdict === "contradicted")
+    return { verdict: value.verdict, method: "judged" }
+  if (value.verdict === "unknown" && "reasonCode" in value && typeof value.reasonCode === "string")
+    return { verdict: "unknown", reasonCode: value.reasonCode }
+  return undefined
 }

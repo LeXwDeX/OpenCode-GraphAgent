@@ -406,6 +406,7 @@ const live: Layer.Layer<
                   slots: selected,
                   calls: input.reasoningDistillation?.calls ?? [],
                   inventoryComplete: input.reasoningDistillation?.inventoryComplete ?? false,
+                  evidenceReferences: input.reasoningDistillation?.references,
                   inventoryFingerprint: input.reasoningDistillation?.inventoryFingerprint ?? "missing-inventory",
                   capability,
                   records: cfg.reasoningDistillation?.compatibility ?? [],

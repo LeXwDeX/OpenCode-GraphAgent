@@ -251,6 +251,8 @@ export type ReasoningEvidence = Readonly<{
   /** Host proof that the inventory completely covers the scope; without it, absence stays unknown. */
   inventoryComplete: boolean
   inventoryFingerprint: string
+  /** Host-observed references in persisted message/part order. */
+  references?: readonly EvidenceRef[]
 }>
 
 /** Per-source-identity call quota (§5.8): propose at most once, judge at most once, never reset by fingerprint change. */
@@ -291,6 +293,8 @@ export type DistillationPlanInput = Readonly<{
   originalTokens: number | undefined
   /** Support verdicts for the candidate's claims, from cache or a prior judge call. */
   support: readonly ClaimSupport[]
+  /** Independent whole-source retention verdict, not implied by per-claim support. */
+  retentionSupport?: SupportResult
   /** Identity of the judge that produced any `judged` support; required when a validation stamp is `judged`. */
   judgeFingerprint?: string
   /** Optional execution targets to audit (§5.5); empty means no execution audit this round. */

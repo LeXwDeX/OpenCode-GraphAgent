@@ -24,9 +24,9 @@ export {
   validateCoverage,
   validateSourceSpans,
 } from "./claims"
-export { evaluateGates } from "./gates"
+export { parseRetention, evaluateGates } from "./gates"
 export type { GateEvaluation, GateID, GateViolation } from "./gates"
-export { planReasoningDistillation } from "./plan"
+export { planReasoningDistillation, renderDistillation } from "./plan"
 export { ReasoningDistillationPolicy } from "./policy"
 export { projectDistillationRequest } from "./projection"
 export { capabilityFingerprint, classifySlotEligibility } from "./slot"

@@ -119,6 +119,8 @@ describe(`frozen reasoning-distillation corpus ${corpus.version}`, () => {
           quota: { proposeUsed: true, judgeUsed: true },
           originalTokens,
           support,
+          // Frozen corpus approval covers both claim fidelity and source retention.
+          retentionSupport: { verdict: "supported", method: "deterministic" },
           judgeFingerprint,
           policyVersion: ReasoningDistillationPolicy.version,
         },
@@ -162,7 +164,9 @@ describe(`frozen reasoning-distillation corpus ${corpus.version}`, () => {
       }
       for (const action of scenario.actionMarkers) {
         actionCount++
-        repeatedActions += Math.max(0, count(output, action) - 1)
+        // Claim identifiers (e.g. dag-park) name evidence; they are not repeated actions.
+        const actionText = output.replace(/^(- )\[[^\n]*?\] /gm, "$1")
+        repeatedActions += Math.max(0, count(actionText, action) - 1)
       }
       accepted++
       realizedSavedTokens += plan.replacements[0].estimatedSavings * scenario.subsequentSends
@@ -172,8 +176,7 @@ describe(`frozen reasoning-distillation corpus ${corpus.version}`, () => {
 
     const latencyMs = performance.now() - started
     const auxiliaryTokens = auxiliaryInputTokens + auxiliaryOutputTokens
-    const savedCostUsd =
-      (realizedSavedTokens * corpus.pricingBasis.inputUsdPerMillionTokens) / 1_000_000
+    const savedCostUsd = (realizedSavedTokens * corpus.pricingBasis.inputUsdPerMillionTokens) / 1_000_000
     const auxiliaryCostUsd =
       (auxiliaryInputTokens * corpus.pricingBasis.inputUsdPerMillionTokens +
         auxiliaryOutputTokens * corpus.pricingBasis.outputUsdPerMillionTokens) /

@@ -236,6 +236,7 @@ const baseInput = (
   records: [record()],
   candidate: validCandidate(TEXT),
   support: deterministicSupport,
+  retentionSupport: { verdict: "supported", method: "deterministic" } as const,
   quota: exhaustedQuota,
   originalTokens: 1000,
   ...overrides,
@@ -267,7 +268,7 @@ describe("projectDistillationAISDK (§5.2)", () => {
       preserved: [preserved],
       coverage: [{ source: preserved, action: "preserve" as const }],
     }
-    const result = projectDistillationAISDK(baseInput(request, { candidate, support: [] }))
+    const result = projectDistillationAISDK(baseInput(request, { candidate, support: [], retentionSupport: undefined }))
     expect(result.applied).toBe(false)
     expect(result.request).toBe(request)
     expect(result.plan.replacements[0]?.projection.text).toBe(TEXT)
@@ -347,10 +348,50 @@ describe("runDistillationCycle live lifecycle", () => {
     callJudge: async () => {
       calls.judge++
       return {
-        output: { support: [{ claimID: "c1", verdict: "supported", method: "judged" }] },
+        output: {
+          retention: { verdict: "supported" },
+          support: [{ claimID: "c1", verdict: "supported", method: "judged" }],
+        },
         usageTokens: 20,
       }
     },
+  })
+
+  test("cached judge evidence cannot be restamped after the tool result changes", async () => {
+    const request = wireRequest(TEXT)
+    const counts = { propose: 0, judge: 0 }
+    const input = { ...cycleInput(request, counts), calls: [call({ result: "complete" })] }
+    const first = await runDistillationCycle(emptyLifecycleState, input)
+    const second = await runDistillationCycle(first.state, input)
+    expect(second.projection.applied).toBe(true)
+    expect(second.state.cache.entries[0].certificate?.evidenceFingerprint).toBe("inv1")
+    const changed = await runDistillationCycle(second.state, {
+      ...input,
+      calls: [call({ result: "compacted" })],
+      inventoryFingerprint: "inv2",
+    })
+    expect(changed.projection.applied).toBe(false)
+    expect(changed.projection.request).toBe(request)
+    expect(changed.state.cache.entries[0].certificate?.evidenceFingerprint).toBe("inv1")
+    expect(counts).toEqual({ propose: 1, judge: 1 })
+  })
+
+  test("claim approval alone does not approve omissions in the whole rendered candidate", async () => {
+    const request = wireRequest(TEXT)
+    const counts = { propose: 0, judge: 0 }
+    const input = cycleInput(request, counts)
+    const first = await runDistillationCycle(emptyLifecycleState, input)
+    const judge = await runDistillationCycle(first.state, {
+      ...input,
+      callJudge: async (prompt) => {
+        expect(prompt).toContain("最终发送文本")
+        expect(prompt).toContain('"coverage"')
+        expect(prompt).toContain('"sources"')
+        return { output: { support: [{ claimID: "c1", verdict: "supported", method: "judged" }] }, usageTokens: 20 }
+      },
+    })
+    expect(judge.projection.applied).toBe(false)
+    expect(judge.projection.request).toBe(request)
   })
 
   test("uses one propose call in the first cycle and one judge call in the next before projecting", async () => {
@@ -561,7 +602,10 @@ describe("runDistillationCycle live lifecycle", () => {
         const partID = prompt.includes(secondText) ? "p2" : "p1"
         calls.push(`judge-${partID}`)
         return {
-          output: { support: [{ claimID: `claim-${partID}`, verdict: "supported", method: "judged" }] },
+          output: {
+            retention: { verdict: "supported" },
+            support: [{ claimID: `claim-${partID}`, verdict: "supported", method: "judged" }],
+          },
           usageTokens: 20,
         }
       },
@@ -570,7 +614,7 @@ describe("runDistillationCycle live lifecycle", () => {
     let state = emptyLifecycleState
     let current = request
     for (let index = 0; index < 4; index++) {
-      const cycle = await runDistillationCycle(state, { ...input, request: current })
+      const cycle = await runDistillationCycle(state, input)
       state = cycle.state
       current = cycle.projection.request
     }
@@ -859,7 +903,10 @@ describe("runPropose / runJudge orchestration (§5.5.3)", () => {
 
   test("runJudge parses support verdicts", async () => {
     const callModel: AuxiliaryCaller = async () => ({
-      output: { support: [{ claimID: "c1", verdict: "supported", method: "judged" }] },
+      output: {
+        retention: { verdict: "supported" },
+        support: [{ claimID: "c1", verdict: "supported", method: "judged" }],
+      },
       usageTokens: 20,
     })
     expect(await runJudge({ prompt: "p", callModel })).toEqual([
@@ -1072,5 +1119,108 @@ describe("persisted history to final W1 lineage", () => {
     expect(snapshot.calls[0]).toMatchObject({ status: "running", result: "missing", provenance: "unavailable" })
     expect(snapshot.inventoryFingerprint).not.toContain("秘密原文")
     expect(snapshot.inventoryFingerprint).not.toContain("/secret")
+  })
+})
+
+describe("review regressions: conservation and source binding", () => {
+  test.each(["drop", "preserve", "merge"] as const)("never clears an entire slot through %s coverage", (action) => {
+    const request = wireRequest(TEXT),
+      source = spanFor(TEXT)
+    const coverage =
+      action === "drop"
+        ? { source, action, reason: "noise" }
+        : action === "merge"
+          ? { source, action, witness: source }
+          : { source, action }
+    const candidate = { ...validCandidate(TEXT), claims: [], preserved: [], coverage: [coverage] }
+    const result = projectDistillationAISDK(baseInput(request, { candidate, support: [], retentionSupport: undefined }))
+    expect(result.applied).toBe(false)
+    expect(result.request).toBe(request)
+  })
+  test("renders uncertainty and superseded decisions in the actual outbound text", () => {
+    const text = "最初采用 A，随后改为 B；部署成功只是未验证假设。".repeat(50)
+    const request = wireRequest(text),
+      original = validCandidate(text)
+    const candidate: Candidate = {
+      ...original,
+      claims: [
+        { ...original.claims[0], id: "old", text: "采用 A" },
+        { ...original.claims[0], id: "new", text: "采用 B", supersedes: "old" },
+        { ...original.claims[0], id: "assumption", text: "部署成功", kind: "assumption", status: "unverified" },
+      ],
+      coverage: [{ source: spanFor(text), action: "keep", claimID: "new" }],
+    }
+    const result = projectDistillationAISDK(
+      baseInput(request, {
+        slots: [slot({ text })],
+        candidate,
+        support: candidate.claims.map((c) => ({
+          claimID: c.id,
+          result: { verdict: "supported", method: "deterministic" },
+        })),
+      }),
+    )
+    expect(result.applied).toBe(true)
+    expect(result.request.messages[0].reasoning).toContain("未验证")
+    expect(result.request.messages[0].reasoning).toContain("已被 new 取代")
+    expect(result.request.messages[0].reasoning).toContain("假设")
+  })
+  test("accepts source subranges and rejects tampered fingerprints", () => {
+    const text = "生产变更需要授权。".repeat(50) + "保持测试记录。",
+      end = text.length - "保持测试记录。".length
+    const request = wireRequest(text),
+      original = validCandidate(text)
+    const first = { ...spanFor(text), end, fingerprint: Hash.sha256(text.slice(0, end)) }
+    const rest = { ...spanFor(text), start: end, fingerprint: Hash.sha256(text.slice(end)) }
+    const candidate: Candidate = {
+      ...original,
+      claims: [{ ...original.claims[0], sources: [first], text: "生产变更需要授权。" }],
+      preserved: [rest],
+      coverage: [
+        { source: first, action: "keep", claimID: "c1" },
+        { source: rest, action: "preserve" },
+      ],
+    }
+    const input = baseInput(request, { slots: [slot({ text })], candidate })
+    expect(projectDistillationAISDK(input).applied).toBe(true)
+    for (const start of [end - 1, end + 1]) {
+      const tail = { ...rest, start, fingerprint: Hash.sha256(text.slice(start)) }
+      const invalid = {
+        ...candidate,
+        preserved: [tail],
+        coverage: [
+          { source: first, action: "keep" as const, claimID: "c1" },
+          { source: tail, action: "preserve" as const },
+        ],
+      }
+      expect(projectDistillationAISDK({ ...input, candidate: invalid }).applied).toBe(false)
+    }
+    expect(
+      projectDistillationAISDK({
+        ...input,
+        candidate: {
+          ...candidate,
+          claims: [{ ...candidate.claims[0], sources: [{ ...first, fingerprint: "wrong" }] }],
+        },
+      }).applied,
+    ).toBe(false)
+  })
+  test("rejects a tool result relabeled as an instruction with a different call ID", () => {
+    const request = wireRequest(TEXT),
+      original = validCandidate(TEXT)
+    const candidate: Candidate = {
+      ...original,
+      claims: [
+        {
+          ...original.claims[0],
+          evidence: [{ messageID: "m0", partID: "tool", callID: "wrong", kind: "instruction" }],
+        },
+      ],
+    }
+    const result = projectDistillationAISDK(
+      baseInput(request, { candidate, calls: [call({ messageID: "m0", partID: "tool", callID: "real" })] }),
+    )
+    expect(result.applied).toBe(false)
+    expect(result.skipReason).toBe("evidence-unresolved")
   })
 })

@@ -6,6 +6,10 @@ import { Token } from "@/util/token"
 import type { PreparedRequestBudgetInput } from "@opencode-ai/core/session/context-folding"
 import {
   cacheInsert,
+  isCertificateCurrent,
+  renderDistillation,
+  parseRetention,
+  type SupportResult,
   cacheKeyFingerprint,
   cacheLookup,
   canJudge,
@@ -116,6 +120,7 @@ export const buildReasoningEvidence = (
   calls: readonly ToolCallObservation[],
   inventoryComplete: boolean,
   inventoryFingerprint: string,
+  references?: readonly EvidenceRef[],
 ): ReasoningEvidence => {
   const spans: SourceSpan[] = slots
     .slice()
@@ -135,7 +140,7 @@ export const buildReasoningEvidence = (
     result: call.result,
     provenance: call.provenance,
   }))
-  return { spans, calls: observations, inventoryComplete, inventoryFingerprint }
+  return { spans, calls: observations, inventoryComplete, inventoryFingerprint, references }
 }
 
 /**
@@ -187,6 +192,8 @@ export type DistillProjectionInput<Request> = Readonly<{
   records: readonly CompatibilityRecord[]
   candidate: Candidate | undefined
   support: readonly ClaimSupport[]
+  retentionSupport?: SupportResult
+  evidenceReferences?: readonly EvidenceRef[]
   judgeFingerprint?: string
   quota: DistillationCallQuota
   originalTokens: number | undefined
@@ -204,6 +211,7 @@ export type DistillProjectionResult<Request> = Readonly<{
 export type DistillationLifecycleState = Readonly<{
   cache: DistillationCache
   ledger: CallLedger
+  retentionSupport: Readonly<Record<string, SupportResult>>
   support: Readonly<Record<string, readonly ClaimSupport[]>>
   judgeFingerprints: Readonly<Record<string, string>>
   callsBySession: Readonly<Record<string, number>>
@@ -233,6 +241,7 @@ export const emptyLifecycleState: DistillationLifecycleState = {
   cache: emptyCache,
   ledger: emptyCallLedger,
   support: {},
+  retentionSupport: {},
   judgeFingerprints: {},
   callsBySession: {},
   usageBySession: {},
@@ -283,7 +292,16 @@ const resolveSlotSpan =
   }
 
 const callSummary = (calls: readonly ToolCallObservation[]): string[] =>
-  calls.map((call) => `${call.toolName} ${call.callID} ${call.status}/${call.result}`)
+  calls.map((call) =>
+    JSON.stringify({
+      messageID: call.messageID,
+      partID: call.partID,
+      callID: call.callID,
+      tool: call.toolName,
+      status: call.status,
+      result: call.result,
+    }),
+  )
 
 /**
  * Execute one bounded lifecycle cycle for one source identity. A cycle can make at most one auxiliary call. Propose
@@ -311,11 +329,13 @@ const runSingleDistillationCycle = async <Request>(
   const key = keyForSlot(input.sessionID, slot, input.capability, input.organizerFingerprint)
   const keyFingerprint = cacheKeyFingerprint(key)
   const cached = cacheLookup(state.cache, key)
+  const current = cached && isCertificateCurrent(cached, input.inventoryFingerprint)
   const quota = { proposeUsed: !canPropose(state.ledger, key), judgeUsed: !canJudge(state.ledger, key) }
   const initial = projectDistillationAISDK({
     ...input,
     candidate: cached?.candidate,
-    support: state.support[keyFingerprint] ?? [],
+    support: current ? (state.support[keyFingerprint] ?? []) : [],
+    retentionSupport: current ? state.retentionSupport[keyFingerprint] : undefined,
     ...(state.judgeFingerprints[keyFingerprint] === undefined
       ? {}
       : { judgeFingerprint: state.judgeFingerprints[keyFingerprint] }),
@@ -426,6 +446,10 @@ const runSingleDistillationCycle = async <Request>(
       reasoningTexts: [slot.text],
       slotRefs: [{ messageID: slot.messageID, partID: slot.partID }],
       candidateClaims: cached.candidate.claims,
+      candidate: cached.candidate,
+      renderedText: renderDistillation(cached.candidate.claims, cached.candidate.preserved, (span) =>
+        slot.text.slice(span.start, span.end),
+      ),
       callSummary: callSummary(input.calls),
     })
     const promptTokens = Token.estimateReserve(prompt)
@@ -437,9 +461,13 @@ const runSingleDistillationCycle = async <Request>(
     const consumed = settle(admitted.consumed, admitted.reservedTokens, outcome, performance.now() - started, "judge")
     const support = isAuxiliaryCallResult(outcome) ? parseSupport(outcome.output) : undefined
     if (!support) return { state: consumed, projection: initial, attempted: "judge" }
-    const judgeFingerprint = Hash.sha256(JSON.stringify(support))
+    const retentionSupport = isAuxiliaryCallResult(outcome) ? parseRetention(outcome.output) : undefined
+    const judgeFingerprint = Hash.sha256(JSON.stringify([support, retentionSupport]))
     const nextState = {
       ...consumed,
+      retentionSupport: retentionSupport
+        ? { ...state.retentionSupport, [keyFingerprint]: retentionSupport }
+        : state.retentionSupport,
       support: { ...state.support, [keyFingerprint]: support },
       judgeFingerprints: { ...state.judgeFingerprints, [keyFingerprint]: judgeFingerprint },
     }
@@ -447,10 +475,13 @@ const runSingleDistillationCycle = async <Request>(
       ...input,
       candidate: cached.candidate,
       support,
+      retentionSupport,
       judgeFingerprint,
       quota: { proposeUsed: true, judgeUsed: true },
       originalTokens: input.originalTokens,
     })
+    const certificate = projection.plan.replacements[0]?.validation
+    if (certificate) nextState.cache = cacheInsert(nextState.cache, { ...cached, certificate })
     return { state: nextState, projection, attempted: "judge" }
   }
 
@@ -459,8 +490,8 @@ const runSingleDistillationCycle = async <Request>(
 
 /**
  * Process every exact reasoning slot in wire order while issuing at most one auxiliary call for the whole request.
- * Already-validated slots may all project in one pass; after the first propose/judge attempt, later slots wait for the
- * next ordinary request. This prevents the first stable slot from starving later slots without weakening per-slot keys.
+ * Reapply all current certificates before advancing a pending judge or a fresh proposal. A paid call never prevents
+ * another validated slot from appearing in this request rebuilt from persisted original history.
  */
 export const runDistillationCycle = async <Request>(
   state: DistillationLifecycleState,
@@ -472,39 +503,38 @@ export const runDistillationCycle = async <Request>(
   let request = input.request
   let applied = false
   let last: DistillationCycleResult<Request> | undefined
-  // Judge advancement first: a slot whose candidate was proposed on an earlier
-  // request must reach judge before fresh proposals starve it (live multi-slot
-  // sessions append a newest reasoning part per request, so strict list order
-  // never revisits older slots). Falls back to proposal order otherwise.
+  const appliedSlots = new Set<ReasoningSlotObservation>()
   for (const slot of input.slots) {
-    const key = keyForSlot(input.sessionID, slot, input.capability, input.organizerFingerprint)
-    if (!cacheLookup(nextState.cache, key) || !canJudge(nextState.ledger, key)) continue
     const cycle = await runSingleDistillationCycle(nextState, {
       ...input,
       request,
       slots: [slot],
-      originalTokens: Math.ceil(slot.text.length / 4),
+      originalTokens: Token.estimate(slot.text),
+      callPropose: undefined,
+      callJudge: undefined,
+    })
+    request = cycle.projection.request
+    applied ||= cycle.projection.applied
+    if (cycle.projection.applied) appliedSlots.add(slot)
+    last = cycle
+  }
+  const pending = input.slots.filter((slot) => !appliedSlots.has(slot))
+  const judgeReady = (slot: ReasoningSlotObservation) => {
+    const key = keyForSlot(input.sessionID, slot, input.capability, input.organizerFingerprint)
+    return !!cacheLookup(nextState.cache, key) && canJudge(nextState.ledger, key)
+  }
+  for (const slot of [...pending.filter(judgeReady), ...pending.filter((slot) => !judgeReady(slot))]) {
+    const cycle = await runSingleDistillationCycle(nextState, {
+      ...input,
+      request,
+      slots: [slot],
+      originalTokens: Token.estimate(slot.text),
     })
     nextState = cycle.state
     request = cycle.projection.request
     applied ||= cycle.projection.applied
     last = cycle
     if (cycle.attempted !== "none") break
-  }
-  if (!last || last.attempted === "none") {
-    for (const slot of input.slots) {
-      const cycle = await runSingleDistillationCycle(nextState, {
-        ...input,
-        request,
-        slots: [slot],
-        originalTokens: Math.ceil(slot.text.length / 4),
-      })
-      nextState = cycle.state
-      request = cycle.projection.request
-      applied ||= cycle.projection.applied
-      last = cycle
-      if (cycle.attempted !== "none") break
-    }
   }
   if (!last) return runSingleDistillationCycle(state, input)
   return {
@@ -517,7 +547,13 @@ export const runDistillationCycle = async <Request>(
 export const projectDistillationAISDK = <Request>(
   input: DistillProjectionInput<Request>,
 ): DistillProjectionResult<Request> => {
-  const evidence = buildReasoningEvidence(input.slots, input.calls, input.inventoryComplete, input.inventoryFingerprint)
+  const evidence = buildReasoningEvidence(
+    input.slots,
+    input.calls,
+    input.inventoryComplete,
+    input.inventoryFingerprint,
+    input.evidenceReferences,
+  )
   const mappings = buildSlotMappings(input.slots, input.capability, input.records)
   const foldingBudget = estimateContextFoldingBudget(input.budget)
   const plan = planReasoningDistillation(
@@ -530,6 +566,7 @@ export const projectDistillationAISDK = <Request>(
       quota: input.quota,
       originalTokens: input.originalTokens,
       support: input.support,
+      retentionSupport: input.retentionSupport,
       ...(input.judgeFingerprint === undefined ? {} : { judgeFingerprint: input.judgeFingerprint }),
       ...(input.targets === undefined ? {} : { targets: input.targets }),
       ...(input.executionContext === undefined ? {} : { executionContext: input.executionContext }),
@@ -976,7 +1013,7 @@ ${LANGUAGE_RULE}
 保留所有会影响未来判断的信息，六类都要：decision、rejection 及其理由、constraint、assumption、fact、state_delta。无法安全归类但有意义的片段放入 preserved，不得静默丢弃。被否决的选项与理由要保留（左右互搏），用 supersedes 指向被否决的旧 claim，旧 claim 仍保留其身份、原主张与适用范围。
 
 # 绑定要求（G1/G3）
-每条 claim 必须用 sources 绑定到 R 的字节跨度 {messageID, partID, start, end}，不得引入 R 之外的新命题。sources/preserved/coverage 里的 messageID 与 partID 必须逐字使用各 slot 标注的值，不得改写或简写。scope 必填，保留时间、环境、对象与条件；scope 不明就原文保留或跳过，不得默认全局。evidence 的 kind 只能取 instruction/source/tool-input/tool-result 之一：引用用户或系统指令用 instruction，引用 R 内推理文本用 source，引用工具入参用 tool-input、工具结果用 tool-result；引用工具时带对应 callID。
+每条 claim 必须用 sources 绑定到 R 的 UTF-16 字符跨度（start 含、end 不含） {messageID, partID, start, end}，不得引入 R 之外的新命题。sources/preserved/coverage 里的 messageID 与 partID 必须逐字使用各 slot 标注的值，不得改写或简写。scope 必填，保留时间、环境、对象与条件；scope 不明就原文保留或跳过，不得默认全局。evidence 的 kind 只能取 instruction/source/tool-input/tool-result 之一：引用用户或系统指令用 instruction，引用 R 内推理文本用 source，引用工具入参用 tool-input、工具结果用 tool-result；引用工具时带对应 callID。
 
 # 覆盖要求
 coverage 必须覆盖 R 的每个有内容片段：keep(claimID) / preserve / merge(witness) / drop(reason)。merge 的 witness 是指向 R 的跨度对象 {messageID, partID, start, end}，不是文本。
@@ -994,6 +1031,8 @@ export type JudgePromptInput = Readonly<{
   reasoningTexts: readonly string[]
   slotRefs: readonly { messageID: string; partID: string }[]
   candidateClaims: readonly { id: string; kind: string; text: string; scope: string; status: string }[]
+  candidate?: Candidate
+  renderedText?: string
   callSummary: readonly string[]
 }>
 
@@ -1009,13 +1048,16 @@ ${UNTRUSTED_PREAMBLE}
 - G4 命题支持：verified 的每条命题有针对性支持；调用完成性与结果内容分别检查。路径/符号重叠只是检索线索，不是语义蕴含；tool 的 completed 只表示按契约结算，不证明任意 state_delta 为真。
 
 # 输出格式
-仅输出 JSON，不要解释：{"support":[{"claimID","verdict","method"|"reasonCode"}]}。verdict 取 supported/contradicted/unknown；supported/contradicted 附 method（deterministic/judged），unknown 附 reasonCode。证据不足、解析失败、输入截断或意见无法落到具体跨度时一律 unknown，不要臆断，也不要为了命中把未决改成 supported。
+必须从完整 R 逐项核对最终发送文本，遗漏未来决策所需的信息、丢失否定/不确定性/取代关系均判 retention 为 contradicted；逐条 claims 有支持不代表信息完整。\n仅输出 JSON，不要解释：{"retention":{"verdict":"supported|contradicted|unknown","reasonCode"?:"原因"},"support":[{"claimID","verdict","method"|"reasonCode"}]}。verdict 取 supported/contradicted/unknown；supported/contradicted 附 method（deterministic/judged），unknown 附 reasonCode。证据不足、解析失败、输入截断或意见无法落到具体跨度时一律 unknown，不要臆断，也不要为了命中把未决改成 supported。
 
 # R（原始思维链）
 ${renderReasoning(input.reasoningTexts, input.slotRefs)}
 
-# 候选 claims
-${input.candidateClaims.map((claim) => `- ${claim.id} [${claim.kind}/${claim.status}] ${claim.text}（scope: ${claim.scope}）`).join("\n")}
+# 候选（包含 sources/evidence/preserved/coverage）
+${JSON.stringify(input.candidate ?? input.candidateClaims)}
+
+# 最终发送文本
+${input.renderedText ?? "（未提供，retention 必须为 unknown）"}
 
 # E（工具调用清单）
 ${renderCalls(input.callSummary)}`
@@ -1090,6 +1132,7 @@ export type PersistedReasoningGroup = Readonly<{
 }>
 
 export type ReasoningHistorySnapshot = Readonly<{
+  references?: readonly EvidenceRef[]
   groups: readonly PersistedReasoningGroup[]
   calls: readonly ToolCallObservation[]
   inventoryComplete: boolean
@@ -1133,14 +1176,30 @@ const callResult = (part: SessionV1.ToolPart): CallResultCompleteness => {
 
 /**
  * Capture the persisted reasoning identities and authoritative tool-call inventory before conversion to AI-SDK
- * messages. Text and tool payloads are never included in the inventory fingerprint; they are available only inside
- * this in-memory request snapshot for exact lineage/evidence binding.
+ * messages. The fingerprint binds ordered identities and content hashes; it contains no raw text or tool payloads.
  */
 export const reasoningHistory = (messages: readonly SessionV1.WithParts[]): ReasoningHistorySnapshot => {
   const groups: PersistedReasoningGroup[] = []
   const calls: ToolCallObservation[] = []
+  const references: EvidenceRef[] = []
+  const contentFingerprints: string[] = []
   let inventoryComplete = true
   for (const message of messages) {
+    for (const part of message.parts) {
+      if (part.type === "reasoning" || part.type === "text") {
+        references.push({
+          messageID: part.messageID,
+          partID: part.id,
+          kind: message.info.role === "user" ? "instruction" : "source",
+        })
+        contentFingerprints.push(Hash.sha256(part.text))
+      }
+      if (part.type === "tool") {
+        for (const kind of ["tool-input", "tool-result"] as const)
+          references.push({ messageID: part.messageID, partID: part.id, callID: part.callID, kind })
+        contentFingerprints.push(fingerprintUnknown(part.state) ?? "unknown")
+      }
+    }
     if (message.info.role !== "assistant") continue
     const parts: Array<InterleavedSourcePart & { inputFingerprint?: string }> = []
     for (const part of message.parts) {
@@ -1189,7 +1248,13 @@ export const reasoningHistory = (messages: readonly SessionV1.WithParts[]): Reas
       })),
     ),
   )
-  return { groups, calls, inventoryComplete, inventoryFingerprint }
+  return {
+    groups,
+    calls,
+    references,
+    inventoryComplete,
+    inventoryFingerprint: Hash.sha256(JSON.stringify([inventoryFingerprint, references, contentFingerprints])),
+  }
 }
 
 const reasoningTexts = (message: ModelMessage): readonly string[] => {

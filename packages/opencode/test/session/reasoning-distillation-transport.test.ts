@@ -161,6 +161,7 @@ function projection(
     capability,
     records: authorized ? [{ ...capability, transportVerified: true, upstreamVerified: true }] : [],
     candidate: candidateFor(slots[0]),
+    retentionSupport: { verdict: "supported", method: "deterministic" },
     support: [{ claimID: "decision-1", result: { verdict: "supported", method: "deterministic" } }],
     targets: [
       {

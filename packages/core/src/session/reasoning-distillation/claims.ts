@@ -1,3 +1,4 @@
+import { Hash } from "../../util/hash"
 import { ReasoningDistillationPolicy } from "./policy"
 import type { Claim, CoverageEntry, DistillationSkipReason, SourceSpan } from "./types"
 
@@ -139,55 +140,99 @@ export const claimEquivalence = (a: Claim, b: Claim): boolean => {
   return aKeys.every((key, index) => key === bKeys[index])
 }
 
-const coverageSourceKey = (entry: CoverageEntry): string => spanKey(entry.source)
+/** Bind a range to host source text. Subranges require a resolver and their own content hash. */
+export const spanBelongsToSource = (
+  span: SourceSpan,
+  spans: readonly SourceSpan[],
+  resolveText?: (span: SourceSpan) => string,
+): boolean => {
+  if (validateSourceSpans([span])) return false
+  const parent = spans.find(
+    (item) =>
+      item.messageID === span.messageID &&
+      item.partID === span.partID &&
+      item.start <= span.start &&
+      item.end >= span.end,
+  )
+  if (!parent) return false
+  if (spanKey(parent) === spanKey(span)) return true
+  const text = resolveText?.(span)
+  return typeof text === "string" && text.length === span.end - span.start && Hash.sha256(text) === span.fingerprint
+}
 
-/**
- * Every source span in R must be covered by exactly one coverage entry (keep/preserve/merge/drop); no span may
- * silently disappear (§5.4: "未覆盖片段不能静默消失", §6.1: "覆盖映射无漏项"). `keep` must resolve to a claim id,
- * `merge` must name a witness span, and `drop` must carry a non-empty reason. Coverage entries may not reference
- * spans outside R.
- */
+/** Coverage partitions the host spans and each retained range must reach the actual rendered candidate. */
 export const validateCoverage = (
   coverage: readonly CoverageEntry[],
   spans: readonly SourceSpan[],
   claims: readonly Claim[],
+  preserved: readonly SourceSpan[] = [],
+  resolveText?: (span: SourceSpan) => string,
 ): DistillationSkipReason | undefined => {
-  if (!Array.isArray(coverage) || !withinLimits(coverage.length)) return "work-limit"
-  const spanKeys = new Set<string>()
-  for (const span of spans) spanKeys.add(spanKey(span))
-  const claimIDs = new Set<string>()
-  for (const claim of claims) claimIDs.add(claim.id)
-
-  const covered = new Set<string>()
-  try {
-    for (const entry of coverage) {
-      if (!entry || !entry.source) return "invalid-reference"
-      const key = coverageSourceKey(entry)
-      if (!spanKeys.has(key)) return "invalid-reference"
-      if (covered.has(key)) return "retention-contract-violated"
-      covered.add(key)
-      switch (entry.action) {
-        case "keep":
-          if (!nonEmpty(entry.claimID) || !claimIDs.has(entry.claimID)) return "invalid-reference"
-          break
-        case "preserve":
-          break
-        case "merge":
-          if (!entry.witness || !spanKeys.has(spanKey(entry.witness))) return "invalid-reference"
-          break
-        case "drop":
-          if (!nonEmpty(entry.reason)) return "retention-contract-violated"
-          break
-        default:
+  if (!Array.isArray(coverage) || !withinLimits(coverage.length) || !withinLimits(preserved.length)) return "work-limit"
+  const bound = (span: SourceSpan) => spanBelongsToSource(span, spans, resolveText)
+  const retained = new Set(preserved.map(spanKey))
+  const byClaim = new Map(claims.map((claim) => [claim.id, claim]))
+  const entries = new Map<string, CoverageEntry>()
+  for (const span of preserved) if (!bound(span)) return "invalid-reference"
+  for (const entry of coverage) {
+    if (!entry || !bound(entry.source)) return "invalid-reference"
+    const key = spanKey(entry.source)
+    if (entries.has(key)) return "retention-contract-violated"
+    entries.set(key, entry)
+    switch (entry.action) {
+      case "keep": {
+        const claim = byClaim.get(entry.claimID)
+        if (
+          !claim ||
+          !claim.sources.some(
+            (source) =>
+              source.messageID === entry.source.messageID &&
+              source.partID === entry.source.partID &&
+              source.start <= entry.source.start &&
+              source.end >= entry.source.end,
+          )
+        )
           return "invalid-reference"
+        break
       }
+      case "preserve":
+        if (!retained.has(key)) return "retention-contract-violated"
+        break
+      case "merge":
+        if (!bound(entry.witness)) return "invalid-reference"
+        if (spanKey(entry.witness) === key) return "retention-contract-violated"
+        break
+      case "drop":
+        if (!nonEmpty(entry.reason)) return "retention-contract-violated"
+        break
+      default:
+        return "invalid-reference"
     }
-  } catch {
-    return "invalid-reference"
   }
-
-  for (const key of spanKeys) {
-    if (!covered.has(key)) return "retention-contract-violated"
+  for (const span of preserved)
+    if (entries.get(spanKey(span))?.action !== "preserve") return "retention-contract-violated"
+  for (const entry of coverage) {
+    if (entry.action !== "merge") continue
+    const witness = entries.get(spanKey(entry.witness))
+    if (!witness || (witness.action !== "keep" && witness.action !== "preserve")) return "retention-contract-violated"
+  }
+  for (const span of spans) {
+    const ranges = coverage
+      .filter(
+        (entry) =>
+          entry.source.messageID === span.messageID &&
+          entry.source.partID === span.partID &&
+          entry.source.start >= span.start &&
+          entry.source.end <= span.end,
+      )
+      .map((entry) => entry.source)
+      .sort((a, b) => a.start - b.start)
+    let next = span.start
+    for (const range of ranges) {
+      if (range.start !== next) return "retention-contract-violated"
+      next = range.end
+    }
+    if (next !== span.end) return "retention-contract-violated"
   }
   return undefined
 }
