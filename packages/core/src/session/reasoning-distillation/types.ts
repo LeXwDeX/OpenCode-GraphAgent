@@ -210,9 +210,11 @@ export type DistillationExtraCall = "none" | "propose" | "judge"
  */
 export type DistillationSkipReason =
   | "below-target"
+  | "cadence-not-due"
   | "unknown-content"
   | "work-limit"
   | "invalid-reference"
+  | "invalid-proposal"
   | "mapping-mismatch"
   | "stale-request"
   | "projection-failed"
@@ -226,6 +228,7 @@ export type DistillationSkipReason =
   | "call-budget-exhausted"
   | "attempt-exhausted"
   | "insufficient-net-savings"
+  | "unchanged-reasoning"
   | "stale-validation"
 
 export type DistillationPlan = Readonly<{
@@ -283,7 +286,9 @@ export type ExecutionVerdictContext = Readonly<{
 
 export type DistillationPlanInput = Readonly<{
   purpose: DistillationPurpose
-  /** Reuses the folding budget; the trigger is overBudget === true (§5.1). */
+  /** Explicit host cadence is independent of the context-capacity budget. */
+  trigger?: "scheduled" | "replay" | "idle"
+  /** Retained for validity checks and callers using capacity-based admission. */
   budget: ContextFoldingBudget
   candidate: Candidate | undefined
   evidence: ReasoningEvidence
@@ -330,6 +335,8 @@ export type DistillationProjectionInput<Request> = Readonly<{
   /** Current model/provider/runtime/adapter identity, fingerprinted with the request. */
   identity: unknown
   expectedRequestFingerprint: string
+  /** Scheduled organization may expand only when the complete projected request fits the input limit. */
+  allowExpansion?: boolean
   budget: PreparedRequestBudgetInput
   /** The plan's eligible replacements (mapping + projection + validation + estimated savings). */
   replacements: readonly DistillationPlanReplacement[]

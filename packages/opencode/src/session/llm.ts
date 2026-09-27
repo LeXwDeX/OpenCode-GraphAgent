@@ -402,6 +402,11 @@ const live: Layer.Layer<
                   },
                   sessionID: input.sessionID,
                   purpose: folding.purpose,
+                  trigger: ReasoningDistillation.isDistillationTurn(input.reasoningDistillation?.reasoningTurn ?? 0)
+                    ? "scheduled"
+                    : "idle",
+                  synchronous: true,
+                  evidenceByMessage: input.reasoningDistillation?.scopes,
                   budget,
                   slots: selected,
                   calls: input.reasoningDistillation?.calls ?? [],
@@ -426,6 +431,9 @@ const live: Layer.Layer<
             Effect.tap((cycle) => {
               const usage = cycle.state.usageBySession[input.sessionID]
               return Effect.logInfo("reasoning distillation", {
+                "session.id": input.sessionID,
+                "reasoning_distillation.turn": input.reasoningDistillation?.reasoningTurn ?? 0,
+                "reasoning_distillation.capability": capability,
                 "reasoning_distillation.runtime": args.runtime,
                 "reasoning_distillation.enabled": true,
                 "reasoning_distillation.source": distillationResolution.source,
@@ -663,6 +671,8 @@ const live: Layer.Layer<
       return {
         type: "ai-sdk" as const,
         result: streamText({
+          // System messages are deliberately assembled by LLMRequestPrep.
+          allowSystemInMessages: true,
           onError(error) {
             bridge.fork(
               Effect.logError("stream error", {

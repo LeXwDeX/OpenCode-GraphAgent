@@ -50,6 +50,18 @@ const allowedPurposes = new Set<string>(ReasoningDistillationPolicy.allowedPurpo
 /** Conservative character proxy; the real tokenizer is supplied by the runtime adapter in Phase 2. */
 const defaultEstimateTokens = (text: string): number => Math.ceil(text.length / 4)
 
+/** Exact UTF-16 ranges include separators so coverage can be checked without model-counted offsets. */
+export const renderSourceRanges = (text: string): string => {
+  let start = 0
+  return JSON.stringify(
+    [...text.matchAll(/[^\n]*\n|[^\n]+$/g)].map(([value]) => {
+      const range = { start, end: start + value.length, text: value }
+      start = range.end
+      return range
+    }),
+  )
+}
+
 /** Minimal renderer; the host original-text parser must be injected for preserved spans to render faithfully. */
 export const renderDistillation = (
   claims: readonly Claim[],
@@ -104,8 +116,11 @@ const plan = (input: DistillationPlanInput, dependencies: DistillationDependenci
   // 1. Purpose gating (§5.1): auxiliary/unknown never sample, call, or apply cache.
   if (!allowedPurposes.has(input.purpose)) return emptyPlan("no-rewritable-slot")
 
-  // 2. Trigger (§5.1): reuse the folding budget; only overBudget === true fires. Unknown budget never triggers.
-  if (input.budget.overBudget !== true) return emptyPlan("below-target")
+  // Scheduled preparation and validated replay do not depend on approaching the context limit.
+  // Unknown/invalid budgets remain protected; a schedule is not permission to bypass validation.
+  if (input.trigger === "idle") return emptyPlan("cadence-not-due")
+  if (input.budget.overBudget === undefined) return emptyPlan("unknown-content")
+  if (input.trigger === undefined && input.budget.overBudget !== true) return emptyPlan("below-target")
 
   // 3. Slot eligibility (§2/§5.1): need at least one authorized rewritable reasoning slot.
   const eligible = input.mappings.filter((mapping) => mapping.eligibility.allowed)
@@ -178,12 +193,12 @@ const plan = (input: DistillationPlanInput, dependencies: DistillationDependenci
   const fingerprint = dependencies.fingerprint ?? Hash.sha256
   const text = render(candidate.claims, candidate.preserved, resolveText)
 
-  // 10. Savings gate (§5.8): a non-positive estimate skips the projection.
+  // Capacity-triggered compression requires savings; scheduled organization may grow within the request limit.
   if (input.originalTokens === undefined || !Number.isSafeInteger(input.originalTokens)) {
     return emptyPlan("unknown-content", audit)
   }
   const estimatedSavings = input.originalTokens - estimateTokens(text)
-  if (estimatedSavings < ReasoningDistillationPolicy.tokens.minimumNetSavingsTokens) {
+  if (input.trigger === undefined && estimatedSavings < ReasoningDistillationPolicy.tokens.minimumNetSavingsTokens) {
     return emptyPlan("insufficient-net-savings", audit)
   }
 

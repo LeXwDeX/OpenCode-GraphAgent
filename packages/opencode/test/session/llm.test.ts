@@ -932,12 +932,13 @@ const foldingConfig = (): Partial<ConfigV1.Info> => ({
 // character, so the body must stay well under the 32_768-token aux input cap (80_000 CJK chars was only
 // admissible under the old length/4 underestimate that this estimator replaced).
 const distillationBody = "反复分析方案A与风险。".repeat(2_000)
-const distillationBackground = "背景材料。".repeat(80_000)
+const distillationBackground = "背景材料。".repeat(100)
 const distillationMessages = (): ModelMessage[] => [
   { role: "assistant", content: [{ type: "reasoning", text: distillationBody }] },
   { role: "user", content: `${distillationBackground}\n继续执行。` },
 ]
 const distillationHistory = (): LLM.StreamInput["reasoningDistillation"] => ({
+  reasoningTurn: 1,
   groups: [
     {
       messageID: "msg-reasoning-source",
@@ -1842,7 +1843,7 @@ describe("session.llm.stream", () => {
 
   for (const runtime of ["opencode-ai-sdk", "opencode-native"] as const) {
     it.instance(
-      `proposes on the first ${runtime} request and applies only after the second-cycle judge`,
+      `organizes before the first ${runtime} send below threshold and replays on an idle turn`,
       () =>
         Effect.gen(function* () {
           const propose = waitRequest(
@@ -1881,16 +1882,16 @@ describe("session.llm.stream", () => {
               ],
             }),
           )
-          const first = waitRequest(
-            "/chat/completions",
-            new Response(createChatStream("first"), { headers: { "Content-Type": "text/event-stream" } }),
-          )
           const judge = waitRequest(
             "/chat/completions",
             auxiliaryResponse({
               retention: { verdict: "supported" },
               support: [{ claimID: "c1", verdict: "supported", method: "judged" }],
             }),
+          )
+          const first = waitRequest(
+            "/chat/completions",
+            new Response(createChatStream("first"), { headers: { "Content-Type": "text/event-stream" } }),
           )
           const second = waitRequest(
             "/chat/completions",
@@ -1935,7 +1936,13 @@ describe("session.llm.stream", () => {
               experimentalNativeLlm: runtime === "opencode-native",
               outputTokenMax: 4_096,
             }),
-            [input("msg_user-distillation-first"), input("msg_user-distillation-second")],
+            [
+              input("msg_user-distillation-first"),
+              {
+                ...input("msg_user-distillation-second"),
+                reasoningDistillation: { ...distillationHistory()!, reasoningTurn: 2 },
+              },
+            ],
           )
 
           const [proposeCapture, firstCapture, judgeCapture, secondCapture] = yield* Effect.promise(() =>
@@ -1949,7 +1956,7 @@ describe("session.llm.stream", () => {
             (capture.body.messages as Array<Record<string, unknown>> | undefined)?.find(
               (message) => message.role === "assistant",
             )?.reasoning_content
-          expect(reasoning(firstCapture)).toBe(distillationBody)
+          expect(reasoning(firstCapture)).toContain("已确认方案A。")
           expect(reasoning(secondCapture)).toContain("已确认方案A。")
           expect(reasoning(secondCapture)).not.toBe(distillationBody)
           expect(JSON.stringify(messages)).toBe(before)
