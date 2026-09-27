@@ -192,6 +192,47 @@ describe("Core runner reasoning distillation adapter", () => {
     }),
   )
 
+  it.effect("offers only preceding tool evidence to the organizer", () =>
+    Effect.gen(function* () {
+      let prompt = ""
+      const client: LLMClientShape = {
+        prepare: () => Effect.die("proposal must not prepare an altered request"),
+        stream: () => Stream.empty,
+        generate: (request) =>
+          Effect.sync(() => {
+            prompt = JSON.stringify(request.messages)
+            return response(candidate)
+          }),
+      }
+      const tool = (id: string): SessionMessage.AssistantTool => ({
+        type: "tool",
+        id,
+        name: "read",
+        state: { status: "completed", input: {}, structured: {}, content: [] },
+        time: { created: now, ran: now, completed: now },
+      })
+      const original = history()
+      const source: SessionMessage.Assistant = {
+        ...original,
+        content: [tool("z-prior-tool"), ...original.content, tool("a-future-tool")],
+      }
+      const conversion = toLLMMessagesWithBindings([source], model)
+      const request = LLM.request({ model, messages: conversion.messages })
+      const adapter = CoreReasoningDistillation.make(client)
+      const result = yield* adapter.distill({
+        sessionID: "ses_temporal_evidence",
+        request,
+        prepared: yield* prepare(request),
+        sourceMessages: [source],
+        bindings: conversion.reasoningBindings,
+        config: new ConfigReasoningDistillation.Info({ compatibility: [compatibility] }),
+      })
+      expect(result.attempted).toBe("propose")
+      expect(prompt).toContain("z-prior-tool")
+      expect(prompt).not.toContain("a-future-tool")
+    }),
+  )
+
   it.effect("prepares on the first user turn and preserves replay after later messages", () =>
     Effect.gen(function* () {
       const roomyModel = Model.make({

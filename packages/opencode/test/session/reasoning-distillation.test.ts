@@ -387,6 +387,41 @@ describe("runDistillationCycle live lifecycle", () => {
     },
   })
 
+  test("auxiliary prompts expose earlier tool evidence but never tools following the source reasoning", async () => {
+    const request = wireRequest(TEXT)
+    const counts = { propose: 0, judge: 0 }
+    const base = cycleInput(request, counts)
+    const prompts: string[] = []
+    const result = await runDistillationCycle(emptyLifecycleState, {
+      ...base,
+      trigger: "scheduled",
+      synchronous: true,
+      calls: [
+        call({ messageID: "z-earlier", partID: "tool-before", callID: "prior-call" }),
+        call({ messageID: "a-later", partID: "tool-after", callID: "future-call" }),
+      ],
+      evidenceReferences: [
+        { messageID: "z-earlier", partID: "tool-before", callID: "prior-call", kind: "tool-result" },
+        { messageID: "m1", partID: "p1", kind: "source" },
+        { messageID: "a-later", partID: "tool-after", callID: "future-call", kind: "tool-result" },
+      ],
+      callPropose: async (prompt) => {
+        prompts.push(prompt)
+        return base.callPropose()
+      },
+      callJudge: async (prompt) => {
+        prompts.push(prompt)
+        return base.callJudge()
+      },
+    })
+    expect(result.projection.applied).toBe(true)
+    expect(prompts).toHaveLength(2)
+    for (const prompt of prompts) {
+      expect(prompt).toContain("prior-call")
+      expect(prompt).not.toContain("future-call")
+    }
+  })
+
   test("scheduled preparation completes proposal and review below the capacity threshold", async () => {
     const request = wireRequest(TEXT)
     const counts = { propose: 0, judge: 0 }

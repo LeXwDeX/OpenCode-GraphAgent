@@ -51,3 +51,11 @@ Core Runner has an independent adapter: its real-user cadence, source-prefix evi
 ## Forge checkpoint
 
 PR #660 targets dev. Additional max-variant protocol replay (`reasoning_effort=max`, `clear_thinking=false`) accepted the independently reviewed replacement and returned RESULT=7. A separate max-variant organizer response was invalid and safely kept the original; this exposed misleading `skip_reason=none`, now corrected to `invalid-proposal` with regression coverage. Model-generated output is never guaranteed to pass fidelity gates.
+
+## Final real-model correction: organizer contract and temporal evidence
+
+- chg-3: The organizer contract incorrectly allowed an empty `sources` array even though the parser requires a source span. A captured real GLM response followed that instruction and added an E-only claim. Require nonempty R bindings, keep `evidence: []` legal, and constrain E to checking R claims. The same saved input then produced a structurally valid candidate.
+- chg-4: The earlier untrusted-data preamble leaked the organizer's restrictions into claims about the source agent. Replace repeated permission narration with one data-boundary contract. The saved-input rerun no longer generated those organizer-state claims; parsers and independent fidelity gates remain unchanged.
+- chg-5: A packaged max run cited a tool call occurring after the source reasoning, correctly rejected as future evidence. Both adapters now render only earlier tool evidence into propose/judge prompts, using ordered persisted references rather than lexicographic IDs. Preserve the full inventory for validation. Regressions cover prior evidence retained and later evidence excluded.
+- Final packaged max run: session `ses_fe5f1be36b53wln0uoOV098dyy`, proposal + independent judge, `applied=true`, actual final `reasoning_content` length 349, upstream continuation `RESULT=7`. Captured wire SHA-256: `fe469c21c7de3057c3b367b2f17afa39b85ad4cf16b4657f33a545b18a2404ed`. No original-history mutation.
+- Follow-up host/LLM regressions: 123 passed. Core Runner: 11 passed. These bounded changes supersede the previous PR head and require a fresh current-head CI result.

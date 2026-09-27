@@ -34,3 +34,9 @@ This test proves the host projection and one real configured upstream's continua
 ## Compiled runtime and max variant
 
 The compiled TUI sent a 225-character structured reasoning field through the actual SDK after two auxiliary calls, then received RESULT=7 after the read-tool result. PTY reload/resize/exit verification passed with zero SDK-warning bytes and exit 0. A separate real replay with `reasoning_effort=max` and `clear_thinking=false` also returned RESULT=7. One independently generated max-variant proposal was invalid and fell back to the original; the runtime now explicitly reports `invalid-proposal` instead of an ambiguous `none` skip reason. This failure is retained as a failure, not counted as replacement acceptance.
+
+## Final packaged max run after contract and temporal-input repairs
+
+Session `ses_fe5f1be36b53wln0uoOV098dyy` (2026-09-27T18:25:03Z) used the actual compiled CLI with `reasoning_effort=max` and `clear_thinking=false`. The first tool continuation completed one organizer and one independent judge call, applied a 349-character organized `reasoning_content`, and the real upstream returned `RESULT=7` after reading the synthetic fixture. Final wire SHA-256: `fe469c21c7de3057c3b367b2f17afa39b85ad4cf16b4657f33a545b18a2404ed`.
+
+Captured earlier failures exposed two concrete mismatches: an output contract permitting empty source bindings, and a prompt offering later tool calls as evidence for earlier reasoning. Both were fixed without weakening source coverage, temporal validation, or semantic review. Invalid or unfaithful model output still keeps the original reasoning; this successful bounded run does not assert universal model reliability.
