@@ -51,12 +51,28 @@ const allowedPurposes = new Set<string>(ReasoningDistillationPolicy.allowedPurpo
 const defaultEstimateTokens = (text: string): number => Math.ceil(text.length / 4)
 
 /** Minimal renderer; the host original-text parser must be injected for preserved spans to render faithfully. */
-const defaultRender = (
+export const renderDistillation = (
   claims: readonly Claim[],
   preserved: readonly SourceSpan[],
   resolveText: (span: SourceSpan) => string,
 ): string => {
-  const claimLines = claims.map((claim) => `- ${claim.text}（范围：${claim.scope}）`)
+  const kinds = {
+    fact: "事实",
+    constraint: "约束",
+    decision: "决定",
+    rejection: "否决",
+    assumption: "假设",
+    state_delta: "状态变化",
+  }
+  const statuses = { verified: "已验证", unverified: "未验证", assumed: "假定" }
+  const superseded = new Map(claims.filter((claim) => claim.supersedes).map((claim) => [claim.supersedes, claim.id]))
+  const claimLines = claims.map((claim) => {
+    const prior = superseded.get(claim.id)
+    const relation = [prior ? `已被 ${prior} 取代` : "", claim.supersedes ? `取代 ${claim.supersedes}` : ""]
+      .filter(Boolean)
+      .join("；")
+    return `- [${claim.id}；${kinds[claim.kind]}；${statuses[claim.status]}${relation ? `；${relation}` : ""}] ${claim.text}（范围：${claim.scope}）`
+  })
   const preservedLines = preserved.map((span) => resolveText(span)).filter((text) => text.length > 0)
   return [...claimLines, ...preservedLines].join("\n")
 }
@@ -112,7 +128,10 @@ const plan = (input: DistillationPlanInput, dependencies: DistillationDependenci
 
   // 6. Gates G1-G4 (§5.4) + conservation audit (§5.5). Diagnostics are assembled before any rejection so a fidelity
   //    failure never hides fabricated/concealed/evidence_swap or source-agent execution findings (§5.2 step 4).
-  const gates = evaluateGates(candidate, input.evidence, input.support)
+  const gates = evaluateGates(candidate, input.evidence, input.support, {
+    resolveText: dependencies.resolveText,
+    retentionSupport: input.retentionSupport,
+  })
   const distillerFindings = gates.violations.map(gateViolationToFinding)
   const executionFindings = auditExecutionTargets(input)
   const audit = assembleAudit(executionFindings, distillerFindings)
@@ -154,7 +173,7 @@ const plan = (input: DistillationPlanInput, dependencies: DistillationDependenci
     preservedText.set(span, original)
   }
   const resolveText = (span: SourceSpan): string => preservedText.get(span) ?? ""
-  const render = dependencies.render ?? defaultRender
+  const render = dependencies.render ?? renderDistillation
   const estimateTokens = dependencies.estimateTokens ?? defaultEstimateTokens
   const fingerprint = dependencies.fingerprint ?? Hash.sha256
   const text = render(candidate.claims, candidate.preserved, resolveText)

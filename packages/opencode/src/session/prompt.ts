@@ -10,20 +10,11 @@ import { Token } from "@/util/token"
 import { measured } from "./overflow"
 import { SessionRevert } from "./revert"
 
-function pendingUniqueToolOutputTokens(messages: SessionV1.WithParts[], messageIndex: number) {
+function estimatePendingToolOutputTokens(messages: SessionV1.WithParts[], messageIndex: number) {
   const current = messages[messageIndex]
   if (!current || current.info.role !== "assistant") return 0
 
-  const previous = new Set<string>()
-  for (const message of messages.slice(0, messageIndex)) {
-    for (const part of message.parts) {
-      if (part.type !== "tool") continue
-      if (part.state.status === "completed") previous.add(part.state.output)
-      if (part.state.status === "error") previous.add(part.state.error)
-    }
-  }
-
-  const pending = new Set<string>()
+  let pending = 0
   for (const part of current.parts) {
     if (part.type !== "tool") continue
     const content =
@@ -32,10 +23,9 @@ function pendingUniqueToolOutputTokens(messages: SessionV1.WithParts[], messageI
         : part.state.status === "error"
           ? part.state.error
           : undefined
-    if (!content || previous.has(content)) continue
-    pending.add(content)
+    if (content) pending += Token.estimate(content)
   }
-  return [...pending].reduce((total, content) => total + Token.estimate(content), 0)
+  return pending
 }
 import { SHELL_ABORT_NOTE } from "../tool/shell"
 import { Session } from "./session"
@@ -1974,9 +1964,9 @@ export const layer = Layer.effect(
               lastFinishedIndex < 0
                 ? []
                 : msgs.slice(lastFinishedIndex + 1).filter((message) => message.info.role === "user")
-            // Same-model usage already reflects the prior prepared request, including folding. Count only new user
-            // text so duplicate tool output can still be folded before full compaction. On a model switch, estimate
-            // the active projected history. Media is stripped before either estimate and never logged.
+            // Same-model usage reflects the prior prepared request, including folding. Add new user text and
+            // pending tool results below. On a model switch, estimate the active projected history.
+            // Media is stripped before either estimate and never logged.
             const estimateMessages = switchedModel || lastFinished.summary === true ? msgs : newUsers
             const estimatedTextTokens = estimateMessages.length
               ? Token.estimate(
@@ -1984,11 +1974,12 @@ export const layer = Layer.effect(
                 )
               : 0
             // Provider usage covers the request that produced lastFinished, but not tool results that completed
-            // afterward. Count each newly unique text result once; exact repeats remain available to context folding.
+            // afterward. Each result is still present until a projection actually folds it; text equality alone
+            // does not authorize a budget deduction (e.g. bash results are protected from folding).
             const pendingToolOutputTokens =
               switchedModel || lastFinished.summary === true
                 ? 0
-                : pendingUniqueToolOutputTokens(msgs, lastFinishedIndex)
+                : estimatePendingToolOutputTokens(msgs, lastFinishedIndex)
             const estimatedInputTokens =
               switchedModel || lastFinished.summary === true
                 ? estimatedTextTokens

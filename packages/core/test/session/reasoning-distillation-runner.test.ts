@@ -112,7 +112,10 @@ const candidate = JSON.stringify({
     },
   ],
 })
-const support = JSON.stringify({ support: [{ claimID: "claim-1", verdict: "supported", method: "judged" }] })
+const support = JSON.stringify({
+  retention: { verdict: "supported" },
+  support: [{ claimID: "claim-1", verdict: "supported", method: "judged" }],
+})
 
 describe("Core runner reasoning distillation adapter", () => {
   it.effect("keeps exact reasoning paths after empty canonical parts are removed", () =>
@@ -173,6 +176,8 @@ describe("Core runner reasoning distillation adapter", () => {
       expect(JSON.stringify(request.messages)).toContain("重复背景")
       expect(JSON.stringify(request.messages)).not.toContain("决定使用安全路径")
       expect(source.content[0]).toMatchObject({ type: "reasoning", text: reasoningText })
+      expect(JSON.stringify(generated[0].messages)).toContain(source.id)
+      expect(JSON.stringify(generated[0].messages)).toContain(source.content[0].id)
       expect(generated).toHaveLength(2)
       expect(generated.every((item) => item.metadata?.purpose === "auxiliary")).toBe(true)
 
@@ -183,6 +188,45 @@ describe("Core runner reasoning distillation adapter", () => {
         skipReason: undefined,
       })
       expect(JSON.stringify(replay.request.messages)).toContain("决定使用安全路径")
+      expect(generated).toHaveLength(2)
+    }),
+  )
+
+  it.effect("invalidates cached judge support when host evidence changes", () =>
+    Effect.gen(function* () {
+      const source = history()
+      const generated: LLMRequest[] = []
+      const outputs = [candidate, support]
+      const client: LLMClientShape = {
+        prepare: () => Effect.die("unused"),
+        stream: () => Stream.empty,
+        generate: (request) =>
+          Effect.sync(() => {
+            generated.push(request)
+            return response(outputs.shift() ?? "{}")
+          }),
+      }
+      const adapter = CoreReasoningDistillation.make(client)
+      const conversion = toLLMMessagesWithBindings([source], model)
+      const request = LLM.request({ model, messages: conversion.messages })
+      const input = {
+        sessionID: "ses_evidence",
+        request,
+        prepared: yield* prepare(request),
+        sourceMessages: [source],
+        bindings: conversion.reasoningBindings,
+        config: new ConfigReasoningDistillation.Info({ compatibility: [compatibility] }),
+      }
+      yield* adapter.distill(input)
+      expect((yield* adapter.distill(input)).applied).toBe(true)
+      expect((yield* adapter.distill(input)).applied).toBe(true)
+      const changed = {
+        ...source,
+        content: [...source.content, { type: "text" as const, id: "new-evidence", text: "新证据表明原先推断未验证" }],
+      }
+      const result = yield* adapter.distill({ ...input, sourceMessages: [changed] })
+      expect(result.applied).toBe(false)
+      expect(result.request).toBe(request)
       expect(generated).toHaveLength(2)
     }),
   )
@@ -353,10 +397,7 @@ describe("Core runner reasoning distillation adapter", () => {
       const secondText = `第二个决定：保留回滚路径。${"第二段背景。".repeat(4_000)}`
       const source = {
         ...history(),
-        content: [
-          ...history().content,
-          { type: "reasoning" as const, id: "reasoning-2", text: secondText },
-        ],
+        content: [...history().content, { type: "reasoning" as const, id: "reasoning-2", text: secondText }],
       }
       const candidateFor = (partID: string, text: string, claimID: string, claimText: string) =>
         JSON.stringify({
@@ -385,7 +426,10 @@ describe("Core runner reasoning distillation adapter", () => {
         candidateFor("reasoning-1", reasoningText, "claim-1", "决定使用安全路径。"),
         support,
         candidateFor("reasoning-2", secondText, "claim-2", "决定保留回滚路径。"),
-        JSON.stringify({ support: [{ claimID: "claim-2", verdict: "supported", method: "judged" }] }),
+        JSON.stringify({
+          retention: { verdict: "supported" },
+          support: [{ claimID: "claim-2", verdict: "supported", method: "judged" }],
+        }),
       ]
       const client: LLMClientShape = {
         prepare: prepare as unknown as LLMClientShape["prepare"],
@@ -418,10 +462,7 @@ describe("Core runner reasoning distillation adapter", () => {
       result = yield* adapter.distill(input)
 
       const projected = JSON.stringify(result.request.messages)
-      snapshots.push([
-        projected.includes("决定使用安全路径"),
-        projected.includes("决定保留回滚路径"),
-      ])
+      snapshots.push([projected.includes("决定使用安全路径"), projected.includes("决定保留回滚路径")])
       expect(snapshots).toEqual([
         [false, false],
         [true, false],

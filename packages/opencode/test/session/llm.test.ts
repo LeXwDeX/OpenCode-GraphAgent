@@ -1887,7 +1887,10 @@ describe("session.llm.stream", () => {
           )
           const judge = waitRequest(
             "/chat/completions",
-            auxiliaryResponse({ support: [{ claimID: "c1", verdict: "supported", method: "judged" }] }),
+            auxiliaryResponse({
+              retention: { verdict: "supported" },
+              support: [{ claimID: "c1", verdict: "supported", method: "judged" }],
+            }),
           )
           const second = waitRequest(
             "/chat/completions",
@@ -1940,6 +1943,8 @@ describe("session.llm.stream", () => {
           )
           expect(proposeCapture.body.stream).not.toBe(true)
           expect(judgeCapture.body.stream).not.toBe(true)
+          expect(JSON.stringify(judgeCapture.body.messages)).toContain("最终发送文本")
+          expect(JSON.stringify(judgeCapture.body.messages)).toContain("retention")
           const reasoning = (capture: Capture) =>
             (capture.body.messages as Array<Record<string, unknown>> | undefined)?.find(
               (message) => message.role === "assistant",

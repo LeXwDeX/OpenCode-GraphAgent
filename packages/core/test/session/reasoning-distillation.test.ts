@@ -123,6 +123,7 @@ const planInput = (overrides: Partial<DistillationPlanInput> = {}): Distillation
   quota: { proposeUsed: false, judgeUsed: false },
   originalTokens: 1000,
   support: [],
+  retentionSupport: { verdict: "supported", method: "deterministic" },
   policyVersion: POLICY_VERSION,
   ...overrides,
 })
@@ -197,7 +198,7 @@ describe("validateCoverage", () => {
       { source: spans[0], action: "keep", claimID: "c1" },
       { source: spans[1], action: "preserve" },
     ]
-    expect(validateCoverage(coverage, spans, claims)).toBeUndefined()
+    expect(validateCoverage(coverage, spans, claims, [spans[1]])).toBeUndefined()
   })
   test("an uncovered span violates the retention contract", () => {
     const coverage: CoverageEntry[] = [{ source: spans[0], action: "keep", claimID: "c1" }]

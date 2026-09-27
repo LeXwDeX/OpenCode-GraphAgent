@@ -354,11 +354,7 @@ function makePrompt(input?: PromptLayerOptions) {
           Layer.provide(flags),
           Layer.provideMerge(deps),
         )
-  const compact = SessionCompaction.layer.pipe(
-    Layer.provide(flags),
-    Layer.provideMerge(proc),
-    Layer.provideMerge(deps),
-  )
+  const compact = SessionCompaction.layer.pipe(Layer.provide(flags), Layer.provideMerge(proc), Layer.provideMerge(deps))
   return SessionPrompt.layer.pipe(
     Layer.provide(SessionRevert.defaultLayer),
     Layer.provide(Image.defaultLayer),
@@ -4990,3 +4986,59 @@ it.instance("human prompt retains question interaction with an active Goal", () 
     expect(yield* questions.list()).toHaveLength(0)
   }),
 )
+
+for (const dynamic of [false, true]) {
+  it.instance(`review: repeated unfoldable tool results count toward the next request (dynamic=${dynamic})`, () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig((url) => {
+        const config = providerCfg(url)
+        return {
+          ...config,
+          compaction: { auto: true, dynamic, max_context_tokens: 25_000 },
+          provider: {
+            ...config.provider,
+            test: {
+              ...config.provider.test,
+              models: {
+                ...config.provider.test.models,
+                "test-model": {
+                  ...config.provider.test.models["test-model"],
+                  limit: { context: 40_000, output: 5_000 },
+                },
+              },
+            },
+          },
+        }
+      })
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Review repeated tool output" })
+      const previous = yield* seed(chat.id, { finish: "tool-calls" })
+      const body = "repeated tool result ".repeat(2000)
+      for (let index = 0; index < 4; index++) {
+        yield* sessions.updatePart({
+          id: PartID.ascending(),
+          messageID: previous.assistant.id,
+          sessionID: chat.id,
+          type: "tool",
+          callID: "repeated-result-" + index,
+          tool: "bash",
+          state: {
+            status: "completed",
+            input: { command: "status" },
+            output: body,
+            title: "Repeated large result",
+            metadata: {},
+            time: { start: 1, end: 2 },
+          },
+        })
+      }
+      yield* llm.text("compact summary")
+      yield* llm.text("continued answer")
+      yield* prompt.loop({ sessionID: chat.id })
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      const compactions = messages.filter((message) => message.parts.some((part) => part.type === "compaction")).length
+      expect(compactions).toBe(1)
+    }),
+  )
+}
