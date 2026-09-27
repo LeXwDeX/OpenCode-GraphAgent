@@ -47,17 +47,27 @@ export const canJudge = (ledger: CallLedger, key: DistillationKey): boolean => {
   )
 }
 
-const consume = (ledger: CallLedger, key: DistillationKey, role: "propose" | "judge"): CallLedger => {
+const adjust = (ledger: CallLedger, key: DistillationKey, role: "propose" | "judge", delta: number): CallLedger => {
   const identity = quotaIdentity(key)
   const usage = ledger.byIdentity[identity] ?? { propose: 0, judge: 0 }
   return {
-    byIdentity: { ...ledger.byIdentity, [identity]: { ...usage, [role]: usage[role] + 1 } },
+    byIdentity: { ...ledger.byIdentity, [identity]: { ...usage, [role]: Math.max(0, usage[role] + delta) } },
   }
 }
 
 /** Consume quota before the call is issued; a failed or cancelled call still counts (§5.8). */
-export const consumePropose = (ledger: CallLedger, key: DistillationKey): CallLedger => consume(ledger, key, "propose")
-export const consumeJudge = (ledger: CallLedger, key: DistillationKey): CallLedger => consume(ledger, key, "judge")
+export const consumePropose = (ledger: CallLedger, key: DistillationKey): CallLedger => adjust(ledger, key, "propose", 1)
+export const consumeJudge = (ledger: CallLedger, key: DistillationKey): CallLedger => adjust(ledger, key, "judge", 1)
+
+/**
+ * Refund a role attempt whose auxiliary call failed without a usable response (user abort, timeout, transport error).
+ * Without it, the one-shot per-identity quota would strand work that can never advance: a proposed candidate whose
+ * only judge attempt failed on the wire, or a slot whose only propose attempt never produced a candidate. Responses
+ * that arrived but were parse-invalid or oversize still count — the model answered, so the attempt was genuinely
+ * spent. The per-session call counter is never refunded: total attempts stay bounded regardless of refunds.
+ */
+export const refundPropose = (ledger: CallLedger, key: DistillationKey): CallLedger => adjust(ledger, key, "propose", -1)
+export const refundJudge = (ledger: CallLedger, key: DistillationKey): CallLedger => adjust(ledger, key, "judge", -1)
 
 /**
  * Paid-candidate admission (§5.8): conservatively admit only when the amortized future saving over at most

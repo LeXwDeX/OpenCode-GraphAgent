@@ -928,7 +928,10 @@ const foldingConfig = (): Partial<ConfigV1.Info> => ({
   },
 })
 
-const distillationBody = "反复分析方案A与风险。".repeat(8_000)
+// The aux prompt embeds this reasoning body; the CJK-aware reserve estimator counts CJK at ~1 token per
+// character, so the body must stay well under the 32_768-token aux input cap (80_000 CJK chars was only
+// admissible under the old length/4 underestimate that this estimator replaced).
+const distillationBody = "反复分析方案A与风险。".repeat(2_000)
 const distillationBackground = "背景材料。".repeat(80_000)
 const distillationMessages = (): ModelMessage[] => [
   { role: "assistant", content: [{ type: "reasoning", text: distillationBody }] },

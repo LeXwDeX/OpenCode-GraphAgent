@@ -4,7 +4,7 @@ import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Provider } from "@/provider/provider"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
-import { Context, Effect, Layer, Semaphore } from "effect"
+import { Context, Effect, Layer } from "effect"
 import * as Stream from "effect/Stream"
 import { asSchema, generateText, streamText, wrapLanguageModel, type ModelMessage, type Tool } from "ai"
 import { LLMRequest, type LLMEvent } from "@opencode-ai/llm"
@@ -173,7 +173,7 @@ const live: Layer.Layer<
     const distillationState = yield* InstanceState.make(() =>
       Effect.succeed({
         current: ReasoningDistillation.emptyLifecycleState,
-        lock: Semaphore.makeUnsafe(1),
+        busy: false,
       }),
     )
 
@@ -266,9 +266,10 @@ const live: Layer.Layer<
             bridge.promise(
               Effect.gen(function* () {
                 const selected = organizerResolution.tier === "small" ? organizer : input.model
-                if (!selected) return yield* Effect.fail(new Error("distillation organizer is unavailable"))
+                if (!selected)
+                  return yield* Effect.fail(new ReasoningDistillation.AuxiliaryCallError({ category: "transport" }))
                 const organizerLanguage = yield* provider.getLanguage(selected)
-                const result = yield* Effect.tryPromise({
+                const settled = yield* Effect.tryPromise({
                   try: (signal) =>
                     generateText({
                       model: organizerLanguage,
@@ -283,21 +284,57 @@ const live: Layer.Layer<
                       providerOptions: { openaiCompatible: { reasoningEffort: "low" } },
                       abortSignal: AbortSignal.any([signal, input.abort]),
                     }),
-                  catch: (cause) => new Error(`reasoning distillation auxiliary call failed: ${String(cause)}`),
-                }).pipe(Effect.timeout(`${Flag.OPENCODE_REASONING_DISTILLATION_AUX_TIMEOUT_MS} millis`))
-                if (!result) return yield* Effect.fail(new Error("reasoning distillation auxiliary call timed out"))
-                if (result.text.length > ReasoningDistillationPolicy.tokens.maxOutputTokens * 4)
-                  return yield* Effect.fail(new Error("reasoning distillation auxiliary output exceeded limit"))
-                if (typeof result.totalUsage?.totalTokens !== "number")
+                  catch: (cause) => cause,
+                }).pipe(
+                  Effect.timeout(`${Flag.OPENCODE_REASONING_DISTILLATION_AUX_TIMEOUT_MS} millis`),
+                  Effect.map((result) => ({ ok: true as const, result })),
+                  Effect.catch((cause) => Effect.succeed({ ok: false as const, cause })),
+                )
+                if (!settled.ok) {
+                  const category: ReasoningDistillation.AuxiliaryFailureCategory = input.abort.aborted
+                    ? "abort"
+                    : errorCategory(settled.cause) === "TimeoutError"
+                      ? "timeout"
+                      : "transport"
+                  yield* Effect.logWarning("reasoning distillation auxiliary call failed", {
+                    "reasoning_distillation.aux_failure_category": category,
+                  })
+                  return yield* Effect.fail(new ReasoningDistillation.AuxiliaryCallError({ category }))
+                }
+                const result = settled.result
+                const usageTokens =
+                  typeof result.totalUsage?.totalTokens === "number" ? result.totalUsage.totalTokens : undefined
+                if (usageTokens === undefined)
                   yield* Effect.logWarning("reasoning distillation auxiliary usage unavailable", {
                     "reasoning_distillation.aux_text_length": result.text.length,
                     "reasoning_distillation.aux_has_total_usage": result.totalUsage !== undefined,
                   })
-                return {
-                  output: strictJSON(result.text),
-                  ...(typeof result.totalUsage?.totalTokens === "number"
-                    ? { usageTokens: result.totalUsage.totalTokens }
-                    : {}),
+                if (result.text.length > ReasoningDistillationPolicy.tokens.maxOutputTokens * 4) {
+                  yield* Effect.logWarning("reasoning distillation auxiliary output exceeded limit", {
+                    "reasoning_distillation.aux_text_length": result.text.length,
+                  })
+                  return yield* Effect.fail(
+                    new ReasoningDistillation.AuxiliaryCallError({
+                      category: "oversize",
+                      ...(usageTokens === undefined ? {} : { usageTokens }),
+                    }),
+                  )
+                }
+                try {
+                  return {
+                    output: strictJSON(result.text),
+                    ...(usageTokens === undefined ? {} : { usageTokens }),
+                  }
+                } catch {
+                  yield* Effect.logWarning("reasoning distillation auxiliary output was not valid JSON", {
+                    "reasoning_distillation.aux_text_length": result.text.length,
+                  })
+                  return yield* Effect.fail(
+                    new ReasoningDistillation.AuxiliaryCallError({
+                      category: "parse",
+                      ...(usageTokens === undefined ? {} : { usageTokens }),
+                    }),
+                  )
                 }
               }),
             )
@@ -337,11 +374,25 @@ const live: Layer.Layer<
           media: hasMedia(args.sourceMessages) ? ("unknown" as const) : ("none" as const),
         }
         const estimatedBudget = estimateContextFoldingBudget(budget)
-        return InstanceState.useEffect(distillationState, (state) =>
-          state.lock.withPermits(1)(
-            Effect.tryPromise({
-              try: async () => {
-                return ReasoningDistillation.runDistillationCycle(state.current, {
+        return InstanceState.useEffect(distillationState, (state) => {
+          // Non-blocking admission: while one auxiliary call is in flight, another request's cycle is skipped
+          // instead of queueing behind it. The old semaphore stalled unrelated sessions for up to the whole aux
+          // timeout; skipping only forgoes an opportunistic distillation cycle, and the next ordinary request
+          // runs its own.
+          if (state.busy)
+            return Effect.logInfo("reasoning distillation skipped: an auxiliary call is already in flight", {
+              "reasoning_distillation.runtime": args.runtime,
+              "reasoning_distillation.enabled": true,
+              "reasoning_distillation.source": distillationResolution.source,
+              "reasoning_distillation.attempted": "none",
+              "reasoning_distillation.applied": false,
+              "reasoning_distillation.skip_reason": "aux-busy",
+            }).pipe(Effect.as(args.request))
+          state.busy = true
+          return Effect.tryPromise({
+            try: async () => {
+              try {
+                return await ReasoningDistillation.runDistillationCycle(state.current, {
                   request: args.request,
                   identity: {
                     adapter: args.adapterVersion,
@@ -364,32 +415,36 @@ const live: Layer.Layer<
                   callJudge: callAuxiliary,
                   commitState: (next) => void (state.current = next),
                 })
-              },
-              catch: (cause) => cause,
-            }).pipe(Effect.tap((result) => Effect.sync(() => void (state.current = result.state)))),
-          ),
-        ).pipe(
-          Effect.tap((cycle) => {
-            const usage = cycle.state.usageBySession[input.sessionID]
-            return Effect.logInfo("reasoning distillation", {
-              "reasoning_distillation.runtime": args.runtime,
-              "reasoning_distillation.enabled": true,
-              "reasoning_distillation.source": distillationResolution.source,
-              "reasoning_distillation.attempted": cycle.attempted,
-              "reasoning_distillation.applied": cycle.projection.applied,
-              "reasoning_distillation.skip_reason": cycle.projection.skipReason ?? "none",
-              "reasoning_distillation.slot_count": args.slots.length,
-              "reasoning_distillation.estimated_input_tokens": estimatedBudget.estimatedInputTokens ?? "unknown",
-              "reasoning_distillation.target_tokens": estimatedBudget.targetTokens ?? "unknown",
-              "reasoning_distillation.budget_skip_reason": estimatedBudget.skipReason ?? "none",
-              "reasoning_distillation.aux_reserved_tokens": usage?.reservedTokens ?? 0,
-              "reasoning_distillation.aux_actual_tokens": usage?.actualTokens ?? 0,
-              "reasoning_distillation.aux_unknown_usage_calls": usage?.unknownUsageCalls ?? 0,
-              "reasoning_distillation.aux_latency_ms": usage?.latencyMs ?? 0,
-              "reasoning_distillation.paid_admission_paused": usage?.paidAdmissionPaused ?? false,
-            })
-          }),
-          Effect.map((cycle) => cycle.projection.request),
+              } finally {
+                state.busy = false
+              }
+            },
+            catch: (cause) => cause,
+          }).pipe(
+            Effect.tap((result) => Effect.sync(() => void (state.current = result.state))),
+            Effect.tap((cycle) => {
+              const usage = cycle.state.usageBySession[input.sessionID]
+              return Effect.logInfo("reasoning distillation", {
+                "reasoning_distillation.runtime": args.runtime,
+                "reasoning_distillation.enabled": true,
+                "reasoning_distillation.source": distillationResolution.source,
+                "reasoning_distillation.attempted": cycle.attempted,
+                "reasoning_distillation.applied": cycle.projection.applied,
+                "reasoning_distillation.skip_reason": cycle.projection.skipReason ?? "none",
+                "reasoning_distillation.slot_count": args.slots.length,
+                "reasoning_distillation.estimated_input_tokens": estimatedBudget.estimatedInputTokens ?? "unknown",
+                "reasoning_distillation.target_tokens": estimatedBudget.targetTokens ?? "unknown",
+                "reasoning_distillation.budget_skip_reason": estimatedBudget.skipReason ?? "none",
+                "reasoning_distillation.aux_reserved_tokens": usage?.reservedTokens ?? 0,
+                "reasoning_distillation.aux_actual_tokens": usage?.actualTokens ?? 0,
+                "reasoning_distillation.aux_unknown_usage_calls": usage?.unknownUsageCalls ?? 0,
+                "reasoning_distillation.aux_latency_ms": usage?.latencyMs ?? 0,
+                "reasoning_distillation.paid_admission_paused": usage?.paidAdmissionPaused ?? false,
+              })
+            }),
+            Effect.map((cycle) => cycle.projection.request),
+          )
+        }).pipe(
           Effect.catch((cause) =>
             Effect.logWarning("reasoning distillation failed", {
               "reasoning_distillation.runtime": args.runtime,
