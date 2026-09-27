@@ -607,6 +607,8 @@ describe("runDistillationCycle live lifecycle", () => {
     const first = await runDistillationCycle(emptyLifecycleState, input)
     const second = await runDistillationCycle(first.state, input)
     expect(first.attempted).toBe("propose")
+    expect(first.projection.skipReason).toBe("invalid-proposal")
+    expect(first.projection.request).toBe(request)
     expect(second.attempted).toBe("none")
     expect(second.projection.skipReason).toBe("call-budget-exhausted")
     expect(calls).toBe(1)

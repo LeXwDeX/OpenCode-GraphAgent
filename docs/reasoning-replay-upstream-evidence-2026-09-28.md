@@ -30,3 +30,7 @@ The organized representation is longer because it explicitly records scope, unce
 ## Evidence boundary
 
 This test proves the host projection and one real configured upstream's continuation behavior. Independent controlled transport tests assert final AI SDK and Native serialization. It is not a blanket compatibility authorization for other endpoints, variants, adapters or options, nor proof of installed TUI behavior. Packaged terminal, current-head CI and stable release acceptance remain separate gates in the delivery ledger. Derived cache state remains process-local and is rebuilt after restart; persisted original reasoning remains the source of truth.
+
+## Compiled runtime and max variant
+
+The compiled TUI sent a 225-character structured reasoning field through the actual SDK after two auxiliary calls, then received RESULT=7 after the read-tool result. PTY reload/resize/exit verification passed with zero SDK-warning bytes and exit 0. A separate real replay with `reasoning_effort=max` and `clear_thinking=false` also returned RESULT=7. One independently generated max-variant proposal was invalid and fell back to the original; the runtime now explicitly reports `invalid-proposal` instead of an ambiguous `none` skip reason. This failure is retained as a failure, not counted as replacement acceptance.

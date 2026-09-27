@@ -214,6 +214,7 @@ export type DistillationSkipReason =
   | "unknown-content"
   | "work-limit"
   | "invalid-reference"
+  | "invalid-proposal"
   | "mapping-mismatch"
   | "stale-request"
   | "projection-failed"

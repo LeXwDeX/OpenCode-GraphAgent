@@ -663,7 +663,15 @@ export const make = (llm: LLMClientShape) => {
               states.set(input.sessionID, state)
             }
             if (!candidate || cycle.trigger === undefined)
-              return { request, attempted: "propose" as const, applied, usage: usageSnapshot(state) }
+              return {
+                request,
+                attempted: "propose" as const,
+                applied,
+                usage: usageSnapshot(state),
+                ...(!candidate
+                  ? { skipReason: raw ? ("invalid-proposal" as const) : ("projection-failed" as const) }
+                  : {}),
+              }
             cycle = plan(cycleInput, slot, state, messages)
           }
           if (cycle.currentPlan.extraCall === "judge" && cycle.cached) {

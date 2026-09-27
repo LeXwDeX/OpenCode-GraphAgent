@@ -41,9 +41,13 @@ Scope: the organizer input/output contract in `session/reasoning-distillation.ts
 - Final Core reasoning/config regressions: 106 passed. Host reasoning lifecycle: 73 passed. LLM entrypoint and final-wire transport tests passed; worker startup/runtime warning capture passed.
 - All 29 workspace typecheck tasks passed. Lint: 4846 warnings, 0 errors, below the unchanged 4850 ceiling; removed unsafe narrowing in the touched Core Runner parser.
 - DAG critical behavior/coverage gate passed; installer boundary 9 passed; config assistant Go tests passed.
-- HttpAPI exerciser: unauthenticated and authenticated runs each 234 passed, zero failures, skips or missing scenarios.
+- HttpAPI exerciser: all three configured runs each 234 passed, zero failures, skips or missing scenarios.
 - OpenTUI native TUI suite: 272 passed, 1 skipped, 8 snapshots. Solid singleton resolution fixed both plugin keymap types and SolidStart event augmentation; no application type casts added.
 - Real configured GLM replay: see `reasoning-replay-upstream-evidence-2026-09-28.md`. Compiled TUI also emitted an actually changed structured `reasoning_content` (225 characters) in the final upstream tool-continuation request after proposal + judge; the original source remains stored.
-- Packaged PTY resize/exit acceptance is still being finalized. First harness run was obscured by the development-version update prompt; it is disabled in the isolated acceptance config.
+- Packaged PTY acceptance passed: initial real model/tool flow, 198×54 → 130×40 → 198×54 resize, restored session with RESULT=7 visible, zero SDK warning bytes, exit 0. The harness sends SIGWINCH to its detached child; merely resizing the PTY does not deliver a foreground-process signal in that setup. Development-version update prompts are disabled in the isolated config.
 
 Core Runner has an independent adapter: its real-user cadence, source-prefix evidence, synchronous preparation, provider-body capacity recheck and model-review provenance were updated and tested as well. Legacy inputs without a user-turn boundary retain capacity-triggered behavior.
+
+## Forge checkpoint
+
+PR #660 targets dev. Additional max-variant protocol replay (`reasoning_effort=max`, `clear_thinking=false`) accepted the independently reviewed replacement and returned RESULT=7. A separate max-variant organizer response was invalid and safely kept the original; this exposed misleading `skip_reason=none`, now corrected to `invalid-proposal` with regression coverage. Model-generated output is never guaranteed to pass fidelity gates.

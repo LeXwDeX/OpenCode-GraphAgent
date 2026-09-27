@@ -445,7 +445,15 @@ const runSingleDistillationCycle = async <Request>(
           derivedBodyBytes: new TextEncoder().encode(JSON.stringify(candidate)).byteLength,
         })
       : consumed.cache
-    return { state: { ...consumed, cache }, projection: initial, attempted: "propose" }
+    const skipReason = isAuxiliaryCallResult(outcome) ? "invalid-proposal" : "projection-failed"
+    const projection: DistillProjectionResult<Request> = candidate
+      ? initial
+      : {
+          ...initial,
+          skipReason,
+          plan: { ...initial.plan, extraCall: "none", skipReason },
+        }
+    return { state: { ...consumed, cache }, projection, attempted: "propose" }
   }
 
   if (initial.plan.extraCall === "judge" && cached && input.callJudge && canJudge(state.ledger, key)) {
