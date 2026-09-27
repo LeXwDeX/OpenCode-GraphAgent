@@ -138,6 +138,21 @@ describe("projectDistillationRequest (§5.2)", () => {
   const original = "原始冗长思绪".repeat(20)
   const distilled = "精简结论"
 
+  test("preserving the complete original is not reported as an applied rewrite", () => {
+    const { request, identity, budget, fingerprint } = fixture(original)
+    const result = projectDistillationRequest({
+      request,
+      identity,
+      budget,
+      expectedRequestFingerprint: fingerprint,
+      allowExpansion: true,
+      replacements: [distillationReplacement(["messages", 0, "reasoning"], Hash.sha256(original), original)],
+    })
+    expect(result.applied).toBe(false)
+    expect(result.skipReason).toBe("unchanged-reasoning")
+    expect(result.request).toBe(request)
+  })
+
   test("applies the projection to a private copy, leaving the original object untouched", () => {
     const { request, identity, budget, fingerprint } = fixture(original)
     const result = projectDistillationRequest<WireRequest>({

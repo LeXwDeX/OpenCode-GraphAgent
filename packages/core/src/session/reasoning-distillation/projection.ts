@@ -1,3 +1,4 @@
+import { estimateContextFoldingBudget } from "../context-folding/budget"
 import { Hash } from "../../util/hash"
 import { Token } from "../../util/token"
 import { fingerprintContextFoldingRequest } from "../context-folding/projection"
@@ -67,11 +68,13 @@ export const projectDistillationRequest = <Request>(
 
       const after = projection.text
       const savings = Token.estimate(body.value) - Token.estimate(after)
-      if (savings < ReasoningDistillationPolicy.tokens.minimumNetSavingsTokens) {
+      if (!input.allowExpansion && savings < ReasoningDistillationPolicy.tokens.minimumNetSavingsTokens) {
         return unchanged("insufficient-net-savings")
       }
       prepared.push({ path, before: body.value, after, savings })
     }
+
+    if (prepared.every((item) => item.before === item.after)) return unchanged("unchanged-reasoning")
 
     // Apply to a private serializable copy; the original request object is never mutated.
     const copy = cloneWireValue(input.request)
@@ -92,6 +95,15 @@ export const projectDistillationRequest = <Request>(
     if (!verification.ok) return unchanged(verification.reason === "work-limit" ? "work-limit" : "projection-failed")
     if (!verification.value) return unchanged("projection-failed")
 
+    if (input.allowExpansion) {
+      const messages = readWirePath(copy.value, ["messages"])
+      if (!messages.ok) return unchanged("unknown-content")
+      const capacity = estimateContextFoldingBudget({ ...input.budget, messages: messages.value })
+      if (capacity.estimatedInputTokens === undefined || capacity.usableInputTokens === undefined) {
+        return unchanged("unknown-content")
+      }
+      if (capacity.estimatedInputTokens > capacity.usableInputTokens) return unchanged("insufficient-net-savings")
+    }
     return { request: copy.value, applied: true, skipReason: undefined }
   } catch {
     return unchanged("projection-failed")

@@ -11,9 +11,12 @@ import {
   type SlotCapability,
   type SourceSpan,
 } from "@opencode-ai/core/session/reasoning-distillation"
+import { SessionID } from "../../src/session/schema"
+import { ProviderV2 } from "@opencode-ai/core/provider"
+import { ModelV2 } from "@opencode-ai/core/model"
 import { Hash } from "@opencode-ai/core/util/hash"
 import { Token } from "@/util/token"
-import type { SessionV1 } from "@opencode-ai/core/v1/session"
+import { SessionV1 } from "@opencode-ai/core/v1/session"
 import type { ModelMessage } from "ai"
 import {
   bindInterleavedReasoningLineage,
@@ -34,6 +37,7 @@ import {
   resolveOrganizerTier,
   runJudge,
   runDistillationCycle,
+  isDistillationTurn,
   runPropose,
   AuxiliaryCallError,
   type AuxiliaryCallResult,
@@ -243,6 +247,32 @@ const baseInput = (
 })
 
 describe("projectDistillationAISDK (§5.2)", () => {
+  test("scheduled organization may expand short reasoning but cannot exceed the complete request capacity", () => {
+    const text = "待验证"
+    const request = wireRequest(text)
+    const input = baseInput(request, {
+      trigger: "scheduled",
+      slots: [slot({ text })],
+      candidate: validCandidate(text),
+      originalTokens: Token.estimate(text),
+      budget: { ...overBudgetInput(request.messages), contextLimit: 100_000 },
+    })
+    const organized = projectDistillationAISDK(input)
+    expect(organized.applied).toBe(true)
+    expect(organized.request.messages[0].reasoning.length).toBeGreaterThan(text.length)
+    const oversized = {
+      ...input.candidate,
+      claims: input.candidate.claims.map((claim) => ({ ...claim, text: "结论".repeat(5000) })),
+    }
+    const rejected = projectDistillationAISDK({
+      ...input,
+      candidate: oversized,
+      budget: { ...input.budget, contextLimit: 1000, outputReserve: 100 },
+    })
+    expect(rejected.applied).toBe(false)
+    expect(rejected.request).toBe(request)
+  })
+
   test("without a compatibility record the slot is P5 and the request is returned unchanged", () => {
     const request = wireRequest(TEXT)
     const result = projectDistillationAISDK(baseInput(request, { records: [] }))
@@ -357,6 +387,177 @@ describe("runDistillationCycle live lifecycle", () => {
     },
   })
 
+  test("auxiliary prompts expose earlier tool evidence but never tools following the source reasoning", async () => {
+    const request = wireRequest(TEXT)
+    const counts = { propose: 0, judge: 0 }
+    const base = cycleInput(request, counts)
+    const prompts: string[] = []
+    const result = await runDistillationCycle(emptyLifecycleState, {
+      ...base,
+      trigger: "scheduled",
+      synchronous: true,
+      calls: [
+        call({ messageID: "z-earlier", partID: "tool-before", callID: "prior-call" }),
+        call({ messageID: "a-later", partID: "tool-after", callID: "future-call" }),
+      ],
+      evidenceReferences: [
+        { messageID: "z-earlier", partID: "tool-before", callID: "prior-call", kind: "tool-result" },
+        { messageID: "m1", partID: "p1", kind: "source" },
+        { messageID: "a-later", partID: "tool-after", callID: "future-call", kind: "tool-result" },
+      ],
+      callPropose: async (prompt) => {
+        prompts.push(prompt)
+        return base.callPropose()
+      },
+      callJudge: async (prompt) => {
+        prompts.push(prompt)
+        return base.callJudge()
+      },
+    })
+    expect(result.projection.applied).toBe(true)
+    expect(prompts).toHaveLength(2)
+    for (const prompt of prompts) {
+      expect(prompt).toContain("prior-call")
+      expect(prompt).not.toContain("future-call")
+    }
+  })
+
+  test("scheduled preparation completes proposal and review below the capacity threshold", async () => {
+    const request = wireRequest(TEXT)
+    const counts = { propose: 0, judge: 0 }
+    const input = {
+      ...cycleInput(request, counts),
+      trigger: "scheduled" as const,
+      synchronous: true,
+      budget: { ...overBudgetInput(request.messages), contextLimit: 100_000 },
+    }
+    const prepared = await runDistillationCycle(emptyLifecycleState, input)
+    expect(prepared.projection.applied).toBe(true)
+    expect(counts).toEqual({ propose: 1, judge: 1 })
+    const replayed = await runDistillationCycle(prepared.state, { ...input, trigger: "idle" })
+    expect(replayed.projection.applied).toBe(true)
+    expect(counts).toEqual({ propose: 1, judge: 1 })
+    const idle = await runDistillationCycle(emptyLifecycleState, { ...input, trigger: "idle" })
+    expect(idle.projection.skipReason).toBe("cadence-not-due")
+    expect(counts).toEqual({ propose: 1, judge: 1 })
+  })
+
+  test("scheduled transient failures do not repeat proposal in the same request", async () => {
+    const request = wireRequest(TEXT)
+    const counts = { propose: 0, judge: 0 }
+    const result = await runDistillationCycle(emptyLifecycleState, {
+      ...cycleInput(request, counts),
+      trigger: "scheduled",
+      synchronous: true,
+      callPropose: async () => {
+        counts.propose++
+        throw new AuxiliaryCallError({ category: "transport" })
+      },
+    })
+    expect(result.projection.applied).toBe(false)
+    expect(counts).toEqual({ propose: 1, judge: 0 })
+  })
+
+  test("source-scoped evidence survives new user messages but detects changes in its source history", async () => {
+    const sessionID = SessionID.make("ses_test")
+    const user = (id: string, text: string): SessionV1.WithParts => ({
+      info: {
+        id: SessionV1.MessageID.make("msg_" + id),
+        sessionID,
+        role: "user",
+        time: { created: 1 },
+        agent: "test",
+        model: { providerID: ProviderV2.ID.make("test"), modelID: ModelV2.ID.make("test") },
+      },
+      parts: [
+        {
+          id: SessionV1.PartID.make("prt_" + id),
+          messageID: SessionV1.MessageID.make("msg_" + id),
+          sessionID,
+          type: "text",
+          text,
+        },
+      ],
+    })
+    const source: SessionV1.WithParts = {
+      info: {
+        id: SessionV1.MessageID.make("msg_m1"),
+        sessionID,
+        role: "assistant",
+        parentID: SessionV1.MessageID.make("msg_u1"),
+        time: { created: 1 },
+        providerID: ProviderV2.ID.make("test"),
+        modelID: ModelV2.ID.make("test"),
+        mode: "build",
+        agent: "test",
+        path: { cwd: "/tmp", root: "/tmp" },
+        cost: 0,
+        tokens: { input: 1, output: 1, reasoning: 1, cache: { read: 0, write: 0 } },
+      },
+      parts: [
+        {
+          id: SessionV1.PartID.make("prt_p1"),
+          messageID: SessionV1.MessageID.make("msg_m1"),
+          sessionID,
+          type: "reasoning",
+          text: TEXT,
+          time: { start: 1, end: 2 },
+        },
+      ],
+    }
+    const before = reasoningHistory([user("u1", "原始要求"), source])
+    const after = reasoningHistory([user("u1", "原始要求"), source, user("u2", "继续")])
+    const changed = reasoningHistory([user("u1", "修改要求"), source, user("u2", "继续")])
+    expect(before.reasoningTurn).toBe(1)
+    expect(before.scopes?.msg_m1.inventoryFingerprint).toBe(after.scopes?.msg_m1.inventoryFingerprint)
+    expect(before.scopes?.msg_m1.inventoryFingerprint).not.toBe(changed.scopes?.msg_m1.inventoryFingerprint)
+    const request = wireRequest(TEXT)
+    const counts = { propose: 0, judge: 0 }
+    const input = {
+      ...cycleInput(request, counts),
+      slots: [slot({ messageID: "msg_m1", partID: "prt_p1", text: TEXT })],
+      callPropose: async () => {
+        counts.propose++
+        const candidate = candidateRaw(TEXT)
+        const ref = { messageID: "msg_m1", partID: "prt_p1" }
+        return {
+          usageTokens: 40,
+          output: {
+            ...candidate,
+            claims: candidate.claims.map((claim) => ({
+              ...claim,
+              sources: claim.sources.map((source) => ({ ...source, ...ref })),
+              evidence: claim.evidence.map((evidence) => ({ ...evidence, ...ref })),
+            })),
+            coverage: candidate.coverage.map((entry) => ({ ...entry, source: { ...entry.source, ...ref } })),
+          },
+        }
+      },
+      trigger: "scheduled" as const,
+      synchronous: true,
+      inventoryFingerprint: before.inventoryFingerprint,
+      evidenceByMessage: before.scopes,
+    }
+    const prepared = await runDistillationCycle(emptyLifecycleState, input)
+    expect(prepared.projection.applied).toBe(true)
+    const next = await runDistillationCycle(prepared.state, {
+      ...input,
+      trigger: "idle",
+      inventoryFingerprint: after.inventoryFingerprint,
+      evidenceByMessage: after.scopes,
+    })
+    expect(next.projection.applied).toBe(true)
+    expect(counts).toEqual({ propose: 1, judge: 1 })
+    const invalidated = await runDistillationCycle(next.state, {
+      ...input,
+      trigger: "idle",
+      inventoryFingerprint: changed.inventoryFingerprint,
+      evidenceByMessage: changed.scopes,
+    })
+    expect(invalidated.projection.applied).toBe(false)
+    expect(invalidated.projection.request).toBe(request)
+  })
+
   test("cached judge evidence cannot be restamped after the tool result changes", async () => {
     const request = wireRequest(TEXT)
     const counts = { propose: 0, judge: 0 }
@@ -441,6 +642,8 @@ describe("runDistillationCycle live lifecycle", () => {
     const first = await runDistillationCycle(emptyLifecycleState, input)
     const second = await runDistillationCycle(first.state, input)
     expect(first.attempted).toBe("propose")
+    expect(first.projection.skipReason).toBe("invalid-proposal")
+    expect(first.projection.request).toBe(request)
     expect(second.attempted).toBe("none")
     expect(second.projection.skipReason).toBe("call-budget-exhausted")
     expect(calls).toBe(1)
@@ -773,6 +976,11 @@ describe("parseSupport", () => {
       { claimID: "c2", result: { verdict: "unknown", reasonCode: "truncated" } },
     ])
   })
+  test("a model cannot label its own judgment as deterministic evidence", () => {
+    expect(parseSupport({ support: [{ claimID: "c1", verdict: "supported", method: "deterministic" }] })).toEqual([
+      { claimID: "c1", result: { verdict: "supported", method: "judged" } },
+    ])
+  })
   test("rejects a verdict missing its method or reasonCode", () => {
     expect(parseSupport({ support: [{ claimID: "c1", verdict: "supported" }] })).toBeUndefined()
     expect(parseSupport({ support: [{ claimID: "c1", verdict: "unknown" }] })).toBeUndefined()
@@ -841,6 +1049,24 @@ describe("extractInterleavedReasoningSlots (W1, §2)", () => {
 })
 
 describe("prompt builders (§5.4.1 / §5.5.3)", () => {
+  test("source coordinates preserve UTF-16 boundaries and all whitespace", () => {
+    const text = "甲😀\n\n乙\r\n末"
+    const prompt = buildProposePrompt({
+      reasoningTexts: [text],
+      slotRefs: [{ messageID: "m", partID: "p" }],
+      callSummary: [],
+    })
+    expect(prompt).toContain(`UTF-16 length=${text.length}`)
+    expect(prompt).toContain(
+      JSON.stringify([
+        { start: 0, end: 4, text: "甲😀\n" },
+        { start: 4, end: 5, text: "\n" },
+        { start: 5, end: 8, text: "乙\r\n" },
+        { start: 8, end: 9, text: "末" },
+      ]),
+    )
+  })
+
   test("propose prompt frames input as untrusted, requires Chinese output with verbatim identifiers, and embeds R/E", () => {
     const prompt = buildProposePrompt({
       reasoningTexts: ["原始思绪甲", "原始思绪乙"],
@@ -1223,4 +1449,10 @@ describe("review regressions: conservation and source binding", () => {
     expect(result.applied).toBe(false)
     expect(result.skipReason).toBe("evidence-unresolved")
   })
+})
+
+test("reasoning preparation cadence is first turn then every three user turns", () => {
+  expect(Array.from({ length: 11 }, (_, turn) => turn).filter(isDistillationTurn)).toEqual([1, 4, 7, 10])
+  expect(isDistillationTurn(NaN)).toBe(false)
+  expect(isDistillationTurn(1.5)).toBe(false)
 })

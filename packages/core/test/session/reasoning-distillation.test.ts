@@ -358,12 +358,12 @@ describe("planReasoningDistillation (§5.2)", () => {
       extraCall: "none",
     })
   })
-  test("the trigger is overBudget === true; unknown budget does not fire", () => {
+  test("capacity-triggered preparation requires a known over-budget request", () => {
     expect(planReasoningDistillation(planInput({ budget: budget(false) }))).toMatchObject({
       skipReason: "below-target",
     })
     expect(planReasoningDistillation(planInput({ budget: budget(undefined) }))).toMatchObject({
-      skipReason: "below-target",
+      skipReason: "unknown-content",
     })
   })
   test("no rewritable slot vs compatibility-unproven (P5)", () => {

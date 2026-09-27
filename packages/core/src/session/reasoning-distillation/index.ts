@@ -26,7 +26,7 @@ export {
 } from "./claims"
 export { parseRetention, evaluateGates } from "./gates"
 export type { GateEvaluation, GateID, GateViolation } from "./gates"
-export { planReasoningDistillation, renderDistillation } from "./plan"
+export { planReasoningDistillation, renderDistillation, renderSourceRanges } from "./plan"
 export { ReasoningDistillationPolicy } from "./policy"
 export { projectDistillationRequest } from "./projection"
 export { capabilityFingerprint, classifySlotEligibility } from "./slot"
