@@ -3,7 +3,7 @@
 
 export * as DagLoop from "./loop"
 
-import { Cause, Effect, Layer, Context, Stream, Semaphore, Fiber, Option, DateTime, Clock, Schema } from "effect"
+import { Cause, Effect, Layer, Context, Stream, Semaphore, Fiber, Option, DateTime, Clock, Schema, Scope } from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { InstanceState } from "@/effect/instance-state"
@@ -18,6 +18,7 @@ import {
   isNodeTerminalStatus,
   isTransitionRejection,
   isWorkflowTerminalStatus,
+  isTerminalWorkflowStatusValue,
 } from "@opencode-ai/core/dag/core/types"
 import { Dag, type WorkflowConfig, parseWorkflowConfig } from "../dag"
 import { projectBriefForNode } from "../admission"
@@ -45,6 +46,11 @@ import { makeArtifactSourceAuthorizer } from "./artifact-permissions"
 import { Permission } from "@/permission"
 
 const parseJsonOption = Schema.decodeUnknownOption(Schema.UnknownFromJsonString)
+const PAUSED_REMINDER_DELAY_MS = 5 * 60_000
+
+export function isPausedReminderDue(workflow: Pick<DagStore.WorkflowRow, "status" | "wakeReported" | "timeUpdated">, now: number) {
+  return workflow.status === "paused" && !workflow.wakeReported && now - workflow.timeUpdated >= PAUSED_REMINDER_DELAY_MS
+}
 
 export interface Interface {
   readonly init: () => Effect.Effect<void>
@@ -91,6 +97,7 @@ const serviceLayer = Layer.effect(
 
     const state = yield* InstanceState.make(
       Effect.fn("DagLoop.state")(function* (ctx) {
+        const stateScope = yield* Scope.Scope
         const runtimes = new Map<string, WorkflowEntry>()
         // Adoption in-flight reservations: recoverWorkflow spans async yield
         // points before it publishes its entry into `runtimes`, so a plain
@@ -875,11 +882,11 @@ const serviceLayer = Layer.effect(
           Effect.forkScoped({ startImmediately: true }),
         )
 
-        for (const def of [DagEvent.NodeCompleted, DagEvent.NodeSkipped]) {
+        for (const def of [DagEvent.NodeCompleted, DagEvent.NodeSkipped, DagEvent.NodeAborted]) {
           // A completed node is an output-producing success; a skipped node is a
           // terminal no-output state that must stay distinguishable so pure-skip
           // descendants cascade instead of running (D13).
-          const settle = def === DagEvent.NodeSkipped
+          const settle = def === DagEvent.NodeSkipped || def === DagEvent.NodeAborted
             ? (entry: WorkflowEntry, nodeID: string) => entry.runtime.markSkipped(nodeID)
             : (entry: WorkflowEntry, nodeID: string) => entry.runtime.markSatisfied(nodeID)
           yield* events.subscribe(def).pipe(
@@ -897,11 +904,11 @@ const serviceLayer = Layer.effect(
                     // matches the event's terminal status means a later
                     // restart/replan reset it — drop the stale event without
                     // touching the new generation's fiber.
-                    const expected = def === DagEvent.NodeSkipped ? "skipped" : "completed"
+                    const expected = def === DagEvent.NodeSkipped ? "skipped" : def === DagEvent.NodeAborted ? "aborted" : "completed"
                     const node = yield* store.getNode(dagID, nodeID)
                     const confirmed = node?.status === expected
                     if (confirmed) {
-                      if (def === DagEvent.NodeSkipped) {
+                      if (def === DagEvent.NodeSkipped || def === DagEvent.NodeAborted) {
                         // Cancel-skip race: workflow-level cancel publishes NodeSkipped
                         // for running nodes, and this handler may win the cross-stream
                         // race against WorkflowCancelled. Deleting the fiber here
@@ -959,7 +966,7 @@ const serviceLayer = Layer.effect(
                 // the parent session may already be idle (no new idle event
                 // will fire), so we can't rely on the idle subscription alone.
                 yield* tryDeliverWake(entry.parentSessionID).pipe(Effect.ignore, Effect.forkScoped)
-              }).pipe(guarded(def === DagEvent.NodeSkipped ? "NodeSkipped" : "NodeCompleted")),
+              }).pipe(guarded(def === DagEvent.NodeSkipped ? "NodeSkipped" : def === DagEvent.NodeAborted ? "NodeAborted" : "NodeCompleted")),
             ),
             Effect.forkScoped({ startImmediately: true }),
           )
@@ -1216,9 +1223,11 @@ const serviceLayer = Layer.effect(
                     if (fragTimeoutMs == null || fragTimeoutMs === oldTimeoutMs) continue
                     const now = yield* Clock.currentTimeMillis
                     // Cap gate (A1) + delivery gate (Q2): both are SKIP
-                    // conjuncts on the single re-time path (this handler is the
-                    // only caller of nodeExtendTimeout; the watchdog never
-                    // re-times — it only proposes escalations).
+                    // conjuncts on this re-time path. The watchdog never
+                    // re-times — it only proposes escalations. The other
+                    // caller of nodeExtendTimeout, Dag.extendTimeout, applies
+                    // the same two gates (A1 in its own body, Q2 inside the
+                    // command).
                     //   A1: a changed timeout alone must not move a healthy
                     //   deadline forward. An agent replanning BEFORE each
                     //   deadline with cycling values (10m→20m→10m…) would push
@@ -1275,12 +1284,10 @@ const serviceLayer = Layer.effect(
                             ),
                       ),
                     )
-                    // Negative verdict: -1 (write failure, mapped above) OR -2
-                    // (Q2 delivery-gate rejection — the node is STILL RUNNING but
-                    // its escalation wake was undelivered, raced in by the watchdog
-                    // re-escalating under the workflow lock AFTER this handler's
-                    // evalLock snapshot read at getNodes). In BOTH cases no deadline
-                    // was written and the node remains running, so the old watcher
+                    // Negative verdict: -1 (write failure, mapped above), -2
+                    // (Q2 delivery-gate rejection), or -3 (cumulative timeout
+                    // cap exhausted). In every case no deadline was written
+                    // and the node remains running, so the old watcher
                     // must keep supervising the elapsed deadline and re-escalating
                     // toward the cap (N1: a running node is never left without a
                     // watcher). Clearing the watcher here would orphan the node and
@@ -1429,8 +1436,12 @@ const serviceLayer = Layer.effect(
               Effect.succeed({ nodes: [], workflows: [] } satisfies DagStore.WakeSnapshot),
             ),
           )
-          const terminalWorkflows = snapshot.workflows.filter(
-            (workflow) => !workflow.wakeReported && isWorkflowTerminalStatus(workflow.status as never),
+          const now = yield* Clock.currentTimeMillis
+          const reportableWorkflows = snapshot.workflows.filter(
+            (workflow) => !workflow.wakeReported && (
+              isTerminalWorkflowStatusValue(workflow.status)
+              || isPausedReminderDue(workflow, now)
+            ),
           )
           // Timeout-escalated nodes must reach the main agent for
           // adjudication — their workflow is a delivery boundary even though
@@ -1449,7 +1460,7 @@ const serviceLayer = Layer.effect(
           )
           const workflowIDs = [...new Set([
             ...snapshot.nodes.map((node) => node.workflowId),
-            ...terminalWorkflows.map((workflow) => workflow.id),
+            ...reportableWorkflows.map((workflow) => workflow.id),
           ])]
           const workflowsByID = new Map(snapshot.workflows.map((workflow) => [workflow.id, workflow]))
           const workflows = workflowIDs.map((workflowID) => workflowsByID.get(workflowID))
@@ -1473,7 +1484,7 @@ const serviceLayer = Layer.effect(
           const atBoundary = new Set(boundaryWorkflows.map((workflow) => workflow.id))
           const batch = {
             nodes: snapshot.nodes.filter((node) => atBoundary.has(node.workflowId)),
-            workflows: terminalWorkflows.filter((workflow) => atBoundary.has(workflow.id)),
+            workflows: reportableWorkflows.filter((workflow) => atBoundary.has(workflow.id)),
           } satisfies DagStore.WakeBatch
           return {
             batch,
@@ -1496,7 +1507,7 @@ const serviceLayer = Layer.effect(
         })
 
         let tryDeliverWake: (sessionID: string) => Effect.Effect<void> = () => Effect.void
-        tryDeliverWake = Effect.fn("DagLoop.tryDeliverWake")(function* (sessionID: string) {
+        const deliverWake = Effect.fn("DagLoop.tryDeliverWake")(function* (sessionID: string) {
           // Cross-instance guard via the execution-location authority: wake
           // delivery is store-global (idle Status events, node-terminal
           // handlers, the startup sweep). Only the instance whose DIRECTORY
@@ -1548,8 +1559,18 @@ const serviceLayer = Layer.effect(
                     // so no reverse ordering exists.
                     yield* entry.evalLock.withPermits(1)(
                       Effect.gen(function* () {
+                        // P0-C: re-read the durable status under the evalLock. A
+                        // parent that responded this turn — e.g. submitted a
+                        // replan/extend that failed validation, which parks the
+                        // workflow paused — must NOT be failed as unresponsive.
+                        // The durable row is transactional with the pause event,
+                        // so it is authoritative over the in-memory paused flag,
+                        // which the WorkflowPaused handler refreshes async and
+                        // could otherwise lose the race against this check.
+                        const durable = yield* store.getWorkflow(dagID)
                         const shouldFail =
-                          !entry.runtime.isPaused()
+                          durable?.status === "running"
+                          && !entry.runtime.isPaused()
                           && !entry.runtime.isStepMode()
                           // Suppress the net only when current-process execution
                           // ownership proves that a running node is making progress.
@@ -1609,7 +1630,7 @@ const serviceLayer = Layer.effect(
                   // extend — escalation_pending and timeoutExtensions>0 agree
                   // here; the flag is the intent-level signal.
                   if (node.status === "running" && node.escalationPending) {
-                    return `[DAG Node Timeout] RUNNING node "${node.name}" exceeded its execution deadline (timeout escalation ${node.timeoutExtensions}) and is still executing. Adjudicate by replanning with a NEW worker_config.timeout_ms to extend the node — that grants more execution time, but the cumulative extension count is NOT reset (only a new attempt resets it), and the node is force-cancelled once the cap is reached — or cancel/replan the node. Queued nodes are not extended: their admission deadline was fixed at permit acquisition and is not adjusted by extensions.`
+                    return `[DAG Node Timeout] RUNNING node "${node.name}" exceeded its execution deadline (timeout escalation ${node.timeoutExtensions}) and is still executing. If the workflow's cumulative escalation cap is not exhausted, control(extend_timeout) { workflow_id, node_id, timeout_ms } grants more execution time WITHOUT a replan — it keeps the same child session and attempt, consumes no replan, rewrites no graph, and the deadline watcher picks up the new deadline on its next read. At the cap, extension of this attempt is refused and the watcher enforces the timeout verdict. The cumulative extension count is NOT reset (only a new attempt resets it). Use control(replan) with a NEW worker_config.timeout_ms when you must also change the graph; restart or cancel the node to stop the current attempt. Queued nodes are not extended: their admission deadline was fixed at permit acquisition and is not adjusted by extensions.`
                   }
                   const durableResult =
                     typeof node.output === "string"
@@ -1626,13 +1647,15 @@ const serviceLayer = Layer.effect(
                 ...batch.workflows.map((workflow) => {
                   const failures = failuresByWorkflow.get(workflow.id)
                   const attribution = failures ? `\nFailed nodes:\n${failures.join("\n")}` : ""
-                  return `[DAG Workflow ${workflow.status}] Workflow "${workflow.title}" has reached terminal status.${attribution}`
+                  return workflow.status === "paused"
+                    ? `[DAG Workflow paused] Workflow "${workflow.title}" has remained paused for five minutes. It is still paused and awaits an explicit control(replan), control(extend), control(resume), or control(cancel); no automatic transition was made.`
+                    : `[DAG Workflow ${workflow.status}] Workflow "${workflow.title}" has reached terminal status.${attribution}`
                 }),
               ]
               const summary = [
                 ...summaries,
                 ...(plan.actionableDagIDs.size > 0
-                  ? ['You MUST act on these workflows in this turn (workflow tool: extend / control replan / complete / cancel). If this turn ends with a workflow stalled and no action taken, it will be failed with reason "orchestrator_unresponsive".']
+                  ? ['Act on these workflows this turn (workflow tool: control extend_timeout for a timeout escalation; control replan / extend to reshape the graph; control resume / complete / cancel to settle). The orchestrator_unresponsive verdict is state-based: a workflow left RUNNING and stalled (no running or ready nodes) at the end of the turn is failed. After a rejected replan/extend, inspect its reported actual state: a durably paused workflow is recoverable, but a failed automatic pause does not protect a still-running workflow. Never cancel the whole graph over a rejection. If you need the user before acting on a stalled workflow, control(pause) it first and verify the state, then stop and ask. A paused workflow whose nodes have all finished settles via control(resume), not control(complete).']
                   : []),
               ].join("\n\n")
 
@@ -1748,9 +1771,20 @@ const serviceLayer = Layer.effect(
           } finally {
             const retry = wakePending.delete(sessionID)
             wakeInFlight.delete(sessionID)
-            if (retry) yield* tryDeliverWake(sessionID)
+            if (retry) yield* tryDeliverWake(sessionID).pipe(guarded("WakePendingRetry"), Effect.forkIn(stateScope))
           }
         })
+        // The in-flight reservation must have a finite lifetime even when a
+        // parent turn or a dependency never settles. Timing out interrupts the
+        // old delivery fiber, runs its finally release, and lets a queued or
+        // periodic stimulus retry through the ordinary idle admission gate.
+        tryDeliverWake = (sessionID) => deliverWake(sessionID).pipe(
+          Effect.timeoutOption("7 minutes"),
+          Effect.flatMap(Option.match({
+            onSome: () => Effect.void,
+            onNone: () => Effect.logWarning("DAG wake delivery lease expired; retry remains available", { sessionID }),
+          })),
+        )
 
         // Idle-event subscription: the primary wake trigger. The handler only
         // forks, so the subscription itself cannot die — guarded here so a
@@ -1763,6 +1797,25 @@ const serviceLayer = Layer.effect(
           ),
           Effect.forkScoped({ startImmediately: true }),
         )
+
+        // A parked workflow can outlive the parent turn that caused its pause.
+        // The paused row's durable wake marker permits one reminder per pause
+        // episode, including after restart. Scanning only starts delivery; the
+        // regular idle/admission and directory ownership gates still apply.
+        const remindPausedWorkflows = Effect.gen(function* () {
+          const now = yield* Clock.currentTimeMillis
+          const paused = yield* store.listByStatus("paused")
+          const sessions = new Set(
+            paused.filter((workflow) => isPausedReminderDue(workflow, now)).map((workflow) => workflow.sessionId),
+          )
+          for (const sessionID of sessions) {
+            if (!(yield* DagLocation.ownsSession(sessionID, ctx.directory))) continue
+            yield* tryDeliverWake(sessionID).pipe(guarded("PausedReminder"), Effect.forkScoped)
+          }
+        }).pipe(guarded("PausedReminderSweep"))
+        yield* Effect.forever(
+          Effect.sleep(30_000).pipe(Effect.flatMap(() => remindPausedWorkflows)),
+        ).pipe(Effect.forkScoped)
 
         // R5 session-deletion teardown: when the parent session is removed,
         // Session.remove publishes SessionV1.Event.Deleted and the FK cascade
@@ -1870,6 +1923,7 @@ const serviceLayer = Layer.effect(
             ),
           )
         }
+        yield* remindPausedWorkflows
 
         // Terminal rows can survive a process crash after projection but before
         // parent delivery. Re-enter the normal serialized drain for every

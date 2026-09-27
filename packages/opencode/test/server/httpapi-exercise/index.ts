@@ -1926,6 +1926,10 @@ const scenarios: Scenario[] = [
         check(typeof summary.completedNodes === "number", "summary should have completedNodes")
         check(typeof summary.runningNodes === "number", "summary should have runningNodes")
         check(typeof summary.failedNodes === "number", "summary should have failedNodes")
+        check(
+          summary.abortedNodes === undefined || (typeof summary.abortedNodes === "number" && summary.abortedNodes >= 0),
+          "summary abortedNodes should be absent for an older server or a non-negative number",
+        )
         check(typeof summary.status === "string", "summary should have status")
         check(typeof summary.title === "string", "summary should have title")
         check(typeof summary.escalatedNodes === "number", "summary should have escalatedNodes")

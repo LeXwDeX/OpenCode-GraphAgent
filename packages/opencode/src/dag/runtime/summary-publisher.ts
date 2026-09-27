@@ -45,6 +45,7 @@ const SUMMARY_TRIGGER_EVENTS = [
   DagEvent.NodeCompleted,
   DagEvent.NodeFailed,
   DagEvent.NodeSkipped,
+  DagEvent.NodeAborted,
   DagEvent.NodeCancelled,
   DagEvent.NodeRestarted,
   // F10: escalation changes the visible summary (escalatedNodes rises from 0)

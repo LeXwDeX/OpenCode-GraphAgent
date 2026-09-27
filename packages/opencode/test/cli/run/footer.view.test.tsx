@@ -1270,6 +1270,12 @@ test("direct question interaction retries after a transient failure", async () =
     expect(attempts).toBe(2)
     expect(app.captureCharFrame()).not.toContain("temporarily offline")
     expect(app.captureCharFrame()).not.toContain("Timeout in ")
+
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    app.mockInput.pressKey("TAB")
+    await Promise.resolve()
+    await app.renderOnce()
+    expect(attempts).toBe(3)
   } finally {
     app.renderer.destroy()
   }

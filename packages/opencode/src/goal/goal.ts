@@ -879,7 +879,7 @@ const serviceLayer = Layer.effect(
         const turnsUsed = parseFailed ? state.turns_used : GoalState.nni(state.turns_used + 1)
         const pauseReason =
           newParseFailures >= GoalPrompts.MAX_CONSECUTIVE_PARSE_FAILURES
-            ? "judge 模型未返回有效 JSON 判定。请检查模型配置或换用更可靠的模型，然后 /goal resume。"
+            ? `judge 模型连续 ${newParseFailures} 次未返回有效判定；最近失败：${reason}。请检查模型配置或换用更可靠的模型，然后 /goal resume。`
             : turnsUsed >= state.max_turns
               ? `已用 ${turnsUsed}/${state.max_turns} 轮预算。/goal clear 停止；/goal resume 会重启一整轮执行（本轮内完成才会计为达成，否则仍会被再次暂停）。`
               : undefined

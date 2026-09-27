@@ -389,7 +389,6 @@ const serviceLayer = Layer.effect(
                         }),
                       catch: (e) => new Error(`judge LLM call failed: ${String(e)}`),
                     }).pipe(Effect.timeout(`${opts.timeout} seconds`))
-                    if (!result) return ""
                     return result.text
                   })),
             )

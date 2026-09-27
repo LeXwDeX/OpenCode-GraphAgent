@@ -689,6 +689,7 @@ export type DagWorkflowSummary = {
   runningNodes: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
   failedNodes: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
   skippedNodes: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  abortedNodes?: number
   queuedNodes: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
   escalatedNodes: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
 }
@@ -2141,7 +2142,9 @@ export type Config = {
     tail_turns?: number
     preserve_recent_tokens?: number
     reserved?: number
+    max_context_tokens?: number
   }
+  reasoningDistillation?: ConfigV2ReasoningDistillation
   experimental?: {
     disable_paste_summary?: boolean
     batch_tool?: boolean
@@ -3005,6 +3008,7 @@ export type DagWorkflowSummary1 = {
   runningNodes: number | "NaN" | "Infinity" | "-Infinity"
   failedNodes: number | "NaN" | "Infinity" | "-Infinity"
   skippedNodes: number | "NaN" | "Infinity" | "-Infinity"
+  abortedNodes?: number
   queuedNodes: number | "NaN" | "Infinity" | "-Infinity"
   escalatedNodes: number | "NaN" | "Infinity" | "-Infinity"
 }
@@ -3894,6 +3898,22 @@ export type ConfigV2ReferenceLocal = {
   path: string
   description?: string
   hidden?: boolean
+}
+
+export type ConfigV2ReasoningDistillationCompatibility = {
+  runtime: string
+  protocol: string
+  providerModelVariant: string
+  endpointIdentity: string
+  adapterVersion: string
+  optionsFingerprint: string
+  transportVerified: boolean
+  upstreamVerified: boolean
+}
+
+export type ConfigV2ReasoningDistillation = {
+  enabled?: boolean
+  compatibility?: Array<ConfigV2ReasoningDistillationCompatibility>
 }
 
 export type PolicyEffect = "allow" | "deny"

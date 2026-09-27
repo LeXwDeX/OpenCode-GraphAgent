@@ -233,12 +233,20 @@ existing graph cannot represent the work, not a requirement of a changed risk
 label. A non-`ACCEPT` verdict does not mandate more agents or a full template.
 
 Report blockers and the actual workflow state when stopping or asking for a
-decision. Do not claim rejected work passed. The runtime's
-`orchestrator_unresponsive` guard applies to stalled live workflows; if ending
-the work, settle live scheduling rather than abandoning active children.
-Naturally completed workflows can be extended, but cannot be paused or replanned.
-For a ceiling breach, do not retry the identical plan; report the remaining
-findings and stop or change approach within the user's authorization.
+decision. Do not claim rejected work passed. A replan or extend rejected by
+validation does NOT fail the workflow — it is parked paused and recoverable, so
+the runtime's `orchestrator_unresponsive` guard (state-based: it fails only a
+workflow left RUNNING and stalled at the end of a turn) cannot fire on it and
+cancelling the graph is never warranted; fix the fragment using the diagnostic
+and replan again. If you must stop to ask the user about a stalled RUNNING
+workflow, `control(pause)` it first — a paused workflow is never failed as
+unresponsive. For a timeout escalation on a node that is still progressing,
+prefer `control(extend_timeout)` to grant more time in place — no replan, no
+lost child session. If ending the work, settle live scheduling rather than
+abandoning active children. Naturally completed workflows can be extended, but
+cannot be paused or replanned. For a ceiling breach, do not retry the identical
+plan; report the remaining findings and stop or change approach within the
+user's authorization.
 
 ## Actionable Checkpoints
 

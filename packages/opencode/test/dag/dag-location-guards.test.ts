@@ -791,7 +791,7 @@ describe("DAG execution-location static contract (DAG-LOC-01 R7)", () => {
       {
         name: "WorkflowStarted handler (first-wave adoption)",
         from: "yield* events.subscribe(DagEvent.WorkflowStarted)",
-        to: "for (const def of [DagEvent.NodeCompleted, DagEvent.NodeSkipped])",
+        to: "for (const def of [DagEvent.NodeCompleted, DagEvent.NodeSkipped, DagEvent.NodeAborted])",
       },
       {
         name: "startup wake sweep",
@@ -800,7 +800,7 @@ describe("DAG execution-location static contract (DAG-LOC-01 R7)", () => {
       },
       {
         name: "tryDeliverWake (idle-Status wake delivery path)",
-        from: 'tryDeliverWake = Effect.fn("DagLoop.tryDeliverWake")',
+        from: 'const deliverWake = Effect.fn("DagLoop.tryDeliverWake")',
         to: "// Idle-event subscription",
       },
     ]

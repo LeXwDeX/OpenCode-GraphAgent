@@ -112,6 +112,22 @@ describe("Config", () => {
     }),
   )
 
+  it.effect("preserves the automatic compaction ceiling across v1 and v2 configuration", () =>
+    Effect.sync(() => {
+      const v1 = Schema.decodeUnknownSync(ConfigV1.Info)({ compaction: { max_context_tokens: 250_000 } })
+      const migrated = ConfigMigrateV1.migrate(v1)
+      expect(Schema.decodeUnknownSync(Config.Info)(migrated).compaction?.max_context_tokens).toBe(250_000)
+      expect(
+        Schema.decodeUnknownSync(Config.Info)({ compaction: { max_context_tokens: 400_000 } }).compaction
+          ?.max_context_tokens,
+      ).toBe(400_000)
+      for (const max_context_tokens of [0, -1, 1.5]) {
+        expect(() => Schema.decodeUnknownSync(ConfigV1.Info)({ compaction: { max_context_tokens } })).toThrow()
+        expect(() => Schema.decodeUnknownSync(Config.Info)({ compaction: { max_context_tokens } })).toThrow()
+      }
+    }),
+  )
+
   it.effect("migrates v1 provider setup options into AISDK settings", () =>
     Effect.sync(() => {
       const migrated = ConfigMigrateV1.migrate({

@@ -3,6 +3,7 @@ export * as DagSummary from "./dag-summary"
 import { Schema } from "effect"
 import { define, inventory } from "./event"
 import { SessionID } from "./session-id"
+import { NonNegativeInt } from "./schema"
 
 /** Aggregated per-workflow progress for TUI display. Mirrors DagStore.WorkflowSummary. */
 export const WorkflowSummary = Schema.Struct({
@@ -19,6 +20,8 @@ export const WorkflowSummary = Schema.Struct({
   // displays count completed+skipped as settled so a gated workflow doesn't
   // finish with a "3/9" denominator lie. queued surfaces true concurrency.
   skippedNodes: Schema.Number,
+  // Optional on the wire so a new client can still read an older server.
+  abortedNodes: Schema.optional(NonNegativeInt),
   queuedNodes: Schema.Number,
   // F10: running nodes with a not-yet-adjudicated timeout escalation
   // (escalation_pending) — lets the TUI distinguish normal RUNNING from

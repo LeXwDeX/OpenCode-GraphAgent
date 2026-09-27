@@ -296,6 +296,9 @@ describe("DagLoop timeout escalation", () => {
           const parent = yield* takeWithin(parentPrompts, "timeout wake did not reach the parent")
           expect(parent.text).toContain("[DAG Node Timeout]")
           expect(parent.text).toContain('"a"')
+          // P0-A: the wake points the parent at the dedicated extend_timeout
+          // adjudication, not a full replan, to grant more time.
+          expect(parent.text).toContain("extend_timeout")
           yield* Deferred.succeed(parent.release, "success")
 
           // The child session is still alive — it can still finish the work.
@@ -1276,14 +1279,14 @@ describe("DagLoop timeout escalation", () => {
   // keeps 0; the handler's existing `written < 0 → continue` then keeps the
   // watcher for -2 (and -1 write-fail) while `written === 0` stays the
   // terminal-cleanup path.
-  it("C1: nodeExtendTimeout distinguishes Q2 rejection (-2) from terminal rejection (0) — three-valued contract", async () => {
+  it("C1: nodeExtendTimeout distinguishes Q2 rejection (-2) from terminal rejection (0)", async () => {
     await Effect.runPromise(
       runLoopTest(({ dag, store, status, childPrompts, parentPrompts }) =>
         Effect.gen(function* () {
           const dagID = yield* dag.create({
             projectID: "project-1",
             sessionID: "ses_parent",
-            title: "C1 three-valued contract",
+            title: "C1 distinct rejection contract",
             config: { name: "c1-contract", nodes: [node("a", [], 300)] },
           })
           const gate = yield* takeWithin(childPrompts, "a did not start")

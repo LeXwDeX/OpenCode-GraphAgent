@@ -2,6 +2,7 @@ import { describe, expect } from "bun:test"
 import { Context, Deferred, Duration, Effect, Exit, Fiber, Layer, Scope } from "effect"
 import * as TestClock from "effect/testing/TestClock"
 import { Database } from "@opencode-ai/core/database/database"
+import { Config } from "@opencode-ai/core/config"
 import { EventV2 } from "@opencode-ai/core/event"
 import { QuestionV2 } from "@opencode-ai/core/question"
 import { SessionV2 } from "@opencode-ai/core/session"
@@ -9,6 +10,15 @@ import { testEffect } from "./lib/effect"
 
 const questions = QuestionV2.layer.pipe(Layer.provide(EventV2.defaultLayer))
 const it = testEffect(Layer.mergeAll(Database.defaultLayer, EventV2.defaultLayer, questions))
+const longTimeoutConfig = Layer.mock(Config.Service)({
+  entries: () =>
+    Effect.succeed([new Config.Document({ type: "document", info: new Config.Info({ question_timeout: 600 }) })]),
+})
+const longTimeoutQuestions = QuestionV2.layer.pipe(
+  Layer.provide(EventV2.defaultLayer),
+  Layer.provide(longTimeoutConfig),
+)
+const longTimeoutIt = testEffect(Layer.mergeAll(Database.defaultLayer, EventV2.defaultLayer, longTimeoutQuestions))
 
 const sessionID = SessionV2.ID.make("ses_question_test")
 const question: QuestionV2.Info = {
@@ -59,17 +69,54 @@ describe("QuestionV2", () => {
     }),
   )
 
-  it.effect("cancels the whole request timeout after interaction and keeps it cancelled", () =>
+  it.effect("expires after interaction inactivity and refuses a late reply", () =>
     Effect.gen(function* () {
       const service = yield* QuestionV2.Service
       const { fiber, request } = yield* waitForAsk(service, { sessionID, questions: [question, question] })
 
       yield* service.interact(request.id)
-      yield* service.interact(request.id)
       expect((yield* service.list())[0]?.expiresAt).toBeUndefined()
-      yield* TestClock.adjust(Duration.hours(1))
-      yield* service.reply({ requestID: request.id, answers: [["One"], ["One"]] })
-      expect(yield* Fiber.join(fiber)).toEqual([["One"], ["One"]])
+      yield* TestClock.adjust(Duration.seconds(59))
+      yield* service.interact(request.id)
+      yield* TestClock.adjust(Duration.seconds(59))
+      expect(yield* service.list()).toHaveLength(1)
+      yield* TestClock.adjust(Duration.seconds(1))
+      const exit = yield* Fiber.await(fiber)
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) expect(exit.cause.toString()).toContain("QuestionV2.TimedOutError")
+      expect(yield* service.list()).toEqual([])
+      expect(yield* service.reply({ requestID: request.id, answers: [["One"], ["One"]] }).pipe(Effect.flip)).toEqual(
+        new QuestionV2.NotFoundError({ requestID: request.id }),
+      )
+    }),
+  )
+
+  it.effect("caps the response phase even when interactions keep refreshing inactivity", () =>
+    Effect.gen(function* () {
+      const service = yield* QuestionV2.Service
+      const { fiber, request } = yield* waitForAsk(service, { sessionID, questions: [question] })
+      yield* service.interact(request.id)
+      for (let interval = 0; interval < 9; interval++) {
+        yield* TestClock.adjust(Duration.seconds(30))
+        yield* service.interact(request.id)
+      }
+      yield* TestClock.adjust(Duration.seconds(30))
+      expect(Exit.isFailure(yield* Fiber.await(fiber))).toBe(true)
+      expect(yield* service.list()).toEqual([])
+    }),
+  )
+
+  longTimeoutIt.effect("observes a response cap shorter than the original configured timeout", () =>
+    Effect.gen(function* () {
+      const service = yield* QuestionV2.Service
+      const { fiber, request } = yield* waitForAsk(service, { sessionID, questions: [question] })
+      expect(request.expiresAt).toBe(600_000)
+      yield* service.interact(request.id)
+      yield* TestClock.adjust(Duration.seconds(299))
+      expect(yield* service.list()).toHaveLength(1)
+      yield* TestClock.adjust(Duration.seconds(1))
+      expect(Exit.isFailure(yield* Fiber.await(fiber))).toBe(true)
+      expect(yield* service.list()).toEqual([])
     }),
   )
 

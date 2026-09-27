@@ -1,6 +1,6 @@
 import { FinishReason, LLMEvent, ProviderMetadata, ToolResultValue } from "@opencode-ai/llm"
 import { Effect, Schema } from "effect"
-import { type streamText } from "ai"
+import { InvalidResponseDataError, type streamText } from "ai"
 import { errorMessage } from "@/util/error"
 import { ProviderError } from "@/provider/error"
 
@@ -16,6 +16,7 @@ export function adapterState() {
     currentReasoningID: undefined as string | undefined,
     toolNames: {} as Record<string, string>,
     copilotTotalNanoAiu: undefined as number | undefined,
+    missingFinishReason: false,
   }
 }
 
@@ -74,6 +75,12 @@ function currentReasoningID(state: ReturnType<typeof adapterState>, id: string |
   return state.currentReasoningID
 }
 
+function isMissingFinishReason(error: unknown) {
+  if (!error || typeof error !== "object") return false
+  if (!("message" in error) || error.message !== "Response stream ended without a finish reason.") return false
+  return InvalidResponseDataError.isInstance(error) || ("name" in error && error.name === "AI_InvalidResponseDataError")
+}
+
 export function toLLMEvents(
   state: ReturnType<typeof adapterState>,
   event: AISDKEvent,
@@ -104,7 +111,7 @@ export function toLLMEvents(
         return [
           LLMEvent.stepFinish({
             index: state.step++,
-            reason: finishReason(event.finishReason),
+            reason: state.missingFinishReason ? "unknown" : finishReason(event.finishReason),
             usage: usage(event.usage),
             providerMetadata: metadata,
           }),
@@ -115,7 +122,7 @@ export function toLLMEvents(
       return Effect.sync(() => {
         const events = [
           LLMEvent.finish({
-            reason: finishReason(event.finishReason),
+            reason: state.missingFinishReason ? "unknown" : finishReason(event.finishReason),
             usage: usage(event.totalUsage),
             providerMetadata: "providerMetadata" in event ? providerMetadata(event.providerMetadata) : undefined,
           }),
@@ -265,6 +272,11 @@ export function toLLMEvents(
       })
 
     case "error":
+      if (isMissingFinishReason(event.error))
+        return Effect.sync(() => {
+          state.missingFinishReason = true
+          return []
+        })
       return Effect.fail(event.error)
 
     case "abort":

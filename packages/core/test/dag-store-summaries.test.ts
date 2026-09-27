@@ -75,6 +75,7 @@ function seed() {
       node("wf-mixed", "p1", "pending", 5),
       node("wf-mixed", "s1", "skipped", 6),
       node("wf-mixed", "q1", "queued", 7),
+      node("wf-mixed", "a1", "aborted", 8),
     ]).run().pipe(Effect.orDie)
   })
 }
@@ -95,11 +96,12 @@ describe("DagStore.getWorkflowSummaries (SQL aggregation)", () => {
           title: "Mixed",
           status: "running",
           graphRev: 1,
-          nodeCount: 7,
+          nodeCount: 8,
           completedNodes: 2,
           runningNodes: 1,
           failedNodes: 1,
           skippedNodes: 1,
+          abortedNodes: 1,
           queuedNodes: 1,
           escalatedNodes: 0,
         })
@@ -113,6 +115,7 @@ describe("DagStore.getWorkflowSummaries (SQL aggregation)", () => {
           runningNodes: 0,
           failedNodes: 0,
           skippedNodes: 0,
+          abortedNodes: 0,
           queuedNodes: 0,
           escalatedNodes: 0,
         })

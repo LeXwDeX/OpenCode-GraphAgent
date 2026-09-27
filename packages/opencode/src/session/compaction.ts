@@ -15,7 +15,7 @@ import { Effect, Layer, Context } from "effect"
 import * as Option from "effect/Option"
 import * as DateTime from "effect/DateTime"
 import { InstanceState } from "@/effect/instance-state"
-import { isOverflow as overflow, usable } from "./overflow"
+import { isOverflow as overflow, measured, triggerLimit, usable } from "./overflow"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { EventV2Bridge } from "@/event-v2-bridge"
@@ -133,6 +133,8 @@ export interface Interface {
   readonly isOverflow: (input: {
     tokens: SessionV1.Assistant["tokens"]
     model: Provider.Model
+    estimatedInputTokens?: number
+    threshold?: "auto" | "model"
   }) => Effect.Effect<boolean>
   readonly process: (input: {
     parentID: MessageID
@@ -170,13 +172,29 @@ export const layer = Layer.effect(
     const isOverflow = Effect.fn("SessionCompaction.isOverflow")(function* (input: {
       tokens: SessionV1.Assistant["tokens"]
       model: Provider.Model
+      estimatedInputTokens?: number
+      threshold?: "auto" | "model"
     }) {
-      return overflow({
-        cfg: yield* config.get(),
+      const cfg = yield* config.get()
+      const request = {
+        cfg,
         tokens: input.tokens,
         model: input.model,
+        estimatedInputTokens: input.estimatedInputTokens,
+        threshold: input.threshold,
         outputTokenMax: flags.outputTokenMax,
-      })
+      }
+      const triggered = overflow(request)
+      if (triggered) {
+        yield* Effect.logInfo("automatic compaction threshold reached", {
+          modelUsableTokens: usable(request),
+          triggerTokens: triggerLimit(request),
+          measuredTokens: measured(input.tokens),
+          estimatedInputTokens: input.estimatedInputTokens,
+          thresholdMode: input.threshold ?? "auto",
+        })
+      }
+      return triggered
     })
 
     const estimate = Effect.fn("SessionCompaction.estimate")(function* (input: {

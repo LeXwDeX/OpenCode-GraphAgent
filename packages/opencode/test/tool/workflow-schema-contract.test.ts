@@ -52,7 +52,7 @@ describe("workflow tool schema contract", () => {
 
   test("the union survives intact inside the params property", () => {
     const transformed = ToolJsonSchema.fromSchema(Parameters as never) as JsonSchemaNode
-    expect(branches(transformed)).toHaveLength(12)
+    expect(branches(transformed)).toHaveLength(13)
     expect(transformed.properties?.params).toBeDefined()
     expect(transformed.required).toEqual(["params"])
   })

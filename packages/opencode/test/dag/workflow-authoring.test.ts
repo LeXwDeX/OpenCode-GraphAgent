@@ -311,3 +311,60 @@ describe("WorkflowAuthoring source-to-graph seam", () => {
     }),
   )
 })
+
+describe("WorkflowAuthoring replan envelope (P0-B)", () => {
+  const replanPrepare = (content: string[]) =>
+    WorkflowAuthoring.make().prepare({
+      action: "replan",
+      source: { kind: "yaml", source: "replan.yaml", content: content.join("\n") },
+      profile: "portable",
+    })
+
+  const nodeLines = [
+    "  - id: work",
+    "    name: work",
+    "    worker_type: general",
+    "    depends_on: []",
+    "    prompt_template: { inline: Do the work }",
+  ]
+
+  it.effect("audit #1: a top-level nodes graph reports the missing fragment envelope, not the union error", () =>
+    Effect.gen(function* () {
+      const result = yield* replanPrepare(["name: rebuild", "nodes:", ...nodeLines])
+      expect(result.valid).toBe(false)
+      const envelope = result.errors.find((error) => error.message.includes('missing required top-level key "fragment"'))
+      expect(envelope).toBeDefined()
+      expect(envelope?.code).toBe(DagValidation.DIAGNOSTIC_CODES.replanEnvelopeMissing)
+      expect(envelope?.path).toBe("$")
+      expect(envelope?.hint).toContain('Move "nodes" under "fragment".')
+      expect(result.errors.some((error) => error.hint.includes("blocks graphs need name+objective+blocks"))).toBe(false)
+    }),
+  )
+
+  it.effect('audit #2: a top-level config (start envelope) is told replan requires "fragment"', () =>
+    Effect.gen(function* () {
+      const result = yield* replanPrepare(["config:", "  name: rebuild", "  nodes:", ...nodeLines.map((line) => `  ${line}`)])
+      expect(result.valid).toBe(false)
+      const envelope = result.errors.find((error) => error.message.includes('missing required top-level key "fragment"'))
+      expect(envelope?.hint).toContain('"config" is the start envelope; replan requires "fragment".')
+    }),
+  )
+
+  it.effect("a top-level blocks graph is told to move name/objective/blocks under fragment", () =>
+    Effect.gen(function* () {
+      const result = yield* replanPrepare(["name: rebuild", "objective: Rebuild the thing.", "blocks:", "  - id: a", "    kind: coding"])
+      expect(result.valid).toBe(false)
+      const envelope = result.errors.find((error) => error.message.includes('missing required top-level key "fragment"'))
+      expect(envelope?.hint).toContain('Move "name", "objective", and "blocks" under "fragment".')
+    }),
+  )
+
+  it.effect("a correct fragment envelope is unaffected (no false positive)", () =>
+    Effect.gen(function* () {
+      const result = yield* replanPrepare(["fragment:", "  name: rebuild", "  nodes:", ...nodeLines])
+      expect(result.errors).toEqual([])
+      expect(result.valid).toBe(true)
+      expect(result.prepared?.nodes).toHaveLength(1)
+    }),
+  )
+})

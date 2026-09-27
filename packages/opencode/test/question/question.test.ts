@@ -37,6 +37,15 @@ const configured = testEffect(
     CrossSpawnSpawner.defaultLayer,
   ),
 )
+const longConfigured = testEffect(
+  Layer.mergeAll(
+    Question.layer.pipe(
+      Layer.provideMerge(EventV2Bridge.defaultLayer),
+      Layer.provide(Layer.mock(Config.Service, { get: () => Effect.succeed({ question_timeout: 600 }) })),
+    ),
+    CrossSpawnSpawner.defaultLayer,
+  ),
+)
 
 const askEffect = Effect.fn("QuestionTest.ask")(function* (input: {
   sessionID: SessionID
@@ -118,7 +127,7 @@ configured.effect(
 )
 
 it.effect(
-  "interact - permanently cancels the timeout for the whole request",
+  "interact - refreshes inactivity but times out an abandoned partial answer",
   Effect.gen(function* () {
     const question = yield* Question.Service
     const fiber = yield* askEffect({
@@ -127,11 +136,59 @@ it.effect(
     }).pipe(Effect.forkScoped)
     const pending = yield* waitForPending(1)
     yield* interactEffect(pending[0].id)
-    yield* interactEffect(pending[0].id)
     expect((yield* listEffect)[0]?.expiresAt).toBeUndefined()
-    yield* TestClock.adjust(Duration.hours(1))
-    yield* question.reply({ requestID: pending[0].id, answers: [["Continue"], ["Continue"]] })
-    expect(yield* Fiber.join(fiber)).toEqual([["Continue"], ["Continue"]])
+    yield* TestClock.adjust(Duration.seconds(59))
+    yield* interactEffect(pending[0].id)
+    yield* TestClock.adjust(Duration.seconds(59))
+    expect(yield* listEffect).toHaveLength(1)
+    yield* TestClock.adjust(Duration.seconds(1))
+    const exit = yield* Fiber.await(fiber)
+    expect(Exit.isFailure(exit)).toBe(true)
+    if (Exit.isFailure(exit)) expect(Cause.squash(exit.cause)).toBeInstanceOf(Question.TimedOutError)
+    expect(yield* listEffect).toEqual([])
+    expect(yield* question.reply({ requestID: pending[0].id, answers: [["Continue"]] }).pipe(Effect.flip)).toEqual(
+      new Question.NotFoundError({ requestID: pending[0].id }),
+    )
+  }).pipe(withTmpdirInstance({ git: true })),
+)
+
+it.effect(
+  "interact - caps the response phase despite continued activity",
+  Effect.gen(function* () {
+    const fiber = yield* askEffect({
+      sessionID: SessionID.make("ses_interaction_cap"),
+      questions: sample,
+    }).pipe(Effect.forkScoped)
+    const pending = yield* waitForPending(1)
+    yield* interactEffect(pending[0].id)
+    for (let interval = 0; interval < 9; interval++) {
+      yield* TestClock.adjust(Duration.seconds(30))
+      yield* interactEffect(pending[0].id)
+    }
+    yield* TestClock.adjust(Duration.seconds(30))
+    const exit = yield* Fiber.await(fiber)
+    expect(Exit.isFailure(exit)).toBe(true)
+    if (Exit.isFailure(exit)) expect(Cause.squash(exit.cause)).toBeInstanceOf(Question.TimedOutError)
+    expect(yield* listEffect).toEqual([])
+  }).pipe(withTmpdirInstance({ git: true })),
+)
+
+longConfigured.effect(
+  "interact - observes a response cap shorter than the configured timeout",
+  Effect.gen(function* () {
+    const fiber = yield* askEffect({
+      sessionID: SessionID.make("ses_shortened_interaction_cap"),
+      questions: sample,
+    }).pipe(Effect.forkScoped)
+    const pending = yield* waitForPending(1)
+    expect(pending[0]?.expiresAt).toBe(600_000)
+    yield* interactEffect(pending[0].id)
+    yield* TestClock.adjust(Duration.seconds(299))
+    expect(yield* listEffect).toHaveLength(1)
+    yield* TestClock.adjust(Duration.seconds(1))
+    const exit = yield* Fiber.await(fiber)
+    expect(Exit.isFailure(exit)).toBe(true)
+    expect(yield* listEffect).toEqual([])
   }).pipe(withTmpdirInstance({ git: true })),
 )
 

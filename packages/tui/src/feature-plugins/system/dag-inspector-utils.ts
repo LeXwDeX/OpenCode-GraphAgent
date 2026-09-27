@@ -122,16 +122,28 @@ export function dagNodeHistoryLabel(node: { replan_attempts: number | string }):
   return `restarted ×${attempts}`
 }
 
-/** Progress fraction counting completed+skipped as settled (P2-9): a skipped
- * node is a legitimate terminal outcome (condition gates), so a gated
- * workflow finishes at N/N instead of lying with a smaller numerator.
- * Accepts the SDK's Infinity/NaN string sentinels (coerced via Number). */
+/** Settled progress with a completed/skipped split (P1-E). A bare "8/8" reads
+ * as "8 succeeded" even when 7 were skipped — condition gates, or a cancelled
+ * workflow's never-run/aborted nodes (never-run nodes publish NodeSkipped;
+ * running or paused nodes cancelled by terminateNonTerminalNodes publish
+ * NodeAborted). The ✓ completed / ⊘ skipped split removes that false-success
+ * signal. The split is omitted when nothing has settled so the narrow inspector
+ * nav row keeps the workflow title (primary navigation) visible. Accepts the
+ * SDK's Infinity/NaN string sentinels (coerced via Number). */
 export function formatDagProgress(summary: {
   nodeCount: number | string
   completedNodes: number | string
   skippedNodes: number | string
+  abortedNodes?: number | string
 }): string {
-  return `${Number(summary.completedNodes) + Number(summary.skippedNodes)}/${Number(summary.nodeCount)}`
+  const total = Number(summary.nodeCount)
+  const completed = Number(summary.completedNodes)
+  const skipped = Number(summary.skippedNodes)
+  const aborted = Number(summary.abortedNodes ?? 0)
+  const settled = completed + skipped + aborted
+  return settled > 0
+    ? `${settled}/${total} ✓${completed} ⊘${skipped}${aborted > 0 ? ` ↯${aborted}` : ""}`
+    : `${settled}/${total}`
 }
 
 /** F10: timeout-pending indicator — running nodes past their deadline awaiting
@@ -165,7 +177,8 @@ export function dagStatusColor<Color>(
 export function dagNodeGlyph(status: string): string {
   if (status === "completed") return "✓"
   if (status === "failed") return "✗"
-  if (status === "skipped" || status === "cancelled" || status === "aborted") return "⊘"
+  if (status === "aborted") return "↯"
+  if (status === "skipped" || status === "cancelled") return "⊘"
   if (status === "queued") return "◌"
   return "○"
 }

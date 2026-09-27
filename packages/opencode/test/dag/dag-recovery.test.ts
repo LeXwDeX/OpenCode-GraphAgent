@@ -426,9 +426,10 @@ describe("rehydration via toSchedulingNodes", () => {
       ["paused", "pending"],
       ["completed", "satisfied"],
       ["failed", "unsatisfied"],
-      ["aborted", "satisfied"],
-      // D13: skipped stays distinguishable from satisfied so pure-skip
-      // descendants cascade-skip after rehydration instead of running.
+      // Aborted and skipped stay distinguishable from satisfied so pure-skip
+      // descendants cascade-skip after rehydration instead of running on a
+      // non-existent output.
+      ["aborted", "skipped"],
       ["skipped", "skipped"],
     ])
   })

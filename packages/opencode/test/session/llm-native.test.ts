@@ -590,7 +590,7 @@ describe("session.llm-native.request", () => {
           ]),
         generate: () => Effect.die("unused"),
       } as LLMClientShape
-      const native = LLMNativeRuntime.stream({
+      const native = yield* LLMNativeRuntime.stream({
         model: baseModel,
         provider: providerInfo,
         auth: undefined,
@@ -747,7 +747,7 @@ describe("session.llm-native.request", () => {
       ) satisfies typeof fetch
 
       const llmClient = yield* LLMClient.Service
-      const native = LLMNativeRuntime.stream({
+      const native = yield* LLMNativeRuntime.stream({
         model: baseModel,
         provider: { ...providerInfo, options: { apiKey: OAUTH_DUMMY_KEY, fetch: customFetch } },
         auth: { type: "oauth", refresh: "refresh", access: "access", expires: Date.now() + 60_000 },

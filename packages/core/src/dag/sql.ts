@@ -42,7 +42,7 @@ export const WorkflowTable = sqliteTable(
     status: text().notNull(),
     config: text().notNull(), // YAML string
     seq: integer().notNull(), // latest durable event seq
-    wake_reported: integer({ mode: "boolean" }).notNull().default(false), // D3: has workflow terminal been reported to parent?
+    wake_reported: integer({ mode: "boolean" }).notNull().default(false), // D3: terminal or paused reminder reported to parent for this status episode?
     // Rev-view (v1.0.15 Train A): the current graph-revision counter. Bumped
     // by the WorkflowReplanned projection; audit/telemetry only — the view
     // predicate is the per-node `superseded` marker below. Default 1: legacy

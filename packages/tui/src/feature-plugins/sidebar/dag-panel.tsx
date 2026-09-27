@@ -36,7 +36,7 @@ function WorkflowRow(props: {
   // graphRev (topology revision) participates so an equal-count replan still
   // changes the signature and triggers exactly one authoritative re-fetch.
   const signature = () =>
-    `${total()}:${completed()}:${running()}:${failed()}:${queued()}:${props.summary.graphRev}`
+    `${total()}:${completed()}:${running()}:${failed()}:${queued()}:${props.summary.skippedNodes}:${props.summary.abortedNodes ?? 0}:${props.summary.graphRev}`
 
   const fetchNodes = async (dagID: string, sig: string) => {
     try {

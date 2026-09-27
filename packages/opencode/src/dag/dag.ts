@@ -4,7 +4,7 @@
 export * as Dag from "./dag"
 
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { DateTime, Effect, Layer, Context, Schema, Option } from "effect"
+import { DateTime, Effect, Layer, Context, Schema, Option, Clock } from "effect"
 import { DagEvent } from "@opencode-ai/schema/dag-event"
 import { DagProjector } from "@opencode-ai/core/dag/projector"
 import { DagStore } from "@opencode-ai/core/dag/store"
@@ -58,6 +58,20 @@ export interface NodeExecutionAttempt {
   /** Admission-only config generation; running settlements intentionally omit it. */
   readonly graphRev?: number
 }
+
+/** Outcome of a dedicated `extend_timeout` control operation (P0-A). */
+export type ExtendTimeoutVerdict =
+  | { readonly status: "extended"; readonly deadlineMs: number }
+  /** Node missing, or no longer running (pending/queued/terminal). */
+  | { readonly status: "not_running" }
+  /** No formal escalation is awaiting adjudication, regardless of whether
+   * the deadline has already elapsed. */
+  | { readonly status: "no_escalation" }
+  /** Q2 delivery gate: a pending escalation has not been delivered to the parent
+   * yet; adjudication must follow delivery. Node stays running. */
+  | { readonly status: "escalation_undelivered" }
+  /** The cumulative escalation count has reached this workflow's cap. */
+  | { readonly status: "cap_exhausted" }
 
 export const DEFAULT_WORKFLOW_CONFIG = {
   maxConcurrency: 5,
@@ -307,6 +321,7 @@ export interface Interface {
   readonly nodeRestarted: (dagID: string, nodeID: string, childSessionID: string) => Effect.Effect<void, Error>
   readonly nodeTimeoutEscalated: (dagID: string, nodeID: string, childSessionID: string, timeoutExtensions: number, staleDeadlineMs?: number | null, attempt?: NodeExecutionAttempt) => Effect.Effect<void, Error>
   readonly nodeExtendTimeout: (dagID: string, nodeID: string, newDeadlineMs: number, attempt?: NodeExecutionAttempt) => Effect.Effect<number, Error>
+  readonly extendTimeout: (dagID: string, nodeID: string, timeoutMs: number) => Effect.Effect<ExtendTimeoutVerdict, Error>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Dag") {}
@@ -553,9 +568,9 @@ export const layer = Layer.effect(
       return { status: "stepping" as const, nodeID }
     })
     // Publish terminal node events for any non-terminal nodes so the read
-    // model stays consistent after workflow termination.  Running nodes get
-    // NodeFailed (or NodeSkipped when failRunning=false); pending/queued
-    // nodes always get NodeSkipped.  The projector's status guards make this
+    // model stays consistent after workflow termination. Running nodes get
+    // NodeFailed when the workflow fails, otherwise a distinct NodeAborted;
+    // pending/queued nodes get NodeSkipped. The projector's status guards make this
     // safe against races — a node that transitioned between the read and the
     // publish is silently left at its current status.
     const terminateNonTerminalNodes = Effect.fnUntraced(function* (lock: WorkflowLock, dagID: string, skipReason: "agent_complete" | "workflow_cancelled" | "workflow_failed", failReason: string, failRunning: boolean) {
@@ -569,6 +584,13 @@ export const layer = Layer.effect(
             nodeID: node.id as never,
             reason: failReason,
             trigger: "exec_failed" as never,
+            timestamp: ts,
+          })
+        } else if (node.status === "running" || node.status === "paused") {
+          yield* events.publish(DagEvent.NodeAborted, {
+            dagID: ID.make(dagID),
+            nodeID: NodeID.make(node.id),
+            reason: skipReason,
             timestamp: ts,
           })
         } else {
@@ -1109,7 +1131,7 @@ export const layer = Layer.effect(
     // it directly, NOT via the publish chain, whose projector return value is
     // discarded). NodeDeadlineExtended is only appended on success, so it is the
     // success log; the projector does a pure idempotent fold. The contract is
-    // THREE-VALUED so the two rejection reasons stay distinguishable (C1):
+    // FOUR-VALUED so the rejection reasons stay distinguishable (C1):
     //   1  = success (deadline written, NodeDeadlineExtended appended)
     //   0  = TERMINAL rejection (node not running / missing — caller drops the
     //        stale watcher; the node is done)
@@ -1117,11 +1139,17 @@ export const layer = Layer.effect(
     //        wake is undelivered — caller MUST keep supervision; killing the
     //        watcher here would orphan a running node and defeat the cap
     //        backstop, violating N1)
+    //  -3  = cumulative timeout-extension cap exhausted; the watcher still
+    //        owns the running node and enforces the terminal timeout verdict
     // The single caller (loop.ts WorkflowReplanned handler) branches on this:
     // < 0 keeps the watcher (covers -2 here and -1 write-failure mapped by the
-    // caller's catchCause), === 0 clears it. The only typed-error channel
-    // beyond this explicit 1/0/-2 is withWorkflowLock (getNode/publish orDie
-    // their work).
+    // caller's catchCause), === 0 clears it. Dag.extendTimeout (the dedicated
+    // parent-facing re-time command below) is the second caller: it maps 1 →
+    // extended, -2 → escalation_undelivered, -3 → cap_exhausted,
+    // 0 → not_running, and needs no
+    // watcher swap (the self-healing watcher re-reads the moved deadline). The
+    // only typed-error channel beyond this explicit 1/0/-2 is withWorkflowLock
+    // (getNode/publish orDie their work).
     const nodeExtendTimeout = Effect.fn("Dag.nodeExtendTimeout")(function* (lock: WorkflowLock, dagID: string, nodeID: string, newDeadlineMs: number, attempt?: NodeExecutionAttempt) {
       const node = yield* store.getNode(dagID, nodeID).pipe(Effect.orDie)
       // running-guard: a node that terminalized between the caller's read and
@@ -1136,8 +1164,16 @@ export const layer = Layer.effect(
       // has not seen. Defense in depth — the primary gate is loop.ts:800, but
       // the command stays self-protecting so a future caller cannot bypass it.
       // Returns -2 (NOT 0): the node is still running, so the caller must keep
-      // its watcher (N1). See the three-valued contract above.
+      // its watcher (N1). See the four-valued contract above.
       if (node.escalationPending && !node.wakeReported) return -2
+      // The watcher enforces the same cap on its next deadline read. Reject
+      // re-timing here under the workflow lock as well: otherwise a delivered
+      // escalation at the cap can be moved up to 24 hours into the future.
+      const workflow = yield* store.getWorkflow(dagID).pipe(Effect.orDie)
+      if (!workflow) return 0
+      const maxExtensions = parseWorkflowConfig(workflow.config)?.max_timeout_extensions
+        ?? DEFAULT_WORKFLOW_CONFIG.maxTimeoutExtensions
+      if (node.timeoutExtensions >= maxExtensions) return -3
       yield* events.publish(DagEvent.NodeDeadlineExtended, {
         dagID: dagID as ID,
         nodeID: nodeID as never,
@@ -1146,6 +1182,38 @@ export const layer = Layer.effect(
         timestamp: yield* DateTime.now,
       })
       return 1
+    })
+
+    // P0-A: dedicated parent-facing timeout extension. Grants an escalated
+    // RUNNING node more time WITHOUT a full graph replan — the incident chain
+    // this replaces forced the parent to resubmit the entire fragment (an
+    // envelope-error trap) just to change one number, and a rejected replan then
+    // drove a whole-workflow cancel. Reuses the exact durable path the replan
+    // re-time uses (nodeExtendTimeout → NodeDeadlineExtended, with its Q2
+    // delivery gate and cumulative cap). A formal escalation must be pending
+    // and delivered before this command can extend the deadline; an elapsed
+    // clock alone is not an adjudication token.
+    // Does NOT bump replanAttempts, restart the agent, or touch the graph; the
+    // self-healing deadline watcher (spawn.ts) re-reads the moved deadline on its
+    // next wake, so supervision is never absent and no watcher swap is needed.
+    const extendTimeout = Effect.fn("Dag.extendTimeout")(function* (lock: WorkflowLock, dagID: string, nodeID: string, timeoutMs: number) {
+      const node = yield* store.getNode(dagID, nodeID).pipe(Effect.orDie)
+      if (!node || node.status !== "running") return { status: "not_running" as const }
+      if (!node.escalationPending) return { status: "no_escalation" as const }
+      if (!node.wakeReported) return { status: "escalation_undelivered" as const }
+      const now = yield* Clock.currentTimeMillis
+      const deadlineMs = now + timeoutMs
+      const written = yield* nodeExtendTimeout(lock, dagID, nodeID, deadlineMs, {
+        replanAttempts: node.replanAttempts,
+        ...(node.childSessionId ? { childSessionID: node.childSessionId } : {}),
+      })
+      if (written === 1) return { status: "extended" as const, deadlineMs }
+      // -2 = Q2 delivery-gate rejection (escalation wake undelivered, node still
+      // running); 0 = the node is not running (pending/queued/terminal). Neither
+      // grants an extension.
+      if (written === -2) return { status: "escalation_undelivered" as const }
+      if (written === -3) return { status: "cap_exhausted" as const }
+      return { status: "not_running" as const }
     })
 
     return Service.of({
@@ -1173,6 +1241,7 @@ export const layer = Layer.effect(
       nodeTimeoutEscalated: (dagID, nodeID, childSessionID, timeoutExtensions, staleDeadlineMs, attempt) =>
         withWorkflowLock(dagID)((lock) => nodeTimeoutEscalated(lock, dagID, nodeID, childSessionID, timeoutExtensions, staleDeadlineMs, attempt)),
       nodeExtendTimeout: (dagID, nodeID, newDeadlineMs, attempt) => withWorkflowLock(dagID)((lock) => nodeExtendTimeout(lock, dagID, nodeID, newDeadlineMs, attempt)),
+      extendTimeout: (dagID, nodeID, timeoutMs) => withWorkflowLock(dagID)((lock) => extendTimeout(lock, dagID, nodeID, timeoutMs)),
     })
   }),
 )

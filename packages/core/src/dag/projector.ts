@@ -34,6 +34,7 @@ export const NodeStatusProjection = {
   completed: { to: "completed", from: ["running"] },
   failed: { to: "failed", from: ["running", "pending", "queued"] },
   skipped: { to: "skipped", from: ["pending", "queued", "running", "paused"] },
+  aborted: { to: "aborted", from: ["running", "paused"] },
   // NodeCancelled has NO independent terminal status — the NodeStatus enum has
   // no CANCELLED and getValidNextNodeStatuses never returns it. A cancelled
   // node lands on `failed` with the cancellation carried by `error_reason`
@@ -123,7 +124,21 @@ export const layer = Layer.effectDiscard(
         .pipe(Effect.orDie),
     )
 
-    yield* events.project(DagEvent.WorkflowPaused, setWorkflowStatus(ws("paused"), [...WorkflowStatusProjection.paused.from]))
+    yield* events.project(DagEvent.WorkflowPaused, (event) =>
+      db
+        .update(WorkflowTable)
+        .set({
+          status: "paused",
+          seq: event.durable!.seq,
+          time_updated: toMillis(event.data.timestamp),
+          // One bounded reminder is available for each pause episode. Its
+          // delivery is acknowledged through the existing wake batch marker.
+          wake_reported: false,
+        })
+        .where(and(eq(WorkflowTable.id, event.data.dagID), inArray(WorkflowTable.status, [...WorkflowStatusProjection.paused.from])))
+        .run()
+        .pipe(Effect.orDie),
+    )
     yield* events.project(DagEvent.WorkflowResumed, setWorkflowStatus(ws("running"), [...WorkflowStatusProjection.resumed.from]))
     yield* events.project(DagEvent.WorkflowStepped, setWorkflowStatus(ws("stepping"), [...WorkflowStatusProjection.stepped.from]))
 
@@ -396,6 +411,25 @@ export const layer = Layer.effectDiscard(
           eq(WorkflowNodeTable.workflow_id, event.data.dagID),
           eq(WorkflowNodeTable.id, event.data.nodeID),
           inArray(WorkflowNodeTable.status, [...NodeStatusProjection.skipped.from]),
+        ))
+        .run()
+        .pipe(Effect.orDie),
+    )
+
+    yield* events.project(DagEvent.NodeAborted, (event) =>
+      db
+        .update(WorkflowNodeTable)
+        .set({
+          status: "aborted",
+          error_reason: event.data.reason,
+          escalation_pending: false,
+          seq: event.durable!.seq,
+          time_updated: toMillis(event.data.timestamp),
+        })
+        .where(and(
+          eq(WorkflowNodeTable.workflow_id, event.data.dagID),
+          eq(WorkflowNodeTable.id, event.data.nodeID),
+          inArray(WorkflowNodeTable.status, [...NodeStatusProjection.aborted.from]),
         ))
         .run()
         .pipe(Effect.orDie),

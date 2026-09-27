@@ -1,8 +1,8 @@
 /** @jsxImportSource @opentui/solid */
-import { useTerminalDimensions, type JSX } from "@opentui/solid"
+import { useTerminalDimensions } from "@opentui/solid"
 import { useBindings, useKeymapSelector } from "@opentui/keymap/solid"
-import { RGBA, VignetteEffect, type KeyEvent, type Renderable } from "@opentui/core"
-import { createBindingLookup, type BindingConfig } from "@opentui/keymap/extras"
+import { RGBA, VignetteEffect } from "@opentui/core"
+import { createBindingLookup } from "@opentui/keymap/extras"
 import type { TuiPlugin, TuiPluginApi, TuiPluginMeta, TuiPluginModule, TuiSlotPlugin } from "@opencode-ai/plugin/tui"
 
 const tabs = ["overview", "counter", "help"]
@@ -35,7 +35,7 @@ const command = {
   modal_close: "smoke_modal_close",
 }
 
-type SmokeBindings = BindingConfig<Renderable, KeyEvent>
+type SmokeBindings = Record<string, unknown>
 
 const defaultKeymap = {
   [command.modal]: "ctrl+shift+m",
@@ -124,7 +124,7 @@ const ui = {
   accent: "#5f87ff",
 }
 
-type Color = RGBA | string
+type Color = unknown
 
 const ink = (map: Record<string, unknown>, name: string, fallback: string): Color => {
   const value = map[name]
@@ -149,11 +149,11 @@ const tone = (api: TuiPluginApi) => {
 }
 
 type Skin = {
-  panel: Color
-  border: Color
-  text: Color
-  muted: Color
-  accent: Color
+  panel: unknown
+  border: unknown
+  text: unknown
+  muted: unknown
+  accent: unknown
   selected: Color
 }
 

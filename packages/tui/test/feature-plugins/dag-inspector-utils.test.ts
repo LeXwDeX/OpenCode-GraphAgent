@@ -138,6 +138,7 @@ describe("shared status presentation", () => {
     expect(dagNodeGlyph("completed")).toBe("✓")
     expect(dagNodeGlyph("failed")).toBe("✗")
     expect(dagNodeGlyph("skipped")).toBe("⊘")
+    expect(dagNodeGlyph("aborted")).toBe("↯")
     expect(dagNodeGlyph("queued")).toBe("◌")
     expect(dagNodeGlyph("pending")).toBe("○")
   })
@@ -174,9 +175,13 @@ describe("node detail formatting", () => {
     expect(dagNodeHistoryLabel({ replan_attempts: 3 })).toBe("restarted ×3")
   })
 
-  test("progress counts completed+skipped as settled (P2-9)", () => {
-    expect(formatDagProgress({ nodeCount: 9, completedNodes: 3, skippedNodes: 4 })).toBe("7/9")
+  test("progress splits settled into completed/skipped so a skipped majority is not a false success (P1-E)", () => {
+    expect(formatDagProgress({ nodeCount: 9, completedNodes: 3, skippedNodes: 4 })).toBe("7/9 ✓3 ⊘4")
     expect(formatDagProgress({ nodeCount: 2, completedNodes: 0, skippedNodes: 0 })).toBe("0/2")
+    // audit #8 — the incident shape: a cancelled workflow's 1 completed + 7
+    // skipped must NOT read as a bare "8/8" success; the ✓/⊘ split exposes it.
+    expect(formatDagProgress({ nodeCount: 8, completedNodes: 1, skippedNodes: 7 })).toBe("8/8 ✓1 ⊘7")
+    expect(formatDagProgress({ nodeCount: 8, completedNodes: 1, skippedNodes: 6, abortedNodes: 1 })).toBe("8/8 ✓1 ⊘6 ↯1")
   })
 })
 

@@ -58,6 +58,11 @@ type StreamInput = {
     readonly history?: ContextFoldingHistorySnapshot
     readonly system: SystemTransmission
   }
+  readonly reasoningDistillation?: (input: {
+    readonly request: LLMRequest
+    readonly sourceMessages: readonly ModelMessage[]
+    readonly transformedMessages: readonly ModelMessage[]
+  }) => Effect.Effect<LLMRequest, never>
 }
 
 export function status(input: Pick<StreamInput, "model" | "provider" | "auth">): RuntimeStatus {
@@ -88,124 +93,133 @@ function statusWithFetch(
   }
 }
 
-export function stream(input: StreamInput): StreamResult {
-  const fetch = providerFetch(input)
-  const current = statusWithFetch(input, fetch)
-  if (current.type === "unsupported") return current
+export function stream(input: StreamInput): Effect.Effect<StreamResult, never> {
+  return Effect.gen(function* () {
+    const fetch = providerFetch(input)
+    const current = statusWithFetch(input, fetch)
+    if (current.type === "unsupported") return current
 
-  // Integration point with @opencode-ai/llm: native-request lowers session data
-  // into an LLMRequest, then LLMClient handles route selection and transport.
-  //
-  // ProviderTransform.providerOptions builds AI-SDK-shaped options for the
-  // selected SDK key (e.g. "openai") and the native LLM SDK reads the same
-  // keys via OpenAIOptions.* (store, reasoningEffort, reasoningSummary,
-  // include, textVerbosity, promptCacheKey). Both sides intentionally use
-  // OpenAI's official wire field names, so this is identity, not translation
-  // — if a field ever needs to differ between the two surfaces, the
-  // translation belongs here, not split across both packages.
-  const tools = nativeTools(input.tools, input)
-  const sourceMessages = ContextFolding.copyModelMessages(input.messages)
-  const transformInput = ContextFolding.copyModelMessages(input.messages) ?? input.messages
-  const transformedMessages = ProviderTransform.message(transformInput, input.model, input.providerOptions ?? {})
-  const canonical = LLMNative.request({
-    model: input.model,
-    apiKey: current.apiKey,
-    baseURL: current.baseURL,
-    messages: transformedMessages,
-    toolChoice: input.toolChoice,
-    temperature: input.temperature,
-    topP: input.topP,
-    topK: input.topK,
-    maxOutputTokens: input.maxOutputTokens,
-    providerOptions: ProviderTransform.providerOptions(input.model, input.providerOptions ?? {}),
-    headers: { ...providerHeaders(input.provider.options.headers), ...input.headers },
-  })
-  const folding = input.contextFolding
-  const snapshot =
-    folding?.enabled && folding.history && folding.purpose === "conversation" && sourceMessages
-      ? ContextFolding.bindModelMessages(folding.history, sourceMessages)
-      : undefined
-  const projection =
-    folding?.enabled && snapshot && folding.purpose === "conversation"
-      ? ContextFolding.projectNative({
-          model: input.model,
-          purpose: folding.purpose,
-          snapshot,
-          request: canonical,
-          transformedMessages,
-          sourceMessages: sourceMessages ?? [],
-          messageTransformOptions: input.providerOptions ?? {},
-          tools: input.tools,
-          toolChoice: input.toolChoice,
-          maxOutputTokens: input.maxOutputTokens,
-          params: {
-            temperature: input.temperature,
-            topP: input.topP,
-            topK: input.topK,
+    // Integration point with @opencode-ai/llm: native-request lowers session data
+    // into an LLMRequest, then LLMClient handles route selection and transport.
+    //
+    // ProviderTransform.providerOptions builds AI-SDK-shaped options for the
+    // selected SDK key (e.g. "openai") and the native LLM SDK reads the same
+    // keys via OpenAIOptions.* (store, reasoningEffort, reasoningSummary,
+    // include, textVerbosity, promptCacheKey). Both sides intentionally use
+    // OpenAI's official wire field names, so this is identity, not translation
+    // — if a field ever needs to differ between the two surfaces, the
+    // translation belongs here, not split across both packages.
+    const tools = nativeTools(input.tools, input)
+    const sourceMessages = ContextFolding.copyModelMessages(input.messages)
+    const transformInput = ContextFolding.copyModelMessages(input.messages) ?? input.messages
+    const transformedMessages = ProviderTransform.message(transformInput, input.model, input.providerOptions ?? {})
+    const canonical = LLMNative.request({
+      model: input.model,
+      apiKey: current.apiKey,
+      baseURL: current.baseURL,
+      messages: transformedMessages,
+      toolChoice: input.toolChoice,
+      temperature: input.temperature,
+      topP: input.topP,
+      topK: input.topK,
+      maxOutputTokens: input.maxOutputTokens,
+      providerOptions: ProviderTransform.providerOptions(input.model, input.providerOptions ?? {}),
+      headers: { ...providerHeaders(input.provider.options.headers), ...input.headers },
+    })
+    const folding = input.contextFolding
+    const snapshot =
+      folding?.enabled && folding.history && folding.purpose === "conversation" && sourceMessages
+        ? ContextFolding.bindModelMessages(folding.history, sourceMessages)
+        : undefined
+    const projection =
+      folding?.enabled && snapshot && folding.purpose === "conversation"
+        ? ContextFolding.projectNative({
+            model: input.model,
+            purpose: folding.purpose,
+            snapshot,
+            request: canonical,
+            transformedMessages,
+            sourceMessages: sourceMessages ?? [],
+            messageTransformOptions: input.providerOptions ?? {},
+            tools: input.tools,
+            toolChoice: input.toolChoice,
             maxOutputTokens: input.maxOutputTokens,
-            providerOptions: input.providerOptions,
-          },
-          system: folding.system,
+            params: {
+              temperature: input.temperature,
+              topP: input.topP,
+              topK: input.topK,
+              maxOutputTokens: input.maxOutputTokens,
+              providerOptions: input.providerOptions,
+            },
+            system: folding.system,
+          })
+        : undefined
+    const foldedRequest =
+      projection?.applied === true
+        ? LLMRequest.update(canonical, { messages: projection.request.messages as typeof canonical.messages })
+        : canonical
+    const request = input.reasoningDistillation
+      ? yield* input.reasoningDistillation({
+          request: foldedRequest,
+          sourceMessages: sourceMessages ?? [],
+          transformedMessages,
         })
-      : undefined
-  const request =
-    projection?.applied === true
-      ? LLMRequest.update(canonical, { messages: projection.request.messages as typeof canonical.messages })
-      : canonical
-  const stream = Stream.scoped(
-    Stream.unwrap(
-      Effect.gen(function* () {
-        const settlements = yield* FiberSet.make<void>()
-        const results = yield* Queue.unbounded<LLMEvent, Cause.Done>()
-        const completion: LLMEvent[] = []
-        const provider = input.llmClient
-          .stream(
-            LLMRequest.update(request, {
-              tools: [...request.tools, ...toDefinitions(tools)],
-            }),
-          )
-          .pipe(
-            Stream.flatMap((event) => {
-              // The processor may close the stream for compaction at step-finish.
-              // Deliver every local settlement before exposing that boundary.
-              if (event.type === "step-finish" || event.type === "finish") {
-                completion.push(event)
-                return Stream.empty
-              }
-              return event.type !== "tool-call" || event.providerExecuted
-                ? Stream.make(event)
-                : Stream.make(event).pipe(
-                    Stream.concat(
-                      Stream.fromEffectDrain(
-                        ToolRuntime.dispatch(tools, event).pipe(
-                          Effect.flatMap((dispatched) => Queue.offerAll(results, dispatched.events)),
-                          Effect.catchCause((cause) => Queue.failCause(results, cause)),
-                          Effect.asVoid,
-                          FiberSet.run(settlements, { startImmediately: true }),
+      : foldedRequest
+    const stream = Stream.scoped(
+      Stream.unwrap(
+        Effect.gen(function* () {
+          const settlements = yield* FiberSet.make<void>()
+          const results = yield* Queue.unbounded<LLMEvent, Cause.Done>()
+          const completion: LLMEvent[] = []
+          const provider = input.llmClient
+            .stream(
+              LLMRequest.update(request, {
+                tools: [...request.tools, ...toDefinitions(tools)],
+              }),
+            )
+            .pipe(
+              Stream.flatMap((event) => {
+                // The processor may close the stream for compaction at step-finish.
+                // Deliver every local settlement before exposing that boundary.
+                if (event.type === "step-finish" || event.type === "finish") {
+                  completion.push(event)
+                  return Stream.empty
+                }
+                return event.type !== "tool-call" || event.providerExecuted
+                  ? Stream.make(event)
+                  : Stream.make(event).pipe(
+                      Stream.concat(
+                        Stream.fromEffectDrain(
+                          ToolRuntime.dispatch(tools, event).pipe(
+                            Effect.flatMap((dispatched) => Queue.offerAll(results, dispatched.events)),
+                            Effect.catchCause((cause) => Queue.failCause(results, cause)),
+                            Effect.asVoid,
+                            FiberSet.run(settlements, { startImmediately: true }),
+                          ),
                         ),
                       ),
-                    ),
-                  )
-            }),
-            Stream.concat(
-              Stream.fromEffectDrain(
-                FiberSet.awaitEmpty(settlements).pipe(Effect.andThen(Queue.end(results)), Effect.asVoid),
+                    )
+              }),
+              Stream.concat(
+                Stream.fromEffectDrain(
+                  FiberSet.awaitEmpty(settlements).pipe(Effect.andThen(Queue.end(results)), Effect.asVoid),
+                ),
               ),
-            ),
+            )
+          return provider.pipe(
+            Stream.concat(Stream.fromQueue(results)),
+            Stream.concat(Stream.suspend(() => Stream.fromIterable(completion))),
           )
-        return provider.pipe(
-          Stream.concat(Stream.fromQueue(results)),
-          Stream.concat(Stream.suspend(() => Stream.fromIterable(completion))),
-        )
-      }),
-    ),
-  )
+        }),
+      ),
+    )
 
-  return {
-    ...current,
-    contextFoldingPlan: projection?.plan,
-    stream: fetch ? stream.pipe(Stream.provideService(FetchHttpClient.Fetch, fetch)) : stream,
-  }
+    return {
+      ...current,
+      contextFoldingPlan: projection?.plan,
+      stream: fetch ? stream.pipe(Stream.provideService(FetchHttpClient.Fetch, fetch)) : stream,
+    }
+  })
 }
 
 function providerFetch(input: Pick<StreamInput, "provider" | "auth">): typeof globalThis.fetch | undefined {

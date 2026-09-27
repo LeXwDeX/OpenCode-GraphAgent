@@ -209,6 +209,11 @@ function decodeAction(action: Action, value: unknown, source: string, profile: D
     if (decoded._tag === "Success") return { value: { action, spec: decoded.success } } as const
     return { result: invalidResult(source, profile, DagValidation.schemaDiagnostics(decoded.failure)) }
   }
+  // Replan-only tail (start/extend returned above). Guard the envelope BEFORE
+  // the union decode so a missing top-level `fragment` reports the real mistake
+  // instead of the misleading "blocks/nodes graph" union error.
+  const envelope = DagValidation.replanEnvelopeDiagnostic(value)
+  if (envelope) return { result: invalidResult(source, profile, [envelope]) }
   const decoded = Schema.decodeUnknownResult(DagValidation.ReplanSpec, options)(value)
   if (decoded._tag === "Success") return { value: { action, spec: decoded.success } } as const
   return { result: invalidResult(source, profile, DagValidation.schemaDiagnostics(decoded.failure)) }

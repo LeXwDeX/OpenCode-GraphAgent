@@ -26,11 +26,13 @@ Workflow Orchestration turns one user objective into one durable DAG. Its model-
 - Workflow Authoring Check is the only raw source-to-Prepared Workflow Graph authority used by tool actions, CLI, generation, and packaging.
 - Parsing, file-only compatibility, strict action decoding, Block compilation, and profile diagnostics are not reimplemented by callers.
 - `portable` validation does not load user environment catalogs. `environment` validation reads current catalogs and verifies actual model availability.
-- No workflow event or durable mutation occurs before a valid Prepared Workflow Graph exists.
+- Workflow graph creation or replacement requires a valid Prepared Workflow Graph. A rejected live mutation may still publish durable `WorkflowPaused` to park the existing graph.
 - The model-facing schema contains fields the model owns. Session/Project identity, admission audit state, model assignment, and other runtime-derived fields remain hidden.
 - Model-facing graph actions expose only `spec_path`; graph fields live in YAML so provider tool-call serialization cannot turn a nested graph into a string.
 - Legacy YAML may be adapted at the file boundary without making legacy fields valid inline input.
 - Runtime Admission and Workflow Authoring Check have separate names, state, and responsibilities.
+- A rejected live replan or extend parks the workflow by publishing durable `WorkflowPaused` before returning diagnostics. If that pause fails or races with a terminal transition, the tool reports the actual durable status; callers must not assume the graph is parked.
+- A paused workflow gets one durable, delayed reminder per pause episode through the wake marker. A reminder never resumes, completes, or fails the workflow.
 - Dependents of a reporting checkpoint must be gated on its output; authoring rejects ungated shapes at start/validate AND at replan/extend fragment actions, and the runtime replan/extend mutation seam re-checks the merged graph (exempting checkpoints already terminal in the durable graph — they are settled and immutable, the spawn-before-verdict race is past; runtime create remains deliberately unchanged). A gated checkpoint must declare `output_schema` (authoring obligation).
 
 ## Conventions

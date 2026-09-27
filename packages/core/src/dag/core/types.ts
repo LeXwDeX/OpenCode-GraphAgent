@@ -152,13 +152,21 @@ export class StateNotPersistedError extends DagCoreError {
 // ============================================================================
 
 /** Iron law #2: terminal statuses are irreversible. */
+const WORKFLOW_TERMINAL_STATUS_VALUES: ReadonlySet<string> = new Set([
+  WorkflowStatus.COMPLETED,
+  WorkflowStatus.FAILED,
+  WorkflowStatus.CANCELLED,
+  WorkflowStatus.ARCHIVED,
+])
+
+/** Terminal-status predicate for durable rows, whose status field is a string. */
+export function isTerminalWorkflowStatusValue(status: string): boolean {
+  return WORKFLOW_TERMINAL_STATUS_VALUES.has(status)
+}
+
+/** Iron law #2: terminal statuses are irreversible. */
 export function isWorkflowTerminalStatus(status: WorkflowStatus): boolean {
-  return (
-    status === WorkflowStatus.COMPLETED ||
-    status === WorkflowStatus.FAILED ||
-    status === WorkflowStatus.CANCELLED ||
-    status === WorkflowStatus.ARCHIVED
-  )
+  return isTerminalWorkflowStatusValue(status)
 }
 
 /** Iron law #2: terminal statuses are irreversible. */
@@ -198,9 +206,9 @@ export function getValidNextNodeStatuses(currentStatus: NodeStatus): NodeStatus[
       // queue-wait timeout (the deadline keeps running while queued, P0-2).
       return [NodeStatus.QUEUED, NodeStatus.RUNNING, NodeStatus.PENDING, NodeStatus.SKIPPED, NodeStatus.FAILED]
     case NodeStatus.RUNNING:
-      return [NodeStatus.COMPLETED, NodeStatus.FAILED, NodeStatus.PAUSED, NodeStatus.PENDING, NodeStatus.SKIPPED]
+      return [NodeStatus.COMPLETED, NodeStatus.FAILED, NodeStatus.ABORTED, NodeStatus.PAUSED, NodeStatus.PENDING, NodeStatus.SKIPPED]
     case NodeStatus.PAUSED:
-      return [NodeStatus.RUNNING, NodeStatus.SKIPPED, NodeStatus.FAILED]
+      return [NodeStatus.RUNNING, NodeStatus.ABORTED, NodeStatus.SKIPPED, NodeStatus.FAILED]
     case NodeStatus.COMPLETED:
     case NodeStatus.FAILED:
     case NodeStatus.ABORTED:

@@ -253,14 +253,14 @@ const store = Layer.mock(DagStore.Service, {
               timeCreated: 1,
               timeUpdated: 2,
             }
-          : id === "dag_paused" || id === "dag_step"
+          : id === "dag_paused" || id === "dag_step" || id === "dag_completed" || id === "dag_pause_failure" || id === "dag_runtime_failure" || id === "dag_runtime_extend_failure"
             ? {
                 id,
                 projectId: projectID,
                 sessionId: "ses_workflow_parent",
                 title: "Control workflow",
             directory: null,
-                status: id === "dag_paused" ? "paused" : "running",
+                status: id === "dag_paused" ? "paused" : id === "dag_completed" ? "completed" : "running",
                 config: mockWorkflowConfig(id),
                 seq: 1,
                 wakeReported: false,
@@ -338,11 +338,19 @@ const store = Layer.mock(DagStore.Service, {
 })
 const events = Layer.mock(EventV2Bridge.Service, {
   publishMany: (entries) => Effect.sync(() => {
+    if (entries.some((entry) => entry.definition.type === DagEvent.WorkflowReplanned.type
+      && typeof entry.data === "object" && entry.data !== null
+      && "dagID" in entry.data
+      && (entry.data.dagID === "dag_runtime_failure" || entry.data.dagID === "dag_runtime_extend_failure")))
+      throw new Error("simulated runtime batch write failure")
     for (const entry of entries) published.push({ type: entry.definition.type, data: entry.data })
     return []
   }),
   publish: (definition, data) =>
     Effect.sync(() => {
+      if (definition.type === DagEvent.WorkflowPaused.type && typeof data === "object" && data !== null &&
+        "dagID" in data && data.dagID === "dag_pause_failure")
+        throw new Error("simulated durable pause write failure")
       published.push({ type: definition.type, data })
       return { id: "event_test", type: definition.type, data } as never
     }),
@@ -640,6 +648,20 @@ describe("workflow tool schema (negative tests)", () => {
     const decode = Schema.decodeUnknownSync(Parameters)
     expect(() => decode({ params: { action: "control", workflow_id: "dag_wf_1", operation: "delete" }})).toThrow()
     expect(() => decode({ params: { action: "control", workflow_id: "dag_wf_1", operation: "start" }})).toThrow()
+  })
+
+  it("control extend_timeout requires node_id and a positive timeout_ms (P0-A)", () => {
+    const decode = Schema.decodeUnknownSync(Parameters, { onExcessProperty: "error" })
+    expect(() =>
+      decode({ params: { action: "control", workflow_id: "dag_wf_1", operation: "extend_timeout", node_id: "n1", timeout_ms: 60_000 }}),
+    ).not.toThrow()
+    expect(() => decode({ params: { action: "control", workflow_id: "dag_wf_1", operation: "extend_timeout", timeout_ms: 60_000 }})).toThrow()
+    expect(() => decode({ params: { action: "control", workflow_id: "dag_wf_1", operation: "extend_timeout", node_id: "n1" }})).toThrow()
+    expect(() => decode({ params: { action: "control", workflow_id: "dag_wf_1", operation: "extend_timeout", node_id: "n1", timeout_ms: 0 }})).toThrow()
+    // Bounds: sub-second extensions (which would instantly re-escalate) and
+    // >24h grants are rejected at the schema boundary.
+    expect(() => decode({ params: { action: "control", workflow_id: "dag_wf_1", operation: "extend_timeout", node_id: "n1", timeout_ms: 999 }})).toThrow()
+    expect(() => decode({ params: { action: "control", workflow_id: "dag_wf_1", operation: "extend_timeout", node_id: "n1", timeout_ms: 86_400_001 }})).toThrow()
   })
 
   it("keeps workflow graph and admission fields inside the YAML file", () => {
@@ -1264,6 +1286,174 @@ describe("workflow tool execution", () => {
       expect(published.find((event) => event.type === DagEvent.NodeRegistered.type)?.data).toEqual(
         expect.objectContaining({ nodeID: "file-replanned" }),
       )
+    }),
+  )
+
+  runtime.effect("parks a recoverable runtime replan rejection and reports the durable state", () =>
+    Effect.gen(function* () {
+      published.length = 0
+      const workflow = yield* (yield* WorkflowTool).init()
+      const spec_path = yield* writeWorkflowSpec("runtime-replan-failure", {
+        fragment: { name: "runtime-replan-failure", nodes: [{
+          id: "repair", name: "Repair", worker_type: "general", depends_on: [],
+          prompt_template: { inline: "repair" },
+        }] },
+      })
+      const result = yield* workflow.execute(
+        Schema.decodeUnknownSync(Parameters)({ params: {
+          action: "control", workflow_id: "dag_runtime_failure", operation: "replan", spec_path,
+        } }),
+        toolContext(),
+      ).pipe(Effect.exit)
+      expect(Exit.isFailure(result)).toBe(true)
+      if (Exit.isFailure(result)) {
+        expect(String(Cause.squash(result.cause))).toContain("simulated runtime batch write failure")
+        expect(String(Cause.squash(result.cause))).toContain("Workflow state: paused (durably parked)")
+      }
+      expect(published.some((event) => event.type === DagEvent.WorkflowPaused.type)).toBe(true)
+    }),
+  )
+
+  runtime.effect("parks a recoverable runtime extend rejection and reports the durable state", () =>
+    Effect.gen(function* () {
+      published.length = 0
+      const workflow = yield* (yield* WorkflowTool).init()
+      const spec_path = yield* writeWorkflowSpec("runtime-extend-failure", {
+        nodes: [{
+          id: "additional", name: "Additional", worker_type: "general", depends_on: [],
+          prompt_template: { inline: "additional" },
+        }],
+      })
+      const result = yield* workflow.execute(
+        Schema.decodeUnknownSync(Parameters)({ params: {
+          action: "extend", workflow_id: "dag_runtime_extend_failure", spec_path,
+        } }),
+        toolContext(),
+      ).pipe(Effect.exit)
+      expect(Exit.isFailure(result)).toBe(true)
+      if (Exit.isFailure(result)) {
+        expect(String(Cause.squash(result.cause))).toContain("simulated runtime batch write failure")
+        expect(String(Cause.squash(result.cause))).toContain("Workflow state: paused (durably parked)")
+      }
+      expect(published.some((event) => event.type === DagEvent.WorkflowPaused.type)).toBe(true)
+    }),
+  )
+
+  runtime.effect("replan without a fragment envelope is rejected with a precise, structured signal (P0-B/P1-F)", () =>
+    Effect.gen(function* () {
+      published.length = 0
+      const info = yield* WorkflowTool
+      const workflow = yield* info.init()
+      // A top-level nodes graph with no `fragment` envelope — the exact mistake
+      // that previously surfaced as the misleading blocks/nodes union error.
+      const spec_path = yield* writeWorkflowSpec("bad-envelope", {
+        name: "bad-envelope",
+        nodes: [{ id: "x", name: "X", worker_type: "general", depends_on: [], prompt_template: { inline: "work" } }],
+      })
+      const exit = yield* workflow
+        .execute(
+          Schema.decodeUnknownSync(Parameters)({ params: {
+            action: "control",
+            workflow_id: "dag_defaults",
+            operation: "replan",
+            spec_path,
+          }}),
+          toolContext(),
+        )
+        .pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) {
+        const pretty = Cause.pretty(exit.cause)
+        // P0-B: precise envelope diagnosis + targeted hint, never the union text.
+        expect(pretty).toContain('missing required top-level key "fragment"')
+        expect(pretty).toContain('Move "nodes" under "fragment".')
+        expect(pretty).not.toContain("blocks graphs need name+objective+blocks")
+        // P1-F: stable machine-readable retry signal for deterministic correction.
+        expect(pretty).toContain("replan.envelope_missing")
+        expect(pretty).toContain('"error_code":"replan_envelope_missing"')
+        expect(pretty).toContain('"required_root_key":"fragment"')
+      }
+      // P0-C / audit #5: a rejected replan parks the workflow paused and
+      // recoverable — it never fails or cancels the graph, and mutates no nodes.
+      expect(published.some((event) => event.type === DagEvent.WorkflowPaused.type)).toBe(true)
+      expect(published.some((event) => event.type === DagEvent.WorkflowFailed.type)).toBe(false)
+      expect(published.some((event) => event.type === DagEvent.WorkflowCancelled.type)).toBe(false)
+      expect(published.some((event) => event.type === DagEvent.NodeRegistered.type)).toBe(false)
+    }),
+  )
+
+  runtime.effect("rejected replan reports a failed durable pause instead of claiming the workflow is parked", () =>
+    Effect.gen(function* () {
+      published.length = 0
+      const workflow = yield* (yield* WorkflowTool).init()
+      const specPath = yield* writeWorkflowSpec("pause-failure-replan", { nodes: [] })
+      const exit = yield* workflow.execute({ params: {
+        action: "control",
+        operation: "replan",
+        workflow_id: Dag.ID.make("dag_pause_failure"),
+        spec_path: specPath,
+      }}, toolContext()).pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) {
+        const message = Cause.pretty(exit.cause)
+        expect(message).toContain("Workflow state: running")
+        expect(message).toContain("Automatic pause failed")
+        expect(message).toContain("simulated durable pause write failure")
+        expect(message).not.toContain("Workflow state: paused (durably parked)")
+      }
+      expect(published.some((event) => event.type === DagEvent.WorkflowPaused.type)).toBe(false)
+    }),
+  )
+
+  runtime.effect("invalid extend on a completed workflow reports its terminal state", () =>
+    Effect.gen(function* () {
+      published.length = 0
+      const workflow = yield* (yield* WorkflowTool).init()
+      const specPath = yield* writeWorkflowSpec("terminal-invalid-extend", { nodes: [{ id: "missing-fields" }] })
+      const exit = yield* workflow.execute({ params: {
+        action: "extend",
+        workflow_id: Dag.ID.make("dag_completed"),
+        spec_path: specPath,
+      }}, toolContext()).pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) {
+        const message = Cause.pretty(exit.cause)
+        expect(message).toContain("Workflow state: completed")
+        expect(message).toContain("Automatic pause failed")
+        expect(message).not.toContain("Workflow state: paused (durably parked)")
+      }
+      expect(published.some((event) => event.type === DagEvent.WorkflowPaused.type)).toBe(false)
+    }),
+  )
+
+  runtime.effect("extend_timeout routes to the durable command and renders its verdict (P0-A)", () =>
+    Effect.gen(function* () {
+      published.length = 0
+      const info = yield* WorkflowTool
+      const workflow = yield* info.init()
+      // The mocked store exposes no running node for dag_defaults, so the command
+      // refuses with not_running — proving the control op routes to
+      // dag.extendTimeout and renders the verdict with no durable side effect.
+      // (The extended / no_escalation / escalation_undelivered / cap_exhausted verdicts are covered
+      // against the real store in dag-deadline-extended.test.ts.)
+      const result = yield* workflow.execute(
+        Schema.decodeUnknownSync(Parameters)({ params: {
+          action: "control",
+          workflow_id: "dag_defaults",
+          operation: "extend_timeout",
+          node_id: "node_missing",
+          timeout_ms: 60_000,
+        }}),
+        toolContext(),
+      )
+      expect(result.title).toContain("Node not running")
+      expect(result.output).toContain('action="extend_timeout"')
+      expect(result.output).toContain('status="not_running"')
+      expect(result.metadata.nodeId).toBe(DagEvent.NodeID.make("node_missing"))
+      expect(published).toHaveLength(0)
     }),
   )
 

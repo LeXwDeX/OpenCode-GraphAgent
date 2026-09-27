@@ -42,6 +42,7 @@ function dagNode(overrides: Partial<DagNode> & { id: string }): DagNode {
 type RenderOpts = {
   workflows?: DagWorkflowSummary[]
   nodes?: DagNode[]
+  width?: number
 }
 
 /** Mirrors the production bridge: the plugin-facing dag(sessionID) accessor
@@ -78,7 +79,7 @@ async function renderDagPanel(opts: RenderOpts = {}) {
   await dagPanelPlugin.tui(api, undefined, undefined as never)
 
   const app = await testRender(() => <TestTuiContexts>{sidebar?.({ session_id: SESSION_ID })}</TestTuiContexts>, {
-    width: 80,
+    width: opts.width ?? 80,
     height: 24,
   })
   // The first active workflow auto-expands; let its initial fetch settle.
@@ -103,6 +104,21 @@ async function waitForCondition(fn: () => boolean, timeout = 2000) {
 }
 
 describe("DagPanel expanded sidebar", () => {
+  test("shows completed and skipped counts at narrow width without implying all nodes succeeded", async () => {
+    const panel = await renderDagPanel({
+      width: 44,
+      workflows: [wfSummary({ id: "wf-1", title: "Gated workflow", status: "paused", nodeCount: 8,
+        completedNodes: 1, skippedNodes: 7, runningNodes: 0 })],
+      nodes: [],
+    })
+    try {
+      await panel.app.waitForFrame((frame) =>
+        frame.includes("Gated workflow") && frame.includes("8/8") && frame.includes("✓1") && frame.includes("⊘7"))
+    } finally {
+      panel.app.renderer.destroy()
+    }
+  })
+
   test("equal-count replan bumps graphRev alone and refetches exactly once with the current node set", async () => {
     const panel = await renderDagPanel({
       workflows: [wfSummary({ id: "wf-1", graphRev: 1 })],
