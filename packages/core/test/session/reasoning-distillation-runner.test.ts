@@ -192,6 +192,62 @@ describe("Core runner reasoning distillation adapter", () => {
     }),
   )
 
+  it.effect("prepares on the first user turn and preserves replay after later messages", () =>
+    Effect.gen(function* () {
+      const roomyModel = Model.make({
+        id: model.id,
+        provider: model.provider,
+        route: OpenAIChat.route.with({ limits: { context: 100_000, output: 4096 } }),
+      })
+      const user: SessionMessage.User = {
+        id: SessionMessage.ID.make("msg_user"),
+        type: "user",
+        text: "分析方案",
+        time: { created: now },
+      }
+      const sourceMessages = [user, history()]
+      const conversion = toLLMMessagesWithBindings(sourceMessages, roomyModel)
+      const request = LLM.request({ model: roomyModel, messages: conversion.messages })
+      const generated: LLMRequest[] = []
+      const outputs = [candidate, support]
+      const client: LLMClientShape = {
+        prepare: prepare as unknown as LLMClientShape["prepare"],
+        stream: () => Stream.empty,
+        generate: (request) =>
+          Effect.sync(() => {
+            generated.push(request)
+            return response(outputs.shift() ?? "{}")
+          }),
+      }
+      const adapter = CoreReasoningDistillation.make(client)
+      const input = {
+        sessionID: "ses_scheduled",
+        request,
+        prepared: yield* prepare(request),
+        sourceMessages,
+        bindings: conversion.reasoningBindings,
+        config: new ConfigReasoningDistillation.Info({ compatibility: [compatibility] }),
+      }
+      const first = yield* adapter.distill(input)
+      expect(first.applied).toBe(true)
+      expect(first.attempted).toBe("judge")
+      expect(generated).toHaveLength(2)
+      const nextMessages = [...sourceMessages, { ...user, id: SessionMessage.ID.make("msg_next"), text: "继续" }]
+      const nextConversion = toLLMMessagesWithBindings(nextMessages, roomyModel)
+      const nextRequest = LLM.request({ model: roomyModel, messages: nextConversion.messages })
+      const replay = yield* adapter.distill({
+        ...input,
+        sourceMessages: nextMessages,
+        request: nextRequest,
+        prepared: yield* prepare(nextRequest),
+        bindings: nextConversion.reasoningBindings,
+      })
+      expect(replay.applied).toBe(true)
+      expect(JSON.stringify(replay.request.messages)).toContain("决定使用安全路径")
+      expect(generated).toHaveLength(2)
+    }),
+  )
+
   it.effect("invalidates cached judge support when host evidence changes", () =>
     Effect.gen(function* () {
       const source = history()
