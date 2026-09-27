@@ -1,7 +1,7 @@
 # dev → main review repair ledger
 
-Date: 2026-09-27. Tracking: [Issue #636](https://github.com/LeXwDeX/OpenCode-GraphAgent/issues/636).
-Base: `a0849d269134e1129ff71168a4cadd8d495002f9`. Branch: `fix/context-review-repairs`.
+Date: 2026-09-27. Tracking: [repair Issue #651](https://github.com/LeXwDeX/OpenCode-GraphAgent/issues/651); broader acceptance remains in [Issue #636](https://github.com/LeXwDeX/OpenCode-GraphAgent/issues/636).
+Base: `a0849d269134e1129ff71168a4cadd8d495002f9`. Implementation branch: `fix/context-review-repairs`; delivery branch: `fix/context-review-delivery`.
 Scope: the eight reproducible findings from the dev/main review. Existing DAG state-machine behavior is covered by regression tests; this patch changes context budgeting and reasoning distillation.
 
 ## Repairs
