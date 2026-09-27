@@ -60,6 +60,7 @@ const decodeAndExecute = (tool: AnyTool, call: ToolCallPart): Effect.Effect<Tool
     ),
   )
 
+// oxlint-disable-next-line typescript-eslint(no-redundant-type-constituents) -- ToolResultValue's circular Schema.Type can resolve with `any` depending on the type resolver; the union is intentional
 const result = (call: ToolCallPart, value: ToolResultValueType | ToolSettlement, error?: unknown): DispatchResult => {
   const settlement = ToolResultValue.is(value) ? { result: value } : value
   return {
