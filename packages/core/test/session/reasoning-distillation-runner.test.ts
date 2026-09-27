@@ -14,6 +14,7 @@ import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { SessionMessage } from "@opencode-ai/core/session/message"
 import * as CoreReasoningDistillation from "@opencode-ai/core/session/runner/reasoning-distillation"
+import { COVERAGE_CONTRACT } from "@opencode-ai/core/session/reasoning-distillation"
 import { toLLMMessagesWithBindings } from "@opencode-ai/core/session/runner/to-llm-message"
 import { Hash } from "@opencode-ai/core/util/hash"
 import { DateTime, Deferred, Effect, Fiber, Stream } from "effect"
@@ -98,7 +99,7 @@ const candidate = JSON.stringify({
       kind: "decision",
       text: "决定使用安全路径。",
       scope: "当前实现",
-      sources: [{ messageID: "msg_reasoning", partID: "reasoning-1", start: 0, end: reasoningText.length }],
+      sources: ["R0.0"],
       evidence: [{ messageID: "msg_reasoning", partID: "reasoning-1", kind: "source" }],
       status: "unverified",
     },
@@ -106,7 +107,7 @@ const candidate = JSON.stringify({
   preserved: [],
   coverage: [
     {
-      source: { messageID: "msg_reasoning", partID: "reasoning-1", start: 0, end: reasoningText.length },
+      source: "R0.0",
       action: "keep",
       claimID: "claim-1",
     },
@@ -229,6 +230,7 @@ describe("Core runner reasoning distillation adapter", () => {
       })
       expect(result.attempted).toBe("propose")
       expect(prompt).toContain("z-prior-tool")
+      expect(prompt).toContain(JSON.stringify(COVERAGE_CONTRACT).slice(1, -1))
       expect(prompt).not.toContain("a-future-tool")
     }),
   )
