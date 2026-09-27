@@ -18,9 +18,9 @@ Branch: `fix/reasoning-replay-tui-release`. Owner authorization: implement throu
 - Current local GLM config has no reasoning compatibility records; lowering the cadence gate alone cannot enable rewriting.
 - AI SDK 6.0.288 directly emits the system-message warning via console.warn; the server worker had no console redirection.
 
-## Remaining delivery gates
+## Delivery acceptance contract
 
-- Stable promotion PR with current-head full checks to main. Implementation, local integration, real upstream replay and dev delivery have passed.
+- Stable promotion requires current-head full checks to main, in addition to implementation, local integration and real upstream replay.
 - Release build, artifact integrity and installed runtime acceptance; only then retire GitHub Release graphagent-v1.0.49.
 
 ## AHE evolve summary: organizer source binding
@@ -65,3 +65,11 @@ PR #660 merged to dev as `008a0ec8dee46737e26342a6dab21b396c33c245`; Issues #656
 Additional packaged terminal verification sent the real XTGETTCAP `4d73` response in fragments: capability response consumed, no visible capability text, no SDK warning bytes, restored RESULT=7 visible, resize round-trip passed, exit 0. This uses a controlled PTY, not a screenshot of the user's already-running old binary.
 
 Existing Dependabot alerts #113/#114 concern Astro in the separate `packages/web` documentation site. They are not resolved by this CLI maintenance change; the embedded CLI application build comes from `packages/app`.
+
+## Formal candidate follow-up: source aliases (#663 / #664)
+
+PR #662 merged to main as `3e079729232a20f1e830afe63afc4b71887e6ccc`. Exact-main Typecheck 36346000263, complete CI Test 36346000266 (22 E2E cases on each platform), and CodeQL passed. Formal build 36346010828 produced all three platforms, but its publication was held: two fresh max organizer responses violated duplicate-preservation/self-witness constraints. PTY acceptance passed; task completion without applied distillation was not counted as success.
+
+Prompt clarification alone then exposed model-invented offsets. The corrective implementation gives organizers host-issued source IDs and binds them to exact original identities/ranges before unchanged parsing, retention and independent review. Unknown IDs fail closed. Both adapters share the coverage contract and valid JSON output example. Detailed falsifiable changes and captured failures are in `reasoning-coverage-contract-evolve.md`.
+
+The correction passed core full suite 1433, host/LLM 125, 29 workspace typechecks, and lint at the unchanged 4846 warnings/0 errors. Three fresh compiled max sessions applied reviewed reasoning and continued successfully (two recorded relay calls and one direct upstream call). Updated compiled PTY reload/resize/fragmented-capability/exit checks passed. A new exact-head CI and formal candidate must complete before #661 publication/retirement acceptance. The held `3e079729` candidate is not the release artifact.

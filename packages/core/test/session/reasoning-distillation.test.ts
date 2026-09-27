@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test"
 import type { ContextFoldingBudget } from "../../src/session/context-folding"
 import {
   claimEquivalence,
+  bindSourceAliases,
   planReasoningDistillation,
   resolveExecutionMatch,
   resolveExecutionVerdict,
@@ -204,6 +205,26 @@ describe("validateCoverage", () => {
     const coverage: CoverageEntry[] = [{ source: spans[0], action: "keep", claimID: "c1" }]
     expect(validateCoverage(coverage, spans, claims)).toBe("retention-contract-violated")
   })
+  test("a kept claim cannot also preserve its source as a backup", () => {
+    const coverage: CoverageEntry[] = [{ source: spans[0], action: "keep", claimID: "c1" }]
+    expect(validateCoverage(coverage, [spans[0]], claims, [spans[0]])).toBe("retention-contract-violated")
+    expect(validateCoverage(coverage, [spans[0]], claims, [])).toBeUndefined()
+  })
+  test("a merge needs a different retained witness, not its own source", () => {
+    expect(validateCoverage([{ source: spans[0], action: "merge", witness: spans[0] }], [spans[0]], claims)).toBe(
+      "retention-contract-violated",
+    )
+    expect(
+      validateCoverage(
+        [
+          { source: spans[0], action: "keep", claimID: "c1" },
+          { source: spans[1], action: "merge", witness: spans[0] },
+        ],
+        spans,
+        claims,
+      ),
+    ).toBeUndefined()
+  })
   test("keep must resolve to a known claim, merge to a known witness", () => {
     expect(validateCoverage([{ source: spans[0], action: "keep", claimID: "ghost" }], [spans[0]], claims)).toBe(
       "invalid-reference",
@@ -221,6 +242,51 @@ describe("validateCoverage", () => {
     expect(validateCoverage([{ source: span("m9", "p9", 0, 1), action: "preserve" }], spans, claims)).toBe(
       "invalid-reference",
     )
+  })
+})
+
+describe("host-issued source aliases", () => {
+  test("binds Unicode, whitespace and multiple slot identities without mutating model output", () => {
+    const slots = [
+      { messageID: "m1", partID: "p1", text: "甲😀\n\n乙\r\n末" },
+      { messageID: "m2", partID: "p2", text: "second" },
+    ]
+    const raw = {
+      claims: [{ sources: ["R0.0", "R1.0"] }],
+      preserved: ["R0.1", "R0.2", "R0.3"],
+      coverage: [{ source: "R0.3", action: "merge", witness: "R0.0" }],
+    }
+    const before = JSON.stringify(raw)
+    expect(bindSourceAliases(raw, slots)).toEqual({
+      claims: [
+        {
+          sources: [
+            { messageID: "m1", partID: "p1", start: 0, end: 4 },
+            { messageID: "m2", partID: "p2", start: 0, end: 6 },
+          ],
+        },
+      ],
+      preserved: [
+        { messageID: "m1", partID: "p1", start: 4, end: 5 },
+        { messageID: "m1", partID: "p1", start: 5, end: 8 },
+        { messageID: "m1", partID: "p1", start: 8, end: 9 },
+      ],
+      coverage: [
+        {
+          source: { messageID: "m1", partID: "p1", start: 8, end: 9 },
+          action: "merge",
+          witness: { messageID: "m1", partID: "p1", start: 0, end: 4 },
+        },
+      ],
+    })
+    expect(JSON.stringify(raw)).toBe(before)
+  })
+  test("unknown aliases stay invalid instead of defaulting to a real source", () => {
+    const raw = { claims: [{ sources: ["R9.0", "__proto__"] }], preserved: [], coverage: [] }
+    expect(bindSourceAliases(raw, [{ messageID: "m", partID: "p", text: "source" }])).toEqual({
+      ...raw,
+      claims: [{ sources: [undefined, undefined] }],
+    })
   })
 })
 

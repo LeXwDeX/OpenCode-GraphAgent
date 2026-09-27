@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test"
 import type { PreparedRequestBudgetInput } from "@opencode-ai/core/session/context-folding"
 import {
   ReasoningDistillationPolicy,
+  COVERAGE_CONTRACT,
   capabilityFingerprint,
   type Candidate,
   type ClaimSupport,
@@ -617,6 +618,32 @@ describe("runDistillationCycle live lifecycle", () => {
     expect(calls).toEqual({ propose: 1, judge: 1 })
   })
 
+  test.each(["R0.0", "R9.0"])("binds organizer source alias %s before review and wire projection", async (alias) => {
+    const request = wireRequest(TEXT)
+    const input = {
+      ...cycleInput(request, { propose: 0, judge: 0 }),
+      callPropose: async () => ({
+        output: {
+          claims: validCandidate(TEXT).claims.map((claim) => ({ ...claim, sources: [alias] })),
+          preserved: [],
+          coverage: [{ source: alias, action: "keep", claimID: "c1" }],
+        },
+        usageTokens: 20,
+      }),
+    }
+    const proposed = await runDistillationCycle(emptyLifecycleState, input)
+    if (alias === "R9.0") {
+      expect(proposed.projection.applied).toBe(false)
+      expect(proposed.projection.skipReason).toBe("invalid-proposal")
+      expect(proposed.projection.request).toBe(request)
+      return
+    }
+    const reviewed = await runDistillationCycle(proposed.state, input)
+    expect(reviewed.projection.applied).toBe(true)
+    expect(reviewed.projection.request.messages[0].reasoning).toContain("精简结论")
+    expect(request.messages[0].reasoning).toBe(TEXT)
+  })
+
   test("compatibility-unproven never calls an auxiliary model", async () => {
     const request = wireRequest(TEXT)
     const calls = { propose: 0, judge: 0 }
@@ -1059,10 +1086,10 @@ describe("prompt builders (§5.4.1 / §5.5.3)", () => {
     expect(prompt).toContain(`UTF-16 length=${text.length}`)
     expect(prompt).toContain(
       JSON.stringify([
-        { start: 0, end: 4, text: "甲😀\n" },
-        { start: 4, end: 5, text: "\n" },
-        { start: 5, end: 8, text: "乙\r\n" },
-        { start: 8, end: 9, text: "末" },
+        { id: "R0.0", start: 0, end: 4, text: "甲😀\n" },
+        { id: "R0.1", start: 4, end: 5, text: "\n" },
+        { id: "R0.2", start: 5, end: 8, text: "乙\r\n" },
+        { id: "R0.3", start: 8, end: 9, text: "末" },
       ]),
     )
   })
@@ -1083,6 +1110,7 @@ describe("prompt builders (§5.4.1 / §5.5.3)", () => {
     expect(prompt).toContain("原始思绪乙")
     expect(prompt).toContain("bash c1 completed")
     expect(prompt).toContain("coverage")
+    expect(prompt).toContain(COVERAGE_CONTRACT)
   })
 
   test("propose prompt exposes the real span identities so models can cite resolvable messageID/partID values", () => {
@@ -1092,7 +1120,7 @@ describe("prompt builders (§5.4.1 / §5.5.3)", () => {
       callSummary: [],
     })
     expect(prompt).toContain("(messageID=msg_01a0def4b881TZa1qIqRrBA6u2, partID=part_0)")
-    expect(prompt).toContain("逐字使用各 slot 标注的值")
+    expect(prompt).toContain("程序负责将编号绑定到原始 messageID、partID 和 UTF-16 范围")
   })
 
   test("propose prompt renders an empty call inventory explicitly", () => {

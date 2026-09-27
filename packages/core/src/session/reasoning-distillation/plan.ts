@@ -50,16 +50,66 @@ const allowedPurposes = new Set<string>(ReasoningDistillationPolicy.allowedPurpo
 /** Conservative character proxy; the real tokenizer is supplied by the runtime adapter in Phase 2. */
 const defaultEstimateTokens = (text: string): number => Math.ceil(text.length / 4)
 
+/** Shared organizer contract for the overlap and self-witness failures observed in release acceptance. */
+export const COVERAGE_CONTRACT = `来源编号由程序绑定到原文的精确范围；sources、preserved、coverage.source 和 merge.witness 只引用 R 列出的编号，不生成字符偏移。
+coverage 必须将 R 的每个来源编号恰好覆盖一次，不重复、不遗漏。每段只选一种动作：
+- keep：用 claimID 指向 sources 包含该段的 claim；该段不再放入 preserved。
+- preserve：原文保留；coverage 的 preserve 段与 preserved 数组逐项一一对应，边界相同。全部提炼为 claims 时 preserved 为 []，不能把它当作原文备份。
+- merge：witness 是另一个来源编号；那一段必须已有 keep 或 preserve 项。禁止指向自身或其他 merge/drop 项。
+- drop：必须给出 reason，不能丢弃影响后续判断的信息。
+claims 的 text/scope 只陈述 R 中的命题及适用范围，不加入整理器自身的权限或动作说明。`
+
+export const ORGANIZER_OUTPUT_FORMAT = `格式示例（text/scope 替换为 R 中的内容，来源编号必须来自当前 R）：{"claims":[{"id":"c1","kind":"decision","text":"...","scope":"...","sources":["R0.0"],"evidence":[],"status":"unverified"}],"preserved":[],"coverage":[{"source":"R0.0","action":"keep","claimID":"c1"}]}。kind 取 fact/constraint/decision/rejection/assumption/state_delta；status 取 verified/unverified/assumed；supersedes 可引用被取代的旧 claim ID。`
+
 /** Exact UTF-16 ranges include separators so coverage can be checked without model-counted offsets. */
-export const renderSourceRanges = (text: string): string => {
+const sourceRanges = (text: string, slotIndex: number) => {
   let start = 0
-  return JSON.stringify(
-    [...text.matchAll(/[^\n]*\n|[^\n]+$/g)].map(([value]) => {
-      const range = { start, end: start + value.length, text: value }
-      start = range.end
-      return range
-    }),
+  return [...text.matchAll(/[^\n]*\n|[^\n]+$/g)].map(([value], index) => {
+    const range = { id: `R${slotIndex}.${index}`, start, end: start + value.length, text: value }
+    start = range.end
+    return range
+  })
+}
+
+export const renderSourceRanges = (text: string, slotIndex = 0): string => JSON.stringify(sourceRanges(text, slotIndex))
+
+/** Resolve only host-issued aliases; downstream parsers and fidelity gates still validate every bound span. */
+export const bindSourceAliases = (
+  raw: unknown,
+  slots: readonly { messageID: string; partID: string; text: string }[],
+): unknown => {
+  const record = (value: unknown): value is Record<string, unknown> =>
+    typeof value === "object" && value !== null && !Array.isArray(value)
+  if (!record(raw)) return raw
+  const aliases = new Map(
+    slots.flatMap((slot, slotIndex) =>
+      sourceRanges(slot.text, slotIndex).map(
+        (range) =>
+          [range.id, { messageID: slot.messageID, partID: slot.partID, start: range.start, end: range.end }] as const,
+      ),
+    ),
   )
+  const resolve = (value: unknown) => (typeof value === "string" ? aliases.get(value) : value)
+  return {
+    ...raw,
+    claims: Array.isArray(raw.claims)
+      ? raw.claims.map((claim) =>
+          record(claim) && Array.isArray(claim.sources) ? { ...claim, sources: claim.sources.map(resolve) } : claim,
+        )
+      : raw.claims,
+    preserved: Array.isArray(raw.preserved) ? raw.preserved.map(resolve) : raw.preserved,
+    coverage: Array.isArray(raw.coverage)
+      ? raw.coverage.map((entry) =>
+          record(entry)
+            ? {
+                ...entry,
+                source: resolve(entry.source),
+                ...(entry.action === "merge" ? { witness: resolve(entry.witness) } : {}),
+              }
+            : entry,
+        )
+      : raw.coverage,
+  }
 }
 
 /** Minimal renderer; the host original-text parser must be injected for preserved spans to render faithfully. */
