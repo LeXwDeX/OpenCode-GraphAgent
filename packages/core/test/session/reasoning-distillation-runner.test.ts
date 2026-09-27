@@ -29,7 +29,7 @@ const modelRef = {
   providerID: ProviderV2.ID.make(String(model.provider)),
 }
 const now = DateTime.makeUnsafe(1)
-const reasoningText = `需要保留这个决定：使用安全路径。${"重复背景。".repeat(10_000)}`
+const reasoningText = `需要保留这个决定：使用安全路径。${"重复背景。".repeat(4_000)}`
 
 const history = (providerMetadata?: Record<string, Record<string, unknown>>): SessionMessage.Assistant => ({
   id: SessionMessage.ID.make("msg_reasoning"),
@@ -350,7 +350,7 @@ describe("Core runner reasoning distillation adapter", () => {
 
   it.effect("advances multiple exact slots without issuing more than one auxiliary call per request", () =>
     Effect.gen(function* () {
-      const secondText = `第二个决定：保留回滚路径。${"第二段背景。".repeat(10_000)}`
+      const secondText = `第二个决定：保留回滚路径。${"第二段背景。".repeat(4_000)}`
       const source = {
         ...history(),
         content: [

@@ -507,7 +507,7 @@ export const make = (llm: LLMClientShape) => {
   const lock = Semaphore.makeUnsafe(1)
 
   const callAuxiliary = (input: Input, prompt: string) => {
-    if (Token.estimate(prompt) > ReasoningDistillationPolicy.tokens.maxInputTokens) return Effect.succeed(undefined)
+    if (Token.estimateReserve(prompt) > ReasoningDistillationPolicy.tokens.maxInputTokens) return Effect.succeed(undefined)
     const request = LLM.request({
       model: input.request.model,
       prompt,
@@ -549,7 +549,7 @@ export const make = (llm: LLMClientShape) => {
         let lastSkipReason: DistillationSkipReason | undefined
 
         const reserve = (prompt: string, role: "propose" | "judge", key: DistillationKey) => {
-          const promptTokens = Token.estimate(prompt)
+          const promptTokens = Token.estimateReserve(prompt)
           if (promptTokens > ReasoningDistillationPolicy.tokens.maxInputTokens) return "work-limit" as const
           const reservedTokens = promptTokens + ReasoningDistillationPolicy.tokens.maxOutputTokens
           if (
