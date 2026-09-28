@@ -613,7 +613,13 @@ const live: Layer.Layer<
 
       // Completed-turn preparation starts from persisted, uniquely identified reasoning parts. It never needs a
       // provider's interleaved wire field, and the resulting edit is committed by the existing adoption transaction.
-      if (distillationOnly && distillationResolution.enabled && input.reasoningDistillation) {
+      if (
+        distillationOnly &&
+        distillationResolution.enabled &&
+        input.reasoningDistillation?.groups.some((group) =>
+          group.parts.some((part) => part.canonicalEditable !== undefined),
+        )
+      ) {
         const sourceMessages = ContextFolding.copyModelMessages(prepared.messages)
         const messages = sourceMessages && plainWireMessages(sourceMessages)
         const parts = input.reasoningDistillation.groups.flatMap((group) => group.parts)

@@ -979,7 +979,10 @@ const auxiliaryResponse = (content: unknown) =>
     usage: { prompt_tokens: 10, completion_tokens: 10, total_tokens: 20 },
   })
 
-const distillationConfig = (runtime: "opencode-ai-sdk" | "opencode-native"): Partial<ConfigV1.Info> => {
+const distillationConfig = (
+  runtime: "opencode-ai-sdk" | "opencode-native",
+  options: { canonical?: boolean } = {},
+): Partial<ConfigV1.Info> => {
   const endpoint = `${state.server!.url.origin}/v1`
   return {
     enabled_providers: ["custom-provider"],
@@ -992,7 +995,7 @@ const distillationConfig = (runtime: "opencode-ai-sdk" | "opencode-native"): Par
           "deepseek-test-r1": {
             name: "DeepSeek R1",
             reasoning: true,
-            interleaved: { field: "reasoning_content" },
+            ...(options.canonical ? {} : { interleaved: { field: "reasoning_content" } }),
             limit: { context: 65_536, output: 4_096 },
           },
         },
@@ -1001,21 +1004,23 @@ const distillationConfig = (runtime: "opencode-ai-sdk" | "opencode-native"): Par
     },
     reasoningDistillation: {
       enabled: true,
-      compatibility: [
-        {
-          runtime,
-          protocol: "openai-compatible",
-          providerModelVariant: "custom-provider/deepseek-test-r1/default",
-          endpointIdentity: Hash.sha256(endpoint),
-          adapterVersion:
-            runtime === "opencode-native"
-              ? "opencode-reasoning-distillation-native-v1"
-              : "opencode-reasoning-distillation-ai-sdk-v1",
-          optionsFingerprint: Hash.sha256(JSON.stringify({})),
-          transportVerified: true,
-          upstreamVerified: true,
-        },
-      ],
+      compatibility: options.canonical
+        ? []
+        : [
+            {
+              runtime,
+              protocol: "openai-compatible",
+              providerModelVariant: "custom-provider/deepseek-test-r1/default",
+              endpointIdentity: Hash.sha256(endpoint),
+              adapterVersion:
+                runtime === "opencode-native"
+                  ? "opencode-reasoning-distillation-native-v1"
+                  : "opencode-reasoning-distillation-ai-sdk-v1",
+              optionsFingerprint: Hash.sha256(JSON.stringify({})),
+              transportVerified: true,
+              upstreamVerified: true,
+            },
+          ],
     },
   }
 }
@@ -1997,6 +2002,194 @@ describe("session.llm.stream", () => {
       )
     }
   }
+
+  for (const accepted of [true, false]) {
+    it.instance(
+      `canonical reasoning without an interleaved field uses persisted identity; adoption accepted=${accepted}`,
+      () =>
+        Effect.gen(function* () {
+          const propose = waitRequest(
+            "/chat/completions",
+            auxiliaryResponse({
+              claims: [
+                {
+                  id: "c1",
+                  kind: "decision",
+                  text: "已确认方案A。",
+                  scope: "当前会话",
+                  sources: [
+                    {
+                      messageID: "msg-reasoning-source",
+                      partID: "prt-reasoning-source",
+                      start: 0,
+                      end: distillationBody.length,
+                    },
+                  ],
+                  evidence: [],
+                  status: "unverified",
+                },
+              ],
+              preserved: [],
+              coverage: [
+                {
+                  source: {
+                    messageID: "msg-reasoning-source",
+                    partID: "prt-reasoning-source",
+                    start: 0,
+                    end: distillationBody.length,
+                  },
+                  action: "keep",
+                  claimID: "c1",
+                },
+              ],
+            }),
+          )
+          const judge = waitRequest(
+            "/chat/completions",
+            auxiliaryResponse({
+              retention: { verdict: "supported" },
+              support: [{ claimID: "c1", verdict: "supported", method: "judged" }],
+            }),
+          )
+          const resolved = yield* Provider.use.getModel(
+            ProviderV2.ID.make("custom-provider"),
+            ModelV2.ID.make("deepseek-test-r1"),
+          )
+          const model = { ...resolved, capabilities: { ...resolved.capabilities, interleaved: false as const } }
+          expect(model.capabilities.interleaved).toBe(false)
+          const history = distillationHistory()!
+          const annotated = {
+            ...history,
+            groups: history.groups.map((group) => ({
+              ...group,
+              parts: group.parts.map((part) => ({ ...part, canonicalEditable: true, canonicalAliasCount: 0 })),
+            })),
+          }
+          const adopted: Array<readonly { before: string; after: string }[]> = []
+          const sessionID = SessionID.make(`session-test-canonical-${accepted}`)
+          const agent = {
+            name: "test",
+            mode: "primary",
+            options: {},
+            permission: [{ permission: "*", pattern: "*", action: "allow" }],
+          } satisfies Agent.Info
+          const input: LLM.StreamInput = {
+            user: {
+              id: MessageID.make("msg_user-canonical"),
+              sessionID,
+              role: "user",
+              time: { created: Date.now() },
+              agent: agent.name,
+              model: { providerID: ProviderV2.ID.make("custom-provider"), modelID: resolved.id },
+            },
+            sessionID,
+            model,
+            agent,
+            system: [],
+            messages: distillationMessages(),
+            tools: {},
+            purpose: "conversation",
+            reasoningDistillation: annotated,
+            adoptReasoning: (replacements) =>
+              Effect.sync(() => {
+                adopted.push(replacements)
+                return accepted
+              }),
+          }
+          const ctx = yield* InstanceRef
+          if (!ctx) throw new Error("InstanceRef not provided")
+          yield* Effect.promise(() =>
+            Effect.runPromise(
+              LLM.Service.use((svc) =>
+                Effect.gen(function* () {
+                  yield* svc.distill(input)
+                }),
+              ).pipe(
+                Effect.provide(llmLayerWithExecutor(RequestExecutor.defaultLayer, { outputTokenMax: 4_096 })),
+                Effect.provideService(InstanceRef, ctx),
+              ),
+            ),
+          )
+          const [proposal, judgment] = yield* Effect.promise(() => Promise.all([propose, judge]))
+          expect(proposal.body.stream).not.toBe(true)
+          expect(judgment.body.stream).not.toBe(true)
+          expect(adopted).toHaveLength(1)
+          expect(adopted[0][0]).toMatchObject({
+            before: distillationBody,
+            after: expect.stringContaining("已确认方案A。"),
+          })
+        }),
+      { config: () => distillationConfig("opencode-ai-sdk", { canonical: true }) },
+    )
+  }
+
+  it.instance(
+    "a protected canonical source never falls back to a proven legacy wire rewrite",
+    () =>
+      Effect.gen(function* () {
+        const resolved = yield* Provider.use.getModel(
+          ProviderV2.ID.make("custom-provider"),
+          ModelV2.ID.make("deepseek-test-r1"),
+        )
+        expect(resolved.capabilities.interleaved).toEqual({ field: "reasoning_content" })
+        const history = distillationHistory()!
+        let adoptionCalls = 0
+        const sessionID = SessionID.make("session-test-protected-canonical")
+        const agent = {
+          name: "test",
+          mode: "primary",
+          options: {},
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        } satisfies Agent.Info
+        const input: LLM.StreamInput = {
+          user: {
+            id: MessageID.make("msg_user-protected-canonical"),
+            sessionID,
+            role: "user",
+            time: { created: Date.now() },
+            agent: agent.name,
+            model: { providerID: ProviderV2.ID.make("custom-provider"), modelID: resolved.id },
+          },
+          sessionID,
+          model: resolved,
+          agent,
+          system: [],
+          messages: distillationMessages(),
+          tools: {},
+          purpose: "conversation",
+          reasoningDistillation: {
+            ...history,
+            groups: history.groups.map((group) => ({
+              ...group,
+              parts: group.parts.map((part) => ({
+                ...part,
+                canonicalEditable: false,
+                canonicalProtection: "protected-carrier",
+              })),
+            })),
+          },
+          adoptReasoning: () =>
+            Effect.sync(() => {
+              adoptionCalls++
+              return true
+            }),
+        }
+        void waitRequest("/chat/completions", auxiliaryResponse({}))
+        const ctx = yield* InstanceRef
+        if (!ctx) throw new Error("InstanceRef not provided")
+        yield* Effect.promise(() =>
+          Effect.runPromise(
+            LLM.Service.use((svc) => svc.distill(input)).pipe(
+              Effect.provide(llmLayerWithExecutor(RequestExecutor.defaultLayer, { outputTokenMax: 4_096 })),
+              Effect.provideService(InstanceRef, ctx),
+            ),
+          ),
+        )
+        expect(adoptionCalls).toBe(0)
+        expect(state.queue).toHaveLength(1)
+      }),
+    { config: () => distillationConfig("opencode-ai-sdk") },
+  )
 
   it.instance(
     "streams OpenAI through native runtime when opted in",
