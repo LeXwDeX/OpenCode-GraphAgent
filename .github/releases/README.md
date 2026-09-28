@@ -1,29 +1,30 @@
 # Release Notes Series Files
 
 One markdown file per release series — `.github/releases/vX.Y.Z.md` — is the
-source of truth for the GitHub Release body. The `dev` prereleases
-(`X.Y.Z-dev.1 … dev.N`) and the `main` stable promotion (`X.Y.Z`) of a series
-all render the **same** file; only the channel word differs.
+source of truth for the GitHub Release body. New releases are stable `X.Y.Z`
+builds dispatched from `main`. Historical `X.Y.Z-dev.N` tags and notes remain
+valid records, but they no longer provide a release entry point or advance the
+next stable version.
 
 The read-only `prepare-release` job (`.github/workflows/release-fork.yml`)
 renders and validates the file, generates and verifies `SHA256SUMS`, and
-uploads one release-candidate artifact on every manual dispatch. The separate
+uploads one release-candidate artifact on every manual dispatch from `main`. A
+dispatch from another branch fails before building. The separate
 `publish-release` job receives the workflow's only `contents: write`
 permission and runs only when `create_release=true`. A missing or invalid notes
 file therefore blocks both a non-publishing candidate and a real release.
 
 ## Lifecycle
 
-1. **Series starts** — when `X.Y.Z` becomes the next version, the release job
+1. **Series starts** — the latest stable `graphagent-v*` tag determines the next
+   patch version. When `X.Y.Z` becomes the next version, the release job
    looks for `.github/releases/vX.Y.Z.md`. Until that file is committed, every
    release attempt of the series fails; the validator error names the exact
    expected path. This is intentional.
-2. **Dev prereleases** — each `X.Y.Z-dev.N` build re-renders the current file
-   content. Update the file as the series evolves.
-3. **Stable promotion** — the `main` release of `X.Y.Z` renders the same file;
-   `{Prerelease/Stable}` becomes `Stable`. The compare range always spans from
-   the last stable tag, not from the previous `-dev.N`.
-4. **Series closes** — after the stable release ships, the file remains as the
+2. **Stable release** — the `main` release of `X.Y.Z` renders the series file;
+   `{Prerelease/Stable}` becomes `Stable`. The compare range spans from the
+   latest stable tag. Historical `-dev.N` tags are ignored for version selection.
+3. **Series closes** — after the stable release ships, the file remains as the
    historical record. The next series needs its own new `vX.Y.(Z+1).md`.
 
 ## Placeholders
@@ -33,8 +34,8 @@ Five tokens are machine-substituted at render time:
 | Token                 | Replaced with                                        |
 | --------------------- | ---------------------------------------------------- |
 | `{VERSION}`           | bare semver, e.g. `1.0.10` (no `v` prefix)           |
-| `{Prerelease/Stable}` | `Prerelease` on `dev`, `Stable` on `main`            |
-| `{branch}`            | releasing branch name (`dev` or `main`)              |
+| `{Prerelease/Stable}` | `Stable`                                             |
+| `{branch}`            | `main`                                               |
 | `{previous_tag}`      | latest existing stable tag, e.g. `graphagent-v1.0.9` |
 | `{current_tag}`       | the tag being released, e.g. `graphagent-v1.0.10`    |
 

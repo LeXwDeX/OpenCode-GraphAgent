@@ -3,11 +3,10 @@
 # ----------------------------------------------------------------------------
 # Purpose : TypeScript type checking across all packages (bun typecheck),
 #           oxlint warning ratchet, and the DAG core behavior/coverage gate
-# Trigger : Push to `main`/`dev`, PRs targeting `main`/`dev`, manual dispatch
+# Trigger : Push to `main`, PRs targeting `main`, manual dispatch
 # Jobs    : typecheck — single Linux runner, `bun run lint` + `bun typecheck`
-# Gate    : Required status check on BOTH `dev` and `main` rulesets. The DAG
-#           core gate protects state-machine and persistence changes before
-#           they merge to dev; the full suite still gates dev → main.
+# Gate    : Required status check on `main` PRs. The DAG core gate protects
+#           state-machine and persistence changes before they merge to main.
 # Notes   : No push trigger on feat/* or fix/* (frequent changes); PRs cover
 #           them.
 # Trust   : push, manual dispatch and same-repository pull requests use the
@@ -24,13 +23,11 @@ on:
   push:
     branches:
       - main
-      - dev
   pull_request:
     # Re-run checks when a draft becomes ready for review.
     types: [opened, synchronize, reopened, ready_for_review]
     branches:
       - main
-      - dev
   workflow_dispatch:
 
 permissions:

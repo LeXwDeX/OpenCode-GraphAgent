@@ -1,5 +1,6 @@
 /** @jsxImportSource @opentui/solid */
 import { testRender } from "@opentui/solid"
+import type { JSX } from "@opentui/solid"
 import { onMount } from "solid-js"
 import { ArgsProvider } from "../../../../src/context/args"
 import { ExitProvider } from "../../../../src/context/exit"
@@ -21,7 +22,7 @@ export async function wait(fn: () => boolean, timeout = 2000) {
 
 type Ctx = { kv: ReturnType<typeof useKV>; project: ReturnType<typeof useProject>; sync: ReturnType<typeof useSync> }
 
-export async function mount(override?: FetchHandler, state?: string) {
+export async function mount(override?: FetchHandler, state?: string, extra?: () => JSX.Element) {
   const calls = createFetch(override)
   const events = createEventSource()
   let sync!: ReturnType<typeof useSync>
@@ -52,6 +53,7 @@ export async function mount(override?: FetchHandler, state?: string) {
               <ProjectProvider>
                 <SyncProvider>
                   <Probe />
+                  {extra?.()}
                 </SyncProvider>
               </ProjectProvider>
             </SDKProvider>

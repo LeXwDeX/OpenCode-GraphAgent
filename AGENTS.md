@@ -27,9 +27,9 @@ Guidance for coding agents in this repository (GraphAgent — an opencode fork w
 
 ## CI gates (.github/workflows)
 
-- GitHub default and integration branch: `dev`; stable release branch: `main`. Push CI runs only on `main`/`dev`; feature work lands via `{type}/**` branches and PRs.
-- `ci-typecheck.yml` (required on PRs to `main`/`dev`): lint → typecheck → DAG-core gate → `oc` installer boundary test.
-- `ci-test.yml` (full suite gates `dev` → `main`): `bun turbo test`, config_assistant Go tests, `check:generated` for `packages/client` and `packages/sdk/js`, HttpAPI exerciser (`test:httpapi:ci`), Playwright e2e (linux + windows).
+- GitHub default and stable release branch: `main`. Push CI runs on `main`; feature work lands via `{type}/**` branches and PRs targeting `main`.
+- `ci-typecheck.yml` (required on PRs to `main`): lint → typecheck → DAG-core gate → `oc` installer boundary test.
+- `ci-test.yml` (full suite gates every PR to `main`): `bun turbo test`, config_assistant Go tests, `check:generated` for `packages/client` and `packages/sdk/js`, HttpAPI exerciser (`test:httpapi:ci`), Playwright e2e (linux + windows).
 
 ## Generated code
 
@@ -44,14 +44,14 @@ Guidance for coding agents in this repository (GraphAgent — an opencode fork w
 ## Delivery (SpecGit 2)
 
 - Use the installed SpecGit 2 contract (`specgit --help`, `specgit --schema`) and the `specgit-native` skill. The shared declaration is `.specgit.yaml`; migration from a remaining v1 declaration must finish with `specgit migrate` before using v2 delivery commands.
-- Track complete Why/Scope/Approach/Acceptance Issues with `specgit issue`, aggregate with `specgit pr`, and observe native evidence with `specgit pr --status` / bounded `specgit watch`. Branch names remain `{type}/short-name`; feature work targets `dev`.
-- GitHub owns acceptance and merge. Both `dev` and `main` require `Typecheck` and `Unit Tests (linux)`; full E2E checks must also pass for the stable release. Check the current PR head, native merge state, and linked Issue closure separately. Never weaken required checks to complete a delivery.
+- Track complete Why/Scope/Approach/Acceptance Issues with `specgit issue`, aggregate with `specgit pr`, and observe native evidence with `specgit pr --status` / bounded `specgit watch`. Branch names remain `{type}/short-name`; feature work targets `main`.
+- GitHub owns acceptance and merge. PRs to `main` require `Typecheck` and `Unit Tests (linux)`; the full Linux and Windows E2E checks must also pass before merge. Check the current PR head, native merge state, and linked Issue closure separately. Never weaken required checks to complete a delivery.
 - Automatic merge and supplementary Issue closure default off. Native `gh` operations require user authorization from the current task; configuration grants none.
 - Retired v1 `finish`, local merge guards, and generated acceptance workflows are not part of v2. The bootstrap compatibility script forwards to v2 without regenerating project files. Historical release evidence remains historical.
 
 ## Releases
 
-- `release-fork.yml` manual `workflow_dispatch` is the only real build path: from `dev` → `X.Y.Z-dev.N` prerelease; from `main` → `X.Y.Z` marked Latest.
+- `release-fork.yml` manual `workflow_dispatch` from `main` is the only real build path: `X.Y.Z` stable release marked Latest. Historical `-dev.N` tags remain valid history but do not advance stable version selection.
 - Versions derive only from `graphagent-v*` tags (`packages/opencode/script/release-version.ts`); the opencode package version is ignored. Notes files must be named `.github/releases/v<derived-version>.md` exactly (fail-closed).
 
 ## Agent references

@@ -26,7 +26,14 @@ import { SplitBorder } from "../../ui/border"
 import { useTuiPaths, useTuiTerminalEnvironment } from "../../context/runtime"
 import { Spinner } from "../../component/spinner"
 import { createSyntaxStyleMemo, generateSubtleSyntax, selectedForeground, useTheme } from "../../context/theme"
-import { BoxRenderable, ScrollBoxRenderable, addDefaultParsers, TextAttributes, RGBA } from "@opentui/core"
+import {
+  BoxRenderable,
+  ScrollBoxRenderable,
+  addDefaultParsers,
+  TextAttributes,
+  RGBA,
+  type SyntaxStyle,
+} from "@opentui/core"
 import { Prompt, type PromptRef } from "../../component/prompt"
 import type {
   AssistantMessage,
@@ -1642,18 +1649,47 @@ function ReasoningPart(props: { last: boolean; part: ReasoningPart; message: Ass
         </box>
         <Show when={(!inMinimal() || expanded()) && summary().body}>
           <box paddingLeft={inMinimal() ? 2 : 0} marginTop={1}>
-            <code
-              filetype="markdown"
-              drawUnstyledText={false}
-              streaming={true}
-              syntaxStyle={syntax()}
+            <ReasoningMarkdown
               content={summary().body}
+              streaming={!isDone()}
+              syntaxStyle={syntax()}
               conceal={ctx.conceal()}
               fg={theme.textMuted}
             />
           </box>
         </Show>
       </box>
+    </Show>
+  )
+}
+
+export function ReasoningMarkdown(props: {
+  content: string
+  streaming: boolean
+  syntaxStyle: SyntaxStyle
+  conceal: boolean
+  fg: RGBA
+}) {
+  // A complete rewrite of a long markdown body reparses every block. Plain text keeps the full thought
+  // responsive; markdown markers remain visible instead of being concealed as formatting syntax.
+  const large = createMemo(() => Buffer.byteLength(props.content, "utf8") > 4 * 1024)
+  return (
+    <Show
+      when={large()}
+      fallback={
+        <markdown
+          streaming={props.streaming}
+          internalBlockMode="top-level"
+          syntaxStyle={props.syntaxStyle}
+          content={props.content}
+          conceal={props.conceal}
+          fg={props.fg}
+        />
+      }
+    >
+      <text fg={props.fg} wrapMode="word">
+        {props.content}
+      </text>
     </Show>
   )
 }
