@@ -48,6 +48,25 @@ const seed = Effect.fnUntraced(function* () {
     })
     .run()
     .pipe(Effect.orDie)
+  const user: SessionMessage.User = {
+    id: SessionMessage.ID.make("msg_adoption_user"),
+    type: "user",
+    text: "start",
+    time: { created: DateTime.makeUnsafe(0) },
+  }
+  const { id: _userID, type: userType, ...userData } = Schema.encodeSync(SessionMessage.User)(user)
+  yield* db
+    .insert(SessionMessageTable)
+    .values({
+      id: user.id,
+      type: userType,
+      data: userData,
+      session_id: sessionID,
+      seq: 0,
+      time_created: 0,
+    })
+    .run()
+    .pipe(Effect.orDie)
   const message: SessionMessage.Assistant = {
     id: SessionMessage.ID.make("msg_adoption"),
     type: "assistant",
@@ -63,21 +82,21 @@ const seed = Effect.fnUntraced(function* () {
   const { id: _id, type, ...data } = Schema.encodeSync(SessionMessage.Assistant)(message)
   yield* db
     .insert(SessionMessageTable)
-    .values({ id: message.id, type, data, session_id: sessionID, seq: 0, time_created: 1 })
+    .values({ id: message.id, type, data, session_id: sessionID, seq: 1, time_created: 1 })
     .run()
     .pipe(Effect.orDie)
   const replacements = [
     { messageID: message.id, partID: "r1", before: "first original", after: "first adopted" },
     { messageID: message.id, partID: "r2", before: "second original", after: "second adopted" },
   ]
-  return { db, events, store, sessionID, message, replacements }
+  return { db, events, store, sessionID, user, message, replacements }
 })
 
 describe("durable reasoning adoption", () => {
   it.effect("persists all accepted slots and reloads the same text into model context without provenance leakage", () =>
     Effect.gen(function* () {
-      const { db, events, store, sessionID, message, replacements } = yield* seed()
-      expect(yield* adoptReasoning(events, db, sessionID, [message], replacements)).toBe(true)
+      const { db, events, store, sessionID, user, message, replacements } = yield* seed()
+      expect(yield* adoptReasoning(events, db, sessionID, [user, message], replacements)).toBe(true)
       const stored = yield* store.message(message.id)
       expect(stored?.message).toMatchObject({
         content: [
@@ -87,23 +106,27 @@ describe("durable reasoning adoption", () => {
         ],
       })
       if (!stored) throw new Error("missing stored message")
-      const conversion = toLLMMessagesWithBindings([stored.message], model)
+      const conversion = toLLMMessagesWithBindings([stored.message], model, { reasoningDistillationEnabled: true })
       expect(conversion.reasoningBindings.every((part) => part.distilled)).toBe(true)
       expect(JSON.stringify(conversion.messages)).not.toContain("original")
       expect(JSON.stringify(conversion.messages)).toContain("first adopted")
       const switched = toLLMMessagesWithBindings(
         [stored.message],
         Model.make({ id: "other", provider: model.provider, route: model.route }),
+        { reasoningDistillationEnabled: true },
       )
       expect(JSON.stringify(switched.messages)).toContain("first adopted")
       expect(JSON.stringify(switched.messages)).not.toContain("original")
-      expect(yield* adoptReasoning(events, db, sessionID, [stored.message], replacements)).toBe(false)
+      const disabled = toLLMMessagesWithBindings([stored.message], model)
+      expect(JSON.stringify(disabled.messages)).toContain("first original")
+      expect(JSON.stringify(disabled.messages)).not.toContain("first adopted")
+      expect(yield* adoptReasoning(events, db, sessionID, [user, stored.message], replacements)).toBe(false)
     }),
   )
 
   it.effect("rejects the entire batch before emitting events when any persisted source has changed", () =>
     Effect.gen(function* () {
-      const { db, events, store, sessionID, message, replacements } = yield* seed()
+      const { db, events, store, sessionID, user, message, replacements } = yield* seed()
       const changed = {
         ...message,
         content: message.content.map((part) => (part.id === "r2" ? { ...part, text: "newer second" } : part)),
@@ -115,7 +138,7 @@ describe("durable reasoning adoption", () => {
         .where(eq(SessionMessageTable.id, message.id))
         .run()
         .pipe(Effect.orDie)
-      expect(yield* adoptReasoning(events, db, sessionID, [message], replacements)).toBe(false)
+      expect(yield* adoptReasoning(events, db, sessionID, [user, message], replacements)).toBe(false)
       expect((yield* store.message(message.id))?.message).toEqual(changed)
       expect(yield* db.select().from(EventTable).all().pipe(Effect.orDie)).toEqual([])
     }),
@@ -136,8 +159,46 @@ describe("durable reasoning adoption", () => {
   )
   it.effect("checks the switch again inside the adoption transaction", () =>
     Effect.gen(function* () {
-      const { db, events, store, sessionID, message, replacements } = yield* seed()
-      expect(yield* adoptReasoning(events, db, sessionID, [message], replacements, Effect.succeed(false))).toBe(false)
+      const { db, events, store, sessionID, user, message, replacements } = yield* seed()
+      expect(yield* adoptReasoning(events, db, sessionID, [user, message], replacements, Effect.succeed(false))).toBe(
+        false,
+      )
+      expect((yield* store.message(message.id))?.message).toEqual(message)
+      expect(yield* db.select().from(EventTable).all().pipe(Effect.orDie)).toEqual([])
+    }),
+  )
+
+  it.effect("rejects adoption after a revert or a new continuation message", () =>
+    Effect.gen(function* () {
+      const { db, events, store, sessionID, user, message, replacements } = yield* seed()
+      yield* db
+        .update(SessionTable)
+        .set({ revert: { messageID: user.id } })
+        .where(eq(SessionTable.id, sessionID))
+        .run()
+        .pipe(Effect.orDie)
+      expect(yield* adoptReasoning(events, db, sessionID, [user, message], replacements)).toBe(false)
+      yield* db
+        .update(SessionTable)
+        .set({ revert: null })
+        .where(eq(SessionTable.id, sessionID))
+        .run()
+        .pipe(Effect.orDie)
+      const retry = { ...message, id: SessionMessage.ID.make("msg_retry") }
+      const { id: _id, type, ...data } = Schema.encodeSync(SessionMessage.Assistant)(retry)
+      yield* db
+        .insert(SessionMessageTable)
+        .values({
+          id: retry.id,
+          type,
+          data,
+          session_id: sessionID,
+          seq: 2,
+          time_created: 3,
+        })
+        .run()
+        .pipe(Effect.orDie)
+      expect(yield* adoptReasoning(events, db, sessionID, [user, message], replacements)).toBe(false)
       expect((yield* store.message(message.id))?.message).toEqual(message)
       expect(yield* db.select().from(EventTable).all().pipe(Effect.orDie)).toEqual([])
     }),

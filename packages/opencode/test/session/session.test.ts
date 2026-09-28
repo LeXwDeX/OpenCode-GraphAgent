@@ -357,7 +357,9 @@ describe("adopted reasoning", () => {
         .pipe(Effect.orDie)
       expect(JSON.stringify(mirror?.data)).toContain(replacements[0].after)
       const model = ProviderTest.model({ id: info.modelID, providerID: info.providerID })
-      const plain = yield* MessageV2.toModelMessagesEffect(reloaded, model)
+      const plain = yield* MessageV2.toModelMessagesEffect(reloaded, model, {
+        reasoningDistillationEnabled: true,
+      })
       expect(JSON.stringify(plain)).toContain(replacements[0].after)
       expect(JSON.stringify(plain)).not.toContain(reasoning.text)
       expect(JSON.stringify(plain)).not.toContain("sourceFingerprint")

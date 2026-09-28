@@ -529,7 +529,12 @@ export type SessionsContextOutput = {
               readonly type: "reasoning"
               readonly id: string
               readonly text: string
-              readonly distillation?: { readonly originalText: string; readonly sourceFingerprint: string } | null
+              readonly distillation?: {
+                readonly originalText: string
+                readonly sourceFingerprint: string
+                readonly version?: 2 | null
+                readonly originalMetadata?: { readonly [x: string]: any } | null
+              } | null
               readonly providerMetadata?: { readonly [x: string]: { readonly [x: string]: JsonValue } } | null
             }
           | {
