@@ -5058,7 +5058,7 @@ const distillationIt = testEffect(makeHttp({ distill: (input) => Effect.suspend(
 
 for (const continuesBeforeAdoption of [false, true] as const)
   distillationIt.instance(
-    `first full turn waits; background adoption ${continuesBeforeAdoption ? "rejects later-turn race" : "succeeds before later turn"}`,
+    `first full turn returns; background adoption ${continuesBeforeAdoption ? "rejects later-turn race" : "succeeds before later turn"}`,
     () =>
       Effect.gen(function* () {
         const { llm } = yield* useServerConfig((url) => ({
@@ -5109,11 +5109,12 @@ for (const continuesBeforeAdoption of [false, true] as const)
         yield* llm.push(reply().reason("original-0").text("first answer").stop())
         const first = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
         yield* awaitWithTimeout(Deferred.await(starts[0]), "first distillation did not start")
-        expect(first.pollUnsafe()).toBeUndefined()
+        const completed = yield* awaitWithTimeout(Fiber.join(first), "first turn waited for background distillation")
+        expect(completed.parts.some((part) => part.type === "reasoning" && part.text === "original-0")).toBe(true)
         expect(thinking(yield* sessions.messages({ sessionID: chat.id }))).toEqual(["original-0"])
         yield* Deferred.succeed(releases[0], undefined)
-        const completed = yield* Fiber.join(first)
-        expect(completed.parts.some((part) => part.type === "reasoning" && part.text === "distilled-0")).toBe(true)
+        yield* awaitWithTimeout(Deferred.await(finishes[0]), "first background distillation did not finish")
+        expect(thinking(yield* sessions.messages({ sessionID: chat.id }))).toEqual(["distilled-0"])
 
         yield* send("second")
         yield* llm.push(reply().reason("original-1").text("second answer").stop())
@@ -5160,6 +5161,7 @@ distillationIt.instance("tool steps form one distillation turn and include all n
       permission: [{ permission: "*", pattern: "*", action: "allow" }],
     })
     let calls = 0
+    const adopted = yield* Deferred.make<void>()
     controlledDistill = (input) =>
       Effect.gen(function* () {
         calls++
@@ -5177,6 +5179,7 @@ distillationIt.instance("tool steps form one distillation turn and include all n
             })),
           ),
         ).toBe(true)
+        yield* Deferred.succeed(adopted, undefined)
       })
     yield* prompt.prompt({
       sessionID: chat.id,
@@ -5191,6 +5194,7 @@ distillationIt.instance("tool steps form one distillation turn and include all n
       reply().reason("final thinking").text("answer").stop(),
     )
     yield* prompt.loop({ sessionID: chat.id })
+    yield* awaitWithTimeout(Deferred.await(adopted), "tool-step distillation did not adopt")
     expect(calls).toBe(1)
     const parts = (yield* sessions.messages({ sessionID: chat.id })).flatMap((message) => message.parts)
     expect(parts.filter((part) => part.type === "reasoning").map((part) => part.text)).toEqual([

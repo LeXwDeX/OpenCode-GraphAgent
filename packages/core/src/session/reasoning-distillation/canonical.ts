@@ -92,7 +92,7 @@ export const replaceCanonicalReasoning = (
   | Readonly<{ text: string; metadata?: Record<string, unknown>; originalMetadata?: Record<string, unknown> }>
   | undefined => {
   const assessment = assessCanonicalReasoning(source)
-  if (!assessment.editable || !after.trim() || after === source.text) return undefined
+  if (!assessment.editable || after === source.text) return undefined
   if (source.metadata === undefined || Object.keys(source.metadata).length === 0)
     return { text: after, metadata: source.metadata }
   let copy: Record<string, unknown>

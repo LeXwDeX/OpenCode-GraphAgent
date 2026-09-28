@@ -72,12 +72,16 @@ export type Error =
 
 export interface Interface {
   readonly resolve: (session: SessionSchema.Info) => Effect.Effect<Model, Error>
+  readonly resolveSmall: (providerID: ProviderV2.ID, configured?: string) => Effect.Effect<Model | undefined, Error>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/v2/SessionRunnerModel") {}
 
 /** Test or embedding seam for supplying a model resolver directly. */
-export const layerWith = (resolve: Interface["resolve"]) => Layer.succeed(Service, Service.of({ resolve }))
+export const layerWith = (
+  resolve: Interface["resolve"],
+  resolveSmall: Interface["resolveSmall"] = () => Effect.succeed(undefined),
+) => Layer.succeed(Service, Service.of({ resolve, resolveSmall }))
 
 const apiKey = (model: ModelV2.Info, credential?: Credential.Value) => {
   if (credential?.type === "key") return Auth.value(credential.key)
@@ -184,6 +188,26 @@ export const locationLayer = Layer.effect(
     const catalog = yield* Catalog.Service
     const integrations = yield* Integration.Service
     return Service.of({
+      resolveSmall: Effect.fn("SessionRunnerModel.resolveSmall")(function* (providerID, configured) {
+        const ref = configured === undefined ? undefined : ModelV2.parse(configured)
+        const selected = ref
+          ? (yield* catalog.model.available()).find(
+              (model) => model.providerID === ref.providerID && model.id === ref.modelID && supported(model),
+            )
+          : yield* catalog.model.small(providerID)
+        if (!selected && ref)
+          return yield* new ModelUnavailableError({ providerID: ref.providerID, modelID: ref.modelID })
+        if (!selected || !supported(selected)) return undefined
+        const provider = yield* catalog.provider.get(selected.providerID)
+        const connection = yield* integrations.connection.active(
+          provider?.integrationID ?? Integration.ID.make(selected.providerID),
+        )
+        const variant = yield* withVariant(selected, undefined)
+        return yield* fromCatalogModel(
+          variant,
+          connection ? yield* integrations.connection.resolve(connection) : undefined,
+        )
+      }),
       resolve: Effect.fn("SessionRunnerModel.resolve")(function* (session) {
         // Location plugins populate and filter the catalog asynchronously during layer startup.
         const defaultModel = session.model ? undefined : yield* catalog.model.default()

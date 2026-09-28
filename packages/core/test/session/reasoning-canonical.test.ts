@@ -87,6 +87,29 @@ describe("canonical reasoning editability", () => {
     })
   })
 
+  test("empty distilled text updates a plaintext mirror and restores the original on disabled replay", () => {
+    const metadata = {
+      relay: { reasoning_details: [{ type: "reasoning.text", text: "ORIGINAL", format: "unknown", index: 0 }] },
+    }
+    const edited = replaceCanonicalReasoning(plain(metadata), "")
+    expect(edited?.text).toBe("")
+    expect(edited?.metadata).toEqual({
+      relay: { reasoning_details: [{ type: "reasoning.text", text: "", format: "unknown", index: 0 }] },
+    })
+    expect(
+      reasoningForReplay({
+        text: "",
+        metadata: edited?.metadata,
+        distillation: {
+          originalText: "ORIGINAL",
+          originalMetadata: metadata,
+          version: 2,
+        },
+        enabled: false,
+      }),
+    ).toEqual({ text: "ORIGINAL", metadata })
+  })
+
   test("legacy adoption never replays a mixed text and carrier pair", () => {
     const metadata = {
       relay: { reasoning_details: [{ type: "reasoning.text", text: "ORIGINAL", format: "unknown", index: 0 }] },

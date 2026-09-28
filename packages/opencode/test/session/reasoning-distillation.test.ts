@@ -3,6 +3,8 @@ import type { PreparedRequestBudgetInput } from "@opencode-ai/core/session/conte
 import {
   ReasoningDistillationPolicy,
   COVERAGE_CONTRACT,
+  DENOISING_CONTRACT,
+  REVIEW_RETENTION_CONTRACT,
   capabilityFingerprint,
   type Candidate,
   type ClaimSupport,
@@ -1146,6 +1148,7 @@ describe("prompt builders (§5.4.1 / §5.5.3)", () => {
     expect(prompt).toContain("bash c1 completed")
     expect(prompt).toContain("coverage")
     expect(prompt).toContain(COVERAGE_CONTRACT)
+    expect(prompt).toContain(DENOISING_CONTRACT)
   })
 
   test("propose prompt exposes the real span identities so models can cite resolvable messageID/partID values", () => {
@@ -1175,6 +1178,7 @@ describe("prompt builders (§5.4.1 / §5.5.3)", () => {
     expect(prompt).toContain("G4")
     expect(prompt).toContain("c1")
     expect(prompt).toContain("采用方案A")
+    expect(prompt).toContain(REVIEW_RETENTION_CONTRACT)
   })
 })
 
@@ -1412,19 +1416,44 @@ describe("persisted history to final W1 lineage", () => {
 })
 
 describe("review regressions: conservation and source binding", () => {
-  test.each(["drop", "preserve", "merge"] as const)("never clears an entire slot through %s coverage", (action) => {
-    const request = wireRequest(TEXT),
-      source = spanFor(TEXT)
-    const coverage =
-      action === "drop"
-        ? { source, action, reason: "noise" }
-        : action === "merge"
-          ? { source, action, witness: source }
-          : { source, action }
-    const candidate = { ...validCandidate(TEXT), claims: [], preserved: [], coverage: [coverage] }
-    const result = projectDistillationAISDK(baseInput(request, { candidate, support: [], retentionSupport: undefined }))
-    expect(result.applied).toBe(false)
-    expect(result.request).toBe(request)
+  test.each(["drop", "preserve", "merge"] as const)(
+    "never clears an entire slot through unreviewed %s coverage",
+    (action) => {
+      const request = wireRequest(TEXT),
+        source = spanFor(TEXT)
+      const coverage =
+        action === "drop"
+          ? { source, action, reason: "noise" }
+          : action === "merge"
+            ? { source, action, witness: source }
+            : { source, action }
+      const candidate = { ...validCandidate(TEXT), claims: [], preserved: [], coverage: [coverage] }
+      const result = projectDistillationAISDK(
+        baseInput(request, { candidate, support: [], retentionSupport: undefined }),
+      )
+      expect(result.applied).toBe(false)
+      expect(result.request).toBe(request)
+    },
+  )
+  test("projects an all-noise slot to empty only after independent retention approval", () => {
+    const request = wireRequest(TEXT)
+    const candidate = {
+      ...validCandidate(TEXT),
+      claims: [],
+      preserved: [],
+      coverage: [{ source: spanFor(TEXT), action: "drop" as const, reason: "仅重复填充" }],
+    }
+    const result = projectDistillationAISDK(
+      baseInput(request, {
+        candidate,
+        support: [],
+        retentionSupport: { verdict: "supported", method: "judged" },
+        judgeFingerprint: "independent-review",
+      }),
+    )
+    expect(result.applied).toBe(true)
+    expect(result.request.messages[0].reasoning).toBe("")
+    expect(request.messages[0].reasoning).toBe(TEXT)
   })
   test("renders uncertainty and superseded decisions in the actual outbound text", () => {
     const text = "最初采用 A，随后改为 B；部署成功只是未验证假设。".repeat(50)
@@ -1450,8 +1479,9 @@ describe("review regressions: conservation and source binding", () => {
       }),
     )
     expect(result.applied).toBe(true)
-    expect(result.request.messages[0].reasoning).toContain("未验证")
-    expect(result.request.messages[0].reasoning).toContain("已被 new 取代")
+    expect(result.request.messages[0].reasoning).toContain("未核验")
+    expect(result.request.messages[0].reasoning).toContain("已被后续判断取代")
+    expect(result.request.messages[0].reasoning).not.toContain("new")
     expect(result.request.messages[0].reasoning).toContain("假设")
   })
   test("accepts source subranges and rejects tampered fingerprints", () => {

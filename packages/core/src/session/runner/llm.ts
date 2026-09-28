@@ -595,6 +595,7 @@ export const layer = Layer.effect(
                     ),
                   enabled,
                   work: Effect.gen(function* () {
+                    const maintenanceStarted = performance.now()
                     const reasoningConfig = Config.latest(yield* config.entries(), "reasoningDistillation")
                     if (!reasoningConfig) return
                     const sources = completed
@@ -652,16 +653,29 @@ export const layer = Layer.effect(
                     }
                     const completedRequest = LLM.updateRequest(request, { messages: latestConversion.messages })
                     const prepared = yield* llm.prepare(completedRequest)
+                    const configuredSmall = Config.latest(yield* config.entries(), "small_model")
+                    const auxiliaryModel = yield* models
+                      .resolveSmall(ProviderV2.ID.make(model.provider), configuredSmall)
+                      .pipe(Effect.catch(() => Effect.succeed(undefined)))
+                    if (!auxiliaryModel) {
+                      yield* Effect.logInfo("reasoning distillation skipped", {
+                        "reasoning_distillation.target": "canonical",
+                        "reasoning_distillation.skip_reason": "small-model-unavailable",
+                      })
+                      return
+                    }
                     const distilled = yield* reasoningDistillation.distill({
                       sessionID: session.id,
                       variant: session.model?.variant,
                       request: completedRequest,
+                      auxiliaryModel,
                       prepared,
                       sourceMessages: completed,
                       bindings: canonicalBindings,
                       target: "canonical",
                       config: reasoningConfig,
                     })
+                    const adoptStarted = performance.now()
                     const adopted =
                       distilled.applied &&
                       (yield* enabled) &&
@@ -679,12 +693,26 @@ export const layer = Layer.effect(
                           }),
                         ),
                       ))
+                    const adoptMs = performance.now() - adoptStarted
                     yield* Effect.logInfo("reasoning distillation", {
                       "reasoning_distillation.runtime": "core-runner",
                       "reasoning_distillation.applied": adopted,
                       "reasoning_distillation.attempted": distilled.attempted,
                       "reasoning_distillation.skip_reason": distilled.skipReason ?? "none",
                       "reasoning_distillation.aux_actual_tokens": distilled.usage?.actualTokens ?? 0,
+                      "reasoning_distillation.model_ms": distilled.timing?.modelMs ?? 0,
+                      "reasoning_distillation.parse_ms": distilled.timing?.parseMs ?? 0,
+                      "reasoning_distillation.collect_ms": Math.max(
+                        0,
+                        adoptStarted -
+                          maintenanceStarted -
+                          (distilled.timing?.modelMs ?? 0) -
+                          (distilled.timing?.parseMs ?? 0),
+                      ),
+                      "reasoning_distillation.adopt_ms": adoptMs,
+                      "reasoning_distillation.total_ms": performance.now() - maintenanceStarted,
+                      "reasoning_distillation.model_calls": distilled.modelCalls ?? 0,
+                      "reasoning_distillation.organize_reason": distilled.organizeReason ?? "none",
                     })
                   }).pipe(Effect.asVoid),
                 }),

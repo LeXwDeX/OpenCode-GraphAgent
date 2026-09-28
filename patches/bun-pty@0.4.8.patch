@@ -1,0 +1,52 @@
+diff --git a/src/terminal.ts b/src/terminal.ts
+--- a/src/terminal.ts
++++ b/src/terminal.ts
+@@ -143,6 +143,7 @@
+ 
+ 	private readonly _onData = new EventEmitter<string>();
+ 	private readonly _onExit = new EventEmitter<IExitEvent>();
++	private _exitEvent: IExitEvent | undefined;
+ 
+ 	constructor(
+ 		file = DEFAULT_FILE,
+@@ -194,7 +195,21 @@
+ 		return this._onData.event;
+ 	}
+ 	get onExit() {
+-		return this._onExit.event;
++		return (listener: (event: IExitEvent) => void) => {
++			const exited = this._exitEvent;
++			if (!exited) return this._onExit.event(listener);
++			let disposed = false;
++			queueMicrotask(() => {
++				if (!disposed) listener(exited);
++			});
++			return { dispose: () => { disposed = true; } };
++		};
++	}
++
++	private fireExit(event: IExitEvent) {
++		if (this._exitEvent) return;
++		this._exitEvent = event;
++		this._onExit.fire(event);
+ 	}
+ 
+ 	/* ------------- IO methods ------------- */
+@@ -217,7 +232,7 @@
+ 		this._closing = true;
+ 		lib.symbols.bun_pty_kill(this.handle);
+ 		lib.symbols.bun_pty_close(this.handle);
+-		this._onExit.fire({ exitCode: 0, signal });
++		this.fireExit({ exitCode: 0, signal });
+ 	}
+ 
+ 	/* ------------- read-loop ------------- */
+@@ -244,7 +259,7 @@
+ 					this._onData.fire(remaining);
+ 				}
+ 				const exitCode = lib.symbols.bun_pty_get_exit_code(this.handle);
+-				this._onExit.fire({ exitCode });
++				this.fireExit({ exitCode });
+ 				break;
+ 			} else if (n < 0) {
+ 				// error - flush decoder before breaking

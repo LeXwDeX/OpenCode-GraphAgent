@@ -4,6 +4,7 @@ import {
   claimEquivalence,
   bindSourceAliases,
   planReasoningDistillation,
+  renderDistillation,
   resolveExecutionMatch,
   resolveExecutionVerdict,
   spanKey,
@@ -24,7 +25,7 @@ import {
   type WireReasoningMapping,
 } from "../../src/session/reasoning-distillation"
 
-const POLICY_VERSION = "reasoning-distillation-v1"
+const POLICY_VERSION = "reasoning-distillation-v2-denoise"
 
 const span = (messageID: string, partID: string, start: number, end: number, fingerprint?: string): SourceSpan => ({
   messageID,
@@ -623,5 +624,59 @@ describe("planReasoningDistillation (§5.2)", () => {
 describe("spanKey", () => {
   test("distinguishes spans by fingerprint", () => {
     expect(spanKey(span("m1", "p1", 0, 10, "a"))).not.toBe(spanKey(span("m1", "p1", 0, 10, "b")))
+  })
+})
+
+describe("denoised projection", () => {
+  test("renders a variable number of claims without schema IDs and retains scope, uncertainty, and change", () => {
+    const before = claim("old", { text: "先使用缓存", status: "assumed" })
+    const after = claim("new", {
+      text: "缓存失效后改为直读",
+      kind: "state_delta",
+      scope: "本次请求",
+      status: "unverified",
+      supersedes: "old",
+    })
+    const rendered = renderDistillation([before, after], [], () => "")
+    expect(rendered).toContain("先使用缓存")
+    expect(rendered).toContain("缓存失效后改为直读")
+    expect(rendered).toContain("本次请求")
+    expect(rendered).toContain("暂作假设")
+    expect(rendered).toContain("未核验")
+    expect(rendered).toContain("取代此前判断")
+    expect(rendered).not.toMatch(/\bold\b|\bnew\b|claimID/)
+    expect(renderDistillation([], [], () => "")).toBe("")
+    expect(
+      renderDistillation([after, ...Array.from({ length: 5 }, (_, i) => claim(`extra${i}`))], [], () => "").split("\n"),
+    ).toHaveLength(6)
+  })
+
+  test("all-drop candidate needs independent review and then projects empty text", () => {
+    const spans = [span("m1", "p1", 0, 10)]
+    const cand = candidate([], [{ source: spans[0], action: "drop", reason: "仅口头填充" }])
+    const unreviewed = planReasoningDistillation(
+      planInput({ candidate: cand, evidence: evidence(spans), retentionSupport: undefined }),
+    )
+    expect(unreviewed).toMatchObject({ extraCall: "judge", replacements: [] })
+    const deterministicOnly = planReasoningDistillation(planInput({ candidate: cand, evidence: evidence(spans) }))
+    expect(deterministicOnly).toMatchObject({ extraCall: "judge", replacements: [] })
+    const reviewed = planReasoningDistillation(
+      planInput({
+        candidate: cand,
+        evidence: evidence(spans),
+        retentionSupport: { verdict: "supported", method: "judged" },
+        judgeFingerprint: "independent-review",
+      }),
+    )
+    expect(reviewed.replacements[0]?.projection).toMatchObject({ text: "", claims: [], preserved: [] })
+    expect(reviewed.replacements[0]?.validation).toMatchObject({ method: "judged" })
+    const contradicted = planReasoningDistillation(
+      planInput({
+        candidate: cand,
+        evidence: evidence(spans),
+        retentionSupport: { verdict: "contradicted", method: "judged" },
+      }),
+    )
+    expect(contradicted).toMatchObject({ skipReason: "retention-contract-violated", replacements: [] })
   })
 })

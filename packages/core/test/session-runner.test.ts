@@ -67,20 +67,18 @@ const requests: LLMRequest[] = []
 let reasoningConfig: ConfigReasoningDistillation.Info | undefined
 let auxiliary: LLMClientShape["generate"] | undefined
 const prepareDistillation = (request: LLMRequest) =>
-  request.model.route.body
-    .from(request)
-    .pipe(
-      Effect.map(
-        (body) =>
-          new PreparedRequest({
-            id: "distillation-test",
-            route: request.model.route.id,
-            protocol: request.model.route.protocol,
-            model: request.model,
-            body,
-          }),
-      ),
-    )
+  request.model.route.body.from(request).pipe(
+    Effect.map(
+      (body) =>
+        new PreparedRequest({
+          id: "distillation-test",
+          route: request.model.route.id,
+          protocol: request.model.route.protocol,
+          model: request.model,
+          body,
+        }),
+    ),
+  )
 
 let response: LLMEvent[] = []
 let responses: LLMEvent[][] | undefined
@@ -183,8 +181,9 @@ const echo = Layer.effectDiscard(
 ).pipe(Layer.provide(registry))
 let modelResolveHook = Effect.void
 let currentModel = model
-const models = SessionRunnerModel.layerWith((session) =>
-  modelResolveHook.pipe(Effect.as(session.model?.id === "replacement" ? replacementModel : currentModel)),
+const models = SessionRunnerModel.layerWith(
+  (session) => modelResolveHook.pipe(Effect.as(session.model?.id === "replacement" ? replacementModel : currentModel)),
+  () => Effect.succeed(Model.make({ id: "small-distillation", provider: "fake", route: OpenAIChat.route })),
 )
 const systemContextKey = SystemContext.Key.make("test/context")
 let systemBaseline = "Initial context"
@@ -3265,45 +3264,24 @@ it.effect("Core runner adopts every slot at turn completion and asynchronously r
         }),
       ],
     })
-    const started = yield* Deferred.make<void>()
-    const release = yield* Deferred.make<void>()
+    const firstStarted = yield* Deferred.make<void>()
+    const releaseFirst = yield* Deferred.make<void>()
+    const secondStarted = yield* Deferred.make<void>()
+    const releaseSecond = yield* Deferred.make<void>()
     let calls = 0
     auxiliary = (request) =>
       Effect.gen(function* () {
-        if (calls++ === 4) {
-          yield* Deferred.succeed(started, undefined)
-          yield* Deferred.await(release)
+        expect(String(request.model.id)).toBe("small-distillation")
+        const index = calls++
+        if (index === 0) {
+          yield* Deferred.succeed(firstStarted, undefined)
+          yield* Deferred.await(releaseFirst)
         }
-        const prompt = request.messages
-          .flatMap((message) => message.content.flatMap((part) => (part.type === "text" ? [part.text] : [])))
-          .join("\n")
-        const ref = /messageID=([^，]+)，partID=([^，]+)，长度=(\d+)/.exec(prompt)
-        const output = ref
-          ? {
-              claims: [
-                {
-                  id: "claim",
-                  kind: "decision",
-                  text: `采用-${ref[2]}`,
-                  scope: "当前回合",
-                  sources: [{ messageID: ref[1], partID: ref[2], start: 0, end: Number(ref[3]) }],
-                  evidence: [],
-                  status: "unverified",
-                },
-              ],
-              preserved: [],
-              coverage: [
-                {
-                  source: { messageID: ref[1], partID: ref[2], start: 0, end: Number(ref[3]) },
-                  action: "keep",
-                  claimID: "claim",
-                },
-              ],
-            }
-          : {
-              retention: { verdict: "supported" },
-              support: [{ claimID: "claim", verdict: "supported", method: "judged" }],
-            }
+        if (index === 1) {
+          yield* Deferred.succeed(secondStarted, undefined)
+          yield* Deferred.await(releaseSecond)
+        }
+        const output = { items: [0, 1].map((slot) => ({ slot, text: `采用-r-${index + 1}-${slot}` })) }
         const result = LLMResponse.fromEvents([
           LLMEvent.stepStart({ index: 0 }),
           LLMEvent.textStart({ id: "aux" }),
@@ -3332,13 +3310,23 @@ it.effect("Core runner adopts every slot at turn completion and asynchronously r
       LLMEvent.finish({ reason: "stop" }),
     ]
     yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "first" }), resume: false })
+    const firstUpdates = yield* events.subscribe(SessionEvent.Reasoning.Ended).pipe(
+      Stream.filter((event) => event.data.distillation !== undefined),
+      Stream.take(2),
+      Stream.runDrain,
+      Effect.forkChild,
+    )
     response = answer(1)
     yield* session.resume(sessionID)
-    expect(calls).toBe(4)
+    yield* Deferred.await(firstStarted)
+    expect(JSON.stringify(yield* session.context(sessionID))).not.toContain("采用-r-1-0")
+    yield* Deferred.succeed(releaseFirst, undefined)
+    yield* Fiber.join(firstUpdates)
+    expect(calls).toBe(1)
     expect(JSON.stringify(yield* session.context(sessionID))).toContain("采用-r-1-0")
     expect(JSON.stringify(yield* session.context(sessionID))).toContain("采用-r-1-1")
 
-    const updates = yield* events.subscribe(SessionEvent.Reasoning.Ended).pipe(
+    const secondUpdates = yield* events.subscribe(SessionEvent.Reasoning.Ended).pipe(
       Stream.filter((event) => event.data.distillation !== undefined),
       Stream.take(2),
       Stream.runDrain,
@@ -3347,13 +3335,13 @@ it.effect("Core runner adopts every slot at turn completion and asynchronously r
     yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "second" }), resume: false })
     response = answer(2)
     yield* session.resume(sessionID)
-    yield* Deferred.await(started)
+    yield* Deferred.await(secondStarted)
     expect(JSON.stringify(requests.at(-1)?.messages)).toContain("采用-r-1-0")
     expect(JSON.stringify(requests.at(-1)?.messages)).not.toContain("original-1")
     expect(JSON.stringify(yield* session.context(sessionID))).not.toContain("采用-r-2-0")
-    yield* Deferred.succeed(release, undefined)
-    yield* Fiber.join(updates)
-    expect(calls).toBe(8)
+    yield* Deferred.succeed(releaseSecond, undefined)
+    yield* Fiber.join(secondUpdates)
+    expect(calls).toBe(2)
     yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "third" }), resume: false })
     response = []
     yield* session.resume(sessionID)

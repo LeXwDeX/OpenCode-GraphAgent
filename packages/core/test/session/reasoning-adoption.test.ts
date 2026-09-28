@@ -157,6 +157,27 @@ describe("durable reasoning adoption", () => {
       ])
     }),
   )
+  it.effect("adopts a reviewed empty result and restores the original when disabled", () =>
+    Effect.gen(function* () {
+      const { db, events, store, sessionID, user, message } = yield* seed()
+      const replacement = { messageID: message.id, partID: "r1", before: "first original", after: "" }
+      expect(
+        reasoningReplacements({ messages: [{ reasoning: "" }] }, [
+          { messageID: message.id, partID: "r1", text: "first original", bodyPath: ["messages", 0, "reasoning"] },
+        ]),
+      ).toEqual([replacement])
+      expect(yield* adoptReasoning(events, db, sessionID, [user, message], [replacement])).toBe(true)
+      const stored = yield* store.message(message.id)
+      if (!stored || stored.message.type !== "assistant") throw new Error("missing stored assistant message")
+      expect(stored.message.content[0]).toMatchObject({ text: "", distillation: { originalText: "first original" } })
+      expect(
+        JSON.stringify(
+          toLLMMessagesWithBindings([stored.message], model, { reasoningDistillationEnabled: true }).messages,
+        ),
+      ).not.toContain("first original")
+      expect(JSON.stringify(toLLMMessagesWithBindings([stored.message], model).messages)).toContain("first original")
+    }),
+  )
   it.effect("checks the switch again inside the adoption transaction", () =>
     Effect.gen(function* () {
       const { db, events, store, sessionID, user, message, replacements } = yield* seed()

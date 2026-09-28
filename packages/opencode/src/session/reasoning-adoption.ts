@@ -41,7 +41,7 @@ export const adoptReasoning = Effect.fn("Session.adoptReasoning")(function* (inp
       part.text !== replacement.before ||
       part.time.end === undefined ||
       part.distillation ||
-      !replacement.after.trim() ||
+      replacement.after === replacement.before ||
       seen.has(part.id)
     )
       return false

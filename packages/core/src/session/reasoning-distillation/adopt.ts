@@ -32,7 +32,7 @@ export const adoptReasoning = Effect.fn("CoreReasoningDistillation.adopt")(funct
       part.type !== "reasoning" ||
       part.distillation ||
       part.text !== replacement.before ||
-      !replacement.after.trim() ||
+      replacement.after === replacement.before ||
       seen.has(key)
     )
       return false

@@ -21,7 +21,7 @@ export function reasoningReplacements(
 ): ReasoningReplacement[] {
   return slots.flatMap((slot) => {
     const value = readWirePath(request, slot.bodyPath)
-    if (!value.ok || typeof value.value !== "string" || !value.value.trim() || value.value === slot.text) return []
+    if (!value.ok || typeof value.value !== "string" || value.value === slot.text) return []
     return [{ messageID: slot.messageID, partID: slot.partID, before: slot.text, after: value.value }]
   })
 }
