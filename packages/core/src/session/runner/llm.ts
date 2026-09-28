@@ -559,22 +559,22 @@ export const layer = Layer.effect(
           yield* withPublication(batch.flush())
           if (stream._tag === "Failure") return yield* Effect.failCause(stream.cause)
           if (settled._tag === "Failure") return yield* Effect.failCause(settled.cause)
-          if (!publisher.hasProviderError() && !needsContinuation) {
+          const enabled = config.entries().pipe(
+            Effect.map(
+              (entries) =>
+                ConfigReasoningDistillation.resolveEnabled({
+                  disabledByEnvironment: Flag.OPENCODE_DISABLE_REASONING_DISTILLATION,
+                  enabled: Config.latest(entries, "reasoningDistillation")?.enabled,
+                }).enabled,
+            ),
+          )
+          if (!publisher.hasProviderError() && !needsContinuation && (yield* enabled)) {
             const completed = yield* getContext(session.id)
             const userIndex = completed.findLastIndex((message) => message.type === "user")
             const turnID = completed[userIndex]?.id
             if (turnID) {
               const turnIDs = new Set(completed.slice(userIndex + 1).map((message) => message.id))
               const latestConversion = toLLMMessagesWithBindings(completed, model)
-              const enabled = config.entries().pipe(
-                Effect.map(
-                  (entries) =>
-                    ConfigReasoningDistillation.resolveEnabled({
-                      disabledByEnvironment: Flag.OPENCODE_DISABLE_REASONING_DISTILLATION,
-                      enabled: Config.latest(entries, "reasoningDistillation")?.enabled,
-                    }).enabled,
-                ),
-              )
               yield* restore(
                 scheduleDistillation({
                   sessionID: session.id,
@@ -603,8 +603,10 @@ export const layer = Layer.effect(
                       ),
                       config: reasoningConfig,
                     })
-                    if (distilled.applied && (yield* enabled))
-                      yield* adoptReasoning(
+                    const adopted =
+                      distilled.applied &&
+                      (yield* enabled) &&
+                      (yield* adoptReasoning(
                         events,
                         db,
                         session.id,
@@ -617,7 +619,14 @@ export const layer = Layer.effect(
                             if (adopted) cursors.delete(session.id)
                           }),
                         ),
-                      )
+                      ))
+                    yield* Effect.logInfo("reasoning distillation", {
+                      "reasoning_distillation.runtime": "core-runner",
+                      "reasoning_distillation.applied": adopted,
+                      "reasoning_distillation.attempted": distilled.attempted,
+                      "reasoning_distillation.skip_reason": distilled.skipReason ?? "none",
+                      "reasoning_distillation.aux_actual_tokens": distilled.usage?.actualTokens ?? 0,
+                    })
                   }).pipe(Effect.asVoid),
                 }),
               )
