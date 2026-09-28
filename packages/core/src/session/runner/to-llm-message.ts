@@ -11,7 +11,11 @@ import {
 } from "@opencode-ai/llm"
 import type { FoldRef } from "../context-folding/types"
 import { SessionMessage } from "../message"
+import { reasoningForReplay } from "../reasoning-distillation/canonical"
 import type { FileAttachment } from "../prompt"
+
+const isProviderMetadata = (value: Record<string, unknown>): value is ProviderMetadata =>
+  Object.values(value).every((item) => typeof item === "object" && item !== null && !Array.isArray(item))
 
 const media = (file: FileAttachment): ContentPart => ({
   type: "media",
@@ -86,6 +90,7 @@ export type ToolMessageBinding = Readonly<{
 
 export type ReasoningMessageBinding = Readonly<{
   distilled?: boolean
+  aliasCount?: number
   ref: Readonly<{ messageID: string; partID: string }>
   /** Exact path in the canonical LLM request, resolved without matching on text. */
   bodyPath: readonly (string | number)[]
@@ -114,7 +119,9 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value)
 
 const containsMetadataKey = (value: unknown, keys: ReadonlySet<string>, depth = 0): boolean => {
-  if (depth > 8 || !isRecord(value)) return false
+  if (depth > 8) return false
+  if (Array.isArray(value)) return value.some((item) => containsMetadataKey(item, keys, depth + 1))
+  if (!isRecord(value)) return false
   for (const [key, item] of Object.entries(value)) {
     if (keys.has(key) && item !== undefined && item !== null && item !== "") return true
     if (containsMetadataKey(item, keys, depth + 1)) return true
@@ -122,7 +129,11 @@ const containsMetadataKey = (value: unknown, keys: ReadonlySet<string>, depth = 
   return false
 }
 
-const assistant = (message: SessionMessage.Assistant, model: Model): MessageConversion => {
+const assistant = (
+  message: SessionMessage.Assistant,
+  model: Model,
+  distillationEnabled: boolean,
+): MessageConversion => {
   const sameModel =
     String(message.model.providerID) === String(model.provider) && String(message.model.id) === String(model.id)
   const toolBindings: ToolMessageBinding[] = []
@@ -134,23 +145,33 @@ const assistant = (message: SessionMessage.Assistant, model: Model): MessageConv
       return [{ type: "text", text: item.text }]
     }
     if (item.type === "reasoning") {
+      const replay = reasoningForReplay({
+        text: item.text,
+        metadata: item.providerMetadata,
+        distillation: item.distillation,
+        enabled: distillationEnabled,
+      })
       if (!sameModel) {
-        if (item.text.length === 0) return []
+        if (replay.text.length === 0) return []
         canonicalContentIndex++
-        return [{ type: "text", text: item.text }]
+        return [{ type: "text", text: replay.text }]
       }
-      const part: ContentPart = { type: "reasoning", text: item.text, providerMetadata: item.providerMetadata }
+      const part: ContentPart = {
+        type: "reasoning",
+        text: replay.text,
+        providerMetadata: replay.metadata && isProviderMetadata(replay.metadata) ? replay.metadata : undefined,
+      }
       const meaningful =
-        item.text !== "" || (item.providerMetadata !== undefined && Object.keys(item.providerMetadata).length > 0)
+        replay.text !== "" || (replay.metadata !== undefined && Object.keys(replay.metadata).length > 0)
       if (meaningful) {
         reasoningBindings.push({
           ref: { messageID: message.id, partID: item.id },
           messageIndex: 0,
           contentIndex: canonicalContentIndex,
-          text: item.text,
-          signed: containsMetadataKey(item.providerMetadata, new Set(["signature", "reasoningOpaque"])),
+          text: replay.text,
+          signed: containsMetadataKey(replay.metadata, new Set(["signature", "reasoningOpaque"])),
           encrypted: containsMetadataKey(
-            item.providerMetadata,
+            replay.metadata,
             new Set(["encrypted_content", "encryptedContent", "reasoningEncryptedContent"]),
           ),
           settled: message.time.completed !== undefined,
@@ -192,7 +213,7 @@ const assistant = (message: SessionMessage.Assistant, model: Model): MessageConv
   }
 }
 
-function toLLMMessage(message: SessionMessage.Message, model: Model): MessageConversion {
+function toLLMMessage(message: SessionMessage.Message, model: Model, distillationEnabled: boolean): MessageConversion {
   switch (message.type) {
     case "agent-switched":
     case "model-switched":
@@ -235,7 +256,7 @@ function toLLMMessage(message: SessionMessage.Message, model: Model): MessageCon
         reasoningBindings: [],
       }
     case "assistant":
-      return assistant(message, model)
+      return assistant(message, model, distillationEnabled)
     case "compaction":
       return {
         messages: [
@@ -267,8 +288,11 @@ ${message.recent}
 export const toLLMMessagesWithBindings = (
   messages: readonly SessionMessage.Message[],
   model: Model,
+  options: { reasoningDistillationEnabled?: boolean } = {},
 ): LLMMessageConversion => {
-  const converted = messages.map((message) => toLLMMessage(message, model))
+  const converted = messages.map((message) =>
+    toLLMMessage(message, model, options.reasoningDistillationEnabled === true),
+  )
   let messageOffset = 0
   const reasoningBindings: ReasoningMessageBinding[] = []
   for (const item of converted) {
@@ -293,5 +317,8 @@ export const toLLMMessagesWithBindings = (
 }
 
 /** Translate projected V2 Session history into canonical @opencode-ai/llm context. */
-export const toLLMMessages = (messages: readonly SessionMessage.Message[], model: Model) =>
-  toLLMMessagesWithBindings(messages, model).messages
+export const toLLMMessages = (
+  messages: readonly SessionMessage.Message[],
+  model: Model,
+  options: { reasoningDistillationEnabled?: boolean } = {},
+) => toLLMMessagesWithBindings(messages, model, options).messages

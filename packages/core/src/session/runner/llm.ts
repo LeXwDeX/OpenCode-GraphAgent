@@ -1,5 +1,6 @@
 import { makeTurnScheduler } from "../reasoning-distillation/schedule"
 import { adoptReasoning } from "../reasoning-distillation/adopt"
+import { assessCanonicalReasoning } from "../reasoning-distillation/canonical"
 import {
   LLM,
   LLMClient,
@@ -363,7 +364,11 @@ export const layer = Layer.effect(
       const isLastStep = agent.info?.steps !== undefined && currentStep >= agent.info.steps
       const toolMaterialization = isLastStep ? undefined : yield* tools.materialize(agent.info?.permissions)
       const promptCacheKey = /^ses_[0-9a-f]{64}$/.test(session.id) ? session.id.slice(4) : session.id
-      const conversion = toLLMMessagesWithBindings(context, model)
+      const reasoningEnabled = ConfigReasoningDistillation.resolveEnabled({
+        disabledByEnvironment: Flag.OPENCODE_DISABLE_REASONING_DISTILLATION,
+        enabled: Config.latest(yield* config.entries(), "reasoningDistillation")?.enabled,
+      }).enabled
+      const conversion = toLLMMessagesWithBindings(context, model, { reasoningDistillationEnabled: reasoningEnabled })
       const expectedMessages = [...conversion.messages, ...(isLastStep ? [Message.assistant(MAX_STEPS_PROMPT)] : [])]
       const preparedRequest = LLM.request({
         model,
@@ -574,7 +579,9 @@ export const layer = Layer.effect(
             const turnID = completed[userIndex]?.id
             if (turnID) {
               const turnIDs = new Set(completed.slice(userIndex + 1).map((message) => message.id))
-              const latestConversion = toLLMMessagesWithBindings(completed, model)
+              const latestConversion = toLLMMessagesWithBindings(completed, model, {
+                reasoningDistillationEnabled: true,
+              })
               yield* restore(
                 scheduleDistillation({
                   sessionID: session.id,
@@ -589,7 +596,60 @@ export const layer = Layer.effect(
                   enabled,
                   work: Effect.gen(function* () {
                     const reasoningConfig = Config.latest(yield* config.entries(), "reasoningDistillation")
-                    if (!reasoningConfig?.compatibility?.length) return
+                    if (!reasoningConfig) return
+                    const sources = completed
+                      .filter(
+                        (message): message is SessionMessage.Assistant =>
+                          message.type === "assistant" && turnIDs.has(message.id),
+                      )
+                      .flatMap((message) =>
+                        message.content.filter((part) => part.type === "reasoning").map((part) => ({ message, part })),
+                      )
+                    const counts = new Map<string, number>()
+                    for (const { message, part } of sources) {
+                      const key = JSON.stringify([message.id, part.id])
+                      counts.set(key, (counts.get(key) ?? 0) + 1)
+                    }
+                    const protectionReasons: Record<string, number> = {}
+                    const canonicalBindings = sources.flatMap(({ message, part }) => {
+                      const eligible = assessCanonicalReasoning({
+                        text: part.text,
+                        metadata: part.providerMetadata,
+                        settled: message.time.completed !== undefined,
+                        distilled: part.distillation !== undefined,
+                      })
+                      const reason =
+                        counts.get(JSON.stringify([message.id, part.id])) !== 1
+                          ? "non-unique-identity"
+                          : eligible.editable
+                            ? undefined
+                            : eligible.reason
+                      if (reason) protectionReasons[reason] = (protectionReasons[reason] ?? 0) + 1
+                      if (reason) return []
+                      return [
+                        {
+                          ref: { messageID: message.id, partID: part.id },
+                          bodyPath: [] as const,
+                          text: part.text,
+                          signed: false,
+                          encrypted: false,
+                          settled: true,
+                          distilled: false,
+                          aliasCount: eligible.editable ? eligible.aliasPaths.length : 0,
+                        },
+                      ]
+                    })
+                    yield* Effect.logInfo("reasoning distillation canonical selection", {
+                      "reasoning_distillation.canonical_candidates": canonicalBindings.length,
+                      "reasoning_distillation.protection_reasons": protectionReasons,
+                    })
+                    if (canonicalBindings.length === 0) {
+                      yield* Effect.logInfo("reasoning distillation skipped", {
+                        "reasoning_distillation.target": "canonical",
+                        "reasoning_distillation.skip_reason": "no-editable-canonical-source",
+                      })
+                      return
+                    }
                     const completedRequest = LLM.updateRequest(request, { messages: latestConversion.messages })
                     const prepared = yield* llm.prepare(completedRequest)
                     const distilled = yield* reasoningDistillation.distill({
@@ -598,9 +658,8 @@ export const layer = Layer.effect(
                       request: completedRequest,
                       prepared,
                       sourceMessages: completed,
-                      bindings: latestConversion.reasoningBindings.filter((binding) =>
-                        turnIDs.has(SessionMessage.ID.make(binding.ref.messageID)),
-                      ),
+                      bindings: canonicalBindings,
+                      target: "canonical",
                       config: reasoningConfig,
                     })
                     const adopted =

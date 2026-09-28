@@ -1,5 +1,6 @@
 import { readWirePath } from "../context-folding/wire-value"
 import { Hash } from "../../util/hash"
+import type { CanonicalReasoning } from "./canonical"
 
 export type ReasoningReplacement = Readonly<{
   messageID: string
@@ -25,7 +26,9 @@ export function reasoningReplacements(
   })
 }
 
-export const adoptionProvenance = (originalText: string) => ({
-  originalText,
-  sourceFingerprint: Hash.sha256(originalText),
+export const adoptionProvenance = (source: CanonicalReasoning) => ({
+  originalText: source.text,
+  sourceFingerprint: Hash.sha256(source.text),
+  version: 2 as const,
+  ...(source.metadata === undefined ? {} : { originalMetadata: source.metadata }),
 })

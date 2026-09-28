@@ -11,6 +11,7 @@ import {
   adoptionProvenance,
   type ReasoningReplacement,
 } from "@opencode-ai/core/session/reasoning-distillation/adoption"
+import { replaceCanonicalReasoning } from "@opencode-ai/core/session/reasoning-distillation/canonical"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Session } from "./session"
 import type { SessionID } from "./schema"
@@ -44,14 +45,17 @@ export const adoptReasoning = Effect.fn("Session.adoptReasoning")(function* (inp
       seen.has(part.id)
     )
       return false
+    const source = { text: part.text, metadata: part.metadata, settled: true, distilled: false }
+    const edited = replaceCanonicalReasoning(source, replacement.after)
+    if (!edited) return false
     seen.add(part.id)
     sources.push(part)
-    const distillation = adoptionProvenance(part.text)
+    const distillation = adoptionProvenance(source)
     entries.push({
       definition: SessionV1.Event.PartUpdated,
       data: {
         sessionID: input.sessionID,
-        part: { ...part, text: replacement.after, distillation },
+        part: { ...part, text: edited.text, metadata: edited.metadata, distillation },
         time: Date.now(),
       },
     })
@@ -62,8 +66,8 @@ export const adoptReasoning = Effect.fn("Session.adoptReasoning")(function* (inp
           sessionID: input.sessionID,
           assistantMessageID: SessionMessage.ID.make(part.v2.messageID),
           reasoningID: part.v2.reasoningID,
-          text: replacement.after,
-          providerMetadata: part.metadata,
+          text: edited.text,
+          providerMetadata: edited.metadata,
           distillation,
           timestamp: DateTime.makeUnsafe(Date.now()),
         },
@@ -85,6 +89,8 @@ export const adoptReasoning = Effect.fn("Session.adoptReasoning")(function* (inp
         yield* Effect.die("reasoning source user was changed")
     }
     const sourceIDs = new Set(input.sources.map((message) => message.info.id))
+    if (currentMessages.some((message) => !sourceIDs.has(message.info.id)))
+      yield* Effect.die("reasoning turn was retried or continued")
     const parentIDs = new Set(
       input.sources
         .filter(

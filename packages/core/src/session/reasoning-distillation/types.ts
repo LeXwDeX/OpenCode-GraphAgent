@@ -115,6 +115,7 @@ export type SlotEligibility =
   | Readonly<{ allowed: false; protection: ProtectionClass }>
 
 export type WireReasoningMapping = Readonly<{
+  authority?: "canonical" | "native-wire"
   refs: readonly SourceRef[]
   shape: ReasoningSlotShape
   eligibility: SlotEligibility
