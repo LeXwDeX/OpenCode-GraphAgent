@@ -1,0 +1,342 @@
+{
+  "measured_at_utc": "2026-09-28T19:31:59.717827+00:00",
+  "model": "local-proxy-compatible/deepseek",
+  "requested_effort": "low",
+  "passed": true,
+  "cases": [
+    {
+      "id": "one-conclusion",
+      "policy": "reasoning-distillation-v2-denoise",
+      "elapsedMs": 30238.000541,
+      "checks": {
+        "applied": true,
+        "adoption": true,
+        "required": true,
+        "forbidden": true,
+        "dynamicCount": true,
+        "empty": true,
+        "effort": true
+      },
+      "passed": true,
+      "claimCount": 1,
+      "after": "- 决定：测试任务的重试上限设为5次。（适用：测试任务；未核验）",
+      "attempted": "judge",
+      "skipReason": null,
+      "stages": [
+        {
+          "role": "direct",
+          "elapsedMs": 4194.416792,
+          "headersMs": 4158.37875,
+          "promptCharacters": 1065,
+          "answerCharacters": 52,
+          "reasoningCharacters": 1371,
+          "usage": 1602,
+          "finishReason": "stop",
+          "wire": {
+            "model": "deepseek",
+            "effort": "low",
+            "stream": false,
+            "maxTokens": 24576
+          }
+        },
+        {
+          "role": "propose",
+          "elapsedMs": 13375.197500000002,
+          "headersMs": 13307.751458000002,
+          "promptCharacters": 4085,
+          "answerCharacters": 1785,
+          "reasoningCharacters": 4788,
+          "usage": 5182,
+          "finishReason": "stop",
+          "wire": {
+            "model": "deepseek",
+            "effort": "low",
+            "stream": false,
+            "maxTokens": 24576
+          }
+        },
+        {
+          "role": "judge",
+          "elapsedMs": 16849.852959000003,
+          "headersMs": 16783.512500000004,
+          "promptCharacters": 5369,
+          "answerCharacters": 113,
+          "reasoningCharacters": 7044,
+          "usage": 6207,
+          "finishReason": "stop",
+          "wire": {
+            "model": "deepseek",
+            "effort": "low",
+            "stream": false,
+            "maxTokens": 24576
+          }
+        }
+      ]
+    },
+    {
+      "id": "deduplicate",
+      "policy": "reasoning-distillation-v2-denoise",
+      "elapsedMs": 25075.698875000002,
+      "checks": {
+        "applied": true,
+        "adoption": true,
+        "required": true,
+        "forbidden": true,
+        "dynamicCount": true,
+        "empty": true,
+        "effort": true
+      },
+      "passed": true,
+      "claimCount": 1,
+      "after": "- 约束：仅限测试环境，请求超时为30秒，不得写入生产数据库。（适用：测试环境；请求；生产数据库；未核验）",
+      "attempted": "judge",
+      "skipReason": null,
+      "stages": [
+        {
+          "role": "propose",
+          "elapsedMs": 17979.945207999997,
+          "headersMs": 17912.101457999997,
+          "promptCharacters": 4073,
+          "answerCharacters": 1723,
+          "reasoningCharacters": 7133,
+          "usage": 6336,
+          "finishReason": "stop",
+          "wire": {
+            "model": "deepseek",
+            "effort": "low",
+            "stream": false,
+            "maxTokens": 24576
+          }
+        },
+        {
+          "role": "judge",
+          "elapsedMs": 7091.166541999999,
+          "headersMs": 7057.7514999999985,
+          "promptCharacters": 5311,
+          "answerCharacters": 113,
+          "reasoningCharacters": 3021,
+          "usage": 4039,
+          "finishReason": "stop",
+          "wire": {
+            "model": "deepseek",
+            "effort": "low",
+            "stream": false,
+            "maxTokens": 24576
+          }
+        }
+      ]
+    },
+    {
+      "id": "different-scopes",
+      "policy": "reasoning-distillation-v2-denoise",
+      "elapsedMs": 17864.627624999994,
+      "checks": {
+        "applied": true,
+        "adoption": true,
+        "required": true,
+        "forbidden": true,
+        "dynamicCount": true,
+        "empty": true,
+        "effort": true
+      },
+      "passed": true,
+      "claimCount": 6,
+      "after": "- 约束：alpha服务在测试环境最多重试2次。（适用：测试环境，alpha服务；未核验）\n- 约束：beta服务在生产环境禁止重试，次数为0。（适用：生产环境，beta服务；未核验）\n- 约束：gamma任务输出必须保存到 /tmp/gamma.json。（适用：gamma任务；未核验）\n- 约束：delta流程不能删除原始记录。（适用：delta流程；未核验）\n- 约束：epsilon服务仅允许读取缓存。（适用：epsilon服务；未核验）\n- 约束：zeta请求超时为45秒。（适用：zeta请求；未核验）",
+      "attempted": "judge",
+      "skipReason": null,
+      "stages": [
+        {
+          "role": "propose",
+          "elapsedMs": 9558.622708000003,
+          "headersMs": 9499.777582999996,
+          "promptCharacters": 4227,
+          "answerCharacters": 2485,
+          "reasoningCharacters": 5377,
+          "usage": 4548,
+          "finishReason": "stop",
+          "wire": {
+            "model": "deepseek",
+            "effort": "low",
+            "stream": false,
+            "maxTokens": 24576
+          }
+        },
+        {
+          "role": "judge",
+          "elapsedMs": 8304.367041000005,
+          "headersMs": 8268.073749999996,
+          "promptCharacters": 6452,
+          "answerCharacters": 433,
+          "reasoningCharacters": 3575,
+          "usage": 4799,
+          "finishReason": "stop",
+          "wire": {
+            "model": "deepseek",
+            "effort": "low",
+            "stream": false,
+            "maxTokens": 24576
+          }
+        }
+      ]
+    },
+    {
+      "id": "meaningful-rejection",
+      "policy": "reasoning-distillation-v2-denoise",
+      "elapsedMs": 26758.655958999996,
+      "checks": {
+        "applied": true,
+        "adoption": true,
+        "required": true,
+        "forbidden": true,
+        "dynamicCount": true,
+        "empty": true,
+        "effort": true
+      },
+      "passed": true,
+      "claimCount": 1,
+      "after": "- 决定：因方案A不支持当前必须使用的离线协议，否决方案A，最终选择方案B；该离线协议限制仍成立，后续不要重新选方案A；方案B尚未执行，不能视为已完成。（适用：当前必须使用离线协议的任务；涉及后续方案选择与方案B执行状态。；未核验）",
+      "attempted": "judge",
+      "skipReason": null,
+      "stages": [
+        {
+          "role": "propose",
+          "elapsedMs": 19616.10220899999,
+          "headersMs": 19546.00016699999,
+          "promptCharacters": 3917,
+          "answerCharacters": 1639,
+          "reasoningCharacters": 7743,
+          "usage": 6418,
+          "finishReason": "stop",
+          "wire": {
+            "model": "deepseek",
+            "effort": "low",
+            "stream": false,
+            "maxTokens": 24576
+          }
+        },
+        {
+          "role": "judge",
+          "elapsedMs": 7140.520958999987,
+          "headersMs": 7106.3846249999915,
+          "promptCharacters": 5119,
+          "answerCharacters": 113,
+          "reasoningCharacters": 2751,
+          "usage": 3937,
+          "finishReason": "stop",
+          "wire": {
+            "model": "deepseek",
+            "effort": "low",
+            "stream": false,
+            "maxTokens": 24576
+          }
+        }
+      ]
+    },
+    {
+      "id": "unresolved",
+      "policy": "reasoning-distillation-v2-denoise",
+      "elapsedMs": 13467.719334000009,
+      "checks": {
+        "applied": true,
+        "adoption": true,
+        "required": true,
+        "forbidden": true,
+        "dynamicCount": true,
+        "empty": true,
+        "effort": true
+      },
+      "passed": true,
+      "claimCount": 1,
+      "after": "- 决定：日志提示可能是网络超时，也可能是锁竞争；目前没有证据排除其中任何一个，尚未确定原因；下一步只读检查超时日志，暂不修改配置。（适用：当前超时问题排查中，日志提示原因未确定时；未核验）",
+      "attempted": "judge",
+      "skipReason": null,
+      "stages": [
+        {
+          "role": "propose",
+          "elapsedMs": 7500.8372919999965,
+          "headersMs": 7464.526541999992,
+          "promptCharacters": 3908,
+          "answerCharacters": 1708,
+          "reasoningCharacters": 2368,
+          "usage": 3841,
+          "finishReason": "stop",
+          "wire": {
+            "model": "deepseek",
+            "effort": "low",
+            "stream": false,
+            "maxTokens": 24576
+          }
+        },
+        {
+          "role": "judge",
+          "elapsedMs": 5964.979999999996,
+          "headersMs": 5927.032999999996,
+          "promptCharacters": 5158,
+          "answerCharacters": 113,
+          "reasoningCharacters": 2367,
+          "usage": 3709,
+          "finishReason": "stop",
+          "wire": {
+            "model": "deepseek",
+            "effort": "low",
+            "stream": false,
+            "maxTokens": 24576
+          }
+        }
+      ]
+    },
+    {
+      "id": "all-noise",
+      "policy": "reasoning-distillation-v2-denoise",
+      "elapsedMs": 4614.694417000006,
+      "checks": {
+        "applied": true,
+        "adoption": true,
+        "required": true,
+        "forbidden": true,
+        "dynamicCount": true,
+        "empty": true,
+        "effort": true
+      },
+      "passed": true,
+      "claimCount": 0,
+      "after": "",
+      "attempted": "judge",
+      "skipReason": null,
+      "stages": [
+        {
+          "role": "propose",
+          "elapsedMs": 2631.329083000004,
+          "headersMs": 2594.4712080000027,
+          "promptCharacters": 4176,
+          "answerCharacters": 1615,
+          "reasoningCharacters": 696,
+          "usage": 2957,
+          "finishReason": "stop",
+          "wire": {
+            "model": "deepseek",
+            "effort": "low",
+            "stream": false,
+            "maxTokens": 24576
+          }
+        },
+        {
+          "role": "judge",
+          "elapsedMs": 1980.8722500000003,
+          "headersMs": 1942.109208000009,
+          "promptCharacters": 5291,
+          "answerCharacters": 118,
+          "reasoningCharacters": 640,
+          "usage": 2860,
+          "finishReason": "stop",
+          "wire": {
+            "model": "deepseek",
+            "effort": "low",
+            "stream": false,
+            "maxTokens": 24576
+          }
+        }
+      ]
+    }
+  ]
+}

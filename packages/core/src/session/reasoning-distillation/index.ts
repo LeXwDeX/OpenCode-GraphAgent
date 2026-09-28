@@ -29,12 +29,15 @@ export type { GateEvaluation, GateID, GateViolation } from "./gates"
 export {
   bindSourceAliases,
   COVERAGE_CONTRACT,
+  DENOISING_CONTRACT,
   ORGANIZER_OUTPUT_FORMAT,
+  REVIEW_RETENTION_CONTRACT,
   planReasoningDistillation,
   renderDistillation,
   renderSourceRanges,
 } from "./plan"
 export { ReasoningDistillationPolicy } from "./policy"
+export { compactCandidateForReview } from "./review"
 export { projectDistillationRequest } from "./projection"
 export { capabilityFingerprint, classifySlotEligibility } from "./slot"
 export type { CompatibilityRecord, SlotAssessment, SlotCapability } from "./slot"

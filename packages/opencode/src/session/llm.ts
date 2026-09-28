@@ -274,12 +274,35 @@ const live: Layer.Layer<
       const bridge = yield* EffectBridge.make()
 
       const callAuxiliary = organizerResolution
-        ? async (prompt: string) =>
+        ? async (role: "propose" | "judge", prompt: string) =>
             bridge.promise(
               Effect.gen(function* () {
                 const selected = organizerResolution.tier === "small" ? organizer : input.model
                 if (!selected)
                   return yield* Effect.fail(new ReasoningDistillation.AuxiliaryCallError({ category: "transport" }))
+                const started = performance.now()
+                const observe = (
+                  success: boolean,
+                  category: string,
+                  outputCharacters: number,
+                  reasoningCharacters = 0,
+                  reportedTotalTokens?: number,
+                ) =>
+                  Effect.logInfo("reasoning distillation auxiliary model call", {
+                    "session.id": input.sessionID,
+                    "reasoning_distillation.aux_role": role,
+                    "reasoning_distillation.aux_tier": organizerResolution.tier,
+                    "reasoning_distillation.aux_provider": selected.providerID,
+                    "reasoning_distillation.aux_model": selected.id,
+                    "reasoning_distillation.aux_requested_effort": "low",
+                    "reasoning_distillation.aux_duration_ms": Math.max(0, performance.now() - started),
+                    "reasoning_distillation.aux_estimated_input_tokens": Math.ceil(prompt.length / 4),
+                    "reasoning_distillation.aux_output_characters": outputCharacters,
+                    "reasoning_distillation.aux_reasoning_characters": reasoningCharacters,
+                    "reasoning_distillation.aux_reported_total_tokens": reportedTotalTokens ?? "unknown",
+                    "reasoning_distillation.aux_success": success,
+                    "reasoning_distillation.aux_failure_category": category,
+                  })
                 const organizerLanguage = yield* provider.getLanguage(selected)
                 const settled = yield* Effect.tryPromise({
                   try: (signal) =>
@@ -301,6 +324,7 @@ const live: Layer.Layer<
                   Effect.timeout(`${Flag.OPENCODE_REASONING_DISTILLATION_AUX_TIMEOUT_MS} millis`),
                   Effect.map((result) => ({ ok: true as const, result })),
                   Effect.catch((cause) => Effect.succeed({ ok: false as const, cause })),
+                  Effect.onInterrupt(() => observe(false, "abort", 0)),
                 )
                 if (!settled.ok) {
                   const category: ReasoningDistillation.AuxiliaryFailureCategory = input.abort.aborted
@@ -311,9 +335,11 @@ const live: Layer.Layer<
                   yield* Effect.logWarning("reasoning distillation auxiliary call failed", {
                     "reasoning_distillation.aux_failure_category": category,
                   })
+                  yield* observe(false, category, 0)
                   return yield* Effect.fail(new ReasoningDistillation.AuxiliaryCallError({ category }))
                 }
                 const result = settled.result
+                const reasoningCharacters = result.reasoningText?.length ?? 0
                 const usageTokens =
                   typeof result.totalUsage?.totalTokens === "number" ? result.totalUsage.totalTokens : undefined
                 if (usageTokens === undefined)
@@ -325,6 +351,7 @@ const live: Layer.Layer<
                   yield* Effect.logWarning("reasoning distillation auxiliary output exceeded limit", {
                     "reasoning_distillation.aux_text_length": result.text.length,
                   })
+                  yield* observe(false, "oversize", result.text.length, reasoningCharacters, usageTokens)
                   return yield* Effect.fail(
                     new ReasoningDistillation.AuxiliaryCallError({
                       category: "oversize",
@@ -333,14 +360,17 @@ const live: Layer.Layer<
                   )
                 }
                 try {
+                  const output = strictJSON(result.text)
+                  yield* observe(true, "none", result.text.length, reasoningCharacters, usageTokens)
                   return {
-                    output: strictJSON(result.text),
+                    output,
                     ...(usageTokens === undefined ? {} : { usageTokens }),
                   }
                 } catch {
                   yield* Effect.logWarning("reasoning distillation auxiliary output was not valid JSON", {
                     "reasoning_distillation.aux_text_length": result.text.length,
                   })
+                  yield* observe(false, "parse", result.text.length, reasoningCharacters, usageTokens)
                   return yield* Effect.fail(
                     new ReasoningDistillation.AuxiliaryCallError({
                       category: "parse",
@@ -424,8 +454,8 @@ const live: Layer.Layer<
                   records: cfg.reasoningDistillation?.compatibility ?? [],
                   organizerFingerprint: organizerResolution.organizerFingerprint,
                   originalTokens: Math.ceil(selected.reduce((total, slot) => total + slot.text.length, 0) / 4),
-                  callPropose: callAuxiliary,
-                  callJudge: callAuxiliary,
+                  callPropose: callAuxiliary && ((prompt) => callAuxiliary("propose", prompt)),
+                  callJudge: callAuxiliary && ((prompt) => callAuxiliary("judge", prompt)),
                   commitState: (next) => {
                     if (!input.abort.aborted && current.generation === generation) current.current = next
                   },

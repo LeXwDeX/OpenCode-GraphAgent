@@ -1,6 +1,6 @@
 import { Cause, Effect, Scope, Semaphore } from "effect"
 
-/** One submission per completed user turn. First submission blocks; later ones belong to the service scope. */
+/** One submission per completed user turn. Work belongs to the service scope, including the first turn. */
 export const makeTurnScheduler = (scope: Scope.Scope) => {
   const sessions = new Map<string, { turns: Set<string>; lock: Semaphore.Semaphore }>()
   return Effect.fn("ReasoningDistillation.schedule")(function* (input: {
@@ -12,7 +12,6 @@ export const makeTurnScheduler = (scope: Scope.Scope) => {
   }) {
     if (!(yield* input.enabled)) return
     let state = sessions.get(input.sessionID)
-    const first = !state && !input.previouslyDistilled
     if (!state) {
       state = { turns: new Set(), lock: Semaphore.makeUnsafe(1) }
       sessions.set(input.sessionID, state)
@@ -32,7 +31,6 @@ export const makeTurnScheduler = (scope: Scope.Scope) => {
             : Effect.logWarning("reasoning distillation failed; retaining current history"),
         ),
       )
-    if (first) yield* work
-    else yield* work.pipe(Effect.forkIn(scope))
+    yield* work.pipe(Effect.forkIn(scope))
   })
 }

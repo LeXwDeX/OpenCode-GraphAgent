@@ -185,7 +185,11 @@ export const evaluateGates = (
     candidate.claims.length > 0 ||
     candidate.coverage.some((entry) => entry.action === "drop" || entry.action === "merge")
   const retention = options.retentionSupport
-  let needsSemanticReview = semanticChange && (!retention || retention.verdict === "unknown")
+  // Empty output erases the entire source slot. Require an independent judge even if a caller supplies a
+  // deterministic whole-source verdict; structural coverage alone cannot certify that everything was noise.
+  const emptyOutput = candidate.claims.length === 0 && candidate.preserved.length === 0
+  let needsSemanticReview =
+    semanticChange && (!retention || retention.verdict === "unknown" || (emptyOutput && retention.method !== "judged"))
   let anyJudged = semanticChange && retention?.verdict === "supported" && retention.method === "judged"
   if (semanticChange && retention?.verdict === "contradicted") {
     g2Failed = true

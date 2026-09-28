@@ -27,7 +27,7 @@ const key = (overrides: Partial<DistillationKey> = {}): DistillationKey => ({
   sourceFingerprint: "src1",
   capabilityFingerprint: "cap1",
   organizerFingerprint: "org1",
-  policyVersion: "reasoning-distillation-v1",
+  policyVersion: "reasoning-distillation-v2-denoise",
   ...overrides,
 })
 

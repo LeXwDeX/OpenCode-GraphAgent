@@ -20,7 +20,7 @@ import {
   type WireReasoningMapping,
 } from "../../src/session/reasoning-distillation"
 
-const POLICY_VERSION = "reasoning-distillation-v1"
+const POLICY_VERSION = "reasoning-distillation-v2-denoise"
 
 const span = (messageID: string, partID: string, start: number, end: number): SourceSpan => ({
   messageID,

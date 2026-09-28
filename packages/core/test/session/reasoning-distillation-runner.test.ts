@@ -14,7 +14,7 @@ import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { SessionMessage } from "@opencode-ai/core/session/message"
 import * as CoreReasoningDistillation from "@opencode-ai/core/session/runner/reasoning-distillation"
-import { COVERAGE_CONTRACT } from "@opencode-ai/core/session/reasoning-distillation"
+import { COVERAGE_CONTRACT, DENOISING_CONTRACT } from "@opencode-ai/core/session/reasoning-distillation"
 import { toLLMMessagesWithBindings } from "@opencode-ai/core/session/runner/to-llm-message"
 import { Hash } from "@opencode-ai/core/util/hash"
 import { DateTime, Deferred, Effect, Fiber, Stream } from "effect"
@@ -277,6 +277,7 @@ describe("Core runner reasoning distillation adapter", () => {
       expect(result.attempted).toBe("propose")
       expect(prompt).toContain("z-prior-tool")
       expect(prompt).toContain(JSON.stringify(COVERAGE_CONTRACT).slice(1, -1))
+      expect(prompt).toContain(JSON.stringify(DENOISING_CONTRACT).slice(1, -1))
       expect(prompt).not.toContain("a-future-tool")
     }),
   )

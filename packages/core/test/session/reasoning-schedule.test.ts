@@ -1,115 +1,139 @@
 import { expect, test } from "bun:test"
-import { Deferred, Effect, Fiber, Scope } from "effect"
+import { Deferred, Effect, Exit, Scope } from "effect"
 import { makeTurnScheduler } from "../../src/session/reasoning-distillation/schedule"
 
-test("default-off admission, first completion blocks, later turns run in order without blocking", async () => {
+const submit = (
+  sessionID: string,
+  turnID: string,
+  work: Effect.Effect<void, unknown>,
+  enabled = Effect.succeed(true),
+) => ({
+  sessionID,
+  turnID,
+  work,
+  enabled,
+})
+
+test("first turn returns immediately; later turns serialize and duplicates are ignored", async () => {
   await Effect.runPromise(
     Effect.scoped(
       Effect.gen(function* () {
         const schedule = makeTurnScheduler(yield* Scope.Scope)
-        let enabled = false
         const calls: string[] = []
-        const first = yield* Deferred.make<void>()
-        const second = yield* Deferred.make<void>()
         const started = yield* Deferred.make<void>()
-        const background = yield* Deferred.make<void>()
-        const input = (turnID: string, work: Effect.Effect<void>) => ({
-          sessionID: "s",
-          turnID,
-          enabled: Effect.sync(() => enabled),
-          work,
-        })
-        yield* schedule(
-          input(
-            "off",
-            Effect.sync(() => {
-              calls.push("off")
-            }),
-          ),
-        )
-        expect(calls).toEqual([])
-        enabled = true
-        const sync = yield* schedule(
-          input(
-            "1",
-            Effect.gen(function* () {
-              calls.push("1-start")
-              yield* Deferred.succeed(started, undefined)
-              yield* Deferred.await(first)
-              calls.push("1-end")
-            }),
-          ),
-        ).pipe(Effect.forkChild)
-        yield* Deferred.await(started)
-        expect(calls).toEqual(["1-start"])
-        expect(sync.pollUnsafe()).toBeUndefined()
-        yield* Deferred.succeed(first, undefined)
-        yield* Fiber.join(sync)
-        yield* schedule(
-          input(
-            "2",
-            Effect.gen(function* () {
-              calls.push("2-start")
-              yield* Deferred.succeed(background, undefined)
-              yield* Deferred.await(second)
-              calls.push("2-end")
-            }),
-          ),
-        )
-        yield* Deferred.await(background)
-        expect(calls).toEqual(["1-start", "1-end", "2-start"])
+        const release = yield* Deferred.make<void>()
         const done = yield* Deferred.make<void>()
         yield* schedule(
-          input(
-            "3",
+          submit(
+            "s",
+            "1",
             Effect.gen(function* () {
-              calls.push("3")
+              calls.push("start")
+              yield* Deferred.succeed(started, undefined)
+              yield* Deferred.await(release)
+              calls.push("end")
+            }),
+          ),
+        )
+        yield* Deferred.await(started)
+        yield* schedule(
+          submit(
+            "s",
+            "2",
+            Effect.gen(function* () {
+              calls.push("second")
               yield* Deferred.succeed(done, undefined)
             }),
           ),
         )
         yield* schedule(
-          input(
-            "3",
-            Effect.sync(() => {
-              calls.push("duplicate")
-            }),
+          submit(
+            "s",
+            "2",
+            Effect.sync(() => calls.push("duplicate")),
           ),
         )
-        yield* Deferred.succeed(second, undefined)
+        expect(calls).toEqual(["start"])
+        yield* Deferred.succeed(release, undefined)
         yield* Deferred.await(done)
-        expect(calls).toEqual(["1-start", "1-end", "2-start", "2-end", "3"])
+        expect(calls).toEqual(["start", "end", "second"])
       }),
     ),
   )
 })
 
-test("turn failure retains progress and disabled queued turns do no work", async () => {
+test("background proposal and judgment can complete adoption after submission returns", async () => {
   await Effect.runPromise(
     Effect.scoped(
       Effect.gen(function* () {
         const schedule = makeTurnScheduler(yield* Scope.Scope)
-        let enabled = true
-        const input = (turnID: string, work: Effect.Effect<void, unknown>) => ({
-          sessionID: "s",
-          turnID,
-          enabled: Effect.sync(() => enabled),
-          work,
-        })
-        yield* schedule(input("1", Effect.fail("auxiliary failed")))
-        const busy = yield* Deferred.make<void>()
-        const release = yield* Deferred.make<void>()
-        yield* schedule(input("2", Deferred.succeed(busy, undefined).pipe(Effect.andThen(Deferred.await(release)))))
-        yield* Deferred.await(busy)
-        let ran = false
+        const proposalStarted = yield* Deferred.make<void>()
+        const releaseProposal = yield* Deferred.make<void>()
+        const adopted = yield* Deferred.make<void>()
+        const phases: string[] = []
         yield* schedule(
-          input(
-            "3",
-            Effect.sync(() => {
-              ran = true
+          submit(
+            "s",
+            "completed-turn",
+            Effect.gen(function* () {
+              phases.push("propose")
+              yield* Deferred.succeed(proposalStarted, undefined)
+              yield* Deferred.await(releaseProposal)
+              phases.push("judge")
+              phases.push("adopt")
+              yield* Deferred.succeed(adopted, undefined)
             }),
           ),
         )
+        yield* Deferred.await(proposalStarted)
+        expect(phases).toEqual(["propose"])
+        yield* Deferred.succeed(releaseProposal, undefined)
+        yield* Deferred.await(adopted)
+        expect(phases).toEqual(["propose", "judge", "adopt"])
+      }),
+    ),
+  )
+})
+
+test("sessions proceed independently and queued work respects disable", async () => {
+  await Effect.runPromise(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const schedule = makeTurnScheduler(yield* Scope.Scope)
+        let enabled = false
+        let ran = false
+        const flag = Effect.sync(() => enabled)
+        yield* schedule(
+          submit(
+            "off",
+            "1",
+            Effect.sync(() => {
+              ran = true
+            }),
+            flag,
+          ),
+        )
+        enabled = true
+        const started = yield* Deferred.make<void>()
+        const release = yield* Deferred.make<void>()
+        yield* schedule(
+          submit("a", "1", Deferred.succeed(started, undefined).pipe(Effect.andThen(Deferred.await(release))), flag),
+        )
+        yield* Deferred.await(started)
+        yield* schedule(
+          submit(
+            "a",
+            "2",
+            Effect.sync(() => {
+              ran = true
+            }),
+            flag,
+          ),
+        )
+        const other = yield* Deferred.make<void>()
+        yield* schedule(submit("b", "1", Deferred.succeed(other, undefined), flag))
+        yield* Deferred.await(other)
+        expect(ran).toBe(false)
         enabled = false
         yield* Deferred.succeed(release, undefined)
         yield* Effect.yieldNow
@@ -119,23 +143,40 @@ test("turn failure retains progress and disabled queued turns do no work", async
   )
 })
 
-test("reopened history with an adopted prior turn resumes background scheduling", async () => {
+test("a failed turn leaves later work runnable", async () => {
   await Effect.runPromise(
     Effect.scoped(
       Effect.gen(function* () {
         const schedule = makeTurnScheduler(yield* Scope.Scope)
-        const started = yield* Deferred.make<void>()
-        const release = yield* Deferred.make<void>()
-        yield* schedule({
-          sessionID: "restored",
-          turnID: "next",
-          previouslyDistilled: true,
-          enabled: Effect.succeed(true),
-          work: Deferred.succeed(started, undefined).pipe(Effect.andThen(Deferred.await(release))),
-        })
-        yield* Deferred.await(started)
-        yield* Deferred.succeed(release, undefined)
+        const done = yield* Deferred.make<void>()
+        yield* schedule(submit("s", "1", Effect.fail("auxiliary failed")))
+        yield* schedule(submit("s", "2", Deferred.succeed(done, undefined)))
+        yield* Deferred.await(done)
       }),
     ),
+  )
+})
+
+test("closing the service scope interrupts background work", async () => {
+  await Effect.runPromise(
+    Effect.gen(function* () {
+      const scope = yield* Scope.make()
+      const schedule = makeTurnScheduler(scope)
+      const started = yield* Deferred.make<void>()
+      const interrupted = yield* Deferred.make<void>()
+      yield* schedule(
+        submit(
+          "s",
+          "1",
+          Deferred.succeed(started, undefined).pipe(
+            Effect.andThen(Effect.never),
+            Effect.onInterrupt(() => Deferred.succeed(interrupted, undefined)),
+          ),
+        ),
+      )
+      yield* Deferred.await(started)
+      yield* Scope.close(scope, Exit.succeed(undefined))
+      yield* Deferred.await(interrupted)
+    }),
   )
 })

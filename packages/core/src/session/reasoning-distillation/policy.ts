@@ -6,7 +6,7 @@ import type { DistillationPurpose, ModelTier } from "./types"
  * a safety, false-positive, or cost failure.
  */
 export const ReasoningDistillationPolicy = {
-  version: "reasoning-distillation-v1",
+  version: "reasoning-distillation-v2-denoise",
   validatorVersion: "gates-v1",
   /** Propose/judge resolution order (§5.6): small model, then the current agent model, then the session primary. */
   modelTierOrder: ["small", "agent", "primary"] as readonly ModelTier[],
