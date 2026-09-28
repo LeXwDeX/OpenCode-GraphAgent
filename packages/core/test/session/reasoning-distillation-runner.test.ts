@@ -8,6 +8,7 @@ import {
   type LLMClientShape,
   type LLMRequest,
 } from "@opencode-ai/llm"
+import { RequestExecutor } from "@opencode-ai/llm/route"
 import * as OpenAIChat from "@opencode-ai/llm/protocols/openai-chat"
 import { ConfigReasoningDistillation } from "@opencode-ai/core/config/reasoning-distillation"
 import { ModelV2 } from "@opencode-ai/core/model"
@@ -17,7 +18,7 @@ import * as CoreReasoningDistillation from "@opencode-ai/core/session/runner/rea
 import { COVERAGE_CONTRACT, DENOISING_CONTRACT } from "@opencode-ai/core/session/reasoning-distillation"
 import { toLLMMessagesWithBindings } from "@opencode-ai/core/session/runner/to-llm-message"
 import { Hash } from "@opencode-ai/core/util/hash"
-import { DateTime, Deferred, Effect, Fiber, Stream } from "effect"
+import { DateTime, Deferred, Duration, Effect, Fiber, Stream } from "effect"
 import { it } from "../lib/effect"
 
 const model = Model.make({
@@ -121,17 +122,28 @@ const support = JSON.stringify({
 })
 
 describe("Core runner reasoning distillation adapter", () => {
-  it.effect("distills a persisted canonical part without wire compatibility proof or changing the request", () =>
+  it.live("cancels the underlying canonical model call and keeps its quota spent", () =>
     Effect.gen(function* () {
-      const outputs = [candidate, support]
-      const generated: LLMRequest[] = []
+      const started = yield* Deferred.make<void>()
+      let calls = 0
+      let stopped = false
       const client: LLMClientShape = {
         prepare: mockPrepare,
         stream: () => Stream.empty,
-        generate: (request) =>
-          Effect.sync(() => {
-            generated.push(request)
-            return response(outputs.shift() ?? "{}")
+        generate: () =>
+          Effect.promise((signal) => {
+            calls++
+            return new Promise<LLMResponse>((resolve) => {
+              signal.addEventListener(
+                "abort",
+                () => {
+                  stopped = true
+                  resolve(response("late"))
+                },
+                { once: true },
+              )
+              queueMicrotask(() => Effect.runSync(Deferred.succeed(started, undefined)))
+            })
           }),
       }
       const adapter = CoreReasoningDistillation.make(client)
@@ -140,16 +152,108 @@ describe("Core runner reasoning distillation adapter", () => {
       const request = LLM.request({ model, messages: conversion.messages })
       const input = {
         target: "canonical" as const,
-        sessionID: "ses_canonical",
+        sessionID: "ses_canonical_cancelled",
         request,
+        auxiliaryModel: model,
         prepared: yield* prepare(request),
         sourceMessages: [source],
         bindings: conversion.reasoningBindings,
         config: new ConfigReasoningDistillation.Info({ compatibility: [] }),
       }
-      expect((yield* adapter.distill(input)).attempted).toBe("propose")
+      const fiber = yield* adapter.distill(input).pipe(Effect.forkChild)
+      yield* Deferred.await(started).pipe(
+        Effect.timeout(Duration.seconds(2)),
+        Effect.mapError(() => Error("start timeout")),
+      )
+      yield* Fiber.interrupt(fiber).pipe(
+        Effect.timeout(Duration.seconds(2)),
+        Effect.mapError(() => Error("interrupt timeout")),
+      )
+      expect(stopped).toBe(true)
+      expect(calls).toBe(1)
+    }),
+  )
+
+  it.effect("organizes two canonical slots in one model call", () =>
+    Effect.gen(function* () {
+      let calls = 0
+      const client: LLMClientShape = {
+        prepare: mockPrepare,
+        stream: () => Stream.empty,
+        generate: () =>
+          Effect.sync(() => {
+            calls++
+            return response(
+              JSON.stringify({
+                items: [
+                  { slot: 0, text: "决定使用安全路径。" },
+                  { slot: 1, text: "权限不足，尚未完成。" },
+                ],
+              }),
+            )
+          }),
+      }
+      const source = {
+        ...history(),
+        content: [
+          ...history().content,
+          { type: "reasoning" as const, id: "reasoning-2", text: "权限不足。任务未完成。" },
+        ],
+      }
+      const conversion = toLLMMessagesWithBindings([source], model)
+      const request = LLM.request({ model, messages: conversion.messages })
+      const result = yield* CoreReasoningDistillation.make(client).distill({
+        target: "canonical",
+        sessionID: "ses_multi_canonical",
+        request,
+        auxiliaryModel: model,
+        prepared: yield* prepare(request),
+        sourceMessages: [source],
+        bindings: conversion.reasoningBindings,
+        config: new ConfigReasoningDistillation.Info({ compatibility: [] }),
+      })
+      expect(calls).toBe(1)
+      expect(result.applied).toBe(true)
+      expect(result.replacements).toHaveLength(2)
+      expect(result.request).toBe(request)
+    }),
+  )
+
+  it.effect("distills a persisted canonical part without wire compatibility proof or changing the request", () =>
+    Effect.gen(function* () {
+      const outputs = ["决定使用安全路径。"]
+      const generated: LLMRequest[] = []
+      const client: LLMClientShape = {
+        prepare: mockPrepare,
+        stream: () => Stream.empty,
+        generate: (request) =>
+          Effect.gen(function* () {
+            expect(yield* RequestExecutor.MaxRetries).toBe(0)
+            generated.push(request)
+            return response(outputs.shift() ?? "{}")
+          }),
+      }
+      const adapter = CoreReasoningDistillation.make(client)
+      const source = history()
+      const conversion = toLLMMessagesWithBindings([source], model)
+      const request = LLM.request({ model, messages: conversion.messages })
+      const smallModel = Model.make({
+        id: "small-distillation",
+        provider: "distillation-provider",
+        route: model.route.with({ http: { body: { reasoning_effort: "high", harmless: "keep" } } }),
+      })
+      const input = {
+        target: "canonical" as const,
+        sessionID: "ses_canonical",
+        request,
+        auxiliaryModel: smallModel,
+        prepared: yield* prepare(request),
+        sourceMessages: [source],
+        bindings: conversion.reasoningBindings,
+        config: new ConfigReasoningDistillation.Info({ compatibility: [] }),
+      }
       const result = yield* adapter.distill(input)
-      expect(result.attempted).toBe("judge")
+      expect(result.attempted).toBe("propose")
       expect(result.applied).toBe(true)
       expect(result.request).toBe(request)
       expect(result.replacements).toEqual([
@@ -160,7 +264,16 @@ describe("Core runner reasoning distillation adapter", () => {
           after: expect.stringContaining("决定使用安全路径"),
         },
       ])
-      expect(generated).toHaveLength(2)
+      expect(generated).toHaveLength(1)
+      expect(String(generated[0]?.model.id)).toBe("small-distillation")
+      expect(JSON.stringify((yield* prepare(generated[0]!)).body)).toContain('"reasoning_effort":"low"')
+      const effective = LLM.updateRequest(generated[0]!, {
+        http: { body: { ...smallModel.route.defaults.http?.body, ...generated[0]!.http?.body } },
+      })
+      const transport = yield* smallModel.route.prepareTransport((yield* prepare(effective)).body, effective)
+      const wire = JSON.parse(JSON.parse(JSON.stringify(transport.request.body)).body) as Record<string, unknown>
+      expect(wire.reasoning_effort).toBe("low")
+      expect(wire.harmless).toBe("keep")
       expect(source.content[0]).toMatchObject({ text: reasoningText })
     }),
   )

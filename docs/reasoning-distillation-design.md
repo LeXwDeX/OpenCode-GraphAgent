@@ -1,12 +1,11 @@
 # 内化推理蒸馏：开发设计与验收规格
 
-> **2026-09-28 product contract:** `opencode.json` controls `reasoningDistillation.enabled`, default `false`.
-> Once enabled, the first completed user turn is distilled synchronously before the turn becomes idle.
-> Each subsequent completed user turn is queued in the background. Tool steps do not count as turns.
-> Successful adoption replaces the persisted reasoning part and emits its normal update event; the TUI,
-> reopened history and later model requests use that same text. In-flight requests retain their snapshot.
-> Failed, incompatible, stale or cancelled work retains the original. Disabling blocks new work and adoption.
-> This contract supersedes the historical request-time, default-on and projection-only behavior below.
+> **2026-09-29 产品契约（1.0.54）：** 默认关闭；开启后，已完成轮次的可编辑思考一次交给配置的小模型整理，直接采用替换正文并事务回写。单段使用正文，多段一次返回轻量编号/正文，不再默认执行 claim 提取、coverage 证明或第二次 judge。
+> 第一次和后续完成轮次均由应用作用域调度；调度与整理耗时分开统计。真实验收记录模型调用、解析与数据库写回，不能用前台先返回代替速度验收。
+> 保留有效条件、数值、未决事项、当前方案执行状态和实际失败/回滚；删除重复和没有后续价值的自我纠错。结构由内容决定，不固定类别或条数。
+> 显式 `small_model` 优先；不可用时保留原文，不回退主模型。辅助调用 low、零自动重试。历史 native-wire 实验路径的 small/agent/primary 枚举不是当前默认完成轮次的调用链。
+> 成功写回发送正常更新事件，TUI、重新打开的历史和后续请求读取同一正文；已经发出的请求保留原快照。原文和 metadata 留作关闭功能后的回放；签名/加密、过期或取消内容不写回。
+> 当前实现、真实测量和验收见 [单次整理验收记录](reasoning-denoise-acceptance.md)。下方旧版设计保留为历史背景，与此契约冲突的逐槽位双调用、同步首轮等描述已被取代。
 
 ```json
 {
@@ -16,8 +15,8 @@
 }
 ```
 
-Set `enabled` to `true` to opt in. Existing exact-provider compatibility evidence and fidelity checks still apply;
-turn scheduling alone does not authorize rewriting signed, encrypted or unsupported reasoning.
+Set `enabled` to `true` to opt in. Canonical source editability and metadata checks still apply;
+turn scheduling alone does not authorize rewriting signed, encrypted or unsupported reasoning. Local structural checks do not certify semantic fidelity.
 The original source is retained as host-owned provenance, excluded from provider request conversion.
 Background work belongs to the running application scope; shutdown cancels unfinished work without changing history.
 

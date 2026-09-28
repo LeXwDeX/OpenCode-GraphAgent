@@ -80,6 +80,20 @@ const drainWith = (layer: Layer.Layer<LLM.Service>, input: LLM.StreamInput) =>
     )
   })
 
+const distillWith = (layer: Layer.Layer<LLM.Service>, input: LLM.StreamInput) =>
+  Effect.gen(function* () {
+    const ctx = yield* InstanceRef
+    if (!ctx) return yield* Effect.die("InstanceRef not provided")
+    return yield* Effect.promise(() =>
+      Effect.runPromise(
+        LLM.Service.use((svc) => svc.distill(input)).pipe(
+          Effect.provide(layer),
+          Effect.provideService(InstanceRef, ctx),
+        ),
+      ),
+    )
+  })
+
 const drainSequenceWith = (layer: Layer.Layer<LLM.Service>, inputs: readonly LLM.StreamInput[], distill = false) =>
   Effect.gen(function* () {
     const ctx = yield* InstanceRef
@@ -88,10 +102,10 @@ const drainSequenceWith = (layer: Layer.Layer<LLM.Service>, inputs: readonly LLM
       Effect.runPromise(
         Effect.forEach(
           inputs,
-          (input) =>
+          (input, index) =>
             LLM.Service.use((svc) =>
               Effect.gen(function* () {
-                if (distill) yield* svc.distill(input)
+                if (distill && index === 0) yield* svc.distill(input)
                 yield* svc.stream(input).pipe(Stream.runDrain)
               }),
             ),
@@ -960,6 +974,7 @@ const distillationHistory = (): LLM.StreamInput["reasoningDistillation"] => ({
           signed: false,
           encrypted: false,
           settled: true,
+          canonicalEditable: true,
         },
       ],
     },
@@ -979,6 +994,49 @@ const auxiliaryResponse = (content: unknown) =>
     usage: { prompt_tokens: 10, completion_tokens: 10, total_tokens: 20 },
   })
 
+const auxiliaryTextResponse = (text: string, finishReason = "stop") =>
+  Response.json({
+    id: "chatcmpl-organize",
+    object: "chat.completion",
+    created: 0,
+    model: "deepseek-test-r1",
+    choices: [{ index: 0, message: { role: "assistant", content: text }, finish_reason: finishReason }],
+    usage: { prompt_tokens: 10, completion_tokens: 10, total_tokens: 20 },
+  })
+
+const organizeInput = (
+  model: Provider.Model,
+  sessionID: SessionID,
+  history: NonNullable<LLM.StreamInput["reasoningDistillation"]>,
+  adoptReasoning: NonNullable<LLM.StreamInput["adoptReasoning"]>,
+): LLM.StreamInput => {
+  const agent = {
+    name: "test",
+    mode: "primary",
+    options: {},
+    permission: [{ permission: "*", pattern: "*", action: "allow" }],
+  } satisfies Agent.Info
+  return {
+    user: {
+      id: MessageID.make("msg_user-organize"),
+      sessionID,
+      role: "user",
+      time: { created: Date.now() },
+      agent: agent.name,
+      model: { providerID: ProviderV2.ID.make("custom-provider"), modelID: model.id },
+    },
+    sessionID,
+    model,
+    agent,
+    system: [],
+    messages: distillationMessages(),
+    tools: {},
+    purpose: "conversation",
+    reasoningDistillation: history,
+    adoptReasoning,
+  }
+}
+
 const distillationConfig = (
   runtime: "opencode-ai-sdk" | "opencode-native",
   options: { canonical?: boolean } = {},
@@ -986,6 +1044,7 @@ const distillationConfig = (
   const endpoint = `${state.server!.url.origin}/v1`
   return {
     enabled_providers: ["custom-provider"],
+    small_model: "custom-provider/deepseek-test-small",
     provider: {
       "custom-provider": {
         name: "Custom Provider",
@@ -996,6 +1055,11 @@ const distillationConfig = (
             name: "DeepSeek R1",
             reasoning: true,
             ...(options.canonical ? {} : { interleaved: { field: "reasoning_content" } }),
+            limit: { context: 65_536, output: 4_096 },
+          },
+          "deepseek-test-small": {
+            name: "DeepSeek Small",
+            reasoning: true,
             limit: { context: 65_536, output: 4_096 },
           },
         },
@@ -1859,52 +1923,10 @@ describe("session.llm.stream", () => {
   for (const runtime of ["opencode-ai-sdk", "opencode-native"] as const) {
     for (const adopted of [true, false]) {
       it.instance(
-        `${runtime} distills independently and only replays persisted replacements; persistence accepted=${adopted}`,
+        `${runtime} organizes once and only replays persisted replacements; persistence accepted=${adopted}`,
         () =>
           Effect.gen(function* () {
-            const propose = waitRequest(
-              "/chat/completions",
-              auxiliaryResponse({
-                claims: [
-                  {
-                    id: "c1",
-                    kind: "decision",
-                    text: "已确认方案A。",
-                    scope: "当前会话",
-                    sources: [
-                      {
-                        messageID: "msg-reasoning-source",
-                        partID: "prt-reasoning-source",
-                        start: 0,
-                        end: distillationBody.length,
-                      },
-                    ],
-                    evidence: [],
-                    status: "unverified",
-                  },
-                ],
-                preserved: [],
-                coverage: [
-                  {
-                    source: {
-                      messageID: "msg-reasoning-source",
-                      partID: "prt-reasoning-source",
-                      start: 0,
-                      end: distillationBody.length,
-                    },
-                    action: "keep",
-                    claimID: "c1",
-                  },
-                ],
-              }),
-            )
-            const judge = waitRequest(
-              "/chat/completions",
-              auxiliaryResponse({
-                retention: { verdict: "supported" },
-                support: [{ claimID: "c1", verdict: "supported", method: "judged" }],
-              }),
-            )
+            const organize = waitRequest("/chat/completions", auxiliaryTextResponse("已确认方案A。"))
             const first = waitRequest(
               "/chat/completions",
               new Response(createChatStream("first"), { headers: { "Content-Type": "text/event-stream" } }),
@@ -1975,18 +1997,18 @@ describe("session.llm.stream", () => {
               true,
             )
 
-            const [proposeCapture, firstCapture, judgeCapture, secondCapture] = yield* Effect.promise(() =>
-              Promise.all([propose, first, judge, second]),
+            const [organizeCapture, firstCapture, secondCapture] = yield* Effect.promise(() =>
+              Promise.all([organize, first, second]),
             )
-            expect(proposeCapture.body.stream).not.toBe(true)
-            expect(judgeCapture.body.stream).not.toBe(true)
-            expect(JSON.stringify(judgeCapture.body.messages)).toContain("最终发送文本")
-            expect(JSON.stringify(judgeCapture.body.messages)).toContain("retention")
+            expect(organizeCapture.body.stream).not.toBe(true)
+            expect(organizeCapture.body.model).toBe("deepseek-test-small")
+            expect(firstCapture.body.model).toBe("deepseek-test-r1")
+            expect(JSON.stringify(organizeCapture.body.messages)).toContain("只输出整理后的正文")
             const reasoning = (capture: Capture) =>
               (capture.body.messages as Array<Record<string, unknown>> | undefined)?.find(
                 (message) => message.role === "assistant",
               )?.reasoning_content
-            expect(applied).toHaveLength(adopted ? 1 : 2)
+            expect(applied).toHaveLength(1)
             expect(applied[0][0].before).toBe(distillationBody)
             expect(applied[0][0].after).toContain("已确认方案A。")
             if (adopted) {
@@ -2008,49 +2030,7 @@ describe("session.llm.stream", () => {
       `canonical reasoning without an interleaved field uses persisted identity; adoption accepted=${accepted}`,
       () =>
         Effect.gen(function* () {
-          const propose = waitRequest(
-            "/chat/completions",
-            auxiliaryResponse({
-              claims: [
-                {
-                  id: "c1",
-                  kind: "decision",
-                  text: "已确认方案A。",
-                  scope: "当前会话",
-                  sources: [
-                    {
-                      messageID: "msg-reasoning-source",
-                      partID: "prt-reasoning-source",
-                      start: 0,
-                      end: distillationBody.length,
-                    },
-                  ],
-                  evidence: [],
-                  status: "unverified",
-                },
-              ],
-              preserved: [],
-              coverage: [
-                {
-                  source: {
-                    messageID: "msg-reasoning-source",
-                    partID: "prt-reasoning-source",
-                    start: 0,
-                    end: distillationBody.length,
-                  },
-                  action: "keep",
-                  claimID: "c1",
-                },
-              ],
-            }),
-          )
-          const judge = waitRequest(
-            "/chat/completions",
-            auxiliaryResponse({
-              retention: { verdict: "supported" },
-              support: [{ claimID: "c1", verdict: "supported", method: "judged" }],
-            }),
-          )
+          const organize = waitRequest("/chat/completions", auxiliaryTextResponse("已确认方案A。"))
           const resolved = yield* Provider.use.getModel(
             ProviderV2.ID.make("custom-provider"),
             ModelV2.ID.make("deepseek-test-r1"),
@@ -2110,9 +2090,8 @@ describe("session.llm.stream", () => {
               ),
             ),
           )
-          const [proposal, judgment] = yield* Effect.promise(() => Promise.all([propose, judge]))
-          expect(proposal.body.stream).not.toBe(true)
-          expect(judgment.body.stream).not.toBe(true)
+          const organized = yield* Effect.promise(() => organize)
+          expect(organized.body.stream).not.toBe(true)
           expect(adopted).toHaveLength(1)
           expect(adopted[0][0]).toMatchObject({
             before: distillationBody,
@@ -2122,6 +2101,140 @@ describe("session.llm.stream", () => {
       { config: () => distillationConfig("opencode-ai-sdk", { canonical: true }) },
     )
   }
+
+  it.instance(
+    "organizes multiple canonical reasoning slots with exactly one model call",
+    () =>
+      Effect.gen(function* () {
+        const organize = waitRequest(
+          "/chat/completions",
+          auxiliaryTextResponse(
+            JSON.stringify({
+              items: [
+                { slot: 0, text: "整理方案A" },
+                { slot: 1, text: "整理方案B" },
+              ],
+            }),
+          ),
+        )
+        const model = yield* Provider.use.getModel(
+          ProviderV2.ID.make("custom-provider"),
+          ModelV2.ID.make("deepseek-test-r1"),
+        )
+        const base = distillationHistory()!
+        const history = {
+          ...base,
+          groups: base.groups.map((group) => ({
+            ...group,
+            parts: [
+              ...group.parts,
+              {
+                ...group.parts[0],
+                partID: "prt-reasoning-second",
+                text: "反复分析方案B与风险。",
+              },
+            ],
+          })),
+        }
+        const adopted: Array<readonly { partID: string; before: string; after: string }[]> = []
+        yield* distillWith(
+          llmLayerWithExecutor(RequestExecutor.defaultLayer),
+          organizeInput(model, SessionID.make("session-test-organize-multiple"), history, (replacements) =>
+            Effect.sync(() => {
+              adopted.push(replacements)
+              return true
+            }),
+          ),
+        )
+        const capture = yield* Effect.promise(() => organize)
+        expect(capture.body.stream).not.toBe(true)
+        const messages: unknown = capture.body.messages
+        const prompt = Array.isArray(messages)
+          ? messages.find((message) => message?.role === "user")?.content
+          : undefined
+        if (typeof prompt !== "string") throw new Error("organization prompt is missing")
+        const sources: unknown = JSON.parse(prompt.slice(prompt.lastIndexOf("\n") + 1))
+        if (!Array.isArray(sources)) throw new Error("organization sources are missing")
+        expect(sources.map((source) => source?.slot)).toEqual([0, 1])
+        expect(adopted).toHaveLength(1)
+        expect(adopted[0].map((item) => [item.partID, item.after])).toEqual([
+          ["prt-reasoning-source", "整理方案A"],
+          ["prt-reasoning-second", "整理方案B"],
+        ])
+      }),
+    { config: () => distillationConfig("opencode-ai-sdk", { canonical: true }) },
+  )
+
+  for (const [name, response, expected] of [
+    ["all noise", auxiliaryTextResponse("<<NO_USEFUL_REASONING>>"), ""],
+    ["empty response", auxiliaryTextResponse(""), undefined],
+    ["truncated response", auxiliaryTextResponse("不完整", "length"), undefined],
+  ] as const) {
+    it.instance(
+      `single-call organization handles ${name} without corrupting original reasoning`,
+      () =>
+        Effect.gen(function* () {
+          const organize = waitRequest("/chat/completions", response)
+          const model = yield* Provider.use.getModel(
+            ProviderV2.ID.make("custom-provider"),
+            ModelV2.ID.make("deepseek-test-r1"),
+          )
+          const adopted: Array<readonly { before: string; after: string }[]> = []
+          yield* distillWith(
+            llmLayerWithExecutor(RequestExecutor.defaultLayer),
+            organizeInput(
+              model,
+              SessionID.make(`session-test-organize-${name}`),
+              distillationHistory()!,
+              (replacements) =>
+                Effect.sync(() => {
+                  adopted.push(replacements)
+                  return true
+                }),
+            ),
+          )
+          const capture = yield* Effect.promise(() => organize)
+          expect(capture.body.stream).not.toBe(true)
+          expect(adopted).toHaveLength(expected === undefined ? 0 : 1)
+          if (expected !== undefined) expect(adopted[0][0]).toMatchObject({ before: distillationBody, after: expected })
+        }),
+      { config: () => distillationConfig("opencode-ai-sdk", { canonical: true }) },
+    )
+  }
+
+  it.instance(
+    "skips organization when the configured small model is unavailable",
+    () =>
+      Effect.gen(function* () {
+        const model = yield* Provider.use.getModel(
+          ProviderV2.ID.make("custom-provider"),
+          ModelV2.ID.make("deepseek-test-r1"),
+        )
+        const adopted: Array<readonly { before: string; after: string }[]> = []
+        void waitRequest("/chat/completions", auxiliaryTextResponse("unexpected"))
+        yield* distillWith(
+          llmLayerWithExecutor(RequestExecutor.defaultLayer),
+          organizeInput(
+            model,
+            SessionID.make("session-test-small-model-unavailable"),
+            distillationHistory()!,
+            (replacements) =>
+              Effect.sync(() => {
+                adopted.push(replacements)
+                return true
+              }),
+          ),
+        )
+        expect(adopted).toHaveLength(0)
+        expect(state.queue).toHaveLength(1)
+      }),
+    {
+      config: () => ({
+        ...distillationConfig("opencode-ai-sdk", { canonical: true }),
+        small_model: "custom-provider/missing",
+      }),
+    },
+  )
 
   it.instance(
     "a protected canonical source never falls back to a proven legacy wire rewrite",

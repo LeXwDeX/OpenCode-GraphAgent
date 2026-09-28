@@ -1,4 +1,5 @@
 import { reasoningReplacements, type ReasoningReplacement } from "../reasoning-distillation/adoption"
+import { organizeReasoning } from "../reasoning-distillation/organize"
 import {
   LLM,
   LLMResponse,
@@ -7,6 +8,7 @@ import {
   type Message,
   type PreparedRequest,
 } from "@opencode-ai/llm"
+import { RequestExecutor } from "@opencode-ai/llm/route"
 import { Duration, Effect, Option, Semaphore } from "effect"
 import type { Info as ReasoningDistillationConfig } from "../../config/reasoning-distillation"
 import { Hash } from "../../util/hash"
@@ -100,8 +102,11 @@ export type Result = Readonly<{
   replacements?: readonly ReasoningReplacement[]
   request: LLMRequest
   attempted: "none" | "propose" | "judge"
+  modelCalls?: number
   applied: boolean
   skipReason?: DistillationSkipReason
+  timing?: Readonly<{ modelMs: number; parseMs: number; totalMs: number }>
+  organizeReason?: string
   usage?: Readonly<{
     reservedTokens: number
     actualTokens: number
@@ -116,6 +121,7 @@ type Input = Readonly<{
   sessionID: string
   variant?: string
   request: LLMRequest
+  auxiliaryModel?: LLMRequest["model"]
   prepared: PreparedRequest
   sourceMessages: readonly SessionMessage.Message[]
   bindings: readonly ReasoningMessageBinding[]
@@ -608,12 +614,149 @@ const plan = (input: Input, slot: Slot, state: LifecycleState, messages: unknown
 export const make = (llm: LLMClientShape) => {
   const states = new Map<string, LifecycleState>()
   const lock = Semaphore.makeUnsafe(1)
+  const canonicalLocks = new Map<string, ReturnType<typeof Semaphore.makeUnsafe>>()
+  const canonicalLock = (sessionID: string) => {
+    const current = canonicalLocks.get(sessionID)
+    if (current) return current
+    const created = Semaphore.makeUnsafe(1)
+    canonicalLocks.set(sessionID, created)
+    return created
+  }
+
+  const organizeCanonical = (input: Input) =>
+    canonicalLock(input.sessionID).withPermits(1)(
+      Effect.gen(function* () {
+        const auxiliaryModel = input.auxiliaryModel
+        if (!auxiliaryModel) return unchanged(input.request, "no-rewritable-slot")
+        const eligible = input.bindings.filter(
+          (slot) => slot.settled && !slot.signed && !slot.encrypted && !slot.distilled,
+        )
+        if (eligible.length === 0) return unchanged(input.request, "no-rewritable-slot")
+        const sources = new Map<string, string>()
+        for (const message of input.sourceMessages) {
+          if (message.type !== "assistant") continue
+          for (const part of message.content) {
+            if (part.type !== "reasoning") continue
+            const key = JSON.stringify([message.id, part.id])
+            if (sources.has(key)) return unchanged(input.request, "mapping-mismatch")
+            sources.set(key, part.text)
+          }
+        }
+        if (eligible.some((slot) => sources.get(JSON.stringify([slot.ref.messageID, slot.ref.partID])) !== slot.text))
+          return unchanged(input.request, "mapping-mismatch")
+        const state = states.get(input.sessionID) ?? emptyState
+        if (state.calls >= ReasoningDistillationPolicy.calls.maxCallsPerSession || state.paidAdmissionPaused)
+          return { ...unchanged(input.request, "call-budget-exhausted"), usage: usageSnapshot(state) }
+        const slots = eligible.map((slot) => ({
+          messageID: slot.ref.messageID,
+          partID: slot.ref.partID,
+          text: slot.text,
+        }))
+        let reserved = 0
+        let budgetSkipReason: DistillationSkipReason | undefined
+        const cancellation = new AbortController()
+        const organized = yield* Effect.promise((signal) => {
+          signal.addEventListener("abort", () => cancellation.abort(), { once: true })
+          return organizeReasoning({
+            slots,
+            callModel: async ({ prompt }) => {
+              const promptTokens = Token.estimateReserve(prompt)
+              const candidateReservation = promptTokens + ReasoningDistillationPolicy.tokens.maxOutputTokens
+              if (promptTokens > ReasoningDistillationPolicy.tokens.maxInputTokens) {
+                budgetSkipReason = "work-limit"
+                return undefined
+              }
+              if (
+                state.reservedTokens + candidateReservation >
+                ReasoningDistillationPolicy.tokens.maxReservedTokensPerSession
+              ) {
+                budgetSkipReason = "call-budget-exhausted"
+                return undefined
+              }
+              // Let Effect.promise install its abort finalizer before starting the nested model effect.
+              await Promise.resolve()
+              if (cancellation.signal.aborted) return undefined
+              reserved = candidateReservation
+              states.set(input.sessionID, {
+                ...state,
+                calls: state.calls + 1,
+                reservedTokens: state.reservedTokens + reserved,
+              })
+              const request = LLM.request({
+                model: auxiliaryModel,
+                prompt,
+                tools: [],
+                toolChoice: "none",
+                generation: { temperature: 0, maxTokens: ReasoningDistillationPolicy.tokens.maxOutputTokens },
+                providerOptions: { openai: { reasoningEffort: "low" } },
+                http: {
+                  timeout: Duration.seconds(30),
+                  body:
+                    auxiliaryModel.route.protocol === "openai-responses"
+                      ? { reasoning: { effort: "low" } }
+                      : auxiliaryModel.route.protocol === "openai-chat" ||
+                          auxiliaryModel.route.protocol === "openai-compatible-chat"
+                        ? { reasoning_effort: "low" }
+                        : undefined,
+                },
+                metadata: { purpose: "auxiliary", feature: "reasoning-distillation" },
+              })
+              try {
+                const response = await Effect.runPromise(
+                  llm.generate(request).pipe(Effect.provideService(RequestExecutor.MaxRetries, 0)),
+                  { signal: cancellation.signal },
+                )
+                const text = LLMResponse.text(response)
+                if (text.length > ReasoningDistillationPolicy.tokens.maxOutputTokens * 4) return undefined
+                return {
+                  text,
+                  usageTokens: LLMResponse.usage(response)?.totalTokens,
+                  finishReason: response.finishReason,
+                }
+              } catch {
+                return undefined
+              }
+            },
+          })
+        }).pipe(Effect.ensuring(Effect.sync(() => cancellation.abort())))
+        if (reserved === 0)
+          return {
+            ...unchanged(input.request, budgetSkipReason ?? "projection-failed"),
+            modelCalls: 0,
+            usage: usageSnapshot(state),
+          }
+        const actual = organized.usageTokens
+        const validActual =
+          typeof actual === "number" && Number.isFinite(actual) && actual >= 0 ? Math.ceil(actual) : undefined
+        const next: LifecycleState = {
+          ...state,
+          calls: state.calls + 1,
+          reservedTokens: state.reservedTokens + reserved,
+          actualTokens: state.actualTokens + (validActual ?? 0),
+          unknownUsageCalls: state.unknownUsageCalls + (validActual === undefined ? 1 : 0),
+          latencyMs: state.latencyMs + organized.timing.modelMs,
+          paidAdmissionPaused: state.paidAdmissionPaused || validActual === undefined || validActual > reserved,
+        }
+        states.set(input.sessionID, next)
+        return {
+          request: input.request,
+          attempted: "propose" as const,
+          modelCalls: 1,
+          applied: organized.status === "organized",
+          replacements: organized.replacements,
+          usage: usageSnapshot(next),
+          ...(organized.status === "skipped" ? { skipReason: "projection-failed" as const } : {}),
+          timing: organized.timing,
+          organizeReason: organized.reason,
+        }
+      }),
+    )
 
   const callAuxiliary = (input: Input, prompt: string) => {
     if (Token.estimateReserve(prompt) > ReasoningDistillationPolicy.tokens.maxInputTokens)
       return Effect.succeed(undefined)
     const request = LLM.request({
-      model: input.request.model,
+      model: input.auxiliaryModel ?? input.request.model,
       prompt,
       tools: [],
       toolChoice: "none",
@@ -796,31 +939,27 @@ export const make = (llm: LLMClientShape) => {
   })
 
   const distill = Effect.fn("CoreReasoningDistillation.distill")(function* (input: Input) {
+    if (input.target === "canonical") return yield* organizeCanonical(input)
     let cycle: Result = unchanged(input.request)
-    const canonicalReplacements: ReasoningReplacement[] = []
     if (!input.sourceMessages.some((message) => message.type === "user")) {
       cycle = yield* distillCycle(input)
-      canonicalReplacements.push(...(cycle.replacements ?? []))
     } else {
       for (const binding of input.bindings) {
         const next = yield* distillCycle({ ...input, request: cycle.request, bindings: [binding] })
-        canonicalReplacements.push(...(next.replacements ?? []))
         cycle = { ...next, applied: cycle.applied || next.applied }
       }
     }
     const result = {
       ...cycle,
       replacements: cycle.applied
-        ? input.target === "canonical"
-          ? canonicalReplacements
-          : reasoningReplacements(
-              cycle.request,
-              input.bindings.map((binding) => ({
-                ...binding,
-                messageID: binding.ref.messageID,
-                partID: binding.ref.partID,
-              })),
-            )
+        ? reasoningReplacements(
+            cycle.request,
+            input.bindings.map((binding) => ({
+              ...binding,
+              messageID: binding.ref.messageID,
+              partID: binding.ref.partID,
+            })),
+          )
         : [],
     }
     if (!result.applied || !input.sourceMessages.some((message) => message.type === "user")) return result
@@ -830,16 +969,7 @@ export const make = (llm: LLMClientShape) => {
     const capacity = estimateContextFoldingBudget(budget(result.request, plainValue(prepared.value.body)))
     if (capacity.estimatedInputTokens === undefined || capacity.usableInputTokens === undefined)
       return { ...result, ...unchanged(input.request, "unknown-content") }
-    const conservativeDelta =
-      input.target === "canonical"
-        ? (result.replacements ?? []).reduce((total, replacement) => {
-            const slot = input.bindings.find(
-              (binding) => binding.ref.messageID === replacement.messageID && binding.ref.partID === replacement.partID,
-            )
-            const delta = Token.estimate(replacement.after) - Token.estimate(replacement.before)
-            return total + (delta > 0 ? delta * (1 + (slot?.aliasCount ?? 0)) : delta)
-          }, 0)
-        : 0
+    const conservativeDelta = 0
     if (capacity.estimatedInputTokens + conservativeDelta > capacity.usableInputTokens)
       return { ...result, ...unchanged(input.request, "insufficient-net-savings") }
     return result

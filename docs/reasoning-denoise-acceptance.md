@@ -1,62 +1,79 @@
 # Reasoning denoising and latency acceptance
 
-## Scope and owners
+## Scope and status
 
 Baseline: stable 1.0.53, source `1adf8b186a5f366eefa40655fb2e354523534225`.
-Work: Issues #680 (useful-information denoising) and #681 (avoidable waiting).
-The owner requests a stable release after implementation, validation and native CI acceptance.
+Issues #680 (useful-information denoising) and #681 (avoidable waiting), PR #682 to `main`.
+The user requires design, implementation, real latency/quality acceptance, then a stable release. `dev` is retired.
 
-| Task                                             | Owner              | Acceptance                                                                                              | Status  |
-| ------------------------------------------------ | ------------------ | ------------------------------------------------------------------------------------------------------- | ------- |
-| Trace actual model/config/runtime                | Primary + Luna     | Configured DeepSeek identified; runtime and stage boundaries verified                                   | Done    |
-| Shared denoising semantics and dynamic rendering | Sol content worker | Remove redundant/abandoned reasoning; preserve meaningful constraints and uncertainty; allow 0..N items | Done    |
-| Foreground scheduling and per-stage timing       | Sol latency worker | First completed turn returns without waiting; background safety remains covered                         | Done    |
-| Live matched-input acceptance                    | Primary            | Actual DeepSeek transport, independent review, accepted output and elapsed times                        | Done    |
-| Review and regression gates                      | Primary + Astra    | Required local tests/typechecks/lint and review findings resolved                                       | Done    |
-| PR and stable release                            | Primary            | Current-head native gates, main merge, release artifacts and installed candidate verification           | Pending |
+| Work                    | Owner   | Acceptance                                                                                             |
+| ----------------------- | ------- | ------------------------------------------------------------------------------------------------------ |
+| Design and final review | Astra   | One small-model call, immediate adoption, lifecycle safety                                             |
+| Core helper and runtime | Sol     | Batch all eligible parts once; configured small model; cancellation and independent sessions           |
+| OpenCode runtime        | Sol     | Dedicated distill entry; no proposal/judge chain; low effort; atomic adoption                          |
+| Discovery               | Luna    | Actual configured model and source call chain                                                          |
+| Live tests and delivery | Primary | Matched synthetic tests, real database writeback, current-head gates and release artifact verification |
 
-## Verified baseline
+## Root cause and rejected intermediate result
 
-- Global configuration explicitly selects `local-proxy-compatible/deepseek` as `small_model`.
-- The 1.0.53 AI SDK adapter requests `reasoningEffort: low`, no automatic retries, and a 30-second timeout per call.
-- Completed turns select eligible reasoning from the current user turn. The first scheduling submission waits for completion; later submissions run under the service scope.
-- Each eligible slot may require sequential proposal and independent review. Multiple slots are processed serially. The configured model names are not the established cause of the delay.
-- Existing local logs contain 34.9 seconds for one slot and 84.4 seconds for three slots with a timeout. These are accumulated auxiliary timings, not per-request durations or a matched-input benchmark.
-- The organizer over-preserves rejected thoughts; the renderer exposes internal claim IDs and provenance-related labels. No fixed four-claim constraint exists in the parser.
+The configured small model is `local-proxy-compatible/deepseek`, with low reasoning effort. The old path asked it for a large claim/provenance proposal and then an independent review; parts were handled serially. A matched synthetic input took **4.19 seconds** with direct cleanup versus **30.24 seconds** through proposal (13.38 seconds) plus review (16.85 seconds). This was primarily extra model work, not a 20-second database transaction.
 
-## Live acceptance procedure
+An intermediate change moved the work behind the foreground response but retained the expensive pipeline. A real source-runtime test returned the primary answer in 1.799 seconds, then adopted reasoning 23.492 seconds later (15.273 seconds proposal + 7.994 seconds review). The user rejected this as a latency solution. That intermediate implementation is not the accepted optimization.
 
-Run the opt-in script from `packages/opencode` using pinned Bun 1.3.14. Set `DISTILLATION_ACCEPTANCE_CONFIG` to an existing authorized configuration and `DISTILLATION_ACCEPTANCE_OUTPUT` to a private local artifact directory. Existing environment credential references must resolve; they are never printed or written. `DISTILLATION_ACCEPTANCE_CASE` optionally selects one synthetic fixture.
+## Final production contract
 
-The harness compares complete direct-model output with the production proposal/review/validation pipeline using the same model, endpoint, effort and output budget. It captures outbound model/effort, timing, synthetic outputs, usage and accepted canonical replacement. It does not access user conversations. Local model SDK calls plus pure pipeline acceptance are distinct from installed-runtime session/TUI acceptance.
+Completed reasoning → configured small model once → returned replacement text → local structure/source checks → atomic persistence → upstream consumption.
 
-## Results
+- Single part: plain replacement body; no claim extraction, fixed C labels or category renderer.
+- Multiple parts: one request and an index/text envelope, with independent content for each part. Invalid/missing/duplicate indices reject the whole batch.
+- Explicit all-noise output allows an empty replacement. Actually empty, truncated or failed output preserves the original.
+- No automatic model retries and no second model review. Core retains `small_model` in config and V1 migration. Missing auxiliary models skip instead of falling back to the main model.
+- Source identity, original metadata, signed/encrypted protection, stale-turn rejection and disabled-feature replay remain host responsibilities.
+- Model cleanup quality is tested offline; local structural validation does not certify semantic fidelity.
+- Scheduling is separate from processing time. A foreground response may already have returned; downstream reads after adoption see the replacement. Timing results below measure the organizer and writeback rather than just foreground return.
 
-The revised synthetic run passed all six cases. See [machine-readable results](evidence/reasoning-denoise-live.json). Every observed wire request used model `deepseek`, effort `low`, no automatic retries and a 24,576-token ceiling; credentials and endpoints are absent from the report.
+## Reproducible real-model acceptance
 
-| Case                 | Accepted claims | Proposal + review | Result |
-| -------------------- | --------------: | ----------------: | ------ |
-| one-conclusion       |               1 |           30.24 s | Pass   |
-| deduplicate          |               1 |           25.08 s | Pass   |
-| different-scopes     |               6 |           17.86 s | Pass   |
-| meaningful-rejection |               1 |           26.76 s | Pass   |
-| unresolved           |               1 |           13.47 s | Pass   |
-| all-noise            |               0 |            4.61 s | Pass   |
+From `packages/opencode`, use pinned Bun 1.3.14 and run `bun run script/reasoning-distillation-live-acceptance.ts` with `DISTILLATION_ACCEPTANCE_CONFIG` pointing at an authorized existing configuration and `DISTILLATION_ACCEPTANCE_OUTPUT` at a private output directory. Credentials remain environment references and are not logged. `DISTILLATION_ACCEPTANCE_CASE` selects a fixture; `DISTILLATION_ACCEPTANCE_REPEATS` sets 1–5 repetitions per case (default 3).
 
-The matched direct call completed in 4.19 seconds. Complete proposal + review took 30.24 seconds on that same input. These are single samples with variable model reasoning cost; smaller requests do not establish a statistical wall-clock speedup. The initial denoising run failed this case by preserving an abandoned value. The shared organizer/reviewer contract was corrected, and the entire six-case corpus was rerun successfully.
+The corpus covers one final conclusion, deduplication, distinct scopes, meaningful rejection, uncertainty, all-noise text, short arithmetic reasoning, long-task continuity and multiple independent parts. Direct baseline order alternates. Long-task follow-up calls are offline acceptance only and are not in the production organizer.
 
-The single-conclusion review request decreased from 8,218 to 5,369 characters despite the strengthened semantic instructions. The different-scopes case decreased from 10,442 to 6,452 characters. All claim content, evidence and exact source ranges remain available. Per-stage model reasoning sizes are recorded so upstream reasoning cost is not confused with local processing.
+The first single-call full run exposed unwanted correction narrative in two of three one-conclusion repetitions. The prompt was strengthened to remove superseded guesses and their correction narrative without deleting real failures or unresolved constraints. That failed run is preserved locally and is not represented as acceptance.
 
-Foreground non-blocking behavior is established by scheduler tests using deferred proposal/review completion, not inferred from model latency. Both adoption bridges are tested with empty accepted text and replay of original content when disabled. A review finding caught the initially missed opencode adoption guard; it was repaired before acceptance.
+## Final synthetic results
 
-Local verification: core reasoning/context-folding: 178 passed; OpenCode reasoning/canonical replay and release contracts: 115 passed; workspace typecheck: 29/29 passed; lint: 0 errors and below the unchanged 4,850-warning cap. The DAG behavior/coverage gate passed all critical floors. Astra final source review accepted after the empty-adoption fix. Native CI and release remain separate delivery gates.
+All **27/27** checks passed (nine cases repeated three times); every organization used exactly one model request. Long-task continuation also retained the execution restrictions and unresolved state. [Machine-readable synthetic evidence](evidence/reasoning-denoise-live.json).
 
-## Runtime preflight
+| Case                 | Passes | Organizer model median | Matched direct median |
+| -------------------- | -----: | ---------------------: | --------------------: |
+| one-conclusion       |    3/3 |                3.144 s |               2.451 s |
+| deduplicate          |    3/3 |                2.829 s |                     — |
+| different-scopes     |    3/3 |                2.650 s |                     — |
+| meaningful-rejection |    3/3 |                2.255 s |                     — |
+| unresolved           |    3/3 |                2.724 s |                     — |
+| all-noise            |    3/3 |                1.600 s |                     — |
+| short-reasoning      |    3/3 |                2.730 s |               2.447 s |
+| long-continuity      |    3/3 |                3.706 s |               3.282 s |
+| multiple-slots       |    3/3 |                2.608 s |               2.997 s |
 
-A fully isolated source-runtime server used the configured DeepSeek provider for a synthetic inventory calculation. The foreground answer returned in 1.799 seconds with no adopted reasoning. The same session received its adopted reasoning 23.492 seconds later, after proposal (15.273 seconds) and review (7.994 seconds). Both auxiliary calls requested `low`; the runtime reported `applied=true`. The accepted text preserved the intermediate arithmetic and final result 83. It expanded an already concise English source into Chinese structured statements, so this is evidence of asynchronous adoption and fidelity, not of compression quality.
+Local helper validation plus canonical text replacement was below **0.9 ms** in these samples. This excludes database adoption, measured independently below. These finite samples establish the measured behavior, not a universal semantic guarantee or fixed network latency. The unmodified direct baseline sometimes retains noise and is used only as a timing comparison.
 
-The first full native CI run exposed a core-runner integration test that still asserted synchronous first-turn completion. The corrected test explicitly holds the auxiliary work, verifies that the foreground returns, then observes adoption for both slots and their use in later turns. All 81 core-runner integration tests and the full 1,454-test core suite passed after the correction. The full local OpenCode run completed with 4,884 passes and four failures: three analogous obsolete synchronous assertions in `session/prompt.test.ts`, and one PTY exit-observation timeout. The three prompt assertions were corrected using completion signals without removing race or payload checks; the entire prompt file then passed 114 tests with one platform skip. The PTY file passed all four tests independently. Native CI must validate the corrected commit; the initial full local run is not represented as green.
+## Actual runtime writeback
 
-## Delivery
+An isolated source server uses a temporary HOME/config/database, the existing authorized DeepSeek provider, synthetic input, no user sessions, and no tools. It waits for a persisted adopted part and reads it back through the session API. Only allowlisted timing fields are retained.
 
-PR #682 targets `main` and closes Issues #680 and #681. Current-head CI, stable publication and downloaded binary acceptance are pending. No release is claimed by the local test results.
+First single-call observation: model **2823.016 ms**, database adoption **5.279 ms**, complete organizer **2829.619 ms**, one model call. The approximately 3.081-second polling observation includes the polling interval; it is not the database duration. Three isolated runs all adopted exactly one model result. Model / adoption / complete times were 2823.016 / 5.279 / 2829.619 ms, 2989.668 / 4.498 / 2995.463 ms and 2372.925 / 3.752 / 2377.790 ms. Total local overhead was 4.864–6.602 ms. [Allowlisted runtime evidence](evidence/reasoning-denoise-runtime.json). The first run preceded the final semantic prompt refinement; the last two used the accepted prompt.
+
+## Regression checks
+
+- Astra final source review accepts the single-call implementation, including actual HTTP effort precedence and request-local retry suppression.
+- Full core suite: **1,463 passed**, zero failures.
+- Full LLM package suite: **312 passed**, 30 skipped, zero failures. New tests prove HTTP 503 sends one request with the auxiliary override and subsequent normal requests retain their default retry behavior.
+- OpenCode LLM file: **59 passed**; prompt integration: **114 passed**, one skipped.
+- DAG core behavior and coverage gate: all critical floors passed.
+
+The full OpenCode run exposed a separate immediate-PTY-exit race already observed in the prior full run. Issue #683 tracks preserving and replaying the real exit event to late subscribers in the existing bun-pty dependency. This is a real lifecycle repair with separate regression coverage, not an increased test timeout. The original immediate `exit 4` HTTP fixture remains unchanged. The initial full OpenCode run had 4,892 passes, 30 skips, one todo and this one failure; a fresh targeted run after the dependency fix verifies the preserved lifecycle assertion. Current-head native full CI remains required.
+
+## Verification and delivery
+
+Final workspace typecheck passed 29/29 packages; lint reported 4,848 existing/total warnings and zero errors, below the unchanged 4,850 cap. Astra accepted both the single-call implementation and the isolated PTY patch. Core PTY tests passed 8/8 and the original HTTP PTY file passed 4/4 after the fix. Client and SDK generators were run after the core config change; no generated contract changes resulted. Local regressions, Astra final review, current-head native checks and release artifact verification are distinct gates. Publishing is pending until those gates complete. Prior failed/cancelled CI runs are not current acceptance.

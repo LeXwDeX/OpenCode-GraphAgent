@@ -3,15 +3,12 @@ import { mkdir } from "node:fs/promises"
 import path from "node:path"
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible"
 import { generateText } from "ai"
-import { Hash } from "@opencode-ai/core/util/hash"
-import { ReasoningDistillationPolicy } from "@opencode-ai/core/session/reasoning-distillation"
-import { replaceCanonicalReasoning } from "@opencode-ai/core/session/reasoning-distillation/canonical"
 import {
-  AuxiliaryCallError,
-  emptyLifecycleState,
-  organizerFingerprintOf,
-  runDistillationCycle,
-} from "../src/session/reasoning-distillation"
+  ReasoningDistillationPolicy,
+  organizeReasoning,
+  type OrganizeResult,
+} from "@opencode-ai/core/session/reasoning-distillation"
+import { replaceCanonicalReasoning } from "@opencode-ai/core/session/reasoning-distillation/canonical"
 
 if (!process.env.DISTILLATION_ACCEPTANCE_CONFIG || !process.env.DISTILLATION_ACCEPTANCE_OUTPUT) {
   throw new Error("Set DISTILLATION_ACCEPTANCE_CONFIG and DISTILLATION_ACCEPTANCE_OUTPUT to opt in to live model calls")
@@ -48,14 +45,12 @@ const fixtures = [
       noise.repeat(8),
     required: ["5"],
     forbidden: ["3次", "看错", "重说一遍"],
-    maxClaims: 1,
   },
   {
     id: "deduplicate",
     text: noise.repeat(8) + "仅限测试环境，请求超时为30秒，不得写入生产数据库。\n".repeat(10) + noise.repeat(5),
     required: ["测试", "30", "生产"],
     forbidden: ["重说一遍"],
-    maxClaims: 3,
   },
   {
     id: "different-scopes",
@@ -65,7 +60,6 @@ const fixtures = [
       noise.repeat(8),
     required: ["alpha", "2", "beta", "0", "/tmp/gamma.json", "delta", "epsilon", "zeta", "45"],
     forbidden: ["重说一遍"],
-    minClaims: 5,
   },
   {
     id: "meaningful-rejection",
@@ -90,10 +84,54 @@ const fixtures = [
     text: "嗯……让我想想。再想一下。不，这样说不好，换个说法。算了，刚才只是口头填充。\n".repeat(24),
     required: [],
     forbidden: [],
-    maxClaims: 0,
     empty: true,
   },
 ]
+
+const shortText =
+  "Start Monday: 83. Tuesday in 47: 130. Wednesday out 29: 101. Thursday returns floor(29/3)=9: 110. Friday out floor(110/4)=27: 83. Final inventory: 83."
+const continuityText =
+  noise.repeat(40) +
+  "任务仅限测试环境，生产数据库只能只读访问。阶段A的备份与schema校验已经完成，不要重复。迁移M已经实际执行失败，原因是当前引擎不支持online选项；已回滚到迁移前状态，不得重试M。下一步只读核对日志和备份哈希，尚未授权再次迁移。请求超时45秒，测试任务最多重试2次。检查点保存到 /tmp/recovery-checkpoint.json。锁竞争是否根因仍未确认。" +
+  noise.repeat(30)
+const cases = [
+  ...fixtures.map((fixture) => ({
+    ...fixture,
+    texts: [fixture.text],
+    benchmark: fixture.id === "one-conclusion",
+    continuity: false,
+  })),
+  {
+    id: "short-reasoning",
+    texts: [shortText],
+    required: ["83"],
+    forbidden: [],
+    benchmark: true,
+    continuity: false,
+  },
+  {
+    id: "long-continuity",
+    texts: [continuityText],
+    required: ["生产", "只读", "online", "回滚", "45", "2", "/tmp/recovery-checkpoint.json", "锁"],
+    forbidden: ["重说一遍"],
+    benchmark: true,
+    continuity: true,
+  },
+  {
+    id: "multiple-slots",
+    texts: [
+      noise.repeat(6) + "alpha测试环境最多重试2次，生产环境禁止执行。",
+      noise.repeat(6) + "beta的备份已完成；恢复校验尚未完成，下一步只读核对 /tmp/beta.json。",
+      noise.repeat(6) + "gamma曾因离线协议不兼容而执行失败，已回滚，不得再次采用同一方案。",
+    ],
+    required: ["alpha", "2", "生产", "beta", "/tmp/beta.json", "gamma", "回滚"],
+    forbidden: ["重说一遍"],
+    benchmark: true,
+    continuity: false,
+  },
+]
+const repeats = Number(process.env.DISTILLATION_ACCEPTANCE_REPEATS ?? 3)
+if (!Number.isSafeInteger(repeats) || repeats < 1 || repeats > 5) throw new Error("Repeats must be 1..5")
 
 type Stage = {
   role: string
@@ -105,197 +143,193 @@ type Stage = {
   usage?: number
   finishReason: string
   wire: { model?: string; effort?: string; stream?: boolean; maxTokens?: number }
+  requests: number
   answer: string
 }
 const reports: unknown[] = []
 let failed = false
-for (const fixture of fixtures.filter(
+for (const fixture of cases.filter(
   (item) => !process.env.DISTILLATION_ACCEPTANCE_CASE || item.id === process.env.DISTILLATION_ACCEPTANCE_CASE,
 )) {
-  const stages: Stage[] = []
-  const call = async (role: string, prompt: string) => {
-    const started = performance.now()
-    let headersMs = 0
-    let wire: Stage["wire"] = {}
-    const provider = createOpenAICompatible({
-      name: providerID,
-      baseURL,
-      apiKey,
-      includeUsage: true,
-      fetch: Object.assign(
-        async (url: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
-          const body = typeof init?.body === "string" ? JSON.parse(init.body) : {}
-          wire = {
-            model: body.model,
-            effort: body.reasoning_effort,
-            stream: body.stream ?? false,
-            maxTokens: body.max_tokens,
-          }
-          const response = await fetch(url, init)
-          headersMs = performance.now() - started
-          return response
-        },
-        { preconnect: fetch.preconnect },
-      ),
-    })
-    try {
-      const result = await generateText({
-        model: provider(configured.models[modelID].id ?? modelID),
-        prompt,
-        temperature: 0,
-        maxOutputTokens: ReasoningDistillationPolicy.tokens.maxOutputTokens,
-        maxRetries: 0,
-        providerOptions: { openaiCompatible: { reasoningEffort: "low" } },
-        abortSignal: AbortSignal.timeout(30_000),
+  for (let repeat = 0; repeat < repeats; repeat++) {
+    const stages: Stage[] = []
+    const call = async (role: string, prompt: string) => {
+      const started = performance.now()
+      let headersMs = 0
+      let requests = 0
+      let wire: Stage["wire"] = {}
+      const provider = createOpenAICompatible({
+        name: providerID,
+        baseURL,
+        apiKey,
+        includeUsage: true,
+        fetch: Object.assign(
+          async (url: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+            requests++
+            const body = typeof init?.body === "string" ? JSON.parse(init.body) : {}
+            wire = {
+              model: body.model,
+              effort: body.reasoning_effort,
+              stream: body.stream ?? false,
+              maxTokens: body.max_tokens,
+            }
+            const response = await fetch(url, init)
+            headersMs = performance.now() - started
+            return response
+          },
+          { preconnect: fetch.preconnect },
+        ),
       })
-      const stage = {
-        role,
-        elapsedMs: performance.now() - started,
-        headersMs,
-        promptCharacters: prompt.length,
-        answerCharacters: result.text.length,
-        reasoningCharacters: result.reasoningText?.length ?? 0,
-        usage: result.totalUsage.totalTokens,
-        finishReason: result.finishReason,
-        wire,
-        answer: result.text,
-      }
-      stages.push(stage)
-      console.log(JSON.stringify({ case: fixture.id, ...stage, answer: undefined }))
-      return stage
-    } catch (error) {
-      console.log(
-        JSON.stringify({
-          case: fixture.id,
+      try {
+        const result = await generateText({
+          model: provider(configured.models[modelID].id ?? modelID),
+          prompt,
+          temperature: 0,
+          maxOutputTokens: ReasoningDistillationPolicy.tokens.maxOutputTokens,
+          maxRetries: 0,
+          providerOptions: { openaiCompatible: { reasoningEffort: "low" } },
+          abortSignal: AbortSignal.timeout(30_000),
+        })
+        const stage: Stage = {
           role,
           elapsedMs: performance.now() - started,
-          error: error instanceof Error ? error.name : "unknown",
-        }),
+          headersMs,
+          promptCharacters: prompt.length,
+          answerCharacters: result.text.length,
+          reasoningCharacters: result.reasoningText?.length ?? 0,
+          usage: result.totalUsage.totalTokens,
+          finishReason: result.finishReason,
+          wire,
+          requests,
+          answer: result.text,
+        }
+        stages.push(stage)
+        console.log(JSON.stringify({ case: fixture.id, repeat, ...stage, answer: undefined }))
+        return stage
+      } catch (error) {
+        console.log(
+          JSON.stringify({
+            case: fixture.id,
+            repeat,
+            role,
+            elapsedMs: performance.now() - started,
+            error: error instanceof Error ? error.name : "unknown",
+          }),
+        )
+        throw new Error("Auxiliary model request failed")
+      }
+    }
+    const direct = () =>
+      call(
+        "direct",
+        "请对以下思考去重、删除无价值的自我纠错与口头填充，保留最终有效信息和有用条件，按实际内容自然组织；不固定条数，不扩写。" +
+          (fixture.texts.length > 1 ? "各段独立整理，按输入顺序返回正文。" : "") +
+          "\n\n" +
+          fixture.texts.join("\n\n---\n\n"),
       )
-      throw new AuxiliaryCallError({ category: "transport" })
+    const slots = fixture.texts.map((text, index) => ({
+      messageID: "synthetic-message",
+      partID: `part-${index}`,
+      text,
+    }))
+    let result: OrganizeResult | undefined
+    const organize = async () => {
+      result = await organizeReasoning({
+        slots,
+        callModel: async ({ prompt }) => {
+          const stage = await call("organize", prompt)
+          return { text: stage.answer, usageTokens: stage.usage, finishReason: stage.finishReason }
+        },
+      })
     }
-  }
-  // Full completion on the same endpoint/effort, rather than comparing first token with a complete JSON result.
-  if (fixture.id === "one-conclusion") {
-    await call(
-      "direct",
-      "请对下面的思考文本去重、删除无价值的自我纠错与口头填充，只保留最终有效信息，按实际内容结构化输出。不要固定条数、不要空栏目、不要加入原文之外的内容。\n\n" +
-        fixture.text,
+    if (fixture.benchmark && repeat % 2 === 0) await direct()
+    await organize()
+    if (fixture.benchmark && repeat % 2 === 1) await direct()
+    if (!result) throw new Error("Organizer result unavailable")
+    const organized = result as OrganizeResult
+    const rewriteStarted = performance.now()
+    const after = slots.map(
+      (slot) => organized.replacements.find((replacement) => replacement.partID === slot.partID)?.after ?? slot.text,
     )
-  }
-  const request = { messages: [{ role: "assistant", reasoning: fixture.text }] }
-  const capability = {
-    runtime: "opencode-ai-sdk",
-    protocol: "openai-compatible",
-    providerModelVariant: `${selected}/low`,
-    endpointIdentity: Hash.sha256(baseURL),
-    adapterVersion: "synthetic-live-acceptance-v1",
-    optionsFingerprint: Hash.sha256("low"),
-  }
-  const auxiliary = (role: string) => async (prompt: string) => {
-    const result = await call(role, prompt)
-    try {
-      return { output: JSON.parse(result.answer) as unknown, usageTokens: result.usage }
-    } catch {
-      throw new AuxiliaryCallError({ category: "parse", usageTokens: result.usage })
+    const adoption = slots.every((slot, index) => {
+      const replacement = organized.replacements.find((item) => item.partID === slot.partID)
+      return (
+        replacement !== undefined &&
+        replaceCanonicalReasoning({ text: slot.text, settled: true, distilled: false }, replacement.after)?.text ===
+          after[index]
+      )
+    })
+    const canonicalRewriteMs = performance.now() - rewriteStarted
+    const combined = after.join("\n")
+    const organizeStages = stages.filter((stage) => stage.role === "organize")
+    const checks = {
+      organized: organized.status === "organized",
+      adoption,
+      required: fixture.required.every((term) => combined.includes(term)),
+      forbidden: fixture.forbidden.every((term) => !combined.includes(term)),
+      empty: !("empty" in fixture) || after[0] === "",
+      noClaimTemplate: !/(?:^|\n)\s*(?:[-*]\s*)?[cC]\d+\s*[:：]/.test(combined),
+      oneModelRequest: organizeStages.length === 1 && organizeStages[0]!.requests === 1,
+      effort: stages.every((stage) => stage.wire.effort === "low"),
+      independentSlots:
+        fixture.id !== "multiple-slots" ||
+        after.every(
+          (text, index) =>
+            text.includes(["alpha", "beta", "gamma"][index]!) &&
+            ["alpha", "beta", "gamma"].every((name, other) => other === index || !text.includes(name)),
+        ),
+      oldValueRemoved: fixture.id !== "one-conclusion" || !/(?:3|三)\s*次/.test(combined),
     }
-  }
-  const started = performance.now()
-  const result = await runDistillationCycle(emptyLifecycleState, {
-    request,
-    identity: { providerID, modelID },
-    sessionID: `synthetic-${fixture.id}`,
-    purpose: "conversation",
-    trigger: "scheduled",
-    synchronous: true,
-    target: "canonical",
-    slots: [
-      {
-        messageID: "m1",
-        partID: "p1",
-        bodyPath: [],
-        text: fixture.text,
-        shape: "interleaved-field",
-        signed: false,
-        encrypted: false,
-        settled: true,
-        structureRewritable: true,
-      },
-    ],
-    budget: {
-      contextLimit: 1_000_000,
-      inputLimit: { kind: "absent" },
-      outputReserve: 24_576,
-      system: { kind: "none" },
-      messages: request.messages,
-      tools: [],
-      protocolOverheadTokens: 0,
-      media: "none",
-    },
-    calls: [],
-    inventoryComplete: true,
-    inventoryFingerprint: "synthetic-no-tools",
-    capability,
-    records: [],
-    organizerFingerprint: organizerFingerprintOf({ providerID, modelID, variant: "low" }),
-    originalTokens: Math.ceil(fixture.text.length / 4),
-    callPropose: auxiliary("propose"),
-    callJudge: auxiliary("judge"),
-  })
-  const elapsedMs = performance.now() - started
-  const replacement = result.projection.replacements?.[0]
-  const after = replacement?.after
-  const proposal = stages.find((stage) => stage.role === "propose")
-  const proposed: unknown = proposal ? JSON.parse(proposal.answer) : undefined
-  const claimCount =
-    proposed && typeof proposed === "object" && "claims" in proposed && Array.isArray(proposed.claims)
-      ? proposed.claims.length
-      : undefined
-  const checks = {
-    applied: result.projection.applied,
-    adoption:
-      replacement !== undefined &&
-      replaceCanonicalReasoning({ text: fixture.text, settled: true, distilled: false }, replacement.after)?.text ===
-        after,
-    required: typeof after === "string" && fixture.required.every((term) => after.includes(term)),
-    forbidden: typeof after === "string" && fixture.forbidden.every((term) => !after.includes(term)),
-    dynamicCount:
-      claimCount !== undefined &&
-      (!("maxClaims" in fixture) || claimCount <= fixture.maxClaims!) &&
-      (!("minClaims" in fixture) || claimCount >= fixture.minClaims!),
-    empty: !("empty" in fixture) || after === "",
-    effort: stages.every((stage) => stage.wire.effort === "low"),
-  }
-  const passed = Object.values(checks).every(Boolean)
-  failed ||= !passed
-  const report = {
-    id: fixture.id,
-    model: selected,
-    policy: ReasoningDistillationPolicy.version,
-    endpointHash: capability.endpointIdentity,
-    input: fixture.text,
-    elapsedMs,
-    checks,
-    passed,
-    claimCount,
-    after,
-    attempted: result.attempted,
-    skipReason: result.projection.skipReason,
-    stages,
-  }
-  reports.push(report)
-  await Bun.write(path.join(output, `${fixture.id}.json`), JSON.stringify(report, null, 2))
-  console.log(
-    JSON.stringify({
-      case: fixture.id,
-      elapsedMs,
+    // Offline quality acceptance only: these continuation calls are never part of production organization.
+    let continuation: unknown
+    if (fixture.continuity && repeat === repeats - 1) {
+      const question =
+        "以下是任务记录。仅根据记录列出下一步、禁止事项、已完成事项、未决问题以及检查点文件；不实际执行操作，不新增计划。\n\n"
+      const original = await call("continuation-original", question + fixture.texts[0])
+      const rewritten = await call("continuation-organized", question + after[0])
+      const terms = ["只读", "online", "回滚", "/tmp/recovery-checkpoint.json", "锁"]
+      continuation = {
+        original: original.answer,
+        organized: rewritten.answer,
+        passed: terms.every((term) => rewritten.answer.includes(term)),
+      }
+      if (!(continuation as { passed: boolean }).passed) failed = true
+    }
+    const passed = Object.values(checks).every(Boolean)
+    failed ||= !passed
+    const report = {
+      id: fixture.id,
+      repeat,
+      model: selected,
+      mode: "single-call-organize",
+      input: fixture.texts,
       passed,
       checks,
       after,
-      claimCount,
-      skipReason: result.projection.skipReason,
-    }),
-  )
+      status: organized.status,
+      reason: organized.reason,
+      timing: {
+        ...organized.timing,
+        canonicalRewriteMs,
+        helperAndCanonicalMs: organized.timing.totalMs + canonicalRewriteMs,
+      },
+      stages,
+      continuation,
+    }
+    reports.push(report)
+    await Bun.write(path.join(output, `${fixture.id}-${repeat + 1}.json`), JSON.stringify(report, null, 2))
+    console.log(
+      JSON.stringify({
+        case: fixture.id,
+        repeat,
+        passed,
+        checks,
+        timing: report.timing,
+        after,
+        reason: organized.reason,
+      }),
+    )
+  }
 }
 await Bun.write(path.join(output, "summary.json"), JSON.stringify({ passed: !failed, reports }, null, 2))
 if (failed) process.exitCode = 1

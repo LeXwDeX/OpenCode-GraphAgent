@@ -87,6 +87,16 @@ describe("Config", () => {
     }),
   )
 
+  it.effect("preserves the configured small model in current and migrated configuration", () =>
+    Effect.sync(() => {
+      const value = "deepseek/deepseek-chat"
+      expect(Schema.decodeUnknownSync(Config.Info)({ small_model: value }).small_model).toBe(value)
+      expect(ConfigMigrateV1.isV1({ small_model: value })).toBe(false)
+      const v1 = Schema.decodeUnknownSync(ConfigV1.Info)({ small_model: value, snapshot: false })
+      expect(Schema.decodeUnknownSync(Config.Info)(ConfigMigrateV1.migrate(v1)).small_model).toBe(value)
+    }),
+  )
+
   it.effect("migrates arbitrary v1 configuration into valid v2 configuration", () =>
     Effect.sync(() => {
       FastCheck.assert(

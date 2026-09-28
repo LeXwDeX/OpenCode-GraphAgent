@@ -73,6 +73,54 @@ const expectLLMError = (error: unknown) => {
 const errorHttp = (error: LLMError) => ("http" in error.reason ? error.reason.http : undefined)
 
 describe("RequestExecutor", () => {
+  it.effect("disables HTTP retries locally without changing subsequent requests", () =>
+    Effect.gen(function* () {
+      const attempts = yield* Ref.make(0)
+      yield* Effect.gen(function* () {
+        const executor = yield* RequestExecutor.Service
+        const first = yield* executor
+          .execute(request)
+          .pipe(Effect.provideService(RequestExecutor.MaxRetries, 0), Effect.flip)
+        expect(first.retryable).toBe(true)
+        expect(yield* Ref.get(attempts)).toBe(1)
+        const second = yield* executor.execute(request)
+        expect(second.status).toBe(200)
+        expect(yield* Ref.get(attempts)).toBe(3)
+      }).pipe(
+        Effect.provide(
+          countedResponsesLayer(attempts, [
+            new Response("busy", { status: 503, headers: { "retry-after-ms": "0" } }),
+            new Response("busy", { status: 503, headers: { "retry-after-ms": "0" } }),
+            new Response("ok", { status: 200 }),
+          ]),
+        ),
+      )
+    }),
+  )
+
+  it.effect("honors zero retries through the full LLM generate path", () =>
+    Effect.gen(function* () {
+      const attempts = yield* Ref.make(0)
+      const model = OpenAIChat.route
+        .with({ endpoint: { baseURL: "https://api.openai.test/v1" } })
+        .model({ id: "auxiliary-model" })
+      const error = yield* LLMClient.generate(LLM.request({ model, prompt: "Organize synthetic text." })).pipe(
+        Effect.provideService(RequestExecutor.MaxRetries, 0),
+        Effect.provide(
+          dynamicResponse((input) =>
+            Ref.update(attempts, (value) => value + 1).pipe(
+              Effect.as(input.respond("busy", { status: 503, headers: { "retry-after-ms": "0" } })),
+            ),
+          ),
+        ),
+        Effect.flip,
+      )
+      expectLLMError(error)
+      expect(error.reason).toMatchObject({ _tag: "ProviderInternal", status: 503 })
+      expect(yield* Ref.get(attempts)).toBe(1)
+    }),
+  )
+
   it.effect("classifies context overflow responses", () =>
     Effect.gen(function* () {
       const executor = yield* RequestExecutor.Service
