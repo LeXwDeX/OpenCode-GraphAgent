@@ -77,3 +77,7 @@ The full OpenCode run exposed a separate immediate-PTY-exit race already observe
 ## Verification and delivery
 
 Final workspace typecheck passed 29/29 packages; lint reported 4,848 existing/total warnings and zero errors, below the unchanged 4,850 cap. Astra accepted both the single-call implementation and the isolated PTY patch. Core PTY tests passed 8/8 and the original HTTP PTY file passed 4/4 after the fix. Client and SDK generators were run after the core config change; no generated contract changes resulted. Local regressions, Astra final review, current-head native checks and release artifact verification are distinct gates. Publishing is pending until those gates complete. Prior failed/cancelled CI runs are not current acceptance.
+
+### Dependency patch installation check
+
+The first native run of `a28853fac3` failed in PTY tests after a clean dependency install: an incorrectly formatted import hunk in the bun-pty patch removed the neighboring `node:path` import. An isolated Bun 1.3.14 installation reproduced this artifact-only defect. The patch was regenerated from the unmodified package with standard unified-diff ranges, removing the unnecessary import change. A second fresh directory with an independent cache preserved the imports and passed actual exit-code/replay checks plus the late-subscriber regression. Native gates are rerun on the corrected commit; the failed run is not acceptance.

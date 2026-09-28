@@ -1,16 +1,7 @@
 diff --git a/src/terminal.ts b/src/terminal.ts
-index ec248d46a939f8a09cd669e853cefb126922c80a..4a4c3e8f32c65c1c43856c712614b1bf09dd36be 100644
 --- a/src/terminal.ts
 +++ b/src/terminal.ts
-@@ -5,6 +5,6 @@
- import { Buffer } from "node:buffer";
- import { EventEmitter } from "./interfaces";
--import type { IPty, IPtyForkOptions, IExitEvent } from "./interfaces";
-+import type { IPty, IPtyForkOptions, IExitEvent, IDisposable } from "./interfaces";
- import { join, dirname, basename } from "node:path";
- import { existsSync } from "node:fs";
-
-@@ -143,6 +143,7 @@ export class Terminal implements IPty {
+@@ -143,6 +143,7 @@
  
  	private readonly _onData = new EventEmitter<string>();
  	private readonly _onExit = new EventEmitter<IExitEvent>();
@@ -18,12 +9,12 @@ index ec248d46a939f8a09cd669e853cefb126922c80a..4a4c3e8f32c65c1c43856c712614b1bf
  
  	constructor(
  		file = DEFAULT_FILE,
-@@ -194,7 +195,21 @@ export class Terminal implements IPty {
+@@ -194,7 +195,21 @@
  		return this._onData.event;
  	}
  	get onExit() {
 -		return this._onExit.event;
-+		return (listener: (event: IExitEvent) => void): IDisposable => {
++		return (listener: (event: IExitEvent) => void) => {
 +			const exited = this._exitEvent;
 +			if (!exited) return this._onExit.event(listener);
 +			let disposed = false;
@@ -41,7 +32,7 @@ index ec248d46a939f8a09cd669e853cefb126922c80a..4a4c3e8f32c65c1c43856c712614b1bf
  	}
  
  	/* ------------- IO methods ------------- */
-@@ -217,7 +232,7 @@ export class Terminal implements IPty {
+@@ -217,7 +232,7 @@
  		this._closing = true;
  		lib.symbols.bun_pty_kill(this.handle);
  		lib.symbols.bun_pty_close(this.handle);
@@ -50,7 +41,7 @@ index ec248d46a939f8a09cd669e853cefb126922c80a..4a4c3e8f32c65c1c43856c712614b1bf
  	}
  
  	/* ------------- read-loop ------------- */
-@@ -244,7 +259,7 @@ export class Terminal implements IPty {
+@@ -244,7 +259,7 @@
  					this._onData.fire(remaining);
  				}
  				const exitCode = lib.symbols.bun_pty_get_exit_code(this.handle);
