@@ -1,13 +1,12 @@
 const tagPrefix = "graphagent-v"
 const stableTag = /^graphagent-v(\d+)\.(\d+)\.(\d+)$/
-const devTag = /^graphagent-v(\d+)\.(\d+)\.(\d+)-dev\.(\d+)$/
 
 type Version = readonly [major: number, minor: number, patch: number]
 
 export function resolveReleaseVersion(input: { branch: string; tags: string[] }) {
   const channel = input.branch
-  if (channel !== "main" && channel !== "dev") {
-    throw new Error(`GraphAgent releases require main or dev, received: ${channel || "(empty)"}`)
+  if (channel !== "main") {
+    throw new Error(`GraphAgent releases require main, received: ${channel || "(empty)"}`)
   }
 
   const latest = input.tags
@@ -21,32 +20,12 @@ export function resolveReleaseVersion(input: { branch: string; tags: string[] })
   const base = target.join(".")
   const previousTag = latest?.tag ?? ""
 
-  if (channel === "main") {
-    return {
-      channel,
-      version: base,
-      tag: `${tagPrefix}${base}`,
-      prerelease: false,
-      latest: true,
-      previous_tag: previousTag,
-    }
-  }
-
-  const sequence =
-    Math.max(
-      0,
-      ...input.tags.flatMap((tag) => {
-        const parsed = parseDevTag(tag)
-        return parsed && sameVersion(parsed.version, target) ? [parsed.sequence] : []
-      }),
-    ) + 1
-  const version = `${base}-dev.${sequence}`
   return {
     channel,
-    version,
-    tag: `${tagPrefix}${version}`,
-    prerelease: true,
-    latest: false,
+    version: base,
+    tag: `${tagPrefix}${base}`,
+    prerelease: false,
+    latest: true,
     previous_tag: previousTag,
   }
 }
@@ -57,15 +36,6 @@ function parseStableTag(tag: string): Version | undefined {
   return [Number(match[1]), Number(match[2]), Number(match[3])]
 }
 
-function parseDevTag(tag: string) {
-  const match = devTag.exec(tag)
-  if (!match) return undefined
-  return {
-    version: [Number(match[1]), Number(match[2]), Number(match[3])] as Version,
-    sequence: Number(match[4]),
-  }
-}
-
 function nextVersion(version: Version | undefined): Version {
   if (!version) return [1, 0, 0]
   return [version[0], version[1], version[2] + 1]
@@ -73,10 +43,6 @@ function nextVersion(version: Version | undefined): Version {
 
 function compareVersion(left: Version, right: Version) {
   return left[0] - right[0] || left[1] - right[1] || left[2] - right[2]
-}
-
-function sameVersion(left: Version, right: Version) {
-  return left[0] === right[0] && left[1] === right[1] && left[2] === right[2]
 }
 
 async function readTags() {

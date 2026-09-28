@@ -5,17 +5,15 @@
 #           LeXwDeX/opencode fork. Stripped-down version of upstream
 #           publish.yml — removes repo guard, Blacksmith runners, code
 #           signing, npm publish, and Tauri desktop.
-# Trigger : Manual workflow_dispatch (PRIMARY) — pick main or dev
-#           Push to main/dev ONLY registers the workflow in the Actions UI
+# Trigger : Manual workflow_dispatch from main only
+#           Push to main ONLY registers the workflow in the Actions UI
 #           (the build job is gated on `github.event_name == 'workflow_dispatch'`)
 # Version : Independent GraphAgent SemVer derived only from graphagent-v* tags.
-#           dev builds the next stable version as X.Y.Z-dev.N; main publishes
-#           X.Y.Z and marks it Latest. OpenCode package versions are ignored.
+#           main builds X.Y.Z and marks it Latest. Historical dev tags do not
+#           advance the stable line. OpenCode package versions are ignored.
 # Inputs  : create_release — when true, create a GitHub Release with the
-#                            built binaries + SHA256SUMS attached. Builds
-#                            from `dev` are marked prerelease (test build);
-#                            `main` builds are formal and become Latest. The
-#                            default is false so an ordinary dispatch exercises
+#                            built binaries + SHA256SUMS attached. The default
+#                            is false so an ordinary dispatch exercises
 #                            the complete candidate path without publishing.
 #           platforms      — comma-separated subset of linux,macos,windows
 #                            to build. Leave blank to build all three.
@@ -44,11 +42,10 @@ on:
         description: "Platforms to build, comma-separated (linux,macos,windows). Leave blank for all."
         required: false
         type: string
-  # Also run on push to main/dev so the workflow registers in Actions UI
+  # Also run on push to main so the workflow registers in Actions UI
   push:
     branches:
       - main
-      - dev
     paths:
       - ".github/workflows/release-fork.yml"
 
@@ -77,6 +74,12 @@ jobs:
       previous_tag: ${{ steps.release-version.outputs.previous_tag }}
 
     steps:
+      - name: Require main branch
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::Stable GraphAgent releases must be dispatched from main."
+          exit 1
+
       - name: Checkout Repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
@@ -93,7 +96,7 @@ jobs:
         run: bun run ./packages/opencode/script/release-version.ts
 
   # Package the latest reference templates from the dedicated config repo
-  # (LeXwDeX/opencode-dag-config) into a release asset. dev/main do not manage
+  # (LeXwDeX/opencode-dag-config) into a release asset. main does not manage
   # these templates anymore — the config repo is the single source of truth.
   # Read-only: no commits, no pushes, so branch protection never blocks it.
   #
@@ -103,7 +106,7 @@ jobs:
   # closed), so an unchecked archive can never be uploaded or embedded.
   package-templates:
     name: Package Reference Templates
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
     runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 30
     permissions:
@@ -170,7 +173,7 @@ jobs:
     # Skip the actual build when triggered by push (registration-only). Per-
     # matrix-entry platform filtering can't live here — `matrix` isn't in
     # scope for a job-level `if:` — so it's applied to each step below instead.
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
     strategy:
       fail-fast: false
       matrix:
@@ -252,7 +255,7 @@ jobs:
         if: inputs.platforms == '' || contains(inputs.platforms, matrix.name)
         run: ./packages/opencode/script/build.ts --single --skip-install
         env:
-          OPENCODE_CHANNEL: ${{ needs.version.outputs.channel == 'main' && 'latest' || 'dev' }}
+          OPENCODE_CHANNEL: latest
           OPENCODE_VERSION: ${{ needs.version.outputs.version }}
 
       # Bundle ripgrep into each dist/opencode-*/bin so air-gapped users do not
@@ -312,7 +315,7 @@ jobs:
   prepare-release:
     name: Prepare Release Candidate
     needs: [version, build-cli, package-templates]
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
     runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 15
     steps:
@@ -411,7 +414,7 @@ jobs:
   publish-release:
     name: Create GitHub Release
     needs: [version, prepare-release]
-    if: inputs.create_release
+    if: inputs.create_release && github.ref == 'refs/heads/main'
     runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 10
     permissions:
@@ -463,16 +466,9 @@ jobs:
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-        # dev releases are prereleases and can never become Latest. main
-        # releases are formal and are explicitly promoted to Latest.
+        # Stable releases are explicitly promoted to Latest.
         run: |
           shopt -s nullglob
-          EXTRA_FLAGS=()
-          if [ "${{ needs.version.outputs.channel }}" = "main" ]; then
-            EXTRA_FLAGS+=(--latest)
-          else
-            EXTRA_FLAGS+=(--prerelease --latest=false)
-          fi
           assets=(
             release-assets/*.tar.gz
             release-assets/*.zip
@@ -484,7 +480,7 @@ jobs:
             --title "OpenCode GraphAgent v${{ needs.version.outputs.version }}" \
             --notes-file "release-assets/RELEASE_NOTES.md" \
             --target "${{ github.sha }}" \
-            "${EXTRA_FLAGS[@]}" \
+            --latest \
             "${assets[@]}"
 
   # No-op job for push-triggered runs — just registers the workflow in Actions UI

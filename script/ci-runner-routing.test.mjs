@@ -26,17 +26,6 @@ const namedSteps = (source, name) => {
   return steps
 }
 
-const runBody = (step) => {
-  const marker = "\n        run: |\n"
-  const start = step.indexOf(marker)
-  assert.notEqual(start, -1, "step has no multiline run body")
-  return step
-    .slice(start + marker.length)
-    .split("\n")
-    .map((line) => line.replace(/^          /, ""))
-    .join("\n")
-}
-
 await test("self-hosted routes are gated by the trusted-event predicate and keep a hosted fallback", () => {
   for (const file of ["ci-typecheck.yml", "ci-test.yml"]) {
     const lines = workflow(file).split("\n")
@@ -91,6 +80,27 @@ await test("the test matrix keeps names and OS keys while carrying standard self
   assert.equal(file.split("selfHosted: [self-hosted, Windows, X64]").length - 1, 1, "windows matrix row")
 })
 
+await test("every main PR runs the full Linux unit and Linux/Windows E2E gates", () => {
+  for (const name of ["ci-typecheck.yml", "ci-test.yml"]) {
+    const file = workflow(name)
+    const triggers = file.slice(file.indexOf("\non:\n"), file.indexOf("\npermissions:\n"))
+    assert.match(triggers, /pull_request:[\s\S]*?branches:\n      - main(?:\n|$)/, `${name}: main PR trigger`)
+    assert.match(triggers, /push:[\s\S]*?branches:\n      - main(?:\n|$)/, `${name}: main push trigger`)
+    assert(!triggers.includes("      - dev"), `${name}: retired dev trigger remains`)
+  }
+
+  const file = workflow("ci-test.yml")
+  const unit = file.slice(file.indexOf("\n  unit-tests:"), file.indexOf("\n  e2e-tests:"))
+  const e2e = file.slice(file.indexOf("\n  e2e-tests:"))
+  assert(unit.includes("name: Unit Tests (${{ matrix.settings.name }})"), "Linux unit status check")
+  for (const step of ["GITHUB_ACTIONS=false bun turbo test", "go test ./...", "bun run test:httpapi:ci"])
+    assert(unit.includes(step), `unit gate: ${step}`)
+  assert(!/^    if:/m.test(e2e.slice(0, e2e.indexOf("    strategy:"))), "E2E job must run on every triggered PR")
+  for (const name of ["linux", "windows"])
+    assert(e2e.includes(`- name: ${name}\n`), `${name} E2E matrix entry`)
+  assert(e2e.includes("run: bun --cwd packages/app test:e2e:local"), "Playwright E2E gate")
+})
+
 await test("self-hosted Linux jobs never require sudo: prerequisites are checked and fail actionably", () => {
   const file = workflow("ci-test.yml")
   assert(!file.includes("run: sudo apt-get"), "a step still installs with sudo directly")
@@ -127,6 +137,22 @@ await test("manual release routes trusted Linux and Windows work while keeping m
   assert(file.includes("runner: macos-latest"), "macOS hosted route")
   assert.equal(file.split("runs-on: [self-hosted, Linux, X64]").length - 1, 5, "trusted Linux jobs")
   assert(!file.includes("runs-on: ubuntu-latest"), "trusted Linux job left on a hosted runner")
+})
+
+await test("manual releases reject non-main refs and publish stable artifacts only", () => {
+  const file = workflow("release-fork.yml")
+  const triggers = file.slice(file.indexOf("\non:\n"), file.indexOf("\npermissions:\n"))
+  const version = file.slice(file.indexOf("\n  version:"), file.indexOf("\n  package-templates:"))
+  const publish = file.slice(file.indexOf("\n  publish-release:"), file.indexOf("\n  # No-op job"))
+
+  assert.match(triggers, /push:[\s\S]*?branches:\n      - main(?:\n|$)/, "main registration trigger")
+  assert(!triggers.includes("      - dev"), "retired dev registration trigger")
+  assert(version.includes("if: github.ref != 'refs/heads/main'"), "non-main dispatch rejection")
+  assert(version.includes("exit 1"), "non-main dispatch must fail")
+  assert(file.includes("OPENCODE_CHANNEL: latest"), "stable binary channel")
+  assert(publish.includes("if: inputs.create_release && github.ref == 'refs/heads/main'"), "main publish guard")
+  assert(publish.includes("--latest"), "stable Latest publication")
+  assert(!publish.includes("--prerelease"), "retired prerelease publication")
 })
 
 await test("release checkout credentials and third-party action versions are fixed", () => {
@@ -174,15 +200,6 @@ await test("release candidate preparation is read-only and publication owns the 
     assert(file.includes(field), `template provenance field: ${field}`)
   assert(file.includes("command -v sha256sum"), "Linux checksum fallback")
   assert(publish.includes('"${assets[@]}"'), "publish must tolerate a selected platform subset")
-})
-
-await test("dev issue auto-close uses the trusted Linux runner without checking out PR code", () => {
-  const file = workflow("dev-issue-autoclose.yml")
-  assert(file.includes("github.event.pull_request.merged == true"), "merged-event gate")
-  assert(file.includes("github.event.pull_request.base.ref == 'dev'"), "dev-base gate")
-  assert(file.includes("runs-on: [self-hosted, Linux, X64]"), "trusted Linux route")
-  assert(file.includes("timeout-minutes: 10"), "bounded job")
-  assert(!file.includes("uses: actions/checkout"), "event helper must not check out PR code")
 })
 
 await test("verified GitHub CLI bootstrap pins supported archives and verifies before extracting", () => {
@@ -239,25 +256,21 @@ await test("jobs that check out repository content bootstrap gh before evidence 
     assert(testBootstraps[index] < evidenceSteps[index], `test job ${index + 1} bootstraps gh after evidence`)
 })
 
-await test("privileged no-checkout jobs share an anonymous fail-closed Linux bootstrap", () => {
+await test("release publication uses an anonymous fail-closed Linux bootstrap", () => {
   const release = workflow("release-fork.yml")
-  const autoclose = workflow("dev-issue-autoclose.yml")
   const publish = release.slice(release.indexOf("\n  publish-release:"), release.indexOf("\n  # No-op job"))
   const publishSetup = namedSteps(publish, "Setup GitHub CLI")[0]
-  const autocloseSetup = namedSteps(autoclose, "Setup GitHub CLI")[0]
 
   assert(publishSetup, "publish bootstrap missing")
-  assert(autocloseSetup, "autoclose bootstrap missing")
-  assert.equal(runBody(publishSetup), runBody(autocloseSetup), "privileged inline bootstrap implementations drifted")
-  for (const step of [publishSetup, autocloseSetup]) {
-    assert(step.includes('GH_CLI_VERSION: "2.101.0"'), "inline version pin")
-    assert(step.includes("9bca2d1c16825f109907a23307628a2f0698fbf99662b73a5cf0b020293072b8"), "inline Linux SHA pin")
-    assert(step.includes('"${RUNNER_OS:-}" != "Linux"'), "inline OS rejection")
-    assert(step.includes('"${RUNNER_ARCH:-}" != "X64"'), "inline architecture rejection")
-    assert(!step.includes("GH_TOKEN"), "bootstrap step must not receive GH_TOKEN")
-    assert(!step.includes("GITHUB_TOKEN"), "bootstrap step must not receive GITHUB_TOKEN")
-    assert(step.indexOf('if [ "$actual" != "$GH_CLI_LINUX_AMD64_SHA256" ]') < step.indexOf('tar -xzf "$archive"'))
-  }
+  assert(publishSetup.includes('GH_CLI_VERSION: "2.101.0"'), "inline version pin")
+  assert(publishSetup.includes("9bca2d1c16825f109907a23307628a2f0698fbf99662b73a5cf0b020293072b8"), "inline Linux SHA pin")
+  assert(publishSetup.includes('"${RUNNER_OS:-}" != "Linux"'), "inline OS rejection")
+  assert(publishSetup.includes('"${RUNNER_ARCH:-}" != "X64"'), "inline architecture rejection")
+  assert(!publishSetup.includes("GH_TOKEN"), "bootstrap step must not receive GH_TOKEN")
+  assert(!publishSetup.includes("GITHUB_TOKEN"), "bootstrap step must not receive GITHUB_TOKEN")
+  assert(
+    publishSetup.indexOf('if [ "$actual" != "$GH_CLI_LINUX_AMD64_SHA256" ]') <
+      publishSetup.indexOf('tar -xzf "$archive"'),
+  )
   assert(!publish.includes("uses: actions/checkout"), "publish must remain no-checkout")
-  assert(!autoclose.includes("uses: actions/checkout"), "autoclose must remain no-checkout")
 })

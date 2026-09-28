@@ -1,0 +1,222 @@
+/** @jsxImportSource @opentui/solid */
+import { afterEach, expect, test } from "bun:test"
+import { RGBA, SyntaxStyle, type ScrollBoxRenderable } from "@opentui/core"
+import { testRender } from "@opentui/solid"
+import { createSignal } from "solid-js"
+import { ReasoningMarkdown } from "../../../../src/routes/session"
+
+const fg = RGBA.fromHex("#888888")
+const syntaxStyle = SyntaxStyle.fromStyles({ default: { fg } })
+let app: Awaited<ReturnType<typeof testRender>> | undefined
+
+afterEach(() => {
+  app?.renderer.destroy()
+  app = undefined
+})
+
+test("replaces a streamed thought with distilled markdown in the same rendered slot", async () => {
+  const [content, setContent] = createSignal("Original reasoning with `old` detail")
+  app = await testRender(
+    () => (
+      <box width={56}>
+        <text>Thought: Plan</text>
+        <ReasoningMarkdown content={content()} streaming={false} syntaxStyle={syntaxStyle} conceal={false} fg={fg} />
+        <text>Final answer</text>
+      </box>
+    ),
+    { width: 56, height: 12 },
+  )
+  for (let i = 0; i < 20 && !app.captureCharFrame().includes("Original reasoning"); i++) {
+    await app.renderOnce()
+    await Bun.sleep(5)
+  }
+  expect(app.captureCharFrame()).toContain("Original reasoning with `old` detail")
+
+  setContent("Replacement reasoning with `new` detail")
+  for (let i = 0; i < 20 && !app.captureCharFrame().includes("Replacement reasoning"); i++) {
+    await app.renderOnce()
+    await Bun.sleep(5)
+  }
+  const frame = app.captureCharFrame()
+  expect(frame).toContain("Replacement reasoning with `new` detail")
+  expect(frame).toContain("Final answer")
+  expect(frame).not.toContain("Original reasoning")
+})
+
+test("shows appended text while the thought is still streaming", async () => {
+  const [content, setContent] = createSignal("Initial thought")
+  app = await testRender(
+    () => <ReasoningMarkdown content={content()} streaming={true} syntaxStyle={syntaxStyle} conceal={false} fg={fg} />,
+    { width: 48, height: 5 },
+  )
+  await app.renderOnce()
+  setContent("Initial thought\n\nNew evidence")
+  await app.renderOnce()
+  expect(app.captureCharFrame()).toContain("New evidence")
+})
+
+test("one mounted thought streams, finalizes, then replaces its first and last blocks", async () => {
+  const [content, setContent] = createSignal("OLD FIRST\n\nOLD LAST")
+  const [streaming, setStreaming] = createSignal(true)
+  app = await testRender(
+    () => (
+      <ReasoningMarkdown
+        content={content()}
+        streaming={streaming()}
+        syntaxStyle={syntaxStyle}
+        conceal={false}
+        fg={fg}
+      />
+    ),
+    { width: 48, height: 8 },
+  )
+  await app.renderOnce()
+  setContent("OLD FIRST\n\nAPPENDED MIDDLE\n\nOLD LAST")
+  await app.renderOnce()
+  expect(app.captureCharFrame()).toContain("APPENDED MIDDLE")
+  setStreaming(false)
+  await app.renderOnce()
+  setContent("NEW FIRST\n\nDISTILLED MIDDLE\n\nNEW LAST")
+  for (let i = 0; i < 20 && !app.captureCharFrame().includes("NEW LAST"); i++) {
+    await app.renderOnce()
+    await Bun.sleep(5)
+  }
+  const frame = app.captureCharFrame()
+  expect(frame).toContain("NEW FIRST")
+  expect(frame).toContain("NEW LAST")
+  expect(frame).not.toContain("OLD FIRST")
+  expect(frame).not.toContain("OLD LAST")
+})
+
+test("switches at exactly 4096/4097 UTF-8 bytes without leaving old content", async () => {
+  const body = (bytes: number, marker: string) => {
+    const head = `### ${marker}\n`
+    const tail = `\n${marker} END`
+    const content = head + "a".repeat(bytes - Buffer.byteLength(head) - Buffer.byteLength(tail)) + tail
+    expect(Buffer.byteLength(content)).toBe(bytes)
+    return content
+  }
+  const short = body(4096, "SHORT")
+  const long = body(4097, "LONG")
+  const [content, setContent] = createSignal(short)
+  let scroll!: ScrollBoxRenderable
+  app = await testRender(
+    () => (
+      <scrollbox ref={scroll} width={56} height={6}>
+        <ReasoningMarkdown content={content()} streaming={false} syntaxStyle={syntaxStyle} conceal={true} fg={fg} />
+      </scrollbox>
+    ),
+    { width: 56, height: 6 },
+  )
+  const frame = async (marker: string) => {
+    for (let i = 0; i < 20; i++) {
+      scroll.scrollTop = 0
+      await app!.renderOnce()
+      if (app!.captureCharFrame().includes(marker)) break
+      await Bun.sleep(5)
+    }
+    const top = app!.captureCharFrame()
+    scroll.scrollBy(100_000)
+    await app!.renderOnce()
+    return { top, bottom: app!.captureCharFrame() }
+  }
+  const first = await frame("SHORT")
+  expect(first.top).toContain("SHORT")
+  expect(first.top).not.toContain("### SHORT")
+  expect(first.bottom).toContain("SHORT END")
+  setContent(long)
+  const second = await frame("### LONG")
+  expect(second.top).toContain("### LONG")
+  expect(second.top).not.toContain("SHORT")
+  expect(second.bottom).toContain("LONG END")
+  setContent(short)
+  const third = await frame("SHORT")
+  expect(third.top).not.toContain("### SHORT")
+  expect(third.top).not.toContain("LONG")
+  expect(third.bottom).toContain("SHORT END")
+
+  const chineseShort = body(4096, "思考")
+  const chineseLong = body(4097, "替换")
+  setContent(chineseShort)
+  const fourth = await frame("思考")
+  expect(fourth.top).not.toContain("### 思考")
+  expect(fourth.bottom).toContain("思考 END")
+  setContent(chineseLong)
+  const fifth = await frame("### 替换")
+  expect(fifth.top).toContain("### 替换")
+  expect(fifth.top).not.toContain("思考")
+  expect(fifth.bottom).toContain("替换 END")
+})
+
+test("shows an entire long replacement as readable plain text without stale content", async () => {
+  const original = Array.from({ length: 800 }, (_, i) => `### Step ${i}: original evidence`).join("\n")
+  const replacement = Array.from({ length: 800 }, (_, i) => `### Task ${i}: distilled evidence`).join("\n")
+  const [content, setContent] = createSignal(original)
+  let scroll!: ScrollBoxRenderable
+  app = await testRender(
+    () => (
+      <scrollbox ref={scroll} width={64} height={8}>
+        <ReasoningMarkdown content={content()} streaming={false} syntaxStyle={syntaxStyle} conceal={false} fg={fg} />
+      </scrollbox>
+    ),
+    { width: 64, height: 8 },
+  )
+  await app.renderOnce()
+  expect(app.captureCharFrame()).toContain("### Step 0: original evidence")
+  setContent(replacement)
+  await app.renderOnce()
+  const top = app.captureCharFrame()
+  expect(top).toContain("### Task 0: distilled evidence")
+  expect(top).not.toContain("original evidence")
+  scroll.scrollBy(100_000)
+  await app.renderOnce()
+  expect(app.captureCharFrame()).toContain("### Task 799: distilled evidence")
+})
+
+test("shortening a thought below the viewport keeps the earlier reading position", async () => {
+  const [content, setContent] = createSignal(Array.from({ length: 14 }, (_, i) => `Thought line ${i}`).join("\n\n"))
+  let scroll!: ScrollBoxRenderable
+  app = await testRender(
+    () => (
+      <scrollbox ref={scroll} width={48} height={5}>
+        <text>{Array.from({ length: 10 }, (_, i) => `Earlier row ${i}`).join("\n")}</text>
+        <ReasoningMarkdown content={content()} streaming={false} syntaxStyle={syntaxStyle} conceal={false} fg={fg} />
+        <text>Later anchor</text>
+      </scrollbox>
+    ),
+    { width: 48, height: 5 },
+  )
+  await app.renderOnce()
+  scroll.scrollTop = 4
+  await app.renderOnce()
+  const before = scroll.scrollTop
+  expect(app.captureCharFrame()).toContain("Earlier row 4")
+  setContent("Short replacement")
+  await app.renderOnce()
+  expect(scroll.scrollTop).toBe(before)
+  expect(app.captureCharFrame()).toContain("Earlier row 4")
+})
+
+test("growing a thought while following the bottom keeps the later anchor visible", async () => {
+  const [content, setContent] = createSignal("Short thought")
+  let scroll!: ScrollBoxRenderable
+  app = await testRender(
+    () => (
+      <scrollbox ref={scroll} stickyScroll={true} stickyStart="bottom" width={48} height={5}>
+        <text>{Array.from({ length: 10 }, (_, i) => `Earlier row ${i}`).join("\n")}</text>
+        <ReasoningMarkdown content={content()} streaming={false} syntaxStyle={syntaxStyle} conceal={false} fg={fg} />
+        <text>Later anchor</text>
+      </scrollbox>
+    ),
+    { width: 48, height: 5 },
+  )
+  await app.renderOnce()
+  scroll.scrollBy(1000)
+  await app.renderOnce()
+  const before = scroll.scrollTop
+  expect(app.captureCharFrame()).toContain("Later anchor")
+  setContent(Array.from({ length: 14 }, (_, i) => `Distilled line ${i}`).join("\n\n"))
+  await app.renderOnce()
+  expect(scroll.scrollTop).toBeGreaterThan(before)
+  expect(app.captureCharFrame()).toContain("Later anchor")
+})
