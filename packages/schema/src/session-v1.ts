@@ -1,3 +1,4 @@
+import { ReasoningDistillation } from "./reasoning-distillation"
 export * as SessionV1 from "./session-v1"
 
 import { Effect, Schema, Types } from "effect"
@@ -119,6 +120,8 @@ export const ReasoningPart = Schema.Struct({
   ...partBase,
   type: Schema.Literal("reasoning"),
   text: Schema.String,
+  distillation: ReasoningDistillation.pipe(Schema.optional),
+  v2: Schema.Struct({ messageID: Schema.String, reasoningID: Schema.String }).pipe(Schema.optional),
   metadata: Schema.optional(Schema.Record(Schema.String, Schema.Any)),
   time: Schema.Struct({
     start: NonNegativeInt,

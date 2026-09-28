@@ -85,6 +85,7 @@ export type ToolMessageBinding = Readonly<{
 }>
 
 export type ReasoningMessageBinding = Readonly<{
+  distilled?: boolean
   ref: Readonly<{ messageID: string; partID: string }>
   /** Exact path in the canonical LLM request, resolved without matching on text. */
   bodyPath: readonly (string | number)[]
@@ -153,6 +154,7 @@ const assistant = (message: SessionMessage.Assistant, model: Model): MessageConv
             new Set(["encrypted_content", "encryptedContent", "reasoningEncryptedContent"]),
           ),
           settled: message.time.completed !== undefined,
+          distilled: item.distillation !== undefined,
         })
         canonicalContentIndex++
       }
@@ -278,6 +280,7 @@ export const toLLMMessagesWithBindings = (
         signed: binding.signed,
         encrypted: binding.encrypted,
         settled: binding.settled,
+        distilled: binding.distilled,
       })),
     )
     messageOffset += item.messages.length

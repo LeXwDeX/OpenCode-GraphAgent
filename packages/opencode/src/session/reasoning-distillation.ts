@@ -540,7 +540,7 @@ const runPreparedCycle = async <Request>(
 }
 
 /**
- * Replay every exact reasoning slot in wire order and prepare at most one new slot per request.
+ * Replay exact reasoning slots in wire order. Completed-turn preparation processes every new slot.
  * Synchronous preparation can perform a proposal followed by its independent review.
  * Reapply all current certificates before advancing a pending judge or a fresh proposal. A paid call never prevents
  * another validated slot from appearing in this request rebuilt from persisted original history.
@@ -587,7 +587,7 @@ export const runDistillationCycle = async <Request>(
     request = cycle.projection.request
     applied ||= cycle.projection.applied
     last = cycle
-    if (cycle.attempted !== "none") break
+    if (!input.synchronous && cycle.attempted !== "none") break
   }
   if (!last) return runSingleDistillationCycle(state, input)
   return {
@@ -911,6 +911,7 @@ export const parseSupport = (raw: unknown): ClaimSupport[] | undefined => {
  * ambiguous, or multi-part lineage remains P4-protected until ordered multi-part evidence mapping is implemented.
  */
 export type InterleavedSourcePart = Readonly<{
+  distilled?: boolean
   messageID: string
   partID: string
   text: string
@@ -962,7 +963,7 @@ export const extractInterleavedReasoningSlots = (
       signed: known ? source.signed : false,
       encrypted: known ? source.encrypted : false,
       settled: known ? source.settled : false,
-      structureRewritable: known,
+      structureRewritable: known && !source.distilled,
     })
   }
   return slots
@@ -1015,7 +1016,7 @@ export const extractNativeInterleavedReasoningSlots = (
       signed: known ? source.signed : false,
       encrypted: known ? source.encrypted : false,
       settled: known ? source.settled : false,
-      structureRewritable: known,
+      structureRewritable: known && !source.distilled,
     })
   }
   return slots
@@ -1195,8 +1196,7 @@ export type ScopedReasoningEvidence = Readonly<{
   evidenceReferences: readonly EvidenceRef[]
 }>
 
-export const isDistillationTurn = (turn: number): boolean =>
-  Number.isSafeInteger(turn) && turn > 0 && (turn - 1) % 3 === 0
+export const isDistillationTurn = (turn: number): boolean => Number.isSafeInteger(turn) && turn > 0
 
 export type ReasoningHistorySnapshot = Readonly<{
   /** User turn owning the newest settled reasoning; tool steps do not increment it. */
@@ -1295,6 +1295,7 @@ export const reasoningHistory = (messages: readonly SessionV1.WithParts[]): Reas
             new Set(["encrypted_content", "encryptedContent", "reasoningEncryptedContent"]),
           ),
           settled: part.time.end !== undefined,
+          distilled: part.distillation !== undefined,
         })
       }
       if (part.type !== "tool") continue

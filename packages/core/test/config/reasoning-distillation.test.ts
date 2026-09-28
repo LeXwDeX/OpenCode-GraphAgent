@@ -3,9 +3,9 @@ import { Schema } from "effect"
 import { ConfigReasoningDistillation } from "../../src/config/reasoning-distillation"
 
 describe("ConfigReasoningDistillation.resolveEnabled (D02)", () => {
-  test("defaults on when nothing is set", () => {
+  test("defaults off when nothing is set", () => {
     expect(ConfigReasoningDistillation.resolveEnabled({ disabledByEnvironment: false })).toEqual({
-      enabled: true,
+      enabled: false,
       source: "default",
     })
   })

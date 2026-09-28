@@ -1,3 +1,5 @@
+import { makeTurnScheduler } from "../reasoning-distillation/schedule"
+import { adoptReasoning } from "../reasoning-distillation/adopt"
 import {
   LLM,
   LLMClient,
@@ -9,7 +11,7 @@ import {
   isContextOverflowFailure,
   type ProviderErrorEvent,
 } from "@opencode-ai/llm"
-import { Cause, DateTime, Deferred, Duration, Effect, FiberSet, Layer, Option, Semaphore, Stream } from "effect"
+import { Cause, DateTime, Deferred, Duration, Effect, FiberSet, Layer, Option, Scope, Semaphore, Stream } from "effect"
 import { AgentV2 } from "../../agent"
 import { Config } from "../../config"
 import { ConfigCompaction } from "../../config/compaction"
@@ -127,6 +129,8 @@ const toolWaitTimeoutError = () =>
 export const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
+    const scope = yield* Scope.Scope
+    const scheduleDistillation = makeTurnScheduler(scope)
     const events = yield* EventV2.Service
     const llm = yield* LLMClient.Service
     const agents = yield* AgentV2.Service
@@ -394,45 +398,7 @@ export const layer = Layer.effect(
           projectionPlan: folding.plan,
         }),
       )
-      let request = folding.request
-      const reasoningConfig = Config.latest(yield* config.entries(), "reasoningDistillation")
-      const reasoningResolution = ConfigReasoningDistillation.resolveEnabled({
-        disabledByEnvironment: Flag.OPENCODE_DISABLE_REASONING_DISTILLATION,
-        enabled: reasoningConfig?.enabled,
-      })
-      if (
-        reasoningResolution.enabled &&
-        (reasoningConfig?.compatibility?.length ?? 0) > 0 &&
-        conversion.reasoningBindings.length > 0
-      ) {
-        const prepared = Option.getOrUndefined(yield* llm.prepare(request).pipe(Effect.option))
-        if (prepared) {
-          const distilled = yield* reasoningDistillation.distill({
-            sessionID: session.id,
-            ...(session.model?.variant === undefined ? {} : { variant: session.model.variant }),
-            request,
-            prepared,
-            sourceMessages: context,
-            bindings: conversion.reasoningBindings,
-            config: reasoningConfig ?? new ConfigReasoningDistillation.Info({}),
-          })
-          request = distilled.request
-          yield* Effect.logInfo("reasoning distillation", {
-            "reasoning_distillation.runtime": "core-runner",
-            "reasoning_distillation.enabled": true,
-            "reasoning_distillation.source": reasoningResolution.source,
-            "reasoning_distillation.attempted": distilled.attempted,
-            "reasoning_distillation.applied": distilled.applied,
-            "reasoning_distillation.skip_reason": distilled.skipReason ?? "none",
-            "reasoning_distillation.slot_count": conversion.reasoningBindings.length,
-            "reasoning_distillation.aux_reserved_tokens": distilled.usage?.reservedTokens ?? 0,
-            "reasoning_distillation.aux_actual_tokens": distilled.usage?.actualTokens ?? 0,
-            "reasoning_distillation.aux_unknown_usage_calls": distilled.usage?.unknownUsageCalls ?? 0,
-            "reasoning_distillation.aux_latency_ms": distilled.usage?.latencyMs ?? 0,
-            "reasoning_distillation.paid_admission_paused": distilled.usage?.paidAdmissionPaused ?? false,
-          })
-        }
-      }
+      const request = folding.request
       if (yield* compaction.compactIfNeeded({ sessionID: session.id, entries, model, request }))
         return yield* Effect.die(continueAfterCompaction(currentStep))
       const startSnapshot = yield* Snapshot.captureDeduped(history.snapshots, snapshots.capture)
@@ -593,6 +559,79 @@ export const layer = Layer.effect(
           yield* withPublication(batch.flush())
           if (stream._tag === "Failure") return yield* Effect.failCause(stream.cause)
           if (settled._tag === "Failure") return yield* Effect.failCause(settled.cause)
+          const enabled = config.entries().pipe(
+            Effect.map(
+              (entries) =>
+                ConfigReasoningDistillation.resolveEnabled({
+                  disabledByEnvironment: Flag.OPENCODE_DISABLE_REASONING_DISTILLATION,
+                  enabled: Config.latest(entries, "reasoningDistillation")?.enabled,
+                }).enabled,
+            ),
+          )
+          if (!publisher.hasProviderError() && !needsContinuation && (yield* enabled)) {
+            const completed = yield* getContext(session.id)
+            const userIndex = completed.findLastIndex((message) => message.type === "user")
+            const turnID = completed[userIndex]?.id
+            if (turnID) {
+              const turnIDs = new Set(completed.slice(userIndex + 1).map((message) => message.id))
+              const latestConversion = toLLMMessagesWithBindings(completed, model)
+              yield* restore(
+                scheduleDistillation({
+                  sessionID: session.id,
+                  turnID,
+                  previouslyDistilled: completed
+                    .slice(0, userIndex)
+                    .some(
+                      (message) =>
+                        message.type === "assistant" &&
+                        message.content.some((part) => part.type === "reasoning" && part.distillation !== undefined),
+                    ),
+                  enabled,
+                  work: Effect.gen(function* () {
+                    const reasoningConfig = Config.latest(yield* config.entries(), "reasoningDistillation")
+                    if (!reasoningConfig?.compatibility?.length) return
+                    const completedRequest = LLM.updateRequest(request, { messages: latestConversion.messages })
+                    const prepared = yield* llm.prepare(completedRequest)
+                    const distilled = yield* reasoningDistillation.distill({
+                      sessionID: session.id,
+                      variant: session.model?.variant,
+                      request: completedRequest,
+                      prepared,
+                      sourceMessages: completed,
+                      bindings: latestConversion.reasoningBindings.filter((binding) =>
+                        turnIDs.has(SessionMessage.ID.make(binding.ref.messageID)),
+                      ),
+                      config: reasoningConfig,
+                    })
+                    const adopted =
+                      distilled.applied &&
+                      (yield* enabled) &&
+                      (yield* adoptReasoning(
+                        events,
+                        db,
+                        session.id,
+                        completed,
+                        distilled.replacements ?? [],
+                        enabled,
+                      ).pipe(
+                        Effect.tap((adopted) =>
+                          Effect.sync(() => {
+                            if (adopted) cursors.delete(session.id)
+                          }),
+                        ),
+                      ))
+                    yield* Effect.logInfo("reasoning distillation", {
+                      "reasoning_distillation.runtime": "core-runner",
+                      "reasoning_distillation.applied": adopted,
+                      "reasoning_distillation.attempted": distilled.attempted,
+                      "reasoning_distillation.skip_reason": distilled.skipReason ?? "none",
+                      "reasoning_distillation.aux_actual_tokens": distilled.usage?.actualTokens ?? 0,
+                    })
+                  }).pipe(Effect.asVoid),
+                }),
+              )
+            }
+          }
           return { needsContinuation: !publisher.hasProviderError() && needsContinuation, step: currentStep }
         }),
       )

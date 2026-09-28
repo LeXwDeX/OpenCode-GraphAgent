@@ -1,3 +1,4 @@
+import { ReasoningDistillation } from "./reasoning-distillation"
 export * as SessionEvent from "./session-event"
 
 import { Schema } from "effect"
@@ -264,6 +265,7 @@ export namespace Reasoning {
       assistantMessageID: SessionMessageID.ID,
       reasoningID: Schema.String,
       text: Schema.String,
+      distillation: ReasoningDistillation.pipe(Schema.optional),
       providerMetadata: ProviderMetadata.pipe(Schema.optional),
     },
   })

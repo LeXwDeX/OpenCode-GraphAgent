@@ -137,7 +137,7 @@ describe("buildReasoningEvidence", () => {
 })
 
 describe("buildSlotMappings (§2.1 gating)", () => {
-  test("without a compatibility record every slot is P5-protected (default-on still a no-op)", () => {
+  test("without a compatibility record every slot is P5-protected (explicit opt-in still a no-op)", () => {
     const mappings = buildSlotMappings([slot()], capability(), [])
     expect(mappings[0].eligibility).toEqual({ allowed: false, protection: "P5" })
     expect(mappings[0].sourceFingerprint).toBe(Hash.sha256("原始冗长思绪"))
@@ -1479,8 +1479,10 @@ describe("review regressions: conservation and source binding", () => {
   })
 })
 
-test("reasoning preparation cadence is first turn then every three user turns", () => {
-  expect(Array.from({ length: 11 }, (_, turn) => turn).filter(isDistillationTurn)).toEqual([1, 4, 7, 10])
+test("reasoning preparation cadence includes every completed user turn", () => {
+  expect(Array.from({ length: 11 }, (_, turn) => turn).filter(isDistillationTurn)).toEqual([
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+  ])
   expect(isDistillationTurn(NaN)).toBe(false)
   expect(isDistillationTurn(1.5)).toBe(false)
 })

@@ -1,3 +1,4 @@
+import { reasoningReplacements, type ReasoningReplacement } from "../reasoning-distillation/adoption"
 import {
   LLM,
   LLMResponse,
@@ -93,6 +94,7 @@ const emptyState: LifecycleState = {
 type Slot = Readonly<ReasoningMessageBinding & { structureRewritable: boolean }>
 
 export type Result = Readonly<{
+  replacements?: readonly ReasoningReplacement[]
   request: LLMRequest
   attempted: "none" | "propose" | "judge"
   applied: boolean
@@ -476,7 +478,7 @@ const plan = (input: Input, slot: Slot, state: LifecycleState, messages: unknown
   const latestIndex = input.sourceMessages.findIndex((message) => message.id === latestSource)
   const turn = input.sourceMessages.slice(0, latestIndex + 1).filter((message) => message.type === "user").length
   const current = cached && isCertificateCurrent(cached, inventory.fingerprint)
-  const trigger = turn === 0 ? undefined : current ? "replay" : (turn - 1) % 3 === 0 ? "scheduled" : "idle"
+  const trigger = turn === 0 ? undefined : current ? "replay" : "scheduled"
   const preparedBudget = budget(input.request, plainValue(input.prepared.body) ?? null)
   const evidence = {
     spans: [sourceSpan(slot)],
@@ -601,7 +603,7 @@ export const make = (llm: LLMClientShape) => {
     return yield* lock.withPermits(1)(
       Effect.gen(function* () {
         const slots: Slot[] = input.bindings.map((binding) => ({ ...binding, structureRewritable: true }))
-        const eligible = slots.filter((item) => item.settled && !item.signed && !item.encrypted)
+        const eligible = slots.filter((item) => item.settled && !item.signed && !item.encrypted && !item.distilled)
         if (eligible.length === 0) return unchanged(input.request, "no-rewritable-slot")
         let state = states.get(input.sessionID) ?? emptyState
         let request = input.request
@@ -746,7 +748,28 @@ export const make = (llm: LLMClientShape) => {
   })
 
   const distill = Effect.fn("CoreReasoningDistillation.distill")(function* (input: Input) {
-    const result = yield* distillCycle(input)
+    let cycle: Result = unchanged(input.request)
+    if (!input.sourceMessages.some((message) => message.type === "user")) {
+      cycle = yield* distillCycle(input)
+    } else {
+      for (const binding of input.bindings) {
+        const next = yield* distillCycle({ ...input, request: cycle.request, bindings: [binding] })
+        cycle = { ...next, applied: cycle.applied || next.applied }
+      }
+    }
+    const result = {
+      ...cycle,
+      replacements: cycle.applied
+        ? reasoningReplacements(
+            cycle.request,
+            input.bindings.map((binding) => ({
+              ...binding,
+              messageID: binding.ref.messageID,
+              partID: binding.ref.partID,
+            })),
+          )
+        : [],
+    }
     if (!result.applied || !input.sourceMessages.some((message) => message.type === "user")) return result
     // Recheck the fully lowered provider body, including tool schemas and protocol fields.
     const prepared = yield* llm.prepare(result.request).pipe(Effect.option)

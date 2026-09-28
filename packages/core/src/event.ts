@@ -75,7 +75,7 @@ export interface Interface {
   /** Batch durable publish: one transaction for the whole batch, contiguous seq per aggregate, projectors run in entry order, single durable wake after commit. */
   readonly publishMany: (
     events: ReadonlyArray<BatchEvent>,
-    options?: { readonly location?: Location.Ref },
+    options?: { readonly location?: Location.Ref; readonly validate?: Effect.Effect<void> },
   ) => Effect.Effect<ReadonlyArray<Payload>>
   readonly subscribe: <D extends Definition>(definition: D) => Stream.Stream<Payload<D>>
   readonly all: () => Stream.Stream<Payload>
@@ -139,11 +139,9 @@ export const layerWith = (options?: LayerOptions) =>
       )
 
       const wakeDurable = (aggregateID: string) =>
-        Effect.forEach(
-          pubsub.durable.get(aggregateID) ?? [],
-          (wake) => PubSub.publish(wake, undefined),
-          { discard: true },
-        )
+        Effect.forEach(pubsub.durable.get(aggregateID) ?? [], (wake) => PubSub.publish(wake, undefined), {
+          discard: true,
+        })
 
       /** Transaction-scoped single durable event commit: seq allocation, owner checks, projectors, UPSERT + INSERT. */
       function commitDurableEventInner(
@@ -416,9 +414,7 @@ export const layerWith = (options?: LayerOptions) =>
       function notify(event: Payload) {
         return Effect.gen(function* () {
           const snapshot = Array.from(listeners)
-          forkListeners(
-            Effect.forEach(snapshot, (listener) => observe(event, listener), { discard: true }),
-          )
+          forkListeners(Effect.forEach(snapshot, (listener) => observe(event, listener), { discard: true }))
           const typed = pubsub.typed.get(event.type)
           if (typed) yield* PubSub.publish(typed, event)
           yield* PubSub.publish(pubsub.all, event)
@@ -447,7 +443,10 @@ export const layerWith = (options?: LayerOptions) =>
         })
       }
 
-      function publishMany(events: ReadonlyArray<BatchEvent>, options?: { readonly location?: Location.Ref }) {
+      function publishMany(
+        events: ReadonlyArray<BatchEvent>,
+        options?: { readonly location?: Location.Ref; readonly validate?: Effect.Effect<void> },
+      ) {
         return Effect.gen(function* () {
           const serviceLocation = Option.getOrUndefined(yield* Effect.serviceOption(Location.Service))
           const location =
@@ -507,6 +506,7 @@ export const layerWith = (options?: LayerOptions) =>
                       // Aligned with entries by index: a deduped entry yields
                       // undefined so the payload pairing below stays positional.
                       const results = new Array<{ aggregateID: string; seq: number } | undefined>()
+                      if (options?.validate) yield* options.validate
                       for (const entry of entries) {
                         // No replay input: seq is allocated contiguously from the latest sequence inside the transaction.
                         const result = yield* commitDurableEventInner(
