@@ -11,8 +11,8 @@ The owner requests a stable release after implementation, validation and native 
 | Trace actual model/config/runtime                | Primary + Luna     | Configured DeepSeek identified; runtime and stage boundaries verified                                   | Done    |
 | Shared denoising semantics and dynamic rendering | Sol content worker | Remove redundant/abandoned reasoning; preserve meaningful constraints and uncertainty; allow 0..N items | Done    |
 | Foreground scheduling and per-stage timing       | Sol latency worker | First completed turn returns without waiting; background safety remains covered                         | Done    |
-| Live matched-input acceptance                    | Primary            | Actual DeepSeek transport, independent review, accepted output and elapsed times                        | Pending |
-| Review and regression gates                      | Primary + Astra    | Required local tests/typechecks/lint and review findings resolved                                       | Pending |
+| Live matched-input acceptance                    | Primary            | Actual DeepSeek transport, independent review, accepted output and elapsed times                        | Done    |
+| Review and regression gates                      | Primary + Astra    | Required local tests/typechecks/lint and review findings resolved                                       | Done    |
 | PR and stable release                            | Primary            | Current-head native gates, main merge, release artifacts and installed candidate verification           | Pending |
 
 ## Verified baseline
@@ -51,6 +51,12 @@ Foreground non-blocking behavior is established by scheduler tests using deferre
 
 Local verification: core reasoning/context-folding: 178 passed; OpenCode reasoning/canonical replay and release contracts: 115 passed; workspace typecheck: 29/29 passed; lint: 0 errors and below the unchanged 4,850-warning cap. The DAG behavior/coverage gate passed all critical floors. Astra final source review accepted after the empty-adoption fix. Native CI and release remain separate delivery gates.
 
+## Runtime preflight
+
+A fully isolated source-runtime server used the configured DeepSeek provider for a synthetic inventory calculation. The foreground answer returned in 1.799 seconds with no adopted reasoning. The same session received its adopted reasoning 23.492 seconds later, after proposal (15.273 seconds) and review (7.994 seconds). Both auxiliary calls requested `low`; the runtime reported `applied=true`. The accepted text preserved the intermediate arithmetic and final result 83. It expanded an already concise English source into Chinese structured statements, so this is evidence of asynchronous adoption and fidelity, not of compression quality.
+
+The first full native CI run exposed a core-runner integration test that still asserted synchronous first-turn completion. The corrected test explicitly holds the auxiliary work, verifies that the foreground returns, then observes adoption for both slots and their use in later turns. All 81 core-runner integration tests and the full 1,454-test core suite passed after the correction. The required native checks remain mandatory.
+
 ## Delivery
 
-PR, current-head CI, stable publication and downloaded binary acceptance are pending. No release is claimed by the local test results.
+PR #682 targets `main` and closes Issues #680 and #681. Current-head CI, stable publication and downloaded binary acceptance are pending. No release is claimed by the local test results.

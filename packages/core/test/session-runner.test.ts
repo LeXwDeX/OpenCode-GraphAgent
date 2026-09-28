@@ -3265,14 +3265,21 @@ it.effect("Core runner adopts every slot at turn completion and asynchronously r
         }),
       ],
     })
-    const started = yield* Deferred.make<void>()
-    const release = yield* Deferred.make<void>()
+    const firstStarted = yield* Deferred.make<void>()
+    const releaseFirst = yield* Deferred.make<void>()
+    const secondStarted = yield* Deferred.make<void>()
+    const releaseSecond = yield* Deferred.make<void>()
     let calls = 0
     auxiliary = (request) =>
       Effect.gen(function* () {
-        if (calls++ === 4) {
-          yield* Deferred.succeed(started, undefined)
-          yield* Deferred.await(release)
+        const index = calls++
+        if (index === 0) {
+          yield* Deferred.succeed(firstStarted, undefined)
+          yield* Deferred.await(releaseFirst)
+        }
+        if (index === 4) {
+          yield* Deferred.succeed(secondStarted, undefined)
+          yield* Deferred.await(releaseSecond)
         }
         const prompt = request.messages
           .flatMap((message) => message.content.flatMap((part) => (part.type === "text" ? [part.text] : [])))
@@ -3332,13 +3339,23 @@ it.effect("Core runner adopts every slot at turn completion and asynchronously r
       LLMEvent.finish({ reason: "stop" }),
     ]
     yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "first" }), resume: false })
+    const firstUpdates = yield* events.subscribe(SessionEvent.Reasoning.Ended).pipe(
+      Stream.filter((event) => event.data.distillation !== undefined),
+      Stream.take(2),
+      Stream.runDrain,
+      Effect.forkChild,
+    )
     response = answer(1)
     yield* session.resume(sessionID)
+    yield* Deferred.await(firstStarted)
+    expect(JSON.stringify(yield* session.context(sessionID))).not.toContain("采用-r-1-0")
+    yield* Deferred.succeed(releaseFirst, undefined)
+    yield* Fiber.join(firstUpdates)
     expect(calls).toBe(4)
     expect(JSON.stringify(yield* session.context(sessionID))).toContain("采用-r-1-0")
     expect(JSON.stringify(yield* session.context(sessionID))).toContain("采用-r-1-1")
 
-    const updates = yield* events.subscribe(SessionEvent.Reasoning.Ended).pipe(
+    const secondUpdates = yield* events.subscribe(SessionEvent.Reasoning.Ended).pipe(
       Stream.filter((event) => event.data.distillation !== undefined),
       Stream.take(2),
       Stream.runDrain,
@@ -3347,12 +3364,12 @@ it.effect("Core runner adopts every slot at turn completion and asynchronously r
     yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "second" }), resume: false })
     response = answer(2)
     yield* session.resume(sessionID)
-    yield* Deferred.await(started)
+    yield* Deferred.await(secondStarted)
     expect(JSON.stringify(requests.at(-1)?.messages)).toContain("采用-r-1-0")
     expect(JSON.stringify(requests.at(-1)?.messages)).not.toContain("original-1")
     expect(JSON.stringify(yield* session.context(sessionID))).not.toContain("采用-r-2-0")
-    yield* Deferred.succeed(release, undefined)
-    yield* Fiber.join(updates)
+    yield* Deferred.succeed(releaseSecond, undefined)
+    yield* Fiber.join(secondUpdates)
     expect(calls).toBe(8)
     yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "third" }), resume: false })
     response = []
