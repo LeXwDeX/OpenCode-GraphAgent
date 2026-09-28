@@ -60,6 +60,8 @@ import {
   type WireReasoningMapping,
 } from "@opencode-ai/core/session/reasoning-distillation"
 import { Hash } from "@opencode-ai/core/util/hash"
+import { assessCanonicalReasoning } from "@opencode-ai/core/session/reasoning-distillation/canonical"
+import type { ReasoningReplacement } from "@opencode-ai/core/session/reasoning-distillation/adoption"
 import type { SessionV1 } from "@opencode-ai/core/v1/session"
 import type { ModelMessage } from "ai"
 
@@ -87,6 +89,8 @@ export type ReasoningSlotObservation = Readonly<{
   encrypted: boolean
   settled: boolean
   structureRewritable: boolean
+  /** Number of exact plaintext mirrors edited atomically with the authoritative text. */
+  aliasCount?: number
 }>
 
 /** A tool call as observed in the persisted history within scope; authoritative execution evidence (§5.5.1). */
@@ -157,6 +161,7 @@ export const buildSlotMappings = (
   slots: readonly ReasoningSlotObservation[],
   capability: SlotCapability,
   records: readonly CompatibilityRecord[],
+  target: "canonical" | "native-wire" = "native-wire",
 ): readonly WireReasoningMapping[] =>
   slots.map((slot) => {
     const assessment: SlotAssessment = {
@@ -170,7 +175,19 @@ export const buildSlotMappings = (
     return {
       refs: [{ messageID: slot.messageID, partID: slot.partID }],
       shape: slot.shape,
-      eligibility: classifySlotEligibility(assessment, records),
+      eligibility:
+        target === "canonical"
+          ? slot.signed
+            ? { allowed: false, protection: "P1" }
+            : slot.encrypted
+              ? { allowed: false, protection: "P2" }
+              : !slot.settled
+                ? { allowed: false, protection: "P4" }
+                : !slot.structureRewritable
+                  ? { allowed: false, protection: "P3" }
+                  : { allowed: true, capabilityFingerprint: capabilityFingerprint(capability) }
+          : classifySlotEligibility(assessment, records),
+      authority: target,
       bodyPath: slot.bodyPath,
       sourceFingerprint: Hash.sha256(slot.text),
     }
@@ -183,6 +200,7 @@ export const buildSlotMappings = (
  * Any skip returns the original request object.
  */
 export type DistillProjectionInput<Request> = Readonly<{
+  target?: "canonical" | "native-wire"
   request: Request
   identity: unknown
   purpose: DistillationPurpose
@@ -210,6 +228,7 @@ export type DistillProjectionResult<Request> = Readonly<{
   applied: boolean
   plan: DistillationPlan
   skipReason: DistillationSkipReason | undefined
+  replacements?: readonly ReasoningReplacement[]
 }>
 
 export type DistillationLifecycleState = Readonly<{
@@ -554,6 +573,7 @@ export const runDistillationCycle = async <Request>(
   let nextState = state
   let request = input.request
   let applied = false
+  const replacements: ReasoningReplacement[] = []
   let last: DistillationCycleResult<Request> | undefined
   const appliedSlots = new Set<ReasoningSlotObservation>()
   for (const slot of input.slots) {
@@ -568,6 +588,7 @@ export const runDistillationCycle = async <Request>(
     nextState = cycle.state
     request = cycle.projection.request
     applied ||= cycle.projection.applied
+    replacements.push(...(cycle.projection.replacements ?? []))
     if (cycle.projection.applied) appliedSlots.add(slot)
     last = cycle
   }
@@ -586,6 +607,7 @@ export const runDistillationCycle = async <Request>(
     nextState = cycle.state
     request = cycle.projection.request
     applied ||= cycle.projection.applied
+    replacements.push(...(cycle.projection.replacements ?? []))
     last = cycle
     if (!input.synchronous && cycle.attempted !== "none") break
   }
@@ -593,7 +615,7 @@ export const runDistillationCycle = async <Request>(
   return {
     state: nextState,
     attempted: last.attempted,
-    projection: { ...last.projection, request, applied },
+    projection: { ...last.projection, request, applied, replacements },
   }
 }
 
@@ -607,7 +629,7 @@ export const projectDistillationAISDK = <Request>(
     input.inventoryFingerprint,
     input.evidenceReferences,
   )
-  const mappings = buildSlotMappings(input.slots, input.capability, input.records)
+  const mappings = buildSlotMappings(input.slots, input.capability, input.records, input.target)
   const foldingBudget = estimateContextFoldingBudget(input.budget)
   const plan = planReasoningDistillation(
     {
@@ -640,6 +662,32 @@ export const projectDistillationAISDK = <Request>(
 
   if (plan.replacements.length === 0) {
     return { request: input.request, applied: false, plan, skipReason: plan.skipReason }
+  }
+
+  if (input.target === "canonical") {
+    const replacements = plan.replacements.flatMap(({ mapping, projection }) => {
+      const ref = mapping.refs[0]
+      const source = input.slots.find((slot) => slot.messageID === ref?.messageID && slot.partID === ref.partID)
+      return ref && source && source.text !== projection.text
+        ? [{ messageID: ref.messageID, partID: ref.partID, before: source.text, after: projection.text }]
+        : []
+    })
+    if (replacements.length !== plan.replacements.length)
+      return { request: input.request, applied: false, plan, skipReason: "mapping-mismatch" }
+    const projectedTokens =
+      foldingBudget.estimatedInputTokens === undefined
+        ? undefined
+        : foldingBudget.estimatedInputTokens +
+          replacements.reduce((total, item) => {
+            const source = input.slots.find((slot) => slot.messageID === item.messageID && slot.partID === item.partID)
+            const delta = Token.estimate(item.after) - Token.estimate(item.before)
+            return total + (delta > 0 ? delta * (1 + (source?.aliasCount ?? 0)) : delta)
+          }, 0)
+    if (projectedTokens === undefined || foldingBudget.usableInputTokens === undefined)
+      return { request: input.request, applied: false, plan, skipReason: "unknown-content" }
+    if (projectedTokens > foldingBudget.usableInputTokens)
+      return { request: input.request, applied: false, plan, skipReason: "insufficient-net-savings" }
+    return { request: input.request, applied: true, plan, skipReason: undefined, replacements }
   }
 
   const fingerprint = fingerprintContextFoldingRequest({
@@ -1186,7 +1234,12 @@ export type PersistedReasoningRef = Readonly<{
 
 export type PersistedReasoningGroup = Readonly<{
   messageID: string
-  parts: readonly (InterleavedSourcePart & { inputFingerprint?: string })[]
+  parts: readonly (InterleavedSourcePart & {
+    inputFingerprint?: string
+    canonicalEditable?: boolean
+    canonicalAliasCount?: number
+    canonicalProtection?: string
+  })[]
 }>
 
 export type ScopedReasoningEvidence = Readonly<{
@@ -1210,7 +1263,9 @@ export type ReasoningHistorySnapshot = Readonly<{
 }>
 
 const containsMetadataKey = (value: unknown, keys: ReadonlySet<string>, depth = 0): boolean => {
-  if (depth > 8 || !isRecord(value)) return false
+  if (depth > 8) return false
+  if (Array.isArray(value)) return value.some((item) => containsMetadataKey(item, keys, depth + 1))
+  if (!isRecord(value)) return false
   for (const [key, item] of Object.entries(value)) {
     if (keys.has(key) && item !== undefined && item !== null && item !== "") return true
     if (containsMetadataKey(item, keys, depth + 1)) return true
@@ -1282,9 +1337,22 @@ export const reasoningHistory = (messages: readonly SessionV1.WithParts[]): Reas
       }
     }
     if (message.info.role !== "assistant") continue
-    const parts: Array<InterleavedSourcePart & { inputFingerprint?: string }> = []
+    const parts: Array<
+      InterleavedSourcePart & {
+        inputFingerprint?: string
+        canonicalEditable?: boolean
+        canonicalAliasCount?: number
+        canonicalProtection?: string
+      }
+    > = []
     for (const part of message.parts) {
       if (part.type === "reasoning") {
+        const canonical = assessCanonicalReasoning({
+          text: part.text,
+          metadata: part.metadata,
+          settled: part.time.end !== undefined && message.info.time.completed !== undefined,
+          distilled: part.distillation !== undefined,
+        })
         parts.push({
           messageID: part.messageID,
           partID: part.id,
@@ -1296,6 +1364,9 @@ export const reasoningHistory = (messages: readonly SessionV1.WithParts[]): Reas
           ),
           settled: part.time.end !== undefined,
           distilled: part.distillation !== undefined,
+          canonicalEditable: canonical.editable,
+          canonicalAliasCount: canonical.editable ? canonical.aliasPaths.length : 0,
+          canonicalProtection: canonical.editable ? undefined : canonical.reason,
         })
       }
       if (part.type !== "tool") continue

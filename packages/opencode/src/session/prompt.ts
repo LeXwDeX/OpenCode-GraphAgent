@@ -237,6 +237,15 @@ export const layer = Layer.effect(
     const llm = yield* LLM.Service
     const events = yield* EventV2Bridge.Service
     const flags = yield* RuntimeFlags.Service
+    const reasoningDistillationEnabled = config.get().pipe(
+      Effect.map(
+        (cfg) =>
+          ConfigReasoningDistillation.resolveEnabled({
+            disabledByEnvironment: Flag.OPENCODE_DISABLE_REASONING_DISTILLATION,
+            enabled: cfg.reasoningDistillation?.enabled,
+          }).enabled,
+      ),
+    )
     const database = yield* Database.Service
     const { db } = database
     const rawSettingsHook = Option.getOrUndefined(yield* Effect.serviceOption(SettingsHook.Service))
@@ -478,7 +487,9 @@ export const layer = Layer.effect(
           (yield* provider.getModel(input.providerID, input.modelID)))
       const msgs = onlySubtasks
         ? [{ role: "user" as const, content: subtasks.map((p) => p.prompt).join("\n") }]
-        : yield* MessageV2.toModelMessagesEffect(context, mdl)
+        : yield* MessageV2.toModelMessagesEffect(context, mdl, {
+            reasoningDistillationEnabled: yield* reasoningDistillationEnabled,
+          })
       const text = yield* llm
         .stream({
           agent: ag,
@@ -986,7 +997,7 @@ export const layer = Layer.effect(
                   // truthiness) so a hook that clears the command to "" is honored rather than ignored.
                   effectiveCommand = decision.effectiveArgs.command as string
                   args = Shell.args(sh, effectiveCommand, cwd)
-                  mutablePart.state.input = { ...(mutablePart.state.input ?? {}), command: effectiveCommand }
+                  mutablePart.state.input = { ...mutablePart.state.input, command: effectiveCommand }
                   yield* sessions.updatePart(mutablePart)
                 }
               }
@@ -1929,14 +1940,7 @@ export const layer = Layer.effect(
                   })
                 }
               }
-              if (
-                !turnError &&
-                distillationInput &&
-                ConfigReasoningDistillation.resolveEnabled({
-                  disabledByEnvironment: Flag.OPENCODE_DISABLE_REASONING_DISTILLATION,
-                  enabled: (yield* config.get()).reasoningDistillation?.enabled,
-                }).enabled
-              ) {
+              if (!turnError && distillationInput && (yield* reasoningDistillationEnabled)) {
                 const sources = yield* sessions.messages({ sessionID }).pipe(Effect.orDie)
                 const current = sources.filter(
                   (message) => message.info.role === "assistant" && message.info.parentID === lastUser.id,
@@ -1951,16 +1955,10 @@ export const layer = Layer.effect(
                       : { ...group, parts: group.parts.map((part) => ({ ...part, distilled: true })) },
                   ),
                 }
-                const modelMessages = yield* MessageV2.toModelMessagesEffect(sources, distillationInput.model)
-                const enabled = config.get().pipe(
-                  Effect.map(
-                    (cfg) =>
-                      ConfigReasoningDistillation.resolveEnabled({
-                        disabledByEnvironment: Flag.OPENCODE_DISABLE_REASONING_DISTILLATION,
-                        enabled: cfg.reasoningDistillation?.enabled,
-                      }).enabled,
-                  ),
-                )
+                const modelMessages = yield* MessageV2.toModelMessagesEffect(sources, distillationInput.model, {
+                  reasoningDistillationEnabled: true,
+                })
+                const enabled = reasoningDistillationEnabled
                 yield* scheduleDistillation({
                   sessionID,
                   turnID: lastUser.id,
@@ -2031,7 +2029,12 @@ export const layer = Layer.effect(
             const estimateMessages = switchedModel || lastFinished.summary === true ? msgs : newUsers
             const estimatedTextTokens = estimateMessages.length
               ? Token.estimate(
-                  JSON.stringify(yield* MessageV2.toModelMessagesEffect(estimateMessages, model, { stripMedia: true })),
+                  JSON.stringify(
+                    yield* MessageV2.toModelMessagesEffect(estimateMessages, model, {
+                      stripMedia: true,
+                      reasoningDistillationEnabled: yield* reasoningDistillationEnabled,
+                    }),
+                  ),
                 )
               : 0
             // Provider usage covers the request that produced lastFinished, but not tool results that completed
@@ -2206,7 +2209,9 @@ export const layer = Layer.effect(
                 sys.goal(sessionID),
                 sys.hooks(),
                 sys.memory({ sessionID, messages: msgs, main: !session.parentID }),
-                MessageV2.toModelMessagesEffect(msgs, model),
+                MessageV2.toModelMessagesEffect(msgs, model, {
+                  reasoningDistillationEnabled: yield* reasoningDistillationEnabled,
+                }),
                 MessageV2.contextFoldingHistory({ messages: msgs, ledger: toolSources }),
               ],
               { concurrency: "unbounded" },

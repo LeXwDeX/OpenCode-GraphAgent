@@ -159,6 +159,17 @@ describe("buildSlotMappings (§2.1 gating)", () => {
     const mappings = buildSlotMappings([slot()], capability(), [record({ upstreamVerified: false })])
     expect(mappings[0].eligibility).toEqual({ allowed: false, protection: "P5" })
   })
+
+  test("canonical authority uses persisted editability while legacy wire still requires its record", () => {
+    const canonical = buildSlotMappings([slot()], capability(), [], "canonical")
+    expect(canonical[0].authority).toBe("canonical")
+    expect(canonical[0].eligibility.allowed).toBe(true)
+    expect(buildSlotMappings([slot({ signed: true })], capability(), [], "canonical")[0].eligibility).toEqual({
+      allowed: false,
+      protection: "P1",
+    })
+    expect(buildSlotMappings([slot()], capability(), [record()], "native-wire")[0].authority).toBe("native-wire")
+  })
 })
 
 const POLICY = ReasoningDistillationPolicy.version
@@ -248,6 +259,30 @@ const baseInput = (
 })
 
 describe("projectDistillationAISDK (§5.2)", () => {
+  test("canonical preparation yields an edit without projecting into a wire request", () => {
+    const request = wireRequest(TEXT)
+    const result = projectDistillationAISDK(
+      baseInput(request, {
+        target: "canonical",
+        trigger: "scheduled",
+        records: [],
+        slots: [slot({ text: TEXT, bodyPath: [] })],
+        budget: { ...overBudgetInput(request.messages), contextLimit: 100_000 },
+      }),
+    )
+    expect(result.applied).toBe(true)
+    expect(result.request).toBe(request)
+    expect(result.replacements).toEqual([
+      {
+        messageID: "m1",
+        partID: "p1",
+        before: TEXT,
+        after: expect.stringContaining("精简结论"),
+      },
+    ])
+    expect(request.messages[0].reasoning).toBe(TEXT)
+  })
+
   test("scheduled organization may expand short reasoning but cannot exceed the complete request capacity", () => {
     const text = "待验证"
     const request = wireRequest(text)

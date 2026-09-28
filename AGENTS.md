@@ -20,6 +20,11 @@ Guidance for coding agents in this repository (GraphAgent — an opencode fork w
 - DAG gate: `cd packages/opencode && bun run test:dag-core` — behavior/coverage gate; run it before merging changes to DAG state-machine or persistence code.
 - Format: Prettier `semi: false`, `printWidth: 120`.
 
+## Live model validation
+
+- The user authorizes necessary isolated development and acceptance calls through the QWEN, GLM and DeepSeek models already present in the system configuration. Discover their current provider/model IDs and reuse the configured endpoint and credential references; do not repeatedly ask the user to select or authorize those models.
+- If a test model is unavailable or quota-limited, continue with an available configured model from those families. Use synthetic sessions, preserve the user's active conversations and configuration, and keep credentials out of logs and artifacts. This authorization is for model calls, not changing credentials or deploying services.
+
 ## CI gates (.github/workflows)
 
 - GitHub default and integration branch: `dev`; stable release branch: `main`. Push CI runs only on `main`/`dev`; feature work lands via `{type}/**` branches and PRs.

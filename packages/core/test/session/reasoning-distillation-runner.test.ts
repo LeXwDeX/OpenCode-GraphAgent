@@ -62,6 +62,8 @@ const prepare = (request: LLMRequest) =>
     ),
   )
 
+const mockPrepare = prepare as unknown as LLMClientShape["prepare"]
+
 const response = (text: string, usageTokens: number | null = 20) => {
   const value = LLMResponse.fromEvents([
     LLMEvent.stepStart({ index: 0 }),
@@ -119,6 +121,50 @@ const support = JSON.stringify({
 })
 
 describe("Core runner reasoning distillation adapter", () => {
+  it.effect("distills a persisted canonical part without wire compatibility proof or changing the request", () =>
+    Effect.gen(function* () {
+      const outputs = [candidate, support]
+      const generated: LLMRequest[] = []
+      const client: LLMClientShape = {
+        prepare: mockPrepare,
+        stream: () => Stream.empty,
+        generate: (request) =>
+          Effect.sync(() => {
+            generated.push(request)
+            return response(outputs.shift() ?? "{}")
+          }),
+      }
+      const adapter = CoreReasoningDistillation.make(client)
+      const source = history()
+      const conversion = toLLMMessagesWithBindings([source], model)
+      const request = LLM.request({ model, messages: conversion.messages })
+      const input = {
+        target: "canonical" as const,
+        sessionID: "ses_canonical",
+        request,
+        prepared: yield* prepare(request),
+        sourceMessages: [source],
+        bindings: conversion.reasoningBindings,
+        config: new ConfigReasoningDistillation.Info({ compatibility: [] }),
+      }
+      expect((yield* adapter.distill(input)).attempted).toBe("propose")
+      const result = yield* adapter.distill(input)
+      expect(result.attempted).toBe("judge")
+      expect(result.applied).toBe(true)
+      expect(result.request).toBe(request)
+      expect(result.replacements).toEqual([
+        {
+          messageID: source.id,
+          partID: "reasoning-1",
+          before: reasoningText,
+          after: expect.stringContaining("决定使用安全路径"),
+        },
+      ])
+      expect(generated).toHaveLength(2)
+      expect(source.content[0]).toMatchObject({ text: reasoningText })
+    }),
+  )
+
   it.effect("keeps exact reasoning paths after empty canonical parts are removed", () =>
     Effect.sync(() => {
       const source = history()
@@ -141,7 +187,7 @@ describe("Core runner reasoning distillation adapter", () => {
       const generated: LLMRequest[] = []
       const outputs = [candidate, support]
       const client: LLMClientShape = {
-        prepare: prepare as unknown as LLMClientShape["prepare"],
+        prepare: mockPrepare,
         stream: () => Stream.empty,
         generate: (request) =>
           Effect.sync(() => {
@@ -254,7 +300,7 @@ describe("Core runner reasoning distillation adapter", () => {
       const generated: LLMRequest[] = []
       const outputs = [candidate, support]
       const client: LLMClientShape = {
-        prepare: prepare as unknown as LLMClientShape["prepare"],
+        prepare: mockPrepare,
         stream: () => Stream.empty,
         generate: (request) =>
           Effect.sync(() => {
@@ -334,7 +380,7 @@ describe("Core runner reasoning distillation adapter", () => {
     Effect.gen(function* () {
       let calls = 0
       const client: LLMClientShape = {
-        prepare: prepare as unknown as LLMClientShape["prepare"],
+        prepare: mockPrepare,
         stream: () => Stream.empty,
         generate: () => Effect.sync(() => (calls++, response(candidate))),
       }
@@ -366,7 +412,7 @@ describe("Core runner reasoning distillation adapter", () => {
     Effect.gen(function* () {
       let calls = 0
       const client: LLMClientShape = {
-        prepare: prepare as unknown as LLMClientShape["prepare"],
+        prepare: mockPrepare,
         stream: () => Stream.empty,
         generate: () => Effect.sync(() => (calls++, response(candidate, null))),
       }
@@ -397,7 +443,7 @@ describe("Core runner reasoning distillation adapter", () => {
     Effect.gen(function* () {
       let calls = 0
       const client: LLMClientShape = {
-        prepare: prepare as unknown as LLMClientShape["prepare"],
+        prepare: mockPrepare,
         stream: () => Stream.empty,
         generate: () => Effect.sync(() => (calls++, response(candidate, 999_999))),
       }
@@ -427,7 +473,7 @@ describe("Core runner reasoning distillation adapter", () => {
     Effect.gen(function* () {
       let calls = 0
       const client: LLMClientShape = {
-        prepare: prepare as unknown as LLMClientShape["prepare"],
+        prepare: mockPrepare,
         stream: () => Stream.empty,
         generate: () => Effect.sync(() => (calls++, response(candidate, 999_999))),
       }
@@ -459,7 +505,7 @@ describe("Core runner reasoning distillation adapter", () => {
       const started = yield* Deferred.make<void>()
       let calls = 0
       const client: LLMClientShape = {
-        prepare: prepare as unknown as LLMClientShape["prepare"],
+        prepare: mockPrepare,
         stream: () => Stream.empty,
         generate: () =>
           Effect.sync(() => calls++).pipe(
@@ -531,7 +577,7 @@ describe("Core runner reasoning distillation adapter", () => {
         }),
       ]
       const client: LLMClientShape = {
-        prepare: prepare as unknown as LLMClientShape["prepare"],
+        prepare: mockPrepare,
         stream: () => Stream.empty,
         generate: (request) =>
           Effect.sync(() => {
