@@ -1,3 +1,4 @@
+import { ReasoningDistillation } from "./reasoning-distillation"
 export * as SessionMessage from "./session-message"
 
 import { Schema } from "effect"
@@ -145,6 +146,7 @@ export const AssistantReasoning = Schema.Struct({
   type: Schema.Literal("reasoning"),
   id: Schema.String,
   text: Schema.String,
+  distillation: ReasoningDistillation.pipe(Schema.optional),
   providerMetadata: ProviderMetadata.pipe(Schema.optional),
 }).annotate({ identifier: "Session.Message.Assistant.Reasoning" })
 

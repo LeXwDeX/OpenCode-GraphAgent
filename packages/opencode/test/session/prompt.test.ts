@@ -264,6 +264,7 @@ const snapshotFenceAgentLayer: Layer.Layer<AgentSvc.Service> = Layer.succeed(
 )
 
 type PromptLayerOptions = {
+  distill?: LLM.Interface["distill"]
   mcpInstructions?: MCP.ServerInstructions[]
   mcpTools?: Record<string, AITool>
   processor?: "blocking"
@@ -295,7 +296,7 @@ function makePrompt(input?: PromptLayerOptions) {
     statusReason: () => Effect.succeed(undefined),
     status: () => Effect.succeed("Memory on"),
   })
-  const llmLayer = input?.native
+  const baseLLM = input?.native
     ? LLM.layer.pipe(
         Layer.provide(Auth.defaultLayer),
         Layer.provide(Config.defaultLayer),
@@ -307,6 +308,15 @@ function makePrompt(input?: PromptLayerOptions) {
         Layer.provide(RuntimeFlags.layer({ experimentalEventSystem: true, experimentalNativeLlm: true })),
       )
     : LLM.defaultLayer
+  const llmLayer = input?.distill
+    ? Layer.effect(
+        LLM.Service,
+        Effect.gen(function* () {
+          const service = yield* LLM.Service
+          return LLM.Service.of({ ...service, distill: input.distill! })
+        }),
+      ).pipe(Layer.provide(baseLLM))
+    : baseLLM
   const deps = Layer.mergeAll(
     hookRecorderLayer,
     memoryLayer,
@@ -5042,3 +5052,148 @@ for (const dynamic of [false, true]) {
     }),
   )
 }
+
+let controlledDistill: LLM.Interface["distill"] = () => Effect.die("distillation fixture not configured")
+const distillationIt = testEffect(makeHttp({ distill: (input) => Effect.suspend(() => controlledDistill(input)) }))
+
+distillationIt.instance(
+  "first full turn waits for adoption; later turns return before background replacement and replay adopted history",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        reasoningDistillation: { enabled: true },
+      }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({
+        title: "Pinned",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      const starts = [yield* Deferred.make<void>(), yield* Deferred.make<void>()]
+      const releases = [yield* Deferred.make<void>(), yield* Deferred.make<void>()]
+      const finishes = [yield* Deferred.make<void>(), yield* Deferred.make<void>()]
+      let calls = 0
+      controlledDistill = (input) =>
+        Effect.gen(function* () {
+          const index = calls++
+          if (index > 1) return
+          const slots = input
+            .reasoningDistillation!.groups.flatMap((group) => group.parts)
+            .filter((part) => !part.distilled)
+          expect(slots).toHaveLength(1)
+          expect(slots[0].text).toBe(`original-${index}`)
+          yield* Deferred.succeed(starts[index], undefined)
+          yield* Deferred.await(releases[index])
+          expect(
+            yield* input.adoptReasoning!(
+              slots.map((slot) => ({
+                messageID: slot.messageID,
+                partID: slot.partID,
+                before: slot.text,
+                after: `distilled-${index}`,
+              })),
+            ),
+          ).toBe(true)
+          yield* Deferred.succeed(finishes[index], undefined)
+        })
+      const send = (text: string) =>
+        prompt.prompt({ sessionID: chat.id, agent: "build", noReply: true, parts: [{ type: "text", text }] })
+      const thinking = (messages: SessionV1.WithParts[]) =>
+        messages
+          .flatMap((message) => message.parts)
+          .filter((part) => part.type === "reasoning")
+          .map((part) => part.text)
+      yield* send("first")
+      yield* llm.push(reply().reason("original-0").text("first answer").stop())
+      const first = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+      yield* awaitWithTimeout(Deferred.await(starts[0]), "first distillation did not start")
+      expect(first.pollUnsafe()).toBeUndefined()
+      expect(thinking(yield* sessions.messages({ sessionID: chat.id }))).toEqual(["original-0"])
+      yield* Deferred.succeed(releases[0], undefined)
+      const completed = yield* Fiber.join(first)
+      expect(completed.parts.some((part) => part.type === "reasoning" && part.text === "distilled-0")).toBe(true)
+
+      yield* send("second")
+      yield* llm.push(reply().reason("original-1").text("second answer").stop())
+      yield* prompt.loop({ sessionID: chat.id })
+      yield* awaitWithTimeout(Deferred.await(starts[1]), "background distillation did not start")
+      expect(thinking(yield* sessions.messages({ sessionID: chat.id }))).toEqual(["distilled-0", "original-1"])
+      yield* send("third while distillation is pending")
+      yield* llm.text("third answer")
+      yield* prompt.loop({ sessionID: chat.id })
+      const pendingPayload = JSON.stringify((yield* llm.hits).at(-1)?.body)
+      expect(pendingPayload).toContain("original-1")
+      expect(pendingPayload).not.toContain("distilled-1")
+      yield* Deferred.succeed(releases[1], undefined)
+      yield* awaitWithTimeout(Deferred.await(finishes[1]), "background distillation did not finish")
+      expect(thinking(yield* sessions.messages({ sessionID: chat.id }))).toEqual(["distilled-0", "distilled-1"])
+
+      yield* send("fourth after replacement")
+      yield* llm.text("fourth answer")
+      yield* prompt.loop({ sessionID: chat.id })
+      const payload = JSON.stringify((yield* llm.hits).at(-1)?.body)
+      expect(payload).toContain("distilled-0")
+      expect(payload).toContain("distilled-1")
+      expect(payload).not.toContain("original-0")
+      expect(payload).not.toContain("original-1")
+    }),
+)
+
+distillationIt.instance("tool steps form one distillation turn and include all newly completed reasoning slots", () =>
+  Effect.gen(function* () {
+    const { llm, dir } = yield* useServerConfig((url) => ({
+      ...providerCfg(url),
+      reasoningDistillation: { enabled: true },
+    }))
+    yield* writeText(path.join(dir, "distillation-source.txt"), "source data")
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({
+      title: "Pinned",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    let calls = 0
+    controlledDistill = (input) =>
+      Effect.gen(function* () {
+        calls++
+        const slots = input
+          .reasoningDistillation!.groups.flatMap((group) => group.parts)
+          .filter((part) => !part.distilled)
+        expect(slots.map((slot) => slot.text)).toEqual(["tool thinking", "final thinking"])
+        expect(
+          yield* input.adoptReasoning!(
+            slots.map((slot) => ({
+              messageID: slot.messageID,
+              partID: slot.partID,
+              before: slot.text,
+              after: `adopted ${slot.text}`,
+            })),
+          ),
+        ).toBe(true)
+      })
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "read and explain" }],
+    })
+    yield* llm.push(
+      reply()
+        .reason("tool thinking")
+        .tool("read", { filePath: path.join(dir, "distillation-source.txt") }, "read-source"),
+      reply().reason("final thinking").text("answer").stop(),
+    )
+    yield* prompt.loop({ sessionID: chat.id })
+    expect(calls).toBe(1)
+    const parts = (yield* sessions.messages({ sessionID: chat.id })).flatMap((message) => message.parts)
+    expect(parts.filter((part) => part.type === "reasoning").map((part) => part.text)).toEqual([
+      "adopted tool thinking",
+      "adopted final thinking",
+    ])
+    expect(parts.find((part) => part.type === "tool")).toMatchObject({
+      callID: "read-source",
+      state: { status: "completed" },
+    })
+  }),
+)

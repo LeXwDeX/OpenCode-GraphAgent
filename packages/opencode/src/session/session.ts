@@ -875,6 +875,7 @@ export const layer: Layer.Layer<
                     messageID: cloned.id,
                     sessionID: session.id,
                   }
+                  if (p.type === "reasoning") delete p.v2
                   if (p.type === "compaction" && p.tail_start_id) {
                     p.tail_start_id = idMap.get(p.tail_start_id)
                   }

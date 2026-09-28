@@ -388,6 +388,9 @@ export const layer = Layer.effect(
               sessionID: ctx.assistantMessage.sessionID,
               type: "reasoning",
               text: "",
+              ...(ctx.v2AssistantMessageID
+                ? { v2: { messageID: ctx.v2AssistantMessageID, reasoningID: value.id } }
+                : {}),
               time: { start: Date.now() },
               metadata: value.providerMetadata,
             }

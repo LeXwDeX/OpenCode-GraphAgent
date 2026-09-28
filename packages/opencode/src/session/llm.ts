@@ -1,10 +1,14 @@
+import {
+  reasoningReplacements,
+  type ReasoningReplacement,
+} from "@opencode-ai/core/session/reasoning-distillation/adoption"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { llmClient } from "@opencode-ai/core/effect/layer-node-platform"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Provider } from "@/provider/provider"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
-import { Context, Effect, Layer } from "effect"
+import { Context, Effect, Layer, Semaphore } from "effect"
 import * as Stream from "effect/Stream"
 import { asSchema, generateText, streamText, wrapLanguageModel, type ModelMessage, type Tool } from "ai"
 import { LLMRequest, type LLMEvent } from "@opencode-ai/llm"
@@ -134,6 +138,7 @@ export type StreamInput = {
   purpose?: RequestPurpose
   contextFolding?: ContextFoldingHistorySnapshot
   reasoningDistillation?: ReasoningDistillationHistorySnapshot
+  adoptReasoning?: (replacements: readonly ReasoningReplacement[]) => Effect.Effect<boolean>
 }
 
 export type StreamRequest = StreamInput & {
@@ -141,6 +146,7 @@ export type StreamRequest = StreamInput & {
 }
 
 export interface Interface {
+  readonly distill: (input: StreamInput) => Effect.Effect<void, unknown>
   readonly stream: (input: StreamInput) => Stream.Stream<LLMEvent, unknown>
 }
 
@@ -171,13 +177,19 @@ const live: Layer.Layer<
     const llmClient = yield* LLMClient.Service
     const flags = yield* RuntimeFlags.Service
     const distillationState = yield* InstanceState.make(() =>
-      Effect.succeed({
-        current: ReasoningDistillation.emptyLifecycleState,
-        busy: false,
-      }),
+      Effect.succeed(
+        new Map<
+          string,
+          {
+            current: typeof ReasoningDistillation.emptyLifecycleState
+            lock: Semaphore.Semaphore
+            generation: number
+          }
+        >(),
+      ),
     )
 
-    const run = Effect.fn("LLM.run")(function* (input: StreamRequest) {
+    const run = Effect.fn("LLM.run")(function* (input: StreamRequest, distillationOnly = false) {
       yield* Effect.logInfo("stream", {
         providerID: input.model.providerID,
         modelID: input.model.id,
@@ -231,7 +243,7 @@ const live: Layer.Layer<
           ? input.model.capabilities.interleaved.field
           : undefined
       const organizer =
-        distillationResolution.enabled && interleavedField
+        distillationOnly && distillationResolution.enabled && interleavedField
           ? ((yield* provider.getSmallModel(input.model.providerID)) ?? input.model)
           : undefined
       const organizerResolution = organizer
@@ -374,25 +386,18 @@ const live: Layer.Layer<
           media: hasMedia(args.sourceMessages) ? ("unknown" as const) : ("none" as const),
         }
         const estimatedBudget = estimateContextFoldingBudget(budget)
-        return InstanceState.useEffect(distillationState, (state) => {
-          // Non-blocking admission: while one auxiliary call is in flight, another request's cycle is skipped
-          // instead of queueing behind it. The old semaphore stalled unrelated sessions for up to the whole aux
-          // timeout; skipping only forgoes an opportunistic distillation cycle, and the next ordinary request
-          // runs its own.
-          if (state.busy)
-            return Effect.logInfo("reasoning distillation skipped: an auxiliary call is already in flight", {
-              "reasoning_distillation.runtime": args.runtime,
-              "reasoning_distillation.enabled": true,
-              "reasoning_distillation.source": distillationResolution.source,
-              "reasoning_distillation.attempted": "none",
-              "reasoning_distillation.applied": false,
-              "reasoning_distillation.skip_reason": "aux-busy",
-            }).pipe(Effect.as(args.request))
-          state.busy = true
-          return Effect.tryPromise({
-            try: async () => {
-              try {
-                return await ReasoningDistillation.runDistillationCycle(state.current, {
+        return InstanceState.useEffect(distillationState, (states) => {
+          let state = states.get(input.sessionID)
+          if (!state) {
+            state = { current: ReasoningDistillation.emptyLifecycleState, lock: Semaphore.makeUnsafe(1), generation: 0 }
+            states.set(input.sessionID, state)
+          }
+          const current = state
+          return current.lock.withPermit(
+            Effect.tryPromise({
+              try: async () => {
+                const generation = ++current.generation
+                return await ReasoningDistillation.runDistillationCycle(current.current, {
                   request: args.request,
                   identity: {
                     adapter: args.adapterVersion,
@@ -419,39 +424,69 @@ const live: Layer.Layer<
                   originalTokens: Math.ceil(selected.reduce((total, slot) => total + slot.text.length, 0) / 4),
                   callPropose: callAuxiliary,
                   callJudge: callAuxiliary,
-                  commitState: (next) => void (state.current = next),
+                  commitState: (next) => {
+                    if (!input.abort.aborted && current.generation === generation) current.current = next
+                  },
                 })
-              } finally {
-                state.busy = false
-              }
-            },
-            catch: (cause) => cause,
-          }).pipe(
-            Effect.tap((result) => Effect.sync(() => void (state.current = result.state))),
-            Effect.tap((cycle) => {
-              const usage = cycle.state.usageBySession[input.sessionID]
-              return Effect.logInfo("reasoning distillation", {
-                "session.id": input.sessionID,
-                "reasoning_distillation.turn": input.reasoningDistillation?.reasoningTurn ?? 0,
-                "reasoning_distillation.capability": capability,
-                "reasoning_distillation.runtime": args.runtime,
-                "reasoning_distillation.enabled": true,
-                "reasoning_distillation.source": distillationResolution.source,
-                "reasoning_distillation.attempted": cycle.attempted,
-                "reasoning_distillation.applied": cycle.projection.applied,
-                "reasoning_distillation.skip_reason": cycle.projection.skipReason ?? "none",
-                "reasoning_distillation.slot_count": args.slots.length,
-                "reasoning_distillation.estimated_input_tokens": estimatedBudget.estimatedInputTokens ?? "unknown",
-                "reasoning_distillation.target_tokens": estimatedBudget.targetTokens ?? "unknown",
-                "reasoning_distillation.budget_skip_reason": estimatedBudget.skipReason ?? "none",
-                "reasoning_distillation.aux_reserved_tokens": usage?.reservedTokens ?? 0,
-                "reasoning_distillation.aux_actual_tokens": usage?.actualTokens ?? 0,
-                "reasoning_distillation.aux_unknown_usage_calls": usage?.unknownUsageCalls ?? 0,
-                "reasoning_distillation.aux_latency_ms": usage?.latencyMs ?? 0,
-                "reasoning_distillation.paid_admission_paused": usage?.paidAdmissionPaused ?? false,
-              })
-            }),
-            Effect.map((cycle) => cycle.projection.request),
+              },
+              catch: (cause) => cause,
+            }).pipe(
+              Effect.tap((result) => Effect.sync(() => void (current.current = result.state))),
+              Effect.flatMap((cycle) => {
+                if (!cycle.projection.applied || !input.adoptReasoning) return Effect.succeed(cycle)
+                const replacements = reasoningReplacements(cycle.projection.request, selected)
+                return Effect.gen(function* () {
+                  const latest = yield* config.get()
+                  if (
+                    input.abort.aborted ||
+                    !ConfigReasoningDistillation.resolveEnabled({
+                      disabledByEnvironment: Flag.OPENCODE_DISABLE_REASONING_DISTILLATION,
+                      enabled: latest.reasoningDistillation?.enabled,
+                    }).enabled
+                  )
+                    return false
+                  return yield* input.adoptReasoning!(replacements)
+                }).pipe(
+                  Effect.map((adopted) =>
+                    adopted
+                      ? cycle
+                      : {
+                          ...cycle,
+                          projection: {
+                            ...cycle.projection,
+                            request: args.request,
+                            applied: false,
+                            skipReason: "projection-failed" as const,
+                          },
+                        },
+                  ),
+                )
+              }),
+              Effect.tap((cycle) => {
+                const usage = cycle.state.usageBySession[input.sessionID]
+                return Effect.logInfo("reasoning distillation", {
+                  "session.id": input.sessionID,
+                  "reasoning_distillation.turn": input.reasoningDistillation?.reasoningTurn ?? 0,
+                  "reasoning_distillation.capability": capability,
+                  "reasoning_distillation.runtime": args.runtime,
+                  "reasoning_distillation.enabled": true,
+                  "reasoning_distillation.source": distillationResolution.source,
+                  "reasoning_distillation.attempted": cycle.attempted,
+                  "reasoning_distillation.applied": cycle.projection.applied,
+                  "reasoning_distillation.skip_reason": cycle.projection.skipReason ?? "none",
+                  "reasoning_distillation.slot_count": args.slots.length,
+                  "reasoning_distillation.estimated_input_tokens": estimatedBudget.estimatedInputTokens ?? "unknown",
+                  "reasoning_distillation.target_tokens": estimatedBudget.targetTokens ?? "unknown",
+                  "reasoning_distillation.budget_skip_reason": estimatedBudget.skipReason ?? "none",
+                  "reasoning_distillation.aux_reserved_tokens": usage?.reservedTokens ?? 0,
+                  "reasoning_distillation.aux_actual_tokens": usage?.actualTokens ?? 0,
+                  "reasoning_distillation.aux_unknown_usage_calls": usage?.unknownUsageCalls ?? 0,
+                  "reasoning_distillation.aux_latency_ms": usage?.latencyMs ?? 0,
+                  "reasoning_distillation.paid_admission_paused": usage?.paidAdmissionPaused ?? false,
+                })
+              }),
+              Effect.map((cycle) => cycle.projection.request),
+            ),
           )
         }).pipe(
           Effect.catch((cause) =>
@@ -591,7 +626,11 @@ const live: Layer.Layer<
           abort: input.abort,
           contextFolding: folding,
           reasoningDistillation:
-            distillationResolution.enabled && interleavedField && organizerResolution && input.reasoningDistillation
+            distillationOnly &&
+            distillationResolution.enabled &&
+            interleavedField &&
+            organizerResolution &&
+            input.reasoningDistillation
               ? ({ request, sourceMessages, transformedMessages }) => {
                   const messages = plainWireMessages(request.messages)
                   if (!messages) return Effect.succeed(request)
@@ -659,6 +698,42 @@ const live: Layer.Layer<
           mode: input.agent.mode,
           reason: native.reason,
         })
+      }
+
+      if (distillationOnly) {
+        if (distillationResolution.enabled && interleavedField && input.reasoningDistillation) {
+          const sourceMessages = ContextFolding.copyModelMessages(prepared.messages)
+          if (sourceMessages) {
+            const transformed = ProviderTransform.message(
+              prepared.messages,
+              input.model,
+              prepared.messageTransformOptions,
+            )
+            const messages = plainWireMessages(transformed)
+            if (messages) {
+              const lineage = ReasoningDistillation.bindInterleavedReasoningLineage(
+                sourceMessages,
+                transformed,
+                interleavedField,
+                input.reasoningDistillation,
+              )
+              yield* distillRequest({
+                runtime: "opencode-ai-sdk",
+                adapterVersion: REASONING_DISTILLATION_ADAPTER_VERSION,
+                request: { messages },
+                messages,
+                sourceMessages,
+                slots: ReasoningDistillation.extractInterleavedReasoningSlots(
+                  messages,
+                  interleavedField,
+                  ["messages"],
+                  lineage,
+                ),
+              })
+            }
+          }
+        }
+        return { type: "native" as const, stream: Stream.empty }
       }
 
       yield* Effect.logInfo("llm runtime selected", {
@@ -753,40 +828,6 @@ const live: Layer.Layer<
                       projectionPlan = projected.plan
                       if (projected.applied) outbound = projected.request.messages
                     }
-                    if (
-                      distillationResolution.enabled &&
-                      interleavedField &&
-                      organizerResolution &&
-                      sourceMessages &&
-                      input.reasoningDistillation
-                    ) {
-                      const messages = plainWireMessages(outbound)
-                      if (messages) {
-                        const lineage = ReasoningDistillation.bindInterleavedReasoningLineage(
-                          sourceMessages,
-                          transformed,
-                          interleavedField,
-                          input.reasoningDistillation,
-                        )
-                        const observed = ReasoningDistillation.extractInterleavedReasoningSlots(
-                          messages,
-                          interleavedField,
-                          ["messages"],
-                          lineage,
-                        )
-                        const projected = await bridge.promise(
-                          distillRequest({
-                            runtime: "opencode-ai-sdk",
-                            adapterVersion: REASONING_DISTILLATION_ADAPTER_VERSION,
-                            request: { messages },
-                            messages,
-                            sourceMessages,
-                            slots: observed,
-                          }),
-                        )
-                        outbound = projected.messages as ModelMessage[]
-                      }
-                    }
                     await bridge.promise(
                       Effect.logInfo(
                         "context folding",
@@ -846,7 +887,17 @@ const live: Layer.Layer<
         ),
       )
 
-    return Service.of({ stream })
+    const distill: Interface["distill"] = (input) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const ctrl = yield* Effect.acquireRelease(
+            Effect.sync(() => new AbortController()),
+            (ctrl) => Effect.sync(() => ctrl.abort()),
+          )
+          yield* run({ ...input, abort: ctrl.signal }, true)
+        }),
+      )
+    return Service.of({ stream, distill })
   }),
 )
 

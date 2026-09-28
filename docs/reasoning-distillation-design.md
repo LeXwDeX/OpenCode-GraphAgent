@@ -1,5 +1,26 @@
 # 内化推理蒸馏：开发设计与验收规格
 
+> **2026-09-28 product contract:** `opencode.json` controls `reasoningDistillation.enabled`, default `false`.
+> Once enabled, the first completed user turn is distilled synchronously before the turn becomes idle.
+> Each subsequent completed user turn is queued in the background. Tool steps do not count as turns.
+> Successful adoption replaces the persisted reasoning part and emits its normal update event; the TUI,
+> reopened history and later model requests use that same text. In-flight requests retain their snapshot.
+> Failed, incompatible, stale or cancelled work retains the original. Disabling blocks new work and adoption.
+> This contract supersedes the historical request-time, default-on and projection-only behavior below.
+
+```json
+{
+  "reasoningDistillation": {
+    "enabled": false
+  }
+}
+```
+
+Set `enabled` to `true` to opt in. Existing exact-provider compatibility evidence and fidelity checks still apply;
+turn scheduling alone does not authorize rewriting signed, encrypted or unsupported reasoning.
+The original source is retained as host-owned provenance, excluded from provider request conversion.
+Background work belongs to the running application scope; shutdown cancels unfinished work without changing history.
+
 - 日期：2026-09-22，第 4 版。
 - 状态：提案。产品实现未开始；文档检查通过不代表产品、模型质量或上游兼容性通过验收。
 - 调研基线：`cedcfb3647e50d9a25633b65e4f3e599adc7fb6c`；`origin/dev` = `f3f4e50a0164c3b11b3b0126b2cd9c1ebe25dc37`。实施前重新核对开发分支。
@@ -74,7 +95,7 @@ W1/W2/W3 描述可定位的候选形态，**并不自动授予改写资格**。�
 
 上一轮读取的本地配置中，small_model 为 `local-proxy-compatible/deepseek`；多个 compatible 模型配置了 `interleaved.field = reasoning_content`，另有 Anthropic 通道和外部 think MCP。这是当时的配置观察，不是本版重新实测上游的结果，也不是可发布的兼容白名单。
 
-该 compatible 配置说明 W1 值得优先验证，但尚不能得出“完全可改写”或“全部历史思绪均被上游计费”的结论。成本需要用实际发送载荷和 usage 证明。默认开启功能时，这些槽位仍受 P5 门控。
+该 compatible 配置说明 W1 值得优先验证，但尚不能得出“完全可改写”或“全部历史思绪均被上游计费”的结论。成本需要用实际发送载荷和 usage 证明。显式开启功能时，这些槽位仍受 P5 门控。
 
 ## 3. think 内化的含义与边界
 
@@ -92,20 +113,20 @@ W1/W2/W3 描述可定位的候选形态，**并不自动授予改写资格**。�
 
 ## 4. 已确认目标与形式化边界
 
-| 编号 | 已确认目标                   | 本版解释                                                           |
-| ---- | ---------------------------- | ------------------------------------------------------------------ |
-| D01  | 内化，无外部 MCP/插件依赖    | 共享核心与宿主适配承担                                             |
-| D02  | 默认开启                     | 开关默认开启，兼容授权仍默认保护                                   |
-| D03  | 仅在压缩/动态压缩触发时执行  | 无后台任务；每请求只做有界开关、用途和预算判定，不做无条件模型整理 |
-| D04  | 替换而非附加回传思绪         | conversation 中原槽位替换；不旁路添加额外消息                      |
-| D05  | 协议保护优先                 | 无兼容证据不改写；收益不能覆盖保护失败                             |
-| D06  | 不写回原始历史               | 缓存、验证、审计和投影均为派生数据                                 |
-| D07  | 小模型 → agent 模型 → 主模型 | 分级解析与实际尝试区分，所有实际调用共用预算                       |
-| D08  | 信息守恒审计                 | 按具体声明核对证据；违反规则不等于证明模型具有欺骗意图             |
-| D09  | 结构化、可回溯               | 每条 claim 有原文锚点，支持证据与来源锚点分开                      |
-| D10  | 回传信息 think 化            | 正反意见与理由保留，不以工具式 think 替代                          |
-| D11  | 安静、可关闭                 | 诊断不含正文；关闭后不应用已有候选缓存                             |
-| D12  | 与折叠、全文压缩独立验收     | 各自计收益和回归，验证组合次序                                     |
+| 编号 | 已确认目标                   | 本版解释                                                     |
+| ---- | ---------------------------- | ------------------------------------------------------------ |
+| D01  | 内化，无外部 MCP/插件依赖    | 共享核心与宿主适配承担                                       |
+| D02  | 默认关闭、显式开启           | opencode.json 中 reasoningDistillation.enabled，缺省为 false |
+| D03  | 完整回合结束时执行           | 首轮同步，此后每轮后台异步；工具步骤不单独计轮               |
+| D04  | 替换而非附加回传思绪         | conversation 中原槽位替换；不旁路添加额外消息                |
+| D05  | 协议保护优先                 | 无兼容证据不改写；收益不能覆盖保护失败                       |
+| D06  | 保存已采用的思考             | 事务更新原思考槽位，保留来源信息，同步显示与后续回传         |
+| D07  | 小模型 → agent 模型 → 主模型 | 分级解析与实际尝试区分，所有实际调用共用预算                 |
+| D08  | 信息守恒审计                 | 按具体声明核对证据；违反规则不等于证明模型具有欺骗意图       |
+| D09  | 结构化、可回溯               | 每条 claim 有原文锚点，支持证据与来源锚点分开                |
+| D10  | 回传信息 think 化            | 正反意见与理由保留，不以工具式 think 替代                    |
+| D11  | 安静、可关闭                 | 诊断不含正文；关闭后不应用已有候选缓存                       |
+| D12  | 与折叠、全文压缩独立验收     | 各自计收益和回归，验证组合次序                               |
 
 ### 4.1 决策等价下的最小表示
 
@@ -531,7 +552,7 @@ claim store 由宿主按 InstanceState 管理，以 location/session 隔离，�
 ## 7. 待决事项与剩余风险
 
 1. **触发判据 — 已解决（2026-09-22，预算制）**：owner 确认采用 `ContextFoldingBudget.overBudget === true`（见 §5.1），不以 duplicatePlan 非空触发；实施前在 dev 分支复核预算估算路径与软阈值取值。
-2. **实现治理 — 已豁免（2026-09-22）**：项目所有者明确授权开发本功能，覆盖 `AGENTS.md` v1 focused-maintenance 的“禁止新增平台特性”约束。豁免仅限推理蒸馏本身及其直接依赖的模块/测试/配置，不扩展到其它无关平台特性或基础重构；是否同步修订 `AGENTS.md` 治理措辞属独立决定。默认开启仍为已确认产品目标。
+2. **实现治理 — 已豁免（2026-09-22）**：项目所有者明确授权开发本功能，覆盖 `AGENTS.md` v1 focused-maintenance 的“禁止新增平台特性”约束。豁免仅限推理蒸馏本身及其直接依赖的模块/测试/配置，不扩展到其它无关平台特性或基础重构；是否同步修订 `AGENTS.md` 治理措辞属独立决定。默认开启目标已由 2026-09-28 的默认关闭产品规则取代。
 3. **兼容授权，启用阻塞**：当前配置只证明 W1 形态，不能生成上游白名单。每个实际启用组合必须完成 §2.1；签名/加密通道收益不对等，不能靠破坏保护补收益。
 4. **语义能力上限**：一般命题等价和支持依赖 judged 证据，仍可能误判。需要跨度级证据、留出基准与明确归因；未知不放行，不能宣称模型审阅等同确定性证明。
 5. **证据完整性上限**：历史和调用清单可能缺失，导致只能 unverifiable。结果正文清理不抹除调用状态；若需要新增持久化执行账本，那是另一个需批准的范围，不在首版偷偷加入。

@@ -93,7 +93,7 @@ export class Info extends Schema.Class<Info>("Config.Info")({
   }),
   reasoningDistillation: ConfigReasoningDistillation.Info.pipe(Schema.optional).annotate({
     description:
-      "Reasoning distillation of returned model thoughts (default-on; any rewrite is gated by per-provider compatibility evidence)",
+      "Reasoning distillation of returned model thoughts (default-off; enable in opencode.json; any rewrite is gated by per-provider compatibility evidence)",
   }),
   skills: Schema.String.pipe(Schema.Array, Schema.optional).annotate({
     description: "Additional paths or URLs to discover skills from",
