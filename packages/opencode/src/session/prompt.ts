@@ -1,3 +1,7 @@
+import { Flag } from "@opencode-ai/core/flag/flag"
+import { makeTurnScheduler } from "@opencode-ai/core/session/reasoning-distillation/schedule"
+import { ConfigReasoningDistillation } from "@opencode-ai/core/config/reasoning-distillation"
+import { adoptReasoning } from "./reasoning-adoption"
 import { withHookFeedback } from "@/hook/trigger-result"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
@@ -224,6 +228,7 @@ export const layer = Layer.effect(
     const todoSvc = yield* Todo.Service
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner
     const scope = yield* Scope.Scope
+    const scheduleDistillation = makeTurnScheduler(scope)
     const instruction = yield* Instruction.Service
     const state = yield* SessionRunState.Service
     const revert = yield* SessionRevert.Service
@@ -1767,6 +1772,7 @@ export const layer = Layer.effect(
     const runLoop: (sessionID: SessionID) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.run")(
       function* (sessionID: SessionID) {
         const ctx = yield* InstanceState.context
+        let distillationInput: LLM.StreamInput | undefined
         let structured: unknown
         let step = 0
         // Error carried by the assistant message when the turn loop breaks — drives
@@ -1922,6 +1928,61 @@ export const layer = Layer.effect(
                     limit: SettingsHook.MAX_STOP_CONTINUATIONS,
                   })
                 }
+              }
+              if (
+                !turnError &&
+                distillationInput &&
+                ConfigReasoningDistillation.resolveEnabled({
+                  disabledByEnvironment: Flag.OPENCODE_DISABLE_REASONING_DISTILLATION,
+                  enabled: (yield* config.get()).reasoningDistillation?.enabled,
+                }).enabled
+              ) {
+                const sources = yield* sessions.messages({ sessionID }).pipe(Effect.orDie)
+                const current = sources.filter(
+                  (message) => message.info.role === "assistant" && message.info.parentID === lastUser.id,
+                )
+                const history = ReasoningDistillation.reasoningHistory(sources)
+                const ids = new Set<string>(current.map((message) => message.info.id))
+                const snapshot = {
+                  ...history,
+                  groups: history.groups.map((group) =>
+                    ids.has(group.messageID)
+                      ? group
+                      : { ...group, parts: group.parts.map((part) => ({ ...part, distilled: true })) },
+                  ),
+                }
+                const modelMessages = yield* MessageV2.toModelMessagesEffect(sources, distillationInput.model)
+                const enabled = config.get().pipe(
+                  Effect.map(
+                    (cfg) =>
+                      ConfigReasoningDistillation.resolveEnabled({
+                        disabledByEnvironment: Flag.OPENCODE_DISABLE_REASONING_DISTILLATION,
+                        enabled: cfg.reasoningDistillation?.enabled,
+                      }).enabled,
+                  ),
+                )
+                yield* scheduleDistillation({
+                  sessionID,
+                  turnID: lastUser.id,
+                  previouslyDistilled: sources.some(
+                    (message) =>
+                      !ids.has(message.info.id) &&
+                      message.parts.some((part) => part.type === "reasoning" && part.distillation !== undefined),
+                  ),
+                  enabled,
+                  work: llm.distill({
+                    ...distillationInput,
+                    messages: modelMessages,
+                    contextFolding: undefined,
+                    reasoningDistillation: snapshot,
+                    adoptReasoning: (replacements) =>
+                      adoptReasoning({ sessionID, sources, replacements, canAdopt: enabled }).pipe(
+                        Effect.provideService(Database.Service, database),
+                        Effect.provideService(Session.Service, sessions),
+                        Effect.provideService(EventV2Bridge.Service, events),
+                      ),
+                  }),
+                })
               }
               return yield* getLastAssistant(sessionID)
             }
@@ -2136,7 +2197,6 @@ export const layer = Layer.effect(
               memoryDocs,
               modelMsgs,
               contextFoldingHistory,
-              reasoningDistillationHistory,
             ] = yield* Effect.all(
               [
                 sys.skills(agent),
@@ -2148,7 +2208,6 @@ export const layer = Layer.effect(
                 sys.memory({ sessionID, messages: msgs, main: !session.parentID }),
                 MessageV2.toModelMessagesEffect(msgs, model),
                 MessageV2.contextFoldingHistory({ messages: msgs, ledger: toolSources }),
-                Effect.sync(() => ReasoningDistillation.reasoningHistory(msgs)),
               ],
               { concurrency: "unbounded" },
             )
@@ -2163,7 +2222,7 @@ export const layer = Layer.effect(
             ]
             const format = lastUser.format ?? { type: "text" as const }
             if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
-            const result = yield* handle.process({
+            const processInput: LLM.StreamInput = {
               user: lastUser,
               agent,
               permission: session.permission,
@@ -2179,8 +2238,9 @@ export const layer = Layer.effect(
               toolChoice: format.type === "json_schema" ? "required" : undefined,
               purpose: "conversation",
               contextFolding: contextFoldingHistory,
-              reasoningDistillation: reasoningDistillationHistory,
-            })
+            }
+            distillationInput = processInput
+            const result = yield* handle.process(processInput)
 
             if (structured !== undefined) {
               handle.message.structured = structured

@@ -2144,3 +2144,13 @@ test("parseManagedPlist handles empty config", async () => {
   )
   expect(config.$schema).toBe("https://opencode.ai/config.json")
 })
+
+for (const enabled of [true, false]) {
+  it.instance(`reads reasoning distillation opt-in ${enabled} from opencode.json`, () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* writeConfigEffect(test.directory, { reasoningDistillation: { enabled } })
+      expect((yield* Config.use.get()).reasoningDistillation?.enabled).toBe(enabled)
+    }),
+  )
+}

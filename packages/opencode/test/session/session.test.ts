@@ -1,9 +1,23 @@
+import { SessionEvent } from "@opencode-ai/core/session/event"
+import { SessionMessage } from "@opencode-ai/core/session/message"
+import { SessionMessageTable } from "@opencode-ai/core/session/sql"
+import { eq } from "drizzle-orm"
+import { adoptReasoning } from "@/session/reasoning-adoption"
+import {
+  reasoningHistory,
+  bindInterleavedReasoningLineage,
+  extractInterleavedReasoningSlots,
+} from "@/session/reasoning-distillation"
+import { ProviderTest } from "../fake/provider"
+import { ProviderTransform } from "@/provider/transform"
+import { ProviderV2 } from "@opencode-ai/core/provider"
+import { ModelV2 } from "@opencode-ai/core/model"
 import { describe, expect } from "bun:test"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Database } from "@opencode-ai/core/database/database"
 import { EventV2 } from "@opencode-ai/core/event"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
-import { Deferred, Effect, Exit, Layer } from "effect"
+import { Schema, DateTime, Deferred, Effect, Exit, Layer } from "effect"
 import { Session as SessionNs } from "@/session/session"
 import { Goal } from "@/goal/goal"
 import { SessionAutomationLease } from "@/session/automation-lease"
@@ -32,6 +46,7 @@ const it = testEffect(
       Layer.provide(SessionAutomationLease.defaultLayer),
       Layer.provide(Dag.defaultLayer),
     ),
+    Database.defaultLayer,
     CrossSpawnSpawner.defaultLayer,
     testInstanceStoreLayer,
   ),
@@ -249,6 +264,168 @@ describe("Session", () => {
 
       expect(created.metadata).toBeUndefined()
       expect(saved.metadata).toBeUndefined()
+    }),
+  )
+})
+
+describe("adopted reasoning", () => {
+  const seed = Effect.fnUntraced(function* () {
+    const session = yield* SessionNs.Service
+    const chat = yield* session.create({})
+    const info: SessionV1.Assistant = {
+      id: MessageID.ascending(),
+      sessionID: chat.id,
+      parentID: MessageID.ascending(),
+      role: "assistant",
+      agent: "build",
+      modelID: ModelV2.ID.make("model"),
+      providerID: ProviderV2.ID.make("provider"),
+      mode: "build",
+      path: { cwd: chat.directory, root: chat.directory },
+      time: { created: 1, completed: 2 },
+      cost: 0,
+      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+    }
+    yield* session.updateMessage(info)
+    const reasoning: SessionV1.ReasoningPart = {
+      id: PartID.ascending(),
+      sessionID: chat.id,
+      messageID: info.id,
+      type: "reasoning",
+      text: "original private reasoning",
+      time: { start: 1, end: 2 },
+    }
+    const events = yield* EventV2Bridge.Service
+    const assistantMessageID = SessionMessage.ID.create()
+    yield* events.publish(SessionEvent.Step.Started, {
+      sessionID: chat.id,
+      assistantMessageID,
+      agent: "build",
+      model: { id: info.modelID, providerID: info.providerID },
+      timestamp: DateTime.makeUnsafe(1),
+    })
+    yield* events.publish(SessionEvent.Reasoning.Started, {
+      sessionID: chat.id,
+      assistantMessageID,
+      reasoningID: "r1",
+      timestamp: DateTime.makeUnsafe(1),
+    })
+    yield* events.publish(SessionEvent.Reasoning.Ended, {
+      sessionID: chat.id,
+      assistantMessageID,
+      reasoningID: "r1",
+      text: reasoning.text,
+      timestamp: DateTime.makeUnsafe(2),
+    })
+    reasoning.v2 = { messageID: assistantMessageID, reasoningID: "r1" }
+    yield* session.updatePart(reasoning)
+    const sources: SessionV1.WithParts[] = [{ info, parts: [reasoning] }]
+    const replacements = [{ messageID: info.id, partID: reasoning.id, before: reasoning.text, after: "采用后的思考" }]
+    return { session, chat, info, reasoning, sources, replacements }
+  })
+
+  it.instance("updates subscribers, reloaded history and model context to the same adopted text", () =>
+    Effect.gen(function* () {
+      const { session, chat, info, reasoning, sources, replacements } = yield* seed()
+      const events = yield* EventV2Bridge.Service
+      const received = yield* Deferred.make<SessionV1.Part>()
+      const unsub = yield* events.listen((event) => {
+        if (event.type === SessionV1.Event.PartUpdated.type) {
+          const part = Schema.decodeUnknownSync(SessionV1.Event.PartUpdated.data)(event.data).part
+          if (part.type === "reasoning" && part.distillation)
+            Deferred.doneUnsafe(received, Effect.succeed(part as SessionV1.Part))
+        }
+        return Effect.void
+      })
+      yield* Effect.addFinalizer(() => unsub)
+      expect(yield* adoptReasoning({ sessionID: chat.id, sources, replacements })).toBe(true)
+      expect(yield* awaitDeferred(received, "adoption event missing")).toMatchObject({
+        id: reasoning.id,
+        text: replacements[0].after,
+      })
+      const reloaded = yield* session.messages({ sessionID: chat.id })
+      const part = reloaded
+        .find((message) => message.info.id === info.id)
+        ?.parts.find((part) => part.id === reasoning.id)
+      expect(part).toMatchObject({ text: replacements[0].after, distillation: { originalText: reasoning.text } })
+      const { db } = yield* Database.Service
+      const mirror = yield* db
+        .select()
+        .from(SessionMessageTable)
+        .where(eq(SessionMessageTable.id, SessionMessage.ID.make(reasoning.v2!.messageID)))
+        .get()
+        .pipe(Effect.orDie)
+      expect(JSON.stringify(mirror?.data)).toContain(replacements[0].after)
+      const model = ProviderTest.model({ id: info.modelID, providerID: info.providerID })
+      const plain = yield* MessageV2.toModelMessagesEffect(reloaded, model)
+      expect(JSON.stringify(plain)).toContain(replacements[0].after)
+      expect(JSON.stringify(plain)).not.toContain(reasoning.text)
+      expect(JSON.stringify(plain)).not.toContain("sourceFingerprint")
+      const interleaved = {
+        ...model,
+        capabilities: { ...model.capabilities, interleaved: { field: "reasoning_content" as const } },
+      }
+      const transformed = ProviderTransform.message(structuredClone(plain), interleaved, {})
+      const snapshot = reasoningHistory(reloaded)
+      const lineage = bindInterleavedReasoningLineage(plain, transformed, "reasoning_content", snapshot)
+      const slots = extractInterleavedReasoningSlots(transformed, "reasoning_content", ["messages"], lineage)
+      expect(slots).toHaveLength(1)
+      expect(slots[0]).toMatchObject({ text: replacements[0].after, structureRewritable: false })
+      expect(yield* adoptReasoning({ sessionID: chat.id, sources, replacements })).toBe(false)
+      yield* session.remove(chat.id)
+    }),
+  )
+
+  it.instance("rejects stale or streaming sources without replacing history", () =>
+    Effect.gen(function* () {
+      const { session, chat, reasoning, sources, replacements } = yield* seed()
+      const changed = { ...reasoning, text: "a newer source" }
+      yield* session.updatePart(changed)
+      expect(yield* adoptReasoning({ sessionID: chat.id, sources, replacements })).toBe(false)
+      expect(
+        yield* session.getPart({ sessionID: chat.id, messageID: reasoning.messageID, partID: reasoning.id }),
+      ).toMatchObject({ text: changed.text })
+      const pending = { ...reasoning, time: { start: 1 } }
+      yield* session.updatePart(pending)
+      expect(
+        yield* adoptReasoning({ sessionID: chat.id, sources: [{ ...sources[0], parts: [pending] }], replacements }),
+      ).toBe(false)
+      yield* session.remove(chat.id)
+    }),
+  )
+
+  it.instance("rolls back every slot if a later source changed", () =>
+    Effect.gen(function* () {
+      const { session, chat, info, reasoning, sources, replacements } = yield* seed()
+      const second = { ...reasoning, id: PartID.ascending(), text: "second source" }
+      yield* session.updatePart(second)
+      sources[0].parts.push(second)
+      yield* session.updatePart({ ...second, metadata: { provider: { signature: "new-signature" } } })
+      expect(
+        yield* adoptReasoning({
+          sessionID: chat.id,
+          sources,
+          replacements: [
+            ...replacements,
+            { messageID: info.id, partID: second.id, before: second.text, after: "second replacement" },
+          ],
+        }),
+      ).toBe(false)
+      expect(yield* session.getPart({ sessionID: chat.id, messageID: info.id, partID: reasoning.id })).toEqual(
+        reasoning,
+      )
+      yield* session.remove(chat.id)
+    }),
+  )
+  it.instance("a disabled switch blocks an already prepared adoption", () =>
+    Effect.gen(function* () {
+      const { session, chat, reasoning, sources, replacements } = yield* seed()
+      expect(
+        yield* adoptReasoning({ sessionID: chat.id, sources, replacements, canAdopt: Effect.succeed(false) }),
+      ).toBe(false)
+      expect(
+        yield* session.getPart({ sessionID: chat.id, messageID: reasoning.messageID, partID: reasoning.id }),
+      ).toEqual(reasoning)
     }),
   )
 })

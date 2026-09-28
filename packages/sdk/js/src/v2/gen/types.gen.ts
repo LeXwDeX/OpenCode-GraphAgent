@@ -416,12 +416,22 @@ export type SubtaskPart = {
   command?: string
 }
 
+export type ReasoningDistillation = {
+  originalText: string
+  sourceFingerprint: string
+}
+
 export type ReasoningPart = {
   id: string
   sessionID: string
   messageID: string
   type: "reasoning"
   text: string
+  distillation?: ReasoningDistillation
+  v2?: {
+    messageID: string
+    reasoningID: string
+  }
   metadata?: {
     [key: string]: unknown
   }
@@ -1076,6 +1086,7 @@ export type GlobalEvent = {
           assistantMessageID: string
           reasoningID: string
           text: string
+          distillation?: ReasoningDistillation
           providerMetadata?: {
             [key: string]: {
               [key: string]: unknown
@@ -3628,6 +3639,7 @@ export type SyncEventSessionNextReasoningEnded = {
       assistantMessageID: string
       reasoningID: string
       text: string
+      distillation?: ReasoningDistillation
       providerMetadata?: {
         [key: string]: {
           [key: string]: unknown
@@ -4154,6 +4166,7 @@ export type SessionMessageAssistantReasoning = {
   type: "reasoning"
   id: string
   text: string
+  distillation?: ReasoningDistillation
   providerMetadata?: {
     [key: string]: {
       [key: string]: unknown
@@ -5118,6 +5131,7 @@ export type V2EventSessionNextReasoningEnded = {
     assistantMessageID: string
     reasoningID: string
     text: string
+    distillation?: ReasoningDistillation
     providerMetadata?: {
       [key: string]: {
         [key: string]: unknown
@@ -6832,6 +6846,7 @@ export type EventSessionNextReasoningEnded = {
     assistantMessageID: string
     reasoningID: string
     text: string
+    distillation?: ReasoningDistillation
     providerMetadata?: {
       [key: string]: {
         [key: string]: unknown

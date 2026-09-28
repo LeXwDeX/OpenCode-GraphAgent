@@ -14,7 +14,7 @@ export class Compatibility extends Schema.Class<Compatibility>("ConfigV2.Reasoni
 }) {}
 
 /**
- * Reasoning-distillation switch (design D02: default-on, but compatibility authorization still defaults to protected).
+ * Reasoning-distillation switch (default-off; explicit opt-in still requires compatibility authorization).
  * The feature only ever rewrites a reasoning slot that carries a §2.1 dual-evidence compatibility record; absent that
  * record every slot is P5-protected, so enabling the switch is safe and never rewrites an unproven provider.
  */
@@ -37,9 +37,9 @@ export type EnableInput = Readonly<{
   enabled?: boolean
 }>
 
-/** Resolve the effective switch without mutating persisted config. Default-on per D02 unless disabled. */
+/** Resolve the effective switch without mutating persisted config. Disabled unless explicitly enabled. */
 export function resolveEnabled(input: EnableInput): EnableResolution {
   if (input.disabledByEnvironment) return { enabled: false, source: "environment" }
   if (input.enabled !== undefined) return { enabled: input.enabled, source: "config" }
-  return { enabled: true, source: "default" }
+  return { enabled: false, source: "default" }
 }

@@ -1,5 +1,10 @@
+import { ConfigReasoningDistillation } from "../src/config/reasoning-distillation"
+import { adapterVersion } from "../src/session/runner/reasoning-distillation"
+import { Hash } from "../src/util/hash"
 import { describe, expect } from "bun:test"
 import {
+  LLMResponse,
+  PreparedRequest,
   LLMClient,
   LLMError,
   LLMEvent,
@@ -59,6 +64,24 @@ import { testEffect } from "./lib/effect"
 
 const questions = QuestionV2.layer.pipe(Layer.provide(EventV2.defaultLayer))
 const requests: LLMRequest[] = []
+let reasoningConfig: ConfigReasoningDistillation.Info | undefined
+let auxiliary: LLMClientShape["generate"] | undefined
+const prepareDistillation = (request: LLMRequest) =>
+  request.model.route.body
+    .from(request)
+    .pipe(
+      Effect.map(
+        (body) =>
+          new PreparedRequest({
+            id: "distillation-test",
+            route: request.model.route.id,
+            protocol: request.model.route.protocol,
+            model: request.model,
+            body,
+          }),
+      ),
+    )
+
 let response: LLMEvent[] = []
 let responses: LLMEvent[][] | undefined
 let responseStream: Stream.Stream<LLMEvent, LLMError> | undefined
@@ -73,7 +96,8 @@ let maxActiveToolExecutions = 0
 const client = Layer.succeed(
   LLMClient.Service,
   LLMClient.Service.of({
-    prepare: () => Effect.die("unused"),
+    prepare: ((request: LLMRequest) =>
+      reasoningConfig ? prepareDistillation(request) : Effect.die("unused")) as LLMClientShape["prepare"],
     stream: ((request: LLMRequest) => {
       requests.push(request)
       if (responseStream) {
@@ -92,7 +116,7 @@ const client = Layer.succeed(
         ),
       )
     }) as unknown as LLMClientShape["stream"],
-    generate: () => Effect.die("unused"),
+    generate: (request) => (auxiliary ? auxiliary(request) : Effect.die("unused")),
   }),
 )
 const model = Model.make({ id: "fake-model", provider: "fake", route: OpenAIChat.route })
@@ -222,6 +246,7 @@ const config = Layer.succeed(
         new Config.Document({
           type: "document",
           info: new Config.Info({
+            reasoningDistillation: reasoningConfig,
             compaction: new ConfigCompaction.Info({
               buffer: 3_000,
               keep: new ConfigCompaction.Keep({ tokens: 1_000 }),
@@ -315,6 +340,8 @@ const insertSession = (id: SessionV2.ID) =>
 const setup = Effect.gen(function* () {
   const { db } = yield* Database.Service
   response = []
+  reasoningConfig = undefined
+  auxiliary = undefined
   systemBaseline = "Initial context"
   systemRemoved = false
   systemUnavailable = false
@@ -3214,3 +3241,123 @@ describe("SessionRunnerLLM", () => {
     }),
   )
 })
+
+it.effect("Core runner adopts every slot at turn completion and asynchronously replaces the next turn", () =>
+  Effect.gen(function* () {
+    yield* setup
+    currentModel = Model.make({
+      id: "distillation",
+      provider: "fake",
+      route: OpenAIChat.route.with({ limits: { context: 100_000, output: 4096 } }),
+    })
+    reasoningConfig = new ConfigReasoningDistillation.Info({
+      enabled: true,
+      compatibility: [
+        new ConfigReasoningDistillation.Compatibility({
+          runtime: "core-runner",
+          protocol: currentModel.route.protocol,
+          providerModelVariant: "fake/distillation/default",
+          endpointIdentity: Hash.sha256(currentModel.route.id),
+          adapterVersion,
+          optionsFingerprint: Hash.sha256(JSON.stringify({ openai: { promptCacheKey: sessionID } })),
+          transportVerified: true,
+          upstreamVerified: true,
+        }),
+      ],
+    })
+    const started = yield* Deferred.make<void>()
+    const release = yield* Deferred.make<void>()
+    let calls = 0
+    auxiliary = (request) =>
+      Effect.gen(function* () {
+        if (calls++ === 4) {
+          yield* Deferred.succeed(started, undefined)
+          yield* Deferred.await(release)
+        }
+        const prompt = request.messages
+          .flatMap((message) => message.content.flatMap((part) => (part.type === "text" ? [part.text] : [])))
+          .join("\n")
+        const ref = /messageID=([^，]+)，partID=([^，]+)，长度=(\d+)/.exec(prompt)
+        const output = ref
+          ? {
+              claims: [
+                {
+                  id: "claim",
+                  kind: "decision",
+                  text: `采用-${ref[2]}`,
+                  scope: "当前回合",
+                  sources: [{ messageID: ref[1], partID: ref[2], start: 0, end: Number(ref[3]) }],
+                  evidence: [],
+                  status: "unverified",
+                },
+              ],
+              preserved: [],
+              coverage: [
+                {
+                  source: { messageID: ref[1], partID: ref[2], start: 0, end: Number(ref[3]) },
+                  action: "keep",
+                  claimID: "claim",
+                },
+              ],
+            }
+          : {
+              retention: { verdict: "supported" },
+              support: [{ claimID: "claim", verdict: "supported", method: "judged" }],
+            }
+        const result = LLMResponse.fromEvents([
+          LLMEvent.stepStart({ index: 0 }),
+          LLMEvent.textStart({ id: "aux" }),
+          LLMEvent.textDelta({ id: "aux", text: JSON.stringify(output) }),
+          LLMEvent.textEnd({ id: "aux" }),
+          LLMEvent.stepFinish({
+            index: 0,
+            reason: "stop",
+            usage: { inputTokens: 10, outputTokens: 10, totalTokens: 20 },
+          }),
+          LLMEvent.finish({ reason: "stop" }),
+        ])
+        if (!result) throw new Error("missing auxiliary response")
+        return result
+      })
+    const session = yield* SessionV2.Service
+    const events = yield* EventV2.Service
+    const answer = (turn: number) => [
+      LLMEvent.stepStart({ index: 0 }),
+      ...[0, 1].flatMap((slot) => [
+        LLMEvent.reasoningStart({ id: `r-${turn}-${slot}` }),
+        LLMEvent.reasoningDelta({ id: `r-${turn}-${slot}`, text: `original-${turn}-${slot}。`.repeat(1000) }),
+        LLMEvent.reasoningEnd({ id: `r-${turn}-${slot}` }),
+      ]),
+      LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+      LLMEvent.finish({ reason: "stop" }),
+    ]
+    yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "first" }), resume: false })
+    response = answer(1)
+    yield* session.resume(sessionID)
+    expect(calls).toBe(4)
+    expect(JSON.stringify(yield* session.context(sessionID))).toContain("采用-r-1-0")
+    expect(JSON.stringify(yield* session.context(sessionID))).toContain("采用-r-1-1")
+
+    const updates = yield* events.subscribe(SessionEvent.Reasoning.Ended).pipe(
+      Stream.filter((event) => event.data.distillation !== undefined),
+      Stream.take(2),
+      Stream.runDrain,
+      Effect.forkChild,
+    )
+    yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "second" }), resume: false })
+    response = answer(2)
+    yield* session.resume(sessionID)
+    yield* Deferred.await(started)
+    expect(JSON.stringify(requests.at(-1)?.messages)).toContain("采用-r-1-0")
+    expect(JSON.stringify(requests.at(-1)?.messages)).not.toContain("original-1")
+    expect(JSON.stringify(yield* session.context(sessionID))).not.toContain("采用-r-2-0")
+    yield* Deferred.succeed(release, undefined)
+    yield* Fiber.join(updates)
+    expect(calls).toBe(8)
+    yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "third" }), resume: false })
+    response = []
+    yield* session.resume(sessionID)
+    expect(JSON.stringify(requests.at(-1)?.messages)).toContain("采用-r-2-0")
+    expect(JSON.stringify(requests.at(-1)?.messages)).not.toContain("original-2")
+  }),
+)

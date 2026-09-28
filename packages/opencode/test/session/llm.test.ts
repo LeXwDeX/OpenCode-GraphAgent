@@ -80,15 +80,25 @@ const drainWith = (layer: Layer.Layer<LLM.Service>, input: LLM.StreamInput) =>
     )
   })
 
-const drainSequenceWith = (layer: Layer.Layer<LLM.Service>, inputs: readonly LLM.StreamInput[]) =>
+const drainSequenceWith = (layer: Layer.Layer<LLM.Service>, inputs: readonly LLM.StreamInput[], distill = false) =>
   Effect.gen(function* () {
     const ctx = yield* InstanceRef
     if (!ctx) return yield* Effect.die("InstanceRef not provided")
     return yield* Effect.promise(() =>
       Effect.runPromise(
-        Effect.forEach(inputs, (input) => LLM.Service.use((svc) => svc.stream(input).pipe(Stream.runDrain)), {
-          discard: true,
-        }).pipe(Effect.provide(layer), Effect.provideService(InstanceRef, ctx)),
+        Effect.forEach(
+          inputs,
+          (input) =>
+            LLM.Service.use((svc) =>
+              Effect.gen(function* () {
+                if (distill) yield* svc.distill(input)
+                yield* svc.stream(input).pipe(Stream.runDrain)
+              }),
+            ),
+          {
+            discard: true,
+          },
+        ).pipe(Effect.provide(layer), Effect.provideService(InstanceRef, ctx)),
       ),
     )
   })
@@ -1842,127 +1852,150 @@ describe("session.llm.stream", () => {
   )
 
   for (const runtime of ["opencode-ai-sdk", "opencode-native"] as const) {
-    it.instance(
-      `organizes before the first ${runtime} send below threshold and replays on an idle turn`,
-      () =>
-        Effect.gen(function* () {
-          const propose = waitRequest(
-            "/chat/completions",
-            auxiliaryResponse({
-              claims: [
-                {
-                  id: "c1",
-                  kind: "decision",
-                  text: "已确认方案A。",
-                  scope: "当前会话",
-                  sources: [
-                    {
+    for (const adopted of [true, false]) {
+      it.instance(
+        `${runtime} distills independently and only replays persisted replacements; persistence accepted=${adopted}`,
+        () =>
+          Effect.gen(function* () {
+            const propose = waitRequest(
+              "/chat/completions",
+              auxiliaryResponse({
+                claims: [
+                  {
+                    id: "c1",
+                    kind: "decision",
+                    text: "已确认方案A。",
+                    scope: "当前会话",
+                    sources: [
+                      {
+                        messageID: "msg-reasoning-source",
+                        partID: "prt-reasoning-source",
+                        start: 0,
+                        end: distillationBody.length,
+                      },
+                    ],
+                    evidence: [],
+                    status: "unverified",
+                  },
+                ],
+                preserved: [],
+                coverage: [
+                  {
+                    source: {
                       messageID: "msg-reasoning-source",
                       partID: "prt-reasoning-source",
                       start: 0,
                       end: distillationBody.length,
                     },
-                  ],
-                  evidence: [],
-                  status: "unverified",
-                },
-              ],
-              preserved: [],
-              coverage: [
-                {
-                  source: {
-                    messageID: "msg-reasoning-source",
-                    partID: "prt-reasoning-source",
-                    start: 0,
-                    end: distillationBody.length,
+                    action: "keep",
+                    claimID: "c1",
                   },
-                  action: "keep",
-                  claimID: "c1",
+                ],
+              }),
+            )
+            const judge = waitRequest(
+              "/chat/completions",
+              auxiliaryResponse({
+                retention: { verdict: "supported" },
+                support: [{ claimID: "c1", verdict: "supported", method: "judged" }],
+              }),
+            )
+            const first = waitRequest(
+              "/chat/completions",
+              new Response(createChatStream("first"), { headers: { "Content-Type": "text/event-stream" } }),
+            )
+            const second = waitRequest(
+              "/chat/completions",
+              new Response(createChatStream("second"), { headers: { "Content-Type": "text/event-stream" } }),
+            )
+
+            const resolved = yield* Provider.use.getModel(
+              ProviderV2.ID.make("custom-provider"),
+              ModelV2.ID.make("deepseek-test-r1"),
+            )
+            expect(resolved.limit).toMatchObject({ context: 65_536, output: 4_096 })
+            const sessionID = SessionID.make(`session-test-distillation-${runtime}`)
+            const agent = {
+              name: "test",
+              mode: "primary",
+              options: {},
+              permission: [{ permission: "*", pattern: "*", action: "allow" }],
+            } satisfies Agent.Info
+            const messages = distillationMessages()
+            const before = JSON.stringify(messages)
+            const applied: Array<readonly { before: string; after: string }[]> = []
+            const input = (id: string): LLM.StreamInput => ({
+              user: {
+                id: MessageID.make(id),
+                sessionID,
+                role: "user",
+                time: { created: Date.now() },
+                agent: agent.name,
+                model: { providerID: ProviderV2.ID.make("custom-provider"), modelID: resolved.id },
+              } satisfies SessionV1.User,
+              sessionID,
+              model: resolved,
+              agent,
+              system: [],
+              messages,
+              tools: {},
+              purpose: "conversation",
+              reasoningDistillation: distillationHistory(),
+              adoptReasoning: (replacements) =>
+                Effect.sync(() => {
+                  applied.push(replacements)
+                  if (adopted) {
+                    const assistant = messages.find((message) => message.role === "assistant")
+                    if (assistant && Array.isArray(assistant.content)) {
+                      for (const part of assistant.content)
+                        if (part.type === "reasoning") part.text = replacements[0].after
+                    }
+                  }
+                  return adopted
+                }),
+            })
+
+            yield* drainSequenceWith(
+              llmLayerWithExecutor(RequestExecutor.defaultLayer, {
+                experimentalNativeLlm: runtime === "opencode-native",
+                outputTokenMax: 4_096,
+              }),
+              [
+                input("msg_user-distillation-first"),
+                {
+                  ...input("msg_user-distillation-second"),
+                  reasoningDistillation: { ...distillationHistory()!, reasoningTurn: 2 },
                 },
               ],
-            }),
-          )
-          const judge = waitRequest(
-            "/chat/completions",
-            auxiliaryResponse({
-              retention: { verdict: "supported" },
-              support: [{ claimID: "c1", verdict: "supported", method: "judged" }],
-            }),
-          )
-          const first = waitRequest(
-            "/chat/completions",
-            new Response(createChatStream("first"), { headers: { "Content-Type": "text/event-stream" } }),
-          )
-          const second = waitRequest(
-            "/chat/completions",
-            new Response(createChatStream("second"), { headers: { "Content-Type": "text/event-stream" } }),
-          )
+              true,
+            )
 
-          const resolved = yield* Provider.use.getModel(
-            ProviderV2.ID.make("custom-provider"),
-            ModelV2.ID.make("deepseek-test-r1"),
-          )
-          expect(resolved.limit).toMatchObject({ context: 65_536, output: 4_096 })
-          const sessionID = SessionID.make(`session-test-distillation-${runtime}`)
-          const agent = {
-            name: "test",
-            mode: "primary",
-            options: {},
-            permission: [{ permission: "*", pattern: "*", action: "allow" }],
-          } satisfies Agent.Info
-          const messages = distillationMessages()
-          const before = JSON.stringify(messages)
-          const input = (id: string): LLM.StreamInput => ({
-            user: {
-              id: MessageID.make(id),
-              sessionID,
-              role: "user",
-              time: { created: Date.now() },
-              agent: agent.name,
-              model: { providerID: ProviderV2.ID.make("custom-provider"), modelID: resolved.id },
-            } satisfies SessionV1.User,
-            sessionID,
-            model: resolved,
-            agent,
-            system: [],
-            messages,
-            tools: {},
-            purpose: "conversation",
-            reasoningDistillation: distillationHistory(),
-          })
-
-          yield* drainSequenceWith(
-            llmLayerWithExecutor(RequestExecutor.defaultLayer, {
-              experimentalNativeLlm: runtime === "opencode-native",
-              outputTokenMax: 4_096,
-            }),
-            [
-              input("msg_user-distillation-first"),
-              {
-                ...input("msg_user-distillation-second"),
-                reasoningDistillation: { ...distillationHistory()!, reasoningTurn: 2 },
-              },
-            ],
-          )
-
-          const [proposeCapture, firstCapture, judgeCapture, secondCapture] = yield* Effect.promise(() =>
-            Promise.all([propose, first, judge, second]),
-          )
-          expect(proposeCapture.body.stream).not.toBe(true)
-          expect(judgeCapture.body.stream).not.toBe(true)
-          expect(JSON.stringify(judgeCapture.body.messages)).toContain("最终发送文本")
-          expect(JSON.stringify(judgeCapture.body.messages)).toContain("retention")
-          const reasoning = (capture: Capture) =>
-            (capture.body.messages as Array<Record<string, unknown>> | undefined)?.find(
-              (message) => message.role === "assistant",
-            )?.reasoning_content
-          expect(reasoning(firstCapture)).toContain("已确认方案A。")
-          expect(reasoning(secondCapture)).toContain("已确认方案A。")
-          expect(reasoning(secondCapture)).not.toBe(distillationBody)
-          expect(JSON.stringify(messages)).toBe(before)
-        }),
-      { config: () => distillationConfig(runtime) },
-    )
+            const [proposeCapture, firstCapture, judgeCapture, secondCapture] = yield* Effect.promise(() =>
+              Promise.all([propose, first, judge, second]),
+            )
+            expect(proposeCapture.body.stream).not.toBe(true)
+            expect(judgeCapture.body.stream).not.toBe(true)
+            expect(JSON.stringify(judgeCapture.body.messages)).toContain("最终发送文本")
+            expect(JSON.stringify(judgeCapture.body.messages)).toContain("retention")
+            const reasoning = (capture: Capture) =>
+              (capture.body.messages as Array<Record<string, unknown>> | undefined)?.find(
+                (message) => message.role === "assistant",
+              )?.reasoning_content
+            expect(applied).toHaveLength(adopted ? 1 : 2)
+            expect(applied[0][0].before).toBe(distillationBody)
+            expect(applied[0][0].after).toContain("已确认方案A。")
+            if (adopted) {
+              expect(reasoning(firstCapture)).toBe(applied[0][0].after)
+              expect(reasoning(secondCapture)).toBe(applied[0][0].after)
+            } else {
+              expect(reasoning(firstCapture)).toBe(distillationBody)
+              expect(reasoning(secondCapture)).toBe(distillationBody)
+            }
+            if (!adopted) expect(JSON.stringify(messages)).toBe(before)
+          }),
+        { config: () => distillationConfig(runtime) },
+      )
+    }
   }
 
   it.instance(
