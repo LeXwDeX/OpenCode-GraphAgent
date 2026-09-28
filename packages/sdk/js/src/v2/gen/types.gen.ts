@@ -419,6 +419,10 @@ export type SubtaskPart = {
 export type ReasoningDistillation = {
   originalText: string
   sourceFingerprint: string
+  version?: 2
+  originalMetadata?: {
+    [key: string]: unknown
+  }
 }
 
 export type ReasoningPart = {

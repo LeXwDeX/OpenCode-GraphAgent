@@ -132,10 +132,12 @@ function providerMeta(metadata: Record<string, any> | undefined) {
   return Object.keys(rest).length > 0 ? rest : undefined
 }
 
+import { reasoningForReplay } from "@opencode-ai/core/session/reasoning-distillation/canonical"
+
 export const toModelMessagesEffect = Effect.fnUntraced(function* (
   input: WithParts[],
   model: Provider.Model,
-  options?: { stripMedia?: boolean; toolOutputMaxChars?: number },
+  options?: { stripMedia?: boolean; toolOutputMaxChars?: number; reasoningDistillationEnabled?: boolean },
 ) {
   const result: UIMessage[] = []
   const toolNames = new Set<string>()
@@ -364,18 +366,24 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
             })
         }
         if (part.type === "reasoning") {
+          const replay = reasoningForReplay({
+            text: part.text,
+            metadata: part.metadata,
+            distillation: part.distillation,
+            enabled: options?.reasoningDistillationEnabled === true,
+          })
           if (differentModel) {
-            if (part.text.trim().length > 0)
+            if (replay.text.trim().length > 0)
               assistantMessage.parts.push({
                 type: "text",
-                text: part.text,
+                text: replay.text,
               })
             continue
           }
           assistantMessage.parts.push({
             type: "reasoning",
-            text: part.text,
-            providerMetadata: part.metadata,
+            text: replay.text,
+            providerMetadata: replay.metadata as typeof part.metadata,
           })
         }
       }
@@ -423,7 +431,7 @@ export const contextFoldingHistory = ContextFolding.history
 export function toModelMessages(
   input: WithParts[],
   model: Provider.Model,
-  options?: { stripMedia?: boolean; toolOutputMaxChars?: number },
+  options?: { stripMedia?: boolean; toolOutputMaxChars?: number; reasoningDistillationEnabled?: boolean },
 ): Promise<ModelMessage[]> {
   return Effect.runPromise(toModelMessagesEffect(input, model, options))
 }

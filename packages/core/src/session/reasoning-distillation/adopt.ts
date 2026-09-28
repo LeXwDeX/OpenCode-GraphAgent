@@ -1,13 +1,14 @@
 import { Cause, DateTime, Effect, Schema } from "effect"
 import { isDeepStrictEqual } from "node:util"
-import { eq } from "drizzle-orm"
+import { eq, gt, and } from "drizzle-orm"
 import { Database } from "../../database/database"
 import { EventV2 } from "../../event"
 import { SessionEvent } from "../event"
 import { SessionMessage } from "../message"
 import { SessionSchema } from "../schema"
-import { SessionMessageTable } from "../sql"
+import { SessionMessageTable, SessionTable } from "../sql"
 import { adoptionProvenance, type ReasoningReplacement } from "./adoption"
+import { replaceCanonicalReasoning } from "./canonical"
 
 export const adoptReasoning = Effect.fn("CoreReasoningDistillation.adopt")(function* (
   events: EventV2.Interface,
@@ -35,6 +36,9 @@ export const adoptReasoning = Effect.fn("CoreReasoningDistillation.adopt")(funct
       seen.has(key)
     )
       return false
+    const source = { text: part.text, metadata: part.providerMetadata, settled: true, distilled: false }
+    const edited = replaceCanonicalReasoning(source, replacement.after)
+    if (!edited) return false
     seen.add(key)
     checks.push({ messageID: message.id, part })
     entries.push({
@@ -43,15 +47,34 @@ export const adoptReasoning = Effect.fn("CoreReasoningDistillation.adopt")(funct
         sessionID,
         assistantMessageID: message.id,
         reasoningID: part.id,
-        text: replacement.after,
-        providerMetadata: part.providerMetadata,
-        distillation: adoptionProvenance(part.text),
+        text: edited.text,
+        providerMetadata: edited.metadata,
+        distillation: adoptionProvenance(source),
         timestamp: DateTime.makeUnsafe(Date.now()),
       },
     })
   }
   const validate = Effect.gen(function* () {
     if (!(yield* canAdopt)) yield* Effect.die("reasoning distillation was disabled")
+    const session = yield* db.select().from(SessionTable).where(eq(SessionTable.id, sessionID)).get().pipe(Effect.orDie)
+    if (!session || session.revert) yield* Effect.die("reasoning source was reverted")
+    const user = messages.findLast((message) => message.type === "user")
+    if (!user) throw new Error("reasoning turn has no user")
+    const userRow = yield* db
+      .select()
+      .from(SessionMessageTable)
+      .where(eq(SessionMessageTable.id, user.id))
+      .get()
+      .pipe(Effect.orDie)
+    if (!userRow || userRow.session_id !== sessionID) throw new Error("reasoning turn user was changed")
+    const known = new Set(messages.map((message) => message.id))
+    const later = yield* db
+      .select({ id: SessionMessageTable.id })
+      .from(SessionMessageTable)
+      .where(and(eq(SessionMessageTable.session_id, sessionID), gt(SessionMessageTable.seq, userRow.seq)))
+      .all()
+      .pipe(Effect.orDie)
+    if (later.some((row) => !known.has(row.id))) yield* Effect.die("reasoning turn was retried or continued")
     for (const user of messages.filter((message) => message.type === "user")) {
       const row = yield* db
         .select()

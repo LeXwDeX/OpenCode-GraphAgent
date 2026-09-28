@@ -257,10 +257,9 @@ jobs:
         if: steps.evidence.outputs.reused != 'true'
         uses: ./.github/actions/setup-bun
         with:
-          # Only Windows saves (sole Windows job). Linux e2e skips —
-          # unit-tests (linux) is the single Linux cache saver, avoiding
-          # intra-run cache key collision on {OS}-bun-{hash}.
-          save-cache: ${{ matrix.settings.name == 'windows' }}
+          # Windows cache archiving can stall before DAG and Playwright tests.
+          # Linux unit tests remain the single Linux cache saver.
+          save-cache: false
 
       - name: Read Playwright version
         if: steps.evidence.outputs.reused != 'true'

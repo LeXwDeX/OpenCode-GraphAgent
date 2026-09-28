@@ -243,7 +243,7 @@ const live: Layer.Layer<
           ? input.model.capabilities.interleaved.field
           : undefined
       const organizer =
-        distillationOnly && distillationResolution.enabled && interleavedField
+        distillationOnly && distillationResolution.enabled
           ? ((yield* provider.getSmallModel(input.model.providerID)) ?? input.model)
           : undefined
       const organizerResolution = organizer
@@ -353,6 +353,7 @@ const live: Layer.Layer<
         : undefined
 
       const distillRequest = <Request>(args: {
+        target?: "canonical" | "native-wire"
         runtime: string
         adapterVersion: string
         request: Request
@@ -419,6 +420,7 @@ const live: Layer.Layer<
                   evidenceReferences: input.reasoningDistillation?.references,
                   inventoryFingerprint: input.reasoningDistillation?.inventoryFingerprint ?? "missing-inventory",
                   capability,
+                  target: args.target,
                   records: cfg.reasoningDistillation?.compatibility ?? [],
                   organizerFingerprint: organizerResolution.organizerFingerprint,
                   originalTokens: Math.ceil(selected.reduce((total, slot) => total + slot.text.length, 0) / 4),
@@ -434,7 +436,10 @@ const live: Layer.Layer<
               Effect.tap((result) => Effect.sync(() => void (current.current = result.state))),
               Effect.flatMap((cycle) => {
                 if (!cycle.projection.applied || !input.adoptReasoning) return Effect.succeed(cycle)
-                const replacements = reasoningReplacements(cycle.projection.request, selected)
+                const replacements =
+                  args.target === "canonical"
+                    ? (cycle.projection.replacements ?? [])
+                    : reasoningReplacements(cycle.projection.request, selected)
                 return Effect.gen(function* () {
                   const latest = yield* config.get()
                   if (
@@ -605,6 +610,74 @@ const live: Layer.Layer<
             },
           })
         : undefined
+
+      // Completed-turn preparation starts from persisted, uniquely identified reasoning parts. It never needs a
+      // provider's interleaved wire field, and the resulting edit is committed by the existing adoption transaction.
+      if (
+        distillationOnly &&
+        distillationResolution.enabled &&
+        input.reasoningDistillation?.groups.some((group) =>
+          group.parts.some((part) => part.canonicalEditable !== undefined),
+        )
+      ) {
+        const sourceMessages = ContextFolding.copyModelMessages(prepared.messages)
+        const messages = sourceMessages && plainWireMessages(sourceMessages)
+        const parts = input.reasoningDistillation.groups.flatMap((group) => group.parts)
+        const counts = new Map<string, number>()
+        for (const part of parts) {
+          const key = JSON.stringify([part.messageID, part.partID])
+          counts.set(key, (counts.get(key) ?? 0) + 1)
+        }
+        const protectionReasons: Record<string, number> = {}
+        for (const part of parts) {
+          const reason =
+            counts.get(JSON.stringify([part.messageID, part.partID])) !== 1
+              ? "non-unique-identity"
+              : part.canonicalProtection
+          if (reason) protectionReasons[reason] = (protectionReasons[reason] ?? 0) + 1
+        }
+        const slots: ReasoningDistillation.ReasoningSlotObservation[] = parts
+          .filter(
+            (part) =>
+              part.canonicalEditable &&
+              part.settled &&
+              !part.distilled &&
+              counts.get(JSON.stringify([part.messageID, part.partID])) === 1,
+          )
+          .map((part) => ({
+            messageID: part.messageID,
+            partID: part.partID,
+            text: part.text,
+            bodyPath: [],
+            shape: "unsigned-reasoning" as const,
+            signed: part.signed,
+            encrypted: part.encrypted,
+            settled: part.settled,
+            structureRewritable: true,
+            aliasCount: part.canonicalAliasCount ?? 0,
+          }))
+        yield* Effect.logInfo("reasoning distillation canonical selection", {
+          "reasoning_distillation.canonical_candidates": slots.length,
+          "reasoning_distillation.protection_reasons": protectionReasons,
+        })
+        if (!messages || slots.length === 0) {
+          yield* Effect.logInfo("reasoning distillation skipped", {
+            "reasoning_distillation.target": "canonical",
+            "reasoning_distillation.skip_reason": !messages ? "unknown-content" : "no-editable-canonical-source",
+          })
+        } else {
+          yield* distillRequest({
+            target: "canonical",
+            runtime: "opencode-ai-sdk",
+            adapterVersion: REASONING_DISTILLATION_ADAPTER_VERSION,
+            request: { messages },
+            messages,
+            sourceMessages,
+            slots,
+          })
+        }
+        return { type: "native" as const, stream: Stream.empty }
+      }
 
       // Runtime seam: native is an opt-in adapter over @opencode-ai/llm. It
       // either returns a ready LLMEvent stream or a concrete fallback reason.

@@ -53,6 +53,7 @@ export const projectDistillationRequest = <Request>(
     const seenPaths = new Set<string>()
     for (const replacement of input.replacements) {
       const { mapping, projection } = replacement
+      if (mapping.authority === "canonical") return unchanged("no-rewritable-slot")
       if (!mapping.eligibility.allowed) return unchanged("no-rewritable-slot")
       const path = mapping.bodyPath
       const id = pathID(path)

@@ -10,6 +10,8 @@ import { SessionProcessor } from "./processor"
 import { Agent } from "@/agent/agent"
 import { Plugin } from "@/plugin"
 import { Config } from "@/config/config"
+import { ConfigReasoningDistillation } from "@opencode-ai/core/config/reasoning-distillation"
+import { Flag } from "@opencode-ai/core/flag/flag"
 
 import { Effect, Layer, Context } from "effect"
 import * as Option from "effect/Option"
@@ -122,7 +124,7 @@ function splitTurn(input: {
       if (size > input.budget) continue
       return {
         start,
-        id: input.messages[start]!.info.id,
+        id: input.messages[start].info.id,
       } satisfies Tail
     }
     return undefined
@@ -168,6 +170,11 @@ export const layer = Layer.effect(
     const events = yield* EventV2Bridge.Service
     const flags = yield* RuntimeFlags.Service
     const settingsHook = Option.getOrUndefined(yield* Effect.serviceOption(SettingsHook.Service))
+    const reasoningDistillationEnabled = (cfg: ConfigV1.Info) =>
+      ConfigReasoningDistillation.resolveEnabled({
+        disabledByEnvironment: Flag.OPENCODE_DISABLE_REASONING_DISTILLATION,
+        enabled: cfg.reasoningDistillation?.enabled,
+      }).enabled
 
     const isOverflow = Effect.fn("SessionCompaction.isOverflow")(function* (input: {
       tokens: SessionV1.Assistant["tokens"]
@@ -201,7 +208,9 @@ export const layer = Layer.effect(
       messages: SessionV1.WithParts[]
       model: Provider.Model
     }) {
-      const msgs = yield* MessageV2.toModelMessagesEffect(input.messages, input.model)
+      const msgs = yield* MessageV2.toModelMessagesEffect(input.messages, input.model, {
+        reasoningDistillationEnabled: reasoningDistillationEnabled(yield* config.get()),
+      })
       return Token.estimate(JSON.stringify(msgs))
     })
 
@@ -229,7 +238,7 @@ export const layer = Layer.effect(
       let total = 0
       let keep: Tail | undefined
       for (let i = recent.length - 1; i >= 0; i--) {
-        const turn = recent[i]!
+        const turn = recent[i]
         const size = sizes[i]
         if (total + size <= budget) {
           total += size
@@ -346,6 +355,7 @@ export const layer = Layer.effect(
       const modelMessages = yield* MessageV2.toModelMessagesEffect(msgs, model, {
         stripMedia: true,
         toolOutputMaxChars: TOOL_OUTPUT_MAX_CHARS,
+        reasoningDistillationEnabled: reasoningDistillationEnabled(cfg),
       })
       const tailIndex = selected.tail_start_id
         ? history.findIndex((message) => message.info.id === selected.tail_start_id)
@@ -357,6 +367,7 @@ export const layer = Layer.effect(
               yield* MessageV2.toModelMessagesEffect(history.slice(tailIndex), model, {
                 stripMedia: true,
                 toolOutputMaxChars: TOOL_OUTPUT_MAX_CHARS,
+                reasoningDistillationEnabled: reasoningDistillationEnabled(cfg),
               }),
             )
       const ctx = yield* InstanceState.context
@@ -537,7 +548,11 @@ export const layer = Layer.effect(
         if (settingsHook) {
           const pcResult = yield* settingsHook
             .trigger(
-              { event: "PostCompact", trigger: input.auto ? "auto" : "manual", compactSummary: summary ?? "compaction completed" } as any,
+              {
+                event: "PostCompact",
+                trigger: input.auto ? "auto" : "manual",
+                compactSummary: summary ?? "compaction completed",
+              } as any,
               { sessionID: input.sessionID, transcriptPath: "" },
             )
             .pipe(Effect.catch(() => Effect.succeed({ additionalContexts: [], systemMessages: [] })))

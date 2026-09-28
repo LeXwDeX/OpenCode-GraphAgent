@@ -109,6 +109,7 @@ export type Result = Readonly<{
 }>
 
 type Input = Readonly<{
+  target?: "canonical" | "native-wire"
   sessionID: string
   variant?: string
   request: LLMRequest
@@ -286,17 +287,23 @@ const sourceSpan = (slot: Slot): SourceSpan => ({
 const mappingFor = (input: Input, slot: Slot): WireReasoningMapping => ({
   refs: [slot.ref],
   shape: "unsigned-reasoning",
-  eligibility: classifySlotEligibility(
-    {
-      shape: "unsigned-reasoning",
-      capability: capability(input),
-      signed: slot.signed,
-      encrypted: slot.encrypted,
-      settled: slot.settled,
-      structureRewritable: slot.structureRewritable,
-    },
-    input.config.compatibility ?? [],
-  ),
+  authority: input.target === "canonical" ? "canonical" : "native-wire",
+  eligibility:
+    input.target === "canonical"
+      ? slot.settled && !slot.signed && !slot.encrypted && slot.structureRewritable
+        ? { allowed: true, capabilityFingerprint: capabilityFingerprint(capability(input)) }
+        : { allowed: false, protection: "P3" }
+      : classifySlotEligibility(
+          {
+            shape: "unsigned-reasoning",
+            capability: capability(input),
+            signed: slot.signed,
+            encrypted: slot.encrypted,
+            settled: slot.settled,
+            structureRewritable: slot.structureRewritable,
+          },
+          input.config.compatibility ?? [],
+        ),
   bodyPath: slot.bodyPath,
   sourceFingerprint: Hash.sha256(slot.text),
 })
@@ -534,6 +541,38 @@ const plan = (input: Input, slot: Slot, state: LifecycleState, messages: unknown
     )
     if (nextPlan.replacements.length === 0)
       return { request: input.request, applied: false, skipReason: nextPlan.skipReason }
+    if (input.target === "canonical") {
+      const replacement = nextPlan.replacements[0]
+      if (
+        !replacement ||
+        replacement.mapping.refs.length !== 1 ||
+        replacement.mapping.refs[0]?.messageID !== slot.ref.messageID ||
+        replacement.mapping.refs[0]?.partID !== slot.ref.partID ||
+        replacement.projection.text === slot.text
+      )
+        return { request: input.request, applied: false, skipReason: "mapping-mismatch" as const }
+      const capacity = estimateContextFoldingBudget(preparedBudget)
+      if (capacity.estimatedInputTokens === undefined || capacity.usableInputTokens === undefined)
+        return { request: input.request, applied: false, skipReason: "unknown-content" as const }
+      const delta = Token.estimate(replacement.projection.text) - Token.estimate(slot.text)
+      const conservativeDelta = delta > 0 ? delta * (1 + (slot.aliasCount ?? 0)) : delta
+      if (capacity.estimatedInputTokens + conservativeDelta > capacity.usableInputTokens)
+        return { request: input.request, applied: false, skipReason: "insufficient-net-savings" as const }
+      return {
+        request: input.request,
+        certificate: replacement.validation,
+        applied: true,
+        skipReason: undefined,
+        replacements: [
+          {
+            messageID: slot.ref.messageID,
+            partID: slot.ref.partID,
+            before: slot.text,
+            after: replacement.projection.text,
+          },
+        ],
+      }
+    }
     const tree = { messages }
     const identity = {
       adapter: ADAPTER_VERSION,
@@ -608,6 +647,7 @@ export const make = (llm: LLMClientShape) => {
         let state = states.get(input.sessionID) ?? emptyState
         let request = input.request
         let applied = false
+        const replacements: ReasoningReplacement[] = []
         let lastSkipReason: DistillationSkipReason | undefined
 
         const reserve = (prompt: string, role: "propose" | "judge", key: DistillationKey) => {
@@ -652,6 +692,7 @@ export const make = (llm: LLMClientShape) => {
           const projected = plan({ ...input, request }, slot, state, messages).project()
           request = projected.request
           applied ||= projected.applied
+          replacements.push(...(projected.replacements ?? []))
           if (projected.applied) appliedSlots.add(slot)
         }
         for (const slot of eligible.filter((slot) => !appliedSlots.has(slot))) {
@@ -723,10 +764,12 @@ export const make = (llm: LLMClientShape) => {
             }
             request = projected.request
             applied ||= projected.applied
+            replacements.push(...(projected.replacements ?? []))
             return {
               request,
               attempted: "judge" as const,
               applied,
+              replacements,
               usage: usageSnapshot(state),
               ...(projected.skipReason === undefined ? {} : { skipReason: projected.skipReason }),
             }
@@ -734,12 +777,14 @@ export const make = (llm: LLMClientShape) => {
           const projected = cycle.project(state)
           request = projected.request
           applied ||= projected.applied
+          replacements.push(...(projected.replacements ?? []))
           lastSkipReason = projected.skipReason
         }
         return {
           request,
           attempted: "none" as const,
           applied,
+          replacements,
           usage: usageSnapshot(state),
           ...(lastSkipReason === undefined ? {} : { skipReason: lastSkipReason }),
         }
@@ -749,25 +794,30 @@ export const make = (llm: LLMClientShape) => {
 
   const distill = Effect.fn("CoreReasoningDistillation.distill")(function* (input: Input) {
     let cycle: Result = unchanged(input.request)
+    const canonicalReplacements: ReasoningReplacement[] = []
     if (!input.sourceMessages.some((message) => message.type === "user")) {
       cycle = yield* distillCycle(input)
+      canonicalReplacements.push(...(cycle.replacements ?? []))
     } else {
       for (const binding of input.bindings) {
         const next = yield* distillCycle({ ...input, request: cycle.request, bindings: [binding] })
+        canonicalReplacements.push(...(next.replacements ?? []))
         cycle = { ...next, applied: cycle.applied || next.applied }
       }
     }
     const result = {
       ...cycle,
       replacements: cycle.applied
-        ? reasoningReplacements(
-            cycle.request,
-            input.bindings.map((binding) => ({
-              ...binding,
-              messageID: binding.ref.messageID,
-              partID: binding.ref.partID,
-            })),
-          )
+        ? input.target === "canonical"
+          ? canonicalReplacements
+          : reasoningReplacements(
+              cycle.request,
+              input.bindings.map((binding) => ({
+                ...binding,
+                messageID: binding.ref.messageID,
+                partID: binding.ref.partID,
+              })),
+            )
         : [],
     }
     if (!result.applied || !input.sourceMessages.some((message) => message.type === "user")) return result
@@ -777,7 +827,17 @@ export const make = (llm: LLMClientShape) => {
     const capacity = estimateContextFoldingBudget(budget(result.request, plainValue(prepared.value.body)))
     if (capacity.estimatedInputTokens === undefined || capacity.usableInputTokens === undefined)
       return { ...result, ...unchanged(input.request, "unknown-content") }
-    if (capacity.estimatedInputTokens > capacity.usableInputTokens)
+    const conservativeDelta =
+      input.target === "canonical"
+        ? (result.replacements ?? []).reduce((total, replacement) => {
+            const slot = input.bindings.find(
+              (binding) => binding.ref.messageID === replacement.messageID && binding.ref.partID === replacement.partID,
+            )
+            const delta = Token.estimate(replacement.after) - Token.estimate(replacement.before)
+            return total + (delta > 0 ? delta * (1 + (slot?.aliasCount ?? 0)) : delta)
+          }, 0)
+        : 0
+    if (capacity.estimatedInputTokens + conservativeDelta > capacity.usableInputTokens)
       return { ...result, ...unchanged(input.request, "insufficient-net-savings") }
     return result
   })
