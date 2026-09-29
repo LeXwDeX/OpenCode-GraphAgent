@@ -5079,6 +5079,8 @@ for (const continuesBeforeAdoption of [false, true] as const)
           Effect.gen(function* () {
             const index = calls++
             if (index > 1) return
+            expect("messages" in input).toBe(false)
+            expect(input.timing?.queued).toBeGreaterThanOrEqual(input.timing?.prepareStarted ?? Infinity)
             const slots = input
               .reasoningDistillation!.groups.flatMap((group) => group.parts)
               .filter((part) => !part.distilled)

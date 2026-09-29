@@ -9,6 +9,7 @@ import {
   type OrganizeResult,
 } from "@opencode-ai/core/session/reasoning-distillation"
 import { replaceCanonicalReasoning } from "@opencode-ai/core/session/reasoning-distillation/canonical"
+import { checkFixtureSemantics } from "./reasoning-distillation-quality"
 
 if (!process.env.DISTILLATION_ACCEPTANCE_CONFIG || !process.env.DISTILLATION_ACCEPTANCE_OUTPUT) {
   throw new Error("Set DISTILLATION_ACCEPTANCE_CONFIG and DISTILLATION_ACCEPTANCE_OUTPUT to opt in to live model calls")
@@ -33,6 +34,7 @@ const resolve = (value: unknown): string => {
 }
 const baseURL = resolve(configured.options?.baseURL)
 const apiKey = resolve(configured.options?.apiKey)
+const effort = configured.models[modelID].variants?.none?.reasoningEffort === "none" ? "none" : "low"
 const output = path.resolve(process.env.DISTILLATION_ACCEPTANCE_OUTPUT)
 await mkdir(output, { recursive: true })
 const noise = "嗯，再想一下。刚才那种说法不够好，重说一遍。只是措辞调整，没有新增事实，也没有采取任何行动。\n"
@@ -187,7 +189,7 @@ for (const fixture of cases.filter(
           temperature: 0,
           maxOutputTokens: ReasoningDistillationPolicy.tokens.maxOutputTokens,
           maxRetries: 0,
-          providerOptions: { openaiCompatible: { reasoningEffort: "low" } },
+          providerOptions: { openaiCompatible: { reasoningEffort: effort } },
           abortSignal: AbortSignal.timeout(30_000),
         })
         const stage: Stage = {
@@ -270,7 +272,7 @@ for (const fixture of cases.filter(
       empty: !("empty" in fixture) || after[0] === "",
       noClaimTemplate: !/(?:^|\n)\s*(?:[-*]\s*)?[cC]\d+\s*[:：]/.test(combined),
       oneModelRequest: organizeStages.length === 1 && organizeStages[0]!.requests === 1,
-      effort: stages.every((stage) => stage.wire.effort === "low"),
+      effort: stages.every((stage) => stage.wire.effort === effort),
       independentSlots:
         fixture.id !== "multiple-slots" ||
         after.every(
@@ -279,6 +281,7 @@ for (const fixture of cases.filter(
             ["alpha", "beta", "gamma"].every((name, other) => other === index || !text.includes(name)),
         ),
       oldValueRemoved: fixture.id !== "one-conclusion" || !/(?:3|三)\s*次/.test(combined),
+      ...checkFixtureSemantics(fixture.id, after),
     }
     // Offline quality acceptance only: these continuation calls are never part of production organization.
     let continuation: unknown
