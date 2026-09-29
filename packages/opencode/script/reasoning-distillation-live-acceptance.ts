@@ -33,6 +33,7 @@ const resolve = (value: unknown): string => {
 }
 const baseURL = resolve(configured.options?.baseURL)
 const apiKey = resolve(configured.options?.apiKey)
+const effort = configured.models[modelID].variants?.none?.reasoningEffort === "none" ? "none" : "low"
 const output = path.resolve(process.env.DISTILLATION_ACCEPTANCE_OUTPUT)
 await mkdir(output, { recursive: true })
 const noise = "嗯，再想一下。刚才那种说法不够好，重说一遍。只是措辞调整，没有新增事实，也没有采取任何行动。\n"
@@ -187,7 +188,7 @@ for (const fixture of cases.filter(
           temperature: 0,
           maxOutputTokens: ReasoningDistillationPolicy.tokens.maxOutputTokens,
           maxRetries: 0,
-          providerOptions: { openaiCompatible: { reasoningEffort: "low" } },
+          providerOptions: { openaiCompatible: { reasoningEffort: effort } },
           abortSignal: AbortSignal.timeout(30_000),
         })
         const stage: Stage = {
@@ -270,7 +271,7 @@ for (const fixture of cases.filter(
       empty: !("empty" in fixture) || after[0] === "",
       noClaimTemplate: !/(?:^|\n)\s*(?:[-*]\s*)?[cC]\d+\s*[:：]/.test(combined),
       oneModelRequest: organizeStages.length === 1 && organizeStages[0]!.requests === 1,
-      effort: stages.every((stage) => stage.wire.effort === "low"),
+      effort: stages.every((stage) => stage.wire.effort === effort),
       independentSlots:
         fixture.id !== "multiple-slots" ||
         after.every(

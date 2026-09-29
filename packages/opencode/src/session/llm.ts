@@ -90,8 +90,16 @@ export type StreamRequest = StreamInput & {
   abort: AbortSignal
 }
 
+export type DistillInput = Pick<
+  StreamInput,
+  "user" | "sessionID" | "model" | "reasoningDistillation" | "adoptReasoning"
+> & {
+  /** Monotonic timestamps for the preparation and scheduler queue stages. */
+  timing?: { prepareStarted: number; queued: number }
+}
+
 export interface Interface {
-  readonly distill: (input: StreamInput) => Effect.Effect<void, unknown>
+  readonly distill: (input: DistillInput) => Effect.Effect<void, unknown>
   readonly stream: (input: StreamInput) => Stream.Stream<LLMEvent, unknown>
 }
 
@@ -504,6 +512,9 @@ const live: Layer.Layer<
     const distill: Interface["distill"] = (input) =>
       Effect.scoped(
         Effect.gen(function* () {
+          const workStarted = performance.now()
+          const prepareMs = input.timing ? input.timing.queued - input.timing.prepareStarted : undefined
+          const queueMs = input.timing ? workStarted - input.timing.queued : undefined
           const collectStarted = performance.now()
           const snapshot = input.reasoningDistillation
           if (!snapshot || !input.adoptReasoning) return
@@ -524,6 +535,7 @@ const live: Layer.Layer<
                 counts.get(JSON.stringify([part.messageID, part.partID])) === 1,
             )
             .map((part) => ({ messageID: part.messageID, partID: part.partID, text: part.text }))
+          const inputCharacters = slots.reduce((total, slot) => total + slot.text.length, 0)
           const initialCollectMs = performance.now() - collectStarted
           if (slots.length === 0) return
           yield* InstanceState.useEffect(fastDistillationState, (states) => {
@@ -570,12 +582,19 @@ const live: Layer.Layer<
                     "session.id": input.sessionID,
                     "reasoning_distillation.reason": "small-model-unavailable",
                     "reasoning_distillation.model_calls": 0,
+                    "reasoning_distillation.input_characters": inputCharacters,
                     "reasoning_distillation.collect_ms": initialCollectMs + performance.now() - modelSetupStarted,
                     "reasoning_distillation.total_ms": initialCollectMs + performance.now() - started,
+                    "reasoning_distillation.prepare_ms": prepareMs ?? "unknown",
+                    "reasoning_distillation.queue_ms": queueMs ?? "unknown",
+                    "reasoning_distillation.end_to_end_ms": input.timing
+                      ? performance.now() - input.timing.prepareStarted
+                      : "unknown",
                   })
                   return
                 }
                 const language = yield* provider.getLanguage(selected)
+                const requestedEffort = selected.variants?.none?.reasoningEffort === "none" ? "none" : "low"
                 const collectMs = initialCollectMs + performance.now() - modelSetupStarted
                 const bridge = yield* EffectBridge.make()
                 const ctrl = yield* Effect.acquireRelease(
@@ -614,7 +633,7 @@ const live: Layer.Layer<
                                   temperature: 0,
                                   maxOutputTokens: ReasoningDistillationPolicy.tokens.maxOutputTokens,
                                   maxRetries: 0,
-                                  providerOptions: { openaiCompatible: { reasoningEffort: "low" } },
+                                  providerOptions: { openaiCompatible: { reasoningEffort: requestedEffort } },
                                   abortSignal: AbortSignal.any([signal, ctrl.signal]),
                                 }),
                               catch: (cause) => cause,
@@ -665,14 +684,20 @@ const live: Layer.Layer<
                   "reasoning_distillation.provider": selected.providerID,
                   "reasoning_distillation.model": selected.id,
                   "reasoning_distillation.model_tier": "small",
-                  "reasoning_distillation.requested_effort": "low",
+                  "reasoning_distillation.requested_effort": requestedEffort,
                   "reasoning_distillation.slot_count": slots.length,
+                  "reasoning_distillation.input_characters": inputCharacters,
                   "reasoning_distillation.model_calls": modelCalls,
                   "reasoning_distillation.collect_ms": collectMs,
                   "reasoning_distillation.model_ms": organized.timing.modelMs,
                   "reasoning_distillation.parse_ms": organized.timing.parseMs,
                   "reasoning_distillation.adopt_ms": adoptMs,
                   "reasoning_distillation.total_ms": initialCollectMs + performance.now() - started,
+                  "reasoning_distillation.prepare_ms": prepareMs ?? "unknown",
+                  "reasoning_distillation.queue_ms": queueMs ?? "unknown",
+                  "reasoning_distillation.end_to_end_ms": input.timing
+                    ? performance.now() - input.timing.prepareStarted
+                    : "unknown",
                   "reasoning_distillation.output_characters": outputCharacters,
                   "reasoning_distillation.reasoning_characters": reasoningCharacters,
                   "reasoning_distillation.reported_total_tokens": reportedTotalTokens ?? "unknown",

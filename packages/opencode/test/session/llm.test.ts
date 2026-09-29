@@ -1039,7 +1039,7 @@ const organizeInput = (
 
 const distillationConfig = (
   runtime: "opencode-ai-sdk" | "opencode-native",
-  options: { canonical?: boolean } = {},
+  options: { canonical?: boolean; none?: boolean } = {},
 ): Partial<ConfigV1.Info> => {
   const endpoint = `${state.server!.url.origin}/v1`
   return {
@@ -1061,6 +1061,7 @@ const distillationConfig = (
             name: "DeepSeek Small",
             reasoning: true,
             limit: { context: 65_536, output: 4_096 },
+            ...(options.none ? { variants: { none: { reasoningEffort: "none" } } } : {}),
           },
         },
         options: { apiKey: "test-key", baseURL: endpoint },
@@ -1921,107 +1922,110 @@ describe("session.llm.stream", () => {
   )
 
   for (const runtime of ["opencode-ai-sdk", "opencode-native"] as const) {
-    for (const adopted of [true, false]) {
-      it.instance(
-        `${runtime} organizes once and only replays persisted replacements; persistence accepted=${adopted}`,
-        () =>
-          Effect.gen(function* () {
-            const organize = waitRequest("/chat/completions", auxiliaryTextResponse("已确认方案A。"))
-            const first = waitRequest(
-              "/chat/completions",
-              new Response(createChatStream("first"), { headers: { "Content-Type": "text/event-stream" } }),
-            )
-            const second = waitRequest(
-              "/chat/completions",
-              new Response(createChatStream("second"), { headers: { "Content-Type": "text/event-stream" } }),
-            )
+    for (const supportsNone of [false, true]) {
+      for (const adopted of [true, false]) {
+        it.instance(
+          `${runtime} organizes with ${supportsNone ? "none" : "low"} and replays persisted replacements; persistence accepted=${adopted}`,
+          () =>
+            Effect.gen(function* () {
+              const organize = waitRequest("/chat/completions", auxiliaryTextResponse("已确认方案A。"))
+              const first = waitRequest(
+                "/chat/completions",
+                new Response(createChatStream("first"), { headers: { "Content-Type": "text/event-stream" } }),
+              )
+              const second = waitRequest(
+                "/chat/completions",
+                new Response(createChatStream("second"), { headers: { "Content-Type": "text/event-stream" } }),
+              )
 
-            const resolved = yield* Provider.use.getModel(
-              ProviderV2.ID.make("custom-provider"),
-              ModelV2.ID.make("deepseek-test-r1"),
-            )
-            expect(resolved.limit).toMatchObject({ context: 65_536, output: 4_096 })
-            const sessionID = SessionID.make(`session-test-distillation-${runtime}`)
-            const agent = {
-              name: "test",
-              mode: "primary",
-              options: {},
-              permission: [{ permission: "*", pattern: "*", action: "allow" }],
-            } satisfies Agent.Info
-            const messages = distillationMessages()
-            const before = JSON.stringify(messages)
-            const applied: Array<readonly { before: string; after: string }[]> = []
-            const input = (id: string): LLM.StreamInput => ({
-              user: {
-                id: MessageID.make(id),
+              const resolved = yield* Provider.use.getModel(
+                ProviderV2.ID.make("custom-provider"),
+                ModelV2.ID.make("deepseek-test-r1"),
+              )
+              expect(resolved.limit).toMatchObject({ context: 65_536, output: 4_096 })
+              const sessionID = SessionID.make(`session-test-distillation-${runtime}`)
+              const agent = {
+                name: "test",
+                mode: "primary",
+                options: {},
+                permission: [{ permission: "*", pattern: "*", action: "allow" }],
+              } satisfies Agent.Info
+              const messages = distillationMessages()
+              const before = JSON.stringify(messages)
+              const applied: Array<readonly { before: string; after: string }[]> = []
+              const input = (id: string): LLM.StreamInput => ({
+                user: {
+                  id: MessageID.make(id),
+                  sessionID,
+                  role: "user",
+                  time: { created: Date.now() },
+                  agent: agent.name,
+                  model: { providerID: ProviderV2.ID.make("custom-provider"), modelID: resolved.id },
+                } satisfies SessionV1.User,
                 sessionID,
-                role: "user",
-                time: { created: Date.now() },
-                agent: agent.name,
-                model: { providerID: ProviderV2.ID.make("custom-provider"), modelID: resolved.id },
-              } satisfies SessionV1.User,
-              sessionID,
-              model: resolved,
-              agent,
-              system: [],
-              messages,
-              tools: {},
-              purpose: "conversation",
-              reasoningDistillation: distillationHistory(),
-              adoptReasoning: (replacements) =>
-                Effect.sync(() => {
-                  applied.push(replacements)
-                  if (adopted) {
-                    const assistant = messages.find((message) => message.role === "assistant")
-                    if (assistant && Array.isArray(assistant.content)) {
-                      for (const part of assistant.content)
-                        if (part.type === "reasoning") part.text = replacements[0].after
+                model: resolved,
+                agent,
+                system: [],
+                messages,
+                tools: {},
+                purpose: "conversation",
+                reasoningDistillation: distillationHistory(),
+                adoptReasoning: (replacements) =>
+                  Effect.sync(() => {
+                    applied.push(replacements)
+                    if (adopted) {
+                      const assistant = messages.find((message) => message.role === "assistant")
+                      if (assistant && Array.isArray(assistant.content)) {
+                        for (const part of assistant.content)
+                          if (part.type === "reasoning") part.text = replacements[0].after
+                      }
                     }
-                  }
-                  return adopted
+                    return adopted
+                  }),
+              })
+
+              yield* drainSequenceWith(
+                llmLayerWithExecutor(RequestExecutor.defaultLayer, {
+                  experimentalNativeLlm: runtime === "opencode-native",
+                  outputTokenMax: 4_096,
                 }),
-            })
+                [
+                  input("msg_user-distillation-first"),
+                  {
+                    ...input("msg_user-distillation-second"),
+                    reasoningDistillation: { ...distillationHistory()!, reasoningTurn: 2 },
+                  },
+                ],
+                true,
+              )
 
-            yield* drainSequenceWith(
-              llmLayerWithExecutor(RequestExecutor.defaultLayer, {
-                experimentalNativeLlm: runtime === "opencode-native",
-                outputTokenMax: 4_096,
-              }),
-              [
-                input("msg_user-distillation-first"),
-                {
-                  ...input("msg_user-distillation-second"),
-                  reasoningDistillation: { ...distillationHistory()!, reasoningTurn: 2 },
-                },
-              ],
-              true,
-            )
-
-            const [organizeCapture, firstCapture, secondCapture] = yield* Effect.promise(() =>
-              Promise.all([organize, first, second]),
-            )
-            expect(organizeCapture.body.stream).not.toBe(true)
-            expect(organizeCapture.body.model).toBe("deepseek-test-small")
-            expect(firstCapture.body.model).toBe("deepseek-test-r1")
-            expect(JSON.stringify(organizeCapture.body.messages)).toContain("只输出整理后的正文")
-            const reasoning = (capture: Capture) =>
-              (capture.body.messages as Array<Record<string, unknown>> | undefined)?.find(
-                (message) => message.role === "assistant",
-              )?.reasoning_content
-            expect(applied).toHaveLength(1)
-            expect(applied[0][0].before).toBe(distillationBody)
-            expect(applied[0][0].after).toContain("已确认方案A。")
-            if (adopted) {
-              expect(reasoning(firstCapture)).toBe(applied[0][0].after)
-              expect(reasoning(secondCapture)).toBe(applied[0][0].after)
-            } else {
-              expect(reasoning(firstCapture)).toBe(distillationBody)
-              expect(reasoning(secondCapture)).toBe(distillationBody)
-            }
-            if (!adopted) expect(JSON.stringify(messages)).toBe(before)
-          }),
-        { config: () => distillationConfig(runtime) },
-      )
+              const [organizeCapture, firstCapture, secondCapture] = yield* Effect.promise(() =>
+                Promise.all([organize, first, second]),
+              )
+              expect(organizeCapture.body.stream).not.toBe(true)
+              expect(organizeCapture.body.model).toBe("deepseek-test-small")
+              expect(organizeCapture.body.reasoning_effort).toBe(supportsNone ? "none" : "low")
+              expect(firstCapture.body.model).toBe("deepseek-test-r1")
+              expect(JSON.stringify(organizeCapture.body.messages)).toContain("只输出整理后的正文")
+              const reasoning = (capture: Capture) =>
+                (capture.body.messages as Array<Record<string, unknown>> | undefined)?.find(
+                  (message) => message.role === "assistant",
+                )?.reasoning_content
+              expect(applied).toHaveLength(1)
+              expect(applied[0][0].before).toBe(distillationBody)
+              expect(applied[0][0].after).toContain("已确认方案A。")
+              if (adopted) {
+                expect(reasoning(firstCapture)).toBe(applied[0][0].after)
+                expect(reasoning(secondCapture)).toBe(applied[0][0].after)
+              } else {
+                expect(reasoning(firstCapture)).toBe(distillationBody)
+                expect(reasoning(secondCapture)).toBe(distillationBody)
+              }
+              if (!adopted) expect(JSON.stringify(messages)).toBe(before)
+            }),
+          { config: () => distillationConfig(runtime, { none: supportsNone }) },
+        )
+      }
     }
   }
 

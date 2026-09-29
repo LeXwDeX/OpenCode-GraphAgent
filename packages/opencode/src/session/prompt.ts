@@ -1941,6 +1941,7 @@ export const layer = Layer.effect(
                 }
               }
               if (!turnError && distillationInput && (yield* reasoningDistillationEnabled)) {
+                const prepareStarted = performance.now()
                 const sources = yield* sessions.messages({ sessionID }).pipe(Effect.orDie)
                 const current = sources.filter(
                   (message) => message.info.role === "assistant" && message.info.parentID === lastUser.id,
@@ -1955,24 +1956,24 @@ export const layer = Layer.effect(
                       : { ...group, parts: group.parts.map((part) => ({ ...part, distilled: true })) },
                   ),
                 }
-                const modelMessages = yield* MessageV2.toModelMessagesEffect(sources, distillationInput.model, {
-                  reasoningDistillationEnabled: true,
-                })
                 const enabled = reasoningDistillationEnabled
+                const previouslyDistilled = sources.some(
+                  (message) =>
+                    !ids.has(message.info.id) &&
+                    message.parts.some((part) => part.type === "reasoning" && part.distillation !== undefined),
+                )
+                const queued = performance.now()
                 yield* scheduleDistillation({
                   sessionID,
                   turnID: lastUser.id,
-                  previouslyDistilled: sources.some(
-                    (message) =>
-                      !ids.has(message.info.id) &&
-                      message.parts.some((part) => part.type === "reasoning" && part.distillation !== undefined),
-                  ),
+                  previouslyDistilled,
                   enabled,
                   work: llm.distill({
-                    ...distillationInput,
-                    messages: modelMessages,
-                    contextFolding: undefined,
+                    user: distillationInput.user,
+                    sessionID,
+                    model: distillationInput.model,
                     reasoningDistillation: snapshot,
+                    timing: { prepareStarted, queued },
                     adoptReasoning: (replacements) =>
                       adoptReasoning({ sessionID, sources, replacements, canAdopt: enabled }).pipe(
                         Effect.provideService(Database.Service, database),
