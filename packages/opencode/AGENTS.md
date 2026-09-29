@@ -23,6 +23,12 @@ registration instead of degrading at provider runtime.
 - Capture the current TUI output with: `tmux capture-pane -pt opencode-dev`.
 - Stop the session explicitly when done: `tmux kill-session -t opencode-dev`.
 
+### Local test build
+
+- When validating a local runtime fix through the installed `opencode` command, first build and install the test binary over `/usr/local/bin/opencode`, the local command target. Confirm `whence -a opencode` and `command -v opencode` show that the command actually runs this installed binary; resolve any earlier alias, function or PATH entry before testing. Check the reported version and verify the build artifact and installed binary have matching SHA-256 hashes. If installation or verification fails, do not report an installed-binary test as passed.
+- Start a new TUI or service process after installation. Existing processes keep running the old binary and do not update automatically. For `opencode attach`, also confirm the connected service was restarted from the new installation.
+- This installed-binary check is not required for unit tests or development checks run with `bun dev`; those test the development runtime. A local test-binary overwrite is not a stable release.
+
 # Module shape
 
 Do not use `export namespace Foo { ... }` for module organization. It is not

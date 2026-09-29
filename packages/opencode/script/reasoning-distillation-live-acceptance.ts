@@ -9,6 +9,7 @@ import {
   type OrganizeResult,
 } from "@opencode-ai/core/session/reasoning-distillation"
 import { replaceCanonicalReasoning } from "@opencode-ai/core/session/reasoning-distillation/canonical"
+import { checkFixtureSemantics } from "./reasoning-distillation-quality"
 
 if (!process.env.DISTILLATION_ACCEPTANCE_CONFIG || !process.env.DISTILLATION_ACCEPTANCE_OUTPUT) {
   throw new Error("Set DISTILLATION_ACCEPTANCE_CONFIG and DISTILLATION_ACCEPTANCE_OUTPUT to opt in to live model calls")
@@ -280,6 +281,7 @@ for (const fixture of cases.filter(
             ["alpha", "beta", "gamma"].every((name, other) => other === index || !text.includes(name)),
         ),
       oldValueRemoved: fixture.id !== "one-conclusion" || !/(?:3|三)\s*次/.test(combined),
+      ...checkFixtureSemantics(fixture.id, after),
     }
     // Offline quality acceptance only: these continuation calls are never part of production organization.
     let continuation: unknown
