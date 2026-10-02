@@ -84,7 +84,7 @@ jobs:
       # Zero network (stub curl); portable across bash hosts.
       - name: Run oc install boundary tests
         if: steps.evidence.outputs.reused != 'true'
-        run: bash script/oc-install-boundary.test.sh
+        run: bash script/oc-install-boundary.test.sh && bash script/oc-path-priority.test.sh
         timeout-minutes: 5
 
       - name: Record successful verification

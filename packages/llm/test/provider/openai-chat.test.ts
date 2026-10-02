@@ -588,6 +588,33 @@ describe("OpenAI Chat route", () => {
     }),
   )
 
+  it.effect("keeps tool identity when OpenAI-compatible argument deltas repeat empty identity fields", () =>
+    Effect.gen(function* () {
+      const body = sseEvents(
+        deltaChunk({ tool_calls: [{ index: 0, id: "call_1", function: { name: "lookup", arguments: "" } }] }),
+        deltaChunk({ tool_calls: [{ index: 0, id: "", function: { name: "", arguments: '{"query"' } }] }),
+        deltaChunk({ tool_calls: [{ index: 0, id: "", function: { name: "", arguments: ':"weather"}' } }] }),
+        deltaChunk({}, "tool_calls"),
+      )
+      const response = yield* LLMClient.generate(
+        LLM.updateRequest(request, {
+          tools: [{ name: "lookup", description: "Lookup data", inputSchema: { type: "object" } }],
+        }),
+      ).pipe(Effect.provide(fixedResponse(body)))
+
+      expect(response.events.filter(LLMEvent.is.toolCall)).toEqual([
+        {
+          type: "tool-call",
+          id: "call_1",
+          name: "lookup",
+          input: { query: "weather" },
+          providerExecuted: undefined,
+          providerMetadata: undefined,
+        },
+      ])
+    }),
+  )
+
   it.effect("does not finalize streamed tool calls without a finish reason", () =>
     Effect.gen(function* () {
       const body = sseEvents(

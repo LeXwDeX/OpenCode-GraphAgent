@@ -168,7 +168,7 @@ run_case() { # <case>
   make_stub_dir "$case"
   (
     cd "$sbx"
-    export PATH="$WORK/stubs/$case:$PATH"
+    export PATH="$WORK/stubs/$case:$sbx/bin:$PATH"
     export HOME="$sbx/home"
     export OC_INSTALL_DIR="$sbx/bin"
     export OC_OPENCODE_NAME="opencode"

@@ -434,6 +434,20 @@ describe("rehydration via toSchedulingNodes", () => {
     ])
   })
 
+  it("rehydrates aborted nodes as no-output terminals and cascades skip-only descendants", () => {
+    const nodes = [
+      makeNodeRow({ id: "aborted", status: "aborted" }),
+      makeNodeRow({ id: "dependent", status: "pending", dependsOn: ["aborted"] }),
+      makeNodeRow({ id: "downstream", status: "pending", dependsOn: ["dependent"] }),
+    ]
+    const rt = new WorkflowRuntime(toSchedulingNodes(nodes), 4)
+
+    expect(rt.getReadyNodes()).toEqual([])
+    expect(rt.getCascadeSkipNodes()).toEqual(["dependent"])
+    rt.markSkipped("dependent")
+    expect(rt.getCascadeSkipNodes()).toEqual(["downstream"])
+  })
+
   it("running nodes are seeded as running in WorkflowRuntime", () => {
     const nodes = [makeNodeRow({ id: "n1", status: "running", childSessionId: "ses_1" })]
     const rt = new WorkflowRuntime(toSchedulingNodes(nodes), 4)
