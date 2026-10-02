@@ -3,7 +3,7 @@ import path from "node:path"
 import { writeFile } from "node:fs/promises"
 import { tmpdir } from "../../../core/test/fixture/tmpdir"
 import { sql } from "drizzle-orm"
-import { Effect, Exit, Layer } from "effect"
+import { Effect, Exit, Layer, Option } from "effect"
 import { Database } from "@opencode-ai/core/database/database"
 import { DagMessages } from "@opencode-ai/core/dag/messages"
 import { DagStore } from "@opencode-ai/core/dag/store"
@@ -18,8 +18,10 @@ import { InstanceRef } from "@/effect/instance-ref"
 import { ProjectV2 } from "@opencode-ai/core/project"
 import { registerCaptureSlot, setCaptureSnapshot, clearCaptureSlot, hasCaptureSlot } from "@/dag/runtime/capture"
 import type { Tool } from "@/tool/tool"
-import { reconcileWorkflow, continueRecoveredMessageNode } from "@/dag/runtime/recovery"
+import { reconcileWorkflow, continueRecoveredMessageNode, makeSessionStatusChecker } from "@/dag/runtime/recovery"
 import { SessionPrompt } from "@/session/prompt"
+import { Session } from "@/session/session"
+import { NonNegativeInt } from "@opencode-ai/core/schema"
 import { MessageID, SessionID, PartID } from "@/session/schema"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
@@ -113,6 +115,91 @@ function reply(id: string, text: string): SessionV1.WithParts {
 }
 
 describe("message settlement through durable DAG events", () => {
+  test("recovery rejects missing json_schema result before semantic error persistence", async () => {
+    const assistant = reply(MessageID.ascending(), "done")
+    if (assistant.info.role !== "assistant") throw new Error("fixture role")
+    const user: SessionV1.WithParts = {
+      info: {
+        id: assistant.info.parentID,
+        sessionID: SessionID.make(child.sessionID),
+        role: "user",
+        time: { created: 1 },
+        agent: "build",
+        model: { modelID: ModelV2.ID.make("test"), providerID: ProviderV2.ID.make("test") },
+        format: new SessionV1.OutputFormatJsonSchema({ type: "json_schema", schema: { type: "null" } }),
+      },
+      parts: [],
+    }
+    const info: Session.Info = {
+      id: SessionID.make(child.sessionID),
+      slug: "s",
+      projectID: ProjectV2.ID.make("p"),
+      directory: process.cwd(),
+      title: "S",
+      version: "test",
+      time: { created: NonNegativeInt.make(1), updated: NonNegativeInt.make(1) },
+    }
+    const session = Layer.mock(Session.Service, {
+      get: () => Effect.succeed(info),
+      messages: () => Effect.succeed([assistant]),
+      findMessage: (_id, predicate) => Effect.succeed(predicate(user) ? Option.some(user) : Option.none()),
+    })
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const checker = makeSessionStatusChecker(yield* Session.Service)
+        expect(yield* checker(child.sessionID)).toBe("failed")
+        if (assistant.info.role !== "assistant") throw new Error("fixture role")
+        assistant.info.finish = "tool-calls"
+        expect(yield* checker(child.sessionID)).toBe("active")
+        assistant.info.finish = "stop"
+        assistant.info.structured = null
+        expect(yield* checker(child.sessionID)).toBe("completed")
+        delete assistant.info.structured
+        if (user.info.role !== "user") throw new Error("fixture role")
+        delete user.info.format
+        expect(yield* checker(child.sessionID)).toBe("completed")
+      }).pipe(Effect.provide(session)),
+    )
+    const limits: (number | undefined)[] = []
+    if (user.info.role !== "user") throw new Error("fixture role")
+    user.info.format = new SessionV1.OutputFormatJsonSchema({ type: "json_schema", schema: { type: "null" } })
+    const legacy = Layer.mock(Session.Service, {
+      get: () => Effect.succeed(info),
+      messages: ({ limit }) =>
+        Effect.sync(() => {
+          limits.push(limit)
+          return limit === 1 ? [assistant] : [user, assistant]
+        }),
+    })
+    expect(
+      await Effect.runPromise(
+        Effect.flatMap(Session.Service, (sessions) => makeSessionStatusChecker(sessions)(child.sessionID)).pipe(
+          Effect.provide(legacy),
+        ),
+      ),
+    ).toBe("failed")
+    expect(limits).toEqual([1, 20])
+  })
+  test("replan restart closes old queued attempt without retargeting it", async () =>
+    run(
+      Effect.gen(function* () {
+        yield* seed
+        const dag = yield* Dag.Service
+        const { db } = yield* Database.Service
+        const config = { id: "n", name: "N", worker_type: "build", depends_on: [], prompt_template: { inline: "work" } }
+        yield* db.run(
+          sql`UPDATE workflow SET config = ${JSON.stringify({ name: "W", nodes: [config] })} WHERE id = 'dag_messages'`,
+        )
+        const accepted = value(yield* accept("old-attempt"))
+        yield* dag.replan("dag_messages", { nodes: [{ ...config, restart: true }] })
+        expect(
+          yield* db.get(sql`SELECT state,reason,recipient_id FROM agent_message WHERE id = ${accepted.id}`),
+        ).toEqual({ state: "undeliverable", reason: "attempt_replaced", recipient_id: accepted.recipient.id })
+        expect((yield* dag.store.getNode("dag_messages", "n"))?.replanAttempts).toBe(1)
+        expect(yield* accept("old-target-again")).toEqual({ ok: false, reason: "stale_attempt" })
+      }),
+    ))
+
   for (const kind of ["effect defect", "thrown preparation error"] as const)
     test(`recovery model ${kind} must terminalize its claimed attempt and pending input`, async () =>
       run(
