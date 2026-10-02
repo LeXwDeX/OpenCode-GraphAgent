@@ -1,9 +1,9 @@
 {
   "version": "7",
   "dialect": "sqlite",
-  "id": "b507440c-f045-4be4-a1c4-905c6b390a92",
+  "id": "0cac197b-bb48-46ac-8965-2b65dfe31dcc",
   "prevIds": [
-    "18e73224-64dc-47d7-ba8e-7e6d0359527d"
+    "b507440c-f045-4be4-a1c4-905c6b390a92"
   ],
   "ddl": [
     {
@@ -331,6 +331,16 @@
       "default": "0",
       "generated": null,
       "name": "revision",
+      "entityType": "columns",
+      "table": "agent_mailbox"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "-1",
+      "generated": null,
+      "name": "result_nudge_revision",
       "entityType": "columns",
       "table": "agent_mailbox"
     },

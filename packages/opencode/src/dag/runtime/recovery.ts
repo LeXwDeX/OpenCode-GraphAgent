@@ -356,52 +356,48 @@ export function continueRecoveredMessageNode(
     const childSessionID = node.childSessionId
     const caller = { projectID: workflow.projectId, directory: workflow.directory, sessionID: childSessionID }
     const attempt = { replanAttempts: node.replanAttempts, childSessionID }
-    const nodeConfig = config?.nodes.find((n) => n.id === nodeID)
-    const metadata = yield* messages.value.revisions(caller)
-    const latest =
-      metadata.ok && metadata.value.snapshotID
-        ? yield* messages.value.snapshotByID(caller, metadata.value.snapshotID)
-        : undefined
-    if (latest?.ok && latest.value?.stopReason) {
-      yield* dag.nodeFailed(
-        dagID,
-        nodeID,
-        `message recovery blocked: ${latest.value.stopReason}`,
-        "exec_failed",
-        attempt,
-      )
-      return
-    }
-    const admit = Effect.gen(function* () {
-      for (;;) {
-        const current = yield* dag.store.getNode(dagID, nodeID)
-        const wf = yield* dag.store.getWorkflow(dagID)
-        if (
-          !current ||
-          current.status !== "running" ||
-          current.childSessionId !== childSessionID ||
-          current.replanAttempts !== attempt.replanAttempts ||
-          !wf ||
-          !["running", "stepping", "paused"].includes(wf.status)
+    yield* Effect.gen(function* () {
+      const nodeConfig = config?.nodes.find((n) => n.id === nodeID)
+      const latest = yield* messages.value.latestSnapshot(caller)
+      if (latest?.ok && latest.value?.stopReason) {
+        yield* dag.nodeFailed(
+          dagID,
+          nodeID,
+          `message recovery blocked: ${latest.value.stopReason}`,
+          "exec_failed",
+          attempt,
         )
-          return false
-        if (current.deadlineMs !== null && (yield* Clock.currentTimeMillis) >= current.deadlineMs) {
-          yield* dag.nodeFailed(
-            dagID,
-            nodeID,
-            "node deadline expired before message recovery admission",
-            "timeout",
-            attempt,
-          )
-          return false
-        }
-        if (wf.status !== "paused") return true
-        yield* Effect.sleep(250)
+        return
       }
-    })
-    if (!(yield* admit)) return
-    if (nodeConfig?.output_schema) registerCaptureSlot(childSessionID, nodeConfig.output_schema)
-    try {
+      const admit = Effect.gen(function* () {
+        for (;;) {
+          const current = yield* dag.store.getNode(dagID, nodeID)
+          const wf = yield* dag.store.getWorkflow(dagID)
+          if (
+            !current ||
+            current.status !== "running" ||
+            current.childSessionId !== childSessionID ||
+            current.replanAttempts !== attempt.replanAttempts ||
+            !wf ||
+            !["running", "stepping", "paused"].includes(wf.status)
+          )
+            return false
+          if (current.deadlineMs !== null && (yield* Clock.currentTimeMillis) >= current.deadlineMs) {
+            yield* dag.nodeFailed(
+              dagID,
+              nodeID,
+              "node deadline expired before message recovery admission",
+              "timeout",
+              attempt,
+            )
+            return false
+          }
+          if (wf.status !== "paused") return true
+          yield* Effect.sleep(250)
+        }
+      })
+      if (!(yield* admit)) return
+      if (nodeConfig?.output_schema) registerCaptureSlot(childSessionID, nodeConfig.output_schema)
       let result = yield* prompt.loop({ sessionID: SessionID.make(childSessionID) })
       for (;;) {
         if (!(yield* admit)) return
@@ -500,6 +496,19 @@ export function continueRecoveredMessageNode(
         }
         const inbox = yield* messages.value.revisions(caller)
         if (!(yield* admit)) return
+        if (nodeConfig?.output_schema && inbox.ok && inbox.value.queued === 0) {
+          const claim = yield* messages.value.claimResultNudge(caller, inbox.value.accepted)
+          if (!claim.ok || !claim.value) {
+            yield* dag.nodeFailed(
+              dagID,
+              nodeID,
+              `unchanged agent input cannot retry structured result: ${claim.ok ? "resubmission already requested" : claim.reason}`,
+              "exec_failed",
+              attempt,
+            )
+            return
+          }
+        }
         result =
           nodeConfig?.output_schema && inbox.ok && inbox.value.queued === 0
             ? yield* prompt.prompt({
@@ -516,9 +525,16 @@ export function continueRecoveredMessageNode(
               })
             : yield* prompt.loop({ sessionID: SessionID.make(childSessionID) })
       }
-    } finally {
-      clearCaptureSlot(childSessionID)
-    }
+    }).pipe(
+      Effect.catchCause((cause) =>
+        Cause.hasInterrupts(cause)
+          ? Effect.failCause(cause)
+          : dag
+              .nodeFailed(dagID, nodeID, Cause.pretty(cause), "exec_failed", attempt)
+              .pipe(Effect.catchIf(isTransitionRejection, () => Effect.void)),
+      ),
+      Effect.ensuring(Effect.sync(() => clearCaptureSlot(childSessionID))),
+    )
   })
 }
 

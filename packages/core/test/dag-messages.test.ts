@@ -58,6 +58,59 @@ function persist(snapshot: DagMessages.Snapshot, text?: string) {
 }
 
 describe("durable DAG agent mailboxes", () => {
+  test("separate processes claim one durable result nudge and reopen preserves exhaustion", async () => {
+    await using tmp = await tmpdir()
+    const filename = path.join(tmp.path, "nudge.sqlite")
+    await run(seed, filename)
+    const worker = path.join(import.meta.dirname, "fixture/dag-messages-race.ts")
+    const outcomes = await Promise.all(
+      [0, 1].map(async () => {
+        const process = Bun.spawn([Bun.which("bun")!, "run", worker, filename, "nudge"], {
+          cwd: child.directory,
+          stdout: "pipe",
+          stderr: "pipe",
+        })
+        const [code, output, error] = await Promise.all([
+          process.exited,
+          new Response(process.stdout).text(),
+          new Response(process.stderr).text(),
+        ])
+        expect(code, error).toBe(0)
+        const result: DagMessages.Result<boolean> = JSON.parse(output)
+        return value(result)
+      }),
+    )
+    expect(outcomes.sort((a, b) => Number(a) - Number(b))).toEqual([false, true])
+    await run(
+      Effect.gen(function* () {
+        const messages = yield* DagMessages.Service
+        expect(value(yield* messages.claimResultNudge(child, 0))).toBe(false)
+        value(yield* messages.send(parent, request()))
+        expect(value(yield* messages.claimResultNudge(child, 1))).toBe(true)
+        expect(value(yield* messages.claimResultNudge(child, 1))).toBe(false)
+      }),
+      filename,
+    )
+  })
+  test("result nudge claims enforce authority, revision, and persisted stop boundaries", async () =>
+    run(
+      Effect.gen(function* () {
+        yield* seed
+        const messages = yield* DagMessages.Service
+        expect(yield* messages.claimResultNudge(parent, 0)).toEqual({ ok: false, reason: "unauthorized" })
+        expect(yield* messages.claimResultNudge({ ...child, directory: "foreign" }, 0)).toEqual({
+          ok: false,
+          reason: "unauthorized",
+        })
+        expect(yield* messages.claimResultNudge(child, -1)).toEqual({ ok: false, reason: "invalid" })
+        expect(yield* messages.claimResultNudge(child, 1)).toEqual({ ok: false, reason: "stale_input" })
+        const boundary = value(yield* messages.freeze(child, "budget"))
+        yield* messages.markStopped(child, boundary.id, "budget_exhausted")
+        expect(yield* messages.claimResultNudge(child, 0)).toEqual({ ok: false, reason: "stopped" })
+        yield* messages.closeWorkflow("wf", "cancelled")
+        expect(yield* messages.claimResultNudge(child, 0)).toEqual({ ok: false, reason: "closed" })
+      }),
+    ))
   test("latest snapshot includes unassociated preparation input with exact caller ownership", async () =>
     run(
       Effect.gen(function* () {

@@ -518,7 +518,7 @@ export function spawnNode(
             )
           return
         }
-        try {
+        yield* Effect.gen(function* () {
           // #379 pause fence: scheduler admission is the only pause gate, so a
           // node queued before control(pause) still holds a spawn fiber that
           // would materialize its child session the moment a permit frees —
@@ -608,6 +608,22 @@ export function spawnNode(
           const caller = workflow?.directory
             ? { projectID: workflow.projectId, directory: workflow.directory, sessionID: childSession.id }
             : undefined
+          const claimResubmission = Effect.gen(function* () {
+            if (Option.isNone(messageService) || !caller) return true
+            const revision = yield* messageService.value.revisions(caller)
+            const claim = revision.ok
+              ? yield* messageService.value.claimResultNudge(caller, revision.value.accepted)
+              : revision
+            if (claim.ok && claim.value === true) return true
+            yield* dag.nodeFailed(
+              input.dagID,
+              input.nodeID,
+              `structured result resubmission was not admitted: ${claim.ok ? "resubmission already requested" : claim.reason}`,
+              "exec_failed",
+              settlementAttempt,
+            )
+            return false
+          })
           let result = yield* promptSvc.prompt({
             messageID: MessageID.ascending(),
             sessionID: childSession.id,
@@ -666,6 +682,7 @@ export function spawnNode(
                 // is NOT nudged: that is a deterministic contract violation and
                 // a retry would only re-bill the same mistake.
                 if (verdict.settlement.kind === "fail" && verdict.neverCalled) {
+                  if (!(yield* claimResubmission)) return
                   registerCaptureSlot(childSession.id, input.outputSchema)
                   result = yield* promptSvc.prompt({
                     messageID: MessageID.ascending(),
@@ -831,6 +848,8 @@ export function spawnNode(
               )
               break
             }
+            if (input.outputSchema && revisions?.ok && revisions.value.queued === 0 && !(yield* claimResubmission))
+              break
             result =
               input.outputSchema && revisions?.ok && revisions.value.queued === 0
                 ? yield* promptSvc.prompt({
@@ -848,9 +867,7 @@ export function spawnNode(
                   })
                 : yield* promptSvc.loop({ sessionID: childSession.id })
           }
-        } finally {
-          yield* semaphore.release(1)
-        }
+        }).pipe(Effect.ensuring(semaphore.release(1)))
       }).pipe(
         Effect.ensuring(
           Effect.gen(function* () {

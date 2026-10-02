@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test"
 import path from "node:path"
 import { writeFile } from "node:fs/promises"
 import { tmpdir } from "../../../core/test/fixture/tmpdir"
-import { Context, Effect, Fiber, Layer, Schema, Semaphore } from "effect"
+import { Context, Effect, Fiber, Layer, Schema, Semaphore, Option } from "effect"
 import { Dag, StaleMessageInputError } from "@/dag/dag"
 import { DagStore } from "@opencode-ai/core/dag/store"
 import { DagMessages } from "@opencode-ai/core/dag/messages"
@@ -13,6 +13,7 @@ import { MessageID, SessionID, PartID } from "@/session/schema"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import type { SessionV1 } from "@opencode-ai/core/v1/session"
+import { hasCaptureSlot } from "@/dag/runtime/capture"
 import { spawnNode } from "@/dag/runtime/spawn"
 import { makeNodeRow, makeWorkflowRow } from "./fixtures"
 
@@ -39,6 +40,8 @@ function reply(text: string): SessionV1.WithParts {
   }
 }
 type Case = {
+  noResubmission?: boolean
+  modelDefect?: boolean
   artifactPath?: string
   staleReceipt?: boolean
   structured?: boolean
@@ -60,6 +63,10 @@ async function exercise(options: Case = {}) {
     capturedSnapshotID: "old-snapshot",
   })
   let workflow = makeWorkflowRow({ directory: process.cwd() })
+  let nudgeClaimed = false
+  let permitReleased = false
+  let captureRegistered = false
+  const semaphore = Semaphore.makeUnsafe(1)
   let receipts = 0
   let created = 0,
     loops = 0,
@@ -98,7 +105,7 @@ async function exercise(options: Case = {}) {
           nodeCompleted: (_dag, _node, output) =>
             Effect.gen(function* () {
               completions++
-              if (completions === 1 && !options.staleReceipt) {
+              if ((completions === 1 || options.noResubmission) && !options.staleReceipt) {
                 if (options.replaced) node = { ...node, replanAttempts: 1, childSessionId: "ses_replaced" }
                 if (options.paused || options.replaceWhilePaused) workflow = { ...workflow, status: "paused" }
                 if (options.deadline) node = { ...node, deadlineMs: Date.now() - 1 }
@@ -125,6 +132,12 @@ async function exercise(options: Case = {}) {
     })
   const messagesLayer = Layer.mock(DagMessages.Service, {
     guard,
+    claimResultNudge: () =>
+      Effect.sync(() => {
+        const claimed = !nudgeClaimed
+        nudgeClaimed = true
+        return { ok: true as const, value: claimed }
+      }),
     snapshotForTurn: (_caller, id) =>
       Effect.succeed({
         ok: true,
@@ -202,6 +215,7 @@ async function exercise(options: Case = {}) {
       }),
   })
   const next = Effect.sync(() => {
+    if (options.noResubmission) return updated
     node = { ...node, capturedOutput: { result: "updated" }, capturedSnapshotID: "updated-snapshot" }
     return updated
   })
@@ -209,6 +223,8 @@ async function exercise(options: Case = {}) {
     prompt: () =>
       Effect.gen(function* () {
         prompts++
+        if (options.modelDefect) return yield* Effect.die(new Error("live preparation defect"))
+        if (prompts > 3) return yield* Effect.die(new Error("unbounded nudge regression"))
         if (prompts === 1) {
           toolWrites++
           return initial
@@ -226,7 +242,7 @@ async function exercise(options: Case = {}) {
   await Effect.runPromise(
     Effect.scoped(
       Effect.gen(function* () {
-        const spawned = yield* spawnNode(Semaphore.makeUnsafe(1), {
+        const spawned = yield* spawnNode(semaphore, {
           dagID: "dag_live",
           nodeID: "node-1",
           node: makeNodeRow(),
@@ -247,13 +263,37 @@ async function exercise(options: Case = {}) {
             ),
           )
         yield* Fiber.join(spawned.fiber)
+        captureRegistered = hasCaptureSlot("ses_child")
+        const available = yield* semaphore.take(1).pipe(Effect.timeoutOption(100))
+        permitReleased = Option.isSome(available)
+        if (permitReleased) yield* semaphore.release(1)
       }),
     ).pipe(Effect.provide(layer)),
   )
-  return { events, created, loops, prompts, toolWrites, node, receipts }
+  return { events, created, loops, prompts, toolWrites, node, receipts, permitReleased, captureRegistered }
 }
 
 describe("live durable message continuation", () => {
+  test("unchanged structured input permits one resubmission then fails without repeated tools", async () => {
+    const r = await exercise({ structured: true, queued: 0, noResubmission: true })
+    expect(r).toMatchObject({
+      created: 1,
+      prompts: 2,
+      loops: 0,
+      toolWrites: 1,
+      permitReleased: true,
+      captureRegistered: false,
+    })
+    expect(r.events).toHaveLength(1)
+    expect(r.events[0]).toMatchObject({ type: "failed" })
+    expect(r.events[0]?.reason).toContain("resubmission already requested")
+  })
+  test("live preparation defects settle failure and release capture and concurrency ownership", async () => {
+    const r = await exercise({ structured: true, modelDefect: true })
+    expect(r).toMatchObject({ prompts: 1, loops: 0, permitReleased: true, captureRegistered: false })
+    expect(r.events[0]).toMatchObject({ type: "failed" })
+    expect(r.events[0]?.reason).toContain("live preparation defect")
+  })
   test("stale file receipt is rejected before capture, then same child persists current receipt", async () => {
     await using tmp = await tmpdir()
     const artifactPath = path.join(tmp.path, "report.txt")

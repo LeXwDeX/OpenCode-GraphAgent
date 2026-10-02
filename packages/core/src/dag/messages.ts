@@ -111,6 +111,8 @@ export interface Interface {
   associate: (caller: Caller, snapshotID: string) => Effect.Effect<Result<Snapshot>>
   /** Latest frozen turn, including preparation failures before actual input association. */
   latestSnapshot: (caller: Caller) => Effect.Effect<Result<Snapshot | undefined>>
+  /** One durable result resubmission per accepted revision of the exact node attempt. */
+  claimResultNudge: (caller: Caller, acceptedRevision: number) => Effect.Effect<Result<boolean>>
   snapshotForTurn: (caller: Caller, logicalTurnID: string) => Effect.Effect<Result<Snapshot | undefined>>
   snapshotByID: (caller: Caller, snapshotID: string) => Effect.Effect<Result<Snapshot | undefined>>
   discardPending: (caller: Caller, reason: string) => Effect.Effect<void>
@@ -149,6 +151,7 @@ type Mailbox = {
   attempt_id: string | null
   revision: number
   closed_reason: string | null
+  result_nudge_revision: number
 }
 type StoredMessage = {
   id: string
@@ -563,6 +566,29 @@ export const layer = Layer.effect(
                 sql`UPDATE agent_message SET state = 'delivered', snapshot_id = ${row.id}, time_delivered = ${Date.now()} WHERE id = ${m.id} AND state = 'queued'`,
               )
             return success(yield* snapshot(tx, { ...row, associated: 1 }))
+          }),
+        ),
+      claimResultNudge: (caller, acceptedRevision) =>
+        transaction((tx) =>
+          Effect.gen(function* () {
+            if (!Number.isSafeInteger(acceptedRevision) || acceptedRevision < 0) return reject("invalid")
+            const endpoint = yield* self(tx, caller)
+            if (!endpoint || endpoint.kind !== "node") return reject("unauthorized")
+            const wf = yield* workflow(tx, endpoint.workflowID!)
+            const n = yield* node(tx, endpoint.workflowID!, endpoint.nodeID!)
+            if (!wf || !liveWorkflow(wf.status)) return reject("closed")
+            if (!n || !liveNode(n) || attempt(n) !== endpoint.attemptID) return reject("stale_attempt")
+            const box = yield* mailbox(tx, endpoint)
+            if (box.closed_reason) return reject("closed")
+            if (box.revision !== acceptedRevision) return reject("stale_input")
+            const latest = yield* tx.get<StoredSnapshot>(
+              sql`SELECT * FROM agent_input_snapshot WHERE mailbox_id = ${box.id} ORDER BY rowid DESC LIMIT 1`,
+            )
+            if (latest?.stop_reason) return reject("stopped")
+            const claimed = yield* tx.get(
+              sql`UPDATE agent_mailbox SET result_nudge_revision = ${acceptedRevision} WHERE id = ${box.id} AND revision = ${acceptedRevision} AND closed_reason IS NULL AND result_nudge_revision <> ${acceptedRevision} RETURNING id`,
+            )
+            return success(!!claimed)
           }),
         ),
       latestSnapshot: (caller) =>

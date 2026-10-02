@@ -11,6 +11,7 @@ const result = await Effect.runPromise(
     const messages = yield* DagMessages.Service
     const { db } = yield* Database.Service
     const caller = { projectID: "p", directory: process.cwd(), sessionID: action === "send" ? "parent" : "child" }
+    if (action === "nudge") return yield* messages.claimResultNudge(caller, 0)
     if (action === "send")
       return yield* messages.send(caller, {
         workflowID: "wf",

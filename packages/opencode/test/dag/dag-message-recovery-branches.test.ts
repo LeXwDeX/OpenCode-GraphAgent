@@ -117,6 +117,14 @@ function harness(
       return commit.pipe(Effect.map((value) => ({ ok: true as const, value })))
     },
     snapshotByID: () => Effect.succeed({ ok: true, value: { ...snapshot, stopReason: input.latestStop } }),
+    latestSnapshot: () =>
+      Effect.succeed({ ok: true, value: input.latestStop ? { ...snapshot, stopReason: input.latestStop } : undefined }),
+    claimResultNudge: (_caller, revision) =>
+      Effect.sync(() => {
+        const claimed = !h.claimedNudgeRevisions.includes(revision)
+        if (claimed) h.claimedNudgeRevisions.push(revision)
+        return { ok: true as const, value: claimed }
+      }),
     snapshotForTurn: () => Effect.succeed({ ok: true, value: { ...snapshot, stopReason: input.settleStop } }),
   })
   const prompt = Layer.mock(SessionPrompt.Service, {
@@ -226,6 +234,7 @@ function state(input: {
     completionAttempts: 0,
     guardCalls: 0,
     receipts: [] as unknown[],
+    claimedNudgeRevisions: [] as number[],
     stale: input.stale ?? 0,
     completed: [] as { output: unknown; attempt: unknown }[],
     failed: [] as { reason: string; errorClass: unknown }[],
@@ -345,8 +354,22 @@ describe("message recovery continuation admission and settlement branches", () =
     await run(structured)
     expect(h.loops).toBe(1)
     expect(h.prompts).toBe(1)
+    expect(h.claimedNudgeRevisions).toEqual([1])
     expect(h.completed[0].output).toBeNull()
     expect(h.completionAttempts).toBe(2)
+  })
+  test("a repeatedly stale structured result cannot claim a second nudge for unchanged input", async () => {
+    const { h, run } = harness({
+      stale: 2,
+      node: { capturedOutput: "old", capturedOutputPresent: true, capturedSnapshotID: "ags_old" },
+    })
+    await run(structured)
+    expect(h.loops).toBe(1)
+    expect(h.prompts).toBe(1)
+    expect(h.claimedNudgeRevisions).toEqual([1])
+    expect(h.completionAttempts).toBe(2)
+    expect(h.completed).toEqual([])
+    expect(h.failed[0].reason).toContain("resubmission already requested")
   })
   test("stale output with queued input resumes its existing child instead of issuing a new prompt", async () => {
     const { h, run } = harness({ stale: 1, queued: 1 })

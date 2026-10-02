@@ -37,6 +37,7 @@ export default {
           \`node_id\` text,
           \`attempt_id\` text,
           \`revision\` integer DEFAULT 0 NOT NULL,
+          \`result_nudge_revision\` integer DEFAULT -1 NOT NULL,
           \`closed_reason\` text,
           \`time_created\` integer NOT NULL
         );

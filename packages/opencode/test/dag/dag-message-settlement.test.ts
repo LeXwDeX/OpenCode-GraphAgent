@@ -1,6 +1,9 @@
 import { describe, expect, test } from "bun:test"
+import path from "node:path"
+import { writeFile } from "node:fs/promises"
+import { tmpdir } from "../../../core/test/fixture/tmpdir"
 import { sql } from "drizzle-orm"
-import { Effect, Exit, Layer, Option } from "effect"
+import { Effect, Exit, Layer } from "effect"
 import { Database } from "@opencode-ai/core/database/database"
 import { DagMessages } from "@opencode-ai/core/dag/messages"
 import { DagStore } from "@opencode-ai/core/dag/store"
@@ -13,12 +16,10 @@ import { Agent } from "@/agent/agent"
 import { Truncate } from "@/tool/truncate"
 import { InstanceRef } from "@/effect/instance-ref"
 import { ProjectV2 } from "@opencode-ai/core/project"
-import { registerCaptureSlot, setCaptureSnapshot, clearCaptureSlot } from "@/dag/runtime/capture"
+import { registerCaptureSlot, setCaptureSnapshot, clearCaptureSlot, hasCaptureSlot } from "@/dag/runtime/capture"
 import type { Tool } from "@/tool/tool"
-import { reconcileWorkflow, continueRecoveredMessageNode, makeSessionStatusChecker } from "@/dag/runtime/recovery"
+import { reconcileWorkflow, continueRecoveredMessageNode } from "@/dag/runtime/recovery"
 import { SessionPrompt } from "@/session/prompt"
-import { Session } from "@/session/session"
-import { NonNegativeInt } from "@opencode-ai/core/schema"
 import { MessageID, SessionID, PartID } from "@/session/schema"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
@@ -112,90 +113,132 @@ function reply(id: string, text: string): SessionV1.WithParts {
 }
 
 describe("message settlement through durable DAG events", () => {
-  test("recovery rejects missing json_schema result before semantic error persistence", async () => {
-    const assistant = reply(MessageID.ascending(), "done")
-    if (assistant.info.role !== "assistant") throw new Error("fixture role")
-    const user: SessionV1.WithParts = {
-      info: {
-        id: assistant.info.parentID,
-        sessionID: SessionID.make(child.sessionID),
-        role: "user",
-        time: { created: 1 },
-        agent: "build",
-        model: { modelID: ModelV2.ID.make("test"), providerID: ProviderV2.ID.make("test") },
-        format: new SessionV1.OutputFormatJsonSchema({ type: "json_schema", schema: { type: "null" } }),
-      },
-      parts: [],
-    }
-    const info: Session.Info = {
-      id: SessionID.make(child.sessionID),
-      slug: "s",
-      projectID: ProjectV2.ID.make("p"),
-      directory: process.cwd(),
-      title: "S",
-      version: "test",
-      time: { created: NonNegativeInt.make(1), updated: NonNegativeInt.make(1) },
-    }
-    const session = Layer.mock(Session.Service, {
-      get: () => Effect.succeed(info),
-      messages: () => Effect.succeed([assistant]),
-      findMessage: (_id, predicate) => Effect.succeed(predicate(user) ? Option.some(user) : Option.none()),
-    })
-    await Effect.runPromise(
-      Effect.gen(function* () {
-        const checker = makeSessionStatusChecker(yield* Session.Service)
-        expect(yield* checker(child.sessionID)).toBe("failed")
-        if (assistant.info.role !== "assistant") throw new Error("fixture role")
-        assistant.info.finish = "tool-calls"
-        expect(yield* checker(child.sessionID)).toBe("active")
-        assistant.info.finish = "stop"
-        assistant.info.structured = null
-        expect(yield* checker(child.sessionID)).toBe("completed")
-        delete assistant.info.structured
-        if (user.info.role !== "user") throw new Error("fixture role")
-        delete user.info.format
-        expect(yield* checker(child.sessionID)).toBe("completed")
-      }).pipe(Effect.provide(session)),
-    )
-    const limits: (number | undefined)[] = []
-    if (user.info.role !== "user") throw new Error("fixture role")
-    user.info.format = new SessionV1.OutputFormatJsonSchema({ type: "json_schema", schema: { type: "null" } })
-    const legacy = Layer.mock(Session.Service, {
-      get: () => Effect.succeed(info),
-      messages: ({ limit }) =>
-        Effect.sync(() => {
-          limits.push(limit)
-          return limit === 1 ? [assistant] : [user, assistant]
+  for (const kind of ["effect defect", "thrown preparation error"] as const)
+    test(`recovery model ${kind} must terminalize its claimed attempt and pending input`, async () =>
+      run(
+        Effect.gen(function* () {
+          yield* seed
+          const dag = yield* Dag.Service
+          const messages = yield* DagMessages.Service
+          value(yield* accept("waiting-on-recovered-model"))
+          let calls = 0
+          const prompt = Layer.mock(SessionPrompt.Service, {
+            loop: () =>
+              Effect.suspend(() => {
+                calls++
+                const error = new Error("recovered provider preparation failed")
+                return kind === "effect defect"
+                  ? Effect.die(error)
+                  : Effect.sync(() => {
+                      throw error
+                    })
+              }),
+          })
+          yield* Effect.exit(
+            continueRecoveredMessageNode("dag_messages", "n", {
+              nodes: [{ id: "n", output_schema: { type: "object" } }],
+            }).pipe(Effect.provide(prompt)),
+          )
+          const node = yield* dag.store.getNode("dag_messages", "n")
+          const message = value(yield* messages.receive(child))[0]
+          const captureRegistered = hasCaptureSlot(child.sessionID)
+          clearCaptureSlot(child.sessionID)
+          expect(calls).toBe(1)
+          expect({ nodeStatus: node?.status, inputState: message.state, captureRegistered }).toEqual({
+            nodeStatus: "failed",
+            inputState: "undeliverable",
+            captureRegistered: false,
+          })
+          expect(node).toMatchObject({ childSessionId: child.sessionID, replanAttempts: 0, errorClass: "exec_failed" })
+          expect(node?.errorReason).toContain("recovered provider preparation failed")
+          expect(message.reason).toBe("exec_failed")
         }),
-    })
-    expect(
-      await Effect.runPromise(
-        Effect.flatMap(Session.Service, (sessions) => makeSessionStatusChecker(sessions)(child.sessionID)).pipe(
-          Effect.provide(legacy),
-        ),
-      ),
-    ).toBe("failed")
-    expect(limits).toEqual([1, 20])
-  })
-  test("replan restart closes old queued attempt without retargeting it", async () =>
+      ))
+  test("interrupted resubmission stays bounded when the same attempt is recovered again", async () =>
     run(
       Effect.gen(function* () {
         yield* seed
         const dag = yield* Dag.Service
-        const { db } = yield* Database.Service
-        const config = { id: "n", name: "N", worker_type: "build", depends_on: [], prompt_template: { inline: "work" } }
-        yield* db.run(
-          sql`UPDATE workflow SET config = ${JSON.stringify({ name: "W", nodes: [config] })} WHERE id = 'dag_messages'`,
-        )
-        const accepted = value(yield* accept("old-attempt"))
-        yield* dag.replan("dag_messages", { nodes: [{ ...config, restart: true }] })
-        expect(
-          yield* db.get(sql`SELECT state,reason,recipient_id FROM agent_message WHERE id = ${accepted.id}`),
-        ).toEqual({ state: "undeliverable", reason: "attempt_replaced", recipient_id: accepted.recipient.id })
-        expect((yield* dag.store.getNode("dag_messages", "n"))?.replanAttempts).toBe(1)
-        expect(yield* accept("old-target-again")).toEqual({ ok: false, reason: "stale_attempt" })
+        const messages = yield* DagMessages.Service
+        const old = yield* associate("old-capture")
+        yield* dag.store.setCapturedOutput(child.sessionID, { result: "old" }, old.id)
+        value(yield* accept("new-input"))
+        const database = yield* Database.Service
+        const current = MessageID.ascending()
+        let loops = 0,
+          nudges = 0
+        const prompt = Layer.mock(SessionPrompt.Service, {
+          loop: () =>
+            Effect.gen(function* () {
+              loops++
+              yield* associate(current)
+              return reply(current, "result still not submitted")
+            }).pipe(
+              Effect.provideService(DagMessages.Service, messages),
+              Effect.provideService(Database.Service, database),
+            ),
+          prompt: () =>
+            Effect.gen(function* () {
+              nudges++
+              return yield* Effect.interrupt
+            }),
+        })
+        const helper = continueRecoveredMessageNode("dag_messages", "n", {
+          nodes: [{ id: "n", output_schema: { type: "object" } }],
+        }).pipe(Effect.provide(prompt))
+        expect(Exit.isFailure(yield* Effect.exit(helper))).toBe(true)
+        expect((yield* dag.store.getNode("dag_messages", "n"))?.status).toBe("running")
+        expect(hasCaptureSlot(child.sessionID)).toBe(false)
+        yield* helper
+        expect({ loops, nudges }).toEqual({ loops: 2, nudges: 1 })
+        expect(yield* dag.store.getNode("dag_messages", "n")).toMatchObject({
+          status: "failed",
+          childSessionId: child.sessionID,
+          replanAttempts: 0,
+          errorClass: "exec_failed",
+        })
+        expect((yield* dag.store.getNode("dag_messages", "n"))?.errorReason).toContain("resubmission already requested")
+        expect(hasCaptureSlot(child.sessionID)).toBe(false)
       }),
     ))
+  test("recovered artifact authorization failures settle the exact node instead of leaking ownership", async () => {
+    await using tmp = await tmpdir()
+    const file = path.join(tmp.path, "report.txt")
+    await writeFile(file, "report")
+    await run(
+      Effect.gen(function* () {
+        yield* seed
+        const dag = yield* Dag.Service
+        const messages = yield* DagMessages.Service
+        const turn = MessageID.ascending()
+        const database = yield* Database.Service
+        const { db } = database
+        const prompt = Layer.mock(SessionPrompt.Service, {
+          loop: () =>
+            associate(turn).pipe(
+              Effect.provideService(DagMessages.Service, messages),
+              Effect.provideService(Database.Service, database),
+              Effect.as(reply(turn, file)),
+            ),
+        })
+        yield* continueRecoveredMessageNode("dag_messages", "n", undefined, undefined, () =>
+          Effect.fail(new Error("artifact authorization failed")),
+        ).pipe(Effect.provide(prompt))
+        expect(yield* dag.store.getNode("dag_messages", "n")).toMatchObject({
+          status: "failed",
+          childSessionId: child.sessionID,
+          replanAttempts: 0,
+          errorClass: "exec_failed",
+        })
+        expect((yield* dag.store.getNode("dag_messages", "n"))?.errorReason).toContain("artifact authorization failed")
+        expect(
+          (yield* db.get<{ count: number }>(
+            sql`SELECT COUNT(*) AS count FROM workflow_node WHERE captured_output_present = 1`,
+          ))?.count,
+        ).toBe(0)
+      }),
+    )
+  })
   test("late submit_result callbacks cannot borrow a newer model-step snapshot", async () =>
     run(
       Effect.gen(function* () {

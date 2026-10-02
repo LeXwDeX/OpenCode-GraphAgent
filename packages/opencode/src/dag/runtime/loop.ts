@@ -17,6 +17,7 @@ import {
   Schema,
   Scope,
   Exit,
+  Deferred,
 } from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
@@ -654,38 +655,55 @@ const serviceLayer = Layer.effect(
               continue
             }
             if (entry.fibers.has(nodeID)) continue
-            const continuation = continueRecoveredMessageNode(
-              dagID,
-              nodeID,
-              entry.config ?? null,
-              ctx.directory,
-              makeArtifactSourceAuthorizer(sessionSvc, agentSvc, ctx.worktree, permissionSvc),
-            ).pipe(
-              Effect.provideService(Dag.Service, dag),
-              Effect.provideService(SessionPrompt.Service, promptSvc),
-              (self) => (messageSvc ? Effect.provideService(self, DagMessages.Service, messageSvc) : self),
-              Effect.onExit((exit) =>
-                Effect.gen(function* () {
-                  if (!Exit.isSuccess(exit) || runtimes.get(dagID) !== entry) return
-                  const current = yield* store.getNode(dagID, nodeID)
-                  if (current?.childSessionId !== node.childSessionId || current.replanAttempts !== node.replanAttempts)
-                    return
-                  entry.fibers.delete(nodeID)
-                  if (current.status !== "running") return
-                  const phase = yield* store.getWorkflow(dagID)
-                  if (!phase || !["running", "stepping", "paused"].includes(phase.status)) return
-                  // Pause may win after the loop reserved this attempt but before
-                  // the helper's first phase read. Keep it resumable; if resume
-                  // raced this cleanup, the scoped retry rechecks the phase.
-                  entry.messageContinuations.add(nodeID)
-                  yield* entry.evalLock
-                    .withPermits(1)(startMessageContinuations(dagID, entry))
-                    .pipe(guarded("RecoveredAgentMessageRearm"), Effect.forkIn(stateScope))
-                }),
-              ),
-              guarded("RecoveredAgentMessageContinuation"),
-            )
-            const fiber = yield* entry.semaphore.withPermits(1)(continuation).pipe(Effect.forkIn(stateScope))
+            const registered = yield* Deferred.make<void>()
+            let ownedFiber: Fiber.Fiber<unknown, unknown> | undefined
+            const continuation = entry.semaphore
+              .withPermits(1)(
+                Deferred.await(registered).pipe(
+                  Effect.andThen(
+                    continueRecoveredMessageNode(
+                      dagID,
+                      nodeID,
+                      entry.config ?? null,
+                      ctx.directory,
+                      makeArtifactSourceAuthorizer(sessionSvc, agentSvc, ctx.worktree, permissionSvc),
+                    ),
+                  ),
+                ),
+              )
+              .pipe(
+                Effect.provideService(Dag.Service, dag),
+                Effect.provideService(SessionPrompt.Service, promptSvc),
+                (self) => (messageSvc ? Effect.provideService(self, DagMessages.Service, messageSvc) : self),
+                Effect.onExit((exit) =>
+                  Effect.gen(function* () {
+                    // A finished or interrupted helper must relinquish its own
+                    // reservation before any DB read or exit classification. Never
+                    // delete a replacement attempt's fiber installed under this ID.
+                    if (ownedFiber && entry.fibers.get(nodeID) === ownedFiber) entry.fibers.delete(nodeID)
+                    if (!Exit.isSuccess(exit) || runtimes.get(dagID) !== entry) return
+                    const current = yield* store.getNode(dagID, nodeID)
+                    if (
+                      current?.childSessionId !== node.childSessionId ||
+                      current.replanAttempts !== node.replanAttempts
+                    )
+                      return
+                    if (current.status !== "running") return
+                    const phase = yield* store.getWorkflow(dagID)
+                    if (!phase || !["running", "stepping", "paused"].includes(phase.status)) return
+                    // Pause may win after the loop reserved this attempt but before
+                    // the helper's first phase read. Keep it resumable; if resume
+                    // raced this cleanup, the scoped retry rechecks the phase.
+                    entry.messageContinuations.add(nodeID)
+                    yield* entry.evalLock
+                      .withPermits(1)(startMessageContinuations(dagID, entry))
+                      .pipe(guarded("RecoveredAgentMessageRearm"), Effect.forkIn(stateScope))
+                  }),
+                ),
+                guarded("RecoveredAgentMessageContinuation"),
+              )
+            const fiber = yield* continuation.pipe(Effect.forkIn(stateScope))
+            ownedFiber = fiber
             entry.fibers.set(nodeID, fiber)
             const nodeConfig = entry.config?.nodes.find((candidate) => candidate.id === nodeID)
             const watcher =
@@ -704,6 +722,7 @@ const serviceLayer = Layer.effect(
               ))
             entry.watchers.set(nodeID, watcher)
             entry.messageContinuations.delete(nodeID)
+            yield* Deferred.succeed(registered, undefined)
           }
         })
 

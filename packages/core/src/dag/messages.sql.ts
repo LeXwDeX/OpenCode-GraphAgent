@@ -13,6 +13,7 @@ export const AgentMailboxTable = sqliteTable(
     node_id: text(),
     attempt_id: text(),
     revision: integer().notNull().default(0),
+    result_nudge_revision: integer().notNull().default(-1),
     closed_reason: text(),
     time_created: integer().notNull(),
   },
