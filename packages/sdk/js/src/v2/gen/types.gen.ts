@@ -3970,6 +3970,15 @@ export type DagNode = {
   model_id?: string
   model_provider_id?: string
   child_session_id?: string
+  attempt_id?: string
+  accepted_input_revision?: number
+  snapshot_revision?: number
+  agent_messages?: {
+    queued: number
+    delivered: number
+    undeliverable: number
+    closed_reason?: string
+  }
   output?: unknown
   error_reason?: string
   error_class?: string

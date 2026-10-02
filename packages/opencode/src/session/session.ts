@@ -51,6 +51,7 @@ import { Dag } from "@/dag/dag"
 import { isWorkflowTerminalStatus } from "@opencode-ai/core/dag/core/types"
 import { landSystemMessages } from "@/hook/trigger-result"
 import { ToolSourceLedger } from "./tool-source-ledger"
+import { DagMessages } from "@opencode-ai/core/dag/messages"
 
 const runtime = makeRuntime(Database.Service, Database.defaultLayer)
 
@@ -520,6 +521,7 @@ export const layer: Layer.Layer<
   Effect.gen(function* () {
     const { db } = yield* Database.Service
     const database = yield* Database.Service
+    const agentMessages = Option.getOrUndefined(yield* Effect.serviceOption(DagMessages.Service))
     const background = yield* BackgroundJob.Service
     const events = yield* EventV2Bridge.Service
     const flags = yield* RuntimeFlags.Service
@@ -699,11 +701,13 @@ export const layer: Layer.Layer<
         // The three steps live in separate aggregates (goal_state/goal_outcome,
         // workflow events, the lease map) so no shared transaction is
         // available; each step is individually atomic.
-        yield* goal.purgeSession(sessionID).pipe(
-          Effect.catchCause((cause) =>
-            Effect.logWarning("goal purge failed during session remove", { sessionID, cause }),
-          ),
-        )
+        yield* goal
+          .purgeSession(sessionID)
+          .pipe(
+            Effect.catchCause((cause) =>
+              Effect.logWarning("goal purge failed during session remove", { sessionID, cause }),
+            ),
+          )
         // GOAL-FP-01-06: cancel workflows owned by this session so the running
         // DagLoop runtime stops (aborts child sessions, releases the dag
         // lease) and a restart recovery scan can never re-adopt them.
@@ -732,15 +736,26 @@ export const layer: Layer.Layer<
         // Belt-and-braces lease sweep: drops goal registrations, wake-sweep
         // registrations, and any dag registration whose workflow did not
         // reach the terminalization handler above (e.g. cancel rejected).
-        yield* automation.purgeSession(sessionID).pipe(
-          Effect.catchCause((cause) =>
-            Effect.logWarning("automation lease purge failed during session remove", { sessionID, cause }),
-          ),
-        )
+        yield* automation
+          .purgeSession(sessionID)
+          .pipe(
+            Effect.catchCause((cause) =>
+              Effect.logWarning("automation lease purge failed during session remove", { sessionID, cause }),
+            ),
+          )
         // Session-row deletion (projector, inside this publish's transaction)
         // comes LAST, after every cleanup step above.
         if (toolSources) yield* toolSources.clearSession(sessionID)
-        yield* events.publish(SessionV1.Event.Deleted, { sessionID, info: session })
+        yield* db
+          .transaction(
+            () =>
+              Effect.gen(function* () {
+                if (agentMessages) yield* agentMessages.closeSession(sessionID, "session_deleted")
+                yield* events.publish(SessionV1.Event.Deleted, { sessionID, info: session })
+              }),
+            { behavior: "immediate" },
+          )
+          .pipe(Effect.orDie)
         yield* events.remove(sessionID)
         // #524: scrub the related dag event aggregates after the session
         // aggregate — terminal workflows included (the cancel loop above skips
@@ -751,13 +766,19 @@ export const layer: Layer.Layer<
         yield* Effect.forEach(
           dagIDs,
           (dagID) =>
-            events.remove(dagID).pipe(
-              Effect.catchCause((cause) =>
-                Cause.hasInterrupts(cause)
-                  ? Effect.interrupt
-                  : Effect.logWarning("dag aggregate scrub failed during session remove", { sessionID, dagID, cause }),
+            events
+              .remove(dagID)
+              .pipe(
+                Effect.catchCause((cause) =>
+                  Cause.hasInterrupts(cause)
+                    ? Effect.interrupt
+                    : Effect.logWarning("dag aggregate scrub failed during session remove", {
+                        sessionID,
+                        dagID,
+                        cause,
+                      }),
+                ),
               ),
-            ),
           { discard: true },
         )
       } catch (error) {
@@ -1082,6 +1103,7 @@ export const layer: Layer.Layer<
 export const defaultLayer = layer.pipe(
   Layer.provide(BackgroundJob.defaultLayer),
   Layer.provide(Database.defaultLayer),
+  Layer.provide(DagMessages.defaultLayer),
   Layer.provide(EventV2Bridge.defaultLayer),
   Layer.provide(SessionExecution.noopLayer),
   Layer.provide(SessionV2.defaultLayer),
@@ -1244,6 +1266,7 @@ export const node = LayerNode.make(layer, [
   BackgroundJob.node,
   RuntimeFlags.node,
   Database.node,
+  DagMessages.node,
   EventV2Bridge.node,
   Goal.node,
   SessionAutomationLease.node,

@@ -180,6 +180,23 @@ describe("resolveInputMapping", () => {
 // --- Unit tests for capture.ts (submit_result validation) ---
 
 describe("validateAgainstSchema", () => {
+  it("validates patterns against the complete accepted string", () => {
+    expect(validateAgainstSchema("a".repeat(99_999) + "!", { pattern: "^a+$" }).ok).toBe(false)
+    expect(validateAgainstSchema("a".repeat(100_000), { pattern: "^a+$" }).ok).toBe(true)
+    expect(validateAgainstSchema("a".repeat(99_999) + "!", { pattern: "!$" }).ok).toBe(true)
+  })
+
+  it("rejects oversize pattern input rather than validating a prefix", () => {
+    expect(validateAgainstSchema("a".repeat(100_000) + "!", { pattern: "^a+$" }).ok).toBe(false)
+    expect(validateAgainstSchema("a".repeat(100_001), { pattern: "^a+$" }).ok).toBe(false)
+    expect(validateAgainstSchema("a".repeat(100_001), { type: "string" }).ok).toBe(true)
+  })
+
+  it("preserves unanchored JSON Schema pattern matching and malformed-pattern rejection", () => {
+    expect(validateAgainstSchema("prefix abc suffix", { pattern: "abc" }).ok).toBe(true)
+    expect(validateAgainstSchema("abc", { pattern: "[" }).ok).toBe(false)
+  })
+
   it("accepts matching object type", () => {
     expect(validateAgainstSchema({ a: 1 }, { type: "object" })).toEqual({ ok: true })
   })

@@ -8,6 +8,18 @@ import type { DagNode, DagWorkflowSummary } from "@opencode-ai/sdk/v2"
 
 export type { DagNode }
 
+/** Acceptance and durable model-input association are separate delivery states. */
+export function formatDagAgentMessages(node: DagNode): string | undefined {
+  const messages = node.agent_messages
+  if (!messages) return undefined
+  return `messages ${messages.queued} queued · ${messages.delivered} delivered · ${messages.undeliverable} undeliverable`
+}
+
+export function formatDagAgentInput(node: DagNode): string | undefined {
+  if (!node.attempt_id) return undefined
+  return `attempt ${node.attempt_id} · input ${node.accepted_input_revision ?? 0} · snapshot ${node.snapshot_revision ?? 0}`
+}
+
 /**
  * Group nodes into topological "waves": wave N contains every node whose
  * dependencies are all satisfied by waves 0..N-1. A wave is a rendering

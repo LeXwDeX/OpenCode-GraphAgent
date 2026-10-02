@@ -1,15 +1,18 @@
 import * as Tool from "./tool"
 import DESCRIPTION from "./submit_result.txt"
 import { Effect, Option, Schema } from "effect"
-import { validatePayload } from "@/dag/runtime/capture"
+import { validatePayload, getCaptureSnapshot } from "@/dag/runtime/capture"
 import { DagStore } from "@opencode-ai/core/dag/store"
+import { DagMessages } from "@opencode-ai/core/dag/messages"
+import { InstanceState } from "@/effect/instance-state"
 
 const id = "submit_result"
 const parseJsonOption = Schema.decodeUnknownOption(Schema.UnknownFromJsonString)
 
 export const Parameters = Schema.Struct({
   payload: Schema.Unknown.annotate({
-    description: "JSON value matching the node's declared output_schema (object, array, string, number, or boolean).",
+    description:
+      "JSON value matching the node's declared output_schema (object, array, string, number, boolean, or null).",
   }),
 })
 
@@ -40,7 +43,8 @@ export const SubmitResultTool = Tool.define<typeof Parameters, Metadata, never>(
             if (result.notAvailable) {
               return {
                 title: "submit_result not applicable",
-                output: "submit_result has no effect in this session — it is only for DAG workflow child sessions that declared an output_schema.",
+                output:
+                  "submit_result has no effect in this session — it is only for DAG workflow child sessions that declared an output_schema.",
                 metadata: {} as Metadata,
               }
             }
@@ -50,7 +54,47 @@ export const SubmitResultTool = Tool.define<typeof Parameters, Metadata, never>(
               metadata: {} as Metadata,
             }
           }
-          yield* storeOpt.value.setCapturedOutput(ctx.sessionID, payload).pipe(Effect.orDie)
+          let snapshotID = getCaptureSnapshot(ctx.sessionID)
+          const messages = yield* Effect.serviceOption(DagMessages.Service)
+          const commit = () => storeOpt.value.setCapturedOutput(ctx.sessionID, payload, snapshotID).pipe(Effect.orDie)
+          if (Option.isSome(messages)) {
+            const instance = yield* InstanceState.context
+            const caller = { projectID: instance.project.id, directory: instance.directory, sessionID: ctx.sessionID }
+            const identity = yield* messages.value.revisions(caller)
+            if (!identity.ok || identity.value.endpoint.kind !== "node")
+              return {
+                title: "submit_result not applicable",
+                output: "This session is not a current DAG node attempt.",
+                metadata: {},
+              }
+            const snapshot = yield* messages.value.snapshotForTurn(caller, ctx.messageID)
+            if (!snapshot.ok || !snapshot.value)
+              return {
+                title: "submit_result input unavailable",
+                output:
+                  "This tool call has no recorded input snapshot. Consume current agent input before submitting a result.",
+                metadata: {},
+              }
+            snapshotID = snapshot.value.id
+            const endpoint = identity.value.endpoint
+            const result = yield* messages.value.guard(
+              caller,
+              {
+                workflowID: endpoint.workflowID!,
+                nodeID: endpoint.nodeID!,
+                attemptID: endpoint.attemptID!,
+                snapshotID,
+                close: false,
+              },
+              commit(),
+            )
+            if (!result.ok)
+              return {
+                title: "submit_result input changed",
+                output: `Submission was not captured (${result.reason}). Consume the current agent input before submitting an updated result. Previously completed tools remain recorded; do not repeat their writes.`,
+                metadata: {},
+              }
+          } else yield* commit()
           return {
             title: "Structured output submitted",
             output: "submit_result succeeded. Your structured output has been captured.",

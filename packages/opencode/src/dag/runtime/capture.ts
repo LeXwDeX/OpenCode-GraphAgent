@@ -14,6 +14,15 @@
 import { validateReviewResult } from "../review-lifecycle"
 
 const schemas = new Map<string, Record<string, unknown>>()
+const snapshots = new Map<string, string>()
+
+export function setCaptureSnapshot(sessionID: string, snapshotID: string): void {
+  snapshots.set(sessionID, snapshotID)
+}
+
+export function getCaptureSnapshot(sessionID: string): string | undefined {
+  return snapshots.get(sessionID)
+}
 
 export function registerCaptureSlot(sessionID: string, schema: Record<string, unknown>): void {
   schemas.set(sessionID, schema)
@@ -29,6 +38,7 @@ export function getCaptureSchema(sessionID: string): Record<string, unknown> | u
 
 export function clearCaptureSlot(sessionID: string): void {
   schemas.delete(sessionID)
+  snapshots.delete(sessionID)
 }
 
 export function validatePayload(sessionID: string, payload: unknown): { ok: true } | { ok: false; error: string; notAvailable?: boolean } {
@@ -75,6 +85,8 @@ export function validateAgainstSchema(value: unknown, schema: Record<string, unk
     if (typeof maxLength === "number" && value.length > maxLength)
       return { ok: false, error: `expected maxLength ${maxLength}, got length ${value.length}` }
     const pattern = schema["pattern"]
+    if (typeof pattern === "string" && value.length > REGEX_TEST_MAX_CHARS)
+      return { ok: false, error: `pattern validation is capped at ${REGEX_TEST_MAX_CHARS} characters, got ${value.length}` }
     if (typeof pattern === "string" && !safeRegexTest(pattern, value))
       return { ok: false, error: `expected value to match pattern ${pattern}` }
   }
@@ -187,8 +199,13 @@ export function settlePlainTextOutput(text: string | undefined): PlainTextSettle
   return { kind: "complete", output: text }
 }
 
-export function settleCapturedOutput(captured: unknown, reviewFingerprint: string | undefined, suffix = ""): CapturedSettlement {
-  if (captured === undefined || captured === null)
+export function settleCapturedOutput(
+  captured: unknown,
+  reviewFingerprint: string | undefined,
+  suffix = "",
+  submitted = captured !== undefined && captured !== null,
+): CapturedSettlement {
+  if (!submitted)
     return { kind: "fail", reason: `output_schema declared but submit_result was never successfully called${suffix}` }
   if (reviewFingerprint) {
     const result = validateReviewResult(captured, reviewFingerprint)
@@ -266,15 +283,16 @@ function describeType(value: unknown): string {
 
 // Schema patterns come from workflow config; a malformed regex must not crash
 // validation, it just fails the constraint.
-// #349/CAP-02: patterns may also be PATHOLOGICAL (the draft action lets a
-// model author them) — cap the tested span so catastrophic backtracking
-// against an unbounded model output cannot hang submit_result validation.
+// Reject oversize pattern inputs rather than validating a prefix and accepting
+// an unchecked suffix. The cap bounds input size, not regex execution time:
+// pathological patterns can still backtrack within the accepted size (#349).
 const REGEX_TEST_MAX_CHARS = 100_000
 // #349/CAP-02: bound for the O(n²) uniqueItems pairwise scan.
 const UNIQUE_ITEMS_MAX = 1_000
 function safeRegexTest(pattern: string, value: string): boolean {
+  if (value.length > REGEX_TEST_MAX_CHARS) return false
   try {
-    return new RegExp(pattern).test(value.slice(0, REGEX_TEST_MAX_CHARS))
+    return new RegExp(pattern).test(value)
   } catch {
     return false
   }

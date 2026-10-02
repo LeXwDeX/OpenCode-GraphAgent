@@ -53,6 +53,7 @@ function recoveryLayer(input: {
   )
   const base = Layer.mergeAll(database, events, bridge, store, projector, dag, status)
   const session = Layer.mock(Session.Service, {
+    getPart: () => Effect.succeed(undefined),
     create: Effect.fn("test.Session.create")((_value?: unknown) =>
       Effect.sync(() => {
         input.created.push("generated")

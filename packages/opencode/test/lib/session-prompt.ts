@@ -19,11 +19,12 @@ export function withIdleAdmission<Error, Value extends object>(
         if (Option.isSome(status) && (yield* status.value.get(sessionID)).type !== "idle") return Option.none<A>()
         return Option.some(yield* work)
       }),
-    prepareIfIdle: (input: SessionPrompt.PromptInput) =>
-      Effect.succeed(
+    prepareIfIdle: (input: SessionPrompt.PromptInput, persistAdmission?: Effect.Effect<void>) =>
+      Effect.as(
+        persistAdmission ?? Effect.void,
         Option.some({
           activate: Effect.void,
-          result: service.promptIfIdle(input).pipe(
+          result: Effect.suspend(() => service.promptIfIdle(input)).pipe(
             Effect.flatMap(Option.match({ onNone: () => Effect.interrupt, onSome: Effect.succeed })),
             Effect.catchCause((cause) =>
               Cause.hasInterrupts(cause) ? Effect.interrupt : Effect.die(Cause.squash(cause)),

@@ -12,6 +12,7 @@ import { Command } from "@/command"
 import { Config } from "@/config/config"
 import { Workspace } from "@/control-plane/workspace"
 import { Dag } from "@/dag/dag"
+import { DagMessages } from "@opencode-ai/core/dag/messages"
 import { Env } from "@/env"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Format } from "@/format"
@@ -244,6 +245,7 @@ export const app = LayerNode.group([
   RuntimeFlags.node,
   EventV2Bridge.node,
   Dag.node,
+  DagMessages.node,
   SessionRunState.node,
   SessionProcessor.node,
   SessionCompaction.node,

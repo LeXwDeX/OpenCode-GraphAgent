@@ -48,6 +48,9 @@ export interface NodeRow {
   childSessionId: string | null
   output: unknown
   capturedOutput: unknown
+  /** Submission presence is independent of the JSON value (which may be null). */
+  capturedOutputPresent?: boolean
+  capturedSnapshotID?: string | null
   errorReason: string | null
   errorClass: string | null
   deadlineMs: number | null
@@ -121,6 +124,8 @@ const mapNode = (r: typeof WorkflowNodeTable.$inferSelect): NodeRow => ({
   childSessionId: r.child_session_id,
   output: r.output,
   capturedOutput: r.captured_output,
+  capturedOutputPresent: r.captured_output_present,
+  capturedSnapshotID: r.captured_snapshot_id,
   errorReason: r.error_reason,
   errorClass: r.error_class,
   deadlineMs: r.deadline_ms,
@@ -188,7 +193,7 @@ export interface Interface {
   readonly getCurrentNodes: (workflowId: string) => Effect.Effect<NodeRow[]>
   readonly getNode: (workflowId: string, nodeId: string) => Effect.Effect<NodeRow | undefined>
   readonly getRunningNodes: (workflowId: string) => Effect.Effect<NodeRow[]>
-  readonly setCapturedOutput: (childSessionID: string, payload: unknown) => Effect.Effect<void>
+  readonly setCapturedOutput: (childSessionID: string, payload: unknown, snapshotID?: string) => Effect.Effect<void>
 
   readonly markNodeWakeReported: (workflowId: string, nodeID: string) => Effect.Effect<void>
   readonly markWorkflowWakeReported: (dagID: string) => Effect.Effect<void>
@@ -398,11 +403,11 @@ export const layer = Layer.effect(
         return rows.map(mapNode)
       }),
 
-      setCapturedOutput: Effect.fn("DagStore.setCapturedOutput")(function* (childSessionID, payload) {
+      setCapturedOutput: Effect.fn("DagStore.setCapturedOutput")(function* (childSessionID, payload, snapshotID) {
         yield* db
           .update(WorkflowNodeTable)
-          .set({ captured_output: payload })
-          .where(eq(WorkflowNodeTable.child_session_id, childSessionID))
+          .set({ captured_output: payload, captured_output_present: true, captured_snapshot_id: snapshotID ?? null })
+          .where(and(eq(WorkflowNodeTable.child_session_id, childSessionID), eq(WorkflowNodeTable.status, "running")))
           .run()
           .pipe(Effect.orDie)
       }),

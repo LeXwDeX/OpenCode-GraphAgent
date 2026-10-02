@@ -58,6 +58,7 @@ import { Goal } from "@/goal/goal"
 import { GoalLoop } from "@/goal/loop"
 import { Dag } from "@/dag/dag"
 import { DagStore } from "@opencode-ai/core/dag/store"
+import { DagMessages } from "@opencode-ai/core/dag/messages"
 import { DagLoop } from "@/dag/runtime/loop"
 import { DagSummaryPublisher } from "@/dag/runtime/summary-publisher"
 import { DagSupervisionSweep } from "@/dag/runtime/supervision-sweep"
@@ -96,6 +97,7 @@ export const AppLayer = Layer.mergeAll(
     EventV2Bridge.defaultLayer,
     SessionRunState.defaultLayer,
     DagStore.defaultLayer,
+    DagMessages.defaultLayer,
     Dag.defaultLayer,
   ),
   Layer.mergeAll(

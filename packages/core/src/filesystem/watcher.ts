@@ -82,25 +82,35 @@ export const layer = Layer.effect(
       Effect.promise(() => Promise.allSettled(subscriptions.map((subscription) => subscription.unsubscribe()))),
     )
 
-    const callback: ParcelWatcher.SubscribeCallback = (_error, updates) => {
-      for (const update of updates) {
+    const callback: ParcelWatcher.SubscribeCallback = (error, updates) => {
+      if (error) {
+        runFork(Effect.logError("watcher callback failed", { error }))
+        return
+      }
+      for (const update of updates ?? []) {
         if (update.type === "create") runFork(events.publish(Event.Updated, { file: update.path, event: "add" }))
         if (update.type === "update") runFork(events.publish(Event.Updated, { file: update.path, event: "change" }))
         if (update.type === "delete") runFork(events.publish(Event.Updated, { file: update.path, event: "unlink" }))
       }
     }
 
-    const subscribe = (directory: string, ignore: string[]) => {
-      const pending = w.subscribe(directory, callback, { ignore, backend })
-      return Effect.promise(() => pending).pipe(
-        Effect.tap((subscription) => Effect.sync(() => subscriptions.push(subscription))),
-        Effect.timeout(SUBSCRIBE_TIMEOUT_MS),
-        Effect.catchCause((cause) => {
-          pending.then((subscription) => subscription.unsubscribe()).catch(() => {})
-          return Effect.logError("failed to subscribe", { directory, cause: Cause.pretty(cause) })
-        }),
-      )
-    }
+    const subscribe = (directory: string, ignore: string[]) =>
+      Effect.suspend(() => {
+        let pending: Promise<ParcelWatcher.AsyncSubscription> | undefined
+        return Effect.promise(() => {
+          // Attach Effect's rejection handler when acquisition starts. Eager acquisition
+          // can reject before a forked subscription fiber has begun observing its promise.
+          pending = w.subscribe(directory, callback, { ignore, backend })
+          return pending
+        }).pipe(
+          Effect.tap((subscription) => Effect.sync(() => subscriptions.push(subscription))),
+          Effect.timeout(SUBSCRIBE_TIMEOUT_MS),
+          Effect.catchCause((cause) => {
+            pending?.then((subscription) => subscription.unsubscribe()).catch(() => {})
+            return Effect.logError("failed to subscribe", { directory, cause: Cause.pretty(cause) })
+          }),
+        )
+      })
 
     const config = (yield* (yield* Config.Service).entries())
       .filter((entry): entry is Config.Document => entry.type === "document")

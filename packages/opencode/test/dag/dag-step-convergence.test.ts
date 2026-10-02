@@ -77,6 +77,7 @@ function stepLayer(childPrompts: Queue.Queue<PromptGate>) {
   const titles = new Map<string, string>()
   let created = 0
   const session = Layer.mock(Session.Service, {
+    getPart: () => Effect.succeed(undefined),
     get: () => Effect.succeed({ id: "ses_parent", permission: [], agent: "build" } as never),
     create: (value) =>
       Effect.sync(() => {

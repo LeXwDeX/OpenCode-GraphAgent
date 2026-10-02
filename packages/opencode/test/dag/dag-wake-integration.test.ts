@@ -145,6 +145,7 @@ function wakeLayer(input: {
   const childTitles = new Map<string, string>()
   const created: string[] = []
   const session = Layer.mock(Session.Service, {
+    getPart: () => Effect.succeed(undefined),
     get: () => Effect.succeed({
       id: SessionID.make("ses_parent"),
       slug: "parent",
@@ -282,6 +283,7 @@ describe("DagLoop atomic wake integration", () => {
         const childTitles = new Map<string, string>()
         const created: string[] = []
         const session = Layer.mock(Session.Service, {
+    getPart: () => Effect.succeed(undefined),
           get: () =>
             Effect.succeed({
               id: SessionID.make("ses_parent"),
@@ -1477,6 +1479,7 @@ describe("DagLoop atomic wake integration", () => {
         const childTitles = new Map<string, string>()
         const created: string[] = []
         const session = Layer.mock(Session.Service, {
+    getPart: () => Effect.succeed(undefined),
           get: () =>
             Effect.succeed({
               id: SessionID.make("ses_parent"),

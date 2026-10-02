@@ -3,7 +3,21 @@
 
 export * as DagLoop from "./loop"
 
-import { Cause, Effect, Layer, Context, Stream, Semaphore, Fiber, Option, DateTime, Clock, Schema, Scope } from "effect"
+import {
+  Cause,
+  Effect,
+  Layer,
+  Context,
+  Stream,
+  Semaphore,
+  Fiber,
+  Option,
+  DateTime,
+  Clock,
+  Schema,
+  Scope,
+  Exit,
+} from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { InstanceState } from "@/effect/instance-state"
@@ -12,6 +26,8 @@ import { DagEvent } from "@opencode-ai/schema/dag-event"
 import { SessionEvent } from "@opencode-ai/schema/session-event"
 import { SessionStatusEvent } from "@opencode-ai/schema/session-status-event"
 import { DagStore } from "@opencode-ai/core/dag/store"
+import { DagMessages } from "@opencode-ai/core/dag/messages"
+import { Hash } from "@opencode-ai/core/util/hash"
 import { DagLocation } from "../location"
 import { WorkflowRuntime, toSchedulingNodes } from "@opencode-ai/core/dag/core/scheduling"
 import {
@@ -31,7 +47,8 @@ import {
 import { Agent } from "@/agent/agent"
 import { Session } from "@/session/session"
 import { SessionPrompt } from "@/session/prompt"
-import { SessionID } from "@/session/schema"
+import * as MessageV2 from "@/session/message-v2"
+import { MessageID, PartID, SessionID } from "@/session/schema"
 import { SessionStatus } from "@/session/status"
 import { SessionAutomationLease } from "@/session/automation-lease"
 import { renderTemplate } from "../templates/resolve"
@@ -39,7 +56,12 @@ import { sanitizeInput } from "../templates/sanitize"
 import { DagConfig } from "../config"
 import { spawnNode, makeDeadlineWatcher } from "./spawn"
 import { evaluateCondition, resolveInputMapping, resolveInputMappingChecked, parseInputMappingReference } from "./eval"
-import { reconcileWorkflow, makeSessionStatusChecker, makeLastAssistantTextReader } from "./recovery"
+import {
+  reconcileWorkflow,
+  continueRecoveredMessageNode,
+  makeSessionStatusChecker,
+  makeLastAssistantTextReader,
+} from "./recovery"
 import { Checkpoint } from "./checkpoint"
 import { verifyOutputFileRef, isManagedOutputFileRef } from "./output-ref"
 import { makeArtifactSourceAuthorizer } from "./artifact-permissions"
@@ -48,8 +70,39 @@ import { Permission } from "@/permission"
 const parseJsonOption = Schema.decodeUnknownOption(Schema.UnknownFromJsonString)
 const PAUSED_REMINDER_DELAY_MS = 5 * 60_000
 
-export function isPausedReminderDue(workflow: Pick<DagStore.WorkflowRow, "status" | "wakeReported" | "timeUpdated">, now: number) {
-  return workflow.status === "paused" && !workflow.wakeReported && now - workflow.timeUpdated >= PAUSED_REMINDER_DELAY_MS
+/** Stable local receipt for the exact durable wake batch, including execution
+ * identity and event revisions. Repeated text from a new attempt is new input. */
+export function wakeBatchIdentity(sessionID: string, batch: DagStore.WakeBatch) {
+  const identity = Hash.sha256(
+    JSON.stringify([
+      sessionID,
+      batch.nodes
+        .map((node) => [
+          node.workflowId,
+          node.id,
+          node.childSessionId,
+          node.replanAttempts,
+          node.seq,
+          node.status,
+          node.deadlineMs,
+          node.timeoutExtensions,
+        ])
+        .sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))),
+      batch.workflows
+        .map((workflow) => [workflow.id, workflow.graphRev, workflow.seq, workflow.status])
+        .sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))),
+    ]),
+  )
+  return { messageID: MessageID.make(`msg_dag_wake_${identity}`), partID: PartID.make(`prt_dag_wake_${identity}`) }
+}
+
+export function isPausedReminderDue(
+  workflow: Pick<DagStore.WorkflowRow, "status" | "wakeReported" | "timeUpdated">,
+  now: number,
+) {
+  return (
+    workflow.status === "paused" && !workflow.wakeReported && now - workflow.timeUpdated >= PAUSED_REMINDER_DELAY_MS
+  )
 }
 
 export interface Interface {
@@ -68,6 +121,8 @@ interface WorkflowEntry {
   graphRev: number
   fibers: Map<string, Fiber.Fiber<unknown, unknown>>
   watchers: Map<string, Fiber.Fiber<unknown, unknown>>
+  /** Accepted messages preserve an existing running attempt through recovery. */
+  messageContinuations: Set<string>
   /** DAG-03/F2: a replan-verdict veto whose durable pause could not be
    * persisted. While set, the in-memory paused flag survives the durable-row
    * re-syncs performed by node terminal events and refreshControlFlags, so
@@ -87,6 +142,7 @@ const serviceLayer = Layer.effect(
   Effect.gen(function* () {
     const events = yield* EventV2Bridge.Service
     const store = yield* DagStore.Service
+    const messageSvc = Option.getOrUndefined(yield* Effect.serviceOption(DagMessages.Service))
     const dag = yield* Dag.Service
     const agentSvc = yield* Agent.Service
     const sessionSvc = yield* Session.Service
@@ -106,15 +162,8 @@ const serviceLayer = Layer.effect(
         const recovering = new Set<string>()
         const wakeInFlight = new Set<string>()
         const wakePending = new Set<string>()
-        // Per-session record of the last wake summary whose transcript part was
-        // written. Admit success IS the delivery (issue #321): the durable
-        // wake_reported mark lands immediately after the write, not after the
-        // wake-driven turn completes, so the in-memory map only needs to dedupe
-        // the narrow mark-retry path — if the leased mark returns None the rows
-        // stay unreported and a later trigger re-marks WITHOUT re-prompting.
-        // In-process only; restart durability now comes from wake_reported being
-        // persisted at admit time, not from this map. Capped: evicting entries
-        // degrades to a redundant re-prompt, never to a lost wake.
+        // Cache the receipt only as an optimization. Exact durable message/part
+        // lookup below survives a crash between admission and wake marking.
         const deliveredWakeSummaries = new Map<string, string>()
 
         // Seed the commented global dag.jsonc once per instance init — the
@@ -128,11 +177,7 @@ const serviceLayer = Layer.effect(
         ) {
           const attempt = dag
             .pauseForCheckpoint(dagID, checkpoint.seq)
-            .pipe(
-              Effect.catchCause((cause) =>
-                Cause.hasInterrupts(cause) ? Effect.failCause(cause) : Effect.void,
-              ),
-            )
+            .pipe(Effect.catchCause((cause) => (Cause.hasInterrupts(cause) ? Effect.failCause(cause) : Effect.void)))
           const first = yield* attempt
           if (first) return first
           const second = yield* attempt
@@ -217,6 +262,7 @@ const serviceLayer = Layer.effect(
           }
         })
 
+        let startMessageContinuations: (dagID: string, entry: WorkflowEntry) => Effect.Effect<void> = () => Effect.void
         const spawnReady = Effect.fn("DagLoop.spawnReady")(function* (dagID: string) {
           const entry = runtimes.get(dagID)
           if (!entry) return
@@ -235,6 +281,7 @@ const serviceLayer = Layer.effect(
           // reach spawnReady first after the durable completion, so arbitrate
           // from durable rows before every dispatch round.
           if (yield* enforceCheckpointGate(dagID, entry)) return
+          yield* startMessageContinuations(dagID, entry)
           yield* convergeSkippedNodes(dagID, entry)
           const ready = entry.runtime.getReadyNodes()
           // P1-3: one snapshot per scheduling round. Every ready node's
@@ -399,7 +446,7 @@ const serviceLayer = Layer.effect(
               }
             }
 
-            const resolved = yield* (nodeConfig?.prompt_template
+            const resolved = yield* nodeConfig?.prompt_template
               ? renderTemplate(nodeConfig.prompt_template, ctx.directory, resolvedMapping).pipe(
                   Effect.tap((result) =>
                     result.text.trim() === ""
@@ -427,7 +474,7 @@ const serviceLayer = Layer.effect(
                   text: node.name,
                   unresolvedPlaceholders: [],
                   interpolatedDynamicKeys: [],
-                }))
+                })
             if (!resolved.ok) continue
 
             if (resolved.unresolvedPlaceholders.length > 0) {
@@ -588,8 +635,77 @@ const serviceLayer = Layer.effect(
         // absorbs the error channel) and would kill the forked runForEach fiber —
         // leaving that event type permanently unhandled for the rest of the
         // process. catchCause absorbs failures AND defects at the boundary.
-        const guarded = (event: string) => <A, E, R>(self: Effect.Effect<A, E, R>) =>
-          self.pipe(Effect.catchCause((cause) => Effect.logWarning("DagLoop handler failed", { event, cause })))
+        const guarded =
+          (event: string) =>
+          <A, E, R>(self: Effect.Effect<A, E, R>) =>
+            self.pipe(Effect.catchCause((cause) => Effect.logWarning("DagLoop handler failed", { event, cause })))
+
+        startMessageContinuations = Effect.fn("DagLoop.startMessageContinuations")(function* (
+          dagID: string,
+          entry: WorkflowEntry,
+        ) {
+          if (entry.runtime.isPaused() || entry.messageContinuations.size === 0) return
+          const workflow = yield* store.getWorkflow(dagID)
+          if (!workflow || !["running", "stepping"].includes(workflow.status)) return
+          for (const nodeID of entry.messageContinuations) {
+            const node = yield* store.getNode(dagID, nodeID)
+            if (!node || node.status !== "running" || !node.childSessionId) {
+              entry.messageContinuations.delete(nodeID)
+              continue
+            }
+            if (entry.fibers.has(nodeID)) continue
+            const continuation = continueRecoveredMessageNode(
+              dagID,
+              nodeID,
+              entry.config ?? null,
+              ctx.directory,
+              makeArtifactSourceAuthorizer(sessionSvc, agentSvc, ctx.worktree, permissionSvc),
+            ).pipe(
+              Effect.provideService(Dag.Service, dag),
+              Effect.provideService(SessionPrompt.Service, promptSvc),
+              (self) => (messageSvc ? Effect.provideService(self, DagMessages.Service, messageSvc) : self),
+              Effect.onExit((exit) =>
+                Effect.gen(function* () {
+                  if (!Exit.isSuccess(exit) || runtimes.get(dagID) !== entry) return
+                  const current = yield* store.getNode(dagID, nodeID)
+                  if (current?.childSessionId !== node.childSessionId || current.replanAttempts !== node.replanAttempts)
+                    return
+                  entry.fibers.delete(nodeID)
+                  if (current.status !== "running") return
+                  const phase = yield* store.getWorkflow(dagID)
+                  if (!phase || !["running", "stepping", "paused"].includes(phase.status)) return
+                  // Pause may win after the loop reserved this attempt but before
+                  // the helper's first phase read. Keep it resumable; if resume
+                  // raced this cleanup, the scoped retry rechecks the phase.
+                  entry.messageContinuations.add(nodeID)
+                  yield* entry.evalLock
+                    .withPermits(1)(startMessageContinuations(dagID, entry))
+                    .pipe(guarded("RecoveredAgentMessageRearm"), Effect.forkIn(stateScope))
+                }),
+              ),
+              guarded("RecoveredAgentMessageContinuation"),
+            )
+            const fiber = yield* entry.semaphore.withPermits(1)(continuation).pipe(Effect.forkIn(stateScope))
+            entry.fibers.set(nodeID, fiber)
+            const nodeConfig = entry.config?.nodes.find((candidate) => candidate.id === nodeID)
+            const watcher =
+              entry.watchers.get(nodeID) ??
+              (yield* makeDeadlineWatcher({
+                dagID,
+                nodeID,
+                attempt: { replanAttempts: node.replanAttempts, childSessionID: node.childSessionId },
+                timeoutMs: nodeConfig?.worker_config?.timeout_ms,
+                maxTimeoutExtensions:
+                  entry.config?.max_timeout_extensions ?? Dag.DEFAULT_WORKFLOW_CONFIG.maxTimeoutExtensions,
+              }).pipe(
+                Effect.provideService(Dag.Service, dag),
+                Effect.provideService(SessionPrompt.Service, promptSvc),
+                Effect.forkIn(stateScope),
+              ))
+            entry.watchers.set(nodeID, watcher)
+            entry.messageContinuations.delete(nodeID)
+          }
+        })
 
         const recoverWorkflow = Effect.fn("DagLoop.recoverWorkflow")(function* (wf: DagStore.WorkflowRow) {
           // Cross-instance guard: DagLoop is per-directory InstanceState but the
@@ -625,8 +741,8 @@ const serviceLayer = Layer.effect(
               lastAssistantText,
               ctx.directory,
               makeArtifactSourceAuthorizer(sessionSvc, agentSvc, ctx.worktree, permissionSvc),
-            ).pipe(
-              Effect.provideService(Dag.Service, dag),
+            ).pipe(Effect.provideService(Dag.Service, dag), (self) =>
+              messageSvc ? Effect.provideService(self, DagMessages.Service, messageSvc) : self,
             )
             // P2-2 recovery-pause: reconciliation invented failures (ownership
             // lost / no child session / deadline enforced offline) without any
@@ -715,6 +831,7 @@ const serviceLayer = Layer.effect(
               graphRev: currentWorkflow?.graphRev ?? wf.graphRev,
               fibers: new Map(),
               watchers: new Map(),
+              messageContinuations: new Set(recovery.continuations ?? []),
               vetoHold: checkpointState === "held",
             }
             // P2-E deletion-race re-check: the SessionV1.Event.Deleted sweep
@@ -732,9 +849,9 @@ const serviceLayer = Layer.effect(
             if (!(yield* store.tryClaimAdoption(dagID))) return
             runtimes.set(dagID, entry)
             yield* automation.register(SessionID.make(wf.sessionId), { kind: "dag", id: dagID })
-            // Reconciliation settles every persisted running attempt before the
-            // runtime is rebuilt. Recovery never adopts or restarts provider work;
-            // a new execution attempt must come from explicit workflow control.
+            // Only accepted messages may continue their existing child attempt.
+            // Paused workflows defer that continuation until explicit resume.
+            if (!isPaused) yield* entry.evalLock.withPermits(1)(startMessageContinuations(dagID, entry))
             if (!isPaused && !isStepping) {
               yield* entry.evalLock.withPermits(1)(
                 Effect.gen(function* () {
@@ -854,6 +971,7 @@ const serviceLayer = Layer.effect(
                   graphRev: wf.graphRev,
                   fibers: new Map(),
                   watchers: new Map(),
+                  messageContinuations: new Set(),
                   vetoHold: false,
                 }
                 // P2-E deletion-race re-check (same window as recoverWorkflow):
@@ -1569,14 +1687,14 @@ const serviceLayer = Layer.effect(
                         // could otherwise lose the race against this check.
                         const durable = yield* store.getWorkflow(dagID)
                         const shouldFail =
-                          durable?.status === "running"
-                          && !entry.runtime.isPaused()
-                          && !entry.runtime.isStepMode()
+                          durable?.status === "running" &&
+                          !entry.runtime.isPaused() &&
+                          !entry.runtime.isStepMode() &&
                           // Suppress the net only when current-process execution
                           // ownership proves that a running node is making progress.
-                          && !entry.runtime.hasRunningMatching((id) => entry.fibers.has(id))
-                          && entry.runtime.getReadyNodes().length === 0
-                          && !entry.runtime.isComplete()
+                          !entry.runtime.hasRunningMatching((id) => entry.fibers.has(id)) &&
+                          entry.runtime.getReadyNodes().length === 0 &&
+                          !entry.runtime.isComplete()
                         if (shouldFail) yield* dag.fail(dagID, "orchestrator_unresponsive").pipe(Effect.ignore)
                       }),
                     )
@@ -1586,6 +1704,19 @@ const serviceLayer = Layer.effect(
               }
 
               if ((yield* statusSvc.get(SessionID.make(sessionID))).type !== "idle") return
+
+              const wakeIdentity = wakeBatchIdentity(sessionID, batch)
+              const durableReceipt =
+                deliveredWakeSummaries.get(sessionID) === wakeIdentity.messageID
+                  ? undefined
+                  : yield* sessionSvc.getPart({
+                      sessionID: SessionID.make(sessionID),
+                      messageID: wakeIdentity.messageID,
+                      partID: wakeIdentity.partID,
+                    })
+              const alreadyAdmitted =
+                deliveredWakeSummaries.get(sessionID) === wakeIdentity.messageID ||
+                (durableReceipt?.type === "text" && durableReceipt.synthetic === true)
 
               // Preemption guard (task 3.3): abort if fresher user message exists
               const msgs = yield* sessionSvc.messages({ sessionID: SessionID.make(sessionID), limit: 20 }).pipe(Effect.catch(() => Effect.succeed([])))
@@ -1597,7 +1728,7 @@ const serviceLayer = Layer.effect(
                 if (m.info.role === "user" && t > lastUserAt) lastUserAt = t
                 else if (m.info.role === "assistant" && t > lastAsstAt) lastAsstAt = t
               }
-              if (lastUserAt > lastAsstAt) return
+              if (!alreadyAdmitted && lastUserAt > lastAsstAt) return
 
               const failuresByWorkflow = new Map<string, string[]>()
               for (const workflow of batch.workflows) {
@@ -1655,9 +1786,15 @@ const serviceLayer = Layer.effect(
               const summary = [
                 ...summaries,
                 ...(plan.actionableDagIDs.size > 0
-                  ? ['Act on these workflows this turn (workflow tool: control extend_timeout for a timeout escalation; control replan / extend to reshape the graph; control resume / complete / cancel to settle). The orchestrator_unresponsive verdict is state-based: a workflow left RUNNING and stalled (no running or ready nodes) at the end of the turn is failed. After a rejected replan/extend, inspect its reported actual state: a durably paused workflow is recoverable, but a failed automatic pause does not protect a still-running workflow. Never cancel the whole graph over a rejection. If you need the user before acting on a stalled workflow, control(pause) it first and verify the state, then stop and ask. A paused workflow whose nodes have all finished settles via control(resume), not control(complete).']
+                  ? [
+                      "Act on these workflows this turn (workflow tool: control extend_timeout for a timeout escalation; control replan / extend to reshape the graph; control resume / complete / cancel to settle). The orchestrator_unresponsive verdict is state-based: a workflow left RUNNING and stalled (no running or ready nodes) at the end of the turn is failed. After a rejected replan/extend, inspect its reported actual state: a durably paused workflow is recoverable, but a failed automatic pause does not protect a still-running workflow. Never cancel the whole graph over a rejection. If you need the user before acting on a stalled workflow, control(pause) it first and verify the state, then stop and ask. A paused workflow whose nodes have all finished settles via control(resume), not control(complete).",
+                    ]
                   : []),
               ].join("\n\n")
+              if (durableReceipt?.type === "text" && durableReceipt.text !== summary) {
+                yield* Effect.die(new Error("DAG wake receipt content does not match its durable batch"))
+                return
+              }
 
               const wakeWorkflowIDs = new Set([
                 ...batch.nodes.map((node) => node.workflowId),
@@ -1684,54 +1821,60 @@ const serviceLayer = Layer.effect(
               // sweep re-injected a byte-identical wake (real incident: the same
               // 4391-char wake injected twice, ~10 min apart, after a TUI
               // restart). Redelivery adds duplicates, never information. The
-              // mark (and the terminal-workflow unregisters) now land right
-              // after admitIfIdle admits the part, BEFORE awaiting the turn.
+              // Transcript persistence and the wake mark commit in one short
+              // transaction; the prepared model turn activates after commit.
               //
-              // The in-memory dedup map still guards the retry path: if the
-              // leased mark below returns None (generation/owner changed), the
-              // rows stay unreported and a later trigger re-marks without
-              // re-prompting. A differing summary (new results committed between
-              // attempts) always prompts.
+              // The stable message and part IDs bind this exact durable batch
+              // to its transcript receipt. A failed mark retries by reading
+              // that receipt even after restart. New attempt/event revisions
+              // produce a new identity; equal summary text cannot suppress it.
               if (deliveredWakeSummaries.size > 1024) deliveredWakeSummaries.clear()
               const didDeliver = yield* Effect.gen(function* () {
                 let wakeTurn: Effect.Effect<SessionV1.WithParts> | undefined
-                if (deliveredWakeSummaries.get(sessionID) !== summary) {
-                  const delivered = yield* SessionPrompt.admitIfIdle(promptSvc, automation, wakeLease, {
-                    sessionID: SessionID.make(sessionID),
-                    parts: [{ type: "text", text: summary, synthetic: true }],
-                  })
+                if (!alreadyAdmitted) {
+                  const delivered = yield* automation.handoff(
+                    wakeLease,
+                    promptSvc.prepareIfIdle(
+                      {
+                        sessionID: SessionID.make(sessionID),
+                        messageID: wakeIdentity.messageID,
+                        parts: [{ id: wakeIdentity.partID, type: "text", text: summary, synthetic: true }],
+                      },
+                      store.markWakeBatchReported(batch),
+                    ),
+                  )
                   if (Option.isNone(delivered)) return false
-                  deliveredWakeSummaries.set(sessionID, summary)
+                  deliveredWakeSummaries.set(sessionID, wakeIdentity.messageID)
                   wakeTurn = delivered.value
                 }
 
-                // Admit success == delivered (issue #321): persist wake_reported
-                // at admit time. A leased mark returning None (generation/owner
-                // raced) is treated as retry-later — the rows stay unreported and
-                // a later trigger re-marks — but the admitted turn still runs
-                // below (its end-of-turn idle is what re-arms that retry).
-                const markLease = Option.getOrUndefined(
-                  yield* automation.claim(SessionID.make(sessionID), { kind: "dag" }),
-                )
+                // New admission already committed its mark atomically. An old
+                // durable receipt from before this boundary can still be
+                // acknowledged under the current automation lease.
+                const markLease = !alreadyAdmitted
+                  ? undefined
+                  : Option.getOrUndefined(yield* automation.claim(SessionID.make(sessionID), { kind: "dag" }))
                 // Any mark failure (lease lost, generation raced, or the store
                 // write dying) degrades to retry-later instead of propagating:
                 // the rows stay unreported and a later trigger re-marks, while
                 // the admitted turn below still runs (its end-of-turn idle is
                 // what re-arms that retry). Only interruption propagates.
-                const markSucceeded = markLease
-                  ? Option.isSome(
-                      yield* automation.use(markLease, store.markWakeBatchReported(batch)).pipe(
-                        Effect.catchCause((cause) =>
-                          Cause.hasInterrupts(cause)
-                            ? Effect.failCause(cause)
-                            : Effect.logWarning("DAG wake batch mark failed; rows stay unreported for retry", {
-                                sessionID,
-                                cause: Cause.pretty(cause),
-                              }).pipe(Effect.as(Option.none())),
+                const markSucceeded =
+                  !alreadyAdmitted ||
+                  (markLease
+                    ? Option.isSome(
+                        yield* automation.use(markLease, store.markWakeBatchReported(batch)).pipe(
+                          Effect.catchCause((cause) =>
+                            Cause.hasInterrupts(cause)
+                              ? Effect.failCause(cause)
+                              : Effect.logWarning("DAG wake batch mark failed; rows stay unreported for retry", {
+                                  sessionID,
+                                  cause: Cause.pretty(cause),
+                                }).pipe(Effect.as(Option.none())),
+                          ),
                         ),
-                      ),
-                    )
-                  : false
+                      )
+                    : false)
                 if (markSucceeded) {
                   plan.unresponsiveDagIDs.forEach((workflowID) => deliveredUnresponsiveDagIDs.add(workflowID))
                   yield* Effect.forEach(
@@ -1778,13 +1921,114 @@ const serviceLayer = Layer.effect(
         // parent turn or a dependency never settles. Timing out interrupts the
         // old delivery fiber, runs its finally release, and lets a queued or
         // periodic stimulus retry through the ordinary idle admission gate.
-        tryDeliverWake = (sessionID) => deliverWake(sessionID).pipe(
+        tryDeliverWake = (sessionID) =>
+          deliverWake(sessionID).pipe(
+            Effect.timeoutOption("7 minutes"),
+            Effect.flatMap(
+              Option.match({
+                onSome: () => Effect.void,
+                onNone: () =>
+                  Effect.logWarning("DAG wake delivery lease expired; retry remains available", { sessionID }),
+              }),
+            ),
+          )
+
+        const mailboxInFlight = new Set<string>()
+        const deliverAgentMessages = Effect.fn("DagLoop.deliverAgentMessages")(
+          function* (sessionID: string) {
+            if (!messageSvc || mailboxInFlight.has(sessionID)) return
+            mailboxInFlight.add(sessionID)
+            yield* Effect.gen(function* () {
+              if ((yield* statusSvc.get(SessionID.make(sessionID))).type !== "idle") return
+              const caller = { projectID: ctx.project.id, directory: ctx.directory, sessionID }
+              const queued = yield* messageSvc.receive(caller, { limit: 64, queuedOnly: true })
+              if (!queued.ok) return
+              const message = queued.value.find((item) => item.state === "queued")
+              if (!message || message.recipient.kind !== "main") return
+              const history = yield* sessionSvc.messages({ sessionID: SessionID.make(sessionID), limit: 20 })
+              const latestAssistant = history
+                .filter((item) => item.info.role === "assistant")
+                .toSorted((a, b) => (MessageV2.before(a.info, b.info) ? -1 : MessageV2.before(b.info, a.info) ? 1 : 0))
+                .at(-1)
+              if (
+                latestAssistant?.info.role === "assistant" &&
+                (latestAssistant.info.error || ["error", "content-filter"].includes(latestAssistant.info.finish ?? ""))
+              ) {
+                const mailboxInputs = new Set(queued.value.map((item) => item.transcriptID))
+                const newContext = history.some((item) => {
+                  if (
+                    item.info.role !== "user" ||
+                    !MessageV2.before(latestAssistant.info, item.info) ||
+                    mailboxInputs.has(item.info.id)
+                  )
+                    return false
+                  return !item.parts.some((part) => {
+                    if (part.type !== "text") return false
+                    const envelope = Option.getOrUndefined(parseJsonOption(part.text))
+                    return (
+                      typeof envelope === "object" &&
+                      envelope !== null &&
+                      "kind" in envelope &&
+                      envelope.kind === "dag_agent_message"
+                    )
+                  })
+                })
+                // A retained queue cannot reset a failed execution every poll.
+                // A later host-admitted prompt advances context; this predicate
+                // grants no permissions and infers no human provenance.
+                if (!newContext) return
+              }
+              // The mailbox lease is separate from workflow lifecycle ownership:
+              // accepted node reports survive source completion and cancellation.
+              const owner = { kind: "dag" as const, id: `agent-mailbox:${message.recipient.id}` }
+              yield* automation.register(SessionID.make(sessionID), owner)
+              yield* Effect.gen(function* () {
+                const token = yield* automation.claim(SessionID.make(sessionID), { kind: "dag" })
+                if (Option.isNone(token)) return
+                const admitted = yield* SessionPrompt.admitIfIdle(promptSvc, automation, token.value, {
+                  sessionID: SessionID.make(sessionID),
+                  messageID: MessageID.make(message.transcriptID),
+                  parts: [
+                    {
+                      id: PartID.make(message.partID),
+                      type: "text",
+                      text: DagMessages.renderMessage(message),
+                      synthetic: true,
+                    },
+                  ],
+                })
+                if (Option.isNone(admitted)) return
+                // Admission alone leaves delivery queued. SessionPrompt freezes
+                // and associates the actual model input, then advances delivery.
+                yield* automation.unregister(SessionID.make(sessionID), owner)
+                yield* admitted.value
+              }).pipe(Effect.ensuring(automation.unregister(SessionID.make(sessionID), owner)))
+            }).pipe(Effect.ensuring(Effect.sync(() => mailboxInFlight.delete(sessionID))))
+          },
           Effect.timeoutOption("7 minutes"),
-          Effect.flatMap(Option.match({
-            onSome: () => Effect.void,
-            onNone: () => Effect.logWarning("DAG wake delivery lease expired; retry remains available", { sessionID }),
-          })),
+          Effect.asVoid,
         )
+
+        let mailboxCursor: string | undefined
+        const pollAgentMailboxes = Effect.gen(function* () {
+          if (!messageSvc) return
+          const recipients = yield* messageSvc.pendingRecipients({
+            projectID: ctx.project.id,
+            directory: ctx.directory,
+            limit: 20,
+            afterSessionID: mailboxCursor,
+          })
+          mailboxCursor = recipients.at(-1)?.sessionID
+          for (const endpoint of recipients) {
+            yield* deliverAgentMessages(endpoint.sessionID).pipe(guarded("AgentMailboxAdmission"), Effect.forkScoped)
+          }
+        }).pipe(guarded("AgentMailboxSweep"))
+        // Scoped, bounded scanning avoids a second event transport and catches
+        // idle parents even when the source node finished before a restart.
+        if (messageSvc) {
+          yield* pollAgentMailboxes
+          yield* Effect.forever(Effect.sleep(250).pipe(Effect.andThen(pollAgentMailboxes))).pipe(Effect.forkScoped)
+        }
 
         // Idle-event subscription: the primary wake trigger. The handler only
         // forks, so the subscription itself cannot die — guarded here so a
@@ -1793,7 +2037,13 @@ const serviceLayer = Layer.effect(
         yield* events.subscribe(SessionStatusEvent.Status).pipe(
           Stream.filter((evt) => evt.data.status.type === "idle"),
           Stream.runForEach((evt) =>
-            tryDeliverWake(evt.data.sessionID as string).pipe(guarded("WakeDelivery"), Effect.forkScoped),
+            Effect.gen(function* () {
+              yield* tryDeliverWake(evt.data.sessionID as string).pipe(guarded("WakeDelivery"), Effect.forkScoped)
+              yield* deliverAgentMessages(evt.data.sessionID as string).pipe(
+                guarded("AgentMailboxIdle"),
+                Effect.forkScoped,
+              )
+            }),
           ),
           Effect.forkScoped({ startImmediately: true }),
         )
@@ -1932,13 +2182,15 @@ const serviceLayer = Layer.effect(
         // absorb them with a warning so layer construction survives, but never
         // silently — a swallowed failure means wake redelivery is lost until
         // the next process restart.
-        const pendingWakeSessions = yield* store.getSessionsWithUnreportedWakes().pipe(
-          Effect.catchCause((cause) =>
-            Effect.logWarning("DagLoop failed to list sessions with unreported wakes", { cause }).pipe(
-              Effect.as([] as string[]),
+        const pendingWakeSessions = yield* store
+          .getSessionsWithUnreportedWakes()
+          .pipe(
+            Effect.catchCause((cause) =>
+              Effect.logWarning("DagLoop failed to list sessions with unreported wakes", { cause }).pipe(
+                Effect.as([] as string[]),
+              ),
             ),
-          ),
-        )
+          )
         for (const sessionID of pendingWakeSessions) {
           // Cross-instance guard via the execution-location authority: wake
           // redelivery is store-global. Only drain sessions whose workflows
@@ -1949,13 +2201,15 @@ const serviceLayer = Layer.effect(
           // The wake snapshot's own workflow rows carry a second ownership
           // proof — only drain sessions whose unreported workflows belong to
           // this project.
-          const snapshot = yield* store.getWakeSnapshot(sessionID).pipe(
-            Effect.catchCause((cause) =>
-              Effect.logWarning("DagLoop failed to read wake snapshot", { sessionID, cause }).pipe(
-                Effect.as({ nodes: [], workflows: [] } satisfies DagStore.WakeSnapshot),
+          const snapshot = yield* store
+            .getWakeSnapshot(sessionID)
+            .pipe(
+              Effect.catchCause((cause) =>
+                Effect.logWarning("DagLoop failed to read wake snapshot", { sessionID, cause }).pipe(
+                  Effect.as({ nodes: [], workflows: [] } satisfies DagStore.WakeSnapshot),
+                ),
               ),
-            ),
-          )
+            )
           if (!snapshot.workflows.some((wf) => wf.projectId === ctx.project.id)) continue
           // GOAL-FP-01-01: register only NON-terminal workflows. Terminal
           // workflows with wake_reported=true would otherwise be re-registered
@@ -1992,6 +2246,7 @@ export const layer = serviceLayer.pipe(Layer.provide(SessionAutomationLease.defa
 export const defaultLayer = layer.pipe(
   Layer.provide(EventV2Bridge.defaultLayer),
   Layer.provide(DagStore.defaultLayer),
+  Layer.provide(DagMessages.defaultLayer),
   Layer.provide(Dag.defaultLayer),
   Layer.provide(Agent.defaultLayer),
   Layer.provide(Session.defaultLayer),
@@ -2003,6 +2258,7 @@ export const defaultLayer = layer.pipe(
 export const node = LayerNode.make(layer, [
   EventV2Bridge.node,
   DagStore.node,
+  DagMessages.node,
   Dag.node,
   Agent.node,
   Session.node,

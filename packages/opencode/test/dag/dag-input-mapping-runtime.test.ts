@@ -83,6 +83,7 @@ function runtimeLayer(records: Queue.Queue<PromptRecord>, created: string[], par
   // realpath cannot expand RUNNER~1 through a non-existent dag-* directory.
   const agentPermissions = Permission.fromConfig({ read: "allow", external_directory: { "*": "ask", [path.join(FSUtil.normalizePath(os.tmpdir()), "dag-*", "*")]: "allow" } })
   const session = Layer.mock(Session.Service, {
+    getPart: () => Effect.succeed(undefined),
     get: (id) => Effect.succeed({ id, permission: permissions.get(id) ?? parentPermissions, agent: "build" } as never),
     create: (input) =>
       Effect.sync(() => {

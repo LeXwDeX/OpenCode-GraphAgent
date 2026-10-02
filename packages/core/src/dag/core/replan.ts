@@ -99,7 +99,6 @@ export function planReplan(
 
   const currentStateById = new Map(current.nodes.map((n) => [n.id, n]))
   const fragmentNodeById = new Map(fragment.nodes.map((n) => [n.id, n]))
-  const fragmentIds = new Set(fragment.nodes.map((n) => n.id))
 
   // 1. Validate fragment-internal consistency: duplicate ids, restart/cancel
   //    mutual exclusion, and restart/cancel on ids that don't exist in the
@@ -135,94 +134,12 @@ export function planReplan(
     }
   }
 
-  // 2. Validate fragment depends_on references: each must resolve to a node that
-  //    exists in EITHER the current graph OR the fragment (a fragment node may
-  //    depend on another fragment node or on a surviving current node).
-  const survivingIds = new Set<string>()
-  for (const n of current.nodes) {
-    // A current node survives unless it's pending-and-not-in-fragment or cancelled.
-    const frag = fragmentNodeById.get(n.id)
-    if (frag?.cancel) continue // explicitly cancelled
-    if (isNodeTerminalStatus(n.status)) {
-      survivingIds.add(n.id) // terminal survives (immutable)
-      continue
-    }
-    if (n.status === NodeStatus.PENDING && !fragmentIds.has(n.id)) continue // superseded
-    survivingIds.add(n.id)
-  }
-  for (const fragNode of fragment.nodes) {
-    const existing = currentStateById.get(fragNode.id)
-    if (existing && isNodeTerminalStatus(existing.status)) continue // ignored
-    if (fragNode.cancel) continue
-    survivingIds.add(fragNode.id) // fragment nodes survive (added/replaced/restarted)
-  }
-  for (const fragNode of fragment.nodes) {
-    const existing = currentStateById.get(fragNode.id)
-    if (existing && isNodeTerminalStatus(existing.status)) continue // ignored, skip ref check
-    if (fragNode.cancel) continue
-    for (const depId of fragNode.depends_on) {
-      if (!survivingIds.has(depId)) {
-        errors.push(
-          `Node "${fragNode.id}" depends on "${depId}" which is not present after merge (the dep was cancelled, superseded, or never existed)`,
-        )
-      }
-    }
-  }
-
   if (errors.length > 0) {
     return { errors, cancel, restart, replace, add, ignore, mergedGraph: new DependencyGraph() }
   }
 
-  // 3. Build the merged graph and check it's acyclic. The merged graph contains
-  //    every surviving node with its POST-merge dependencies.
-  const mergedGraph = new DependencyGraph()
-  for (const id of survivingIds) mergedGraph.addNode(id)
-
-  // Apply edges: terminal + running-unchanged nodes keep their current deps;
-  // pending-replaced + added + restarted nodes take the fragment's deps.
-  // addEdge throws CycleError on a cycle — catch it and report as a validation
-  // error rather than propagating (replan rejection, not a crash).
-  const tryAddEdge = (from: string, to: string) => {
-    try {
-      if (mergedGraph.hasNode(from) && mergedGraph.hasNode(to)) mergedGraph.addEdge(from, to)
-    } catch (e) {
-      if (e instanceof CycleError) {
-        errors.push(`Merged graph contains a cycle: ${e.cycle.join(" -> ")}`)
-        return
-      }
-      throw e
-    }
-  }
-  for (const n of current.nodes) {
-    if (!survivingIds.has(n.id)) continue
-    const frag = fragmentNodeById.get(n.id)
-    // P1a: the CHECK graph must equal the proposed post-merge graph. A running
-    // node present without a restart marker is classified as replaced, so it
-    // takes the fragment's deps here. The host rejects changed admitted deps
-    // before applying this plan; keeping the proposed edge here also makes this
-    // config-free planner safe for every caller. Terminal nodes are immutable.
-    const deps = frag && !isNodeTerminalStatus(n.status) ? frag.depends_on : n.depends_on
-    for (const depId of deps) tryAddEdge(n.id, depId)
-  }
-  for (const fragNode of fragment.nodes) {
-    if (currentStateById.has(fragNode.id)) continue // handled above
-    for (const depId of fragNode.depends_on) tryAddEdge(fragNode.id, depId)
-  }
-
-  if (errors.length > 0) {
-    return { errors, cancel, restart, replace, add, ignore, mergedGraph }
-  }
-
-  // Defensive: addEdge's wouldCreateCycle pre-check catches direct cycles, but
-  // a multi-edge insertion could still leave a cycle if edges were added in an
-  // order that bypassed the pre-check. Verify explicitly.
-  if (mergedGraph.hasCycle()) {
-    const cycle = mergedGraph.findCycles()[0] ?? []
-    errors.push(`Merged graph contains a cycle: ${cycle.join(" -> ")}`)
-    return { errors, cancel, restart, replace, add, ignore, mergedGraph }
-  }
-
-  // 4. Classify each node into the plan buckets.
+  // 2. Classify once; dependency validation and the merged graph must use
+  //    exactly the same cancellation decisions as the host applies.
   for (const n of current.nodes) {
     const frag = fragmentNodeById.get(n.id)
     if (frag?.cancel) {
@@ -255,6 +172,72 @@ export function planReplan(
   for (const fragNode of fragment.nodes) {
     if (!currentStateById.has(fragNode.id)) add.push(fragNode.id)
   }
+  // 3. Resolve the effective dependencies from the same classified plan.
+  const cancelledIds = new Set(cancel)
+  const survivingIds = new Set([
+    ...current.nodes.filter((node) => !cancelledIds.has(node.id)).map((node) => node.id),
+    ...add,
+  ])
+  const mergedDependencies = new Map<string, string[]>()
+  for (const id of survivingIds) {
+    const existing = currentStateById.get(id)
+    const frag = fragmentNodeById.get(id)
+    const terminal = existing !== undefined && isNodeTerminalStatus(existing.status)
+    const deps = terminal ? existing.depends_on : frag?.depends_on ?? existing!.depends_on
+    mergedDependencies.set(id, deps)
+    // Terminal outputs are immutable evidence. Historical dependencies no
+    // longer schedule work and may refer to superseded nodes. Every dependency
+    // of a node that can still execute, including an omitted running survivor,
+    // must resolve in the actual post-merge graph.
+    if (terminal) continue
+    for (const depId of deps) {
+      if (!survivingIds.has(depId)) {
+        errors.push(
+          `Node "${id}" depends on "${depId}" which is not present after merge (the dep was cancelled, superseded, or never existed)`,
+        )
+      }
+    }
+  }
 
+  if (errors.length > 0) {
+    return { errors, cancel, restart, replace, add, ignore, mergedGraph: new DependencyGraph() }
+  }
+
+  // 4. Build the merged graph and check it's acyclic. The merged graph contains
+  //    every surviving node with its POST-merge dependencies.
+  const mergedGraph = new DependencyGraph()
+  for (const id of survivingIds) mergedGraph.addNode(id)
+
+  // Apply edges: terminal + running-unchanged nodes keep their current deps;
+  // pending-replaced + added + restarted nodes take the fragment's deps.
+  // addEdge throws CycleError on a cycle — catch it and report as a validation
+  // error rather than propagating (replan rejection, not a crash).
+  const tryAddEdge = (from: string, to: string) => {
+    try {
+      if (mergedGraph.hasNode(from) && mergedGraph.hasNode(to)) mergedGraph.addEdge(from, to)
+    } catch (e) {
+      if (e instanceof CycleError) {
+        errors.push(`Merged graph contains a cycle: ${e.cycle.join(" -> ")}`)
+        return
+      }
+      throw e
+    }
+  }
+  for (const [id, deps] of mergedDependencies) {
+    for (const depId of deps) tryAddEdge(id, depId)
+  }
+
+  if (errors.length > 0) {
+    return { errors, cancel, restart, replace, add, ignore, mergedGraph }
+  }
+
+  // Defensive: addEdge's wouldCreateCycle pre-check catches direct cycles, but
+  // a multi-edge insertion could still leave a cycle if edges were added in an
+  // order that bypassed the pre-check. Verify explicitly.
+  if (mergedGraph.hasCycle()) {
+    const cycle = mergedGraph.findCycles()[0] ?? []
+    errors.push(`Merged graph contains a cycle: ${cycle.join(" -> ")}`)
+    return { errors, cancel, restart, replace, add, ignore, mergedGraph }
+  }
   return { errors, cancel, restart, replace, add, ignore, mergedGraph }
 }

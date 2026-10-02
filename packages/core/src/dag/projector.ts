@@ -304,6 +304,8 @@ export const layer = Layer.effectDiscard(
           status: "running",
           child_session_id: event.data.childSessionID,
           captured_output: null,
+          captured_output_present: false,
+          captured_snapshot_id: null,
           started_at: toMillis(event.data.timestamp),
           deadline_ms: event.data.deadlineMs ?? null,
           wake_eligible: event.data.wakeEligible ?? false,
@@ -338,7 +340,7 @@ export const layer = Layer.effectDiscard(
         .set({
           status: "completed",
           output: event.data.output,
-          ...(event.data.capturedOutput !== undefined ? { captured_output: event.data.capturedOutput } : {}),
+          ...(event.data.capturedOutput !== undefined ? { captured_output: event.data.capturedOutput, captured_output_present: true } : {}),
           completed_at: toMillis(event.data.timestamp),
           // Q1: a terminal node is no longer awaiting adjudication — clear the
           // escalation flag. Its result is delivered via the wake_reported

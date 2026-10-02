@@ -68,6 +68,13 @@ afterEach(async () => {
 })
 
 describe("tool.registry", () => {
+  it.instance("registers agent messaging as a built-in tool", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      expect(yield* registry.ids()).toContain("agent")
+    }),
+  )
+
   it.instance("registers memory_search as a built-in tool", () =>
     Effect.gen(function* () {
       const registry = yield* ToolRegistry.Service

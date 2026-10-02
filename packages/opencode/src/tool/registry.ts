@@ -20,6 +20,8 @@ import { WriteTool } from "./write"
 import { InvalidTool } from "./invalid"
 import { SkillTool } from "./skill"
 import { WorkflowTool } from "./workflow"
+import { AgentTool } from "./agent"
+import { DagAgentMessages } from "@/dag/agent-messages"
 import { SubmitResultTool } from "./submit_result"
 import { Dag } from "@/dag/dag"
 import * as Tool from "./tool"
@@ -136,6 +138,7 @@ export const layer = Layer.effect(
     const patchtool = yield* ApplyPatchTool
     const skilltool = yield* SkillTool
     const workflow = yield* WorkflowTool
+    const agentTool = yield* AgentTool
     const submitResult = yield* SubmitResultTool
     const agent = yield* Agent.Service
 
@@ -244,6 +247,7 @@ export const layer = Layer.effect(
           skill: Tool.init(skilltool),
           patch: Tool.init(patchtool),
           workflow: Tool.init(workflow),
+          agent: Tool.init(agentTool),
           submitResult: Tool.init(submitResult),
           question: Tool.init(question),
           lsp: Tool.init(lsptool),
@@ -270,6 +274,7 @@ export const layer = Layer.effect(
             tool.skill,
             tool.patch,
             tool.workflow,
+            tool.agent,
             tool.submitResult,
             ...(flags.experimentalLspTool ? [tool.lsp] : []),
             ...(flags.experimentalPlanMode && flags.client === "cli" ? [tool.plan] : []),
@@ -413,6 +418,7 @@ export const defaultLayer = Layer.suspend(() =>
       Layer.provide(Ripgrep.defaultLayer),
       Layer.provide(EventV2Bridge.defaultLayer),
       Layer.provide(Dag.defaultLayer),
+      Layer.provide(DagAgentMessages.defaultLayer),
       Layer.provide(FetchHttpClient.layer),
       Layer.provide(Format.defaultLayer),
       Layer.provide(CrossSpawnSpawner.defaultLayer),
@@ -519,6 +525,7 @@ export const node = LayerNode.make(layer.pipe(Layer.provide(Ripgrep.defaultLayer
   Database.node,
   SettingsHook.node,
   Dag.node,
+  DagAgentMessages.node,
 ])
 
 export * as ToolRegistry from "./registry"

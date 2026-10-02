@@ -116,6 +116,7 @@ function leaseLifecycleLayer(input: { childPrompts: Queue.Queue<ChildPromptGate>
   const childTitles = new Map<string, string>()
   const created: string[] = []
   const session = Layer.mock(Session.Service, {
+    getPart: () => Effect.succeed(undefined),
     get: (sessionID) =>
       sessionID === "ses_child_ghost"
         ? // Simulated session-store DEFECT: a die passes through the checker's

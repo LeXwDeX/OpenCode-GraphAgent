@@ -36,6 +36,7 @@ function orphanRecoveryLayer(input: { promptCalls: string[] }) {
   )
   const base = Layer.mergeAll(database, events, bridge, store, projector, dag, status)
   const session = Layer.mock(Session.Service, {
+    getPart: () => Effect.succeed(undefined),
     create: Effect.fn("test.Session.create")((_value?: unknown) =>
       Effect.sync(() => ({}) as never),
     ),

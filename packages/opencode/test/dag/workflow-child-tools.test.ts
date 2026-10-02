@@ -31,6 +31,12 @@ const taskDefinition: Tool.Def<typeof Parameters> = {
   parameters: Parameters,
   execute: () => Effect.succeed({ title: "task", output: "started", metadata: {} }),
 }
+const agentDefinition: Tool.Def<typeof Parameters> = {
+  id: "agent",
+  description: "agent",
+  parameters: Parameters,
+  execute: () => Effect.succeed({ title: "agent", output: "queued", metadata: {} }),
+}
 const trigger: Plugin.Interface["trigger"] = (_name, _input, output) => Effect.succeed(output)
 const it = testEffect(
   Layer.mergeAll(
@@ -44,11 +50,12 @@ const it = testEffect(
     Layer.mock(Permission.Service, { ask: () => Effect.void }),
     Layer.mock(MCP.Service, { clients: () => Effect.succeed({}), tools: () => Effect.succeed({}) }),
     Layer.mock(ToolRegistry.Service, {
-      tools: () => Effect.succeed([workflowDefinition, taskDefinition]),
+      tools: () => Effect.succeed([workflowDefinition, taskDefinition, agentDefinition]),
       registrations: () =>
         Effect.succeed([
           { definition: workflowDefinition, sourceKind: "host-builtin", registrationID: "test:workflow" },
           { definition: taskDefinition, sourceKind: "host-builtin", registrationID: "test:task" },
+          { definition: agentDefinition, sourceKind: "host-builtin", registrationID: "test:agent" },
         ]),
     }),
   ),
@@ -66,6 +73,8 @@ describe("workflow child boundary", () => {
       expect(parentTools).toEqual(expect.arrayContaining(["workflow", "task"]))
       expect(childTools).not.toContain("workflow")
       expect(childTools).not.toContain("task")
+      expect(parentTools).toContain("agent")
+      expect(childTools).toContain("agent")
     }),
   )
 })

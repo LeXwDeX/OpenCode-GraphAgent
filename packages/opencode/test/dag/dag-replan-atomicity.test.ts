@@ -4,7 +4,7 @@ import { eq } from "drizzle-orm"
 import { Database } from "@opencode-ai/core/database/database"
 import { DagProjector } from "@opencode-ai/core/dag/projector"
 import { DagStore } from "@opencode-ai/core/dag/store"
-import { WorkflowTable } from "@opencode-ai/core/dag/sql"
+import { WorkflowNodeTable, WorkflowTable } from "@opencode-ai/core/dag/sql"
 import { EventV2 } from "@opencode-ai/core/event"
 import { Project } from "@opencode-ai/core/project"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
@@ -144,6 +144,35 @@ function setup() {
 describe("Dag.replan atomic transaction (DAG-A03)", () => {
   const probe: BatchProbe = { failAtConfig: true }
   const it = testEffect(atomicLayer(probe))
+
+  for (const status of ["queued", "paused"] as const) {
+    it.live(`rejects a dependency on an omitted ${status} node before any durable mutation`, () =>
+      Effect.gen(function* () {
+        probe.failAtConfig = false
+        yield* setup()
+        const dag = yield* Dag.Service
+        const store = yield* DagStore.Service
+        const database = yield* Database.Service
+        const dagID = yield* dag.create({
+          projectID,
+          sessionID: SessionID.make("ses_parent"),
+          title: "Dependency closure",
+          config: { name: "dependency-closure", nodes: [node("old", "Existing task")] },
+        })
+        // Seed the admission/pause snapshot under review; the test exercises
+        // the host's durable replan boundary, not those earlier transitions.
+        yield* database.db.update(WorkflowNodeTable).set({ status }).where(eq(WorkflowNodeTable.workflow_id, dagID)).run()
+        const before = { workflow: yield* store.getWorkflow(dagID), nodes: yield* store.getNodes(dagID) }
+        const result = yield* dag.replan(dagID, {
+          nodes: [{ ...node("new", "Must wait for old"), depends_on: ["old"] }],
+        }).pipe(Effect.result)
+        expect(result._tag).toBe("Failure")
+        if (result._tag === "Failure") expect(result.failure.message).toContain('depends on "old"')
+        expect({ workflow: yield* store.getWorkflow(dagID), nodes: yield* store.getNodes(dagID) }).toEqual(before)
+        expect(yield* store.getNode(dagID, "new")).toBeUndefined()
+      }).pipe(Effect.provideService(InstanceRef, instance)),
+    )
+  }
 
   it.live("rolls back recovery revision, superseded history, new attempts, and events as one batch", () =>
     Effect.gen(function* () {

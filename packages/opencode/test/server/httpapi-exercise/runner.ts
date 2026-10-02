@@ -6,6 +6,7 @@ import { ProjectTable } from "@opencode-ai/core/project/sql"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
+import { DagMessages } from "@opencode-ai/core/dag/messages"
 import { Cause, Duration, Effect, Layer, Scope } from "effect"
 import { TestLLMServer } from "../../lib/llm-server"
 
@@ -194,6 +195,7 @@ function withContext<A, E>(
           tuiRequest: (request) => Effect.sync(() => modules.Tui.submitTuiRequest(request)),
           dag: (input) => run(createDagFixture(input.sessionID, input.title, input.nodes)),
           dagFailNode: (dagID, nodeID, reason, errorClass) => run(failDagNodeFixture(dagID, nodeID, reason, errorClass)),
+          dagAgentMessage: (dagID, nodeID, ownerSessionID) => run(seedDagAgentMessage(dagID, nodeID, ownerSessionID)),
           foreignDag: (input) => run(createForeignDagFixture(input.title, input.nodes)),
         }
         yield* trace(options, scenario, `${label} seed start`)
@@ -317,6 +319,33 @@ function failDagNodeFixture(dagID: string, nodeID: string, reason: string, error
     const modules = yield* Effect.promise(() => runtime())
     const dag = yield* modules.Dag.Service
     yield* dag.nodeFailed(dagID, nodeID, reason, errorClass).pipe(Effect.orDie)
+  })
+}
+
+function seedDagAgentMessage(dagID: string, nodeID: string, ownerSessionID: SessionID) {
+  return Effect.gen(function* () {
+    const modules = yield* Effect.promise(() => runtime())
+    const dag = yield* modules.Dag.Service
+    const sessions = yield* modules.Session.Service
+    const messages = yield* DagMessages.Service
+    const instance = (yield* modules.InstanceRef)!
+    const child = yield* sessions.create({ parentID: ownerSessionID, title: "HTTP agent message recipient" })
+    yield* dag.nodeQueued(dagID, nodeID).pipe(Effect.orDie)
+    yield* dag.nodeStarted(dagID, nodeID, child.id).pipe(Effect.orDie)
+    const caller = { projectID: instance.project.id, directory: instance.directory, sessionID: ownerSessionID }
+    const endpoint = yield* messages.resolve(caller, dagID, nodeID)
+    if (!endpoint.ok) {
+      yield* Effect.die(new Error(`message fixture endpoint rejected: ${endpoint.reason}`))
+      return
+    }
+    const accepted = yield* messages.send(caller, {
+      workflowID: dagID,
+      nodeID,
+      attemptID: endpoint.value.attemptID,
+      idempotencyKey: "httpapi-message",
+      content: "HTTP_MESSAGE_BODY_PRIVATE",
+    })
+    if (!accepted.ok) yield* Effect.die(new Error(`message fixture rejected: ${accepted.reason}`))
   })
 }
 
