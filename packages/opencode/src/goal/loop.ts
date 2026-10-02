@@ -31,13 +31,7 @@ export class Service extends Context.Service<Service, Interface>()("@opencode/Go
  * (continue→done) with no network or Provider credentials. Production never
  * provides it, so the Provider path is byte-for-byte unchanged.
  */
-export type JudgeCallLLM = (opts: {
-  system: string
-  user: string
-  temperature: number
-  maxTokens: number
-  timeout: number
-}) => Effect.Effect<string, Error>
+export type JudgeCallLLM = GoalJudge.CallLLM
 
 export interface GoalLoopJudgeLLMInterface {
   readonly call: JudgeCallLLM
@@ -135,8 +129,7 @@ const serviceLayer = Layer.effect(
 
     const pauseGoal = Effect.fnUntraced(function* (sessionID: SessionID, reason: string) {
       const paused = yield* goal.pauseAndPublish(sessionID, reason)
-      if (paused)
-        yield* automation.unregister(sessionID, { kind: "goal", id: paused.goal_id ?? "legacy" })
+      if (paused) yield* automation.unregister(sessionID, { kind: "goal", id: paused.goal_id ?? "legacy" })
       return paused
     })
 
@@ -211,9 +204,7 @@ const serviceLayer = Layer.effect(
         // log an error and skip the scan. The idle subscription above stays
         // armed either way, so the event-driven path is unaffected.
         if (!scanDirectoryRef.current) {
-          yield* Effect.logError(
-            "goal startup scan skipped: instance directory not resolved before state build",
-          )
+          yield* Effect.logError("goal startup scan skipped: instance directory not resolved before state build")
           return {}
         }
         const snapshot = yield* goal.listActiveSessions(scanDirectoryRef.current).pipe(
@@ -316,9 +307,9 @@ const serviceLayer = Layer.effect(
         const hasAssistant = probeMsgs.some((m) => m.info.role === "assistant")
         if (isStaleZombie(goalState, hasAssistant)) {
           yield* pauseGoal(
-              sessionID,
-              `initial kick produced no assistant response within ${GoalPrompts.FRESHNESS_THRESHOLD / 1000}s — likely provider error or model refusal. Use /goal resume to retry.`,
-            ).pipe(Effect.ignore)
+            sessionID,
+            `initial kick produced no assistant response within ${GoalPrompts.FRESHNESS_THRESHOLD / 1000}s — likely provider error or model refusal. Use /goal resume to retry.`,
+          ).pipe(Effect.ignore)
           return
         }
       }
@@ -341,7 +332,9 @@ const serviceLayer = Layer.effect(
         // guard window. Pause visibly instead of silently stalling.
         const pauseMsg = "近期消息中无 assistant 回复，目标已暂停。使用 /goal resume 重试。"
         yield* pauseGoal(sessionID, pauseMsg).pipe(Effect.ignore)
-        yield* promptSvc.prompt({ sessionID, noReply: true, parts: [{ type: "text", text: `⏸ 目标已暂停 — ${pauseMsg}` }] }).pipe(Effect.ignore)
+        yield* promptSvc
+          .prompt({ sessionID, noReply: true, parts: [{ type: "text", text: `⏸ 目标已暂停 — ${pauseMsg}` }] })
+          .pipe(Effect.ignore)
         return
       }
       // GOAL-01: on a boundary-gate hit the judge call and its commit are
@@ -377,6 +370,14 @@ const serviceLayer = Layer.effect(
                     const small = yield* provider.getSmallModel(defaultM.providerID)
                     const model = small ?? (yield* provider.getModel(defaultM.providerID, defaultM.modelID))
                     const language = yield* provider.getLanguage(model)
+                    yield* Effect.logInfo("goal judge request", {
+                      sessionID,
+                      "goal.judge.provider_id": model.providerID,
+                      "goal.judge.model_id": model.id,
+                      "goal.judge.attempt": opts.attempt,
+                      "goal.judge.max_output_tokens": opts.maxTokens,
+                      "goal.judge.timeout_seconds": opts.timeout,
+                    })
                     const result = yield* Effect.tryPromise({
                       try: (signal) =>
                         generateText({
@@ -385,14 +386,27 @@ const serviceLayer = Layer.effect(
                           prompt: opts.user,
                           temperature: opts.temperature,
                           maxOutputTokens: opts.maxTokens,
+                          maxRetries: 0,
                           abortSignal: signal,
                         }),
-                      catch: (e) => new Error(`judge LLM call failed: ${String(e)}`),
+                      catch: (e) => (e instanceof Error ? e : new Error("judge LLM call failed")),
                     }).pipe(Effect.timeout(`${opts.timeout} seconds`))
-                    return result.text
+                    return {
+                      text: result.text,
+                      finishReason: result.finishReason,
+                      outputTokens: result.usage.outputTokens,
+                      reasoningTokens: result.usage.reasoningTokens,
+                      sessionID,
+                      providerID: model.providerID,
+                      modelID: model.id,
+                    }
                   })),
             )
-          : { verdict: "continue" as const, reason: "上一轮无文本输出（纯工具调用），跳过判定直接继续", parseFailed: false }
+          : {
+              verdict: "continue" as const,
+              reason: "上一轮无文本输出（纯工具调用），跳过判定直接继续",
+              parseFailed: false,
+            }
 
         const updateResult = Option.getOrUndefined(
           yield* automation
@@ -442,18 +456,20 @@ const serviceLayer = Layer.effect(
             // swallow it silently — log it so a lost confirmation is
             // diagnosable. No retry: a retried prompt could re-inject a "done"
             // line after the goal was re-created.
-            yield* promptSvc.prompt({
-              sessionID,
-              noReply: true,
-              parts: [{ type: "text", text: updateResult.message }],
-            }).pipe(
-              Effect.catchCause((cause) =>
-                Effect.logWarning("goal done message delivery failed", {
-                  sessionID,
-                  cause: Cause.pretty(cause),
-                }),
-              ),
-            )
+            yield* promptSvc
+              .prompt({
+                sessionID,
+                noReply: true,
+                parts: [{ type: "text", text: updateResult.message }],
+              })
+              .pipe(
+                Effect.catchCause((cause) =>
+                  Effect.logWarning("goal done message delivery failed", {
+                    sessionID,
+                    cause: Cause.pretty(cause),
+                  }),
+                ),
+              )
           } else {
             // Auto-pause branch: updateAfterJudge paused the goal due to
             // judge-parse-failure or budget exhaustion (verdict.verdict is
@@ -464,18 +480,20 @@ const serviceLayer = Layer.effect(
             // Emit it as a noReply part so it shows up without spawning a new
             // agent turn; the fiber then naturally terminates (no clearFiber
             // needed, see updateAfterJudge).
-            yield* promptSvc.prompt({
-              sessionID,
-              noReply: true,
-              parts: [{ type: "text", text: updateResult.message }],
-            }).pipe(
-              Effect.catchCause((cause) =>
-                Effect.logWarning("goal pause message delivery failed", {
-                  sessionID,
-                  cause: Cause.pretty(cause),
-                }),
-              ),
-            )
+            yield* promptSvc
+              .prompt({
+                sessionID,
+                noReply: true,
+                parts: [{ type: "text", text: updateResult.message }],
+              })
+              .pipe(
+                Effect.catchCause((cause) =>
+                  Effect.logWarning("goal pause message delivery failed", {
+                    sessionID,
+                    cause: Cause.pretty(cause),
+                  }),
+                ),
+              )
           }
           return
         }
@@ -553,45 +571,49 @@ const serviceLayer = Layer.effect(
         }
         yield* admitted.value
       }).pipe(
-          Effect.catchCause((cause) =>
-            Effect.gen(function* () {
-              // F1: Only pause for non-interrupt causes. An interrupt (user
-              // pressed ESC during continuation) is safe to drop because
-              // SessionPrompt.cancel pauses goal-driven turns SYNCHRONOUSLY via
-              // goal.pauseForUserCancel (prompt.ts) BEFORE state.cancel lets the
-              // interrupt propagate — by the time this catchCause observes the
-              // cause, the goal is already paused, and pausing again HERE would
-              // double-publish. The session still ALWAYS re-emits idle
-              // afterwards, which re-drives this loop: SessionRunState.cancel
-              // (run-state.ts) and the runner's onIdle callback both call
-              // status.set(idle), and SessionStatus.set (status.ts) publishes
-              // the Status+Idle event pair unconditionally — even when the
-              // session was already idle. On that next cycle shouldPreempt is
-              // only the DB-failure fallback for a pauseForUserCancel that could
-              // not persist. Real dispatch failures (provider fault, session
-              // write error) still get the recoverable pause below.
-              // F1: hasInterrupts is a structural check; Cause.interruptors only
-              // collects DEFINED fiber ids and silently ignores interrupts
-              // carrying none (e.g. Cause.interrupt()), which would otherwise be
-              // misclassified as a dispatch failure and spuriously paused here.
-              if (Cause.hasInterrupts(cause)) {
-                yield* Effect.logInfo("goal continuation interrupted (likely user ESC) — not pausing; cancel path already paused the goal")
-                return Option.none()
-              }
-              const errMsg = `continuation dispatch failed: ${Cause.pretty(cause)}`
-              yield* Effect.logWarning("goal continuation dispatch failed", { error: Cause.pretty(cause) })
-              // GOAL-FP-01-12: symmetric with every other pause site — the
-              // unregister must be part of the failure transition, not
-              // deferred to the trailing afterDispatch load (which a defect or
-              // a concurrent replacement can skip, leaking the registration
-              // until /goal clear). pauseGoal keeps the fiber-safe
-              // pauseAndPublish (goal.pause would clearFiber — us —
-              // mid-publish) and releases the lease registration inline.
-              yield* pauseGoal(sessionID, errMsg).pipe(Effect.ignore)
-              yield* promptSvc.prompt({ sessionID, noReply: true, parts: [{ type: "text", text: `⏸ 目标已暂停 — ${errMsg}` }] }).pipe(Effect.ignore)
+        Effect.catchCause((cause) =>
+          Effect.gen(function* () {
+            // F1: Only pause for non-interrupt causes. An interrupt (user
+            // pressed ESC during continuation) is safe to drop because
+            // SessionPrompt.cancel pauses goal-driven turns SYNCHRONOUSLY via
+            // goal.pauseForUserCancel (prompt.ts) BEFORE state.cancel lets the
+            // interrupt propagate — by the time this catchCause observes the
+            // cause, the goal is already paused, and pausing again HERE would
+            // double-publish. The session still ALWAYS re-emits idle
+            // afterwards, which re-drives this loop: SessionRunState.cancel
+            // (run-state.ts) and the runner's onIdle callback both call
+            // status.set(idle), and SessionStatus.set (status.ts) publishes
+            // the Status+Idle event pair unconditionally — even when the
+            // session was already idle. On that next cycle shouldPreempt is
+            // only the DB-failure fallback for a pauseForUserCancel that could
+            // not persist. Real dispatch failures (provider fault, session
+            // write error) still get the recoverable pause below.
+            // F1: hasInterrupts is a structural check; Cause.interruptors only
+            // collects DEFINED fiber ids and silently ignores interrupts
+            // carrying none (e.g. Cause.interrupt()), which would otherwise be
+            // misclassified as a dispatch failure and spuriously paused here.
+            if (Cause.hasInterrupts(cause)) {
+              yield* Effect.logInfo(
+                "goal continuation interrupted (likely user ESC) — not pausing; cancel path already paused the goal",
+              )
               return Option.none()
-            }),
-          ),
+            }
+            const errMsg = `continuation dispatch failed: ${Cause.pretty(cause)}`
+            yield* Effect.logWarning("goal continuation dispatch failed", { error: Cause.pretty(cause) })
+            // GOAL-FP-01-12: symmetric with every other pause site — the
+            // unregister must be part of the failure transition, not
+            // deferred to the trailing afterDispatch load (which a defect or
+            // a concurrent replacement can skip, leaking the registration
+            // until /goal clear). pauseGoal keeps the fiber-safe
+            // pauseAndPublish (goal.pause would clearFiber — us —
+            // mid-publish) and releases the lease registration inline.
+            yield* pauseGoal(sessionID, errMsg).pipe(Effect.ignore)
+            yield* promptSvc
+              .prompt({ sessionID, noReply: true, parts: [{ type: "text", text: `⏸ 目标已暂停 — ${errMsg}` }] })
+              .pipe(Effect.ignore)
+            return Option.none()
+          }),
+        ),
       )
       const afterDispatch = yield* goal.load(sessionID)
       if (!afterDispatch || afterDispatch.status !== "active") {
