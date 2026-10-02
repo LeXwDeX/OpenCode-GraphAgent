@@ -614,13 +614,22 @@ export function spawnNode(
             const claim = revision.ok
               ? yield* messageService.value.claimResultNudge(caller, revision.value.accepted)
               : revision
-            if (claim.ok && claim.value === true) return true
+            if (claim.ok && claim.value) return true
+            if (!claim.ok && claim.reason === "stale_input")
+              return yield* new Dag.StaleMessageInputError({
+                dagID: input.dagID,
+                nodeID: input.nodeID,
+                reason: claim.reason,
+              })
             yield* dag.nodeFailed(
               input.dagID,
               input.nodeID,
               `structured result resubmission was not admitted: ${claim.ok ? "resubmission already requested" : claim.reason}`,
               "exec_failed",
-              settlementAttempt,
+              {
+                ...settlementAttempt,
+                ...(claim.ok && revision.ok ? { expectedAcceptedRevision: revision.value.accepted } : {}),
+              },
             )
             return false
           })
@@ -848,24 +857,29 @@ export function spawnNode(
               )
               break
             }
-            if (input.outputSchema && revisions?.ok && revisions.value.queued === 0 && !(yield* claimResubmission))
-              break
-            result =
-              input.outputSchema && revisions?.ok && revisions.value.queued === 0
-                ? yield* promptSvc.prompt({
-                    messageID: MessageID.ascending(),
-                    sessionID: childSession.id,
-                    model,
-                    agent: agent.name,
-                    ...(input.variant ? { variant: input.variant } : {}),
-                    parts: [
-                      {
-                        type: "text",
-                        text: "Runtime continuation: the earlier structured result belongs to an older input snapshot. Review the recorded agent messages and submit an updated result. Keep completed tool evidence and do not repeat completed writes.",
-                      },
-                    ],
-                  })
-                : yield* promptSvc.loop({ sessionID: childSession.id })
+            let nudge = !!(input.outputSchema && revisions?.ok && revisions.value.queued === 0)
+            if (nudge) {
+              const admitted = yield* claimResubmission.pipe(
+                Effect.catchIf(isStaleMessageInput, () => Effect.succeed(undefined)),
+              )
+              if (admitted === false) break
+              nudge = admitted === true
+            }
+            result = nudge
+              ? yield* promptSvc.prompt({
+                  messageID: MessageID.ascending(),
+                  sessionID: childSession.id,
+                  model,
+                  agent: agent.name,
+                  ...(input.variant ? { variant: input.variant } : {}),
+                  parts: [
+                    {
+                      type: "text",
+                      text: "Runtime continuation: the earlier structured result belongs to an older input snapshot. Review the recorded agent messages and submit an updated result. Keep completed tool evidence and do not repeat completed writes.",
+                    },
+                  ],
+                })
+              : yield* promptSvc.loop({ sessionID: childSession.id })
           }
         }).pipe(Effect.ensuring(semaphore.release(1)))
       }).pipe(

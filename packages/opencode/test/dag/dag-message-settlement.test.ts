@@ -154,6 +154,67 @@ describe("message settlement through durable DAG events", () => {
           expect(message.reason).toBe("exec_failed")
         }),
       ))
+  for (const ordering of ["accept-before-claim", "accept-after-spent-claim"] as const)
+    test(`new input winning retry exhaustion continues recovered child: ${ordering}`, async () =>
+      run(
+        Effect.gen(function* () {
+          yield* seed
+          const dag = yield* Dag.Service
+          const messages = yield* DagMessages.Service
+          const database = yield* Database.Service
+          const old = yield* associate("old-capture")
+          yield* dag.store.setCapturedOutput(child.sessionID, { result: "old" }, old.id)
+          value(yield* accept("already-consumed"))
+          if (ordering === "accept-after-spent-claim") value(yield* messages.claimResultNudge(child, 1))
+          let loops = 0,
+            nudges = 0,
+            injected = false
+          const instrumented: DagMessages.Interface = {
+            ...messages,
+            claimResultNudge: (caller, revision) =>
+              Effect.gen(function* () {
+                if (injected) return yield* messages.claimResultNudge(caller, revision)
+                injected = true
+                if (ordering === "accept-before-claim") value(yield* accept("wins-before-claim"))
+                const claim = yield* messages.claimResultNudge(caller, revision)
+                if (ordering === "accept-after-spent-claim") value(yield* accept("wins-before-failure"))
+                return claim
+              }).pipe(Effect.provideService(DagMessages.Service, messages)),
+          }
+          const prompt = Layer.mock(SessionPrompt.Service, {
+            loop: () =>
+              Effect.gen(function* () {
+                loops++
+                const turn = MessageID.ascending()
+                const snapshot = yield* associate(turn)
+                if (loops > 1)
+                  yield* dag.store.setCapturedOutput(child.sessionID, { result: "new input consumed" }, snapshot.id)
+                return reply(turn, "result")
+              }).pipe(
+                Effect.provideService(DagMessages.Service, messages),
+                Effect.provideService(Database.Service, database),
+              ),
+            prompt: () =>
+              Effect.sync(() => {
+                nudges++
+                return reply(MessageID.ascending(), "unexpected nudge")
+              }),
+          })
+          yield* continueRecoveredMessageNode("dag_messages", "n", {
+            nodes: [{ id: "n", output_schema: { type: "object" } }],
+          }).pipe(Effect.provide(prompt), Effect.provideService(DagMessages.Service, instrumented))
+          expect({ loops, nudges }).toEqual({ loops: 2, nudges: 0 })
+          expect(yield* dag.store.getNode("dag_messages", "n")).toMatchObject({
+            status: "completed",
+            childSessionId: child.sessionID,
+            replanAttempts: 0,
+          })
+          expect(value(yield* messages.receive(child)).map((m) => m.state)).toEqual(["delivered", "delivered"])
+          expect((yield* dag.store.getNode("dag_messages", "n"))?.capturedOutput).toEqual({
+            result: "new input consumed",
+          })
+        }),
+      ))
   test("interrupted resubmission stays bounded when the same attempt is recovered again", async () =>
     run(
       Effect.gen(function* () {

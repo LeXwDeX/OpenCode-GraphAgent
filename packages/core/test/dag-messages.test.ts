@@ -92,6 +92,67 @@ describe("durable DAG agent mailboxes", () => {
       filename,
     )
   })
+  for (const ordering of ["accept-before-claim", "accept-after-spent-claim"] as const)
+    test(`conditional retry exhaustion preserves new input: ${ordering}`, async () =>
+      run(
+        Effect.gen(function* () {
+          yield* seed
+          const messages = yield* DagMessages.Service
+          const { db } = yield* Database.Service
+          value(yield* messages.claimResultNudge(child, 0))
+          if (ordering === "accept-before-claim") value(yield* messages.send(parent, request()))
+          const claim = yield* messages.claimResultNudge(child, 0)
+          expect(claim).toEqual(
+            ordering === "accept-before-claim" ? { ok: false, reason: "stale_input" } : { ok: true, value: false },
+          )
+          if (ordering === "accept-after-spent-claim") value(yield* messages.send(parent, request()))
+          const result = yield* messages.guard(
+            child,
+            {
+              workflowID: "wf",
+              nodeID: "n",
+              attemptID: request().attemptID!,
+              failureReason: "exec_failed",
+              expectedAcceptedRevision: 0,
+            },
+            db.run(sql`UPDATE workflow_node SET status = 'failed' WHERE id = 'n'`).pipe(Effect.orDie),
+          )
+          expect(result).toEqual({ ok: false, reason: "stale_input" })
+          expect(
+            (yield* db.get<{ status: string }>(sql`SELECT status FROM workflow_node WHERE id = 'n'`))?.status,
+          ).toBe("running")
+          expect(value(yield* messages.receive(child))[0].state).toBe("queued")
+        }),
+      ))
+  test("conditional retry exhaustion closes its unchanged revision atomically", async () =>
+    run(
+      Effect.gen(function* () {
+        yield* seed
+        const messages = yield* DagMessages.Service
+        const { db } = yield* Database.Service
+        value(yield* messages.send(parent, request()))
+        value(
+          yield* messages.guard(
+            child,
+            {
+              workflowID: "wf",
+              nodeID: "n",
+              attemptID: request().attemptID!,
+              failureReason: "exec_failed",
+              expectedAcceptedRevision: 1,
+            },
+            db.run(sql`UPDATE workflow_node SET status = 'failed' WHERE id = 'n'`).pipe(Effect.orDie),
+          ),
+        )
+        expect((yield* db.get<{ status: string }>(sql`SELECT status FROM workflow_node WHERE id = 'n'`))?.status).toBe(
+          "failed",
+        )
+        expect(value(yield* messages.receive(child))[0]).toMatchObject({
+          state: "undeliverable",
+          reason: "exec_failed",
+        })
+      }),
+    ))
   test("result nudge claims enforce authority, revision, and persisted stop boundaries", async () =>
     run(
       Effect.gen(function* () {

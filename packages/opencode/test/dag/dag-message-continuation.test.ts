@@ -40,6 +40,7 @@ function reply(text: string): SessionV1.WithParts {
   }
 }
 type Case = {
+  claimRace?: "accept-before-claim" | "accept-after-spent-claim"
   noResubmission?: boolean
   modelDefect?: boolean
   artifactPath?: string
@@ -63,6 +64,8 @@ async function exercise(options: Case = {}) {
     capturedSnapshotID: "old-snapshot",
   })
   let workflow = makeWorkflowRow({ directory: process.cwd() })
+  let accepted = 1
+  let newInputQueued = false
   let nudgeClaimed = false
   let permitReleased = false
   let captureRegistered = false
@@ -115,8 +118,10 @@ async function exercise(options: Case = {}) {
               node = { ...node, status: "completed" }
               events.push({ type: "completed", output })
             }),
-          nodeFailed: (_dag, _node, reason) =>
-            Effect.sync(() => {
+          nodeFailed: (_dag, _node, reason, _trigger, attempt) =>
+            Effect.gen(function* () {
+              if (attempt?.expectedAcceptedRevision !== undefined && attempt.expectedAcceptedRevision !== accepted)
+                yield* new StaleMessageInputError({ dagID: "dag_live", nodeID: "node-1", reason: "stale_input" })
               node = { ...node, status: "failed" }
               events.push({ type: "failed", reason })
             }),
@@ -134,6 +139,13 @@ async function exercise(options: Case = {}) {
     guard,
     claimResultNudge: () =>
       Effect.sync(() => {
+        if (options.claimRace && accepted === 1) {
+          accepted = 2
+          newInputQueued = true
+          return options.claimRace === "accept-before-claim"
+            ? { ok: false as const, reason: "stale_input" as const }
+            : { ok: true as const, value: false }
+        }
         const claimed = !nudgeClaimed
         nudgeClaimed = true
         return { ok: true as const, value: claimed }
@@ -152,17 +164,17 @@ async function exercise(options: Case = {}) {
         },
       }),
     revisions: () =>
-      Effect.succeed({
-        ok: true,
+      Effect.sync(() => ({
+        ok: true as const,
         value: {
           endpoint: { id: "box", kind: "node", sessionID: "ses_child" },
-          accepted: 1,
+          accepted,
           snapshot: 0,
-          queued: options.queued ?? 1,
+          queued: newInputQueued ? 1 : (options.queued ?? 1),
           delivered: 0,
           undeliverable: options.undeliverable ?? 0,
         },
-      }),
+      })),
   })
   const agentLayer = Layer.mock(Agent.Service, {
     get: () =>
@@ -215,6 +227,7 @@ async function exercise(options: Case = {}) {
       }),
   })
   const next = Effect.sync(() => {
+    newInputQueued = false
     if (options.noResubmission) return updated
     node = { ...node, capturedOutput: { result: "updated" }, capturedSnapshotID: "updated-snapshot" }
     return updated
@@ -274,6 +287,12 @@ async function exercise(options: Case = {}) {
 }
 
 describe("live durable message continuation", () => {
+  for (const claimRace of ["accept-before-claim", "accept-after-spent-claim"] as const)
+    test(`new input winning retry exhaustion continues the live child: ${claimRace}`, async () => {
+      const r = await exercise({ structured: true, queued: 0, claimRace })
+      expect(r).toMatchObject({ created: 1, prompts: 1, loops: 1, toolWrites: 1, permitReleased: true })
+      expect(r.events).toEqual([{ type: "completed", output: { result: "updated" } }])
+    })
   test("unchanged structured input permits one resubmission then fails without repeated tools", async () => {
     const r = await exercise({ structured: true, queued: 0, noResubmission: true })
     expect(r).toMatchObject({

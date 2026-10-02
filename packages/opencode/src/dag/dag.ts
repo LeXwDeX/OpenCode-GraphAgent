@@ -54,6 +54,8 @@ export interface NodeExecutionAttempt {
   /** Admission-only config generation; running settlements intentionally omit it. */
   readonly graphRev?: number
   readonly inputSnapshotID?: string
+  /** Revision-dependent failure; newer accepted input wins instead of being closed. */
+  readonly expectedAcceptedRevision?: number
 }
 
 export class StaleMessageInputError extends Schema.TaggedErrorClass<StaleMessageInputError>()(
@@ -1311,10 +1313,15 @@ export const layer = Layer.effect(
           nodeID,
           attemptID: DagMessages.nodeAttemptID(node.childSessionId, node.replanAttempts),
           failureReason: trigger,
+          expectedAcceptedRevision: attempt?.expectedAcceptedRevision,
         },
         commit,
       )
-      if (!guarded.ok) yield* Effect.fail(new TerminalViolationError(nodeID, node.status, "failed"))
+      if (!guarded.ok) {
+        if (guarded.reason === "stale_input")
+          yield* Effect.fail(new StaleMessageInputError({ dagID, nodeID, reason: guarded.reason }))
+        yield* Effect.fail(new TerminalViolationError(nodeID, node.status, "failed"))
+      }
     })
     const nodeSkipped = Effect.fn("Dag.nodeSkipped")(function* (
       lock: WorkflowLock,

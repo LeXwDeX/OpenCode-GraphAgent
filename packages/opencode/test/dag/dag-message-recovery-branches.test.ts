@@ -1,8 +1,9 @@
 import path from "node:path"
 import { tmpdir } from "../fixture/fixture"
 import { describe, expect, test } from "bun:test"
-import { Effect, Layer } from "effect"
-import { Dag, StaleMessageInputError } from "@/dag/dag"
+import { Cause, Effect, Exit, Layer } from "effect"
+import { Dag, StaleMessageInputError, type NodeExecutionAttempt } from "@/dag/dag"
+import { StaleNodeAttemptError, TerminalViolationError } from "@opencode-ai/core/dag/core/types"
 import { DagMessages } from "@opencode-ai/core/dag/messages"
 import { DagStore } from "@opencode-ai/core/dag/store"
 import { continueRecoveredMessageNode } from "@/dag/runtime/recovery"
@@ -50,7 +51,11 @@ function harness(
     text?: string
     userResult?: boolean
     modelError?: boolean
+    loopFault?: "defect" | "interrupt"
     guardStale?: boolean
+    claimRejection?: DagMessages.Rejection["reason"]
+    beforeClaim?: (h: ReturnType<typeof state>) => void
+    beforeFailure?: (h: ReturnType<typeof state>, attempt?: NodeExecutionAttempt) => void
     afterStale?: (h: ReturnType<typeof state>) => void
     afterLoop?: (h: ReturnType<typeof state>) => void
   } = {},
@@ -86,8 +91,30 @@ function harness(
             }
             h.completed.push({ output, attempt })
           }),
-        nodeFailed: (_dag, _node, reason, errorClass) =>
-          Effect.sync(() => {
+        nodeFailed: (_dag, _node, reason, errorClass, attempt) =>
+          Effect.gen(function* () {
+            h.failureAttempts.push({ reason, errorClass, attempt })
+            input.beforeFailure?.(h, attempt)
+            if (
+              attempt &&
+              h.node &&
+              (h.node.childSessionId !== attempt.childSessionID || h.node.replanAttempts !== attempt.replanAttempts)
+            )
+              yield* Effect.fail(
+                new StaleNodeAttemptError("n", attempt, {
+                  childSessionID: h.node.childSessionId,
+                  replanAttempts: h.node.replanAttempts,
+                  nodeSeq: h.node.seq,
+                  graphRev: h.workflow?.graphRev ?? 0,
+                }),
+              )
+            if (h.workflow?.status === "cancelled")
+              yield* Effect.fail(new TerminalViolationError("dag_recovery", "cancelled", "failed"))
+            if (
+              attempt?.expectedAcceptedRevision !== undefined &&
+              attempt.expectedAcceptedRevision !== h.acceptedRevision
+            )
+              yield* new StaleMessageInputError({ dagID: "dag_recovery", nodeID: "n", reason: "stale_input" })
             h.failed.push({ reason, errorClass })
           }),
       }),
@@ -96,18 +123,18 @@ function harness(
   let rejectedReceipt = input.guardStale === true
   const messages = Layer.mock(DagMessages.Service, {
     revisions: () =>
-      Effect.succeed({
+      Effect.sync(() => ({
         ok: true,
         value: {
           endpoint: { id: "box", kind: "node", sessionID: "ses_recovery" },
-          accepted: 1,
+          accepted: h.acceptedRevision,
           snapshot: 1,
           snapshotID: input.latestStop ? snapshot.id : undefined,
           queued: input.queued ?? 0,
           delivered: 1,
           undeliverable: 0,
         },
-      }),
+      })),
     guard: (_caller, _input, commit) => {
       h.guardCalls++
       if (rejectedReceipt) {
@@ -121,6 +148,9 @@ function harness(
       Effect.succeed({ ok: true, value: input.latestStop ? { ...snapshot, stopReason: input.latestStop } : undefined }),
     claimResultNudge: (_caller, revision) =>
       Effect.sync(() => {
+        input.beforeClaim?.(h)
+        if (input.claimRejection) return { ok: false as const, reason: input.claimRejection }
+        if (revision !== h.acceptedRevision) return { ok: false as const, reason: "stale_input" as const }
         const claimed = !h.claimedNudgeRevisions.includes(revision)
         if (claimed) h.claimedNudgeRevisions.push(revision)
         return { ok: true as const, value: claimed }
@@ -148,7 +178,15 @@ function harness(
         if (input.modelError && r.info.role === "assistant")
           r.info.error = { name: "UnknownError", data: { message: "model failed" } }
         return r
-      }),
+      }).pipe(
+        Effect.flatMap((result) =>
+          input.loopFault === "interrupt"
+            ? Effect.interrupt
+            : input.loopFault === "defect"
+              ? Effect.die(new Error("Injected recovered request preparation failure"))
+              : Effect.succeed(result),
+        ),
+      ),
     prompt: () =>
       Effect.sync(() => {
         h.prompts++
@@ -160,15 +198,19 @@ function harness(
         return reply("msg_nudged")
       }),
   })
+  const execution = (
+    config?: Config,
+    directory?: string,
+    authorizeSource?: Parameters<typeof continueRecoveredMessageNode>[4],
+  ) =>
+    continueRecoveredMessageNode("dag_recovery", "n", config, directory, authorizeSource).pipe(
+      Effect.provide(Layer.mergeAll(dag, prompt, ...(input.noMessages ? [] : [messages]))),
+      Effect.scoped,
+    )
   return {
     h,
-    run: (config?: Config, directory?: string, authorizeSource?: Parameters<typeof continueRecoveredMessageNode>[4]) =>
-      Effect.runPromise(
-        continueRecoveredMessageNode("dag_recovery", "n", config, directory, authorizeSource).pipe(
-          Effect.provide(Layer.mergeAll(dag, prompt, ...(input.noMessages ? [] : [messages]))),
-          Effect.scoped,
-        ),
-      ),
+    run: (...args: Parameters<typeof execution>) => Effect.runPromise(execution(...args)),
+    runExit: (...args: Parameters<typeof execution>) => Effect.runPromiseExit(execution(...args)),
   }
 }
 function state(input: {
@@ -235,6 +277,8 @@ function state(input: {
     guardCalls: 0,
     receipts: [] as unknown[],
     claimedNudgeRevisions: [] as number[],
+    acceptedRevision: 1,
+    failureAttempts: [] as { reason: string; errorClass: unknown; attempt?: NodeExecutionAttempt }[],
     stale: input.stale ?? 0,
     completed: [] as { output: unknown; attempt: unknown }[],
     failed: [] as { reason: string; errorClass: unknown }[],
@@ -370,6 +414,108 @@ describe("message recovery continuation admission and settlement branches", () =
     expect(h.completionAttempts).toBe(2)
     expect(h.completed).toEqual([])
     expect(h.failed[0].reason).toContain("resubmission already requested")
+  })
+  for (const reason of ["stopped", "closed"] as const)
+    test(`a ${reason} result-nudge claim terminates recovery without another model call`, async () => {
+      const { h, run } = harness({
+        stale: 1,
+        claimRejection: reason,
+        node: { capturedOutput: "old", capturedOutputPresent: true, capturedSnapshotID: "ags_old" },
+      })
+      await run(structured)
+      expect(h.loops).toBe(1)
+      expect(h.prompts).toBe(0)
+      expect(h.claimedNudgeRevisions).toEqual([])
+      expect(h.completed).toEqual([])
+      expect(h.failed).toMatchObject([{ reason: expect.stringContaining(reason), errorClass: "exec_failed" }])
+      expect(h.failureAttempts[0].attempt).toEqual({ childSessionID: "ses_recovery", replanAttempts: 0 })
+    })
+  test("input accepted during the nudge claim resumes the same child without a resubmission prompt", async () => {
+    const { h, run } = harness({
+      stale: 1,
+      node: { capturedOutput: "old", capturedOutputPresent: true, capturedSnapshotID: "ags_old" },
+      beforeClaim: (h) => {
+        h.acceptedRevision++
+      },
+      afterLoop: (h) => {
+        if (h.loops === 2 && h.node) {
+          h.node.capturedOutput = "updated accepted input"
+          h.node.capturedSnapshotID = "ags_new_input"
+        }
+      },
+    })
+    await run(structured)
+    expect(h.loops).toBe(2)
+    expect(h.prompts).toBe(0)
+    expect(h.claimedNudgeRevisions).toEqual([])
+    expect(h.failed).toEqual([])
+    expect(h.completed).toMatchObject([{ output: "updated accepted input" }])
+  })
+  test("new input wins over a spent-nudge failure at its accepted-revision guard", async () => {
+    const { h, run } = harness({
+      stale: 2,
+      node: { capturedOutput: "old", capturedOutputPresent: true, capturedSnapshotID: "ags_old" },
+      beforeFailure: (h, attempt) => {
+        if (attempt?.expectedAcceptedRevision !== 1 || !h.node) return
+        h.acceptedRevision = 2
+        h.node.capturedOutput = "new input after spent nudge"
+        h.node.capturedSnapshotID = "ags_new_input"
+      },
+    })
+    await run(structured)
+    expect(h.loops).toBe(2)
+    expect(h.prompts).toBe(1)
+    expect(h.claimedNudgeRevisions).toEqual([1])
+    expect(h.failureAttempts).toMatchObject([{ attempt: { expectedAcceptedRevision: 1 } }])
+    expect(h.failed).toEqual([])
+    expect(h.completed).toMatchObject([{ output: "new input after spent nudge" }])
+  })
+  test("a recovered preparation defect fails only its current execution attempt", async () => {
+    const { h, run } = harness({ loopFault: "defect" })
+    await run()
+    expect(h.loops).toBe(1)
+    expect(h.prompts).toBe(0)
+    expect(h.failed).toMatchObject([
+      { reason: expect.stringContaining("Injected recovered"), errorClass: "exec_failed" },
+    ])
+    expect(h.failureAttempts[0].attempt).toEqual({ childSessionID: "ses_recovery", replanAttempts: 0 })
+    expect(h.completed).toEqual([])
+  })
+  for (const change of ["replacement", "cancellation"] as const)
+    test(`a preparation defect cannot fail a ${change} after its original attempt loses ownership`, async () => {
+      const { h, runExit } = harness({
+        loopFault: "defect",
+        afterLoop: (h) => {
+          if (change === "replacement" && h.node) {
+            h.node.childSessionId = "ses_replacement"
+            h.node.replanAttempts++
+          }
+          if (change === "cancellation" && h.workflow) h.workflow.status = "cancelled"
+        },
+      })
+      expect(Exit.isSuccess(await runExit(structured))).toBe(true)
+      expect(h.failureAttempts).toHaveLength(1)
+      expect(h.failureAttempts[0].attempt).toEqual({ childSessionID: "ses_recovery", replanAttempts: 0 })
+      expect(h.failed).toEqual([])
+      expect(h.completed).toEqual([])
+      expect(hasCaptureSlot("ses_recovery")).toBe(false)
+    })
+  test("interruption propagates without turning cancellation into node failure and clears capture state", async () => {
+    let registered = false
+    const { h, runExit } = harness({
+      loopFault: "interrupt",
+      afterLoop: () => {
+        registered = hasCaptureSlot("ses_recovery")
+      },
+    })
+    const result = await runExit(structured)
+    expect(registered).toBe(true)
+    expect(Exit.isFailure(result)).toBe(true)
+    if (Exit.isFailure(result)) expect(Cause.hasInterrupts(result.cause)).toBe(true)
+    expect(h.failureAttempts).toEqual([])
+    expect(h.failed).toEqual([])
+    expect(h.completed).toEqual([])
+    expect(hasCaptureSlot("ses_recovery")).toBe(false)
   })
   test("stale output with queued input resumes its existing child instead of issuing a new prompt", async () => {
     const { h, run } = harness({ stale: 1, queued: 1 })

@@ -79,7 +79,9 @@ export interface Guard {
   attemptID: string
   snapshotID?: string
   close?: boolean
-  /** Permanent failure/cancellation outranks pending input; never use for successful completion. */
+  /** Conditional failure applies only to this accepted revision, checked in the settlement transaction. */
+  expectedAcceptedRevision?: number
+  /** Failure/cancellation outranks pending input unless expectedAcceptedRevision makes it conditional. */
   failureReason?: string
 }
 export interface Metadata {
@@ -664,6 +666,8 @@ export const layer = Layer.effect(
                 const endpoint = child(n)
                 const box = yield* mailbox(tx, endpoint)
                 if (box.closed_reason) return reject("closed")
+                if (input.expectedAcceptedRevision !== undefined && box.revision !== input.expectedAcceptedRevision)
+                  return reject("stale_input")
                 const frozen = input.snapshotID
                   ? yield* tx.get<StoredSnapshot>(
                       sql`SELECT * FROM agent_input_snapshot WHERE id = ${input.snapshotID} AND mailbox_id = ${box.id}`,

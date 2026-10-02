@@ -496,34 +496,41 @@ export function continueRecoveredMessageNode(
         }
         const inbox = yield* messages.value.revisions(caller)
         if (!(yield* admit)) return
-        if (nodeConfig?.output_schema && inbox.ok && inbox.value.queued === 0) {
+        let nudge = !!(nodeConfig?.output_schema && inbox.ok && inbox.value.queued === 0)
+        if (nudge && inbox.ok) {
           const claim = yield* messages.value.claimResultNudge(caller, inbox.value.accepted)
-          if (!claim.ok || !claim.value) {
-            yield* dag.nodeFailed(
-              dagID,
-              nodeID,
-              `unchanged agent input cannot retry structured result: ${claim.ok ? "resubmission already requested" : claim.reason}`,
-              "exec_failed",
-              attempt,
-            )
-            return
+          if (!claim.ok && claim.reason === "stale_input") nudge = false
+          else if (!claim.ok || !claim.value) {
+            const failed = yield* dag
+              .nodeFailed(
+                dagID,
+                nodeID,
+                `unchanged agent input cannot retry structured result: ${claim.ok ? "resubmission already requested" : claim.reason}`,
+                "exec_failed",
+                { ...attempt, ...(claim.ok ? { expectedAcceptedRevision: inbox.value.accepted } : {}) },
+              )
+              .pipe(
+                Effect.as(true),
+                Effect.catchIf(isStaleMessageInput, () => Effect.succeed(false)),
+              )
+            if (failed) return
+            nudge = false
           }
         }
-        result =
-          nodeConfig?.output_schema && inbox.ok && inbox.value.queued === 0
-            ? yield* prompt.prompt({
-                sessionID: SessionID.make(childSessionID),
-                messageID: MessageID.ascending(),
-                agent: result.info.agent,
-                model: { modelID: result.info.modelID, providerID: result.info.providerID },
-                parts: [
-                  {
-                    type: "text",
-                    text: "Runtime continuation: incorporate the recorded agent messages and submit an updated result. Keep completed tool evidence; do not repeat completed writes.",
-                  },
-                ],
-              })
-            : yield* prompt.loop({ sessionID: SessionID.make(childSessionID) })
+        result = nudge
+          ? yield* prompt.prompt({
+              sessionID: SessionID.make(childSessionID),
+              messageID: MessageID.ascending(),
+              agent: result.info.agent,
+              model: { modelID: result.info.modelID, providerID: result.info.providerID },
+              parts: [
+                {
+                  type: "text",
+                  text: "Runtime continuation: incorporate the recorded agent messages and submit an updated result. Keep completed tool evidence; do not repeat completed writes.",
+                },
+              ],
+            })
+          : yield* prompt.loop({ sessionID: SessionID.make(childSessionID) })
       }
     }).pipe(
       Effect.catchCause((cause) =>
