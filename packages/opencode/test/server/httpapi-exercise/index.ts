@@ -23,12 +23,7 @@ import { TestLLMServer } from "../../lib/llm-server"
 import path from "path"
 import { array, boolean, check, isRecord, message, object, stable } from "./assertions"
 import { controlledPtyInput, http, route } from "./dsl"
-import {
-  exerciseConfigDirectory,
-  exerciseDataDirectory,
-  exerciseDatabasePath,
-  exerciseGlobalRoot,
-} from "./environment"
+import { exerciseConfigDirectory, exerciseDataDirectory, exerciseDatabasePath, exerciseGlobalRoot } from "./environment"
 import { color, printHeader, printResults } from "./report"
 import { coverageResult, parseOptions, routeKey, routeKeys, selectedScenarios } from "./routing"
 import { runScenario } from "./runner"
@@ -395,7 +390,10 @@ const scenarios: Scenario[] = [
           )
         } else {
           check(entry.era === undefined, "MCP era field should only appear on connected statuses")
-          check(entry.protocolVersion === undefined, "MCP protocolVersion field should only appear on connected statuses")
+          check(
+            entry.protocolVersion === undefined,
+            "MCP protocolVersion field should only appear on connected statuses",
+          )
         }
       }
     },
@@ -1260,7 +1258,7 @@ const scenarios: Scenario[] = [
       headers: ctx.headers(),
       body: {
         event: "UserPromptSubmit",
-        hooks: [{ type: "command", command: "printf '%s' 'hook-ran'" }],
+        hooks: [{ type: "command", command: "printf '%s' 'hook-ran'", inputFormat: "claude-code" }],
       },
     }))
     .json(200, (body) => {
@@ -1274,6 +1272,24 @@ const scenarios: Scenario[] = [
       path: route("/session/{sessionID}/hook", { sessionID: ctx.state.id }),
       headers: ctx.headers(),
       body: { event: "NotAnEvent", hooks: [{ type: "command", command: "printf '%s' 'x'" }] },
+    }))
+    .status(400),
+  http.protected
+    .post("/session/{sessionID}/hook", "session.hook.add.invalid_input_format")
+    .seeded((ctx) => ctx.session({ title: "Hook invalid input format" }))
+    .at((ctx) => ({
+      path: route("/session/{sessionID}/hook", { sessionID: ctx.state.id }),
+      headers: ctx.headers(),
+      body: { event: "PreToolUse", hooks: [{ type: "command", command: "true", inputFormat: "CLAUDE" }] },
+    }))
+    .status(400),
+  http.protected
+    .post("/session/{sessionID}/hook", "session.hook.add.non_command_input_format")
+    .seeded((ctx) => ctx.session({ title: "Hook non-command input format" }))
+    .at((ctx) => ({
+      path: route("/session/{sessionID}/hook", { sessionID: ctx.state.id }),
+      headers: ctx.headers(),
+      body: { event: "PreToolUse", hooks: [{ type: "http", url: "https://example.com", inputFormat: "claude-code" }] },
     }))
     .status(400),
   http.protected
@@ -1451,10 +1467,7 @@ const scenarios: Scenario[] = [
     }))
     .json(409, (body) => {
       object(body)
-      check(
-        body._tag === "ConflictError" && body.resource === "not_queued",
-        "edit should reject a non-queued message",
-      )
+      check(body._tag === "ConflictError" && body.resource === "not_queued", "edit should reject a non-queued message")
     }),
   http.protected
     .delete("/session/{sessionID}/message/{messageID}/queued", "session.deleteQueuedMessage")
@@ -1888,11 +1901,17 @@ const scenarios: Scenario[] = [
     .seeded((ctx) =>
       ctx.session({ title: "DAG bySession owner" }).pipe(
         Effect.flatMap((s) =>
-          ctx.dag({ sessionID: s.id, nodes: [{ id: "x", name: "X", worker_type: "general", depends_on: [], required: true }] }),
+          ctx.dag({
+            sessionID: s.id,
+            nodes: [{ id: "x", name: "X", worker_type: "general", depends_on: [], required: true }],
+          }),
         ),
       ),
     )
-    .at((ctx) => ({ path: route("/dag/session/{sessionID}", { sessionID: ctx.state.sessionID }), headers: ctx.headers() }))
+    .at((ctx) => ({
+      path: route("/dag/session/{sessionID}", { sessionID: ctx.state.sessionID }),
+      headers: ctx.headers(),
+    }))
     .jsonEffect(200, (body) =>
       Effect.sync(() => {
         array(body)
@@ -1915,7 +1934,10 @@ const scenarios: Scenario[] = [
         ),
       ),
     )
-    .at((ctx) => ({ path: route("/dag/session/{sessionID}/summary", { sessionID: ctx.state.sessionID }), headers: ctx.headers() }))
+    .at((ctx) => ({
+      path: route("/dag/session/{sessionID}/summary", { sessionID: ctx.state.sessionID }),
+      headers: ctx.headers(),
+    }))
     .jsonEffect(200, (body) =>
       Effect.sync(() => {
         array(body)
@@ -1945,7 +1967,10 @@ const scenarios: Scenario[] = [
     .seeded((ctx) =>
       ctx.session({ title: "DAG detail owner" }).pipe(
         Effect.flatMap((s) =>
-          ctx.dag({ sessionID: s.id, nodes: [{ id: "n1", name: "N1", worker_type: "general", depends_on: [], required: true }] }),
+          ctx.dag({
+            sessionID: s.id,
+            nodes: [{ id: "n1", name: "N1", worker_type: "general", depends_on: [], required: true }],
+          }),
         ),
       ),
     )
@@ -2004,11 +2029,17 @@ const scenarios: Scenario[] = [
     .seeded((ctx) =>
       ctx.session({ title: "DAG nodeDetail owner" }).pipe(
         Effect.flatMap((s) =>
-          ctx.dag({ sessionID: s.id, nodes: [{ id: "n1", name: "N1", worker_type: "general", depends_on: [], required: true }] }),
+          ctx.dag({
+            sessionID: s.id,
+            nodes: [{ id: "n1", name: "N1", worker_type: "general", depends_on: [], required: true }],
+          }),
         ),
       ),
     )
-    .at((ctx) => ({ path: route("/dag/{dagID}/nodes/{nodeID}", { dagID: ctx.state.dagID, nodeID: "n1" }), headers: ctx.headers() }))
+    .at((ctx) => ({
+      path: route("/dag/{dagID}/nodes/{nodeID}", { dagID: ctx.state.dagID, nodeID: "n1" }),
+      headers: ctx.headers(),
+    }))
     .jsonEffect(200, (body) =>
       Effect.sync(() => {
         object(body)
@@ -2035,7 +2066,16 @@ const scenarios: Scenario[] = [
         title: "HTTP started workflow",
         config: {
           name: "http-start",
-          nodes: [{ id: "n1", name: "N1", worker_type: "general", depends_on: [], required: true, prompt_template: { inline: "noop" } }],
+          nodes: [
+            {
+              id: "n1",
+              name: "N1",
+              worker_type: "general",
+              depends_on: [],
+              required: true,
+              prompt_template: { inline: "noop" },
+            },
+          ],
         },
       },
     }))
@@ -2064,14 +2104,22 @@ const scenarios: Scenario[] = [
         config: {
           name: "schemaless-gate",
           nodes: [
-            { id: "cp", name: "CP", worker_type: "general", depends_on: [], required: true, report_to_parent: true, prompt_template: { inline: "noop" } },
+            {
+              id: "cp",
+              name: "CP",
+              worker_type: "general",
+              depends_on: [],
+              required: true,
+              report_to_parent: true,
+              prompt_template: { inline: "noop" },
+            },
             {
               id: "after",
               name: "After",
               worker_type: "general",
               depends_on: ["cp"],
               required: true,
-              condition: "cp.output.verdict == \"accept\"",
+              condition: 'cp.output.verdict == "accept"',
               prompt_template: { inline: "noop" },
             },
           ],
@@ -2086,11 +2134,18 @@ const scenarios: Scenario[] = [
     .seeded((ctx) =>
       ctx.session({ title: "DAG control owner" }).pipe(
         Effect.flatMap((s) =>
-          ctx.dag({ sessionID: s.id, nodes: [{ id: "n1", name: "N1", worker_type: "general", depends_on: [], required: true }] }),
+          ctx.dag({
+            sessionID: s.id,
+            nodes: [{ id: "n1", name: "N1", worker_type: "general", depends_on: [], required: true }],
+          }),
         ),
       ),
     )
-    .at((ctx) => ({ path: route("/dag/{dagID}/control", { dagID: ctx.state.dagID }), headers: ctx.headers(), body: { operation: "pause" } }))
+    .at((ctx) => ({
+      path: route("/dag/{dagID}/control", { dagID: ctx.state.dagID }),
+      headers: ctx.headers(),
+      body: { operation: "pause" },
+    }))
     .jsonEffect(200, (body) =>
       Effect.sync(() => {
         object(body)
@@ -2104,7 +2159,10 @@ const scenarios: Scenario[] = [
     .seeded((ctx) =>
       ctx.session({ title: "DAG extend owner" }).pipe(
         Effect.flatMap((s) =>
-          ctx.dag({ sessionID: s.id, nodes: [{ id: "n1", name: "N1", worker_type: "general", depends_on: [], required: true }] }),
+          ctx.dag({
+            sessionID: s.id,
+            nodes: [{ id: "n1", name: "N1", worker_type: "general", depends_on: [], required: true }],
+          }),
         ),
       ),
     )
@@ -2114,7 +2172,16 @@ const scenarios: Scenario[] = [
       body: {
         operation: "extend",
         fragment: {
-          nodes: [{ id: "n2", name: "N2", worker_type: "general", depends_on: ["n1"], required: false, prompt_template: { inline: "noop" } }],
+          nodes: [
+            {
+              id: "n2",
+              name: "N2",
+              worker_type: "general",
+              depends_on: ["n1"],
+              required: false,
+              prompt_template: { inline: "noop" },
+            },
+          ],
         },
       },
     }))
@@ -2249,14 +2316,16 @@ const scenarios: Scenario[] = [
         title: "Cross-project start",
         config: {
           name: "cross-project-start",
-          nodes: [{
-            id: "n1",
-            name: "N1",
-            worker_type: "general",
-            depends_on: [],
-            required: true,
-            prompt_template: { inline: "noop" },
-          }],
+          nodes: [
+            {
+              id: "n1",
+              name: "N1",
+              worker_type: "general",
+              depends_on: [],
+              required: true,
+              prompt_template: { inline: "noop" },
+            },
+          ],
         },
       },
     }))
@@ -2269,21 +2338,35 @@ const scenarios: Scenario[] = [
     .status(404),
   http.protected
     .get("/dag/{dagID}/nodes", "dag.nodes")
-    .at(() => ({ path: route("/dag/{dagID}/nodes", { dagID: "dag_nonexistent" }), headers: {} as Record<string, string> }))
+    .at(() => ({
+      path: route("/dag/{dagID}/nodes", { dagID: "dag_nonexistent" }),
+      headers: {} as Record<string, string>,
+    }))
     .status(404),
   http.protected
     .get("/dag/{dagID}/nodes/{nodeID}", "dag.nodeDetail")
-    .at(() => ({ path: route("/dag/{dagID}/nodes/{nodeID}", { dagID: "dag_nonexistent", nodeID: "n1" }), headers: {} as Record<string, string> }))
+    .at(() => ({
+      path: route("/dag/{dagID}/nodes/{nodeID}", { dagID: "dag_nonexistent", nodeID: "n1" }),
+      headers: {} as Record<string, string>,
+    }))
     .status(404),
   http.protected
     .post("/dag/{dagID}/control", "dag.control")
     .mutating()
-    .at(() => ({ path: route("/dag/{dagID}/control", { dagID: "dag_nonexistent" }), headers: {} as Record<string, string>, body: { operation: "pause" } }))
+    .at(() => ({
+      path: route("/dag/{dagID}/control", { dagID: "dag_nonexistent" }),
+      headers: {} as Record<string, string>,
+      body: { operation: "pause" },
+    }))
     .status(404),
   http.protected
     .post("/dag/{dagID}/control", "dag.control")
     .mutating()
-    .at(() => ({ path: route("/dag/{dagID}/control", { dagID: "dag_nonexistent" }), headers: {} as Record<string, string>, body: { operation: "replan", fragment: { nodes: [] } } }))
+    .at(() => ({
+      path: route("/dag/{dagID}/control", { dagID: "dag_nonexistent" }),
+      headers: {} as Record<string, string>,
+      body: { operation: "replan", fragment: { nodes: [] } },
+    }))
     .status(404),
 ]
 
@@ -2340,7 +2423,6 @@ const main = Effect.gen(function* () {
   return undefined
 })
 
-runMainWithHardExit(
-  Effect.runPromise(main.pipe(Effect.provide(TestLLMServer.layer), Effect.scoped)),
-  (code) => process.exit(code),
+runMainWithHardExit(Effect.runPromise(main.pipe(Effect.provide(TestLLMServer.layer), Effect.scoped)), (code) =>
+  process.exit(code),
 )

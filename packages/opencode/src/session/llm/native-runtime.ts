@@ -17,6 +17,7 @@ import {
   type LLMEvent,
 } from "@opencode-ai/llm"
 import type { LLMClientShape } from "@opencode-ai/llm/route"
+import { RequestExecutor } from "@opencode-ai/llm/route"
 import { LLMNative } from "./native-request"
 import {
   ContextFolding,
@@ -212,7 +213,7 @@ export function stream(input: StreamInput): Effect.Effect<StreamResult, never> {
           )
         }),
       ),
-    )
+    ).pipe(Stream.provideService(RequestExecutor.RetryTimeouts, input.contextFolding?.purpose !== "compaction"))
 
     return {
       ...current,

@@ -21,6 +21,14 @@ import { FSUtil } from "@opencode-ai/core/fs-util"
 import { ChildProcessSpawner } from "effect/unstable/process/ChildProcessSpawner"
 import { buildAgentTools } from "@/hook/agent-tools"
 import { jsonSchema, tool } from "ai"
+import { ReadTool } from "@/tool/read"
+import { GrepTool } from "@/tool/grep"
+import { GlobTool } from "@/tool/glob"
+import { Agent } from "@/agent/agent"
+import { Instruction } from "@/session/instruction"
+import { LSP } from "@/lsp/lsp"
+import { Ripgrep } from "@opencode-ai/core/ripgrep"
+import { claudeHookCommand, nativeHookCommand, hookCommand } from "../fixture/claude-hook"
 
 const quote = (text: string) => "'" + text.replaceAll("'", "'\\''") + "'"
 const jsonCommand = (json: unknown) => "printf '%s' " + quote(JSON.stringify(json))
@@ -249,6 +257,180 @@ describe("agent tool runtime boundary", () => {
       expect(() => process.kill(pid!, 0)).toThrow()
     }),
   )
+})
+
+const discoveryDefinitions = Effect.gen(function* () {
+  const read = yield* ReadTool
+  const grep = yield* GrepTool
+  const glob = yield* GlobTool
+  return [
+    { id: read.id, ...(yield* read.init()) },
+    { id: grep.id, ...(yield* grep.init()) },
+    { id: glob.id, ...(yield* glob.init()) },
+  ]
+})
+const discoveryToolLayer = Layer.mergeAll(
+  FSUtil.defaultLayer,
+  CrossSpawnSpawner.defaultLayer,
+  Ripgrep.defaultLayer,
+  Layer.mock(Agent.Service, {}),
+  Layer.mock(Instruction.Service, { resolve: () => Effect.succeed([]) }),
+  Layer.mock(LSP.Service, { touchFile: () => Effect.void }),
+  Layer.mock(Truncate.Service, {}),
+)
+const discovery = testEffect(
+  Layer.mergeAll(
+    hookLayer,
+    Layer.mock(Plugin.Service, { trigger: (_name, _input, output) => Effect.succeed(output) }),
+    Layer.mock(Permission.Service, { ask: () => Effect.void }),
+    Layer.mock(MCP.Service, { clients: () => Effect.succeed({}), tools: () => Effect.succeed({}) }),
+    Layer.unwrap(
+      Effect.gen(function* () {
+        const definitions = yield* discoveryDefinitions
+        return Layer.mock(ToolRegistry.Service, {
+          tools: () => Effect.succeed(definitions),
+          registrations: () =>
+            Effect.succeed(
+              definitions.map((definition) => ({
+                definition,
+                sourceKind: "host-builtin" as const,
+                registrationID: `test:${definition.id}`,
+              })),
+            ),
+        })
+      }),
+    ).pipe(Layer.provideMerge(discoveryToolLayer)),
+  ),
+)
+
+describe("Claude command consumer with real discovery tools", () => {
+  for (const name of ["read", "grep", "glob"] as const) {
+    discovery.instance(`${name}: match -> stdin -> consumer JSON -> model-facing context`, () =>
+      Effect.gen(function* () {
+        const instance = yield* TestInstance
+        const store = yield* SessionHooks.Service
+        const id = SessionID.descending()
+        const target = path.join(instance.directory, "target.txt")
+        yield* Effect.promise(() => fs.writeFile(target, "HOOK_SEARCH_NEEDLE\n"))
+        const event = name === "read" ? "PostToolUse" : "PreToolUse"
+        yield* store.add(id, {
+          event,
+          matcher: name === "read" ? "Read" : "Grep|Glob",
+          hooks: [
+            { type: "command", command: claudeHookCommand, inputFormat: "claude-code" },
+            { type: "command", command: nativeHookCommand },
+          ],
+        })
+        const tools = yield* resolve(id, instance.directory)
+        const args =
+          name === "read"
+            ? { filePath: target }
+            : name === "grep"
+              ? { pattern: "HOOK_SEARCH_NEEDLE", path: instance.directory, include: "target.txt" }
+              : { pattern: "target.txt", path: instance.directory }
+        const executeTool = tools[name].execute
+        if (!executeTool) throw new Error("missing discovery tool executor")
+        const result = yield* Effect.promise(() =>
+          Promise.resolve(
+            executeTool(args, {
+              toolCallId: `compat-${name}`,
+              messages: [],
+              abortSignal: new AbortController().signal,
+            }),
+          ),
+        )
+        const output = result.output
+        expect(output).toContain("CLAUDE_CONTEXT:")
+        expect(output).toContain("NATIVE_CONTEXT:")
+        const claude = JSON.parse(output.split("CLAUDE_CONTEXT:")[1].split("\n")[0])
+        const native = JSON.parse(output.split("NATIVE_CONTEXT:")[1].split("\n")[0])
+        expect(claude.tool_name).toBe(name[0].toUpperCase() + name.slice(1))
+        expect(native.tool_name).toBe(name)
+        expect(native.tool_input).toEqual(args)
+        expect(claude.hook_event_name).toBe(event)
+        expect(claude.tool_use_id).toBe(`compat-${name}`)
+        if (name === "read") {
+          expect(claude.tool_input.file_path).toBe(target)
+          expect(claude.tool_response).toContain("HOOK_SEARCH_NEEDLE")
+        } else expect(output).toContain(target)
+      }),
+    )
+  }
+
+  discovery.instance("Claude updatedInput is applied to a real read, not silently discarded", () =>
+    Effect.gen(function* () {
+      const instance = yield* TestInstance
+      const store = yield* SessionHooks.Service
+      const id = SessionID.descending()
+      const target = path.join(instance.directory, "rewritten.txt")
+      yield* Effect.promise(() => fs.writeFile(target, "REWRITTEN_READ\n"))
+      yield* store.add(id, {
+        event: "PreToolUse",
+        matcher: "Read",
+        hooks: [
+          {
+            type: "command",
+            inputFormat: "claude-code",
+            command: hookCommand(
+              `console.log(JSON.stringify(${JSON.stringify({
+                hookSpecificOutput: { hookEventName: "PreToolUse", updatedInput: { file_path: target } },
+              })}))`,
+            ),
+          },
+        ],
+      })
+      const tools = yield* resolve(id, instance.directory)
+      const executeRead = tools.read.execute
+      if (!executeRead) throw new Error("missing read executor")
+      const result = yield* Effect.promise(() =>
+        Promise.resolve(
+          executeRead(
+            { filePath: path.join(instance.directory, "missing.txt") },
+            {
+              toolCallId: "rewrite-read",
+              messages: [],
+              abortSignal: new AbortController().signal,
+            },
+          ),
+        ),
+      )
+      expect(result.output).toContain("REWRITTEN_READ")
+    }),
+  )
+
+  for (const program of ["console.log('{broken')", "console.log(''); process.exit(1)"]) {
+    discovery.instance(`adapter preserves fail-open output handling: ${program}`, () =>
+      Effect.gen(function* () {
+        const instance = yield* TestInstance
+        const store = yield* SessionHooks.Service
+        const id = SessionID.descending()
+        const target = path.join(instance.directory, "target.txt")
+        yield* Effect.promise(() => fs.writeFile(target, "SUCCESS_WITH_FAILED_HOOK\n"))
+        yield* store.add(id, {
+          event: "PostToolUse",
+          matcher: "Read",
+          hooks: [{ type: "command", inputFormat: "claude-code", command: hookCommand(program) }],
+        })
+        const tools = yield* resolve(id, instance.directory)
+        const executeRead = tools.read.execute
+        if (!executeRead) throw new Error("missing read executor")
+        const result = yield* Effect.promise(() =>
+          Promise.resolve(
+            executeRead(
+              { filePath: target },
+              {
+                toolCallId: "failed-hook",
+                messages: [],
+                abortSignal: new AbortController().signal,
+              },
+            ),
+          ),
+        )
+        expect(result.output).toContain("SUCCESS_WITH_FAILED_HOOK")
+        expect(result.output).not.toContain("CLAUDE_CONTEXT")
+      }),
+    )
+  }
 })
 
 const permission = testEffect(

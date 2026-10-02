@@ -154,6 +154,8 @@ export interface HookCommand {
    * default (/bin/sh on POSIX, cmd.exe on Windows). The interpreter must be installed.
    */
   shell?: "bash" | "powershell"
+  /** Command-only naming adapter. Omitted or opencode preserves native tool ids and arguments. */
+  inputFormat?: "opencode" | "claude-code"
   /**
    * Conditional gate, evaluated by `extensions/condition-filter.ts` in
    * `ForkHooks.beforeRunEntry` BEFORE each matched entry runs (returning false
@@ -1442,10 +1444,60 @@ interface HookHandler<E extends HookCommand = HookCommand> {
   ) => Effect.Effect<{ json?: HookJSONOutput; exitBlock?: string; rawStdout?: string; exitCode?: number | null }>
 }
 
+const claudeTools = new Map<string, { name: string; fields: readonly (readonly [string, string])[] }>([
+  ["bash", { name: "Bash", fields: [] }],
+  ["grep", { name: "Grep", fields: [["include", "glob"]] }],
+  ["glob", { name: "Glob", fields: [] }],
+  ["read", { name: "Read", fields: [["filePath", "file_path"]] }],
+  ["write", { name: "Write", fields: [["filePath", "file_path"]] }],
+  [
+    "edit",
+    {
+      name: "Edit",
+      fields: [
+        ["filePath", "file_path"],
+        ["oldString", "old_string"],
+        ["newString", "new_string"],
+        ["replaceAll", "replace_all"],
+      ],
+    },
+  ],
+])
+
+function translateClaudeInput(toolName: string, input: object, toClaude: boolean) {
+  const fields = claudeTools.get(toolName.toLowerCase())?.fields
+  const result: Record<string, unknown> = { ...input }
+  for (const [native, claude] of fields ?? []) {
+    if (toClaude) {
+      if (result[claude] == null && result[native] !== undefined) result[claude] = result[native]
+    } else if (Object.hasOwn(result, claude)) {
+      result[native] = result[claude]
+      delete result[claude]
+    }
+  }
+  return result
+}
+
 const commandHandler: HookHandler = {
   type: "command",
   run: Effect.fn("SettingsHook.handler.command")(function* (entry, envelope, cwd, _inHook) {
-    const stdinJSON = JSON.stringify(envelope)
+    // Translate at this entry's command boundary, never the shared native envelope.
+    const toolName = typeof envelope.tool_name === "string" ? envelope.tool_name : ""
+    const claudeTool = entry.inputFormat === "claude-code" ? claudeTools.get(toolName.toLowerCase()) : undefined
+    const stdinJSON = JSON.stringify(
+      claudeTool
+        ? {
+            ...envelope,
+            tool_name: claudeTool.name,
+            tool_input:
+              typeof envelope.tool_input === "object" &&
+              envelope.tool_input !== null &&
+              !Array.isArray(envelope.tool_input)
+                ? translateClaudeInput(toolName, envelope.tool_input, true)
+                : envelope.tool_input,
+          }
+        : envelope,
+    )
     const { exitCode, stdout, stderr, spawnError } = yield* Effect.promise((signal) =>
       execShell(entry, stdinJSON, cwd, signal),
     )
@@ -1479,9 +1531,12 @@ const commandHandler: HookHandler = {
     // trigger aggregator can inject it as additionalContext for
     // UserPromptSubmit / SessionStart (CC protocol). JSON stdout still parses
     // normally via parseStdout; rawStdout is only consumed when json is null.
-    return exitCode === 0
-      ? { json: parseStdout(stdout, commandText(entry)), rawStdout: stdout, exitCode }
-      : { exitCode }
+    if (exitCode !== 0) return { exitCode }
+    const json = parseStdout(stdout, commandText(entry))
+    const hso = json?.hookSpecificOutput
+    if (claudeTool && envelope.hook_event_name === "PreToolUse" && hso && "updatedInput" in hso && hso.updatedInput)
+      hso.updatedInput = translateClaudeInput(toolName, hso.updatedInput, false)
+    return { json, rawStdout: stdout, exitCode }
   }),
 }
 

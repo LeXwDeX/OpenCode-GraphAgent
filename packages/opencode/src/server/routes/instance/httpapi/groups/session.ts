@@ -99,6 +99,7 @@ export const SessionHookCommandPayload = Schema.Struct({
   async: Schema.optional(Schema.Boolean),
   asyncRewake: Schema.optional(Schema.Boolean),
   shell: Schema.optional(Schema.Literals(["bash", "powershell"])),
+  inputFormat: Schema.optional(Schema.Literals(["opencode", "claude-code"])),
   allowedEnvVars: Schema.optional(Schema.Array(Schema.String)),
   statusMessage: Schema.optional(Schema.String),
   once: Schema.optional(Schema.Boolean),

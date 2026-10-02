@@ -6,6 +6,10 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 import { APICallError } from "ai"
 import { Cause, Deferred, Effect, Exit, Fiber, Layer, Schema } from "effect"
 import * as Stream from "effect/Stream"
+import * as TestClock from "effect/testing/TestClock"
+import { HttpClient, HttpClientResponse } from "effect/unstable/http"
+import { LLMClient, RequestExecutor, WebSocketExecutor } from "@opencode-ai/llm/route"
+import { LLMNativeRuntime } from "@/session/llm/native-runtime"
 import { Config } from "@/config/config"
 import { Image } from "@/image/image"
 import { Agent } from "../../src/agent/agent"
@@ -36,6 +40,7 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { Memory } from "@/memory/memory"
 import { SettingsHook } from "@/hook/settings"
+import { CompactionTimeoutError } from "../../src/session/compaction-timeout"
 
 const summary = Layer.succeed(
   SessionSummary.Service,
@@ -234,6 +239,7 @@ const deps = Layer.mergeAll(
   Plugin.defaultLayer,
   EventV2Bridge.defaultLayer,
   Config.defaultLayer,
+  SessionStatus.defaultLayer,
   RuntimeFlags.layer({ experimentalEventSystem: true }),
   Database.defaultLayer,
   EventV2Bridge.defaultLayer,
@@ -1220,6 +1226,267 @@ describe("session.compaction.process", () => {
         expect(last.parts[0].text).toContain("previous request exceeded the provider's size limit")
       }
     }),
+  )
+
+  for (const outcome of [
+    "success",
+    "exhausted",
+    "overflow",
+    "gateway-timeout",
+    "native-408",
+    "native-504",
+    "native-504-retry-after",
+    "native-cancel",
+    "cancel",
+  ] as const) {
+    itCompaction.instance(
+      `compaction model ladder: ${outcome}`,
+      () => {
+        const stub = llm()
+        const seen: string[] = []
+        const requests: string[] = []
+        const small = { ...createModel({ context: 100_000, output: 32_000 }), id: ModelV2.ID.make("small") }
+        const agentModel = { ...small, id: ModelV2.ID.make("agent") }
+        const conversation = createModel({ context: 100_000, output: 32_000 })
+        const provider = ProviderTest.fake({
+          model: conversation,
+          getSmallModel: () => Effect.succeed(small),
+          getModel: (_providerID, modelID) => Effect.succeed(modelID === agentModel.id ? agentModel : conversation),
+        })
+        const ready = Deferred.makeUnsafe<void>()
+        for (const model of [small, agentModel, conversation]) {
+          stub.push((input) => {
+            seen.push(input.model.id)
+            expect(input.retries).toBe(0)
+            if (outcome === "cancel") {
+              return Stream.fromEffect(Deferred.succeed(ready, undefined).pipe(Effect.andThen(Effect.never)))
+            }
+            if (outcome.startsWith("native-")) {
+              const http = Layer.succeed(
+                HttpClient.HttpClient,
+                HttpClient.make((request) =>
+                  Effect.gen(function* () {
+                    requests.push(input.model.id)
+                    if (outcome === "native-cancel") {
+                      yield* Deferred.succeed(ready, undefined)
+                      return yield* Effect.never
+                    }
+                    return HttpClientResponse.fromWeb(
+                      request,
+                      new Response(null, {
+                        status: outcome === "native-408" ? 408 : 504,
+                        headers: outcome === "native-504-retry-after" ? { "retry-after-ms": "10000" } : {},
+                      }),
+                    )
+                  }),
+                ),
+              )
+              return Stream.unwrap(
+                Effect.gen(function* () {
+                  const llmClient = yield* LLMClient.Service
+                  const native = yield* LLMNativeRuntime.stream({
+                    model: {
+                      ...input.model,
+                      api: { id: input.model.id, url: "https://provider.test/v1", npm: "@ai-sdk/openai-compatible" },
+                    },
+                    provider: {
+                      id: input.model.providerID,
+                      name: "test",
+                      source: "config",
+                      env: [],
+                      options: { apiKey: "test" },
+                      models: {},
+                    },
+                    auth: undefined,
+                    llmClient,
+                    messages: input.messages,
+                    tools: {},
+                    headers: {},
+                    abort: new AbortController().signal,
+                    contextFolding: {
+                      enabled: false,
+                      purpose: input.purpose ?? "unknown",
+                      system: { kind: "messages" },
+                    },
+                  })
+                  if (native.type !== "supported") return yield* Effect.die(native.reason)
+                  return native.stream
+                }).pipe(
+                  Effect.provide(
+                    LLMClient.layer.pipe(
+                      Layer.provide(
+                        Layer.mergeAll(RequestExecutor.layer.pipe(Layer.provide(http)), WebSocketExecutor.layer),
+                      ),
+                      Layer.fresh,
+                    ),
+                  ),
+                ),
+              )
+            }
+            if (outcome === "gateway-timeout")
+              return Stream.fail(
+                new APICallError({
+                  message: "Gateway Timeout",
+                  url: "https://example.com",
+                  requestBodyValues: {},
+                  statusCode: 504,
+                  isRetryable: true,
+                  responseHeaders: { "retry-after-ms": "10000" },
+                }),
+              )
+            if (outcome === "success" && model === conversation) return reply("complete summary")(input)
+            const error =
+              outcome === "overflow" && model === small
+                ? new APICallError({
+                    message: "maximum context length exceeded",
+                    url: "https://example.com",
+                    requestBodyValues: {},
+                    statusCode: 400,
+                    isRetryable: false,
+                  })
+                : new CompactionTimeoutError({ message: "Compaction stream timed out without progress" })
+            return Stream.make(
+              LLMEvent.textStart({ id: "partial" }),
+              LLMEvent.textDelta({ id: "partial", text: "incomplete summary" }),
+            ).pipe(Stream.concat(Stream.fail(error)))
+          })
+        }
+        return Effect.gen(function* () {
+          const ssn = yield* SessionNs.Service
+          const session = yield* ssn.create({})
+          yield* createUserMessage(session.id, "hello")
+          yield* createSummaryCompaction(session.id)
+          const messages = yield* ssn.messages({ sessionID: session.id })
+          const parent = messages.at(-1)!
+          const effect = SessionCompaction.use.process({
+            parentID: parent.info.id,
+            messages,
+            sessionID: session.id,
+            auto: true,
+          })
+          if (outcome === "cancel" || outcome === "native-cancel") {
+            const fiber = yield* effect.pipe(Effect.forkChild)
+            yield* Deferred.await(ready)
+            yield* Fiber.interrupt(fiber)
+            const exit = yield* Fiber.await(fiber)
+            expect(Exit.isFailure(exit)).toBe(true)
+            expect(seen).toEqual(["small"])
+            if (outcome === "native-cancel") expect(requests).toEqual(["small"])
+            return
+          }
+          const started = Date.now()
+          const result = yield* effect
+          expect(Date.now() - started).toBeLessThan(2_000)
+          expect(seen).toEqual(["small", "agent", "test-model"])
+          if (outcome.startsWith("native-")) expect(requests).toEqual(seen)
+          expect(result).toBe(outcome === "success" ? "continue" : "stop")
+          const stored = yield* ssn.messages({ sessionID: session.id })
+          const summaries = stored.filter((item) => item.info.role === "assistant" && item.info.summary)
+          expect(summaries).toHaveLength(1)
+          expect(summaries[0].info.role === "assistant" && summaries[0].info.modelID).toBe(
+            ModelV2.ID.make("test-model"),
+          )
+          if (outcome === "success") {
+            expect(summaries[0].parts.filter((part) => part.type === "text").map((part) => part.text)).toEqual([
+              "complete summary",
+            ])
+            expect(
+              stored.filter((item) => item.parts.some((part) => part.type === "text" && part.synthetic)),
+            ).toHaveLength(1)
+          } else {
+            const status = yield* SessionStatus.Service
+            expect((yield* status.get(session.id)).type).toBe("idle")
+            expect(summaries[0].info.role === "assistant" && summaries[0].info.error).toBeDefined()
+          }
+        }).pipe(
+          withCompaction({
+            llm: stub.layer,
+            provider,
+          }),
+        )
+      },
+      { git: true, config: { agent: { compaction: { model: "test/agent" } } } },
+    )
+  }
+
+  itCompaction.instance(
+    "actual stalled compaction stream is aborted before model fallback",
+    () => {
+      const stub = llm()
+      const seen: string[] = []
+      const small = { ...createModel({ context: 100_000, output: 32_000 }), id: ModelV2.ID.make("small") }
+      const ready = Deferred.makeUnsafe<void>()
+      let interrupted = false
+      stub.push((input) => {
+        seen.push(input.model.id)
+        return Stream.fromEffect(
+          Deferred.succeed(ready, undefined).pipe(
+            Effect.andThen(Effect.never),
+            Effect.onInterrupt(() =>
+              Effect.sync(() => {
+                interrupted = true
+              }),
+            ),
+          ),
+        )
+      })
+      stub.push(
+        reply("recovered summary", (input) => {
+          expect(interrupted).toBe(true)
+          seen.push(input.model.id)
+        }),
+      )
+      return Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const session = yield* ssn.create({})
+        const parent = yield* createUserMessage(session.id, "hello")
+        const messages = yield* ssn.messages({ sessionID: session.id })
+        yield* Effect.gen(function* () {
+          const fiber = yield* SessionCompaction.use
+            .process({ parentID: parent.id, messages, sessionID: session.id, auto: false })
+            .pipe(Effect.forkChild)
+          yield* Deferred.await(ready)
+          yield* TestClock.adjust("2 minutes")
+          expect(yield* Fiber.join(fiber)).toBe("continue")
+          expect(seen).toEqual(["small", "test-model"])
+        }).pipe(Effect.provide(TestClock.layer()))
+      }).pipe(
+        withCompaction({
+          llm: stub.layer,
+          provider: ProviderTest.fake({
+            model: createModel({ context: 100_000, output: 32_000 }),
+            getSmallModel: () => Effect.succeed(small),
+          }),
+        }),
+      )
+    },
+    { git: true },
+  )
+
+  itCompaction.instance(
+    "duplicate compaction models are attempted only once",
+    () => {
+      const stub = llm()
+      let calls = 0
+      stub.push(() => {
+        calls++
+        return Stream.fail(new CompactionTimeoutError({ message: "Compaction stream timed out" }))
+      })
+      return Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const session = yield* ssn.create({})
+        const parent = yield* createUserMessage(session.id, "hello")
+        const result = yield* SessionCompaction.use.process({
+          parentID: parent.id,
+          messages: yield* ssn.messages({ sessionID: session.id }),
+          sessionID: session.id,
+          auto: false,
+        })
+        expect(result).toBe("stop")
+        expect(calls).toBe(1)
+      }).pipe(withCompaction({ llm: stub.layer }))
+    },
+    { git: true },
   )
 
   itCompaction.instance(

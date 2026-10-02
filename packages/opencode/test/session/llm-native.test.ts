@@ -1,8 +1,9 @@
 import { describe, expect, test } from "bun:test"
-import { LLMEvent, ToolFailure } from "@opencode-ai/llm"
+import { LLMError, LLMEvent, ToolFailure } from "@opencode-ai/llm"
 import { LLMClient, RequestExecutor, WebSocketExecutor, type LLMClientShape } from "@opencode-ai/llm/route"
 import { jsonSchema, tool, type ModelMessage, type Tool } from "ai"
 import { Effect, Fiber, Layer, Stream } from "effect"
+import { FetchHttpClient } from "effect/unstable/http"
 import { LLMNative } from "@/session/llm/native-request"
 import { LLMNativeRuntime } from "@/session/llm/native-runtime"
 import type { Provider } from "@/provider/provider"
@@ -150,6 +151,43 @@ const expectOpenAIResponsesRequest = (input: {
   })
 
 describe("session.llm-native.request", () => {
+  for (const purpose of ["conversation", "compaction"] as const) {
+    it.effect(`native ${purpose} applies its own timeout retry policy`, () =>
+      Effect.gen(function* () {
+        const llmClient = yield* LLMClient.Service
+        let attempts = 0
+        const native = yield* LLMNativeRuntime.stream({
+          model: baseModel,
+          provider: providerInfo,
+          auth: undefined,
+          llmClient,
+          messages: [{ role: "user", content: "hello" }],
+          tools: {},
+          headers: {},
+          abort: new AbortController().signal,
+          contextFolding: { enabled: false, purpose, system: { kind: "messages" } },
+        })
+        if (native.type !== "supported") throw new Error(native.reason)
+        const error = yield* native.stream.pipe(
+          Stream.runDrain,
+          Effect.flip,
+          Effect.provideService(
+            FetchHttpClient.Fetch,
+            Object.assign(
+              async () => {
+                attempts++
+                return new Response(null, { status: 504, headers: { "retry-after-ms": "0" } })
+              },
+              { preconnect: globalThis.fetch.preconnect },
+            ),
+          ),
+        )
+        expect(error).toBeInstanceOf(LLMError)
+        expect(attempts).toBe(purpose === "conversation" ? 3 : 1)
+      }),
+    )
+  }
+
   test("maps normalized stream inputs to a native LLM request", () => {
     const messages: ModelMessage[] = [
       {

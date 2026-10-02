@@ -105,10 +105,62 @@ this skill is a map, not the full schema.
 - `options` (fork-only field, no CC equivalent): exported as
   `CLAUDE_PLUGIN_OPTION_<KEY>` env vars in the subprocess
 
+### `inputFormat` — Claude Code envelope naming (command hooks only)
+
+Command hooks accept an optional `inputFormat` field:
+
+- `"opencode"` (default): the stdin envelope carries native OpenCode naming —
+  lowercase tool ids (`bash`, `read`, `grep`, …) and native input keys
+  (`filePath`, `oldString`, `include`, …).
+- `"claude-code"`: the envelope is translated toward Claude Code naming so an
+  unmodified CC hook script keeps working:
+  - `tool_name` is canonicalized case-insensitively for known builtins only:
+    `bash`→`Bash`, `read`→`Read`, `write`→`Write`, `edit`→`Edit`,
+    `grep`→`Grep`, `glob`→`Glob`. Names outside this six-name set, including
+    MCP and custom names, pass through unchanged. A custom tool shadowing one
+    of these names receives the same naming translation.
+  - `tool_input` keys are mapped: `filePath`→`file_path` (read/write/edit);
+    `oldString`/`newString`/`replaceAll`→`old_string`/`new_string`/`replace_all`
+    (edit); `include`→`glob` (grep). Original keys and unrelated fields are
+    preserved; where a Claude key is already present with a non-null value,
+    it wins and the native key is not written over it.
+  - On `PreToolUse`, for the same six known names, a
+    `hookSpecificOutput.updatedInput` returned by the hook is translated back
+    to native keys before the tool runs; explicit Claude keys win over
+    translated aliases. The rewrite direction also applies only to known
+    names: for tools outside the set, a returned `updatedInput` is passed
+    through unchanged, so such a hook must emit native keys (`filePath`,
+    `oldString`, `include`, …) to rewrite a call.
+
+This is naming compatibility only, not full tool semantic equivalence: hook
+output handling and tool responses are unchanged, and behavioral differences
+between Claude Code and OpenCode tools still surface. Verify a ported hook by
+actually running it and checking what it receives on stdin, what it returns,
+and any context it injects into the session — the hook listing in the Active
+Hooks block, or exiting 0, does not prove its augmentation logic fired.
+
+Example — reusing a Claude Code edit-guard hook unchanged:
+
+```json
+{
+  "PreToolUse": [
+    {
+      "matcher": "Edit",
+      "hooks": [{ "type": "command", "command": "./scripts/guard.py", "inputFormat": "claude-code" }]
+    }
+  ]
+}
+```
+
+`guard.py` sees `tool_name: "Edit"` and `tool_input.file_path` /
+`old_string` / `new_string`; its permission-decision output is handled exactly
+as in Claude Code.
+
 ### Handler options and agent tools
 
 - `timeout`: positive seconds; cancellation reaches the running process, model request or MCP tool.
 - `shell`: command hooks can explicitly select `bash` or `powershell`; that interpreter must be installed. Omit it for `/bin/sh` on POSIX or `cmd.exe` on Windows.
+- `inputFormat`: command hooks only — `"opencode"` (default) or `"claude-code"` for Claude Code envelope naming; contract in the `inputFormat` section above.
 - `allowedEnvVars`: when supplied, HTTP hooks expand `$NAME` and `${NAME}` in headers only for names in this list. Unlisted or unset variables expand to an empty string. When omitted, headers remain literal.
 - `statusMessage`: recorded in the hook execution log before dispatch; it does not create a UI progress indicator.
 - Command-level `once`: runs once per session for the current loaded configuration entry, including concurrent/async triggers. Reloading the file creates fresh entries. Session registration-level `once` atomically claims the whole matching group; unmatched conditions leave it available.

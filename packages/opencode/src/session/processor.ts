@@ -16,6 +16,7 @@ import { isOverflow } from "./overflow"
 import { PartID } from "./schema"
 import type { SessionID } from "./schema"
 import { SessionRetry } from "./retry"
+import { CompactionTimeoutError, watchCompactionStream } from "./compaction-timeout"
 import { SessionStatus } from "./status"
 import { SessionSummary } from "./summary"
 import type { Provider } from "@/provider/provider"
@@ -30,10 +31,10 @@ import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import * as DateTime from "effect/DateTime"
 import { RuntimeFlags } from "@/effect/runtime-flags"
-import { ToolOutput, Usage, type LLMEvent } from "@opencode-ai/llm"
+import { LLMError, Usage, type LLMEvent } from "@opencode-ai/llm"
 
 const DOOM_LOOP_THRESHOLD = 3
-export type Result = "compact" | "stop" | "continue"
+export type Result = "compact" | "stop" | "continue" | "timeout"
 
 export interface Handle {
   readonly message: SessionV1.Assistant
@@ -975,6 +976,24 @@ export const layer = Layer.effect(
         })
         ctx.needsCompaction = false
         ctx.shouldBreak = (yield* config.get()).experimental?.continue_loop_on_deny !== true
+        let timedOut = false
+        const isCompactionTimeout = (error: unknown) => {
+          if (streamInput.purpose !== "compaction" || aborted) return false
+          const parsed = parse(error)
+          if (SessionV1.AbortedError.isInstance(parsed) || SessionV1.ContextOverflowError.isInstance(parsed))
+            return false
+          return (
+            error instanceof CompactionTimeoutError ||
+            (error instanceof LLMError && error.isTimeout) ||
+            (error instanceof Error && error.name.endsWith("TimeoutError")) ||
+            (SessionV1.APIError.isInstance(parsed) && [408, 504].includes(parsed.data.statusCode ?? 0)) ||
+            (isRecord(parsed.data) &&
+              typeof parsed.data.message === "string" &&
+              /\b(?:request|response|connection|network|stream|read) (?:timeout|timed out|time out)\b/i.test(
+                parsed.data.message,
+              ))
+          )
+        }
 
         return yield* Effect.gen(function* () {
           yield* Effect.gen(function* () {
@@ -982,7 +1001,8 @@ export const layer = Layer.effect(
             ctx.currentTextID = undefined
             ctx.reasoningMap = {}
             yield* status.set(ctx.sessionID, { type: "busy" })
-            const stream = llm.stream(streamInput)
+            const source = llm.stream(streamInput)
+            const stream = streamInput.purpose === "compaction" ? watchCompactionStream(source) : source
 
             yield* stream.pipe(
               Stream.tap((event) => handleEvent(event)),
@@ -1005,7 +1025,11 @@ export const layer = Layer.effect(
             Effect.retry(
               SessionRetry.policy({
                 provider: input.model.providerID,
-                parse,
+                // Compaction timeouts immediately advance the model ladder, without retry backoff.
+                parse: (error) =>
+                  isCompactionTimeout(error)
+                    ? new SessionV1.AbortedError({ message: "Compaction timeout; advancing model fallback" }).toObject()
+                    : parse(error),
                 set: (info) => {
                   // TODO(v2): Temporary dual-write while migrating session messages to v2 events.
                   const event = mirrorAssistant
@@ -1034,10 +1058,17 @@ export const layer = Layer.effect(
                 },
               }),
             ),
-            Effect.catch(halt),
+            Effect.catch((error) => {
+              if (!isCompactionTimeout(error)) return halt(error)
+              timedOut = true
+              ctx.assistantMessage.error = parse(error)
+              ctx.assistantMessage.finish = "error"
+              return Effect.void
+            }),
             Effect.ensuring(cleanup()),
           )
 
+          if (timedOut) return "timeout"
           if (ctx.needsCompaction) return "compact"
           if (ctx.blocked || ctx.assistantMessage.error) return "stop"
           return "continue"
