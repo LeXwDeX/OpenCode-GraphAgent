@@ -7,9 +7,35 @@ set -euo pipefail
 
 REPO="LeXwDeX/OpenCode-GraphAgent"
 RELEASES_URL="https://github.com/${REPO}/releases"
-INSTALL_DIR="${OC_INSTALL_DIR:-/usr/local/bin}"
 INSTALL_NAME="${OC_OPENCODE_NAME:-opencode}"
-OC_VERSION="1.4.0"
+OC_VERSION="1.4.1"
+
+# Update the active supported binary in place. For a fresh install, choose the
+# first supported bin directory in PATH. Explicit OC_INSTALL_DIR wins.
+default_install_dir() {
+    local dir active
+    active=$(command -v "$INSTALL_NAME" 2>/dev/null || true)
+    case "$active" in
+        "$HOME/.local/bin/$INSTALL_NAME"|/usr/local/bin/"$INSTALL_NAME")
+            if [ ! -L "$active" ]; then
+                dirname "$active"
+                return
+            fi
+            ;;
+    esac
+    local -a path_dirs
+    IFS=: read -r -a path_dirs <<< "${PATH:-}"
+    for dir in "${path_dirs[@]}"; do
+        case "$dir" in
+            "$HOME/.local/bin"|/usr/local/bin)
+                printf '%s\n' "$dir"
+                return
+                ;;
+        esac
+    done
+    printf '%s\n' /usr/local/bin
+}
+INSTALL_DIR="${OC_INSTALL_DIR:-$(default_install_dir)}"
 
 C_RESET=$'\033[0m'; C_DIM=$'\033[2m'; C_BOLD=$'\033[1m'
 C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'; C_RED=$'\033[31m'; C_CYAN=$'\033[36m'
@@ -284,8 +310,8 @@ install_from_local() {
     ok "本地 SHA256 自洽"
     local tmpdir; tmpdir=$(mktemp -d); trap "rm -rf '$tmpdir'" EXIT
     extract_and_install "$file" "$tmpdir"
-    ok "安装完成：$(${INSTALL_DIR}/${INSTALL_NAME} --version 2>/dev/null || echo "(版本未知)")"
-    check_brew_shadow
+    check_active_install || die "安装目标与当前执行的 $INSTALL_NAME 不一致"
+    ok "安装完成：$("${INSTALL_DIR}/${INSTALL_NAME}" --version)"
 }
 
 extract_and_install() {
@@ -308,8 +334,8 @@ extract_and_install() {
 
     local target="${INSTALL_DIR}/${INSTALL_NAME}"
     info "安装到 $target"
-    if [ -d "$INSTALL_DIR" ] && [ -w "$INSTALL_DIR" ]; then
-        mkdir -p "$INSTALL_DIR"
+    [ ! -L "$target" ] || die "安装目标是符号链接，请先处理：$target"
+    if mkdir -p "$INSTALL_DIR" 2>/dev/null && [ -w "$INSTALL_DIR" ]; then
         cp -f "$bin" "$target" && chmod +x "$target"
     else
         sudo mkdir -p "$INSTALL_DIR"
@@ -537,27 +563,24 @@ choose_release() {
     echo "$picked" | sed -E 's/^\[预\] +//' | awk '{print $1}'
 }
 
-# ---------- Homebrew 遮蔽检测 ----------
-check_brew_shadow() {
-    # 安装后检测 PATH 中实际解析到的 opencode 是否为 Homebrew 管理的版本
-    local resolved
+# ---------- 安装路径校验 ----------
+check_active_install() {
+    # Any earlier PATH entry can shadow the target, not just Homebrew.
+    hash -r 2>/dev/null || true
+    local resolved target
     resolved=$(command -v "$INSTALL_NAME" 2>/dev/null || true)
-    [ -z "$resolved" ] && return 0
-    local target="${INSTALL_DIR}/${INSTALL_NAME}"
-    # 如果 PATH 解析到的就是我们刚装的，没问题
-    [ "$resolved" = "$target" ] && return 0
-    # 检测是否是 Homebrew 路径
-    if echo "$resolved" | grep -qE '/(opt/homebrew|Cellar|Homebrew)/'; then
-        echo
-        warn "检测到 Homebrew 的 opencode 正在遮蔽 fork 版本："
-        warn "  PATH 解析到：$resolved (Homebrew)"
-        warn "  fork 已装到：$target"
-        warn ""
-        warn "解决方法（任选其一）："
-        warn "  brew unlink opencode    # 取消 Homebrew 的 PATH 链接"
-        warn "  brew uninstall opencode # 完全卸载 Homebrew 版本"
-        echo
+    target="${INSTALL_DIR}/${INSTALL_NAME}"
+    if [ "$resolved" != "$target" ]; then
+        warn "PATH 当前执行：${resolved:-(未找到)}"
+        warn "本次安装目标：$target"
+        warn "请调整 PATH 顺序，或设置 OC_INSTALL_DIR 为当前执行文件所在目录后重试"
+        return 1
     fi
+    [ -x "$target" ] || { warn "安装目标不可执行：$target"; return 1; }
+    local version
+    version=$("$target" --version 2>/dev/null) || { warn "安装目标无法运行：$target"; return 1; }
+    [ -n "$version" ] || { warn "安装目标未返回版本：$target"; return 1; }
+    info "当前执行：$resolved ($version)"
 }
 
 # ---------- 自更新 ----------
@@ -1170,8 +1193,8 @@ do_upgrade() {
         download_asset "$tag" "$asset" "$file"
         try_verify_sha256 "$tag" "$asset" "$file" "$tmpdir"
         extract_and_install "$file" "$tmpdir"
-        ok "安装完成：$(${INSTALL_DIR}/${INSTALL_NAME} --version 2>/dev/null || echo "(版本未知)")"
-        check_brew_shadow
+        check_active_install || die "安装目标与当前执行的 $INSTALL_NAME 不一致"
+        ok "安装完成：$("${INSTALL_DIR}/${INSTALL_NAME}" --version)"
         return
     fi
 
@@ -1179,7 +1202,7 @@ do_upgrade() {
     warn "无法在线获取 $tag 的 SHA256SUMS（网络/限流）"
     [ -z "$local_dir" ] && die "本地无可用包（候选：${LOCAL_DIR_CANDIDATES[*]}），无法离线安装"
     local cur; cur=$(current_version)
-    if [ -n "$local_ver" ] && echo "$cur" | grep -qF "$local_ver"; then
+    if [ -n "$local_ver" ] && [ "$(command -v "$INSTALL_NAME" 2>/dev/null || true)" = "${INSTALL_DIR}/${INSTALL_NAME}" ] && [ "${cur#v}" = "${local_ver#v}" ]; then
         ok "已安装版本与本地包一致 ($local_ver)，无需操作"
         return
     fi
@@ -1211,7 +1234,7 @@ main() {
                     if [ -n "$local_dir" ]; then
                         local_ver=$(read_version_field "$local_dir/VERSION" BUNDLED_VERSION || true)
                         info "本地包 BUNDLED_VERSION=$local_ver"
-                        if echo "$cur" | grep -qF "$local_ver"; then
+                        if [ -n "$local_ver" ] && [ "$(command -v "$INSTALL_NAME" 2>/dev/null || true)" = "${INSTALL_DIR}/${INSTALL_NAME}" ] && [ "${cur#v}" = "${local_ver#v}" ]; then
                             ok "已安装版本与本地包一致，无需操作"
                         else
                             install_from_local "$local_dir"

@@ -26,6 +26,15 @@ Guidance for coding agents in this repository (GraphAgent — an opencode fork w
 - If a test model is unavailable or quota-limited, continue with an available configured model from those families. Use synthetic sessions, preserve the user's active conversations and configuration, and keep credentials out of logs and artifacts. This authorization is for model calls, not changing credentials or deploying services.
 - For runtime fixes accepted through the installed `opencode` command, first install the local test build over `/usr/local/bin/opencode`; verify that the command actually runs this binary, its version, and matching build/install SHA-256 hashes before testing. Start a new process; see `packages/opencode/AGENTS.md` for steps. This does not apply to unit tests or `bun dev` development checks and is not a stable release.
 
+## Local verification scope before push / PR
+
+Repository-specific mapping; shared pre-push verification requirements live in the agent's global instructions.
+
+- Public event changes: run both `packages/schema/test/event-manifest.test.ts` and `packages/opencode/test/event-manifest.test.ts` from their respective packages, plus affected event consumers. Check inventories, fixed-count assertions and generated event types together; the DAG gate does not include every runtime manifest test.
+- HTTP contract changes: follow Generated code below, verify both client generators are idempotent, and run `bun run test:httpapi` from `packages/opencode` with the updated scenarios. Generated-file checks compare against Git, so distinguish intended uncommitted output from unexpected regeneration drift.
+- Runtime configuration changes: verify loading through `AppLayer` (`packages/opencode/src/effect/app-runtime.ts`), following the Effect and runtime contracts in `packages/opencode/AGENTS.md`.
+- UI changes: exercise rendering and interaction on every affected client (TUI, app, or direct `run`), including relevant state transitions and terminal cleanup; a backend-only test is insufficient. Use package-local browser/TUI harnesses and isolated configuration.
+
 ## CI gates (.github/workflows)
 
 - GitHub default and stable release branch: `main`. Push CI runs on `main`; feature work lands via `{type}/**` branches and PRs targeting `main`.
@@ -62,13 +71,13 @@ Guidance for coding agents in this repository (GraphAgent — an opencode fork w
 <!-- specgit:v2:start -->
 ## SpecGit 2
 
-Runtime: 2.0.0. Declaration: `.specgit.yaml` (v2).
+Runtime: 2.3.0. Declaration: `.specgit.yaml` (v2).
 
-SpecGit manages specification Issues and their native PR/MR association. Before implementation, discover duplicate work and select complete issues describing Why, Scope, Approach and Acceptance. Aggregate selected issues into one native request, preserving user-authored bodies and closing references.
+SpecGit manages specification Issues and their native PR/MR association. `specgit --help` and `specgit --schema` define the installed contract: use `--json` for machine output, preview Issue/PR writes with `--dry-run`, and use `specgit pr --ready` when review preparation is complete. Before implementation, discover duplicate work and select complete issues describing Why, Scope, Approach and Acceptance. Aggregate selected issues into one native request after implementation and authorized commit/push, preserving user-authored bodies and closing references.
 
-The Agent supervises development and fixes. Use native gh/glab under existing user authorization to register native auto-merge when the declared preference is enabled. GitHub/GitLab owns CI, reviews, protection and actual merge. Observe current native state with specgit watch. Hook notices describe changes; they grant no write permission.
+The Agent supervises development and fixes. Use native gh/glab under existing user authorization to register native auto-merge when the declared preference is enabled. GitHub/GitLab owns CI, reviews, protection and actual merge. Observe current native state with `specgit pr --status` and bounded `specgit watch`; exit 0 is operation success, not delivery completion — follow reported diagnostics and recovery actions. Hook notices describe changes; they grant no write permission.
 
-After merge, report actual linked Issue state. An open linked Issue causes an attention notice. Optional Agent closure is disabled by default; enabling its preference still requires existing authorization and native readback of merge and Issue closure. Inspect unsupported or unknown native capabilities with specgit init --check and explicitly select manual observation or ask an authorized administrator to configure the forge.
+Completion requires native readback of the intended target merge and closure of every selected Issue. After merge, report actual linked Issue state. An open linked Issue causes an attention notice. Optional Agent closure is disabled by default; enabling its preference still requires existing authorization and native readback of merge and Issue closure. Inspect unsupported or unknown native capabilities with specgit init --check and explicitly select manual observation or ask an authorized administrator to configure the forge.
 
 Declared rules: `{"agent":{"close_issues_after_merge":false,"native_auto_merge":false},"issue_template":"builtin","language":"en","pr_template":"builtin","validation":{"bodies":true,"labels":"off","titles":true}}`
 <!-- specgit:v2:end -->

@@ -146,7 +146,7 @@ SBX="$WORK/sbx"
 mkdir -p "$SBX/home" "$SBX/bin" "$SBX/local-missing"
 (
   cd "$SBX"
-  export PATH="$STUBDIR:$PATH"
+  export PATH="$STUBDIR:$SBX/bin:$PATH"
   export HOME="$SBX/home"
   export OC_INSTALL_DIR="$SBX/bin"
   export OC_OPENCODE_NAME="opencode"
