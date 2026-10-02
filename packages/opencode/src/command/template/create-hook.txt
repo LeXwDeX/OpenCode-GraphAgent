@@ -8,7 +8,7 @@ This command guides interactive authoring of a **single new hook entry** into th
 
 ## Prerequisites
 
-Load the `configure-hooks` skill first — it documents the canonical 27-event list, the 5 hook types, and the `hooks.json` format. Reference it instead of guessing event names or field shapes.
+Load the `configure-hooks` skill first — it documents the canonical 26-event list, the 5 hook types, and the `hooks.json` format. Reference it instead of guessing event names or field shapes.
 
 ## Process
 
@@ -40,7 +40,8 @@ Ask the user for each field, one at a time:
 - Empty / omitted / `*` — matches all tools
 - `Bash` — exact tool name
 - `Bash|Edit|Write` — pipe-separated list
-- Any other string — treated as a regex
+- Names using letters, digits or underscores — exact match (case-insensitive), optionally pipe-separated
+- Other strings — treated as a regex
 
 For non-tool events, omit the matcher entirely.
 
@@ -126,7 +127,7 @@ Point the user at the **Active Hooks** block in the system prompt (visible on th
 
 ```
 User: /create-hook
-Agent: Which event should this hook fire on? (see the configure-hooks skill for all 27 events)
+Agent: Which event should this hook fire on? (see the configure-hooks skill for all 26 events)
 User: PreToolUse
 Agent: What type of hook? command / mcp / http / prompt / agent
 User: command

@@ -7,6 +7,33 @@ const slots: OrganizeSlot[] = [
 ]
 
 describe("one-call reasoning organizer", () => {
+  test("English input requests Chinese prose and literal preservation in either format", async () => {
+    const text = "Run bun test at src/llm.ts; keep maxRetries=0 for v1.0.57 and https://example.com; 2 calls."
+    for (const count of [1, 2]) {
+      let calls = 0
+      let request: { prompt: string; format: "text" | "json" } | undefined
+      const result = await organizeReasoning({
+        slots: slots.slice(0, count).map((slot) => ({ ...slot, text })),
+        callModel: async ({ prompt, format }) => {
+          calls++
+          request = { prompt, format }
+          return {
+            text:
+              count === 1
+                ? "运行 bun test。"
+                : '{"items":[{"slot":0,"text":"运行 bun test。"},{"slot":1,"text":"运行 bun test。"}]}',
+          }
+        },
+      })
+      expect(calls).toBe(1)
+      expect(result.status).toBe("organized")
+      expect(request?.prompt).toContain("整理后的说明文字一律用中文")
+      expect(request?.prompt).toContain("文件路径、命令、符号、代码、URL、配置键、版本号和数值逐字保留")
+      expect(request?.prompt).toContain(text)
+      expect(request?.format).toBe(count === 1 ? "text" : "json")
+    }
+  })
+
   test("single slot passes only text and keeps host IDs local", async () => {
     let calls = 0
     const result = await organizeReasoning({

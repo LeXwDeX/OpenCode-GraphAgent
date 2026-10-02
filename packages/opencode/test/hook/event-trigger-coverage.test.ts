@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test"
 import { readdirSync, readFileSync, statSync } from "fs"
 import path from "path"
 import { VALID_HOOK_EVENTS } from "@/hook/settings"
+import { ConfigureHooksDescription } from "@opencode-ai/core/plugin/skill"
 
 /**
  * Regression guard (hook-event-wiring D4): every event declared in the
@@ -27,6 +28,21 @@ function sourceFiles(dir: string): string[] {
 }
 
 describe("hook event trigger coverage", () => {
+  test("bundled hook instructions name the supported event count", () => {
+    const create = readFileSync(path.join(SRC_ROOT, "command/template/create-hook.txt"), "utf8")
+    const migrate = readFileSync(path.join(SRC_ROOT, "command/template/import-claude-hooks.txt"), "utf8")
+    const skill = readFileSync(path.resolve(SRC_ROOT, "../../core/src/plugin/skill/configure-hooks.md"), "utf8")
+    expect(create).toContain(`${VALID_HOOK_EVENTS.size}-event list`)
+    expect(create).toContain(`all ${VALID_HOOK_EVENTS.size} events`)
+    expect(migrate).toContain(`${VALID_HOOK_EVENTS.size} events total`)
+    expect(skill).toContain(`Events (${VALID_HOOK_EVENTS.size} total)`)
+    expect(ConfigureHooksDescription).toContain(`the ${VALID_HOOK_EVENTS.size} supported events`)
+    expect(create).toContain("Names using letters, digits or underscores — exact match (case-insensitive)")
+    expect(skill).toContain("names using letters, digits or underscores — exact match (case-insensitive)")
+    expect(migrate).toContain("Entries naming it are silently skipped")
+    expect(skill).toContain("silently skipped")
+  })
+
   const haystack = sourceFiles(SRC_ROOT)
     .map((file) => readFileSync(file, "utf8"))
     .join("\n")
@@ -38,8 +54,7 @@ describe("hook event trigger coverage", () => {
 
   for (const event of VALID_HOOK_EVENTS) {
     test(`event "${event}" has at least one trigger site`, () => {
-      const wired =
-        haystack.includes(`event: "${event}"`) || settingsSource.includes(`trigger({ event: "${event}"`)
+      const wired = haystack.includes(`event: "${event}"`) || settingsSource.includes(`trigger({ event: "${event}"`)
       expect(wired).toBe(true)
     })
   }

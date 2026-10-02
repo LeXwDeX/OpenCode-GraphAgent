@@ -53,7 +53,8 @@ Top-level keys are event names; each maps to a list of matcher blocks:
 - `"*"` or omitted — matches everything
 - `"Bash"` — exact match (case-insensitive)
 - `"Bash|Edit|Write"` — pipe-separated list
-- any other string — treated as a regex tested against the target
+- names using letters, digits or underscores — exact match (case-insensitive), optionally pipe-separated
+- other strings — treated as a regex tested against the target
 
 ## Events (26 total)
 
@@ -68,8 +69,8 @@ Other: `Notification`, `ConfigChange`, `WorktreeCreate`, `WorktreeRemove`,
 `InstructionsLoaded`, `CwdChanged`, `FileChanged`
 
 Removed event: `TeammateIdle` — no teammate concept exists in opencode, so it
-could never fire. Entries naming it in hooks.json are skipped with a warning
-(not an error); delete them.
+could never fire. Entries naming it in hooks.json are silently skipped; delete
+them.
 
 `Elicitation` / `ElicitationResult` fire when an MCP server issues
 `elicitation/create`; the ask is mapped onto the Question UI, validated against
