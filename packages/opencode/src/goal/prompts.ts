@@ -33,7 +33,7 @@ You will receive:
 1. The user's original goal.
 2. The agent's most recent response.
 
-Return ONLY a JSON object (no markdown, no explanation):
+Return ONLY a JSON object (no markdown, no explanation). Keep reason under 160 characters:
 {"verdict": "done" | "continue" | "blocked", "reason": "one sentence explanation"}
 
 "verdict" = "done" means ONE of:
@@ -65,7 +65,7 @@ Agent's most recent response (last {snippetChars} chars):
 {response}
 ---
 
-Is the goal done? For each sub-goal, provide concrete evidence it was met. Do not accept vague claims like "all requirements met".`
+Is the goal done? Check every sub-goal against concrete evidence. Return only the verdict and one concise reason; do not list each sub-goal. Do not accept vague claims like "all requirements met".`
 
 export interface ContinuationInput {
   readonly goal: string
@@ -96,9 +96,7 @@ export function renderContinuation(input: ContinuationInput): string {
   lines.push("")
   lines.push("Continue working toward this goal. Take the next concrete step.")
   lines.push("If you believe the goal is complete, state so explicitly and stop.")
-  lines.push(
-    "If you are completely blocked and cannot make any progress, state the blocker explicitly and stop.",
-  )
+  lines.push("If you are completely blocked and cannot make any progress, state the blocker explicitly and stop.")
   return lines.join("\n")
 }
 
@@ -134,19 +132,13 @@ export function renderGoalSystemBlock(state: GoalState.Info): string {
   return lines.join("\n")
 }
 
-export function renderJudgeUserPrompt(
-  goal: string,
-  response: string,
-  subgoals: ReadonlyArray<string>,
-): string {
+export function renderJudgeUserPrompt(goal: string, response: string, subgoals: ReadonlyArray<string>): string {
   const snippet = response.slice(-JUDGE_RESPONSE_SNIPPET_CHARS)
   if (subgoals.length === 0)
-    return JUDGE_USER_PROMPT_TEMPLATE
-      .replace("{goal}", goal)
+    return JUDGE_USER_PROMPT_TEMPLATE.replace("{goal}", goal)
       .replace("{snippetChars}", String(JUDGE_RESPONSE_SNIPPET_CHARS))
       .replace("{response}", snippet)
-  return JUDGE_USER_PROMPT_WITH_SUBGOALS_TEMPLATE
-    .replace("{goal}", goal)
+  return JUDGE_USER_PROMPT_WITH_SUBGOALS_TEMPLATE.replace("{goal}", goal)
     .replace("{subgoals}", subgoals.map((s, i) => `${i + 1}. ${s}`).join("\n"))
     .replace("{snippetChars}", String(JUDGE_RESPONSE_SNIPPET_CHARS))
     .replace("{response}", snippet)

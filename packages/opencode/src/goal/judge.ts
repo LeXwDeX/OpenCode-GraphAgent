@@ -1,6 +1,6 @@
 export * as GoalJudge from "./judge"
 
-import { Effect } from "effect"
+import { Cause, Effect } from "effect"
 import { GoalPrompts } from "./prompts"
 
 /** Privacy-safe failure category: error tag or class name only, never the message (may echo wire content). */
@@ -21,6 +21,27 @@ export interface JudgeResult {
   readonly failureCategory?: JudgeFailureCategory
 }
 
+export interface Request {
+  system: string
+  user: string
+  temperature: number
+  maxTokens: number
+  timeout: number
+  attempt: number
+}
+
+export interface Completion {
+  text: string
+  finishReason: string
+  outputTokens?: number
+  reasoningTokens?: number
+  sessionID?: string
+  providerID?: string
+  modelID?: string
+}
+
+export type CallLLM = (opts: Request) => Effect.Effect<string | Completion, Error>
+
 export type JudgeFailureCategory =
   | "empty"
   | "truncated-json"
@@ -39,7 +60,12 @@ function verdict(value: unknown): JudgeResult | undefined {
       typeof value.reason === "string"
     )
       result = { verdict: value.verdict, reason: value.reason, parseFailed: false }
-    else if ("done" in value && typeof value.done === "boolean" && "reason" in value && typeof value.reason === "string")
+    else if (
+      "done" in value &&
+      typeof value.done === "boolean" &&
+      "reason" in value &&
+      typeof value.reason === "string"
+    )
       result = { verdict: value.done ? "done" : "continue", reason: value.reason, parseFailed: false }
   }
   return result
@@ -98,6 +124,10 @@ function failed(category: JudgeFailureCategory, chars: number): JudgeResult {
 }
 
 export function parseJudgeResponse(raw: string): JudgeResult {
+  // Parse before removing fences: a reason can contain literal markdown.
+  try {
+    return verdict(JSON.parse(raw)) ?? failed("invalid-shape", raw.trim().length)
+  } catch {}
   const stripped = raw.replace(/```(?:json)?\s*([\s\S]*?)```/g, "$1").trim()
   if (!stripped) return failed("empty", 0)
 
@@ -120,8 +150,7 @@ export function parseJudgeResponse(raw: string): JudgeResult {
 
   if (candidates.unclosed) return failed("truncated-json", stripped.length)
   if (invalidShape) return failed("invalid-shape", stripped.length)
-  if (malformed || stripped.includes("{") || stripped.includes("}"))
-    return failed("malformed-json", stripped.length)
+  if (malformed || stripped.includes("{") || stripped.includes("}")) return failed("malformed-json", stripped.length)
   return failed("non-json", stripped.length)
 }
 
@@ -129,43 +158,64 @@ export const run = Effect.fn("Goal.Judge.run")(function* (
   goal: string,
   response: string,
   subgoals: ReadonlyArray<string>,
-  callLLM: (opts: {
-    system: string
-    user: string
-    temperature: number
-    maxTokens: number
-    timeout: number
-  }) => Effect.Effect<string, Error>,
+  callLLM: CallLLM,
 ) {
   const userPrompt = GoalPrompts.renderJudgeUserPrompt(goal, response, subgoals)
 
-  return yield* callLLM({
-    system: GoalPrompts.JUDGE_SYSTEM_PROMPT,
-    user: userPrompt,
-    temperature: 0,
-    maxTokens: 200,
-    timeout: GoalPrompts.DEFAULT_JUDGE_TIMEOUT_SECONDS,
-  }).pipe(
-    Effect.map((text) => parseJudgeResponse(text)),
-    // Transport errors (timeout, network, non-JSON transport-level failure)
-    // count toward the pause budget. Previously they returned
-    // parseFailed: false, which reset consecutive_parse_failures and let a
-    // flaky provider alternate bad-JSON and timeout indefinitely without
-    // ever hitting MAX_CONSECUTIVE_PARSE_FAILURES. Returning parseFailed: true
-    // feeds them through the same auto-pause path as parse failures, treating
-    // "judge is unreliable" uniformly regardless of failure mode. The verdict
-    // stays "continue" so a single transient blip does not stall the loop;
-    // it only pauses after MAX_CONSECUTIVE_PARSE_FAILURES in a row.
-    //
-    // catchCause (not orElseSucceed): the production callLLM chain can
-    // DEFECT — config first-use orDie, payload decode throws — and a defect
-    // escaping here kills afterIdle invisibly (the loop stalls at 0 turns
-    // with zero logs and no pause budget). catchCause folds defects into
-    // the same parseFailed budget.
-    Effect.catchCause((cause) =>
-      Effect.logWarning("goal judge transport failure", {
-        "goal.judge.error_category": errorCategory(cause),
-      }).pipe(Effect.as(failed("transport-error", 0))),
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const result = yield* Effect.suspend(() =>
+      callLLM({
+        system: GoalPrompts.JUDGE_SYSTEM_PROMPT,
+        user: userPrompt,
+        temperature: 0,
+        maxTokens: attempt === 1 ? 1024 : 2048,
+        timeout: GoalPrompts.DEFAULT_JUDGE_TIMEOUT_SECONDS,
+        attempt,
+      }),
+    ).pipe(
+      Effect.timeout(`${GoalPrompts.DEFAULT_JUDGE_TIMEOUT_SECONDS} seconds`),
+      Effect.flatMap((completion) => {
+        const text = typeof completion === "string" ? completion : completion.text
+        const parsed = parseJudgeResponse(text)
+        return Effect.logInfo("goal judge response", {
+          "goal.judge.attempt": attempt,
+          "goal.judge.output_characters": text.length,
+          "goal.judge.failure_category": parsed.failureCategory,
+          ...(typeof completion === "string"
+            ? {}
+            : {
+                "goal.judge.finish_reason": completion.finishReason,
+                "goal.judge.output_tokens": completion.outputTokens,
+                "goal.judge.reasoning_tokens": completion.reasoningTokens,
+                "goal.judge.session_id": completion.sessionID,
+                "goal.judge.provider_id": completion.providerID,
+                "goal.judge.model_id": completion.modelID,
+              }),
+        }).pipe(Effect.as(parsed))
+      }),
+      // Transport errors (timeout, network, non-JSON transport-level failure)
+      // count toward the pause budget. Previously they returned
+      // parseFailed: false, which reset consecutive_parse_failures and let a
+      // flaky provider alternate bad-JSON and timeout indefinitely without
+      // ever hitting MAX_CONSECUTIVE_PARSE_FAILURES. Returning parseFailed: true
+      // feeds them through the same auto-pause path as parse failures, treating
+      // "judge is unreliable" uniformly regardless of failure mode. The verdict
+      // stays "continue" so a single transient blip does not stall the loop;
+      // it only pauses after MAX_CONSECUTIVE_PARSE_FAILURES in a row.
+      //
+      // catchCause (not orElseSucceed): the production callLLM chain can
+      // DEFECT — config first-use orDie, payload decode throws — and a defect
+      // escaping here kills afterIdle invisibly (the loop stalls at 0 turns
+      // with zero logs and no pause budget). catchCause folds defects into
+      // the same parseFailed budget.
+      Effect.catchCause((cause) =>
+        Effect.logWarning("goal judge transport failure", {
+          "goal.judge.attempt": attempt,
+          "goal.judge.error_category": errorCategory(Cause.squash(cause)),
+        }).pipe(Effect.as(failed("transport-error", 0))),
+      ),
     )
-  )
+    if (!result.parseFailed || attempt === 2) return result
+  }
+  return failed("transport-error", 0)
 })

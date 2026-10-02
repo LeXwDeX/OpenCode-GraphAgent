@@ -1861,7 +1861,7 @@ describe("GoalLoop — judge-chain defect degrades into the parse budget (GOAL-F
         "parse failure never committed — the judge defect escaped the fork",
         "5 seconds",
       )
-      expect(judgeCalls).toBe(1)
+      expect(judgeCalls).toBe(2)
       expect(committed.turns_used).toBe(0)
       expect(committed.consecutive_parse_failures).toBe(1)
       expect(committed.last_judged_msg).toBeUndefined()

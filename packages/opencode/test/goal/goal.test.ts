@@ -188,13 +188,10 @@ describe("Goal.updateAfterJudge — blocked branch", () => {
       const state = yield* goal.set(sessionID, "deploy production", 10)
       seen.length = 0
 
-      const result = yield* goal.updateAfterJudge(
-        sessionID,
-        "blocked",
-        "missing production credentials",
-        false,
-        { goalID: state.goal_id ?? "legacy", revision: state.revision ?? 0 },
-      )
+      const result = yield* goal.updateAfterJudge(sessionID, "blocked", "missing production credentials", false, {
+        goalID: state.goal_id ?? "legacy",
+        revision: state.revision ?? 0,
+      })
 
       expect(result?.state.status).toBe("paused")
       expect(result?.state.last_verdict).toBe("blocked")
@@ -254,13 +251,10 @@ describe("Goal transition authority — stale loop decisions", () => {
       const before = yield* goal.set(sessionID, "ship feature X", 10)
 
       yield* goal.pause(sessionID, "user-paused")
-      const stale = yield* goal.updateAfterJudge(
-        sessionID,
-        "continue",
-        "stale judge result",
-        false,
-        { goalID: before.goal_id ?? "legacy", revision: before.revision ?? 0 },
-      )
+      const stale = yield* goal.updateAfterJudge(sessionID, "continue", "stale judge result", false, {
+        goalID: before.goal_id ?? "legacy",
+        revision: before.revision ?? 0,
+      })
 
       expect(stale).toBeUndefined()
       expect((yield* goal.load(sessionID))?.status).toBe("paused")
@@ -275,13 +269,10 @@ describe("Goal transition authority — stale loop decisions", () => {
 
       yield* goal.clear(sessionID)
       const replacement = yield* goal.set(sessionID, "new goal", 10)
-      const stale = yield* goal.updateAfterJudge(
-        sessionID,
-        "continue",
-        "old result",
-        false,
-        { goalID: before.goal_id ?? "legacy", revision: before.revision ?? 0 },
-      )
+      const stale = yield* goal.updateAfterJudge(sessionID, "continue", "old result", false, {
+        goalID: before.goal_id ?? "legacy",
+        revision: before.revision ?? 0,
+      })
 
       expect(stale).toBeUndefined()
       const current = yield* goal.load(sessionID)
@@ -655,13 +646,10 @@ describe("Goal.updateAfterJudge — transport failures trigger auto-pause (D5)",
 
       let result: Effect.Success<ReturnType<typeof goal.updateAfterJudge>>
       for (let attempt = 0; attempt < GoalPrompts.MAX_CONSECUTIVE_PARSE_FAILURES; attempt++) {
-        result = yield* goal.updateAfterJudge(
-          sessionID,
-          invalid.verdict,
-          invalid.reason,
-          invalid.parseFailed,
-          { goalID: state.goal_id ?? "legacy", revision: state.revision ?? 0 },
-        )
+        result = yield* goal.updateAfterJudge(sessionID, invalid.verdict, invalid.reason, invalid.parseFailed, {
+          goalID: state.goal_id ?? "legacy",
+          revision: state.revision ?? 0,
+        })
         if (result) state = result.state
       }
 
@@ -810,6 +798,54 @@ describe("Goal.updateAfterJudge — transport failures trigger auto-pause (D5)",
       expect(Number(after?.turns_used)).toBe(1)
       expect(after?.last_judged_msg).toBe("msg_boundary_real")
       expect(Number(after?.consecutive_parse_failures)).toBe(0)
+    }),
+  )
+
+  // Issue #691 regression chain — the exact user-reported sequence in ONE
+  // flow: 3 invalid judge results auto-pause (counter-climb + GOAL-03 budget
+  // neutrality), resume retains goal/subgoals/max_turns and the un-spent
+  // turns_used, then the first valid judgment after resume counts (0 → 1).
+  // §9.2/§5.3/§9.3c each cover only a fragment; this locks the full chain.
+  it.live("3 invalid results pause, resume retains goal/subgoals/budget/turns_used, valid continue counts", () =>
+    Effect.gen(function* () {
+      const goal = yield* Goal.Service
+      const sessionID = SessionID.descending()
+
+      yield* goal.set(sessionID, "build feature X", 5)
+      const seeded = yield* goal.addSubgoal(sessionID, "ship module A")
+
+      let expected = { goalID: seeded?.goal_id ?? "legacy", revision: seeded?.revision ?? 0 }
+      let result: Effect.Success<ReturnType<typeof goal.updateAfterJudge>>
+      for (let attempt = 0; attempt < GoalPrompts.MAX_CONSECUTIVE_PARSE_FAILURES; attempt++) {
+        result = yield* goal.updateAfterJudge(sessionID, "continue", `invalid response ${attempt}`, true, expected)
+        expect(result?.shouldContinue).toBe(attempt < GoalPrompts.MAX_CONSECUTIVE_PARSE_FAILURES - 1)
+        if (result) expected = { goalID: result.state.goal_id ?? "legacy", revision: result.state.revision ?? 0 }
+      }
+
+      // Auto-paused on the 3rd failure; nothing spent, nothing lost.
+      const paused = yield* goal.load(sessionID)
+      expect(paused?.status).toBe("paused")
+      expect(Number(paused?.turns_used)).toBe(0)
+      expect(paused?.goal).toBe("build feature X")
+      expect(paused?.subgoals).toEqual(["ship module A"])
+      expect(Number(paused?.max_turns)).toBe(5)
+
+      // Resume: active again with goal/subgoals/budget and turns_used intact.
+      const resumed = yield* goal.resume(sessionID)
+      expect(resumed?.status).toBe("active")
+      expect(resumed?.goal).toBe("build feature X")
+      expect(resumed?.subgoals).toEqual(["ship module A"])
+      expect(Number(resumed?.max_turns)).toBe(5)
+      expect(Number(resumed?.turns_used)).toBe(0)
+      expect(Number(resumed?.consecutive_parse_failures)).toBe(0)
+
+      // The first valid judgment after resume counts: turns_used 0 → 1.
+      const ok = yield* goal.updateAfterJudge(sessionID, "continue", "real verdict", false, {
+        goalID: resumed?.goal_id ?? "legacy",
+        revision: resumed?.revision ?? 0,
+      })
+      expect(ok?.shouldContinue).toBe(true)
+      expect(Number(ok?.state.turns_used)).toBe(1)
     }),
   )
 })
