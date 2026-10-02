@@ -12,6 +12,7 @@ export const HookCommandSchema = z
     statusMessage: z.string().optional(),
     once: z.boolean().optional(),
     shell: z.enum(["bash", "powershell"]).optional(),
+    inputFormat: z.enum(["opencode", "claude-code"]).optional(),
     if: z.string().optional(),
     async: z.boolean().optional(),
     asyncRewake: z.boolean().optional(),
@@ -19,6 +20,8 @@ export const HookCommandSchema = z
     __sourceDir: z.string().optional(),
   })
   .superRefine((entry, ctx) => {
+    if (entry.inputFormat !== undefined && entry.type !== "command")
+      ctx.addIssue({ code: "custom", message: "inputFormat is only supported for command hooks" })
     const value =
       entry.type === "http"
         ? (entry.url ?? entry.command)

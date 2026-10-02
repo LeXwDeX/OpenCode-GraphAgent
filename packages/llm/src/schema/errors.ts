@@ -182,6 +182,12 @@ export class LLMError extends Schema.TaggedErrorClass<LLMError>()("LLM.Error", {
     return this.reason.retryable
   }
 
+  get isTimeout() {
+    if (this.reason._tag === "Transport") return this.reason.kind === "Timeout"
+    const status = "status" in this.reason ? this.reason.status : undefined
+    return status === 408 || status === 504
+  }
+
   get retryAfterMs() {
     return "retryAfterMs" in this.reason ? this.reason.retryAfterMs : undefined
   }

@@ -10358,6 +10358,7 @@ export type SessionHookListResponses = {
       async?: boolean
       asyncRewake?: boolean
       shell?: "bash" | "powershell"
+      inputFormat?: "opencode" | "claude-code"
       allowedEnvVars?: Array<string>
       statusMessage?: string
       once?: boolean
@@ -10414,6 +10415,7 @@ export type SessionHookAddData = {
       async?: boolean
       asyncRewake?: boolean
       shell?: "bash" | "powershell"
+      inputFormat?: "opencode" | "claude-code"
       allowedEnvVars?: Array<string>
       statusMessage?: string
       once?: boolean

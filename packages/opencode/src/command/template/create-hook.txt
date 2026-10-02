@@ -48,11 +48,12 @@ For non-tool events, omit the matcher entirely.
 
 - `timeout` — seconds before the hook is killed (default 60)
 - `statusMessage` — short label shown in the UI while the hook runs
+- `inputFormat` (command hooks only) — `"opencode"` (default) or `"claude-code"`. Offer `"claude-code"` only when the script was written for Claude Code's hook stdin (expects `Bash`/`Read`/`Grep`-style tool names and `file_path`-style keys) and is being reused unchanged; see the `configure-hooks` skill's `inputFormat` section for the exact contract.
 
 **Scope** — `project` or `global`:
 
 - `project` → `.opencode/hooks.json` in the current project (hot-reloads in ~2s)
-- `global` → `~/.config/opencode/hooks.json` (requires restart to take effect)
+- `global` → `~/.config/opencode/hooks.json` (hot-reloads in ~2s as well)
 
 ### 2. Build the JSON entry
 
@@ -117,7 +118,7 @@ After writing, re-read the file and JSON-parse it to confirm validity:
 ### 6. Report hot-reload semantics
 
 - **Project scope**: "The hook will hot-reload within ~2 seconds — it will be active on the next session turn."
-- **Global scope**: "Global hooks load at startup. Restart opencode for this hook to take effect."
+- **Global scope**: "The global hooks.json is polled every ~2 seconds too — the hook becomes active shortly after the write, no restart needed."
 
 Point the user at the **Active Hooks** block in the system prompt (visible on the next turn for project-scoped hooks) to confirm the hook is live.
 
@@ -133,7 +134,7 @@ Agent: What shell command should run?
 User: ./scripts/check.sh
 Agent: Matcher (which tools should trigger this)? Empty = all tools.
 User: Bash
-Agent: Project or global scope? (project hot-reloads in ~2s; global requires restart)
+Agent: Project or global scope? (project hot-reloads in ~2s; global hot-reloads in ~2s too)
 User: project
 
 Here is the entry I will write to .opencode/hooks.json:

@@ -32,6 +32,10 @@ export interface Interface {
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/LLM/RequestExecutor") {}
 
+export const RetryTimeouts = Context.Reference<boolean>("@opencode/LLM/RequestExecutor/RetryTimeouts", {
+  defaultValue: () => true,
+})
+
 const BODY_LIMIT = 16_384
 const MAX_RETRIES = 2
 /** Request-local retry budget. Callers can disable retries without changing shared executor defaults. */
@@ -361,10 +365,12 @@ const retryStatusFailures = <A, R>(
 ): Effect.Effect<A, LLMError, R> =>
   Effect.catchTag(effect, "LLM.Error", (error): Effect.Effect<A, LLMError, R> => {
     if (!error.retryable || retries <= 0) return Effect.fail(error)
-    return retryDelay(error, attempt).pipe(
-      Effect.flatMap((delay) => Effect.sleep(delay)),
-      Effect.flatMap(() => retryStatusFailures(effect, retries - 1, attempt + 1)),
-    )
+    return Effect.gen(function* () {
+      if (error.isTimeout && !(yield* RetryTimeouts)) return yield* error
+      const delay = yield* retryDelay(error, attempt)
+      yield* Effect.sleep(delay)
+      return yield* retryStatusFailures(effect, retries - 1, attempt + 1)
+    })
   })
 
 export const layer: Layer.Layer<Service, never, HttpClient.HttpClient> = Layer.effect(

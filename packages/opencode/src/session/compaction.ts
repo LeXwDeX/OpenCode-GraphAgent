@@ -29,6 +29,7 @@ import { buildPrompt } from "@opencode-ai/core/session/compaction"
 import { SessionCompactionEvent } from "@opencode-ai/schema/session-compaction-event"
 import { SettingsHook, type TriggerResult } from "@/hook/settings"
 import { Memory } from "@/memory/memory"
+import { SessionStatus } from "./status"
 
 export const Event = SessionCompactionEvent
 
@@ -169,6 +170,7 @@ export const layer = Layer.effect(
     const provider = yield* Provider.Service
     const events = yield* EventV2Bridge.Service
     const flags = yield* RuntimeFlags.Service
+    const status = yield* SessionStatus.Service
     const settingsHook = Option.getOrUndefined(yield* Effect.serviceOption(SettingsHook.Service))
     const reasoningDistillationEnabled = (cfg: ConfigV1.Info) =>
       ConfigReasoningDistillation.resolveEnabled({
@@ -330,9 +332,19 @@ export const layer = Layer.effect(
       }
 
       const agent = yield* agents.get("compaction")
-      const model = agent.model
+      const conversationModel = yield* provider
+        .getModel(userMessage.model.providerID, userMessage.model.modelID)
+        .pipe(Effect.orDie)
+      const smallModel = yield* provider.getSmallModel(conversationModel.providerID)
+      const agentModel = agent.model
         ? yield* provider.getModel(agent.model.providerID, agent.model.modelID).pipe(Effect.orDie)
-        : yield* provider.getModel(userMessage.model.providerID, userMessage.model.modelID).pipe(Effect.orDie)
+        : undefined
+      const models = [smallModel, agentModel, conversationModel].filter(
+        (candidate, index, all): candidate is Provider.Model =>
+          candidate !== undefined &&
+          all.findIndex((item) => item?.id === candidate.id && item.providerID === candidate.providerID) === index,
+      )
+      const model = models[0]
       const cfg = yield* config.get()
       const history = compactionPart && messages.at(-1)?.info.id === input.parentID ? messages.slice(0, -1) : messages
       const prior = completedCompactions(history)
@@ -352,11 +364,6 @@ export const layer = Layer.effect(
       const nextPrompt = compacting.prompt ?? buildPrompt({ previousSummary, context: compacting.context })
       const msgs = structuredClone(selected.head)
       yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
-      const modelMessages = yield* MessageV2.toModelMessagesEffect(msgs, model, {
-        stripMedia: true,
-        toolOutputMaxChars: TOOL_OUTPUT_MAX_CHARS,
-        reasoningDistillationEnabled: reasoningDistillationEnabled(cfg),
-      })
       const tailIndex = selected.tail_start_id
         ? history.findIndex((message) => message.info.id === selected.tail_start_id)
         : -1
@@ -371,7 +378,7 @@ export const layer = Layer.effect(
               }),
             )
       const ctx = yield* InstanceState.context
-      const msg: SessionV1.Assistant = {
+      const template = {
         id: MessageID.ascending(),
         role: "assistant",
         parentID: input.parentID,
@@ -396,29 +403,64 @@ export const layer = Layer.effect(
         time: {
           created: Date.now(),
         },
+      } satisfies SessionV1.Assistant
+      let attempt = 0
+      let msg: SessionV1.Assistant = template
+      let processor: SessionProcessor.Handle
+      let result: SessionProcessor.Result
+      while (true) {
+        const candidate = models[attempt]
+        msg = {
+          ...template,
+          id: MessageID.ascending(),
+          modelID: candidate.id,
+          providerID: candidate.providerID,
+          time: { created: Date.now() },
+        }
+        yield* session.updateMessage(msg)
+        processor = yield* processors.create({ assistantMessage: msg, sessionID: input.sessionID, model: candidate })
+        const modelMessages = yield* MessageV2.toModelMessagesEffect(msgs, candidate, {
+          stripMedia: true,
+          toolOutputMaxChars: TOOL_OUTPUT_MAX_CHARS,
+          reasoningDistillationEnabled: reasoningDistillationEnabled(cfg),
+        })
+        result = yield* processor.process({
+          user: userMessage,
+          agent,
+          sessionID: input.sessionID,
+          tools: {},
+          system: [],
+          messages: [
+            ...modelMessages,
+            {
+              role: "user",
+              content: [{ type: "text", text: nextPrompt }],
+            },
+          ],
+          model: candidate,
+          purpose: "compaction",
+          retries: 0,
+        })
+        if (result !== "timeout" && result !== "compact") break
+        if (attempt + 1 >= models.length) {
+          if (result === "timeout") {
+            if (processor.message.error)
+              yield* events.publish(Session.Event.Error, { sessionID: input.sessionID, error: processor.message.error })
+            yield* status.set(input.sessionID, { type: "idle" })
+            return "stop"
+          }
+          break
+        }
+        // Failed/partial summaries must never become future compaction input.
+        yield* session.removeMessage({ sessionID: input.sessionID, messageID: msg.id })
+        attempt++
+        yield* status.set(input.sessionID, {
+          type: "retry",
+          attempt,
+          message: `Compaction ${result === "timeout" ? "timed out" : "exceeded context"}; switching to ${models[attempt].providerID}/${models[attempt].id}`,
+          next: Date.now(),
+        })
       }
-      yield* session.updateMessage(msg)
-      const processor = yield* processors.create({
-        assistantMessage: msg,
-        sessionID: input.sessionID,
-        model,
-      })
-      const result = yield* processor.process({
-        user: userMessage,
-        agent,
-        sessionID: input.sessionID,
-        tools: {},
-        system: [],
-        messages: [
-          ...modelMessages,
-          {
-            role: "user",
-            content: [{ type: "text", text: nextPrompt }],
-          },
-        ],
-        model,
-        purpose: "compaction",
-      })
 
       if (result === "compact") {
         processor.message.error = new SessionV1.ContextOverflowError({
@@ -428,6 +470,7 @@ export const layer = Layer.effect(
         }).toObject()
         processor.message.finish = "error"
         yield* session.updateMessage(processor.message)
+        yield* status.set(input.sessionID, { type: "idle" })
         return "stop"
       }
 
@@ -559,7 +602,7 @@ export const layer = Layer.effect(
           yield* SettingsHook.landSystemMessages(pcResult, { sessionID: input.sessionID })
         }
       }
-      return result
+      return result === "continue" ? "continue" : "stop"
     })
 
     const create = Effect.fn("SessionCompaction.create")(function* (input: {
@@ -613,6 +656,7 @@ export const defaultLayer = Layer.suspend(() =>
     Layer.provide(Config.defaultLayer),
     Layer.provide(RuntimeFlags.defaultLayer),
     Layer.provide(EventV2Bridge.defaultLayer),
+    Layer.provide(SessionStatus.defaultLayer),
   ),
 )
 
@@ -627,6 +671,7 @@ export const node = LayerNode.make(layer, [
   RuntimeFlags.node,
   Memory.node,
   SettingsHook.node,
+  SessionStatus.node,
 ])
 
 export * as SessionCompaction from "./compaction"

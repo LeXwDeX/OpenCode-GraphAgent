@@ -121,6 +121,39 @@ describe("RequestExecutor", () => {
     }),
   )
 
+  for (const status of [408, 504]) {
+    it.effect(`can bypass only timeout retries for HTTP ${status}`, () =>
+      Effect.gen(function* () {
+        const attempts = yield* Ref.make(0)
+        const error = yield* RequestExecutor.Service.use((executor) => executor.execute(request)).pipe(
+          Effect.flip,
+          Effect.provideService(RequestExecutor.RetryTimeouts, false),
+          Effect.provide(
+            countedResponsesLayer(attempts, [new Response(null, { status, headers: { "retry-after-ms": "10000" } })]),
+          ),
+        )
+        expect(error.isTimeout).toBe(true)
+        expect(yield* Ref.get(attempts)).toBe(1)
+      }),
+    )
+  }
+
+  it.effect("retains default HTTP 504 retries", () =>
+    Effect.gen(function* () {
+      const attempts = yield* Ref.make(0)
+      const response = yield* RequestExecutor.Service.use((executor) => executor.execute(request)).pipe(
+        Effect.provide(
+          countedResponsesLayer(attempts, [
+            new Response(null, { status: 504, headers: { "retry-after-ms": "0" } }),
+            new Response("ok"),
+          ]),
+        ),
+      )
+      expect(response.status).toBe(200)
+      expect(yield* Ref.get(attempts)).toBe(2)
+    }),
+  )
+
   it.effect("classifies context overflow responses", () =>
     Effect.gen(function* () {
       const executor = yield* RequestExecutor.Service
