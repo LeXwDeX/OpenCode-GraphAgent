@@ -150,7 +150,7 @@ Supported events:
 - MCP elicitation: `Elicitation`, `ElicitationResult`
 - Other: `Notification`, `ConfigChange`, `WorktreeCreate`, `WorktreeRemove`, `InstructionsLoaded`, `CwdChanged`, `FileChanged`
 
-Note: Claude Code's `TeammateIdle` event is not supported (no teammate concept in opencode). Entries naming it are skipped with a warning — remove it during import.
+Note: Claude Code's `TeammateIdle` event is not supported (no teammate concept in opencode). Entries naming it are silently skipped — remove it during import.
 
 Each event maps to an array of **matcher blocks**. Each matcher block has:
 
