@@ -1,0 +1,317 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>GraphAgent v1 总架构</title>
+    <link
+      href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&display=swap"
+      rel="stylesheet"
+    />
+    <style>
+      *,
+      *::before,
+      *::after {
+        box-sizing: border-box;
+      }
+      :root {
+        /* Monochrome skin: neutral and ink come from the repository's OpenCode theme. */
+        --color-paper: #ffffff;
+        --color-paper-2: #f7f7f7;
+        --color-ink: #1a1a1a;
+        --color-muted: #626262;
+        --color-rule: #d4d4d4;
+        --font-sans: "Geist", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+        --font-serif: "Instrument Serif", "Songti SC", "SimSun", serif;
+        --font-mono: "Geist Mono", ui-monospace, monospace;
+      }
+      body {
+        margin: 0;
+        padding: 40px 24px;
+        background: var(--color-paper);
+        color: var(--color-ink);
+        font-family: var(--font-sans);
+      }
+      .frame {
+        width: 100%;
+        max-width: 1360px;
+        min-width: 0;
+        margin: 0 auto;
+      }
+      .eyebrow {
+        margin: 0 0 8px;
+        color: var(--color-muted);
+        font-family: var(--font-mono);
+        font-size: 11px;
+        letter-spacing: 0.12em;
+      }
+      h1 {
+        margin: 0 0 12px;
+        font-family: var(--font-serif);
+        font-size: 28px;
+        font-weight: 400;
+      }
+      .intro,
+      .footer {
+        margin: 0 0 20px;
+        color: var(--color-muted);
+        font-size: 14px;
+        line-height: 1.7;
+      }
+      .diagram-container {
+        width: 100%;
+        overflow-x: auto;
+        border: 1px solid var(--color-rule);
+        border-radius: 8px;
+      }
+      svg {
+        display: block;
+        width: 100%;
+        min-width: 1280px;
+      }
+      .zone {
+        fill: var(--color-paper-2);
+        stroke: var(--color-rule);
+        stroke-width: 1;
+      }
+      .zone-label {
+        fill: var(--color-muted);
+        font-family: var(--font-sans);
+        font-size: 12px;
+        font-weight: 500;
+      }
+      .node {
+        fill: var(--color-paper);
+        stroke: var(--color-rule);
+        stroke-width: 1;
+      }
+      .focus {
+        fill: var(--color-ink);
+        stroke: var(--color-ink);
+      }
+      .node-name {
+        fill: var(--color-ink);
+        font-family: var(--font-sans);
+        font-size: 12px;
+        font-weight: 600;
+      }
+      .sublabel {
+        fill: var(--color-muted);
+        font-family: var(--font-mono);
+        font-size: 9px;
+        font-weight: 400;
+      }
+      .focus-name {
+        fill: #ffffff;
+      }
+      .focus-label {
+        fill: #dedede;
+      }
+      .connector {
+        fill: none;
+        stroke: var(--color-ink);
+        stroke-width: 1.4;
+        marker-end: url(#architecture-arrow);
+      }
+      .storage-connector {
+        stroke: var(--color-muted);
+        stroke-width: 1.2;
+        marker-end: url(#architecture-storage-arrow);
+      }
+      .return-connector {
+        stroke-dasharray: 5 4;
+      }
+      .arrow-label {
+        fill: var(--color-muted);
+        font-family: var(--font-mono);
+        font-size: 8px;
+        font-weight: 400;
+        letter-spacing: 0.04em;
+        text-anchor: middle;
+      }
+      .legend {
+        fill: var(--color-muted);
+        font-family: var(--font-sans);
+        font-size: 12px;
+      }
+      .footer {
+        margin: 20px 0 0;
+      }
+      a {
+        color: var(--color-ink);
+        text-underline-offset: 3px;
+      }
+      @media print {
+        body {
+          padding: 0;
+        }
+        .diagram-container {
+          overflow-x: visible;
+        }
+        svg {
+          min-width: 0;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="frame">
+      <p class="eyebrow">GRAPHAGENT V1 / ARCHITECTURE / 2026-10-03</p>
+      <h1>GraphAgent v1 总架构</h1>
+      <p class="intro">客户端提交输入。会话执行模型与工具调用。DAG 和 Goal 复用会话执行。状态与文件分别保存。</p>
+      <div class="diagram-container">
+        <svg
+          viewBox="0 0 1280 720"
+          xmlns="http://www.w3.org/2000/svg"
+          role="img"
+          aria-labelledby="architecture-title architecture-desc"
+        >
+          <title id="architecture-title">GraphAgent v1 总架构</title>
+          <desc id="architecture-desc">
+            GraphAgent 的客户端通过 HTTP API 提交输入并接收事件，AppLayer 组合的会话、DAG、Goal、模型适配和工具服务访问
+            SQLite 与文件存储。
+          </desc>
+          <defs>
+            <marker id="architecture-arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+              <polygon points="0 0, 8 3, 0 6" fill="#1a1a1a" />
+            </marker>
+            <marker id="architecture-storage-arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+              <polygon points="0 0, 8 3, 0 6" fill="#626262" />
+            </marker>
+          </defs>
+          <rect width="1280" height="720" fill="#ffffff" />
+
+          <!-- Service composition is a container, not another serial execution step. -->
+          <rect class="zone" x="256" y="64" width="768" height="472" rx="8" stroke-dasharray="5 4" />
+          <text class="zone-label" x="280" y="88">opencode 服务进程</text>
+          <rect x="520" y="88" width="488" height="440" rx="8" fill="none" stroke="#d4d4d4" />
+          <text class="zone-label" x="544" y="108">AppLayer · 组合服务与资源生命周期</text>
+
+          <!-- Connections precede nodes. Crossings on the DAG storage route have explicit hops. -->
+          <path class="connector" d="M 208 304 H 280" />
+          <path class="connector return-connector" d="M 280 344 H 208" />
+          <path class="connector" d="M 464 324 H 536" />
+          <path class="connector" d="M 372 264 V 168 Q 372 160 380 160 H 536" />
+          <path class="connector" d="M 648 224 V 264" />
+          <path class="connector" d="M 760 324 H 808" />
+          <path class="connector" d="M 1008 324 H 1056" />
+          <path class="connector" d="M 704 384 V 404 Q 704 412 712 412 H 900 Q 908 412 908 420 V 432" />
+          <path class="connector storage-connector" d="M 908 520 V 588 Q 908 596 900 596 H 864" />
+          <path
+            class="connector storage-connector"
+            d="M 592 384 V 448 Q 592 456 584 456 H 368 Q 360 456 360 464 V 552"
+          />
+          <path
+            class="connector storage-connector"
+            d="M 536 192 H 512 Q 504 192 504 200 V 316 a 8 8 0 0 0 0 16 V 448 a 8 8 0 0 0 0 16 V 520 Q 504 528 496 528 H 448 Q 440 528 440 536 V 552"
+          />
+          <path
+            class="connector storage-connector"
+            d="M 648 384 V 512 Q 648 520 656 520 H 708 Q 716 520 716 528 V 552"
+          />
+
+          <!-- Labels are masked and separated from their connector strokes. -->
+          <rect x="224" y="280" width="40" height="16" rx="2" fill="#ffffff" />
+          <text class="arrow-label" x="244" y="291">HTTP</text>
+          <rect x="224" y="352" width="40" height="16" rx="2" fill="#ffffff" />
+          <text class="arrow-label" x="244" y="363">SSE</text>
+          <rect x="480" y="300" width="40" height="16" rx="2" fill="#ffffff" />
+          <text class="arrow-label" x="500" y="311">PROMPT</text>
+          <rect x="424" y="136" width="64" height="16" rx="2" fill="#ffffff" />
+          <text class="arrow-label" x="456" y="147">CONTROL</text>
+          <rect x="656" y="232" width="64" height="16" rx="2" fill="#ffffff" />
+          <text class="arrow-label" x="688" y="243">SESSION</text>
+          <rect x="292" y="488" width="60" height="16" rx="2" fill="#ffffff" />
+          <text class="arrow-label" x="322" y="499">STATE</text>
+          <rect x="512" y="496" width="72" height="16" rx="2" fill="#ffffff" />
+          <text class="arrow-label" x="548" y="507">DAG STATE</text>
+          <rect x="656" y="472" width="88" height="16" rx="2" fill="#ffffff" />
+          <text class="arrow-label" x="700" y="483">MEMORY / IO</text>
+          <rect x="916" y="552" width="44" height="16" rx="2" fill="#ffffff" />
+          <text class="arrow-label" x="938" y="563">FILES</text>
+
+          <!-- Nine logical components. The provider and storage boxes are resources. -->
+          <g data-component="clients">
+            <rect class="node" x="40" y="264" width="168" height="120" rx="6" />
+            <text class="node-name" x="60" y="292">客户端</text>
+            <text class="sublabel" x="60" y="316">CLI / TUI · Web</text>
+            <text class="sublabel" x="60" y="336">Electron · SDK</text>
+            <text class="sublabel" x="60" y="360">local / remote server</text>
+          </g>
+          <g data-component="api">
+            <rect class="node" x="280" y="264" width="184" height="120" rx="6" />
+            <text class="node-name" x="300" y="292">HTTP API 与事件</text>
+            <text class="sublabel" x="300" y="316">Hono / Effect HttpApi</text>
+            <text class="sublabel" x="300" y="336">sessions · dag · events</text>
+            <text class="sublabel" x="300" y="360">JSON / SSE</text>
+          </g>
+          <g data-component="orchestrator">
+            <rect x="536" y="128" width="224" height="96" rx="6" fill="#ffffff" stroke="#1a1a1a" stroke-width="1.6" />
+            <text class="node-name" x="556" y="156">自动编排 · DAG / Goal</text>
+            <text class="sublabel" x="556" y="176">DagLoop · GoalLoop</text>
+            <text class="sublabel" x="556" y="196">.opencode/dag.jsonc</text>
+          </g>
+          <g data-component="session">
+            <rect class="node focus" x="536" y="264" width="224" height="120" rx="6" />
+            <text class="node-name focus-name" x="556" y="292">Session · 会话执行</text>
+            <text class="sublabel focus-label" x="556" y="316">SessionPrompt · Processor</text>
+            <text class="sublabel focus-label" x="556" y="336">Memory / System Context</text>
+            <text class="sublabel focus-label" x="556" y="360">history · model · tools</text>
+          </g>
+          <g data-component="models">
+            <rect class="node" x="808" y="264" width="200" height="120" rx="6" />
+            <text class="node-name" x="828" y="292">模型适配</text>
+            <text class="sublabel" x="828" y="316">Provider · session/llm</text>
+            <text class="sublabel" x="828" y="336">AI SDK (default)</text>
+            <text class="sublabel" x="828" y="360">native: packages/llm</text>
+          </g>
+          <g data-component="external">
+            <rect
+              x="1056"
+              y="264"
+              width="184"
+              height="120"
+              rx="6"
+              fill="#ffffff"
+              stroke="#1a1a1a"
+              stroke-dasharray="5 4"
+            />
+            <text class="node-name" x="1076" y="292">模型服务</text>
+            <text class="sublabel" x="1076" y="316">configured providers</text>
+            <text class="sublabel" x="1076" y="336">HTTP / streaming APIs</text>
+          </g>
+          <g data-component="tools">
+            <rect class="node" x="808" y="432" width="200" height="88" rx="6" />
+            <text class="node-name" x="828" y="460">工具与集成</text>
+            <text class="sublabel" x="828" y="480">ToolRegistry · MCP · LSP</text>
+            <text class="sublabel" x="828" y="500">files / processes / plugins</text>
+          </g>
+          <g data-component="db">
+            <rect x="280" y="552" width="240" height="88" rx="6" fill="#f7f7f7" stroke="#d4d4d4" />
+            <text class="node-name" x="300" y="580">SQLite 持久化</text>
+            <text class="sublabel" x="300" y="600">events · sessions · DAG</text>
+            <text class="sublabel" x="300" y="620">agent_mailbox / agent_message</text>
+          </g>
+          <g data-component="files">
+            <rect x="568" y="552" width="296" height="88" rx="6" fill="#f7f7f7" stroke="#d4d4d4" />
+            <text class="node-name" x="588" y="580">文件存储</text>
+            <text class="sublabel" x="588" y="600">workspace · Memory YAML</text>
+            <text class="sublabel" x="588" y="620">workflow-artifacts/objects/...</text>
+          </g>
+
+          <line x1="40" y1="660" x2="1240" y2="660" stroke="#d4d4d4" />
+          <line x1="40" y1="680" x2="88" y2="680" stroke="#1a1a1a" stroke-width="1.4" />
+          <text class="legend" x="100" y="684">调用与状态读写</text>
+          <line x1="280" y1="680" x2="328" y2="680" stroke="#1a1a1a" stroke-width="1.4" stroke-dasharray="5 4" />
+          <text class="legend" x="340" y="684">SSE 事件返回</text>
+          <text class="sublabel" x="872" y="684">MAIN @ 10806c9ad7 · 2026-10-03</text>
+        </svg>
+      </div>
+      <p class="footer">
+        图中是逻辑组件。AppLayer 负责服务组合。DAG 和 Goal 通过 Session 执行。 原生模型路径需要开启实验开关。SQLite
+        保存状态与文件引用。文件存储保存实际内容。
+        <a href="architecture.md">查看架构说明与源码入口</a>。
+      </p>
+    </main>
+  </body>
+</html>
