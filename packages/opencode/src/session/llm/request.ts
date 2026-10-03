@@ -10,6 +10,7 @@ import { ProviderTransform } from "@/provider/transform"
 import { SystemPrompt } from "../system"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import { RUNTIME_CAPABILITIES } from "@opencode-ai/core/system-context/capabilities"
+import { DEFAULT_WRITING_STYLE } from "@opencode-ai/core/system-context/writing-style"
 import { Effect, Record } from "effect"
 import { jsonSchema, tool as aiTool, type ModelMessage, type Tool } from "ai"
 import type { Plugin } from "@/plugin"
@@ -59,6 +60,7 @@ export const prepare = Effect.fn("LLMRequestPrep.prepare")(function* (input: Pre
     [
       ...(input.agent.prompt ? [input.agent.prompt] : SystemPrompt.provider(input.model)),
       ...(input.small ? [] : [RUNTIME_CAPABILITIES]),
+      DEFAULT_WRITING_STYLE,
       ...input.system,
       ...(input.user.system ? [input.user.system] : []),
     ]
@@ -103,12 +105,10 @@ export const prepare = Effect.fn("LLMRequestPrep.prepare")(function* (input: Pre
     isOpenaiOauth || input.isWorkflow
       ? input.messages
       : [
-          ...system.map(
-            (x): ModelMessage => ({
-              role: "system",
-              content: x,
-            }),
-          ),
+          ...system.map((x): ModelMessage => ({
+            role: "system",
+            content: x,
+          })),
           ...input.messages,
         ]
 

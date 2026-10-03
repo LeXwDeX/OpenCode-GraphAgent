@@ -15,7 +15,7 @@ import { Provider } from "@/provider/provider"
 const CONNECT_TIMEOUT = Duration.seconds(60)
 const IDLE_TIMEOUT = Duration.seconds(60)
 
-const JSON_HINT = "Respond with a JSON object matching the provided schema."
+const JSON_HINT = "Return only a JSON object that matches the provided schema."
 
 export interface Request {
   readonly model: Provider.Model

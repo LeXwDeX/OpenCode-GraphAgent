@@ -5,7 +5,7 @@
 - Use this tool when you need to retrieve and analyze web content
 
 Usage notes:
-  - IMPORTANT: if another tool is present that offers better web fetching capabilities, is more targeted to the task, or has fewer restrictions, prefer using that tool instead of this one.
+  - If another available tool fetches web content better, targets the task more closely, or has fewer restrictions, use it instead.
   - The URL must be a fully-formed valid URL
   - HTTP URLs will be automatically upgraded to HTTPS
   - Format options: "markdown" (default), "text", or "html"

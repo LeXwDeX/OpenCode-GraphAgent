@@ -9,6 +9,7 @@ import { SystemContext } from "@opencode-ai/core/system-context"
 import { SystemContextBuiltIns } from "@opencode-ai/core/system-context/builtins"
 import { SystemContextRegistry } from "@opencode-ai/core/system-context/registry"
 import { RUNTIME_CAPABILITIES } from "@opencode-ai/core/system-context/capabilities"
+import { DEFAULT_WRITING_STYLE } from "@opencode-ai/core/system-context/writing-style"
 import { location } from "../fixture/location"
 import { testEffect } from "../lib/effect"
 
@@ -62,6 +63,8 @@ describe("SystemContextBuiltIns", () => {
 
       expect(initialized.baseline).toBe(
         [
+          DEFAULT_WRITING_STYLE,
+          "",
           RUNTIME_CAPABILITIES,
           "",
           "Here is some useful information about the environment you are running in:",
@@ -91,7 +94,10 @@ describe("SystemContextBuiltIns", () => {
         _tag: "Updated",
         text: `Today's date is now: ${localDate(timestamp + 24 * 60 * 60 * 1000)}`,
       })
-      if (refreshed._tag === "Updated") expect(refreshed.text).not.toContain("## GraphAgent / OpenCode capabilities")
+      if (refreshed._tag === "Updated") {
+        expect(refreshed.text).not.toContain("## GraphAgent / OpenCode capabilities")
+        expect(refreshed.text).not.toContain(DEFAULT_WRITING_STYLE)
+      }
     }),
   )
 
@@ -113,6 +119,8 @@ describe("SystemContextBuiltIns", () => {
 
       expect((yield* SystemContext.initialize(yield* context.load())).baseline).toBe(
         [
+          DEFAULT_WRITING_STYLE,
+          "",
           RUNTIME_CAPABILITIES,
           "",
           "Here is some useful information about the environment you are running in:",

@@ -4,9 +4,9 @@ Be aware: OS: ${os}, Shell: ${shell}
 
 ${workdirSection}
 
-Use `${tmp}` for temporary work outside the workspace. This directory has already been created, already exists, and is pre-approved for external directory access.
+Use `${tmp}` for temporary files outside the workspace. It already exists and is approved for external access.
 
-IMPORTANT: This tool is for terminal operations like git, npm, docker, etc. DO NOT use it for file operations (reading, writing, editing, searching, finding files) - use the specialized tools for this instead.
+Use this tool for terminal operations such as `git`, `npm`, and `docker`. For file operations, use the specialized tools.
 
 ${commandSection}
 
