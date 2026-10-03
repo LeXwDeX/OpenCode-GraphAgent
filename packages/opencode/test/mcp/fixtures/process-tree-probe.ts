@@ -6,10 +6,32 @@
 // reaped (issue #503).
 import fs from "fs/promises"
 import path from "path"
+import os from "os"
 import { Effect } from "effect"
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio"
-import { MCP } from "../../../src/mcp/index"
-import { TestInstance, withTmpdirInstance } from "../../fixture/fixture"
+import { markPluginDependenciesReady } from "../../fixture/plugin"
+
+// A direct subprocess does not run test/preload.ts. Set its own paths before
+// importing application modules, including xdg-basedir's import-time cache.
+const isolation = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-mcp-tree-"))
+process.env.XDG_DATA_HOME = path.join(isolation, "share")
+process.env.XDG_CACHE_HOME = path.join(isolation, "cache")
+process.env.XDG_CONFIG_HOME = path.join(isolation, "config")
+process.env.XDG_STATE_HOME = path.join(isolation, "state")
+process.env.OPENCODE_CONFIG_DIR = path.join(isolation, "config", "opencode")
+process.env.OPENCODE_TEST_HOME = path.join(isolation, "home")
+process.env.OPENCODE_TEST_MANAGED_CONFIG_DIR = path.join(isolation, "managed")
+process.env.OPENCODE_DB = ":memory:"
+delete process.env.OPENCODE_CONFIG
+delete process.env.OPENCODE_CONFIG_CONTENT
+await fs.mkdir(process.env.OPENCODE_TEST_HOME, { recursive: true })
+await markPluginDependenciesReady(process.env.OPENCODE_CONFIG_DIR)
+
+const { MCP } = await import("../../../src/mcp/index")
+const { TestInstance, withTmpdirInstance } = await import("../../fixture/fixture")
+const { Process } = await import("../../../src/util/process")
+const { AppRuntime } = await import("../../../src/effect/app-runtime")
+const ownedPids: number[] = []
 
 function alive(pid: number) {
   try {
@@ -44,41 +66,52 @@ async function waitForPidFile(file: string, timeoutMs: number) {
   return undefined
 }
 
-const result = await Effect.runPromise(
-  withTmpdirInstance({ config: { mcp: {} } })(
-    Effect.gen(function* () {
-      const mcp = yield* MCP.Service
-      const { directory } = yield* TestInstance
-      const childPidFile = path.join(directory, "fixture-child.pid")
+let result: { ok: boolean; rootDead?: boolean; childDead?: boolean }
+try {
+  result = await Effect.runPromise(
+    withTmpdirInstance({ config: { mcp: {} } })(
+      Effect.gen(function* () {
+        const mcp = yield* MCP.Service
+        const { directory } = yield* TestInstance
+        const childPidFile = path.join(directory, "fixture-child.pid")
 
-      yield* mcp.add("tree-server", {
-        type: "local",
-        command: [process.execPath, path.join(import.meta.dir, "server-stdio.ts")],
-        environment: { MCP_FIXTURE_CHILD_PID_FILE: childPidFile },
-      })
+        yield* mcp.add("tree-server", {
+          type: "local",
+          command: [process.execPath, path.join(import.meta.dir, "server-stdio.ts")],
+          environment: { MCP_FIXTURE_CHILD_PID_FILE: childPidFile },
+        })
 
-      const status = (yield* mcp.status())["tree-server"]
-      if (status?.status !== "connected") return { ok: false, stage: "connect", status }
+        const status = (yield* mcp.status())["tree-server"]
+        if (status?.status !== "connected") return { ok: false, stage: "connect", status }
 
-      const client = (yield* mcp.clients())["tree-server"]
-      const rootPid = client?.transport instanceof StdioClientTransport ? client.transport.pid : null
-      if (typeof rootPid !== "number") return { ok: false, stage: "root-pid" }
+        const client = (yield* mcp.clients())["tree-server"]
+        const rootPid = client?.transport instanceof StdioClientTransport ? client.transport.pid : null
+        if (typeof rootPid !== "number") return { ok: false, stage: "root-pid" }
+        ownedPids.push(rootPid)
 
-      const childPid = yield* Effect.promise(() => waitForPidFile(childPidFile, 5_000))
-      if (childPid === undefined) return { ok: false, stage: "child-pid-file", rootPid }
+        const childPid = yield* Effect.promise(() => waitForPidFile(childPidFile, 5_000))
+        if (childPid === undefined) return { ok: false, stage: "child-pid-file", rootPid }
+        ownedPids.push(childPid)
 
-      yield* mcp.disconnect("tree-server")
+        yield* mcp.disconnect("tree-server")
 
-      return {
-        ok: true,
-        rootDead: yield* Effect.promise(() => waitDead(rootPid, 10_000)),
-        childDead: yield* Effect.promise(() => waitDead(childPid, 10_000)),
-        rootPid,
-        childPid,
-      }
-    }),
-  ).pipe(Effect.scoped, Effect.provide(MCP.defaultLayer)),
-)
+        return {
+          ok: true,
+          rootDead: yield* Effect.promise(() => waitDead(rootPid, 10_000)),
+          childDead: yield* Effect.promise(() => waitDead(childPid, 10_000)),
+          rootPid,
+          childPid,
+        }
+      }),
+    ).pipe(Effect.scoped, Effect.provide(MCP.defaultLayer)),
+  )
+} finally {
+  // Cleanup follows the observations and never changes a failed result into a
+  // pass. Only fixture-owned PIDs are eligible, even when pgrep is unavailable.
+  await Process.stopTree(ownedPids)
+  await AppRuntime.dispose()
+  await fs.rm(isolation, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
+}
 
 await Bun.write(Bun.stdout, `${JSON.stringify(result)}\n`)
 process.exit(result.ok && result.rootDead && result.childDead ? 0 : 1)

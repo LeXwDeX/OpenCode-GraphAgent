@@ -2549,11 +2549,7 @@ export type McpStatusNeedsClientRegistration = {
 }
 
 export type McpStatus =
-  | McpStatusConnected
-  | McpStatusDisabled
-  | McpStatusFailed
-  | McpStatusNeedsAuth
-  | McpStatusNeedsClientRegistration
+  McpStatusConnected | McpStatusDisabled | McpStatusFailed | McpStatusNeedsAuth | McpStatusNeedsClientRegistration
 
 export type McpUnsupportedOAuthError = {
   error: string

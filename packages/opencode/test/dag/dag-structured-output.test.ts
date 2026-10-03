@@ -196,6 +196,37 @@ describe("validateAgainstSchema", () => {
     expect(validateAgainstSchema({ name: "x", count: 1 }, schema).ok).toBe(true)
   })
 
+  it("requires own JSON properties even for Object.prototype names", () => {
+    for (const field of ["constructor", "toString", "__proto__"]) {
+      expect(validateAgainstSchema({}, { type: "object", required: [field] }).ok).toBe(false)
+      const payload = JSON.parse(`{"${field}":"present"}`)
+      expect(validateAgainstSchema(payload, { type: "object", required: [field] }).ok).toBe(true)
+    }
+  })
+
+  it("validates only present own properties and rejects undeclared prototype names", () => {
+    for (const field of ["constructor", "toString", "__proto__"]) {
+      const properties = JSON.parse(`{"${field}":{"type":"string"}}`)
+      const schema = { type: "object", properties, additionalProperties: false }
+      expect(validateAgainstSchema({}, schema).ok).toBe(true)
+      expect(validateAgainstSchema(JSON.parse(`{"${field}":"valid"}`), schema).ok).toBe(true)
+      expect(validateAgainstSchema(JSON.parse(`{"${field}":1}`), schema).ok).toBe(false)
+      expect(validateAgainstSchema(JSON.parse(`{"${field}":"extra"}`), {
+        type: "object", properties: {}, additionalProperties: false,
+      }).ok).toBe(false)
+    }
+  })
+
+  it("matches the complete string at the regex length boundary and rejects longer values", () => {
+    const schema = { type: "string", pattern: "^a+$" }
+    expect(validateAgainstSchema("a".repeat(99_999), schema).ok).toBe(true)
+    expect(validateAgainstSchema("a".repeat(100_000), schema).ok).toBe(true)
+    expect(validateAgainstSchema("a".repeat(99_999) + "!", schema).ok).toBe(false)
+    expect(validateAgainstSchema("a".repeat(100_001), schema).ok).toBe(false)
+    expect(validateAgainstSchema("a".repeat(100_000) + "!", schema).ok).toBe(false)
+    expect(validateAgainstSchema("a".repeat(100_001), { type: "string" }).ok).toBe(true)
+  })
+
   it("validates nested properties recursively", () => {
     const schema = {
       type: "object" as const,

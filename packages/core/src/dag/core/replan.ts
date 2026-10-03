@@ -140,14 +140,18 @@ export function planReplan(
   //    depend on another fragment node or on a surviving current node).
   const survivingIds = new Set<string>()
   for (const n of current.nodes) {
-    // A current node survives unless it's pending-and-not-in-fragment or cancelled.
+    // Non-running, non-terminal nodes omitted from the fragment are cancelled.
+    // Keep this graph consistent with the cancel classification below.
     const frag = fragmentNodeById.get(n.id)
     if (frag?.cancel) continue // explicitly cancelled
     if (isNodeTerminalStatus(n.status)) {
       survivingIds.add(n.id) // terminal survives (immutable)
       continue
     }
-    if (n.status === NodeStatus.PENDING && !fragmentIds.has(n.id)) continue // superseded
+    if (
+      (n.status === NodeStatus.PENDING || n.status === NodeStatus.QUEUED || n.status === NodeStatus.PAUSED)
+      && !fragmentIds.has(n.id)
+    ) continue // superseded
     survivingIds.add(n.id)
   }
   for (const fragNode of fragment.nodes) {

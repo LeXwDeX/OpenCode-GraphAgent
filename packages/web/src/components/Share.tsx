@@ -5,12 +5,12 @@ import { IconArrowDown } from "./icons"
 import { IconOpencode } from "./icons/custom"
 import { ShareI18nProvider, formatCurrency, formatNumber, normalizeLocale } from "./share/common"
 import styles from "./share.module.css"
-import type { MessageV2 } from "opencode/session/message-v2"
-import type { Message } from "opencode/session/message"
-import type { Session } from "opencode/session/index"
+import type { Message, Part as MessagePart, Session } from "@opencode-ai/sdk/v2/types"
+import type { Message as LegacyMessage } from "opencode/session/message"
 import { Part, ProviderIcon } from "./share/part"
+import { isRecord } from "./share/tool-data"
 
-type MessageWithParts = MessageV2.Info & { parts: MessageV2.Part[] }
+type MessageWithParts = Message & { parts: MessagePart[] }
 
 type Status = "disconnected" | "connecting" | "connected" | "error" | "reconnecting"
 
@@ -41,7 +41,7 @@ function getStatusText(status: [Status, string?], messages: Record<string, strin
 export default function Share(props: {
   id: string
   api: string
-  info: Session.Info
+  info: Session
   messages: { locale: string } & Record<string, string>
 }) {
   let lastScrollY = 0
@@ -58,7 +58,7 @@ export default function Share(props: {
   const [isNearBottom, setIsNearBottom] = createSignal(false)
 
   const [store, setStore] = createStore<{
-    info?: Session.Info
+    info?: Session
     messages: Record<string, MessageWithParts>
   }>({
     info: {
@@ -94,9 +94,11 @@ export default function Share(props: {
 
     let reconnectTimer: number | undefined
     let socket: WebSocket | null = null
+    let disposed = false
 
     // Function to create and set up WebSocket with auto-reconnect
     const setupWebSocket = () => {
+      if (disposed) return
       // Close any existing connection
       if (socket) {
         socket.close()
@@ -108,15 +110,18 @@ export default function Share(props: {
       const wsBaseUrl = apiUrl.replace(/^https?:\/\//, "wss://")
       const wsUrl = `${wsBaseUrl}/share_poll?id=${props.id}`
       // Create WebSocket connection
-      socket = new WebSocket(wsUrl)
+      const currentSocket = new WebSocket(wsUrl)
+      socket = currentSocket
 
       // Handle connection opening
-      socket.onopen = () => {
+      currentSocket.onopen = () => {
+        if (disposed || socket !== currentSocket) return
         setConnectionStatus(["connected"])
       }
 
       // Handle incoming messages
-      socket.onmessage = (event) => {
+      currentSocket.onmessage = (event) => {
+        if (disposed || socket !== currentSocket) return
         try {
           const d = JSON.parse(event.data)
           const [root, type, ...splits] = d.key.split("/")
@@ -147,18 +152,20 @@ export default function Share(props: {
       }
 
       // Handle errors
-      socket.onerror = (error) => {
+      currentSocket.onerror = (error) => {
+        if (disposed || socket !== currentSocket) return
         console.error("WebSocket error:", error)
         setConnectionStatus(["error", props.messages.error_connection_failed])
       }
 
       // Handle connection close and reconnection
-      socket.onclose = () => {
+      currentSocket.onclose = () => {
+        if (disposed || socket !== currentSocket) return
         setConnectionStatus(["reconnecting"])
 
         // Try to reconnect after 2 seconds
         clearTimeout(reconnectTimer)
-        reconnectTimer = window.setTimeout(setupWebSocket, 2000) as unknown as number
+        reconnectTimer = window.setTimeout(setupWebSocket, 2000)
       }
     }
 
@@ -167,10 +174,11 @@ export default function Share(props: {
 
     // Clean up on component unmount
     onCleanup(() => {
-      if (socket) {
-        socket.close()
-      }
+      disposed = true
+      const currentSocket = socket
+      socket = null
       clearTimeout(reconnectTimer)
+      currentSocket?.close()
     })
   })
 
@@ -498,7 +506,7 @@ export default function Share(props: {
   )
 }
 
-export function fromV1(v1: Message.Info): MessageWithParts {
+export function fromV1(v1: LegacyMessage.Info): MessageWithParts {
   if (v1.role === "assistant") {
     return {
       id: v1.id,
@@ -526,7 +534,7 @@ export function fromV1(v1: Message.Info): MessageWithParts {
       providerID: v1.metadata.assistant!.providerID,
       mode: "build",
       error: v1.metadata.error,
-      parts: v1.parts.flatMap((part, index): MessageV2.Part[] => {
+      parts: v1.parts.flatMap((part, index): MessagePart[] => {
         const base = {
           id: index.toString(),
           messageID: v1.id,
@@ -569,7 +577,7 @@ export function fromV1(v1: Message.Info): MessageWithParts {
                 if (part.toolInvocation.state === "call") {
                   return {
                     status: "running",
-                    input: part.toolInvocation.args,
+                    input: isRecord(part.toolInvocation.args) ? part.toolInvocation.args : {},
                     time: {
                       start: time.start,
                     },
@@ -579,7 +587,7 @@ export function fromV1(v1: Message.Info): MessageWithParts {
                 if (part.toolInvocation.state === "result") {
                   return {
                     status: "completed",
-                    input: part.toolInvocation.args,
+                    input: isRecord(part.toolInvocation.args) ? part.toolInvocation.args : {},
                     output: part.toolInvocation.result,
                     title,
                     time,
@@ -609,7 +617,7 @@ export function fromV1(v1: Message.Info): MessageWithParts {
       time: {
         created: v1.metadata.time.created,
       },
-      parts: v1.parts.flatMap((part, index): MessageV2.Part[] => {
+      parts: v1.parts.flatMap((part, index): MessagePart[] => {
         const base = {
           id: index.toString(),
           messageID: v1.id,

@@ -17,6 +17,7 @@ const generated = await import("./generate.ts")
 
 import { Script } from "@opencode-ai/script"
 import pkg from "../package.json"
+import { resolveDependencyVersion } from "../../../script/toolchain.mjs"
 
 const singleFlag = process.argv.includes("--single")
 const baselineFlag = process.argv.includes("--baseline")
@@ -148,9 +149,10 @@ await $`rm -rf dist`
 
 const binaries: Record<string, string> = {}
 if (!skipInstall) {
-  await $`bun install --os="*" --cpu="*" @opentui/core@${pkg.dependencies["@opentui/core"]}`
-  await $`bun install --os="*" --cpu="*" @parcel/watcher@${pkg.dependencies["@parcel/watcher"]}`
-  await $`bun install --os="*" --cpu="*" @ff-labs/fff-bun@${pkg.dependencies["@ff-labs/fff-bun"]}`
+  const version = (name: keyof typeof pkg.dependencies) => resolveDependencyVersion(name, pkg.dependencies[name])
+  await $`bun install --no-save --frozen-lockfile --os="*" --cpu="*" @opentui/core@${version("@opentui/core")}`
+  await $`bun install --no-save --frozen-lockfile --os="*" --cpu="*" @parcel/watcher@${version("@parcel/watcher")}`
+  await $`bun install --no-save --frozen-lockfile --os="*" --cpu="*" @ff-labs/fff-bun@${version("@ff-labs/fff-bun")}`
 }
 for (const item of targets) {
   const name = [

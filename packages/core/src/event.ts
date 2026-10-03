@@ -229,26 +229,24 @@ export const layerWith = (options?: LayerOptions) =>
           const dataHash = Hash.sha256(JSON.stringify(encoded))
           if (!input) {
             // Idempotency gate (#523): a fresh append that byte-for-byte repeats
-            // this aggregate's latest same-type event carries zero information
-            // delta. Skip it entirely — no seq consumed, no projectors, no commit
+            // this aggregate's latest event with the same type and payload
+            // carries zero information delta. An intervening event can change
+            // its state, so A → B → A must append even when both A payloads are identical.
+            // Skip consecutive duplicates — no seq consumed, no projectors, no commit
             // hook, no durable wake — so the persisted sequence stays dense and
             // both the replayAll contiguity check and gt(seq, after) readers are
             // unaffected. Replay appends (input) keep their exact-seq contract,
             // and legacy rows carry a NULL hash so they never match.
             const previous = yield* db
-              .select({ dataHash: EventTable.data_hash })
+              .select({ type: EventTable.type, dataHash: EventTable.data_hash })
               .from(EventTable)
-              .where(
-                and(
-                  eq(EventTable.aggregate_id, aggregateID),
-                  eq(EventTable.type, versionedType(definition.type, durable.version)),
-                ),
-              )
+              .where(eq(EventTable.aggregate_id, aggregateID))
               .orderBy(desc(EventTable.seq))
               .limit(1)
               .get()
               .pipe(Effect.orDie)
-            if (previous && previous.dataHash === dataHash) return undefined
+            if (previous?.type === versionedType(definition.type, durable.version) && previous.dataHash === dataHash)
+              return undefined
           }
           const seq = input?.seq ?? latest + 1
           if (input && seq !== latest + 1) {

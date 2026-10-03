@@ -14,7 +14,7 @@
     "typecheck": "tsgo --noEmit"
   },
   "dependencies": {
-    "@aws-sdk/client-firehose": "3.933.0",
+    "@aws-sdk/client-firehose": "3.1143.0",
     "@effect/platform-node": "catalog:",
     "@opencode-ai/stats-core": "workspace:*",
     "effect": "catalog:",

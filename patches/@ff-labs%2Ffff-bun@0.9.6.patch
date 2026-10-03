@@ -1,0 +1,138 @@
+diff --git a/src/download.ts b/src/download.ts
+--- a/src/download.ts
++++ b/src/download.ts
+@@ -6,6 +6,7 @@
+  * 2. Local dev build (target/release or target/debug)
+  */
+ 
++declare const FFF_LIBC: "gnu" | "musl";
+ import { existsSync } from "node:fs";
+ import { createRequire } from "node:module";
+ import { dirname, join } from "node:path";
+@@ -57,9 +58,33 @@
+   const packageName = getNpmPackageName();
+ 
+   try {
++    // Literal requires let Bun embed native assets into a compiled executable.
++    // Development runs must resolve paths instead of parsing native files.
++    if (import.meta.url.includes("$bunfs")) {
++      let binaryPath: string | undefined;
++      if (process.platform === "darwin") {
++        binaryPath = process.arch === "arm64"
++          ? require("@ff-labs/fff-bin-darwin-arm64/libfff_c.dylib")
++          : require("@ff-labs/fff-bin-darwin-x64/libfff_c.dylib");
++      } else if (process.platform === "linux") {
++        const musl = typeof FFF_LIBC === "string" ? FFF_LIBC === "musl" : getNpmPackageName().endsWith("musl");
++        binaryPath = process.arch === "arm64"
++          ? musl
++            ? require("@ff-labs/fff-bin-linux-arm64-musl/libfff_c.so")
++            : require("@ff-labs/fff-bin-linux-arm64-gnu/libfff_c.so")
++          : musl
++            ? require("@ff-labs/fff-bin-linux-x64-musl/libfff_c.so")
++            : require("@ff-labs/fff-bin-linux-x64-gnu/libfff_c.so");
++      } else if (process.platform === "win32") {
++        binaryPath = process.arch === "arm64"
++          ? require("@ff-labs/fff-bin-win32-arm64/fff_c.dll")
++          : require("@ff-labs/fff-bin-win32-x64/fff_c.dll");
++      }
++      return binaryPath && existsSync(binaryPath) ? binaryPath : null;
++    }
+     // Use createRequire to resolve the platform package's location
+-    const require = createRequire(join(getPackageDir(), "package.json"));
+-    const packageJsonPath = require.resolve(`${packageName}/package.json`);
++    const nodeRequire = createRequire(join(getPackageDir(), "package.json"));
++    const packageJsonPath = nodeRequire.resolve(`${packageName}/package.json`);
+     const packageDir = dirname(packageJsonPath);
+     const binaryPath = join(packageDir, getLibFilename());
+ 
+diff --git a/src/ffi.ts b/src/ffi.ts
+--- a/src/ffi.ts
++++ b/src/ffi.ts
+@@ -382,7 +382,7 @@
+ const FCO_ENABLE_HOME_DIR_SCANNING = 81;
+ 
+ function readResultEnvelope(
+-  resultPtr: Pointer | null,
++  resultPtr: Pointer | bigint | null,
+ ): { success: true; handlePtr: number; intValue: number } | Result<never> {
+   if (resultPtr === null) {
+     return err("FFI returned null pointer");
+@@ -405,21 +405,21 @@
+ }
+ 
+ /** Parse a FffResult that carries a bool in int_value (0 = false, nonzero = true). */
+-function parseBoolResult(resultPtr: Pointer | null): Result<boolean> {
++function parseBoolResult(resultPtr: Pointer | bigint | null): Result<boolean> {
+   const envelope = readResultEnvelope(resultPtr);
+   if (!("success" in envelope)) return envelope;
+   return { ok: true, value: envelope.intValue !== 0 };
+ }
+ 
+ /** Parse a FffResult that carries an integer in int_value. */
+-function parseIntResult(resultPtr: Pointer | null): Result<number> {
++function parseIntResult(resultPtr: Pointer | bigint | null): Result<number> {
+   const envelope = readResultEnvelope(resultPtr);
+   if (!("success" in envelope)) return envelope;
+   return { ok: true, value: envelope.intValue };
+ }
+ 
+ /** Parse a FffResult that carries a string in handle (freed with fff_free_string). */
+-function parseStringResult(resultPtr: Pointer | null): Result<string | null> {
++function parseStringResult(resultPtr: Pointer | bigint | null): Result<string | null> {
+   const envelope = readResultEnvelope(resultPtr);
+   if (!("success" in envelope)) return envelope;
+ 
+@@ -432,7 +432,7 @@
+ }
+ 
+ /** Parse a FffResult that carries a JSON string in handle. */
+-function parseJsonResult<T>(resultPtr: Pointer | null): Result<T> {
++function parseJsonResult<T>(resultPtr: Pointer | bigint | null): Result<T> {
+   const envelope = readResultEnvelope(resultPtr);
+   if (!("success" in envelope)) return envelope;
+ 
+@@ -452,7 +452,7 @@
+ }
+ 
+ /** Parse a FffResult with no payload (void, success/error only). */
+-function parseVoidResult(resultPtr: Pointer | null): Result<void> {
++function parseVoidResult(resultPtr: Pointer | bigint | null): Result<void> {
+   const envelope = readResultEnvelope(resultPtr);
+   if (!("success" in envelope)) return envelope;
+   return { ok: true, value: undefined };
+@@ -655,7 +655,7 @@
+ /**
+  * Parse an FffSearchResult from a raw pointer, then free native memory.
+  */
+-function parseSearchResult(resultPtr: Pointer | null): Result<SearchResult> {
++function parseSearchResult(resultPtr: Pointer | bigint | null): Result<SearchResult> {
+   if (resultPtr === null) {
+     return err("FFI returned null pointer");
+   }
+@@ -743,7 +743,7 @@
+ /**
+  * Parse an FffDirSearchResult from a raw FffResult pointer, then free native memory.
+  */
+-function parseDirSearchResult(resultPtr: Pointer | null): Result<DirSearchResult> {
++function parseDirSearchResult(resultPtr: Pointer | bigint | null): Result<DirSearchResult> {
+   if (resultPtr === null) {
+     return err("FFI returned null pointer");
+   }
+@@ -846,7 +846,7 @@
+ /**
+  * Parse an FffMixedSearchResult from a raw FffResult pointer, then free native memory.
+  */
+-function parseMixedSearchResult(resultPtr: Pointer | null): Result<MixedSearchResult> {
++function parseMixedSearchResult(resultPtr: Pointer | bigint | null): Result<MixedSearchResult> {
+   if (resultPtr === null) {
+     return err("FFI returned null pointer");
+   }
+@@ -1042,7 +1042,7 @@
+ /**
+  * Parse an FffGrepResult from a raw FffResult pointer, then free native memory.
+  */
+-function parseGrepResult(resultPtr: Pointer | null): Result<GrepResult> {
++function parseGrepResult(resultPtr: Pointer | bigint | null): Result<GrepResult> {
+   const envelope = readResultEnvelope(resultPtr);
+   if (!("success" in envelope)) return envelope;
+ 

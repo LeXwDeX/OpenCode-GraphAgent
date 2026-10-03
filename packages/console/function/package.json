@@ -10,16 +10,16 @@
   },
   "devDependencies": {
     "@cloudflare/workers-types": "catalog:",
-    "@tsconfig/node22": "22.0.2",
+    "@tsconfig/node22": "catalog:",
     "@types/node": "catalog:",
-    "openai": "5.11.0",
+    "openai": "5.23.2",
     "typescript": "catalog:",
     "@typescript/native-preview": "catalog:"
   },
   "dependencies": {
     "@opencode-ai/console-core": "workspace:*",
     "@opencode-ai/console-resource": "workspace:*",
-    "@openauthjs/openauth": "0.0.0-20250322224806",
+    "@openauthjs/openauth": "catalog:",
     "ai": "catalog:",
     "zod": "catalog:"
   }

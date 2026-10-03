@@ -5,7 +5,7 @@ Guidance for coding agents in this repository (GraphAgent — an opencode fork w
 ## Scope and layout
 
 - GraphAgent v1 is in focused maintenance: DAG configuration, curated workflow templates, and reproducible defect fixes. No new platform features, no foundational refactors.
-- Bun workspace + Turbo. Bun is pinned via `packageManager` in `package.json`; `.husky/pre-push` fails pushes from mismatched Bun majors.
+- Bun workspace + Turbo. Runtime pins have one source each: Bun in `package.json` (`packageManager`), Node in `.node-version`, Go in `config_assistant/go.mod`. `bun run toolchain:check` and `.husky/pre-push` reject any differing runtime patch; CI and container builds read the same pins. Electron owns its embedded Node runtime; VSCode extension host types retain their own compatibility major.
 - `packages/core`: DAG engine primitives (`src/dag/` — store/projector/sql, exported as `./dag/core/*` and `./dag/*`) plus DB schema/migrations ownership.
 - `packages/opencode`: agent runtime. Services compose in `AppLayer` (`src/effect/app-runtime.ts`). Effect v4 (beta) rules, `makeRuntime`/`InstanceState`, tool-schema, and module-shape contracts are owned by `packages/opencode/AGENTS.md` (pattern reference: `packages/opencode/specs/effect/migration.md`).
 - Curated workflow YAML, composable blocks, and worker prompts live in the `LeXwDeX/opencode-dag-config` repo; builtin templates are compiled into release binaries from a snapshot injected via `DAG_TEMPLATES_DIR` (`packages/opencode/script/generate.ts`). Config-only changes belong there, not in this runtime repo.
@@ -13,6 +13,8 @@ Guidance for coding agents in this repository (GraphAgent — an opencode fork w
 ## Commands (from repo root unless noted)
 
 - Install: `bun install`. Installs are exact-pinned; newly resolved releases must be ≥3 days old unless excluded (root `bunfig.toml`).
+- Toolchain: `bun run toolchain:check` checks installed Bun, Node and Go before validation; build scripts check Bun and Node. Go CI sets `GOTOOLCHAIN=local` to prevent automatic toolchain substitution. Auxiliary Rust containers read `packages/containers/rust-toolchain.toml` and verify the installed compiler against it.
+- Nix: shared runtime assertions reject stale nixpkgs packages; the current April 2026 input and `nix/hashes.json` still require regeneration and real builds on a Nix host. See `nix/README.md`; local validation without Nix does not certify those hashes.
 - Dev: `bun run dev` (opencode CLI — starts the interactive TUI; use the tmux pattern from `packages/opencode/AGENTS.md`, never a blocking foreground run), `bun run dev:web`, `bun run dev:desktop`.
 - Typecheck: `bun run typecheck` (turbo → per-package `tsgo --noEmit`). Use package scripts, never raw `tsc`. `bun run build` bundles without typechecking — a green build is not type soundness.
 - Lint: `bun run lint` = `oxlint` with a `--max-warnings` ratchet. The ratchet only tightens: fix warnings, never raise the cap (contract: `_lint_ratchet_note` in `package.json` and the `.oxlintrc.json` header).
@@ -69,6 +71,7 @@ Repository-specific mapping; shared pre-push verification requirements live in t
 - Issues/PRDs: GitHub Issues via `gh` — `docs/agents/issue-tracker.md`. Triage labels: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix` — `docs/agents/triage-labels.md`.
 
 <!-- specgit:v2:start -->
+
 ## SpecGit 2
 
 Runtime: 2.3.0. Declaration: `.specgit.yaml` (v2).
@@ -81,3 +84,14 @@ Completion requires native readback of the intended target merge and closure of 
 
 Declared rules: `{"agent":{"close_issues_after_merge":false,"native_auto_merge":false},"issue_template":"builtin","language":"en","pr_template":"builtin","validation":{"bodies":true,"labels":"off","titles":true}}`
 <!-- specgit:v2:end -->
+
+<!-- BEGIN:turborepo-agent-rules -->
+
+# This is NOT the Turborepo you know
+
+Turborepo configuration, task behavior, and CLI commands can vary between installed versions and may differ from your training data. Resolve the `turbo` package from this file's directory or relevant workspace; in monorepos, it may not be visible from the repository root. For example, run `node -p "require.resolve('turbo/package.json')"` from a workspace that depends on `turbo`.
+
+Read `docs/README.md` inside that installed package first, then read the relevant pages from its `docs/` directory before changing Turborepo configuration or commands. Heed deprecation notices. These bundled docs match the installed package version and are available without network access.
+
+This block is written and re-added by `turbo` before repository-scoped commands when an AI agent is detected. In the Turborepo source repository, its template is defined in `crates/turborepo-cli/src/cli/agent_guidance.rs`. Removing the managed block while updates are enabled means a later qualifying invocation will add it again. Set `"agentGuidance": false` in the root `turbo.json` or `turbo.jsonc` to opt out; this does not remove an existing block. Keep the block committed with your work to avoid an uncommitted change on the next agent invocation.
+<!-- END:turborepo-agent-rules -->

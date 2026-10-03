@@ -1,6 +1,6 @@
 export * as SessionAutomationLease from "./automation-lease"
 
-import { Context, Effect, Layer, Option } from "effect"
+import { Context, Effect, Layer, Option, type Scope } from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { KeyedMutex } from "@opencode-ai/core/effect/keyed-mutex"
 import { SessionID } from "./schema"
@@ -27,6 +27,10 @@ type Request =
   | { readonly kind: "dag" }
 
 export interface Interface {
+  /** Installed by the shared Goal layer for its lifetime; reads its shared durable store. */
+  readonly installGoalAuthority: (
+    resolve: (sessionID: SessionID) => Effect.Effect<string | undefined>,
+  ) => Effect.Effect<void, never, Scope.Scope>
   readonly register: (sessionID: SessionID, owner: Owner) => Effect.Effect<void>
   readonly unregister: (sessionID: SessionID, owner: Owner) => Effect.Effect<void>
   readonly claim: (sessionID: SessionID, request: Request) => Effect.Effect<Option.Option<Token>>
@@ -61,6 +65,11 @@ export const layer = Layer.effect(
   // per-session lock, so the re-trigger decision is atomic with claim
   // serialization (GOAL-FP-01-02 follow-up / R1).
   const blockedGoalClaims = new Set<SessionID>()
+  // Entries can be removed and later recreated for the same resumed Goal id.
+  // Never reuse a generation, or an old token could become valid again.
+  let generation = 0
+  type GoalAuthority = Parameters<Interface["installGoalAuthority"]>[0]
+  let goalAuthority: { readonly resolve: GoalAuthority; users: number } | undefined
 
   const entry = (sessionID: SessionID) => {
     const current = registrations.get(sessionID)
@@ -79,17 +88,61 @@ export const layer = Layer.effect(
     return undefined
   }
 
+  // Called only while holding this session's lease lock. A durable transition
+  // may finish before a delayed register/unregister reaches us; its arguments
+  // are observations, so the current active row is the goal owner authority.
+  // Read errors propagate before touching registrations (fail closed).
+  const reconcileGoal = Effect.fnUntraced(function* (sessionID: SessionID) {
+    const authority = goalAuthority
+    if (!authority) return false
+    const id = yield* authority.resolve(sessionID)
+    if (goalAuthority !== authority) return true
+    const current = registrations.get(sessionID)
+    if (id === undefined && (!current || current.goals.size === 0)) return true
+    if (id !== undefined && current?.goals.size === 1 && current.goals.has(id)) return true
+    const next = current ?? entry(sessionID)
+    next.goals.clear()
+    if (id !== undefined) next.goals.add(id)
+    next.generation = ++generation
+    if (next.goals.size === 0 && next.dags.size === 0) registrations.delete(sessionID)
+    return true
+  })
+
+  const installGoalAuthority: Interface["installGoalAuthority"] = (resolve) =>
+    Effect.acquireRelease(
+      Effect.sync(() => {
+        if (goalAuthority && goalAuthority.resolve !== resolve)
+          throw new Error("SessionAutomationLease already has a different Goal authority")
+        if (goalAuthority) goalAuthority.users += 1
+        else goalAuthority = { resolve, users: 1 }
+      }),
+      () => Effect.sync(() => {
+        if (!goalAuthority || goalAuthority.resolve !== resolve || --goalAuthority.users > 0) return
+        goalAuthority = undefined
+        // The shared Goal scope has closed: do not retain its DB closure or
+        // goal registrations in a lease service whose DAG scope outlives it.
+        for (const [sessionID, current] of registrations) {
+          if (current.goals.size === 0) continue
+          current.goals.clear()
+          current.generation = ++generation
+          blockedGoalClaims.delete(sessionID)
+          if (current.dags.size === 0) registrations.delete(sessionID)
+        }
+      }),
+    )
+
   const register = Effect.fn("SessionAutomationLease.register")(function* (
     sessionID: SessionID,
     value: Owner,
   ) {
     yield* locks.withLock(sessionID)(
-      Effect.sync(() => {
+      Effect.gen(function* () {
+        if (value.kind === "goal" && (yield* reconcileGoal(sessionID))) return
         const current = entry(sessionID)
         const values = value.kind === "dag" ? current.dags : current.goals
         if (values.has(value.id)) return
         values.add(value.id)
-        current.generation += 1
+        current.generation = ++generation
       }),
     )
   })
@@ -129,13 +182,14 @@ export const layer = Layer.effect(
     // claim clears the flag (under the same lock), so a release that a
     // boundary evaluation already picked up does not double-fire.
     const goalRetryDue = yield* locks.withLock(sessionID)(
-      Effect.sync(() => {
+      Effect.gen(function* () {
         const current = registrations.get(sessionID)
-        if (!current) return false
         const before = owner(sessionID)
+        if (value.kind === "goal" && (yield* reconcileGoal(sessionID))) return false
+        if (!current) return false
         const values = value.kind === "dag" ? current.dags : current.goals
         if (!values.delete(value.id)) return false
-        current.generation += 1
+        current.generation = ++generation
         if (current.goals.size === 0 && current.dags.size === 0) registrations.delete(sessionID)
         const after = owner(sessionID)
         if (before?.kind !== "dag" || after?.kind === "dag") return false
@@ -161,7 +215,8 @@ export const layer = Layer.effect(
     request: Request,
   ) {
     return yield* locks.withLock(sessionID)(
-      Effect.sync(() => {
+      Effect.gen(function* () {
+        yield* reconcileGoal(sessionID)
         const current = registrations.get(sessionID)
         const selected = owner(sessionID)
         if (request.kind === "goal") {
@@ -184,6 +239,7 @@ export const layer = Layer.effect(
   const use: Interface["use"] = Effect.fn("SessionAutomationLease.use")(function* (token, effect) {
     return yield* locks.withLock(token.sessionID)(
       Effect.gen(function* () {
+        yield* reconcileGoal(token.sessionID)
         const current = registrations.get(token.sessionID)
         const selected = owner(token.sessionID)
         const valid = !(
@@ -193,7 +249,9 @@ export const layer = Layer.effect(
           selected.id !== token.owner.id
         )
         if (!valid) return Option.none()
-        return Option.some(yield* effect)
+        const result = yield* effect
+        yield* reconcileGoal(token.sessionID)
+        return Option.some(result)
       }),
     )
   })
@@ -204,6 +262,7 @@ export const layer = Layer.effect(
         const prepared = yield* restore(
           locks.withLock(token.sessionID)(
             Effect.gen(function* () {
+              yield* reconcileGoal(token.sessionID)
               const current = registrations.get(token.sessionID)
               const selected = owner(token.sessionID)
               if (
@@ -238,7 +297,7 @@ export const layer = Layer.effect(
     )
   })
 
-  return Service.of({ register, unregister, claim, use, handoff, purgeSession })
+  return Service.of({ installGoalAuthority, register, unregister, claim, use, handoff, purgeSession })
   }),
 )
 

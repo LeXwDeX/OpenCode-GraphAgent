@@ -326,7 +326,7 @@ describe("DagLoop lease lifecycle — startup wake sweep (GOAL-FP-01-01)", () =>
 describe("DagLoop lease lifecycle — terminal event release (GOAL-FP-01-03)", () => {
   it("a workflow that terminalizes without a successful wake delivery releases its dag lease", async () => {
     await Effect.runPromise(
-      runLeaseTest(({ dag, loop, store, status, automation, childPrompts }) =>
+      runLeaseTest(({ dag, loop, store, goal, status, automation, childPrompts }) =>
         Effect.gen(function* () {
           const sid = SessionID.make(PARENT_SESSION)
 
@@ -365,9 +365,11 @@ describe("DagLoop lease lifecycle — terminal event release (GOAL-FP-01-03)", (
             "dag lease was not released after workflow terminalization without wake delivery",
           )
 
-          // And the goal can now be admitted.
-          const goalOwner = { kind: "goal" as const, id: "goal-1" }
-          yield* automation.register(sid, goalOwner)
+          // A real active Goal can now be admitted. This fixture installs
+          // Goal's durable authority, so an arbitrary id without a row is
+          // correctly rejected even after the DAG has released its lease.
+          const goalState = yield* goal.set(sid, "ship the feature", 10)
+          const goalOwner = { kind: "goal" as const, id: goalState.goal_id ?? "legacy" }
           expect(Option.isSome(yield* automation.claim(sid, goalOwner))).toBe(true)
         }),
       ),
@@ -378,7 +380,7 @@ describe("DagLoop lease lifecycle — terminal event release (GOAL-FP-01-03)", (
 describe("DagLoop lease lifecycle — runtime-less terminal release (GOAL-FP-01-03 follow-up)", () => {
   it("releases a swept registration when a workflow with no runtime entry is terminalized by a control op", async () => {
     await Effect.runPromise(
-      runLeaseTest(({ loop, dag, store, status, automation, database }) =>
+      runLeaseTest(({ loop, dag, store, goal, status, automation, database }) =>
         Effect.gen(function* () {
           const sid = SessionID.make(PARENT_SESSION)
 
@@ -465,8 +467,8 @@ describe("DagLoop lease lifecycle — runtime-less terminal release (GOAL-FP-01-
             "dag lease was not released when a runtime-less workflow terminalized",
           )
 
-          const goalOwner = { kind: "goal" as const, id: "goal-1" }
-          yield* automation.register(sid, goalOwner)
+          const goalState = yield* goal.set(sid, "ship the feature", 10)
+          const goalOwner = { kind: "goal" as const, id: goalState.goal_id ?? "legacy" }
           expect(Option.isSome(yield* automation.claim(sid, goalOwner))).toBe(true)
         }),
       ),

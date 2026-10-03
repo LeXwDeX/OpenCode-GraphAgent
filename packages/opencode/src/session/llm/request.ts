@@ -5,11 +5,11 @@ import type { RuntimeFlags } from "@/effect/runtime-flags"
 import { InstanceState } from "@/effect/instance-state"
 import { Permission } from "@/permission"
 import type { Agent } from "@/agent/agent"
-import type { MessageV2 } from "../message-v2"
 import type { Provider } from "@/provider/provider"
 import { ProviderTransform } from "@/provider/transform"
 import { SystemPrompt } from "../system"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
+import { RUNTIME_CAPABILITIES } from "@opencode-ai/core/system-context/capabilities"
 import { Effect, Record } from "effect"
 import { jsonSchema, tool as aiTool, type ModelMessage, type Tool } from "ai"
 import type { Plugin } from "@/plugin"
@@ -58,6 +58,7 @@ export const prepare = Effect.fn("LLMRequestPrep.prepare")(function* (input: Pre
   const system = [
     [
       ...(input.agent.prompt ? [input.agent.prompt] : SystemPrompt.provider(input.model)),
+      ...(input.small ? [] : [RUNTIME_CAPABILITIES]),
       ...input.system,
       ...(input.user.system ? [input.user.system] : []),
     ]

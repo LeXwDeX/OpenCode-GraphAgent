@@ -68,15 +68,18 @@ export class NotFoundError extends Schema.TaggedErrorClass<NotFoundError>()("MCP
 type MCPClient = Client
 
 function createClient(directory: string, protocol?: "auto" | "legacy" | "modern") {
-  const client = new Client({ name: "opencode", version: InstallationVersion }, {
-    ...CLIENT_OPTIONS,
-    // Per-server protocol era (#448). Absent/'auto' probes server/discover with
-    // conservative fallback to the 2025 initialize handshake; 'legacy' skips the
-    // probe; 'modern' pins 2026-07-28 with no fallback.
-    versionNegotiation: {
-      mode: protocol === "legacy" ? "legacy" : protocol === "modern" ? { pin: "2026-07-28" } : "auto",
+  const client = new Client(
+    { name: "opencode", version: InstallationVersion },
+    {
+      ...CLIENT_OPTIONS,
+      // Per-server protocol era (#448). Absent/'auto' probes server/discover with
+      // conservative fallback to the 2025 initialize handshake; 'legacy' skips the
+      // probe; 'modern' pins 2026-07-28 with no fallback.
+      versionNegotiation: {
+        mode: protocol === "legacy" ? "legacy" : protocol === "modern" ? { pin: "2026-07-28" } : "auto",
+      },
     },
-  })
+  )
   client.setRequestHandler("roots/list", () => Promise.resolve({ roots: [{ uri: pathToFileURL(directory).href }] }))
   return client
 }
@@ -426,7 +429,13 @@ export const layer = Layer.effect(
           const current = queue[index]
           const handle = yield* spawner.spawn(ChildProcess.make("pgrep", ["-P", String(current)], { stdin: "ignore" }))
           const text = yield* Stream.mkString(Stream.decodeText(handle.stdout))
-          yield* handle.exitCode
+          const code = yield* handle.exitCode
+          // pgrep exits 1 when there are no children; larger codes mean the
+          // process listing itself failed, so surface the incomplete snapshot.
+          if (code > 1) {
+            yield* Effect.logWarning("MCP descendant discovery failed", { pid: current, exitCode: code })
+            continue
+          }
           for (const tok of text.split("\n")) {
             const cpid = parseInt(tok, 10)
             if (!isNaN(cpid) && !pids.includes(cpid)) {
@@ -438,7 +447,9 @@ export const layer = Layer.effect(
         return pids
       },
       Effect.scoped,
-      Effect.catch(() => Effect.succeed([] as number[])),
+      Effect.catch((error) =>
+        Effect.logWarning("MCP descendant discovery failed", { error }).pipe(Effect.as([] as number[])),
+      ),
     )
 
     // Close a client and make sure its whole process tree is reaped. The

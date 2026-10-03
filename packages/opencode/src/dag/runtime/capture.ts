@@ -45,7 +45,7 @@ export function validateAgainstSchema(value: unknown, schema: Record<string, unk
   if (declared.length > 0 && !declared.some((t) => matchesScalarType(value, t)))
     return { ok: false, error: `expected type ${declared.length === 1 ? `"${declared[0]}"` : JSON.stringify(declared)}, got ${describeType(value)}` }
 
-  if ("const" in schema && !deepEqual(value, schema["const"]))
+  if (Object.hasOwn(schema, "const") && !deepEqual(value, schema["const"]))
     return { ok: false, error: `expected const ${truncate(JSON.stringify(schema["const"]))}, got ${truncate(JSON.stringify(value))}` }
 
   const enumVals = schema["enum"]
@@ -111,7 +111,7 @@ export function validateAgainstSchema(value: unknown, schema: Record<string, unk
   const hasRequired = Array.isArray(schema["required"])
   const hasProperties = isSchemaObject(schema["properties"])
   const hasAdditionalProperties =
-    "additionalProperties" in schema
+    Object.hasOwn(schema, "additionalProperties")
     && (typeof schema["additionalProperties"] === "boolean" || isSchemaObject(schema["additionalProperties"]))
   if ((hasRequired || hasProperties || hasAdditionalProperties) && !isSchemaObject(value)) {
     const keywords = [
@@ -125,7 +125,7 @@ export function validateAgainstSchema(value: unknown, schema: Record<string, unk
   const required = schema["required"]
   if (Array.isArray(required) && isSchemaObject(value)) {
     for (const field of required) {
-      if (typeof field === "string" && !(field in value))
+      if (typeof field === "string" && !Object.hasOwn(value, field))
         return { ok: false, error: `missing required field: "${field}"` }
     }
   }
@@ -134,7 +134,7 @@ export function validateAgainstSchema(value: unknown, schema: Record<string, unk
   const narrowedProperties = isSchemaObject(properties) ? properties : undefined
   if (narrowedProperties !== undefined && isSchemaObject(value)) {
     for (const [key, propSchema] of Object.entries(narrowedProperties)) {
-      if (key in value && isSchemaObject(propSchema)) {
+      if (Object.hasOwn(value, key) && isSchemaObject(propSchema)) {
         const result = validateAgainstSchema(value[key], propSchema)
         if (!result.ok) return { ok: false, error: `field "${key}": ${result.error}` }
       }
@@ -147,7 +147,7 @@ export function validateAgainstSchema(value: unknown, schema: Record<string, unk
   // branch and never ran for this spelling.
   if (schema["additionalProperties"] === false && isSchemaObject(value)) {
     const allowed: Record<string, unknown> = narrowedProperties ?? {}
-    const extra = Object.keys(value).find((key) => !(key in allowed))
+    const extra = Object.keys(value).find((key) => !Object.hasOwn(allowed, key))
     if (extra !== undefined)
       return { ok: false, error: `unexpected additional property: "${extra}"` }
   }
@@ -267,14 +267,15 @@ function describeType(value: unknown): string {
 // Schema patterns come from workflow config; a malformed regex must not crash
 // validation, it just fails the constraint.
 // #349/CAP-02: patterns may also be PATHOLOGICAL (the draft action lets a
-// model author them) — cap the tested span so catastrophic backtracking
-// against an unbounded model output cannot hang submit_result validation.
+// model author them) — reject values above the tested-span cap. Testing only
+// their prefix would accept an invalid suffix without validating stored bytes.
 const REGEX_TEST_MAX_CHARS = 100_000
 // #349/CAP-02: bound for the O(n²) uniqueItems pairwise scan.
 const UNIQUE_ITEMS_MAX = 1_000
 function safeRegexTest(pattern: string, value: string): boolean {
+  if (value.length > REGEX_TEST_MAX_CHARS) return false
   try {
-    return new RegExp(pattern).test(value.slice(0, REGEX_TEST_MAX_CHARS))
+    return new RegExp(pattern).test(value)
   } catch {
     return false
   }
@@ -300,5 +301,5 @@ function deepEqual(a: unknown, b: unknown): boolean {
   const bObj = b as Record<string, unknown>
   const aKeys = Object.keys(aObj)
   if (aKeys.length !== Object.keys(bObj).length) return false
-  return aKeys.every((key) => key in bObj && deepEqual(aObj[key], bObj[key]))
+  return aKeys.every((key) => Object.hasOwn(bObj, key) && deepEqual(aObj[key], bObj[key]))
 }

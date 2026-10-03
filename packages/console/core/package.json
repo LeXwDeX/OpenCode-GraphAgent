@@ -6,15 +6,15 @@
   "type": "module",
   "license": "MIT",
   "dependencies": {
-    "@aws-sdk/client-sts": "3.782.0",
-    "@jsx-email/render": "1.1.1",
+    "@aws-sdk/client-sts": "3.1143.0",
+    "@jsx-email/render": "catalog:",
     "@opencode-ai/console-mail": "workspace:*",
     "@opencode-ai/console-resource": "workspace:*",
-    "@planetscale/database": "1.19.0",
-    "aws4fetch": "1.0.20",
+    "@planetscale/database": "catalog:",
+    "aws4fetch": "catalog:",
     "drizzle-orm": "catalog:",
-    "postgres": "3.4.7",
-    "stripe": "18.0.0",
+    "postgres": "3.4.9",
+    "stripe": "catalog:",
     "ulid": "catalog:",
     "zod": "catalog:"
   },
@@ -37,15 +37,16 @@
     "update-limits": "script/update-limits.ts",
     "promote-limits-to-dev": "script/promote-limits.ts dev",
     "promote-limits-to-prod": "script/promote-limits.ts production",
-    "typecheck": "tsgo --noEmit"
+    "typecheck": "tsgo --noEmit",
+    "test": "bun test"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "catalog:",
-    "@tsconfig/node22": "22.0.2",
+    "@tsconfig/node22": "catalog:",
     "@types/bun": "catalog:",
     "@types/node": "catalog:",
     "drizzle-kit": "catalog:",
-    "mysql2": "3.22.0",
+    "mysql2": "3.24.5",
     "typescript": "catalog:",
     "@typescript/native-preview": "catalog:"
   }

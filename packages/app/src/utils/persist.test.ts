@@ -52,7 +52,7 @@ let Persist: PersistType
 let removePersisted: RemovePersistedType
 
 beforeAll(async () => {
-  mock.module("@/context/platform", () => ({
+  await mock.module("@/context/platform", () => ({
     usePlatform: () => ({ platform: "web" }),
   }))
 
