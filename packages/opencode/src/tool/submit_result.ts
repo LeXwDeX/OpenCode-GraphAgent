@@ -1,15 +1,18 @@
 import * as Tool from "./tool"
 import DESCRIPTION from "./submit_result.txt"
-import { Effect, Option, Schema } from "effect"
-import { validatePayload } from "@/dag/runtime/capture"
+import { Effect, Option, Scheduler, Schema } from "effect"
+import { validatePayloadAsync, isCaptureValidationCurrent, getCaptureSnapshot } from "@/dag/runtime/capture"
 import { DagStore } from "@opencode-ai/core/dag/store"
+import { DagMessages } from "@opencode-ai/core/dag/messages"
+import { Database } from "@opencode-ai/core/database/database"
+import { InstanceState } from "@/effect/instance-state"
 
 const id = "submit_result"
-const parseJsonOption = Schema.decodeUnknownOption(Schema.UnknownFromJsonString)
 
 export const Parameters = Schema.Struct({
   payload: Schema.Unknown.annotate({
-    description: "JSON value matching the node's declared output_schema (object, array, string, number, or boolean).",
+    description:
+      "JSON value matching the node's declared output_schema (object, array, string, number, boolean, or null).",
   }),
 })
 
@@ -31,16 +34,15 @@ export const SubmitResultTool = Tool.define<typeof Parameters, Metadata, never>(
               metadata: {} as Metadata,
             }
           }
-          const initial = validatePayload(ctx.sessionID, params.payload)
-          const parsed =
-            !initial.ok && typeof params.payload === "string" ? parseJsonOption(params.payload) : Option.none()
-          const payload = Option.isSome(parsed) ? parsed.value : params.payload
-          const result = Option.isSome(parsed) ? validatePayload(ctx.sessionID, payload) : initial
+          const result = yield* Effect.promise((signal) =>
+            validatePayloadAsync(ctx.sessionID, params.payload, AbortSignal.any([signal, ctx.abort])),
+          )
           if (!result.ok) {
             if (result.notAvailable) {
               return {
                 title: "submit_result not applicable",
-                output: "submit_result has no effect in this session — it is only for DAG workflow child sessions that declared an output_schema.",
+                output:
+                  "submit_result has no effect in this session — it is only for DAG workflow child sessions that declared an output_schema.",
                 metadata: {} as Metadata,
               }
             }
@@ -50,7 +52,70 @@ export const SubmitResultTool = Tool.define<typeof Parameters, Metadata, never>(
               metadata: {} as Metadata,
             }
           }
-          yield* storeOpt.value.setCapturedOutput(ctx.sessionID, payload).pipe(Effect.orDie)
+          const payload = result.payload
+          let snapshotID = getCaptureSnapshot(ctx.sessionID)
+          const messages = yield* Effect.serviceOption(DagMessages.Service)
+          const commit = () =>
+            Effect.gen(function* () {
+              if (ctx.abort.aborted || !isCaptureValidationCurrent(ctx.sessionID, result)) return false
+              yield* storeOpt.value.setCapturedOutput(ctx.sessionID, payload, snapshotID).pipe(Effect.orDie)
+              return true
+            }).pipe(
+              // The transaction already owns the synchronous SQLite connection.
+              // Keep slot authority and the write in one JS execution segment.
+              Effect.provideService(Scheduler.PreventSchedulerYield, true),
+            )
+          if (Option.isSome(messages)) {
+            const instance = yield* InstanceState.context
+            const caller = { projectID: instance.project.id, directory: instance.directory, sessionID: ctx.sessionID }
+            const identity = yield* messages.value.revisions(caller)
+            if (!identity.ok || identity.value.endpoint.kind !== "node")
+              return {
+                title: "submit_result not applicable",
+                output: "This session is not a current DAG node attempt.",
+                metadata: {},
+              }
+            const snapshot = yield* messages.value.snapshotForTurn(caller, ctx.messageID)
+            if (!snapshot.ok || !snapshot.value)
+              return {
+                title: "submit_result input unavailable",
+                output:
+                  "This tool call has no recorded input snapshot. Consume current agent input before submitting a result.",
+                metadata: {},
+              }
+            snapshotID = snapshot.value.id
+            const endpoint = identity.value.endpoint
+            const result = yield* messages.value.guard(
+              caller,
+              {
+                workflowID: endpoint.workflowID!,
+                nodeID: endpoint.nodeID!,
+                attemptID: endpoint.attemptID!,
+                snapshotID,
+                close: false,
+              },
+              commit(),
+            )
+            if (!result.ok || !result.value)
+              return {
+                title: "submit_result input changed",
+                output: `Submission was not captured (${result.ok ? "capture slot changed or cancelled" : result.reason}). Consume the current agent input before submitting an updated result. Previously completed tools remain recorded; do not repeat their writes.`,
+                metadata: {},
+              }
+          } else {
+            const database = yield* Effect.serviceOption(Database.Service)
+            // Acquire a connection before checking the slot in the legacy path.
+            // Connection contention can suspend; the guarded write cannot.
+            const captured = yield* Option.isSome(database)
+              ? database.value.db.transaction(() => commit()).pipe(Effect.orDie)
+              : commit()
+            if (!captured)
+              return {
+                title: "submit_result input changed",
+                output: "Submission was not captured because its capture slot changed or validation was cancelled.",
+                metadata: {},
+              }
+          }
           return {
             title: "Structured output submitted",
             output: "submit_result succeeded. Your structured output has been captured.",

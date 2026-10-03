@@ -77,30 +77,30 @@ const clientFor = (directory: string) => {
 beforeAll(async () => {
   const rootClient = clientFor("/repo/main")
 
-  mock.module("@solidjs/router", () => ({
+  await mock.module("@solidjs/router", () => ({
     useNavigate: () => () => undefined,
     useParams: () => params,
     useLocation: () => ({}),
     useSearchParams: () => [search, () => undefined],
   }))
 
-  mock.module("@opencode-ai/sdk/v2/client", () => ({
+  await mock.module("@opencode-ai/sdk/v2/client", () => ({
     createOpencodeClient: (input: { directory: string }) => {
       createdClients.push(input.directory)
       return clientFor(input.directory)
     },
   }))
 
-  mock.module("@opencode-ai/ui/toast", () => ({
+  await mock.module("@opencode-ai/ui/toast", () => ({
     Toast: { Region: () => null },
     showToast: () => 0,
   }))
 
-  mock.module("@opencode-ai/core/util/encode", () => ({
+  await mock.module("@opencode-ai/core/util/encode", () => ({
     base64Encode: (value: string) => value,
   }))
 
-  mock.module("@/context/local", () => ({
+  await mock.module("@/context/local", () => ({
     useLocal: () => ({
       model: {
         current: () => ({ id: "model", provider: { id: "provider" } }),
@@ -117,7 +117,7 @@ beforeAll(async () => {
     }),
   }))
 
-  mock.module("@/context/permission", () => ({
+  await mock.module("@/context/permission", () => ({
     usePermission: () => ({
       enableAutoAccept(sessionID: string, directory: string) {
         enabledAutoAccept.push({ sessionID, directory })
@@ -125,11 +125,11 @@ beforeAll(async () => {
     }),
   }))
 
-  mock.module("@/context/server", () => ({
+  await mock.module("@/context/server", () => ({
     useServer: () => ({ key: "server-key" }),
   }))
 
-  mock.module("@/context/tabs", () => ({
+  await mock.module("@/context/tabs", () => ({
     useTabs: () => ({
       draft: () => ({ server: "project-server" }),
       promoteDraft: (draftID: string, session: { server: string; sessionId: string }) => {
@@ -138,11 +138,11 @@ beforeAll(async () => {
     }),
   }))
 
-  mock.module("@/context/prompt", () => ({
+  await mock.module("@/context/prompt", () => ({
     usePrompt: () => prompt,
   }))
 
-  mock.module("@/context/layout", () => ({
+  await mock.module("@/context/layout", () => ({
     useLayout: () => ({
       handoff: {
         setTabs: () => undefined,
@@ -150,7 +150,7 @@ beforeAll(async () => {
     }),
   }))
 
-  mock.module("@/context/sdk", () => ({
+  await mock.module("@/context/sdk", () => ({
     useSDK: () => {
       const sdk = {
         scope: "local",
@@ -165,7 +165,7 @@ beforeAll(async () => {
     },
   }))
 
-  mock.module("@/context/sync", () => ({
+  await mock.module("@/context/sync", () => ({
     useSync: () => () => ({
       data: { command: [] },
       session: {
@@ -189,7 +189,7 @@ beforeAll(async () => {
     }),
   }))
 
-  mock.module("@/context/server-sync", () => ({
+  await mock.module("@/context/server-sync", () => ({
     useServerSync: () => () => ({
       session: {
         remember: () => undefined,
@@ -216,13 +216,13 @@ beforeAll(async () => {
     }),
   }))
 
-  mock.module("@/context/platform", () => ({
+  await mock.module("@/context/platform", () => ({
     usePlatform: () => ({
       fetch: fetch,
     }),
   }))
 
-  mock.module("@/context/language", () => ({
+  await mock.module("@/context/language", () => ({
     useLanguage: () => ({
       t: (key: string) => key,
     }),

@@ -3,7 +3,7 @@
   stdenvNoCC,
   callPackage,
   bun,
-  nodejs,
+  nodejs_24,
   sysctl,
   makeBinaryWrapper,
   models-dev,
@@ -11,28 +11,24 @@
   installShellFiles,
   versionCheckHook,
   writableTmpDirAsHomeHook,
-  node_modules ? callPackage ./node-modules.nix { },
+  node_modules ? callPackage ./node_modules.nix { },
 }:
+let
+  toolchain = import ./toolchain.nix { inherit lib; };
+in
 stdenvNoCC.mkDerivation (finalAttrs: {
   pname = "opencode";
   inherit (node_modules) version src;
   inherit node_modules;
 
   nativeBuildInputs = [
-    bun
-    nodejs # for patchShebangs node_modules
+    (toolchain.requireVersion "bun" bun)
+    (toolchain.requireVersion "node" nodejs_24) # for patchShebangs node_modules
     installShellFiles
     makeBinaryWrapper
     models-dev
     writableTmpDirAsHomeHook
   ];
-
-  postPatch = ''
-    # NOTE: Relax Bun version check to be a warning instead of an error
-    substituteInPlace packages/script/src/index.ts \
-      --replace-fail 'throw new Error(`This script requires bun@''${expectedBunVersionRange}' \
-                     'console.warn(`Warning: This script requires bun@''${expectedBunVersionRange}'
-  '';
 
   configurePhase = ''
     runHook preConfigure
@@ -47,10 +43,11 @@ stdenvNoCC.mkDerivation (finalAttrs: {
   env.MODELS_DEV_API_JSON = "${models-dev}/dist/_api.json";
   env.OPENCODE_DISABLE_MODELS_FETCH = true;
   env.OPENCODE_VERSION = finalAttrs.version;
-  env.OPENCODE_CHANNEL = "prod";
+  env.OPENCODE_CHANNEL = "dev";
 
   buildPhase = ''
     runHook preBuild
+    node script/toolchain.mjs check
 
     cd ./packages/opencode
     bun --bun ./script/build.ts --single --skip-install

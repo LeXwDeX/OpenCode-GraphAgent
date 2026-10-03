@@ -11,9 +11,9 @@
     "typescript": "^5"
   },
   "dependencies": {
-    "@actions/core": "1.11.1",
-    "@actions/github": "6.0.1",
-    "@octokit/graphql": "9.0.1",
+    "@actions/core": "catalog:",
+    "@actions/github": "catalog:",
+    "@octokit/graphql": "catalog:",
     "@octokit/rest": "catalog:",
     "@opencode-ai/sdk": "workspace:*"
   }

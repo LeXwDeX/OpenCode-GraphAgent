@@ -1097,6 +1097,17 @@ const serviceLayer = Layer.effect(
       }
     })
 
+    // The lease and Goal use this same shared durable store. Install once for
+    // this Goal layer's scope; its finalizer removes the resolver and stale
+    // registrations if the lease's DAG consumers outlive the Goal service.
+    // The resolver only reads DB state, never takes another lease lock, so
+    // updateAfterJudge remains safe inside automation.use's existing lock.
+    yield* automation.installGoalAuthority((sessionID) =>
+      loadState(sessionID).pipe(
+        Effect.map((state) => state?.status === "active" ? state.goal_id ?? "legacy" : undefined),
+      ),
+    )
+
     return Service.of({
       controlDuringTurn,
       load,

@@ -99,6 +99,8 @@ import { KeyedMutex } from "@opencode-ai/core/effect/keyed-mutex"
 import { Memory } from "@/memory/memory"
 import { SessionAutomationLease } from "./automation-lease"
 import { ReasoningDistillation } from "./reasoning-distillation"
+import { DagMessages } from "@opencode-ai/core/dag/messages"
+import { setCaptureSnapshot } from "@/dag/runtime/capture"
 
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -150,7 +152,10 @@ export interface Interface {
     sessionID: SessionID,
     work: Effect.Effect<A, E, R>,
   ) => Effect.Effect<Option.Option<A>, E, R>
-  readonly prepareIfIdle: (input: PromptInput) => Effect.Effect<Option.Option<IdleAdmission>, Image.Error>
+  readonly prepareIfIdle: (
+    input: PromptInput,
+    persistAdmission?: Effect.Effect<void>,
+  ) => Effect.Effect<Option.Option<IdleAdmission>, Image.Error>
   readonly promptIfIdle: (input: PromptInput) => Effect.Effect<Option.Option<SessionV1.WithParts>, Image.Error>
   readonly loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts>
   readonly shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError>
@@ -247,6 +252,7 @@ export const layer = Layer.effect(
       ),
     )
     const database = yield* Database.Service
+    const agentMessages = Option.getOrUndefined(yield* Effect.serviceOption(DagMessages.Service))
     const { db } = database
     const rawSettingsHook = Option.getOrUndefined(yield* Effect.serviceOption(SettingsHook.Service))
     const rewake = Context.make(
@@ -416,6 +422,14 @@ export const layer = Layer.effect(
       // with a continuation the user just tried to abort. Pause instead.
       if (goal && (yield* goal.isTurnDriven(sessionID))) {
         yield* goal.pauseForUserCancel(sessionID, "用户中断（ESC）— /goal resume 继续").pipe(Effect.ignore)
+      }
+      if (agentMessages) {
+        const context = yield* InstanceState.context
+        const identity = { projectID: context.project.id, directory: context.directory, sessionID }
+        const input = yield* agentMessages.revisions(identity)
+        if (input.ok && input.value.snapshotID)
+          yield* agentMessages.markStopped(identity, input.value.snapshotID, "cancelled")
+        yield* agentMessages.discardPending(identity, "cancelled")
       }
       yield* state.cancel(sessionID)
     })
@@ -1113,7 +1127,10 @@ export const layer = Layer.effect(
       return yield* Effect.die(err)
     })
 
-    const createUserMessage = Effect.fn("SessionPrompt.createUserMessage")(function* (input: PromptInput) {
+    const createUserMessage = Effect.fn("SessionPrompt.createUserMessage")(function* (
+      input: PromptInput,
+      persistAdmission?: Effect.Effect<void>,
+    ) {
       const agentName = input.agent
       const ag = agentName ? yield* agents.get(agentName) : yield* agents.defaultInfo()
       if (!ag) {
@@ -1536,86 +1553,95 @@ export const layer = Layer.effect(
         })
       }
 
-      yield* sessions.updateMessage(info)
-      for (const part of parts) yield* sessions.updatePart(part)
-      const nextPrompt = parts.reduce(
-        (result, part) => {
-          if (part.type === "text") {
-            if (part.synthetic) result.synthetic.push(part.text)
-            else result.text.push(part.text)
-          }
-          if (part.type === "file") {
-            result.files.push(
-              FileAttachment.make({
-                uri: part.url,
-                mime: part.mime,
-                name: part.filename,
-                source: part.source
-                  ? Source.make({
-                      start: part.source.text.start,
-                      end: part.source.text.end,
-                      text: part.source.text.value,
-                    })
-                  : undefined,
-              }),
-            )
-          }
-          if (part.type === "agent") {
-            result.agents.push(
-              AgentAttachment.make({
-                name: part.name,
-                source: part.source
-                  ? Source.make({
-                      start: part.source.start,
-                      end: part.source.end,
-                      text: part.source.value,
-                    })
-                  : undefined,
-              }),
-            )
-          }
-          return result
-        },
-        {
-          text: [] as string[],
-          files: [] as FileAttachment[],
-          agents: [] as AgentAttachment[],
-          synthetic: [] as string[],
-        },
-      )
-      // TODO(v2): Temporary dual-write while migrating session messages to v2 events.
-      if (flags.experimentalEventSystem) {
-        yield* events.publish(SessionEvent.Prompted, {
-          sessionID: input.sessionID,
-          messageID: SessionMessage.ID.create(),
-          timestamp: DateTime.makeUnsafe(info.time.created),
-          delivery: "steer",
-          prompt: Prompt.make({
-            text: nextPrompt.text.join("\n"),
-            files: nextPrompt.files,
-            agents: nextPrompt.agents,
-          }),
-        })
-      }
-      for (const text of nextPrompt.synthetic) {
+      const persist = Effect.gen(function* () {
+        yield* sessions.updateMessage(info)
+        for (const part of parts) yield* sessions.updatePart(part)
+        const nextPrompt = parts.reduce(
+          (result, part) => {
+            if (part.type === "text") {
+              if (part.synthetic) result.synthetic.push(part.text)
+              else result.text.push(part.text)
+            }
+            if (part.type === "file") {
+              result.files.push(
+                FileAttachment.make({
+                  uri: part.url,
+                  mime: part.mime,
+                  name: part.filename,
+                  source: part.source
+                    ? Source.make({
+                        start: part.source.text.start,
+                        end: part.source.text.end,
+                        text: part.source.text.value,
+                      })
+                    : undefined,
+                }),
+              )
+            }
+            if (part.type === "agent") {
+              result.agents.push(
+                AgentAttachment.make({
+                  name: part.name,
+                  source: part.source
+                    ? Source.make({
+                        start: part.source.start,
+                        end: part.source.end,
+                        text: part.source.value,
+                      })
+                    : undefined,
+                }),
+              )
+            }
+            return result
+          },
+          {
+            text: [] as string[],
+            files: [] as FileAttachment[],
+            agents: [] as AgentAttachment[],
+            synthetic: [] as string[],
+          },
+        )
         // TODO(v2): Temporary dual-write while migrating session messages to v2 events.
         if (flags.experimentalEventSystem) {
-          yield* events.publish(SessionEvent.Synthetic, {
+          yield* events.publish(SessionEvent.Prompted, {
             sessionID: input.sessionID,
             messageID: SessionMessage.ID.create(),
             timestamp: DateTime.makeUnsafe(info.time.created),
-            text,
+            delivery: "steer",
+            prompt: Prompt.make({
+              text: nextPrompt.text.join("\n"),
+              files: nextPrompt.files,
+              agents: nextPrompt.agents,
+            }),
           })
         }
-      }
+        for (const text of nextPrompt.synthetic) {
+          // TODO(v2): Temporary dual-write while migrating session messages to v2 events.
+          if (flags.experimentalEventSystem) {
+            yield* events.publish(SessionEvent.Synthetic, {
+              sessionID: input.sessionID,
+              messageID: SessionMessage.ID.create(),
+              timestamp: DateTime.makeUnsafe(info.time.created),
+              text,
+            })
+          }
+        }
 
+        if (persistAdmission) yield* persistAdmission
+      })
+      // Preparation, plugin callbacks and hooks stay outside the write reservation.
+      // Internal wakes commit their transcript receipt and reporting mark together.
+      yield* persistAdmission ? db.transaction(() => persist, { behavior: "immediate" }).pipe(Effect.orDie) : persist
       return { info, parts }
     }, Effect.scoped)
 
-    const admitPrompt = Effect.fn("SessionPrompt.admitPrompt")(function* (input: PromptInput) {
+    const admitPrompt = Effect.fn("SessionPrompt.admitPrompt")(function* (
+      input: PromptInput,
+      persistAdmission?: Effect.Effect<void>,
+    ) {
       const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
       yield* revert.cleanup(session)
-      const message = yield* createUserMessage(input)
+      const message = yield* createUserMessage(input, persistAdmission)
       yield* sessions.touch(input.sessionID)
 
       // SettingsHook: UserPromptSubmit — gives hooks a chance to block or modify the turn.
@@ -1660,6 +1686,13 @@ export const layer = Layer.effect(
             synthetic: true,
           } satisfies SessionV1.TextPart)
           message.parts.push(part)
+          if (agentMessages) {
+            const ctx = yield* InstanceState.context
+            yield* agentMessages.discardPending(
+              { projectID: ctx.project.id, directory: ctx.directory, sessionID: input.sessionID },
+              "hook_blocked",
+            )
+          }
           return { message, run: false as const }
         }
       }
@@ -1723,6 +1756,7 @@ export const layer = Layer.effect(
 
     const prepareIfIdle: Interface["prepareIfIdle"] = Effect.fn("SessionPrompt.prepareIfIdle")(function* (
       input: PromptInput,
+      persistAdmission?: Effect.Effect<void>,
     ) {
       return yield* promptLocks.withLock(input.sessionID)(
         Effect.uninterruptibleMask((restore) =>
@@ -1745,7 +1779,7 @@ export const layer = Layer.effect(
             )
             if (Option.isNone(wait)) return Option.none<IdleAdmission>()
 
-            const admitted = yield* restore(admitPrompt(input)).pipe(Effect.exit)
+            const admitted = yield* restore(admitPrompt(input, persistAdmission)).pipe(Effect.exit)
             yield* Deferred.succeed(admission, admitted)
             if (Exit.isFailure(admitted)) {
               yield* Deferred.succeed(activation, undefined)
@@ -1780,7 +1814,7 @@ export const layer = Layer.effect(
       throw new Error("Impossible")
     })
 
-    const runLoop: (sessionID: SessionID) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.run")(
+    const runLoopImpl: (sessionID: SessionID) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.run")(
       function* (sessionID: SessionID) {
         const ctx = yield* InstanceState.context
         let distillationInput: LLM.StreamInput | undefined
@@ -1805,6 +1839,8 @@ export const layer = Layer.effect(
         // finished-check alone misses blocked turns whose finish is "tool-calls",
         // so this flag forces the exit path (and its Stop hook) to fire.
         let turnStopped = false
+        let agentInputBlocked = false
+        let agentBoundaryApproved = false
         let nextAutoCompactionMinimum: number | undefined
         let autoCompactionPending = false
         let awaitingPostCompactionUsage = false
@@ -1818,7 +1854,62 @@ export const layer = Layer.effect(
           yield* status.set(sessionID, { type: "busy" })
           yield* Effect.logInfo("loop", { "session.id": sessionID, step })
 
+          const modelMessageID = MessageID.ascending()
+          const identity = { projectID: ctx.project.id, directory: ctx.directory, sessionID }
+          let agentSnapshot: DagMessages.Snapshot | undefined
           let msgs = yield* claimSnapshot(sessionID)
+          const previous = MessageV2.latest(msgs)
+          const previousParts = msgs.findLast((message) => message.info.id === previous.assistant?.id)?.parts
+          const needsStop =
+            turnStopped ||
+            (previous.assistant?.finish &&
+              previous.assistant.finish !== "tool-calls" &&
+              !previousParts?.some(
+                (part) => part.type === "tool" && !part.metadata?.providerExecuted && !isOrphanedInterruptedTool(part),
+              ) &&
+              previous.user &&
+              MessageV2.before(previous.user, previous.assistant))
+          // Agent input cannot outrun the Stop decision for a completed model turn.
+          if (agentMessages && !agentInputBlocked && (!needsStop || agentBoundaryApproved || forceContinue)) {
+            agentBoundaryApproved = false
+            const frozen = yield* agentMessages.freeze(identity, modelMessageID)
+            if (frozen.ok) {
+              agentSnapshot = frozen.value
+              if (agentSnapshot.messages.length) {
+                const history = yield* sessions.messages({ sessionID }).pipe(Effect.orDie)
+                const user = history.findLast((message) => message.info.role === "user")?.info
+                if (!user || user.role !== "user") throw new Error("Agent messages require an existing user context")
+                for (const message of agentSnapshot.messages) {
+                  const messageID = MessageID.make(message.transcriptID)
+                  // Stable IDs recover admission crashes without duplicating a logical message.
+                  if (!history.some((existing) => existing.info.id === messageID)) {
+                    yield* sessions.updateMessage({
+                      id: messageID,
+                      sessionID,
+                      role: "user",
+                      agent: user.agent,
+                      model: user.model,
+                      format: user.format,
+                      system: user.system,
+                      tools: user.tools,
+                      time: { created: message.timeCreated },
+                    })
+                  }
+                  yield* sessions.updatePart({
+                    id: PartID.make(message.partID),
+                    messageID,
+                    sessionID,
+                    type: "text",
+                    text: DagMessages.renderMessage(message),
+                    synthetic: true,
+                  })
+                }
+                // A clean result becomes stale when newer accepted input is awaiting the model.
+                turnStopped = false
+                msgs = yield* claimSnapshot(sessionID)
+              }
+            }
+          }
 
           const { user: lastUser, assistant: lastAssistant, finished: lastFinished, tasks } = MessageV2.latest(msgs)
 
@@ -1856,11 +1947,12 @@ export const layer = Layer.effect(
             // Stop-hook continuation: when forceContinue is set (a prior Stop hook
             // blocked), skip the Stop exit for one iteration so another model turn
             // runs; reset the flag so that turn can finish and Stop normally.
-            if (forceContinue) {
+            if (forceContinue && !agentInputBlocked) {
               forceContinue = false
               turnStopped = false
             } else {
               yield* Effect.logInfo("exiting loop", { "session.id": sessionID })
+              let agentContinuationPrevented = false
               // SettingsHook: Stop on clean turn exit, StopFailure when it ended in error.
               if (settingsHook) {
                 const lastAssistantMessage =
@@ -1884,6 +1976,13 @@ export const layer = Layer.effect(
                   .pipe(
                     Effect.catch(() => Effect.succeed({ additionalContexts: [], systemMessages: [] } as TriggerResult)),
                   )
+                agentContinuationPrevented = stopResult.preventContinuation === true
+                if (agentContinuationPrevented && agentMessages) {
+                  const input = lastAssistant && (yield* agentMessages.snapshotForTurn(identity, lastAssistant.id))
+                  if (input?.ok && input.value)
+                    yield* agentMessages.markStopped(identity, input.value.id, "hook_blocked")
+                  yield* agentMessages.discardPending(identity, "hook_blocked")
+                }
                 // Consume Stop-hook outputs so nothing is silently dropped: inject
                 // additionalContexts as synthetic text parts (model-visible on the
                 // continuation turn, recorded in history on exit) and land any
@@ -1914,7 +2013,7 @@ export const layer = Layer.effect(
                 // stop_hook_active=true so a well-behaved hook stops blocking (anti-loop).
                 // Capped by MAX_STOP_CONTINUATIONS so a hook that ignores the signal
                 // can't loop forever; at the limit we log.warn and force a normal exit.
-                if (!turnError && stopResult.blocked && !stopResult.preventContinuation) {
+                if (!agentInputBlocked && !turnError && stopResult.blocked && !stopResult.preventContinuation) {
                   if (stopContinuationCount < SettingsHook.MAX_STOP_CONTINUATIONS) {
                     stopContinuationCount++
                     stopHookBlocked = true
@@ -1938,6 +2037,14 @@ export const layer = Layer.effect(
                     "session.id": sessionID,
                     limit: SettingsHook.MAX_STOP_CONTINUATIONS,
                   })
+                }
+              }
+              if (!agentInputBlocked && !agentContinuationPrevented && !turnError && agentMessages) {
+                const incoming = yield* agentMessages.revisions(identity)
+                if (incoming.ok && incoming.value.queued > 0) {
+                  agentBoundaryApproved = true
+                  turnStopped = false
+                  continue
                 }
               }
               if (!turnError && distillationInput && (yield* reasoningDistillationEnabled)) {
@@ -1987,6 +2094,7 @@ export const layer = Layer.effect(
             }
           }
 
+          forceContinue = false
           step++
           if (step === 1)
             yield* title({
@@ -2120,7 +2228,7 @@ export const layer = Layer.effect(
           )
 
           const msg: SessionV1.Assistant = {
-            id: MessageID.ascending(),
+            id: modelMessageID,
             parentID: lastUser.id,
             role: "assistant",
             mode: agent.name,
@@ -2146,13 +2254,34 @@ export const layer = Layer.effect(
             yield* sessions.updateMessage(msg)
           })
 
+          const finalizeFailedAssistant = Effect.fnUntraced(function* (cause: Cause.Cause<never>) {
+            if (Cause.hasInterrupts(cause)) return yield* finalizeInterruptedAssistant
+            msg.error ??= MessageV2.fromError(Cause.squash(cause), { providerID: msg.providerID })
+            msg.time.completed ??= Date.now()
+            yield* sessions.updateMessage(msg)
+            if (!agentMessages || !agentSnapshot) return
+            const input = yield* agentMessages.snapshotForTurn(identity, modelMessageID)
+            // Preparation failures retain unassociated input for a later admitted
+            // turn. An already associated request has a permanent failed outcome.
+            if (input.ok && input.value?.associated) {
+              yield* agentMessages.markStopped(identity, input.value.id, "model_error")
+              yield* agentMessages.discardPending(identity, "model_error")
+            }
+          })
+
           const handle = yield* processor
             .create({
               assistantMessage: msg,
               sessionID,
               model,
             })
-            .pipe(Effect.onInterrupt(() => finalizeInterruptedAssistant))
+            .pipe(
+              Effect.onError(finalizeFailedAssistant),
+              Effect.onInterrupt(() => finalizeInterruptedAssistant),
+            )
+
+          // A later input must produce its own structured response.
+          structured = undefined
 
           const outcome: "break" | "continue" = yield* Effect.gen(function* () {
             const lastUserMsg = msgs.findLast((m) => m.info.role === "user")
@@ -2246,9 +2375,58 @@ export const layer = Layer.effect(
               contextFolding: contextFoldingHistory,
             }
             distillationInput = processInput
+            if (agentMessages && agentSnapshot) {
+              for (const message of agentSnapshot.messages) {
+                if (
+                  !msgs.some(
+                    (item) =>
+                      item.info.id === message.transcriptID &&
+                      item.parts.some(
+                        (part) =>
+                          part.id === message.partID &&
+                          part.type === "text" &&
+                          !part.ignored &&
+                          part.text === DagMessages.renderMessage(message),
+                      ),
+                  )
+                )
+                  throw new Error("Agent message was removed from the model input")
+              }
+              const associated = yield* agentMessages.associate(identity, agentSnapshot.id)
+              if (!associated.ok) throw new Error(`Agent input association rejected: ${associated.reason}`)
+              const endpoint = yield* agentMessages.revisions(identity)
+              if (endpoint.ok && endpoint.value.endpoint.kind === "node")
+                setCaptureSnapshot(sessionID, agentSnapshot.id)
+            }
             const result = yield* handle.process(processInput)
+            if (result === "stop" || handle.message.error) {
+              agentInputBlocked = true
+              const reason = handle.message.error ? "model_error" : "turn_blocked"
+              if (agentMessages) {
+                if (agentSnapshot) yield* agentMessages.markStopped(identity, agentSnapshot.id, reason)
+                yield* agentMessages.discardPending(identity, reason)
+                if (result === "stop" && !handle.message.error) {
+                  const endpoint = yield* agentMessages.revisions(identity)
+                  if (endpoint.ok && endpoint.value.endpoint.kind === "node") {
+                    handle.message.error = new NamedError.Unknown({
+                      message: "DAG child turn blocked; continuation requires user action",
+                    }).toObject()
+                    yield* sessions.updateMessage(handle.message)
+                  }
+                }
+              }
+            }
 
-            if (structured !== undefined) {
+            if (handle.message.finish === "content-filter" && !handle.message.error) {
+              handle.message.error = new SessionV1.ContentFilterError({
+                message: "The response was blocked by the provider's content filter",
+              }).toObject()
+              yield* sessions.updateMessage(handle.message)
+              yield* events.publish(Session.Event.Error, { sessionID, error: handle.message.error })
+              return "break" as const
+            }
+
+            if (structured !== undefined && !handle.message.error) {
               handle.message.structured = structured
               handle.message.finish = handle.message.finish ?? "stop"
               yield* sessions.updateMessage(handle.message)
@@ -2257,18 +2435,6 @@ export const layer = Layer.effect(
 
             const finished = handle.message.finish && !["tool-calls", "unknown"].includes(handle.message.finish)
             if (finished && !handle.message.error) {
-              // Surface any content-filter finish (e.g. Anthropic stop_reason:
-              // refusal) as an error. These turns may have produced no visible
-              // output at all — previously the session went idle silently — or
-              // partial text that was cut off by the provider's filter.
-              if (handle.message.finish === "content-filter") {
-                handle.message.error = new SessionV1.ContentFilterError({
-                  message: "The response was blocked by the provider's content filter",
-                }).toObject()
-                yield* sessions.updateMessage(handle.message)
-                yield* events.publish(Session.Event.Error, { sessionID, error: handle.message.error })
-                return "break" as const
-              }
               if (format.type === "json_schema") {
                 handle.message.error = new SessionV1.StructuredOutputError({
                   message: "Model did not produce structured output",
@@ -2280,6 +2446,7 @@ export const layer = Layer.effect(
             }
 
             if (result === "stop") return "break" as const
+            if (isLastStep) return "break" as const
             if (result === "compact") {
               yield* compaction.create({
                 sessionID,
@@ -2292,8 +2459,20 @@ export const layer = Layer.effect(
             return "continue" as const
           }).pipe(
             Effect.ensuring(instruction.clear(handle.message.id)),
+            Effect.onError(finalizeFailedAssistant),
             Effect.onInterrupt(() => finalizeInterruptedAssistant),
           )
+          // Semantic errors can be assigned after the processor returns (for
+          // example a missing structured response). They share the same permanent
+          // stop boundary as transport errors and cannot re-admit late input.
+          if (!agentInputBlocked && (handle.message.error || isLastStep)) {
+            agentInputBlocked = true
+            if (agentMessages) {
+              const reason = handle.message.error ? "model_error" : "budget_exhausted"
+              if (agentSnapshot) yield* agentMessages.markStopped(identity, agentSnapshot.id, reason)
+              yield* agentMessages.discardPending(identity, reason)
+            }
+          }
           // The turn finished (outcome "break") or is ongoing (tool calls). Either way
           // loop back: the finished-check at the top of the next iteration fires the
           // Stop hook and returns once the agent is truly done. turnStopped covers
@@ -2307,6 +2486,63 @@ export const layer = Layer.effect(
         return yield* getLastAssistant(sessionID)
       },
     )
+
+    const runLoop = (sessionID: SessionID): Effect.Effect<SessionV1.WithParts> =>
+      runLoopImpl(sessionID).pipe(
+        Effect.onError((cause: Cause.Cause<never>) =>
+          db
+            .transaction(
+              () =>
+                Effect.gen(function* () {
+                  if (!agentMessages || Cause.hasInterrupts(cause)) return
+                  const ctx = yield* InstanceState.context
+                  const identity = { projectID: ctx.project.id, directory: ctx.directory, sessionID }
+                  const latest = yield* agentMessages.latestSnapshot(identity)
+                  if (!latest.ok || !latest.value) return
+                  const input = latest.value
+                  yield* agentMessages.markStopped(
+                    identity,
+                    input.id,
+                    input.associated ? "model_error" : "preparation_failed",
+                  )
+                  if (input.associated) yield* agentMessages.discardPending(identity, "model_error")
+                  const history = yield* sessions.messages({ sessionID }).pipe(Effect.orDie)
+                  if (history.some((message) => message.info.id === input.logicalTurnID)) return
+                  const user = history.findLast((message) => message.info.role === "user")?.info
+                  if (!user || user.role !== "user") return
+                  const now = Date.now()
+                  // Earlier preparation failures precede processor creation. Record
+                  // their exact turn so a retained inbox cannot reset it on every wake.
+                  yield* sessions.updateMessage({
+                    id: MessageID.make(input.logicalTurnID),
+                    parentID: user.id,
+                    role: "assistant",
+                    mode: user.agent,
+                    agent: user.agent,
+                    variant: user.model.variant,
+                    path: { cwd: ctx.directory, root: ctx.worktree },
+                    cost: 0,
+                    tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+                    modelID: user.model.modelID,
+                    providerID: user.model.providerID,
+                    time: { created: now, completed: now },
+                    sessionID,
+                    error: MessageV2.fromError(Cause.squash(cause), { providerID: user.model.providerID }),
+                  })
+                }),
+              { behavior: "immediate" },
+            )
+            .pipe(
+              Effect.orDie,
+              Effect.catchCause((failure) =>
+                Effect.logWarning("failed to record DAG input preparation error", {
+                  sessionID,
+                  cause: Cause.pretty(failure),
+                }),
+              ),
+            ),
+        ),
+      )
 
     const loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.loop")(function* (
       input: LoopInput,
@@ -2722,6 +2958,7 @@ export const defaultLayer = Layer.suspend(() =>
       Layer.mergeAll(
         Agent.defaultLayer,
         Database.defaultLayer,
+        DagMessages.defaultLayer,
         SystemPrompt.defaultLayer,
         LLM.defaultLayer,
         CrossSpawnSpawner.defaultLayer,
@@ -2885,6 +3122,7 @@ export const node = LayerNode.make(layer, [
   EventV2Bridge.node,
   RuntimeFlags.node,
   Database.node,
+  DagMessages.node,
   Memory.node,
   Todo.node,
   HookStartContext.node,

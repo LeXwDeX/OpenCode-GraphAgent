@@ -2000,6 +2000,7 @@ const scenarios: Scenario[] = [
         Effect.flatMap((dag) =>
           ctx.dagFailNode(dag.dagID, "b", "node exceeded timeout of 600000ms", "timeout").pipe(Effect.as(dag)),
         ),
+        Effect.flatMap((dag) => ctx.dagAgentMessage(dag.dagID, "a", dag.sessionID).pipe(Effect.as(dag))),
       ),
     )
     .at((ctx) => ({ path: route("/dag/{dagID}/nodes", { dagID: ctx.state.dagID }), headers: ctx.headers() }))
@@ -2021,6 +2022,14 @@ const scenarios: Scenario[] = [
         const pristine = body.find((node: any) => node.id === "a")
         object(pristine)
         check(!("error_class" in pristine), "error_class should be absent on non-failed nodes")
+        check(typeof pristine.attempt_id === "string", "running node should expose exact attempt identity")
+        check(pristine.accepted_input_revision === 1, "acceptance should advance input revision")
+        check(pristine.snapshot_revision === 0, "queued message must not advance model snapshot")
+        object(pristine.agent_messages)
+        check(pristine.agent_messages.queued === 1, "accepted input should be queued")
+        check(pristine.agent_messages.delivered === 0, "acceptance must not claim delivery")
+        check(pristine.agent_messages.undeliverable === 0, "live recipient should have no undeliverable input")
+        check(!JSON.stringify(body).includes("HTTP_MESSAGE_BODY_PRIVATE"), "node metadata must not expose message bodies")
       }),
     ),
 

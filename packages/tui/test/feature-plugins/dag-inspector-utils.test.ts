@@ -14,6 +14,8 @@ import {
   formatDagError,
   formatDagOutputPreview,
   formatDagProgress,
+  formatDagAgentMessages,
+  formatDagAgentInput,
   mergeDagWorkflowSummaries,
   type DagNode,
 } from "../../src/feature-plugins/system/dag-inspector-utils"
@@ -27,6 +29,17 @@ const node = (id: string, depends_on: string[] = [], name = id): DagNode => ({
   required: false,
   depends_on,
   replan_attempts: 0,
+})
+
+describe("agent observations", () => {
+  test("keeps legacy nodes compatible and distinguishes accepted input from frozen snapshots", () => {
+    expect(formatDagAgentMessages(node("legacy"))).toBeUndefined()
+    expect(formatDagAgentInput(node("legacy"))).toBeUndefined()
+    const observed = { ...node("worker"), attempt_id: "attempt-1", accepted_input_revision: 4, snapshot_revision: 2,
+      agent_messages: { queued: 2, delivered: 1, undeliverable: 1 } }
+    expect(formatDagAgentMessages(observed)).toBe("messages 2 queued · 1 delivered · 1 undeliverable")
+    expect(formatDagAgentInput(observed)).toBe("attempt attempt-1 · input 4 · snapshot 2")
+  })
 })
 
 describe("computeWaves", () => {

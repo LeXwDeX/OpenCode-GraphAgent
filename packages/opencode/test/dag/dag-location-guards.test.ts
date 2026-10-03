@@ -259,6 +259,7 @@ function twoInstanceLayer(input: TwoInstanceInput) {
   const childTitles = new Map<string, string>()
   const created: string[] = []
   const session = Layer.mock(Session.Service, {
+    getPart: () => Effect.succeed(undefined),
     get: () => Effect.succeed({ id: "ses_parent", permission: [], agent: "build" } as never),
     create: (value) =>
       Effect.sync(() => {
@@ -338,7 +339,7 @@ function twoInstanceLayer(input: TwoInstanceInput) {
     // admitIfIdle → prepareIfIdle, not promptIfIdle. Without a gate this
     // returns none (no admission); with parkWakeDelivery it parks the result
     // effect on the gate so a probe can race Session.remove mid-delivery.
-    prepareIfIdle: (value) =>
+    prepareIfIdle: (value, persistAdmission) =>
       Effect.sync(() => {
         const gate = input.parkWakeDelivery
         if (!gate) return Option.none()
@@ -351,7 +352,7 @@ function twoInstanceLayer(input: TwoInstanceInput) {
           ),
         )
         return Option.some({ activate: Effect.void, result, abort: Effect.void })
-      }),
+      }).pipe(Effect.tap((prepared) => Option.isSome(prepared) ? persistAdmission ?? Effect.void : Effect.void)),
   })
   const agent = Layer.mock(Agent.Service, {
     get: () => Effect.succeed({
@@ -959,6 +960,7 @@ function goalLoopLayer(input: {
     }),
   )
   const session = Layer.mock(Session.Service, {
+    getPart: () => Effect.succeed(undefined),
     messages: (value) =>
       Effect.sync(() => input.messagesBySession.get((value as { sessionID?: string }).sessionID ?? "") ?? []),
   })

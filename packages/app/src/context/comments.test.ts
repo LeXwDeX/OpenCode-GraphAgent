@@ -5,13 +5,13 @@ import type { LineComment } from "./comments"
 let createCommentSessionForTest: typeof import("./comments").createCommentSessionForTest
 
 beforeAll(async () => {
-  mock.module("@solidjs/router", () => ({
+  await mock.module("@solidjs/router", () => ({
     useNavigate: () => () => undefined,
     useParams: () => ({}),
     useLocation: () => ({}),
     useSearchParams: () => [{}, () => undefined],
   }))
-  mock.module("@opencode-ai/ui/context", () => ({
+  await mock.module("@opencode-ai/ui/context", () => ({
     createSimpleContext: () => ({
       use: () => undefined,
       provider: () => undefined,

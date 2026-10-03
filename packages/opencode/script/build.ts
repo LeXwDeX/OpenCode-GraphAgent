@@ -17,6 +17,7 @@ const generated = await import("./generate.ts")
 
 import { Script } from "@opencode-ai/script"
 import pkg from "../package.json"
+import { resolveDependencyVersion } from "../../../script/toolchain.mjs"
 
 const singleFlag = process.argv.includes("--single")
 const baselineFlag = process.argv.includes("--baseline")
@@ -148,9 +149,10 @@ await $`rm -rf dist`
 
 const binaries: Record<string, string> = {}
 if (!skipInstall) {
-  await $`bun install --os="*" --cpu="*" @opentui/core@${pkg.dependencies["@opentui/core"]}`
-  await $`bun install --os="*" --cpu="*" @parcel/watcher@${pkg.dependencies["@parcel/watcher"]}`
-  await $`bun install --os="*" --cpu="*" @ff-labs/fff-bun@${pkg.dependencies["@ff-labs/fff-bun"]}`
+  const version = (name: keyof typeof pkg.dependencies) => resolveDependencyVersion(name, pkg.dependencies[name])
+  await $`bun install --no-save --frozen-lockfile --os="*" --cpu="*" @opentui/core@${version("@opentui/core")}`
+  await $`bun install --no-save --frozen-lockfile --os="*" --cpu="*" @parcel/watcher@${version("@parcel/watcher")}`
+  await $`bun install --no-save --frozen-lockfile --os="*" --cpu="*" @ff-labs/fff-bun@${version("@ff-labs/fff-bun")}`
 }
 for (const item of targets) {
   const name = [
@@ -170,6 +172,7 @@ for (const item of targets) {
   const rootPath = path.resolve(dir, "../../node_modules/@opentui/core/parser.worker.js")
   const parserWorker = fs.realpathSync(fs.existsSync(localPath) ? localPath : rootPath)
   const workerPath = "./src/cli/tui/worker.ts"
+  const schemaValidationWorkerPath = "./src/dag/runtime/schema-validation-worker.ts"
 
   // Use platform-specific bunfs root path based on target OS
   const bunfsRoot = item.os === "win32" ? "B:/~BUN/root/" : "/$bunfs/root/"
@@ -195,7 +198,13 @@ for (const item of targets) {
       windows: {},
     },
     files: embeddedFileMap ? { "opencode-web-ui.gen.ts": embeddedFileMap } : {},
-    entrypoints: ["./src/index.ts", parserWorker, workerPath, ...(embeddedFileMap ? ["opencode-web-ui.gen.ts"] : [])],
+    entrypoints: [
+      "./src/index.ts",
+      parserWorker,
+      workerPath,
+      schemaValidationWorkerPath,
+      ...(embeddedFileMap ? ["opencode-web-ui.gen.ts"] : []),
+    ],
     define: {
       FFF_LIBC: JSON.stringify(item.abi === "musl" ? "musl" : "gnu"),
       OPENCODE_VERSION: `'${Script.version}'`,
@@ -203,6 +212,7 @@ for (const item of targets) {
       OPENCODE_DAG_TEMPLATES: generated.dagTemplatesData,
       OTUI_TREE_SITTER_WORKER_PATH: bunfsRoot + workerRelativePath,
       OPENCODE_WORKER_PATH: workerPath,
+      OPENCODE_SCHEMA_VALIDATION_WORKER_PATH: schemaValidationWorkerPath,
       OPENCODE_CHANNEL: `'${Script.channel}'`,
       OPENCODE_LIBC: item.os === "linux" ? `'${item.abi ?? "glibc"}'` : "",
       ...(item.os === "linux" ? { "process.env.OPENTUI_LIBC": JSON.stringify(item.abi ?? "glibc") } : {}),
@@ -211,7 +221,7 @@ for (const item of targets) {
 
   // macOS kills freshly compiled unsigned darwin binaries (SIGKILL 137) before they can run
   if (process.platform === "darwin" && item.os === "darwin" && fs.existsSync("/usr/bin/codesign")) {
-    await $`codesign --force --sign - dist/${name}/bin/opencode`
+    await $`/usr/bin/codesign --force --sign - dist/${name}/bin/opencode`
   }
 
   // Smoke test: only run if binary is for current platform

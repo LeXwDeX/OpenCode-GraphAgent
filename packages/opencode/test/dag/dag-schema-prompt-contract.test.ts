@@ -88,6 +88,7 @@ function contractLayer(childPrompts: Queue.Queue<PromptGate>) {
   const dag = Dag.layer.pipe(Layer.provide(bridge), Layer.provide(store))
   const base = Layer.mergeAll(database, events, bridge, store, projector, dag, status)
   const session = Layer.mock(Session.Service, {
+    getPart: () => Effect.succeed(undefined),
     get: () => Effect.succeed({ id: "ses_parent", permission: [], agent: "build" } as never),
     create: () => Effect.succeed({ id: "ses_child_1" } as never),
     messages: () => Effect.succeed([]),

@@ -1,5 +1,5 @@
 import { describe, expect } from "bun:test"
-import { Deferred, Effect, Fiber, Layer, Option, Schema } from "effect"
+import { Deferred, Effect, Exit, Fiber, Layer, Option, Schema } from "effect"
 import { SessionAutomationLease } from "@/session/automation-lease"
 import { SessionID } from "@/session/schema"
 import { SessionStatus } from "@/session/status"
@@ -14,6 +14,92 @@ const it = testEffect(
 )
 
 describe("SessionAutomationLease", () => {
+  it.live("durable Goal authority overrides stale register and unregister observations", () =>
+    Effect.gen(function* () {
+      const lease = yield* SessionAutomationLease.Service
+      const sessionID = SessionID.descending()
+      let activeID: string | undefined = "current-goal"
+      yield* lease.installGoalAuthority(() => Effect.sync(() => activeID))
+      yield* lease.register(sessionID, { kind: "goal", id: "old-goal" })
+      expect(Option.isNone(yield* lease.claim(sessionID, { kind: "goal", id: "old-goal" }))).toBe(true)
+      const current = { kind: "goal" as const, id: "current-goal" }
+      expect(Option.isSome(yield* lease.claim(sessionID, current))).toBe(true)
+      yield* lease.unregister(sessionID, current)
+      expect(Option.isSome(yield* lease.claim(sessionID, current))).toBe(true)
+      activeID = undefined
+      expect(Option.isNone(yield* lease.claim(sessionID, current))).toBe(true)
+    }),
+  )
+
+  it.live("authority read failure blocks admission without erasing the last registration", () =>
+    Effect.gen(function* () {
+      const lease = yield* SessionAutomationLease.Service
+      const sessionID = SessionID.descending()
+      const goal = { kind: "goal" as const, id: "current-goal" }
+      let unavailable = false
+      yield* lease.installGoalAuthority(() =>
+        Effect.suspend(() => (unavailable ? Effect.die("durable read failed") : Effect.succeed(goal.id))),
+      )
+      yield* lease.register(sessionID, goal)
+      const before = Option.getOrThrow(yield* lease.claim(sessionID, goal))
+      unavailable = true
+      expect(Exit.isFailure(yield* lease.claim(sessionID, goal).pipe(Effect.exit))).toBe(true)
+      expect(Exit.isFailure(yield* lease.register(sessionID, { kind: "goal", id: "stale" }).pipe(Effect.exit))).toBe(
+        true,
+      )
+      expect(Exit.isFailure(yield* lease.use(before, Effect.void).pipe(Effect.exit))).toBe(true)
+      expect(Exit.isFailure(yield* lease.handoff(before, Effect.succeed(Option.none())).pipe(Effect.exit))).toBe(true)
+      unavailable = false
+      const after = Option.getOrThrow(yield* lease.claim(sessionID, goal))
+      expect(after.generation).toBe(before.generation)
+      expect(Option.isSome(yield* lease.use(before, Effect.void))).toBe(true)
+    }),
+  )
+
+  it.live("rejects a second different durable authority in the same shared lease", () =>
+    Effect.gen(function* () {
+      const lease = yield* SessionAutomationLease.Service
+      const first = () => Effect.succeed("first")
+      yield* lease.installGoalAuthority(first)
+      const second = yield* lease.installGoalAuthority(() => Effect.succeed("second")).pipe(Effect.exit)
+      expect(Exit.isFailure(second)).toBe(true)
+      // A rejected installation must not replace the original resolver.
+      const sessionID = SessionID.descending()
+      expect(Option.isSome(yield* lease.claim(sessionID, { kind: "goal", id: "first" }))).toBe(true)
+    }),
+  )
+
+  it.live("scope disposal removes the authority closure and Goal registrations while preserving DAG ownership", () =>
+    Effect.gen(function* () {
+      const lease = yield* SessionAutomationLease.Service
+      const sessionID = SessionID.descending()
+      const goal = { kind: "goal" as const, id: "old-goal" }
+      const dag = { kind: "dag" as const, id: "dag" }
+      let reads = 0
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          yield* lease.installGoalAuthority(() =>
+            Effect.sync(() => {
+              reads += 1
+              return goal.id
+            }),
+          )
+          yield* lease.register(sessionID, goal)
+          yield* lease.register(sessionID, dag)
+          expect(Option.isSome(yield* lease.claim(sessionID, { kind: "dag" }))).toBe(true)
+        }),
+      )
+      const before = reads
+      expect(Option.isSome(yield* lease.claim(sessionID, { kind: "dag" }))).toBe(true)
+      yield* lease.unregister(sessionID, dag)
+      expect(Option.isNone(yield* lease.claim(sessionID, goal))).toBe(true)
+      // Independent lease fixtures retain their explicit-registration semantics.
+      yield* lease.register(sessionID, { kind: "goal", id: "fixture-goal" })
+      expect(Option.isSome(yield* lease.claim(sessionID, { kind: "goal", id: "fixture-goal" }))).toBe(true)
+      expect(reads).toBe(before)
+    }),
+  )
+
   it.instance("DAG registration preempts Goal and invalidates its generation", () =>
     Effect.gen(function* () {
       const lease = yield* SessionAutomationLease.Service

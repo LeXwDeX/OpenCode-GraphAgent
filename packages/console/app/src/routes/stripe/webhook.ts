@@ -1,7 +1,7 @@
 import type { Stripe } from "stripe"
 import { Billing } from "@opencode-ai/console-core/billing.js"
 import type { APIEvent } from "@solidjs/start/server"
-import { and, Database, eq, sql } from "@opencode-ai/console-core/drizzle/index.js"
+import { and, Database, eq, or, sql } from "@opencode-ai/console-core/drizzle/index.js"
 import { BillingTable, LiteTable, PaymentTable } from "@opencode-ai/console-core/schema/billing.sql.js"
 import { Identifier } from "@opencode-ai/console-core/identifier.js"
 import { centsToMicroCents } from "@opencode-ai/console-core/util/price.js"
@@ -11,13 +11,40 @@ import { LiteData } from "@opencode-ai/console-core/lite.js"
 import { BlackData } from "@opencode-ai/console-core/black.js"
 import { Referral } from "@opencode-ai/console-core/referral.js"
 
+async function lockBilling(tx: Database.TxOrDb, workspaceID: string, customerID: string, allowNew = false) {
+  const billing = await tx
+    .select()
+    .from(BillingTable)
+    .where(eq(BillingTable.workspaceID, workspaceID))
+    .for("update")
+    .then((rows) => rows[0])
+  if (!billing) throw new Error(`Workspace with ID ${workspaceID} not found`)
+  if (billing.customerID !== customerID && !(allowNew && !billing.customerID)) throw new Error("Customer ID mismatch")
+  return billing
+}
+
+async function hasPayment(tx: Database.TxOrDb, workspaceID: string, invoiceID: string, paymentID?: string) {
+  // Billing is locked first by every payment writer. Use a current read after acquiring it.
+  return tx
+    .select({ id: PaymentTable.id })
+    .from(PaymentTable)
+    .where(
+      and(
+        eq(PaymentTable.workspaceID, workspaceID),
+        or(eq(PaymentTable.invoiceID, invoiceID), paymentID ? eq(PaymentTable.paymentID, paymentID) : undefined),
+      ),
+    )
+    .for("update")
+    .then((rows) => rows.length > 0)
+}
+
 export async function POST(input: APIEvent) {
   const body = await Billing.stripe().webhooks.constructEventAsync(
     await input.request.text(),
     input.request.headers.get("stripe-signature")!,
     Resource.STRIPE_WEBHOOK_SECRET.value,
   )
-  console.log(body.type, JSON.stringify(body, null, 2))
+  console.log("Stripe webhook", { id: body.id, type: body.type })
 
   return (async () => {
     if (body.type === "customer.updated") {
@@ -77,6 +104,8 @@ export async function POST(input: APIEvent) {
         if (!paymentMethod || typeof paymentMethod === "string") throw new Error("Payment method not expanded")
 
         await Database.transaction(async (tx) => {
+          const billing = await lockBilling(tx, workspaceID, customerID, true)
+          if (await hasPayment(tx, workspaceID, invoiceID, paymentID)) return
           await tx
             .update(BillingTable)
             .set({
@@ -86,7 +115,7 @@ export async function POST(input: APIEvent) {
               paymentMethodLast4: paymentMethod.card?.last4 ?? null,
               paymentMethodType: paymentMethod.type,
               // enable reload if first time enabling billing
-              ...(customer?.customerID
+              ...(billing.customerID
                 ? {}
                 : {
                     reloadError: null,
@@ -142,6 +171,8 @@ export async function POST(input: APIEvent) {
           }
 
           await Database.transaction(async (tx) => {
+            const current = await lockBilling(tx, workspaceID, customerID, true)
+            if (current.liteSubscriptionID === subscriptionID) return
             await tx
               .update(BillingTable)
               .set({
@@ -241,8 +272,10 @@ export async function POST(input: APIEvent) {
         )
         if (!workspaceID) throw new Error("Workspace ID not found for customer")
 
-        await Database.use((tx) =>
-          tx.insert(PaymentTable).values({
+        await Database.transaction(async (tx) => {
+          await lockBilling(tx, workspaceID, customerID)
+          if (await hasPayment(tx, workspaceID, invoiceID, paymentID)) return
+          await tx.insert(PaymentTable).values({
             workspaceID,
             id: Identifier.create("payment"),
             amount: centsToMicroCents(amountInCents),
@@ -254,8 +287,8 @@ export async function POST(input: APIEvent) {
               currency: body.data.object.currency === "inr" ? "inr" : undefined,
               couponID,
             },
-          }),
-        )
+          })
+        })
       } else if (body.data.object.billing_reason === "manual") {
         const workspaceID = body.data.object.metadata?.workspaceID
         const amountInCents = body.data.object.metadata?.amount && parseInt(body.data.object.metadata?.amount)
@@ -273,6 +306,10 @@ export async function POST(input: APIEvent) {
             expand: ["payments"],
           })
           await Database.transaction(async (tx) => {
+            await lockBilling(tx, workspaceID, customerID)
+            const paymentIntent = invoice.payments?.data[0]?.payment.payment_intent
+            const paymentID = typeof paymentIntent === "string" ? paymentIntent : paymentIntent?.id
+            if (await hasPayment(tx, workspaceID, invoiceID, paymentID)) return
             await tx
               .update(BillingTable)
               .set({
@@ -286,7 +323,7 @@ export async function POST(input: APIEvent) {
               id: Identifier.create("payment"),
               amount: centsToMicroCents(amountInCents),
               invoiceID,
-              paymentID: invoice.payments?.data[0].payment.payment_intent as string,
+              paymentID,
               customerID,
             })
           })
@@ -297,28 +334,42 @@ export async function POST(input: APIEvent) {
       if (body.data.object.billing_reason === "manual") {
         const workspaceID = body.data.object.metadata?.workspaceID
         const invoiceID = body.data.object.id
+        const customer = body.data.object.customer
+        const customerID = typeof customer === "string" ? customer : customer?.id
 
         if (!workspaceID) throw new Error("Workspace ID not found")
         if (!invoiceID) throw new Error("Invoice ID not found")
-
-        const paymentIntent = await Billing.stripe().paymentIntents.retrieve(invoiceID)
-        console.log(JSON.stringify(paymentIntent))
-        const errorMessage =
-          typeof paymentIntent === "object" && paymentIntent !== null
-            ? paymentIntent.last_payment_error?.message
-            : undefined
+        if (!customerID) throw new Error("Customer ID not found")
 
         await Actor.provide("system", { workspaceID }, async () => {
-          await Database.use((tx) =>
-            tx
+          await Database.transaction(async (tx) => {
+            await lockBilling(tx, workspaceID, customerID)
+            // A delayed failure notification must not undo a successful reload.
+            if (await hasPayment(tx, workspaceID, invoiceID)) return
+            const invoice = await Billing.stripe().invoices.retrieve(invoiceID, { expand: ["payments"] })
+            const invoiceCustomer = typeof invoice.customer === "string" ? invoice.customer : invoice.customer?.id
+            if (invoiceCustomer !== customerID) throw new Error("Customer ID mismatch")
+            if (invoice.status === "paid") return
+
+            const invoicePayment = invoice.payments?.data.find((item) => item.payment.payment_intent)
+            const linkedIntent = invoicePayment?.payment.payment_intent
+            const paymentID = typeof linkedIntent === "string" ? linkedIntent : linkedIntent?.id
+            if (paymentID && (await hasPayment(tx, workspaceID, invoiceID, paymentID))) return
+            const paymentIntent = paymentID ? await Billing.stripe().paymentIntents.retrieve(paymentID) : undefined
+            const intentCustomer =
+              typeof paymentIntent?.customer === "string" ? paymentIntent.customer : paymentIntent?.customer?.id
+            if (intentCustomer && intentCustomer !== customerID) throw new Error("Customer ID mismatch")
+            if (paymentIntent?.status === "succeeded") return
+
+            await tx
               .update(BillingTable)
               .set({
                 reload: false,
-                reloadError: errorMessage ?? "workspace.reload.error.paymentFailed",
+                reloadError: paymentIntent?.last_payment_error?.message ?? "workspace.reload.error.paymentFailed",
                 timeReloadError: sql`now()`,
               })
-              .where(eq(BillingTable.workspaceID, Actor.workspace())),
-          )
+              .where(eq(BillingTable.workspaceID, workspaceID))
+          })
         })
       }
     }
@@ -339,25 +390,28 @@ export async function POST(input: APIEvent) {
       )
       if (!workspaceID) throw new Error("Workspace ID not found")
 
-      const payment = await Database.use((tx) =>
-        tx
+      await Database.transaction(async (tx) => {
+        await lockBilling(tx, workspaceID, customerID)
+        const payment = await tx
           .select({
+            id: PaymentTable.id,
             amount: PaymentTable.amount,
             enrichment: PaymentTable.enrichment,
+            timeRefunded: PaymentTable.timeRefunded,
           })
           .from(PaymentTable)
           .where(and(eq(PaymentTable.paymentID, paymentIntentID), eq(PaymentTable.workspaceID, workspaceID)))
-          .then((rows) => rows[0]),
-      )
-      if (!payment) throw new Error("Payment not found")
+          .for("update")
+          .then((rows) => rows[0])
+        if (!payment) throw new Error("Payment not found")
+        if (payment.timeRefunded) return
 
-      await Database.transaction(async (tx) => {
         await tx
           .update(PaymentTable)
           .set({
             timeRefunded: new Date(body.created * 1000),
           })
-          .where(and(eq(PaymentTable.paymentID, paymentIntentID), eq(PaymentTable.workspaceID, workspaceID)))
+          .where(and(eq(PaymentTable.id, payment.id), eq(PaymentTable.workspaceID, workspaceID)))
 
         // deduct balance only for top up
         if (!payment.enrichment?.type) {

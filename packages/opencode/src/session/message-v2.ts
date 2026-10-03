@@ -81,12 +81,19 @@ export const cursor = {
   },
 }
 
-const info = (row: typeof MessageTable.$inferSelect) =>
-  ({
+const decodeFormat = Schema.decodeUnknownSync(SessionV1.Format)
+
+const info = (row: typeof MessageTable.$inferSelect): Info => {
+  const value = {
     ...row.data,
     id: row.id,
     sessionID: row.session_id,
-  }) as Info
+  } as Info
+  // JSON persistence removes Schema.Class prototypes. Rehydrate the output
+  // format before this user message can be consumed or republished as an event.
+  if (value.role === "user" && value.format) value.format = decodeFormat(value.format)
+  return value
+}
 
 const part = (row: typeof PartTable.$inferSelect) =>
   ({

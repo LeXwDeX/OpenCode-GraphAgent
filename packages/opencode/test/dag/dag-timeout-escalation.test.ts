@@ -121,6 +121,7 @@ function loopLayer(input: {
   const created: string[] = []
   let cancelCount = 0
   const session = Layer.mock(Session.Service, {
+    getPart: () => Effect.succeed(undefined),
     get: () => Effect.succeed({
       id: SessionID.make("ses_parent"),
       slug: "parent",

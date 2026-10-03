@@ -1,7 +1,7 @@
 ARG REGISTRY=ghcr.io/anomalyco
 FROM ${REGISTRY}/build/bun-node:24.04
 
-ARG RUST_TOOLCHAIN=stable
+ARG RUST_TOOLCHAIN
 
 ENV CARGO_HOME=/opt/cargo
 ENV RUSTUP_HOME=/opt/rustup
@@ -10,4 +10,5 @@ ENV PATH=/opt/cargo/bin:/opt/bun/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/u
 RUN set -euo pipefail; \
   curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain "${RUST_TOOLCHAIN}"; \
   rustc --version; \
-  cargo --version
+  cargo --version; \
+  node /opt/opencode-toolchain/script/toolchain.mjs check --rust

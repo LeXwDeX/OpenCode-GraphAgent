@@ -24,6 +24,8 @@ import {
   formatDagError,
   formatDagOutputPreview,
   formatDagProgress,
+  formatDagAgentMessages,
+  formatDagAgentInput,
   mergeDagWorkflowSummaries,
   dagEscalationLabel,
   type DagControlOperation,
@@ -38,10 +40,11 @@ const ROUTE = "dag"
 const NAV_WIDTH_MAX = 32
 const NAV_WIDTH_MIN = 18
 const NAV_WIDTH_SHARE = 0.3
-// Node detail content rows: header, dependencies, error/output preview. The
+// Node detail content rows: header, attempt/input, delivery counts, dependencies,
+// error/output preview. The
 // detail block adds two padding rows on top; fixed so changing the selection
 // never moves the footer.
-const NODE_DETAIL_HEIGHT = 3
+const NODE_DETAIL_HEIGHT = 5
 // A stalled summary request must surface as an error (with one retry) instead
 // of pinning the route on its first attempt forever.
 const FETCH_TIMEOUT_MS_DEFAULT = 15_000
@@ -300,6 +303,15 @@ function DagInspector(props: { api: TuiPluginApi }) {
     // open has something to compare against.
     lastSignature = signatureFor(wf)
     void fetchNodes(wf)
+    // Message acceptance and input association do not change topology or node
+    // status. Refresh the selected workflow while this route is mounted so
+    // those durable counts remain visible without publishing message bodies.
+    let refreshing = false
+    const timer = setInterval(() => {
+      if (refreshing) return
+      refreshing = true
+      void fetchNodes(wf).finally(() => { refreshing = false })
+    }, 2_000)
     // Re-fetch nodes only when a summary event for the selected workflow's
     // owning session indicates the workflow's node-level state changed.
     // Project discovery supplies the owning session when the route carries
@@ -312,7 +324,10 @@ function DagInspector(props: { api: TuiPluginApi }) {
       lastSignature = sig
       void fetchNodes(wf)
     })
-    onCleanup(() => off())
+    onCleanup(() => {
+      off()
+      clearInterval(timer)
+    })
   })
 
   const layers = createMemo(() => computeWaves(nodes()))
@@ -762,6 +777,12 @@ function DagInspector(props: { api: TuiPluginApi }) {
                             )}
                           </Show>
                         </box>
+                        <Show when={formatDagAgentInput(node())}>
+                          {(input) => <text fg={theme().textMuted} wrapMode="none">{input()}</text>}
+                        </Show>
+                        <Show when={formatDagAgentMessages(node())}>
+                          {(messages) => <text fg={theme().textMuted} wrapMode="none">{messages()}</text>}
+                        </Show>
                         <Show when={node().depends_on.length > 0}>
                           <text fg={theme().textMuted} wrapMode="none">
                             depends on {node().depends_on.join(", ")}

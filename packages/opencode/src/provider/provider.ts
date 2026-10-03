@@ -46,7 +46,9 @@ function wrapSSE(res: Response, ms: number, ctl: AbortController) {
         const id = setTimeout(() => {
           const err = new ProviderError.ResponseStreamError("SSE read timed out")
           ctl.abort(err)
-          void reader.cancel(err)
+          // Aborting fetch can make cancellation reject with the same timeout.
+          // The read below still reports that error to the model stream.
+          void reader.cancel(err).catch(() => {})
           reject(err)
         }, ms)
 

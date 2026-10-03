@@ -70,6 +70,7 @@ export type ScenarioContext = {
   dag: (input: { sessionID: SessionID; title?: string; nodes: DagNodeSeed[] }) => Effect.Effect<DagWorkflowInfo>
   /** Fail a seeded DAG node through the Dag service (projects error_class on the wire). */
   dagFailNode: (dagID: string, nodeID: string, reason: string, errorClass: "timeout" | "exec_failed" | "verdict_fail") => Effect.Effect<void>
+  dagAgentMessage: (dagID: string, nodeID: string, ownerSessionID: SessionID) => Effect.Effect<void>
   /** Create a DAG workflow under a different project in the shared database. */
   foreignDag: (input: { title?: string; nodes: DagNodeSeed[] }) => Effect.Effect<DagWorkflowInfo>
 }

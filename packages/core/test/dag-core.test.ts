@@ -380,6 +380,40 @@ describe("validateRequiredNodes", () => {
 })
 
 describe("planReplan (D11 simplified model)", () => {
+  for (const status of [NodeStatus.PENDING, NodeStatus.QUEUED, NodeStatus.PAUSED]) {
+    it(`rejects a new dependency on an omitted ${status} node`, () => {
+      const plan = planReplan(
+        { nodes: [{ id: "old", status, depends_on: [] }] },
+        { nodes: [{ id: "new", depends_on: ["old"] }] },
+      )
+      expect(plan.errors).toEqual([
+        'Node "new" depends on "old" which is not present after merge (the dep was cancelled, superseded, or never existed)',
+      ])
+    })
+
+    it(`excludes an omitted ${status} node from a valid replacement graph`, () => {
+      const plan = planReplan(
+        { nodes: [{ id: "old", status, depends_on: [] }] },
+        { nodes: [{ id: "new", depends_on: [] }] },
+      )
+      expect(plan.errors).toEqual([])
+      expect(plan.cancel).toEqual(["old"])
+      expect(plan.add).toEqual(["new"])
+      expect(plan.mergedGraph.getAllNodes()).toEqual(["new"])
+    })
+
+    it(`preserves a ${status} node and its dependency when included in the fragment`, () => {
+      const plan = planReplan(
+        { nodes: [{ id: "old", status, depends_on: [] }] },
+        { nodes: [{ id: "old", depends_on: [] }, { id: "new", depends_on: ["old"] }] },
+      )
+      expect(plan.errors).toEqual([])
+      expect(plan.cancel).toEqual([])
+      expect(plan.replace).toEqual(["old"])
+      expect(plan.mergedGraph.getDependencies("new")).toEqual(["old"])
+    })
+  }
+
   it("rejects restart + cancel on the same node", () => {
     const plan = planReplan(
       { nodes: [{ id: "n1", status: NodeStatus.RUNNING, depends_on: [] }] },

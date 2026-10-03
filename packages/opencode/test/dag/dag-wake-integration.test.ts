@@ -145,6 +145,7 @@ function wakeLayer(input: {
   const childTitles = new Map<string, string>()
   const created: string[] = []
   const session = Layer.mock(Session.Service, {
+    getPart: () => Effect.succeed(undefined),
     get: () => Effect.succeed({
       id: SessionID.make("ses_parent"),
       slug: "parent",
@@ -282,6 +283,7 @@ describe("DagLoop atomic wake integration", () => {
         const childTitles = new Map<string, string>()
         const created: string[] = []
         const session = Layer.mock(Session.Service, {
+    getPart: () => Effect.succeed(undefined),
           get: () =>
             Effect.succeed({
               id: SessionID.make("ses_parent"),
@@ -480,7 +482,9 @@ describe("DagLoop atomic wake integration", () => {
     )
   })
 
-  integration.live("acknowledges one paused reminder and rearms only on the next pause episode", () =>
+  // Hold time fixed so pause → resume → pause shares a timestamp. Each pause
+  // episode must still project and rearm its reminder.
+  integration.effect("acknowledges one paused reminder and rearms only on the next pause episode", () =>
     runWakeTest(({ dag, store, childPrompts }) => Effect.gen(function* () {
       const dagID = yield* dag.create({
         projectID: "project-1", sessionID: "ses_parent", title: "Pause reminder",
@@ -494,8 +498,13 @@ describe("DagLoop atomic wake integration", () => {
       yield* store.markWakeBatchReported({ nodes: [], workflows: [firstPause!] })
       expect((yield* store.getWorkflow(dagID))?.wakeReported).toBe(true)
       yield* dag.resume(dagID)
+      expect((yield* store.getWorkflow(dagID))?.status).toBe("running")
       yield* dag.pause(dagID)
       expect((yield* store.getWorkflow(dagID))?.wakeReported).toBe(false)
+      const secondPause = yield* store.getWorkflow(dagID)
+      expect(secondPause?.status).toBe("paused")
+      expect(secondPause?.seq).toBeGreaterThan(firstPause!.seq)
+      expect(secondPause?.timeUpdated).toBe(firstPause?.timeUpdated)
       yield* dag.cancel(dagID)
     })),
   )
@@ -1477,6 +1486,7 @@ describe("DagLoop atomic wake integration", () => {
         const childTitles = new Map<string, string>()
         const created: string[] = []
         const session = Layer.mock(Session.Service, {
+    getPart: () => Effect.succeed(undefined),
           get: () =>
             Effect.succeed({
               id: SessionID.make("ses_parent"),

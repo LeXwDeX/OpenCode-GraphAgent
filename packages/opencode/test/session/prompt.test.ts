@@ -3,11 +3,11 @@ import { createHash } from "node:crypto"
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Database } from "@opencode-ai/core/database/database"
-import { eq } from "drizzle-orm"
+import { eq, sql } from "drizzle-orm"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { FetchHttpClient } from "effect/unstable/http"
 import { expect } from "bun:test"
-import { Cause, Deferred, Duration, Effect, Exit, Fiber, Layer, Option, Stream } from "effect"
+import { Cause, Deferred, Duration, Effect, Exit, Fiber, Layer, Option, Schema, Stream } from "effect"
 import path from "path"
 import { fileURLToPath } from "url"
 import { NamedError } from "@opencode-ai/core/util/error"
@@ -48,6 +48,9 @@ import { Shell } from "@opencode-ai/core/shell"
 import { Snapshot } from "../../src/snapshot"
 import { ToolRegistry } from "@/tool/registry"
 import { Dag } from "@/dag/dag"
+import { DagMessages } from "@opencode-ai/core/dag/messages"
+import { DagAgentMessages } from "@/dag/agent-messages"
+import { InstanceState } from "@/effect/instance-state"
 import { Goal } from "@/goal/goal"
 import { GoalLoop, GoalLoopJudgeLLM } from "@/goal/loop"
 import { Truncate } from "@/tool/truncate"
@@ -186,6 +189,7 @@ let stopBlockNext = 0
 //   stopAdditionalContexts— returned on every Stop (additionalContext test)
 //   subagentStopBlockAlways— every SubagentStop blocks (SubagentStop hard-limit test)
 let stopBlockAlways = false
+let stopPreventContinuation = false
 let stopSystemMessages: string[] = []
 let stopAdditionalContexts: string[] = []
 let subagentStopBlockAlways = false
@@ -222,6 +226,7 @@ const hookRecorderLayer = Layer.succeed(
         const additionalContexts = payload.event === "Stop" ? stopAdditionalContexts : []
         return {
           blocked,
+          preventContinuation: payload.event === "Stop" && stopPreventContinuation,
           permissionDecision: undefined,
           permissionDecisionReason: undefined,
           additionalContexts,
@@ -336,12 +341,14 @@ function makePrompt(input?: PromptLayerOptions) {
     BackgroundJob.defaultLayer,
     status,
     Database.defaultLayer,
+    DagMessages.defaultLayer,
     EventV2Bridge.defaultLayer,
     ToolSourceLedger.defaultLayer,
   ).pipe(Layer.provideMerge(infra))
   const question = Question.layer.pipe(Layer.provideMerge(deps))
   const todo = Todo.layer.pipe(Layer.provideMerge(deps))
   const registry = ToolRegistry.layer.pipe(
+    Layer.provide(DagAgentMessages.defaultLayer),
     Layer.provide(Skill.defaultLayer),
     Layer.provide(Dag.defaultLayer),
     Layer.provide(FetchHttpClient.layer),
@@ -611,6 +618,867 @@ const useServerConfig = Effect.fn("test.useServerConfig")(function* (config: (ur
   yield* writeConfig(dir, config(llm.url))
   return { dir, llm }
 })
+
+const seedAgentConversation = Effect.fn("test.seedAgentConversation")(function* () {
+  const sessions = yield* Session.Service
+  const instance = yield* InstanceState.context
+  const { db } = yield* Database.Service
+  const parent = yield* sessions.create({ title: "DAG parent" })
+  const child = yield* sessions.create({ parentID: parent.id, title: "DAG child" })
+  const workflowID = `dag-${parent.id}`
+  yield* db.run(sql`INSERT INTO workflow (id,project_id,session_id,directory,title,status,config,seq,time_created,time_updated)
+    VALUES (${workflowID},${instance.project.id},${parent.id},${instance.directory},'Messaging','running','{}',1,1,1)`)
+  yield* db.run(sql`INSERT INTO workflow_node (id,workflow_id,name,worker_type,status,depends_on,child_session_id,seq,time_created,time_updated)
+    VALUES ('worker',${workflowID},'Worker','task','running','[]',${child.id},1,1,1)`)
+  const identity = { projectID: instance.project.id, directory: instance.directory }
+  return {
+    parent,
+    child,
+    workflowID,
+    parentCaller: { ...identity, sessionID: parent.id },
+    childCaller: { ...identity, sessionID: child.id },
+  }
+})
+
+const answerPreparedAgentQuestion = Effect.fn("test.answerPreparedAgentQuestion")(function* (input: {
+  prepared: SessionPrompt.IdleAdmission
+  parentID: SessionID
+  parentCaller: DagMessages.Caller
+  question: string
+  childPrompt: ReturnType<SessionPrompt.Interface["prompt"]>
+  questionTimeout?: Duration.Input
+  beforeActivate?: Effect.Effect<unknown, Error>
+}) {
+  const mailbox = yield* DagMessages.Service
+  const status = yield* SessionStatus.Service
+  yield* Effect.addFinalizer(() => input.prepared.abort)
+  const child = yield* input.childPrompt.pipe(Effect.forkScoped)
+  const accepted = yield* pollWithTimeout(
+    mailbox
+      .receive(input.parentCaller)
+      .pipe(
+        Effect.map((received) =>
+          received.ok ? received.value.find((message) => message.content === input.question) : undefined,
+        ),
+      ),
+    "node question was never durably accepted",
+    input.questionTimeout,
+  )
+  expect(accepted.state).toBe("queued")
+  expect(yield* status.get(input.parentID)).toMatchObject({ type: "busy" })
+  if (input.beforeActivate) yield* input.beforeActivate
+  yield* input.prepared.activate
+  yield* input.prepared.result
+  const result = yield* Fiber.join(child)
+  expect(result.info.role).toBe("assistant")
+  if (result.info.role === "assistant") expect(result.info.error).toBeUndefined()
+  return accepted
+})
+
+it.instance("DAG prepared parent answers while its node is waiting without acknowledging a mailbox read", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const mailbox = yield* DagMessages.Service
+    const { parent, child, childCaller, parentCaller, workflowID } = yield* seedAgentConversation()
+    const question = "DAG_WAITING_NODE_QUESTION"
+    const answer = "DAG_PREPARED_PARENT_ANSWER"
+    const fromChild = (hit: { body: unknown }) => JSON.stringify(hit.body).includes("DAG_WAITING_CHILD")
+    const fromParent = (hit: { body: unknown }) => JSON.stringify(hit.body).includes("DAG_PREPARED_MAIN")
+    yield* llm.toolMatch(fromChild, "agent", {
+      params: {
+        action: "send",
+        workflow_id: workflowID,
+        recipient: "parent",
+        idempotency_key: "waiting-question",
+        content: question,
+      },
+    })
+    yield* llm.toolMatch(fromChild, "agent", {
+      params: { action: "receive", workflow_id: workflowID, wait_ms: 30_000 },
+    })
+    yield* llm.textMatch(fromChild, "Node received its answer")
+    yield* llm.toolMatch(fromParent, "agent", {
+      params: {
+        action: "send",
+        workflow_id: workflowID,
+        recipient: "node",
+        node_id: "worker",
+        attempt_id: DagMessages.nodeAttemptID(child.id, 0),
+        idempotency_key: "waiting-answer",
+        content: answer,
+      },
+    })
+    yield* llm.textMatch(fromParent, "Main answered")
+    const prepared = yield* prompt.prepareIfIdle({
+      sessionID: parent.id,
+      model: ref,
+      parts: [{ type: "text", text: "DAG_PREPARED_MAIN" }],
+    })
+    if (Option.isNone(prepared)) throw new Error("Synthetic main admission was unexpectedly busy")
+    const accepted = yield* answerPreparedAgentQuestion({
+      prepared: prepared.value,
+      parentID: parent.id,
+      parentCaller,
+      question,
+      childPrompt: prompt.prompt({
+        sessionID: child.id,
+        model: ref,
+        parts: [{ type: "text", text: "DAG_WAITING_CHILD" }],
+      }),
+      beforeActivate: pollWithTimeout(
+        sessions
+          .messages({ sessionID: child.id })
+          .pipe(
+            Effect.map((history) =>
+              history
+                .flatMap((message) => message.parts)
+                .some(
+                  (part) =>
+                    part.type === "tool" &&
+                    part.tool === "agent" &&
+                    part.state.status === "running" &&
+                    part.state.input.params &&
+                    record(part.state.input.params) &&
+                    part.state.input.params.action === "receive",
+                )
+                ? true
+                : undefined,
+            ),
+          ),
+        "node did not wait for the main answer",
+      ),
+    })
+    expect(accepted).toMatchObject({ sender: { sessionID: child.id }, recipient: { sessionID: parent.id } })
+    expect(yield* mailbox.receive(parentCaller)).toMatchObject({ value: [{ id: accepted.id, state: "delivered" }] })
+    expect(yield* mailbox.receive(childCaller)).toMatchObject({
+      value: [
+        { content: answer, state: "delivered", sender: { sessionID: parent.id }, recipient: { sessionID: child.id } },
+      ],
+    })
+    const inputs = (yield* llm.hits).filter(
+      (hit) => !JSON.stringify(hit.body).includes("Generate a title for this conversation"),
+    )
+    expect(inputs.filter(fromChild)).toHaveLength(3)
+    expect(inputs.filter(fromParent)).toHaveLength(2)
+    expect(JSON.stringify(inputs.filter(fromChild).at(-1)?.body)).toContain(answer)
+  }),
+)
+
+it.instance("DAG messages enter an actual model input once and receive does not acknowledge them", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const mailbox = yield* DagMessages.Service
+    const { parent, childCaller, parentCaller, workflowID } = yield* seedAgentConversation()
+    yield* prompt.prompt({
+      sessionID: parent.id,
+      model: ref,
+      noReply: true,
+      parts: [{ type: "text", text: "DAG initial context" }],
+    })
+    const accepted = yield* mailbox.send(childCaller, {
+      workflowID,
+      idempotencyKey: "report",
+      content: "DAG_CHILD_REPORT",
+    })
+    expect(accepted.ok).toBe(true)
+    if (!accepted.ok) throw new Error(accepted.reason)
+    const before = yield* mailbox.receive(parentCaller)
+    expect(before).toMatchObject({ value: [{ state: "queued" }] })
+    yield* llm.text("report acknowledged")
+    yield* prompt.loop({ sessionID: parent.id })
+    const requests = (yield* llm.hits).filter(
+      (hit) => !JSON.stringify(hit.body).includes("Generate a title for this conversation"),
+    )
+    expect(requests).toHaveLength(1)
+    expect(JSON.stringify(requests[0].body)).toContain("dag_agent_message")
+    expect(JSON.stringify(requests[0].body)).toContain("DAG_CHILD_REPORT")
+    expect(yield* mailbox.receive(parentCaller)).toMatchObject({ value: [{ state: "delivered" }] })
+    yield* prompt.loop({ sessionID: parent.id })
+    const history = yield* sessions.messages({ sessionID: parent.id })
+    expect(
+      history.flatMap((message) => message.parts).filter((part) => part.id === accepted.value.partID),
+    ).toHaveLength(1)
+    expect(
+      (yield* llm.hits).filter((hit) => !JSON.stringify(hit.body).includes("Generate a title for this conversation")),
+    ).toHaveLength(1)
+  }),
+)
+
+it.instance("DAG late input continues the same child after a clean result without repeating prior input", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const mailbox = yield* DagMessages.Service
+    const { child, parentCaller, childCaller, workflowID } = yield* seedAgentConversation()
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    yield* llm.hold("old result", gate)
+    yield* llm.text("new result includes update")
+    const running = yield* prompt
+      .prompt({ sessionID: child.id, model: ref, parts: [{ type: "text", text: "DAG child initial context" }] })
+      .pipe(Effect.forkChild)
+    yield* pollWithTimeout(
+      llm.hits.pipe(
+        Effect.map((hits) =>
+          hits.some((hit) => !JSON.stringify(hit.body).includes("Generate a title for this conversation"))
+            ? true
+            : undefined,
+        ),
+      ),
+      "child model never started",
+    )
+    const request = {
+      workflowID,
+      nodeID: "worker",
+      attemptID: DagMessages.nodeAttemptID(child.id, 0),
+      idempotencyKey: "late-update",
+      content: "DAG_LATE_UPDATE",
+    }
+    const accepted = yield* mailbox.send(parentCaller, request)
+    expect(accepted.ok).toBe(true)
+    expect(yield* mailbox.send(parentCaller, request)).toEqual(accepted)
+    release()
+    yield* Fiber.join(running)
+    const hits = (yield* llm.hits).filter(
+      (hit) => !JSON.stringify(hit.body).includes("Generate a title for this conversation"),
+    )
+    expect(hits).toHaveLength(2)
+    expect(JSON.stringify(hits[0].body)).not.toContain("DAG_LATE_UPDATE")
+    expect(JSON.stringify(hits[1].body)).toContain("DAG_LATE_UPDATE")
+    expect(yield* mailbox.revisions(childCaller)).toMatchObject({
+      value: { accepted: 1, snapshot: 1, queued: 0, delivered: 1 },
+    })
+  }),
+)
+
+const boundedMessageIt = testEffect(
+  makeHttp({
+    agentLayer: Layer.mock(AgentSvc.Service, {
+      get: () => Effect.succeed({ ...fencedAgent, steps: 1 }),
+      defaultAgent: () => Effect.succeed("build"),
+      defaultInfo: () => Effect.succeed({ ...fencedAgent, steps: 1 }),
+      list: () => Effect.succeed([{ ...fencedAgent, steps: 1 }]),
+    }),
+  }),
+)
+boundedMessageIt.instance("DAG late input cannot bypass the model step budget", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const mailbox = yield* DagMessages.Service
+    const { child, parentCaller, childCaller, workflowID } = yield* seedAgentConversation()
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    yield* llm.hold("budget boundary", gate)
+    const running = yield* prompt
+      .prompt({ sessionID: child.id, model: ref, parts: [{ type: "text", text: "DAG bounded child" }] })
+      .pipe(Effect.forkChild)
+    yield* pollWithTimeout(
+      llm.hits.pipe(
+        Effect.map((hits) =>
+          hits.some((hit) => !JSON.stringify(hit.body).includes("Generate a title for this conversation"))
+            ? true
+            : undefined,
+        ),
+      ),
+      "bounded model never started",
+    )
+    expect(
+      yield* mailbox.send(parentCaller, {
+        workflowID,
+        nodeID: "worker",
+        attemptID: DagMessages.nodeAttemptID(child.id, 0),
+        idempotencyKey: "budget-update",
+        content: "DAG_BUDGET_UPDATE",
+      }),
+    ).toMatchObject({ ok: true })
+    release()
+    yield* Fiber.join(running)
+    expect(
+      (yield* llm.hits).filter((hit) => !JSON.stringify(hit.body).includes("Generate a title for this conversation")),
+    ).toHaveLength(1)
+    expect(yield* mailbox.receive(childCaller)).toMatchObject({
+      value: [{ state: "undeliverable", reason: "budget_exhausted" }],
+    })
+  }),
+)
+
+boundedMessageIt.instance("a Stop hook cannot extend an exhausted model step budget", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const sessions = yield* Session.Service
+    const prompt = yield* SessionPrompt.Service
+    const session = yield* sessions.create({ title: "Bounded stop hook" })
+    stopBlockNext = 1
+    yield* llm.text("final result")
+    yield* prompt.prompt({ sessionID: session.id, model: ref, parts: [{ type: "text", text: "Answer once" }] })
+    expect(
+      (yield* llm.hits).filter((hit) => !JSON.stringify(hit.body).includes("Generate a title for this conversation")),
+    ).toHaveLength(1)
+  }).pipe(
+    Effect.ensuring(
+      Effect.sync(() => {
+        stopBlockNext = 0
+      }),
+    ),
+  ),
+)
+
+it.instance("DAG late input respects a Stop hook preventing continuation", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const mailbox = yield* DagMessages.Service
+    const { child, parentCaller, childCaller, workflowID } = yield* seedAgentConversation()
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    stopPreventContinuation = true
+    yield* llm.hold("result before stop hook", gate)
+    const running = yield* prompt
+      .prompt({ sessionID: child.id, model: ref, parts: [{ type: "text", text: "DAG hook controlled child" }] })
+      .pipe(Effect.forkChild)
+    yield* pollWithTimeout(
+      llm.hits.pipe(
+        Effect.map((hits) =>
+          hits.some((hit) => !JSON.stringify(hit.body).includes("Generate a title for this conversation"))
+            ? true
+            : undefined,
+        ),
+      ),
+      "hook controlled model never started",
+    )
+    expect(
+      yield* mailbox.send(parentCaller, {
+        workflowID,
+        nodeID: "worker",
+        attemptID: DagMessages.nodeAttemptID(child.id, 0),
+        idempotencyKey: "hook-update",
+        content: "DAG_HOOK_BLOCKED_UPDATE",
+      }),
+    ).toMatchObject({ ok: true })
+    release()
+    yield* Fiber.join(running)
+    expect(
+      (yield* llm.hits).filter((hit) => !JSON.stringify(hit.body).includes("Generate a title for this conversation")),
+    ).toHaveLength(1)
+    expect(yield* mailbox.receive(childCaller)).toMatchObject({
+      value: [{ state: "undeliverable", reason: "hook_blocked" }],
+    })
+  }).pipe(
+    Effect.ensuring(
+      Effect.sync(() => {
+        stopPreventContinuation = false
+      }),
+    ),
+  ),
+)
+
+const dagStructuredFormat = Schema.decodeUnknownSync(SessionV1.OutputFormatJsonSchema)({
+  type: "json_schema",
+  schema: {
+    type: "object",
+    properties: { value: { type: "string" } },
+    required: ["value"],
+    additionalProperties: false,
+  },
+})
+
+for (const semanticError of ["content-filter", "missing-structured-output"] as const) {
+  for (const [suffix, register] of [
+    ["", it.instance],
+    [" at the final model step", boundedMessageIt.instance],
+  ] as const) {
+    register(`DAG late input becomes undeliverable after ${semanticError}${suffix}`, () =>
+      Effect.gen(function* () {
+        const { llm } = yield* useServerConfig(providerCfg)
+        const prompt = yield* SessionPrompt.Service
+        const mailbox = yield* DagMessages.Service
+        const { parent, childCaller, parentCaller, workflowID } = yield* seedAgentConversation()
+        let release!: () => void
+        const gate = new Promise<void>((resolve) => {
+          release = resolve
+        })
+        const response = reply().wait(gate).text("semantic failure response")
+        yield* llm.push(semanticError === "content-filter" ? response.contentFilter() : response.stop())
+        const running = yield* prompt
+          .prompt({
+            sessionID: parent.id,
+            model: ref,
+            format: semanticError === "missing-structured-output" ? dagStructuredFormat : undefined,
+            parts: [{ type: "text", text: "DAG semantic error boundary" }],
+          })
+          .pipe(Effect.forkChild)
+        yield* pollWithTimeout(
+          llm.hits.pipe(
+            Effect.map((hits) =>
+              hits.some((hit) => !JSON.stringify(hit.body).includes("Generate a title for this conversation"))
+                ? true
+                : undefined,
+            ),
+          ),
+          "semantic failure model never started",
+        ).pipe(Effect.race(Fiber.join(running).pipe(Effect.andThen(Effect.die("Model completed before release")))))
+        expect(
+          yield* mailbox.send(childCaller, {
+            workflowID,
+            idempotencyKey: "semantic-late",
+            content: "DAG_LATE_AFTER_SEMANTIC_FAILURE",
+          }),
+        ).toMatchObject({ ok: true })
+        release()
+        const result = yield* Fiber.join(running)
+        expect(result.info.role).toBe("assistant")
+        if (result.info.role !== "assistant") throw new Error("Expected assistant")
+        expect(result.info.error?.name).toBe(
+          semanticError === "content-filter" ? "ContentFilterError" : "StructuredOutputError",
+        )
+        expect(yield* mailbox.receive(parentCaller)).toMatchObject({
+          value: [{ state: "undeliverable", reason: "model_error" }],
+        })
+        const revision = yield* mailbox.revisions(parentCaller)
+        if (!revision.ok || !revision.value.snapshotID) throw new Error("Expected durable model snapshot")
+        expect(yield* mailbox.snapshotByID(parentCaller, revision.value.snapshotID)).toMatchObject({
+          value: { stopReason: "model_error" },
+        })
+        expect(
+          (yield* llm.hits).filter(
+            (hit) => !JSON.stringify(hit.body).includes("Generate a title for this conversation"),
+          ),
+        ).toHaveLength(1)
+      }),
+    )
+  }
+}
+
+it.instance("DAG continuation must produce fresh structured output instead of borrowing the prior model step", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const mailbox = yield* DagMessages.Service
+    const { parent, childCaller, parentCaller, workflowID } = yield* seedAgentConversation()
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    yield* llm.push(reply().wait(gate).tool("StructuredOutput", { value: "OLD_STRUCTURED_RESULT" }))
+    yield* llm.text("Plain response did not satisfy the new structured request")
+    const running = yield* prompt
+      .prompt({
+        sessionID: parent.id,
+        model: ref,
+        format: dagStructuredFormat,
+        parts: [{ type: "text", text: "DAG structured continuation" }],
+      })
+      .pipe(Effect.forkChild)
+    yield* pollWithTimeout(
+      llm.hits.pipe(
+        Effect.map((hits) =>
+          hits.some((hit) => !JSON.stringify(hit.body).includes("Generate a title for this conversation"))
+            ? true
+            : undefined,
+        ),
+      ),
+      "structured model never started",
+    ).pipe(Effect.race(Fiber.join(running).pipe(Effect.andThen(Effect.die("Model completed before release")))))
+    expect(
+      yield* mailbox.send(childCaller, {
+        workflowID,
+        idempotencyKey: "structured-late",
+        content: "DAG_STRUCTURED_LATE_INPUT",
+      }),
+    ).toMatchObject({ ok: true })
+    release()
+    const result = yield* Fiber.join(running)
+    if (result.info.role !== "assistant") throw new Error("Expected assistant")
+    expect(result.info.error?.name).toBe("StructuredOutputError")
+    expect(result.info.structured).toBeUndefined()
+    const history = yield* sessions.messages({ sessionID: parent.id })
+    expect(
+      history.filter((message) => message.info.role === "assistant" && message.info.structured !== undefined),
+    ).toHaveLength(1)
+    const requests = (yield* llm.hits).filter(
+      (hit) => !JSON.stringify(hit.body).includes("Generate a title for this conversation"),
+    )
+    expect(requests).toHaveLength(2)
+    expect(JSON.stringify(requests[1].body)).toContain("DAG_STRUCTURED_LATE_INPUT")
+    expect(yield* mailbox.receive(parentCaller)).toMatchObject({
+      value: [{ state: "delivered" }],
+    })
+  }),
+)
+
+it.instance("DAG structured output cannot turn a content-filter finish into a successful model outcome", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const mailbox = yield* DagMessages.Service
+    const { parent, childCaller, parentCaller, workflowID } = yield* seedAgentConversation()
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    yield* llm.push(reply().wait(gate).tool("StructuredOutput", { value: "FILTERED_RESULT" }).contentFilter())
+    const running = yield* prompt
+      .prompt({
+        sessionID: parent.id,
+        model: ref,
+        format: dagStructuredFormat,
+        parts: [{ type: "text", text: "DAG filtered structured response" }],
+      })
+      .pipe(Effect.forkChild)
+    yield* pollWithTimeout(
+      llm.hits.pipe(
+        Effect.map((hits) =>
+          hits.some((hit) => !JSON.stringify(hit.body).includes("Generate a title for this conversation"))
+            ? true
+            : undefined,
+        ),
+      ),
+      "filtered structured model never started",
+    ).pipe(Effect.race(Fiber.join(running).pipe(Effect.andThen(Effect.die("Model completed before release")))))
+    expect(
+      yield* mailbox.send(childCaller, {
+        workflowID,
+        idempotencyKey: "filtered-structured-late",
+        content: "DAG_LATE_AFTER_FILTERED_STRUCTURED_OUTPUT",
+      }),
+    ).toMatchObject({ ok: true })
+    release()
+    const result = yield* Fiber.join(running)
+    if (result.info.role !== "assistant") throw new Error("Expected assistant")
+    expect(result.info.error?.name).toBe("ContentFilterError")
+    expect(yield* mailbox.receive(parentCaller)).toMatchObject({
+      value: [{ state: "undeliverable", reason: "model_error" }],
+    })
+    const snapshot = yield* mailbox.snapshotForTurn(parentCaller, result.info.id)
+    expect(snapshot).toMatchObject({ value: { associated: true, stopReason: "model_error" } })
+    expect(
+      (yield* llm.hits).filter((hit) => !JSON.stringify(hit.body).includes("Generate a title for this conversation")),
+    ).toHaveLength(1)
+  }),
+)
+
+it.instance("DAG request preparation failure finalizes the assistant and retains unassociated input", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const mailbox = yield* DagMessages.Service
+    const plugins = yield* Plugin.Service
+    const { parent, childCaller, parentCaller, workflowID } = yield* seedAgentConversation()
+    expect(
+      yield* mailbox.send(childCaller, {
+        workflowID,
+        idempotencyKey: "preparation-input",
+        content: "DAG_INPUT_BEFORE_PREPARATION_FAILURE",
+      }),
+    ).toMatchObject({ ok: true })
+    let preparations = 0
+    const hooks = yield* plugins.list()
+    hooks.push({
+      "experimental.chat.messages.transform": async () => {
+        preparations++
+        throw new Error("Injected outbound preparation failure")
+      },
+    })
+    yield* prompt
+      .prompt({
+        sessionID: parent.id,
+        model: ref,
+        parts: [{ type: "text", text: "Prepare DAG model input" }],
+      })
+      .pipe(Effect.exit)
+    const history = yield* sessions.messages({ sessionID: parent.id })
+    const assistant = history.findLast((message) => message.info.role === "assistant")?.info
+    if (!assistant || assistant.role !== "assistant") throw new Error("Expected persisted failed assistant")
+    expect(assistant.error).toBeDefined()
+    expect(assistant.time.completed).toBeDefined()
+    expect(yield* mailbox.snapshotForTurn(parentCaller, assistant.id)).toMatchObject({
+      value: { associated: false, logicalTurnID: assistant.id, stopReason: "preparation_failed" },
+    })
+    expect(yield* mailbox.receive(parentCaller)).toMatchObject({ value: [{ state: "queued" }] })
+    expect(yield* (yield* SessionStatus.Service).get(parent.id)).toMatchObject({ type: "idle" })
+    expect(preparations).toBe(1)
+    expect(
+      (yield* llm.hits).filter((hit) => !JSON.stringify(hit.body).includes("Generate a title for this conversation")),
+    ).toHaveLength(0)
+  }),
+)
+
+it.instance("DAG early model resolution failure durably stops preparation without consuming queued input", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const mailbox = yield* DagMessages.Service
+    const { parent, childCaller, parentCaller, workflowID } = yield* seedAgentConversation()
+    expect(
+      yield* mailbox.send(childCaller, {
+        workflowID,
+        idempotencyKey: "early-preparation-input",
+        content: "DAG_INPUT_BEFORE_MODEL_RESOLUTION_FAILURE",
+      }),
+    ).toMatchObject({ ok: true })
+    const failed = yield* prompt
+      .prompt({
+        sessionID: parent.id,
+        model: { ...ref, modelID: ModelV2.ID.make("missing-dag-model-697") },
+        parts: [{ type: "text", text: "Prepare DAG input with an unavailable model" }],
+      })
+      .pipe(Effect.exit)
+    expect(Exit.isFailure(failed)).toBe(true)
+    expect(yield* mailbox.receive(parentCaller)).toMatchObject({ value: [{ state: "queued" }] })
+    expect(yield* (yield* SessionStatus.Service).get(parent.id)).toMatchObject({ type: "idle" })
+    expect(
+      (yield* llm.hits).filter((hit) => !JSON.stringify(hit.body).includes("Generate a title for this conversation")),
+    ).toHaveLength(0)
+    const history = yield* sessions.messages({ sessionID: parent.id })
+    const assistant = history.findLast((message) => message.info.role === "assistant")?.info
+    expect(assistant?.role).toBe("assistant")
+    if (!assistant || assistant.role !== "assistant") throw new Error("Expected durable early preparation failure")
+    expect(assistant.error).toBeDefined()
+    expect(assistant.time.completed).toBeDefined()
+    expect(history.filter((message) => message.info.role === "assistant")).toHaveLength(1)
+    expect(yield* mailbox.snapshotForTurn(parentCaller, assistant.id)).toMatchObject({
+      value: { associated: false, logicalTurnID: assistant.id, stopReason: "preparation_failed" },
+    })
+  }),
+)
+
+it.instance("idle admission rolls back its transcript and reporting mark together before model activation", () =>
+  Effect.gen(function* () {
+    yield* useServerConfig(providerCfg)
+    const sessions = yield* Session.Service
+    const prompt = yield* SessionPrompt.Service
+    const status = yield* SessionStatus.Service
+    const session = yield* sessions.create({ title: "Atomic wake admission" })
+    const messageID = MessageID.ascending()
+    const attempt = yield* prompt
+      .prepareIfIdle(
+        {
+          sessionID: session.id,
+          messageID,
+          model: ref,
+          parts: [{ type: "text", text: "Atomic wake receipt", synthetic: true }],
+        },
+        Effect.die(new Error("Injected reporting write failure")),
+      )
+      .pipe(Effect.exit)
+    expect(Exit.isFailure(attempt)).toBe(true)
+    expect((yield* sessions.messages({ sessionID: session.id })).some((message) => message.info.id === messageID)).toBe(
+      false,
+    )
+    yield* pollWithTimeout(
+      status.get(session.id).pipe(Effect.map((state) => (state.type === "idle" ? true : undefined))),
+      "failed admission retained its runner",
+    )
+    const next = yield* prompt.prepareIfIdle({
+      sessionID: session.id,
+      model: ref,
+      parts: [{ type: "text", text: "Replacement admission" }],
+    })
+    expect(Option.isSome(next)).toBe(true)
+    if (Option.isSome(next)) yield* next.value.abort
+    expect(yield* (yield* TestLLMServer).hits).toHaveLength(0)
+  }),
+)
+
+// Explicit opt-in acceptance against existing configured providers, always in a synthetic instance.
+const liveAgentIt = testEffect(
+  makeHttpNoLLMServer({
+    agentLayer: Layer.mock(AgentSvc.Service, {
+      get: () =>
+        Effect.succeed({
+          ...fencedAgent,
+          steps: 4,
+          permission: [
+            { permission: "*", pattern: "*", action: "deny" },
+            { permission: "agent", pattern: "*", action: "allow" },
+          ],
+        }),
+      defaultAgent: () => Effect.succeed("build"),
+      defaultInfo: () => Effect.succeed(fencedAgent),
+      list: () => Effect.succeed([fencedAgent]),
+    }),
+  }),
+)
+for (const modelID of ["qwen-max", "glm", "deepseek"]) {
+  const runLive = process.env.OPENCODE_DAG_LIVE_CONFIG ? liveAgentIt.instance : liveAgentIt.instance.skip
+  runLive(`DAG configured ${modelID} accepts the agent tool and sends to the observed attempt`, () =>
+    Effect.gen(function* () {
+      const configPath = process.env.OPENCODE_DAG_LIVE_CONFIG!
+      const configured = yield* Effect.promise(() => Bun.file(configPath).json()).pipe(
+        Effect.flatMap(Schema.decodeUnknownEffect(ConfigV1.Info)),
+      )
+      const entry = Object.entries(configured.provider ?? {}).find(([, provider]) => provider.models?.[modelID])
+      if (!entry) throw new Error(`No configured provider for ${modelID}`)
+      const [providerID, provider] = entry
+      const { directory } = yield* TestInstance
+      yield* writeConfig(directory, {
+        provider: { [providerID]: provider },
+        compaction: { auto: false },
+        reasoningDistillation: { enabled: false },
+      })
+      const prompt = yield* SessionPrompt.Service
+      const mailbox = yield* DagMessages.Service
+      const { parent, child, childCaller, parentCaller, workflowID } = yield* seedAgentConversation()
+      const content = `live-${modelID}-message`
+      const result = yield* prompt.prompt({
+        sessionID: parent.id,
+        model: { providerID: ProviderV2.ID.make(providerID), modelID: ModelV2.ID.make(modelID) },
+        parts: [
+          {
+            type: "text",
+            text: `This is an isolated DAG messaging acceptance test. Use only the agent tool. First observe workflow_id ${JSON.stringify(workflowID)}, node_id "worker". Then send the same node a message using its observed attempt_id (expected ${JSON.stringify(DagMessages.nodeAttemptID(child.id, 0))}), idempotency_key "live-${modelID}", and content ${JSON.stringify(content)}. Finish with a short confirmation. This instruction authorizes only these two agent operations.`,
+          },
+        ],
+      })
+      expect(result.info.role).toBe("assistant")
+      if (result.info.role === "assistant") expect(result.info.error).toBeUndefined()
+      const received = yield* mailbox.receive(childCaller)
+      if (received.ok && !received.value.length) {
+        const transcript = yield* (yield* Session.Service).messages({ sessionID: parent.id })
+        const evidence = {
+          modelID,
+          parts: transcript
+            .flatMap((message) => message.parts)
+            .flatMap<{
+              type: string
+              text?: string
+              tool?: string
+              status?: string
+            }>((part) =>
+              part.type === "text"
+                ? [{ type: part.type, text: part.text.slice(0, 2000) }]
+                : part.type === "tool"
+                  ? [{ type: part.type, tool: part.tool, status: part.state.status }]
+                  : [],
+            ),
+        }
+        if (process.env.OPENCODE_DAG_LIVE_EVIDENCE)
+          yield* Effect.promise(() =>
+            Bun.write(process.env.OPENCODE_DAG_LIVE_EVIDENCE!, JSON.stringify(evidence, null, 2)),
+          )
+      }
+      expect(received).toMatchObject({ ok: true, value: [{ content, state: "queued" }] })
+      if (modelID === "glm") {
+        const selectedModel = { providerID: ProviderV2.ID.make(providerID), modelID: ModelV2.ID.make(modelID) }
+        const question = "LIVE_NODE_QUESTION: confirm the main update"
+        const answer = "LIVE_MAIN_REPLY: update confirmed"
+        const prepared = yield* prompt.prepareIfIdle({
+          sessionID: parent.id,
+          model: selectedModel,
+          parts: [
+            {
+              type: "text",
+              text: `Await the node's agent message, then reply with the agent tool. Use {"params":{"action":"send","workflow_id":${JSON.stringify(workflowID)},"recipient":"node","node_id":"worker","attempt_id":${JSON.stringify(DagMessages.nodeAttemptID(child.id, 0))},"idempotency_key":"live-reply-glm","content":${JSON.stringify(answer)}}}. Finish briefly.`,
+            },
+          ],
+        })
+        expect(Option.isSome(prepared)).toBe(true)
+        if (Option.isNone(prepared)) throw new Error("Synthetic main admission was unexpectedly busy")
+        const accepted = yield* answerPreparedAgentQuestion({
+          prepared: prepared.value,
+          parentID: parent.id,
+          parentCaller,
+          question,
+          questionTimeout: "60 seconds",
+          childPrompt: prompt.prompt({
+            sessionID: child.id,
+            model: selectedModel,
+            parts: [
+              {
+                type: "text",
+                text: `Use only agent. Read the main update in your context and ask its author a question before finishing: {"params":{"action":"send","workflow_id":${JSON.stringify(workflowID)},"recipient":"parent","idempotency_key":"live-question-glm","content":${JSON.stringify(question)}}}. Then finish briefly.`,
+              },
+            ],
+          }),
+        })
+        expect(accepted).toMatchObject({
+          sender: { sessionID: child.id },
+          recipient: { sessionID: parent.id },
+          workflowID,
+        })
+        expect(yield* mailbox.receive(parentCaller)).toMatchObject({ value: [{ id: accepted.id, state: "delivered" }] })
+        yield* prompt.loop({ sessionID: child.id })
+        expect(yield* mailbox.receive(childCaller)).toMatchObject({
+          value: [
+            { id: received.ok ? received.value[0]?.id : undefined, content, recipientSequence: 1, state: "delivered" },
+            {
+              content: answer,
+              recipientSequence: 2,
+              state: "delivered",
+              sender: { sessionID: parent.id },
+              recipient: { sessionID: child.id, attemptID: DagMessages.nodeAttemptID(child.id, 0) },
+            },
+          ],
+        })
+      }
+      if (modelID === "deepseek") {
+        const sessions = yield* Session.Service
+        const simple = yield* sessions.create({ title: "Simple task without orchestration" })
+        yield* prompt.prompt({
+          sessionID: simple.id,
+          model: { providerID: ProviderV2.ID.make(providerID), modelID: ModelV2.ID.make(modelID) },
+          parts: [{ type: "text", text: "What is 2 + 2? Reply briefly without calling any tools." }],
+        })
+        expect(
+          (yield* sessions.messages({ sessionID: simple.id }))
+            .flatMap((message) => message.parts)
+            .filter((part) => part.type === "tool"),
+        ).toHaveLength(0)
+        const before = yield* mailbox.latestSnapshot(parentCaller)
+        const running = yield* prompt
+          .prompt({
+            sessionID: parent.id,
+            model: { providerID: ProviderV2.ID.make(providerID), modelID: ModelV2.ID.make(modelID) },
+            parts: [
+              {
+                type: "text",
+                text: "Answer briefly without tools. If a new DAG agent update arrives, account for its context in your next answer.",
+              },
+            ],
+          })
+          .pipe(Effect.forkChild)
+        yield* pollWithTimeout(
+          mailbox
+            .latestSnapshot(parentCaller)
+            .pipe(
+              Effect.map((snapshot) =>
+                snapshot.ok && snapshot.value?.associated && (!before.ok || snapshot.value.id !== before.value?.id)
+                  ? true
+                  : undefined,
+              ),
+            ),
+          "live main model input was never associated",
+        )
+        expect(yield* (yield* SessionStatus.Service).get(parent.id)).toMatchObject({ type: "busy" })
+        expect(
+          yield* mailbox.send(childCaller, {
+            workflowID,
+            idempotencyKey: "live-late-deepseek",
+            content: "LIVE_LATE_UPDATE: the node verified its output",
+          }),
+        ).toMatchObject({ ok: true })
+        yield* Fiber.join(running)
+        expect(yield* mailbox.receive(parentCaller)).toMatchObject({
+          value: [{ content: "LIVE_LATE_UPDATE: the node verified its output", state: "delivered" }],
+        })
+      }
+    }),
+  )
+}
 
 it.instance("compacts a large new user message before sending it on the same model", () =>
   Effect.gen(function* () {

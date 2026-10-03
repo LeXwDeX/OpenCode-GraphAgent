@@ -1,6 +1,6 @@
 /** @jsxImportSource @opentui/solid */
 import { afterEach, expect, test } from "bun:test"
-import { RGBA, SyntaxStyle, type ScrollBoxRenderable } from "@opentui/core"
+import { CodeRenderable, RGBA, SyntaxStyle, type BaseRenderable, type ScrollBoxRenderable } from "@opentui/core"
 import { testRender } from "@opentui/solid"
 import { createSignal } from "solid-js"
 import { ReasoningMarkdown } from "../../../../src/routes/session"
@@ -8,6 +8,38 @@ import { ReasoningMarkdown } from "../../../../src/routes/session"
 const fg = RGBA.fromHex("#888888")
 const syntaxStyle = SyntaxStyle.fromStyles({ default: { fg } })
 let app: Awaited<ReturnType<typeof testRender>> | undefined
+
+// Markdown blocks start asynchronous Tree-sitter highlighting during rendering.
+// Wait for OpenTUI's completion promise, then render its resulting text/layout.
+async function renderReady() {
+  const current = app!
+  const deadline = performance.now() + 5_000
+  const highlighting = (node: BaseRenderable): CodeRenderable[] => [
+    ...(node instanceof CodeRenderable && node.isHighlighting ? [node] : []),
+    ...node.getChildren().flatMap(highlighting),
+  ]
+  for (;;) {
+    await current.renderOnce()
+    const pending = highlighting(current.renderer.root)
+    if (pending.length === 0) return
+    const remaining = deadline - performance.now()
+    if (remaining <= 0) throw new Error(`Markdown highlighting did not settle:\n${current.captureCharFrame()}`)
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      await Promise.race([
+        Promise.all(pending.map((node) => node.highlightingDone)),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(
+            () => reject(new Error(`Markdown highlighting did not settle:\n${current.captureCharFrame()}`)),
+            remaining,
+          )
+        }),
+      ])
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+}
 
 afterEach(() => {
   app?.renderer.destroy()
@@ -26,17 +58,11 @@ test("replaces a streamed thought with distilled markdown in the same rendered s
     ),
     { width: 56, height: 12 },
   )
-  for (let i = 0; i < 20 && !app.captureCharFrame().includes("Original reasoning"); i++) {
-    await app.renderOnce()
-    await Bun.sleep(5)
-  }
+  await renderReady()
   expect(app.captureCharFrame()).toContain("Original reasoning with `old` detail")
 
   setContent("Replacement reasoning with `new` detail")
-  for (let i = 0; i < 20 && !app.captureCharFrame().includes("Replacement reasoning"); i++) {
-    await app.renderOnce()
-    await Bun.sleep(5)
-  }
+  await renderReady()
   const frame = app.captureCharFrame()
   expect(frame).toContain("Replacement reasoning with `new` detail")
   expect(frame).toContain("Final answer")
@@ -49,9 +75,9 @@ test("shows appended text while the thought is still streaming", async () => {
     () => <ReasoningMarkdown content={content()} streaming={true} syntaxStyle={syntaxStyle} conceal={false} fg={fg} />,
     { width: 48, height: 5 },
   )
-  await app.renderOnce()
+  await renderReady()
   setContent("Initial thought\n\nNew evidence")
-  await app.renderOnce()
+  await renderReady()
   expect(app.captureCharFrame()).toContain("New evidence")
 })
 
@@ -70,17 +96,14 @@ test("one mounted thought streams, finalizes, then replaces its first and last b
     ),
     { width: 48, height: 8 },
   )
-  await app.renderOnce()
+  await renderReady()
   setContent("OLD FIRST\n\nAPPENDED MIDDLE\n\nOLD LAST")
-  await app.renderOnce()
+  await renderReady()
   expect(app.captureCharFrame()).toContain("APPENDED MIDDLE")
   setStreaming(false)
-  await app.renderOnce()
+  await renderReady()
   setContent("NEW FIRST\n\nDISTILLED MIDDLE\n\nNEW LAST")
-  for (let i = 0; i < 20 && !app.captureCharFrame().includes("NEW LAST"); i++) {
-    await app.renderOnce()
-    await Bun.sleep(5)
-  }
+  await renderReady()
   const frame = app.captureCharFrame()
   expect(frame).toContain("NEW FIRST")
   expect(frame).toContain("NEW LAST")
@@ -108,29 +131,25 @@ test("switches at exactly 4096/4097 UTF-8 bytes without leaving old content", as
     ),
     { width: 56, height: 6 },
   )
-  const frame = async (marker: string) => {
-    for (let i = 0; i < 20; i++) {
-      scroll.scrollTop = 0
-      await app!.renderOnce()
-      if (app!.captureCharFrame().includes(marker)) break
-      await Bun.sleep(5)
-    }
+  const frame = async () => {
+    scroll.scrollTop = 0
+    await renderReady()
     const top = app!.captureCharFrame()
     scroll.scrollBy(100_000)
-    await app!.renderOnce()
+    await renderReady()
     return { top, bottom: app!.captureCharFrame() }
   }
-  const first = await frame("SHORT")
+  const first = await frame()
   expect(first.top).toContain("SHORT")
   expect(first.top).not.toContain("### SHORT")
   expect(first.bottom).toContain("SHORT END")
   setContent(long)
-  const second = await frame("### LONG")
+  const second = await frame()
   expect(second.top).toContain("### LONG")
   expect(second.top).not.toContain("SHORT")
   expect(second.bottom).toContain("LONG END")
   setContent(short)
-  const third = await frame("SHORT")
+  const third = await frame()
   expect(third.top).not.toContain("### SHORT")
   expect(third.top).not.toContain("LONG")
   expect(third.bottom).toContain("SHORT END")
@@ -138,11 +157,11 @@ test("switches at exactly 4096/4097 UTF-8 bytes without leaving old content", as
   const chineseShort = body(4096, "思考")
   const chineseLong = body(4097, "替换")
   setContent(chineseShort)
-  const fourth = await frame("思考")
+  const fourth = await frame()
   expect(fourth.top).not.toContain("### 思考")
   expect(fourth.bottom).toContain("思考 END")
   setContent(chineseLong)
-  const fifth = await frame("### 替换")
+  const fifth = await frame()
   expect(fifth.top).toContain("### 替换")
   expect(fifth.top).not.toContain("思考")
   expect(fifth.bottom).toContain("替换 END")
@@ -161,15 +180,15 @@ test("shows an entire long replacement as readable plain text without stale cont
     ),
     { width: 64, height: 8 },
   )
-  await app.renderOnce()
+  await renderReady()
   expect(app.captureCharFrame()).toContain("### Step 0: original evidence")
   setContent(replacement)
-  await app.renderOnce()
+  await renderReady()
   const top = app.captureCharFrame()
   expect(top).toContain("### Task 0: distilled evidence")
   expect(top).not.toContain("original evidence")
   scroll.scrollBy(100_000)
-  await app.renderOnce()
+  await renderReady()
   expect(app.captureCharFrame()).toContain("### Task 799: distilled evidence")
 })
 
@@ -186,13 +205,13 @@ test("shortening a thought below the viewport keeps the earlier reading position
     ),
     { width: 48, height: 5 },
   )
-  await app.renderOnce()
+  await renderReady()
   scroll.scrollTop = 4
-  await app.renderOnce()
+  await renderReady()
   const before = scroll.scrollTop
   expect(app.captureCharFrame()).toContain("Earlier row 4")
   setContent("Short replacement")
-  await app.renderOnce()
+  await renderReady()
   expect(scroll.scrollTop).toBe(before)
   expect(app.captureCharFrame()).toContain("Earlier row 4")
 })
@@ -210,13 +229,13 @@ test("growing a thought while following the bottom keeps the later anchor visibl
     ),
     { width: 48, height: 5 },
   )
-  await app.renderOnce()
+  await renderReady()
   scroll.scrollBy(1000)
-  await app.renderOnce()
+  await renderReady()
   const before = scroll.scrollTop
   expect(app.captureCharFrame()).toContain("Later anchor")
   setContent(Array.from({ length: 14 }, (_, i) => `Distilled line ${i}`).join("\n\n"))
-  await app.renderOnce()
+  await renderReady()
   expect(scroll.scrollTop).toBeGreaterThan(before)
   expect(app.captureCharFrame()).toContain("Later anchor")
 })

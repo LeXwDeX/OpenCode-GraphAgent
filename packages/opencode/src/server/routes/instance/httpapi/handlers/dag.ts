@@ -17,6 +17,7 @@ import { SessionID } from "@/session/schema"
 import { InstanceState } from "@/effect/instance-state"
 import { InvalidTransitionError, TerminalViolationError } from "@opencode-ai/core/dag/core/types"
 import type { DagStore } from "@opencode-ai/core/dag/store"
+import { DagMessages } from "@opencode-ai/core/dag/messages"
 
 /** Map a DAG control op's typed transition failure into a 409 Conflict, not a 500 defect. */
 function mapTransitionConflict<Success>(effect: Effect.Effect<Success, Error>) {
@@ -42,6 +43,7 @@ function mapTransitionConflict<Success>(effect: Effect.Effect<Success, Error>) {
 export const dagHandlers = HttpApiBuilder.group(InstanceHttpApi, "dag", (handlers) =>
   Effect.gen(function* () {
     const dag = yield* Dag.Service
+    const messages = yield* DagMessages.Service
     const sessions = yield* Session.Service
     const agents = yield* Agent.Service
     const provider = yield* Provider.Service
@@ -74,13 +76,36 @@ export const dagHandlers = HttpApiBuilder.group(InstanceHttpApi, "dag", (handler
       ...(r.modelId !== null ? { model_id: r.modelId } : {}),
       ...(r.modelProviderId !== null ? { model_provider_id: r.modelProviderId } : {}),
       ...(r.childSessionId !== null ? { child_session_id: r.childSessionId } : {}),
-      ...(r.output !== null ? { output: r.output } : {}),
+      ...(r.output !== null || r.status === "completed" ? { output: r.output } : {}),
       ...(r.errorReason !== null ? { error_reason: r.errorReason } : {}),
       ...(r.errorClass !== null ? { error_class: r.errorClass } : {}),
       ...(r.deadlineMs !== null ? { deadline_ms: r.deadlineMs } : {}),
       replan_attempts: r.replanAttempts,
       ...(r.startedAt !== null ? { started_at: r.startedAt } : {}),
       ...(r.completedAt !== null ? { completed_at: r.completedAt } : {}),
+    })
+
+    const observedNode = Effect.fn("DagHttpApi.observedNode")(function* (row: DagStore.NodeRow, ownerSessionID: string) {
+      const instance = yield* InstanceState.context
+      const metadata = yield* messages.metadata({
+        projectID: instance.project.id,
+        directory: instance.directory,
+        sessionID: ownerSessionID,
+      }, row.workflowId, row.id)
+      return {
+        ...node(row),
+        ...(metadata.ok ? {
+          attempt_id: metadata.value.endpoint.attemptID,
+          accepted_input_revision: metadata.value.accepted,
+          snapshot_revision: metadata.value.snapshot,
+          agent_messages: {
+            queued: metadata.value.queued,
+            delivered: metadata.value.delivered,
+            undeliverable: metadata.value.undeliverable,
+            closed_reason: metadata.value.closedReason,
+          },
+        } : {}),
+      }
     })
 
     const workflowInProject = Effect.fn("DagHttpApi.workflowInProject")(function* (dagID: string) {
@@ -140,20 +165,20 @@ export const dagHandlers = HttpApiBuilder.group(InstanceHttpApi, "dag", (handler
     })
 
     const nodes = Effect.fn("DagHttpApi.nodes")(function* (ctx: { params: { dagID: string } }) {
-      yield* requireWorkflow(ctx.params.dagID)
+      const workflow = yield* requireWorkflow(ctx.params.dagID)
       // Rev-view (v1.0.15 Train A): the TUI node list is a view seam — it
       // renders the CURRENT graph revision only (zero TUI changes: the
       // server filters). nodeDetail below keeps the unfiltered read so a
       // superseded node's durable state stays auditable by id.
       const rows = yield* dag.store.getCurrentNodes(ctx.params.dagID).pipe(Effect.orDie)
-      return rows.map(node)
+      return yield* Effect.forEach(rows, (row) => observedNode(row, workflow.sessionId))
     })
 
     const nodeDetail = Effect.fn("DagHttpApi.nodeDetail")(function* (ctx: { params: { dagID: string; nodeID: string } }) {
-      yield* requireWorkflow(ctx.params.dagID)
+      const workflow = yield* requireWorkflow(ctx.params.dagID)
       const row = yield* dag.store.getNode(ctx.params.dagID, ctx.params.nodeID).pipe(Effect.orDie)
       if (!row) return yield* Effect.fail(notFound(`Node not found: ${ctx.params.nodeID}`))
-      return node(row)
+      return yield* observedNode(row, workflow.sessionId)
     })
 
     const start = Effect.fn("DagHttpApi.start")(function* (ctx: { payload: { session_id: string; title?: string; config: unknown } }) {

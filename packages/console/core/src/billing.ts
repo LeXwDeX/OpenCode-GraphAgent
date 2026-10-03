@@ -176,33 +176,30 @@ export namespace Billing {
   }
 
   export const redeemCoupon = async (email: string, type: (typeof CouponType)[number]) => {
-    // validate coupon type
-    await (async () => {
-      if (type === "GO1MONTH50") return
-      const coupon = await Database.use((tx) =>
-        tx
+    await Database.transaction(async (tx) => {
+      // Keep eligibility and the credit grant under the same row lock and transaction.
+      if (type !== "GO1MONTH50") {
+        const coupon = await tx
           .select()
           .from(CouponTable)
           .where(and(eq(CouponTable.email, email), eq(CouponTable.type, type)))
-          .then((rows) => rows[0]),
-      )
-      if (!coupon) throw new Error("Invalid coupon code")
-      if (coupon.timeRedeemed) throw new Error("Coupon already redeemed")
-    })()
+          .for("update")
+          .then((rows) => rows[0])
+        if (!coupon) throw new Error("Invalid coupon code")
+        if (coupon.timeRedeemed) throw new Error("Coupon already redeemed")
+      }
 
-    // handle coupon type
-    if (type === "BUILDATHON") await grantCredit(Actor.workspace(), 500)
+      if (type === "BUILDATHON") await grantCredit(Actor.workspace(), 500)
 
-    await Database.use((tx) =>
-      tx
+      await tx
         .insert(CouponTable)
         .values({ email, type, timeRedeemed: sql`now()` })
         .onDuplicateKeyUpdate({
           set: {
             timeRedeemed: sql`now()`,
           },
-        }),
-    )
+        })
+    })
   }
 
   export const setMonthlyLimit = fn(z.number(), async (input) => {
@@ -460,10 +457,27 @@ export namespace Billing {
     async (input) => {
       const { paymentID } = input
 
+      const payment = await Database.use((tx) =>
+        tx
+          .select({ id: PaymentTable.id })
+          .from(PaymentTable)
+          .where(
+            and(
+              eq(PaymentTable.workspaceID, Actor.workspace()),
+              eq(PaymentTable.paymentID, paymentID),
+              isNull(PaymentTable.timeDeleted),
+            ),
+          )
+          .limit(1)
+          .then((rows) => rows[0]),
+      )
+      if (!payment) throw new Error("Payment not found")
+
       const intent = await Billing.stripe().paymentIntents.retrieve(paymentID)
       if (!intent.latest_charge) throw new Error("No charge found")
 
-      const charge = await Billing.stripe().charges.retrieve(intent.latest_charge as string)
+      const chargeID = typeof intent.latest_charge === "string" ? intent.latest_charge : intent.latest_charge.id
+      const charge = await Billing.stripe().charges.retrieve(chargeID)
       if (!charge.receipt_url) throw new Error("No receipt URL found")
 
       return charge.receipt_url

@@ -143,6 +143,7 @@ function loopLayer(input: {
     time: { created: 0, updated: 0 },
   })
   const session = Layer.mock(Session.Service, {
+    getPart: () => Effect.succeed(undefined),
     get: (id) => Effect.succeed(sessionInfo(id, "Parent")),
     create: (value) =>
       Effect.sync(() => {

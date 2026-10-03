@@ -84,6 +84,7 @@ function checkpointLayer(probe: Probe) {
   const dag = Dag.layer.pipe(Layer.provide(bridge), Layer.provide(store))
   const base = Layer.mergeAll(database, events, bridge, store, projector, status, dag)
   const session = Layer.mock(Session.Service, {
+    getPart: () => Effect.succeed(undefined),
     get: () => Effect.succeed({ id: "ses_checkpoint_parent", permission: [], agent: "build" } as never),
     create: (input) =>
       Effect.gen(function* () {

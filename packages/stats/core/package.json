@@ -23,11 +23,12 @@
     "db:push": "drizzle-kit push --config=drizzle.config.ts",
     "db:studio": "drizzle-kit studio --config=drizzle.config.ts",
     "honeycomb:backfill": "bun src/honeycomb-backfill.ts",
-    "typecheck": "tsgo --noEmit"
+    "typecheck": "tsgo --noEmit",
+    "test": "bun test"
   },
   "dependencies": {
-    "@aws-sdk/client-athena": "3.933.0",
-    "@planetscale/database": "1.19.0",
+    "@aws-sdk/client-athena": "3.1143.0",
+    "@planetscale/database": "catalog:",
     "drizzle-orm": "catalog:",
     "effect": "catalog:",
     "sst": "catalog:"

@@ -159,6 +159,7 @@ function guardLayer(input: {
   const base = Layer.mergeAll(database, events, bridge, store, projector, dag, status)
   const childTitles = new Map<string, string>()
   const session = Layer.mock(Session.Service, {
+    getPart: () => Effect.succeed(undefined),
     get: () => Effect.succeed({ id: "ses_parent", permission: [], agent: "build" } as never),
     create: (value) =>
       Effect.sync(() => {

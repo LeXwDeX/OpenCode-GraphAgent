@@ -58,5 +58,8 @@ export const migrations = (
     import("./migration/20260815083000_workflow_directory_convergence"),
     import("./migration/20260903044702_drop_session_summary_diffs"),
     import("./migration/20260903062324_add_event_data_hash"),
+    import("./migration/20261002224523_dag_agent_messages"),
+    import("./migration/20261002233822_dag_result_nudge"),
+    import("./migration/20261003000100_dag_capture_presence"),
   ])
 ).map((module) => module.default) satisfies DatabaseMigration.Migration[]

@@ -71,6 +71,7 @@ function recoveryLayer(input: { wakes: string[] }) {
   // recovery checker reports "unknown" (ownership lost), not a fabricated
   // completion/failure read off the child.
   const session = Layer.mock(Session.Service, {
+    getPart: () => Effect.succeed(undefined),
     create: () => Effect.sync(() => ({}) as never),
     get: () => Effect.succeed({} as never),
     messages: () => Effect.succeed([]),

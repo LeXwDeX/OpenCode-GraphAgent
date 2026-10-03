@@ -2,16 +2,29 @@
   lib,
   stdenv,
   bun,
-  nodejs,
+  nodejs_24,
   darwin,
-  electron_41,
+  callPackage,
+  fetchurl,
+  graphagentElectron ? callPackage ./electron.nix { },
   makeWrapper,
   writableTmpDirAsHomeHook,
   autoPatchelfHook,
   opencode,
 }:
 let
-  electron = electron_41;
+  electron = graphagentElectron;
+  toolchain = import ./toolchain.nix { inherit lib; };
+  runtime = builtins.fromJSON (builtins.readFile ./ripgrep-sources.json);
+  archive = runtime.sources.${stdenv.hostPlatform.system};
+  catalog = builtins.readFile ../packages/core/src/runtime-asset/catalog/ripgrep.ts;
+  runtimeArchive = assert lib.assertMsg (
+    lib.hasInfix "export const version = \"${runtime.version}\"" catalog && lib.hasInfix archive.sha256 catalog
+  ) "Ripgrep catalog changed; verify its official archives and update nix/ripgrep-sources.json first.";
+    fetchurl {
+      url = "https://github.com/BurntSushi/ripgrep/releases/download/${runtime.version}/${archive.file}";
+      sha256 = archive.sha256;
+    };
 in
 stdenv.mkDerivation (finalAttrs: {
   pname = "opencode-desktop";
@@ -23,8 +36,8 @@ stdenv.mkDerivation (finalAttrs: {
     ;
 
   nativeBuildInputs = [
-    bun
-    nodejs
+    (toolchain.requireVersion "bun" bun)
+    (toolchain.requireVersion "node" nodejs_24)
     makeWrapper
     writableTmpDirAsHomeHook
   ] ++ lib.optionals stdenv.hostPlatform.isLinux [
@@ -44,7 +57,7 @@ stdenv.mkDerivation (finalAttrs: {
 
   # https://github.com/electron/electron/issues/31121
   # mac builds use a .app bundle which doesnt have this issue
-  postPatch = lib.optionalString stdenv.isLinux ''
+  postPatch = lib.optionalString stdenv.hostPlatform.isLinux ''
     BASE_PATH=packages/desktop
     FILES=(src/main/windows.ts)
     for file in "''${FILES[@]}"; do
@@ -54,7 +67,7 @@ stdenv.mkDerivation (finalAttrs: {
   '';
 
   preBuild = ''
-    cp -r "${electron.dist}" $HOME/.electron-dist
+    cp -r "${(toolchain.requireVersion "electron" electron).dist}" $HOME/.electron-dist
     chmod -R u+w $HOME/.electron-dist
 
     cp -R ${finalAttrs.node_modules}/. .
@@ -64,14 +77,18 @@ stdenv.mkDerivation (finalAttrs: {
 
   buildPhase = ''
     runHook preBuild
+    node script/toolchain.mjs check
 
+    bun --bun ${./scripts/prime-desktop-assets.ts} ${runtimeArchive}
     cd packages/desktop
 
+    # The canonical desktop build applies its bounded Node heap budget here too.
     bun run build
     npx electron-builder --dir \
       --config electron-builder.config.ts \
       --config.mac.identity=null \
-      --config.electronDist="$HOME/.electron-dist"
+      --config.electronDist="$HOME/.electron-dist" \
+      --config.extraMetadata.version="${finalAttrs.version}"
 
     runHook postBuild
   '';
@@ -83,7 +100,7 @@ stdenv.mkDerivation (finalAttrs: {
     + lib.optionalString stdenv.hostPlatform.isDarwin ''
       mkdir -p $out/Applications
       mv dist/mac*/*.app $out/Applications
-      makeWrapper "$out/Applications/OpenCode.app/Contents/MacOS/OpenCode" $out/bin/opencode-desktop
+      makeWrapper "$out/Applications/OpenCode Dev.app/Contents/MacOS/OpenCode Dev" $out/bin/opencode-desktop
     ''
     + lib.optionalString stdenv.hostPlatform.isLinux ''
       mkdir -p $out/opt/opencode-desktop

@@ -53,83 +53,151 @@ export interface Interface {}
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/v2/FileWatcher") {}
 
-export const layer = Layer.effect(
-  Service,
-  Effect.gen(function* () {
-    if (yield* Flag.OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER) return Service.of({})
+export const layerWith = (options?: {
+  readonly native?: typeof import("@parcel/watcher")
+  readonly timeout?: number
+}) =>
+  Layer.effect(
+    Service,
+    Effect.gen(function* () {
+      if (yield* Flag.OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER) return Service.of({})
 
-    const backend = getBackend()
-    const location = yield* Location.Service
-    if (!backend) {
-      yield* Effect.logError("watcher backend not supported", {
-        directory: location.directory,
-        platform: process.platform,
-      })
-      return Service.of({})
-    }
-
-    const w = watcher()
-    if (!w) return Service.of({})
-
-    yield* Effect.logInfo("watcher backend", { directory: location.directory, platform: process.platform, backend })
-    const events = yield* EventV2.Service
-    const fs = yield* FSUtil.Service
-    const git = yield* Git.Service
-    const context = yield* Effect.context()
-    const runFork = Effect.runForkWith(context)
-    const subscriptions: ParcelWatcher.AsyncSubscription[] = []
-    yield* Effect.addFinalizer(() =>
-      Effect.promise(() => Promise.allSettled(subscriptions.map((subscription) => subscription.unsubscribe()))),
-    )
-
-    const callback: ParcelWatcher.SubscribeCallback = (_error, updates) => {
-      for (const update of updates) {
-        if (update.type === "create") runFork(events.publish(Event.Updated, { file: update.path, event: "add" }))
-        if (update.type === "update") runFork(events.publish(Event.Updated, { file: update.path, event: "change" }))
-        if (update.type === "delete") runFork(events.publish(Event.Updated, { file: update.path, event: "unlink" }))
+      const backend = getBackend()
+      const location = yield* Location.Service
+      if (!backend) {
+        yield* Effect.logError("watcher backend not supported", {
+          directory: location.directory,
+          platform: process.platform,
+        })
+        return Service.of({})
       }
-    }
 
-    const subscribe = (directory: string, ignore: string[]) => {
-      const pending = w.subscribe(directory, callback, { ignore, backend })
-      return Effect.promise(() => pending).pipe(
-        Effect.tap((subscription) => Effect.sync(() => subscriptions.push(subscription))),
-        Effect.timeout(SUBSCRIBE_TIMEOUT_MS),
-        Effect.catchCause((cause) => {
-          pending.then((subscription) => subscription.unsubscribe()).catch(() => {})
-          return Effect.logError("failed to subscribe", { directory, cause: Cause.pretty(cause) })
-        }),
+      const w = options?.native ?? watcher()
+      if (!w) return Service.of({})
+
+      yield* Effect.logInfo("watcher backend", { directory: location.directory, platform: process.platform, backend })
+      const events = yield* EventV2.Service
+      const fs = yield* FSUtil.Service
+      const git = yield* Git.Service
+      const context = yield* Effect.context()
+      const runFork = Effect.runForkWith(context)
+      const subscriptions: ParcelWatcher.AsyncSubscription[] = []
+      let disposed = false
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          disposed = true
+        }).pipe(
+          Effect.andThen(
+            Effect.forEach(
+              subscriptions,
+              (subscription) =>
+                Effect.promise(() => subscription.unsubscribe()).pipe(
+                  Effect.catchCause((cause) =>
+                    Effect.logError("failed to unsubscribe", { cause: Cause.pretty(cause) }),
+                  ),
+                ),
+              { concurrency: "unbounded" },
+            ),
+          ),
+        ),
       )
-    }
 
-    const config = (yield* (yield* Config.Service).entries())
-      .filter((entry): entry is Config.Document => entry.type === "document")
-      .flatMap((item) => item.info.watcher?.ignore ?? [])
-    if (location.vcs && (yield* Flag.OPENCODE_EXPERIMENTAL_FILEWATCHER)) {
-      yield* Effect.forkScoped(
-        subscribe(location.directory, [...Ignore.PATTERNS, ...config, ...protecteds(location.directory)]),
-      )
-    }
+      const callback: ParcelWatcher.SubscribeCallback = (error, updates) => {
+        if (disposed) return
+        if (error) {
+          runFork(Effect.logError("watcher callback failed", { error }))
+          return
+        }
+        for (const update of updates ?? []) {
+          if (update.type === "create") runFork(events.publish(Event.Updated, { file: update.path, event: "add" }))
+          if (update.type === "update") runFork(events.publish(Event.Updated, { file: update.path, event: "change" }))
+          if (update.type === "delete") runFork(events.publish(Event.Updated, { file: update.path, event: "unlink" }))
+        }
+      }
 
-    if (location.vcs?.type === "git") {
-      const resolved = (yield* git.repo.discover(location.directory))?.gitDirectory
-      const vcs = resolved ? yield* fs.realPath(resolved).pipe(Effect.catch(() => Effect.succeed(resolved))) : undefined
-      if (vcs && !config.includes(".git") && !config.includes(vcs) && (!resolved || !config.includes(resolved))) {
-        const ignore = (yield* fs.readDirectoryEntries(vcs).pipe(Effect.catch(() => Effect.succeed([])))).flatMap(
-          (entry) => (entry.name === "HEAD" ? [] : [entry.name]),
+      const subscribe = (directory: string, ignore: string[]) =>
+        Effect.suspend(() => {
+          let pending: Promise<ParcelWatcher.AsyncSubscription> | undefined
+          let accepted = false
+          let relinquished = false
+          // Declaring the signal keeps the promise wait interruptible even though
+          // the native watcher cannot abort acquisition itself.
+          return Effect.promise((_signal) => {
+            // Attach the rejection handler when the fiber runs, rather than starting
+            // a native subscription while merely constructing the effect.
+            pending = w.subscribe(
+              directory,
+              (error, updates) => {
+                if (!relinquished) callback(error, updates)
+              },
+              { ignore, backend },
+            )
+            return pending
+          }).pipe(
+            Effect.tap((subscription) =>
+              Effect.sync(() => {
+                subscriptions.push(subscription)
+                accepted = true
+              }),
+            ),
+            Effect.timeout(options?.timeout ?? SUBSCRIBE_TIMEOUT_MS),
+            Effect.onExit(() =>
+              Effect.sync(() => {
+                if (accepted) return
+                relinquished = true
+                if (!pending) return
+                // Timeout and scope interruption both relinquish ownership, including
+                // subscriptions which resolve after the scope has already closed.
+                void pending.then(
+                  async (subscription) => {
+                    try {
+                      await subscription.unsubscribe()
+                    } catch (error) {
+                      runFork(Effect.logError("failed to unsubscribe", { directory, error }))
+                    }
+                  },
+                  () => {},
+                )
+              }),
+            ),
+            Effect.catchCause((cause) =>
+              Effect.logError("failed to subscribe", { directory, cause: Cause.pretty(cause) }),
+            ),
+          )
+        })
+
+      const config = (yield* (yield* Config.Service).entries())
+        .filter((entry): entry is Config.Document => entry.type === "document")
+        .flatMap((item) => item.info.watcher?.ignore ?? [])
+      if (location.vcs && (yield* Flag.OPENCODE_EXPERIMENTAL_FILEWATCHER)) {
+        yield* Effect.forkScoped(
+          subscribe(location.directory, [...Ignore.PATTERNS, ...config, ...protecteds(location.directory)]),
         )
-        yield* Effect.forkScoped(subscribe(vcs, ignore))
       }
-    }
 
-    return Service.of({})
-  }).pipe(
-    Effect.catchCause((cause) => {
-      return Effect.logError("failed to init watcher service", { cause: Cause.pretty(cause) }).pipe(
-        Effect.as(Service.of({})),
-      )
-    }),
-  ),
-)
+      if (location.vcs?.type === "git") {
+        const resolved = (yield* git.repo.discover(location.directory))?.gitDirectory
+        const vcs = resolved
+          ? yield* fs.realPath(resolved).pipe(Effect.catch(() => Effect.succeed(resolved)))
+          : undefined
+        if (vcs && !config.includes(".git") && !config.includes(vcs) && (!resolved || !config.includes(resolved))) {
+          const ignore = (yield* fs.readDirectoryEntries(vcs).pipe(Effect.catch(() => Effect.succeed([])))).flatMap(
+            (entry) => (entry.name === "HEAD" ? [] : [entry.name]),
+          )
+          yield* Effect.forkScoped(subscribe(vcs, ignore))
+        }
+      }
+
+      return Service.of({})
+    }).pipe(
+      Effect.catchCause((cause) => {
+        return Effect.logError("failed to init watcher service", { cause: Cause.pretty(cause) }).pipe(
+          Effect.as(Service.of({})),
+        )
+      }),
+    ),
+  )
+
+export const layer = layerWith()
 
 export const locationLayer = layer.pipe(Layer.provide(Config.locationLayer), Layer.provide(Git.defaultLayer))

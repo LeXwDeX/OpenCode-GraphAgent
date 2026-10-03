@@ -255,6 +255,35 @@ function runCommand(commands: RegisteredCommands, name: string) {
 }
 
 describe("DagInspector", () => {
+  test("renders truthful delivery states and refreshes counts without a node status change", async () => {
+    const current = dagNode({
+      id: "worker",
+      name: "Message worker",
+      status: "running",
+      attempt_id: "attempt-1",
+      accepted_input_revision: 3,
+      snapshot_revision: 1,
+      agent_messages: { queued: 2, delivered: 1, undeliverable: 0 },
+    })
+    const viewer = await renderDagInspector({ workflows: [wfSummary()], nodes: [current] })
+    try {
+      await viewer.app.waitForFrame((frame) =>
+        frame.includes("attempt attempt-1 · input 3 · snapshot 1") &&
+        frame.includes("messages 2 queued · 1 delivered · 0 undeliverable"),
+      )
+      const initialCalls = viewer.nodesCalls().length
+      viewer.setNodes([{ ...current, snapshot_revision: 3, agent_messages: { queued: 0, delivered: 2, undeliverable: 1 } }])
+      await waitForCondition(() => viewer.nodesCalls().length > initialCalls, 4_000)
+      await viewer.app.waitForFrame((frame) => frame.includes("messages 0 queued · 2 delivered · 1 undeliverable"))
+      runCommand(viewer.commands, "dag.close")
+      const calls = viewer.nodesCalls().length
+      await Bun.sleep(2_100)
+      expect(viewer.nodesCalls()).toHaveLength(calls)
+    } finally {
+      viewer.app.renderer.destroy()
+    }
+  })
+
   test("/dag dispatches dag.open locally without submitting a model command", async () => {
     const returnRoute = { name: "session", params: { sessionID: SESSION_ID } }
     const viewer = await renderDagInspector({ initialRoute: returnRoute })

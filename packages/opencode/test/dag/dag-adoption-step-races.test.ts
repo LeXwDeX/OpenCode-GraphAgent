@@ -91,6 +91,7 @@ function raceLayer(input: {
   const childTitles = new Map<string, string>()
   const created: string[] = []
   const session = Layer.mock(Session.Service, {
+    getPart: () => Effect.succeed(undefined),
     get: () => Effect.succeed({ id: "ses_parent", permission: [], agent: "build" } as never),
     create: (value) =>
       Effect.sync(() => {

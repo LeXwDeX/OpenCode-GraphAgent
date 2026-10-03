@@ -1,7 +1,7 @@
 import { sentryVitePlugin } from "@sentry/vite-plugin"
 import { defineConfig } from "electron-vite"
 import appPlugin from "@opencode-ai/app/vite"
-import * as fs from "node:fs/promises"
+import { copyServerAssets } from "./scripts/server-assets"
 
 const OPENCODE_SERVER_DIST = "../opencode/dist/node"
 
@@ -48,6 +48,7 @@ export default defineConfig({
         enforce: "pre",
         resolveId(s) {
           if (s === "@lydell/node-pty") return nodePtyPkg
+          return null
         },
       },
       {
@@ -55,15 +56,13 @@ export default defineConfig({
         enforce: "pre",
         resolveId(id) {
           if (id === "virtual:opencode-server") return this.resolve(`${OPENCODE_SERVER_DIST}/node.js`)
+          return null
         },
       },
       {
         name: "opencode:copy-server-assets",
         async writeBundle() {
-          for (const l of await fs.readdir(OPENCODE_SERVER_DIST)) {
-            if (!l.endsWith(".wasm")) continue
-            await fs.writeFile(`./out/main/chunks/${l}`, await fs.readFile(`${OPENCODE_SERVER_DIST}/${l}`))
-          }
+          await copyServerAssets(OPENCODE_SERVER_DIST, "./out/main/chunks")
         },
       },
     ],

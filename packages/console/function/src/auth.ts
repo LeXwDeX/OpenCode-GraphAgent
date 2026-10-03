@@ -103,8 +103,6 @@ export default {
       }),
       subjects,
       async success(ctx, response) {
-        console.log(response)
-
         let subject: string | undefined
         let email: string | undefined
 

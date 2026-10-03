@@ -156,6 +156,7 @@ function goalWakeLayer(input: { childPrompts: Queue.Queue<ChildPromptGate>; fail
   const created: string[] = []
   let lastAssistant = mkAssistant()
   const session = Layer.mock(Session.Service, {
+    getPart: () => Effect.succeed(undefined),
     get: (_sessionID) =>
       Effect.succeed({
         id: SessionID.make(PARENT_SESSION),

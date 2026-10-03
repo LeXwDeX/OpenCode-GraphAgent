@@ -1,5 +1,196 @@
 // Bun Snapshot v1, https://bun.sh/docs/test/snapshots
 
+exports[`tool parameters JSON Schema (wire shape) agent 1`] = `
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "params": {
+      "anyOf": [
+        {
+          "properties": {
+            "action": {
+              "enum": [
+                "observe",
+              ],
+              "type": "string",
+            },
+            "attempt_id": {
+              "maxLength": 200,
+              "minLength": 1,
+              "type": "string",
+            },
+            "cursor": {
+              "type": "string",
+            },
+            "limit": {
+              "maximum": 50,
+              "minimum": 1,
+              "type": "integer",
+            },
+            "node_id": {
+              "maxLength": 200,
+              "minLength": 1,
+              "type": "string",
+            },
+            "workflow_id": {
+              "maxLength": 200,
+              "minLength": 1,
+              "type": "string",
+            },
+          },
+          "required": [
+            "action",
+            "workflow_id",
+          ],
+          "type": "object",
+        },
+        {
+          "properties": {
+            "action": {
+              "enum": [
+                "send",
+              ],
+              "type": "string",
+            },
+            "attempt_id": {
+              "description": "Exact execution attempt returned by observe; retries never retarget a newer attempt.",
+              "maxLength": 200,
+              "minLength": 1,
+              "type": "string",
+            },
+            "content": {
+              "maxLength": 16384,
+              "minLength": 1,
+              "type": "string",
+            },
+            "idempotency_key": {
+              "description": "Stable retry key. Reuse only for the identical destination and content.",
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string",
+            },
+            "node_id": {
+              "maxLength": 200,
+              "minLength": 1,
+              "type": "string",
+            },
+            "recipient": {
+              "enum": [
+                "node",
+              ],
+              "type": "string",
+            },
+            "reply_to": {
+              "maxLength": 200,
+              "minLength": 1,
+              "type": "string",
+            },
+            "workflow_id": {
+              "maxLength": 200,
+              "minLength": 1,
+              "type": "string",
+            },
+          },
+          "required": [
+            "action",
+            "workflow_id",
+            "idempotency_key",
+            "content",
+            "recipient",
+            "node_id",
+            "attempt_id",
+          ],
+          "type": "object",
+        },
+        {
+          "properties": {
+            "action": {
+              "enum": [
+                "send",
+              ],
+              "type": "string",
+            },
+            "content": {
+              "maxLength": 16384,
+              "minLength": 1,
+              "type": "string",
+            },
+            "idempotency_key": {
+              "description": "Stable retry key. Reuse only for the identical destination and content.",
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string",
+            },
+            "recipient": {
+              "enum": [
+                "parent",
+              ],
+              "type": "string",
+            },
+            "reply_to": {
+              "maxLength": 200,
+              "minLength": 1,
+              "type": "string",
+            },
+            "workflow_id": {
+              "maxLength": 200,
+              "minLength": 1,
+              "type": "string",
+            },
+          },
+          "required": [
+            "action",
+            "workflow_id",
+            "idempotency_key",
+            "content",
+            "recipient",
+          ],
+          "type": "object",
+        },
+        {
+          "properties": {
+            "action": {
+              "enum": [
+                "receive",
+              ],
+              "type": "string",
+            },
+            "after_sequence": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer",
+            },
+            "limit": {
+              "maximum": 50,
+              "minimum": 1,
+              "type": "integer",
+            },
+            "wait_ms": {
+              "maximum": 30000,
+              "minimum": 0,
+              "type": "integer",
+            },
+            "workflow_id": {
+              "maxLength": 200,
+              "minLength": 1,
+              "type": "string",
+            },
+          },
+          "required": [
+            "action",
+          ],
+          "type": "object",
+        },
+      ],
+    },
+  },
+  "required": [
+    "params",
+  ],
+  "type": "object",
+}
+`;
+
 exports[`tool parameters JSON Schema (wire shape) apply_patch 1`] = `
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",

@@ -45,6 +45,7 @@ permissions:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  GOTOOLCHAIN: local
 
 jobs:
   unit-tests:
@@ -74,6 +75,9 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Setup Node
+        uses: ./.github/actions/setup-node
+
       - name: Setup GitHub CLI
         uses: ./.github/actions/setup-gh
 
@@ -84,12 +88,6 @@ jobs:
           check: unit
           job-name: Unit Tests (${{ matrix.settings.name }})
           runner-label: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]' && github.actor != 'dependabot[bot]')) && join(matrix.settings.selfHosted, ',') || matrix.settings.host }}
-
-      - name: Setup Node
-        if: steps.evidence.outputs.reused != 'true'
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
-        with:
-          node-version: "24"
 
       - name: Setup Go
         if: steps.evidence.outputs.reused != 'true' && (runner.os == 'Linux')
@@ -106,6 +104,10 @@ jobs:
           # saver (runs on every push, fast, low collision risk) — this job
           # only restores, to avoid racing on the same {OS}-bun-{hash} key.
           save-cache: false
+
+      - name: Verify Go toolchain
+        if: steps.evidence.outputs.reused != 'true' && runner.os == 'Linux'
+        run: node script/toolchain.mjs check --go
 
       - name: Configure Git Identity
         if: steps.evidence.outputs.reused != 'true'
@@ -230,6 +232,10 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Setup Node
+        # Browser installation below checks extraction on the shared Node pin.
+        uses: ./.github/actions/setup-node
+
       - name: Setup GitHub CLI
         uses: ./.github/actions/setup-gh
 
@@ -240,13 +246,6 @@ jobs:
           check: e2e
           job-name: E2E Tests (${{ matrix.settings.name }})
           runner-label: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]' && github.actor != 'dependabot[bot]')) && join(matrix.settings.selfHosted, ',') || matrix.settings.host }}
-
-      - name: Setup Node
-        if: steps.evidence.outputs.reused != 'true'
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
-        with:
-          # Playwright 1.59 hangs while extracting Chromium with Node 24.16.
-          node-version: "24.15"
 
       - name: Setup Bun
         if: steps.evidence.outputs.reused != 'true'
@@ -302,6 +301,14 @@ jobs:
         working-directory: packages/opencode
         run: bun test --timeout 30000 --only-failures test/dag/dag-output-ref.test.ts test/dag/dag-output-ref-result.test.ts test/dag/dag-input-mapping-runtime.test.ts test/dag/dag-artifact-permissions.test.ts
         timeout-minutes: 5
+
+      - name: Verify shared Markdown in Chromium
+        if: steps.evidence.outputs.reused != 'true'
+        working-directory: packages/web
+        run: bun test test/sanitize-markdown.test.ts --timeout 30000 --only-failures
+        env:
+          OPENCODE_TEST_BROWSER: "1"
+        timeout-minutes: 3
 
       - name: Run app e2e tests
         if: steps.evidence.outputs.reused != 'true'

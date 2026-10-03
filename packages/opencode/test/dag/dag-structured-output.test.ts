@@ -180,6 +180,23 @@ describe("resolveInputMapping", () => {
 // --- Unit tests for capture.ts (submit_result validation) ---
 
 describe("validateAgainstSchema", () => {
+  it("validates patterns against the complete accepted string", () => {
+    expect(validateAgainstSchema("a".repeat(99_999) + "!", { pattern: "^a+$" }).ok).toBe(false)
+    expect(validateAgainstSchema("a".repeat(100_000), { pattern: "^a+$" }).ok).toBe(true)
+    expect(validateAgainstSchema("a".repeat(99_999) + "!", { pattern: "!$" }).ok).toBe(true)
+  })
+
+  it("rejects oversize pattern input rather than validating a prefix", () => {
+    expect(validateAgainstSchema("a".repeat(100_000) + "!", { pattern: "^a+$" }).ok).toBe(false)
+    expect(validateAgainstSchema("a".repeat(100_001), { pattern: "^a+$" }).ok).toBe(false)
+    expect(validateAgainstSchema("a".repeat(100_001), { type: "string" }).ok).toBe(true)
+  })
+
+  it("preserves unanchored JSON Schema pattern matching and malformed-pattern rejection", () => {
+    expect(validateAgainstSchema("prefix abc suffix", { pattern: "abc" }).ok).toBe(true)
+    expect(validateAgainstSchema("abc", { pattern: "[" }).ok).toBe(false)
+  })
+
   it("accepts matching object type", () => {
     expect(validateAgainstSchema({ a: 1 }, { type: "object" })).toEqual({ ok: true })
   })
@@ -194,6 +211,37 @@ describe("validateAgainstSchema", () => {
     const schema = { type: "object" as const, required: ["name", "count"] }
     expect(validateAgainstSchema({ name: "x" }, schema).ok).toBe(false)
     expect(validateAgainstSchema({ name: "x", count: 1 }, schema).ok).toBe(true)
+  })
+
+  it("requires own JSON properties even for Object.prototype names", () => {
+    for (const field of ["constructor", "toString", "__proto__"]) {
+      expect(validateAgainstSchema({}, { type: "object", required: [field] }).ok).toBe(false)
+      const payload = JSON.parse(`{"${field}":"present"}`)
+      expect(validateAgainstSchema(payload, { type: "object", required: [field] }).ok).toBe(true)
+    }
+  })
+
+  it("validates only present own properties and rejects undeclared prototype names", () => {
+    for (const field of ["constructor", "toString", "__proto__"]) {
+      const properties = JSON.parse(`{"${field}":{"type":"string"}}`)
+      const schema = { type: "object", properties, additionalProperties: false }
+      expect(validateAgainstSchema({}, schema).ok).toBe(true)
+      expect(validateAgainstSchema(JSON.parse(`{"${field}":"valid"}`), schema).ok).toBe(true)
+      expect(validateAgainstSchema(JSON.parse(`{"${field}":1}`), schema).ok).toBe(false)
+      expect(validateAgainstSchema(JSON.parse(`{"${field}":"extra"}`), {
+        type: "object", properties: {}, additionalProperties: false,
+      }).ok).toBe(false)
+    }
+  })
+
+  it("matches the complete string at the regex length boundary and rejects longer values", () => {
+    const schema = { type: "string", pattern: "^a+$" }
+    expect(validateAgainstSchema("a".repeat(99_999), schema).ok).toBe(true)
+    expect(validateAgainstSchema("a".repeat(100_000), schema).ok).toBe(true)
+    expect(validateAgainstSchema("a".repeat(99_999) + "!", schema).ok).toBe(false)
+    expect(validateAgainstSchema("a".repeat(100_001), schema).ok).toBe(false)
+    expect(validateAgainstSchema("a".repeat(100_000) + "!", schema).ok).toBe(false)
+    expect(validateAgainstSchema("a".repeat(100_001), { type: "string" }).ok).toBe(true)
   })
 
   it("validates nested properties recursively", () => {

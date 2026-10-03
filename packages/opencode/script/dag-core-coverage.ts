@@ -62,6 +62,9 @@ export async function runDagCoreCoverageGate() {
       output: path.join(output, "core"),
       tests: [
         "test/dag-core.test.ts",
+        "test/dag-replan-dependency-closure.test.ts",
+        "test/dag-capture-presence.test.ts",
+        "test/dag-messages.test.ts",
         "test/dag-store-wake.test.ts",
         "test/dag-node-cancelled-projection.test.ts",
         "test/dag-store-summaries.test.ts",
