@@ -568,6 +568,17 @@ export function topK(model: Provider.Model) {
 
 const WIDELY_SUPPORTED_EFFORTS = ["low", "medium", "high"]
 const OPENAI_EFFORTS = ["none", "minimal", ...WIDELY_SUPPORTED_EFFORTS, "xhigh"]
+const VARIANT_EFFORT_ORDER = [...OPENAI_EFFORTS, "max", "ultra"]
+
+export function sortVariants<T>(variants: Record<string, T>): Record<string, T> {
+  const rank = (name: string) => {
+    const index = VARIANT_EFFORT_ORDER.indexOf(name)
+    return index === -1 ? VARIANT_EFFORT_ORDER.length : index
+  }
+  // Custom names have no standard effort ranking. Keep their relative order.
+  return Object.fromEntries(Object.entries(variants).sort(([a], [b]) => rank(a) - rank(b)))
+}
+
 const OPENAI_GPT5_1_EFFORTS = ["none", ...WIDELY_SUPPORTED_EFFORTS]
 const OPENAI_GPT5_2_PLUS_EFFORTS = [...OPENAI_GPT5_1_EFFORTS, "xhigh"]
 const OPENAI_GPT5_PRO_EFFORTS = ["high"]
