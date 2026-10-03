@@ -20,6 +20,25 @@ const pathological = "a".repeat(99_999) + "!"
 const slow = { type: "string", pattern: "^(a|a?)+$" }
 afterEach(() => clearCaptureSlot(session))
 
+/** Observe admission without starting a competing validation or adding a runtime API. */
+function observeWorkerPost() {
+  const NativeWorker = globalThis.Worker
+  const posted = Promise.withResolvers<void>()
+  globalThis.Worker = class extends NativeWorker {
+    override postMessage(message: unknown, options?: Transferable[] | StructuredSerializeOptions) {
+      if (Array.isArray(options)) super.postMessage(message, options)
+      else super.postMessage(message, options)
+      posted.resolve()
+    }
+  }
+  return {
+    ready: Effect.promise(() => posted.promise).pipe(Effect.timeout("2 seconds")),
+    restore: () => {
+      globalThis.Worker = NativeWorker
+    },
+  }
+}
+
 describe("bounded schema validation", () => {
   test("pathological regex keeps the host responsive and reports a resource deadline", async () => {
     const child = Bun.spawn(
@@ -198,17 +217,22 @@ describe("submit_result worker persistence", () => {
         const tool = yield* SubmitResultTool
         const definition = yield* tool.init()
         registerCaptureSlot(session, slow)
-        const fiber = yield* definition
-          .execute({ payload: pathological }, context(new AbortController().signal))
-          .pipe(Effect.forkChild)
-        yield* Effect.sleep("30 millis")
-        yield* Fiber.interrupt(fiber)
-        const exit = yield* Fiber.await(fiber)
-        expect(Exit.isFailure(exit)).toBe(true)
-        expect(captured).toEqual([])
-        expect((yield* Effect.promise(() => validatePayloadAsync(session, "a", new AbortController().signal))).ok).toBe(
-          true,
-        )
+        const started = observeWorkerPost()
+        try {
+          const fiber = yield* definition
+            .execute({ payload: pathological }, context(new AbortController().signal))
+            .pipe(Effect.forkChild)
+          yield* started.ready
+          yield* Fiber.interrupt(fiber)
+          const exit = yield* Fiber.await(fiber)
+          expect(Exit.isFailure(exit)).toBe(true)
+          expect(captured).toEqual([])
+          expect(
+            (yield* Effect.promise(() => validatePayloadAsync(session, "a", new AbortController().signal))).ok,
+          ).toBe(true)
+        } finally {
+          started.restore()
+        }
       }).pipe(Effect.provide(layers(captured))),
     )
   })
@@ -221,18 +245,23 @@ describe("submit_result worker persistence", () => {
         for (const cancel of [true, false]) {
           registerCaptureSlot(session, slow)
           const abort = new AbortController()
-          const fiber = yield* definition
-            .execute({ payload: pathological }, context(abort.signal))
-            .pipe(Effect.forkChild)
-          yield* Effect.sleep("30 millis")
-          if (cancel) abort.abort()
-          else {
-            clearCaptureSlot(session)
-            registerCaptureSlot(session, slow)
+          const started = observeWorkerPost()
+          try {
+            const fiber = yield* definition
+              .execute({ payload: pathological }, context(abort.signal))
+              .pipe(Effect.forkChild)
+            yield* started.ready
+            if (cancel) abort.abort()
+            else {
+              clearCaptureSlot(session)
+              registerCaptureSlot(session, slow)
+            }
+            const result = yield* Fiber.join(fiber)
+            expect(result.metadata.captured).not.toBe(true)
+            expect(captured).toEqual([])
+          } finally {
+            started.restore()
           }
-          const result = yield* Fiber.join(fiber)
-          expect(result.metadata.captured).not.toBe(true)
-          expect(captured).toEqual([])
         }
       }).pipe(Effect.provide(layers(captured))),
     )

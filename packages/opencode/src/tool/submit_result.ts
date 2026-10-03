@@ -1,9 +1,10 @@
 import * as Tool from "./tool"
 import DESCRIPTION from "./submit_result.txt"
-import { Effect, Option, Schema } from "effect"
+import { Effect, Option, Scheduler, Schema } from "effect"
 import { validatePayloadAsync, isCaptureValidationCurrent, getCaptureSnapshot } from "@/dag/runtime/capture"
 import { DagStore } from "@opencode-ai/core/dag/store"
 import { DagMessages } from "@opencode-ai/core/dag/messages"
+import { Database } from "@opencode-ai/core/database/database"
 import { InstanceState } from "@/effect/instance-state"
 
 const id = "submit_result"
@@ -59,7 +60,11 @@ export const SubmitResultTool = Tool.define<typeof Parameters, Metadata, never>(
               if (ctx.abort.aborted || !isCaptureValidationCurrent(ctx.sessionID, result)) return false
               yield* storeOpt.value.setCapturedOutput(ctx.sessionID, payload, snapshotID).pipe(Effect.orDie)
               return true
-            })
+            }).pipe(
+              // The transaction already owns the synchronous SQLite connection.
+              // Keep slot authority and the write in one JS execution segment.
+              Effect.provideService(Scheduler.PreventSchedulerYield, true),
+            )
           if (Option.isSome(messages)) {
             const instance = yield* InstanceState.context
             const caller = { projectID: instance.project.id, directory: instance.directory, sessionID: ctx.sessionID }
@@ -97,12 +102,20 @@ export const SubmitResultTool = Tool.define<typeof Parameters, Metadata, never>(
                 output: `Submission was not captured (${result.ok ? "capture slot changed or cancelled" : result.reason}). Consume the current agent input before submitting an updated result. Previously completed tools remain recorded; do not repeat their writes.`,
                 metadata: {},
               }
-          } else if (!(yield* commit()))
-            return {
-              title: "submit_result input changed",
-              output: "Submission was not captured because its capture slot changed or validation was cancelled.",
-              metadata: {},
-            }
+          } else {
+            const database = yield* Effect.serviceOption(Database.Service)
+            // Acquire a connection before checking the slot in the legacy path.
+            // Connection contention can suspend; the guarded write cannot.
+            const captured = yield* Option.isSome(database)
+              ? database.value.db.transaction(() => commit()).pipe(Effect.orDie)
+              : commit()
+            if (!captured)
+              return {
+                title: "submit_result input changed",
+                output: "Submission was not captured because its capture slot changed or validation was cancelled.",
+                metadata: {},
+              }
+          }
           return {
             title: "Structured output submitted",
             output: "submit_result succeeded. Your structured output has been captured.",

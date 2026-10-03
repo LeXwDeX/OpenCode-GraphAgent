@@ -3,8 +3,11 @@ import path from "node:path"
 import { writeFile } from "node:fs/promises"
 import { tmpdir } from "../../../core/test/fixture/tmpdir"
 import { sql } from "drizzle-orm"
-import { Effect, Exit, Layer, Option } from "effect"
+import { Context, Deferred, Effect, Exit, Fiber, Layer, Option, Scheduler, Scope } from "effect"
+import type { Database as NativeDatabase } from "bun:sqlite"
 import { Database } from "@opencode-ai/core/database/database"
+import { layer as sqliteLayer } from "@opencode-ai/core/database/sqlite.bun"
+import { Sqlite } from "@opencode-ai/core/database/sqlite"
 import { DagMessages } from "@opencode-ai/core/dag/messages"
 import { DagStore } from "@opencode-ai/core/dag/store"
 import { DagProjector } from "@opencode-ai/core/dag/projector"
@@ -31,17 +34,22 @@ const parent = { projectID: "p", directory: process.cwd(), sessionID: "ses_paren
 const child = { ...parent, sessionID: "ses_child" }
 const attempt = { replanAttempts: 0, childSessionID: child.sessionID }
 function services() {
-  const database = Database.layerFromPath(":memory:")
+  const sqlite = sqliteLayer({ filename: ":memory:" })
+  const database = Database.layer.pipe(Layer.provide(sqlite))
   const events = EventV2.layer.pipe(Layer.provide(database))
   const bridge = EventV2Bridge.layer.pipe(Layer.provide(events))
   const store = DagStore.layer.pipe(Layer.provide(database))
   const messages = DagMessages.layer.pipe(Layer.provide(database))
   const projector = DagProjector.layer.pipe(Layer.provide(Layer.merge(database, events)))
   const dependencies = Layer.mergeAll(database, events, bridge, store, messages, projector)
-  return Layer.merge(dependencies, Dag.layer.pipe(Layer.provide(dependencies)))
+  return Layer.mergeAll(sqlite, dependencies, Dag.layer.pipe(Layer.provide(dependencies)))
 }
 const run = <A, E>(
-  effect: Effect.Effect<A, E, Database.Service | DagMessages.Service | Dag.Service | DagStore.Service>,
+  effect: Effect.Effect<
+    A,
+    E,
+    Database.Service | DagMessages.Service | Dag.Service | DagStore.Service | Sqlite.Native | Scope.Scope
+  >,
 ) => Effect.runPromise(effect.pipe(Effect.provide(services()), Effect.scoped))
 const seed = Effect.gen(function* () {
   const { db } = yield* Database.Service
@@ -509,6 +517,134 @@ describe("message settlement through durable DAG events", () => {
         }),
       ),
     ))
+  for (const boundary of ["scheduler", "connection-wait", "connection-abort"] as const)
+    test(`submit_result preserves slot authority across ${boundary}`, async () =>
+      run(
+        Effect.gen(function* () {
+          yield* seed
+          const database = yield* Database.Service
+          const store = yield* DagStore.Service
+          const native = (yield* Sqlite.Native) as NativeDatabase
+          const turn = MessageID.ascending()
+          yield* associate(turn)
+          const schema = { type: "object" }
+          registerCaptureSlot(child.sessionID, schema)
+          const order: string[] = []
+          const query = native.query.bind(native)
+          native.query = ((text: string) => {
+            if (/update/i.test(text) && text.includes("captured_output")) order.push("write")
+            return query(text)
+          }) as typeof native.query
+          const replace = () => {
+            clearCaptureSlot(child.sessionID)
+            registerCaptureSlot(child.sessionID, schema)
+            order.push("replace")
+          }
+          try {
+            const tool = yield* SubmitResultTool
+            const definition = yield* tool.init()
+            const abort = new AbortController()
+            const context: Tool.Context = {
+              sessionID: SessionID.make(child.sessionID),
+              messageID: turn,
+              agent: "build",
+              abort: abort.signal,
+              messages: [],
+              ask: () => Effect.void,
+              metadata: () => Effect.void,
+            }
+            const execute = definition.execute({ payload: { result: "old" } }, context)
+            if (boundary === "scheduler") {
+              const observed = {
+                ...store,
+                setCapturedOutput: (...args: Parameters<DagStore.Interface["setCapturedOutput"]>) => {
+                  queueMicrotask(replace)
+                  return store.setCapturedOutput(...args)
+                },
+              }
+              const result = yield* execute.pipe(
+                Effect.provideService(DagStore.Service, observed),
+                Effect.provideService(Scheduler.MaxOpsBeforeYield, 20),
+              )
+              yield* Effect.promise(() => Promise.resolve())
+              // A successful capture must linearize before the replacement.
+              expect(result.metadata.captured).toBe(true)
+              expect(order).toEqual(["write", "replace"])
+              expect((yield* store.getNode("dag_messages", "n"))?.capturedOutput).toEqual({ result: "old" })
+            } else {
+              const held = yield* Deferred.make<void>()
+              const release = yield* Deferred.make<void>()
+              yield* Effect.addFinalizer(() => Deferred.succeed(release, undefined))
+              const holder = yield* database.db
+                .transaction(() => Deferred.succeed(held, undefined).pipe(Effect.andThen(Deferred.await(release))))
+                .pipe(Effect.forkChild)
+              yield* Deferred.await(held)
+              const requested = Promise.withResolvers<void>()
+              const observed: Database.Interface = {
+                db: new Proxy(database.db, {
+                  get(target, key, receiver) {
+                    if (key === "transaction")
+                      return (...args: Parameters<typeof database.db.transaction>) => {
+                        requested.resolve()
+                        return database.db.transaction(...args)
+                      }
+                    return Reflect.get(target, key, receiver)
+                  },
+                }),
+              }
+              const pending = yield* execute.pipe(
+                Effect.updateContext((context: Context.Context<never>) => Context.omit(DagMessages.Service)(context)),
+                Effect.provideService(Database.Service, observed),
+                Effect.forkChild,
+              )
+              yield* Effect.promise(() => requested.promise).pipe(Effect.timeout("2 seconds"))
+              if (boundary === "connection-abort") {
+                abort.abort()
+                order.push("abort")
+              } else replace()
+              yield* Deferred.succeed(release, undefined)
+              yield* Fiber.join(holder)
+              const result = yield* Fiber.join(pending)
+              expect(result.metadata.captured).not.toBe(true)
+              expect(order).toEqual([boundary === "connection-abort" ? "abort" : "replace"])
+              expect((yield* store.getNode("dag_messages", "n"))?.capturedOutputPresent).toBe(false)
+              registerCaptureSlot(child.sessionID, { type: "null" })
+              const fresh = yield* definition.execute(
+                { payload: null },
+                { ...context, abort: new AbortController().signal },
+              )
+              expect(fresh.metadata.captured).toBe(true)
+              const current = yield* store.getNode("dag_messages", "n")
+              expect(current?.capturedOutputPresent).toBe(true)
+              expect(current?.capturedOutput).toBeNull()
+            }
+          } finally {
+            native.query = query as typeof native.query
+            clearCaptureSlot(child.sessionID)
+          }
+        }).pipe(
+          Effect.provide(
+            Layer.mergeAll(
+              Layer.mock(Agent.Service, {
+                get: () => Effect.succeed({ name: "build", mode: "all", permission: [], options: {} }),
+              }),
+              Layer.mock(Truncate.Service, {
+                output: (content: string) => Effect.succeed({ content, truncated: false }),
+              }),
+            ),
+          ),
+          Effect.provideService(InstanceRef, {
+            directory: process.cwd(),
+            worktree: process.cwd(),
+            project: {
+              id: ProjectV2.ID.make("p"),
+              worktree: process.cwd(),
+              sandboxes: [],
+              time: { created: 1, updated: 1 },
+            },
+          }),
+        ),
+      ))
   for (const action of ["cancel", "complete", "fail"] as const)
     test(`workflow ${action} atomically rejects child input and preserves accepted parent reports`, async () =>
       run(
