@@ -145,8 +145,10 @@ jobs:
         # time it runs — that silence can look like a hang but isn't one.
         # 20m was never sized against real data; give it margin above the
         # measured baseline instead of racing it.
+        # Hosted runners execute workspace tasks one at a time. This avoids
+        # CPU contention between builds and tests timing out 250ms Node workers.
         timeout-minutes: 35
-        run: GITHUB_ACTIONS=false bun turbo test
+        run: GITHUB_ACTIONS=false bun turbo test --concurrency=1
         env:
           OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER: ${{ runner.os == 'Windows' && 'true' || 'false' }}
 

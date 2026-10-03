@@ -61,7 +61,11 @@ await test("every main PR runs the full Linux unit and Linux/Windows E2E gates",
   const unit = file.slice(file.indexOf("\n  unit-tests:"), file.indexOf("\n  e2e-tests:"))
   const e2e = file.slice(file.indexOf("\n  e2e-tests:"))
   assert(unit.includes("name: Unit Tests (${{ matrix.settings.name }})"), "Linux unit status check")
-  for (const step of ["GITHUB_ACTIONS=false bun turbo test", "go test ./...", "bun run test:httpapi:ci"])
+  for (const step of [
+    "GITHUB_ACTIONS=false bun turbo test --concurrency=1",
+    "go test ./...",
+    "bun run test:httpapi:ci",
+  ])
     assert(unit.includes(step), `unit gate: ${step}`)
   assert(!/^    if:/m.test(e2e.slice(0, e2e.indexOf("    strategy:"))), "E2E job must run on every triggered PR")
   for (const name of ["linux", "windows"]) assert(e2e.includes(`- name: ${name}\n`), `${name} E2E matrix entry`)
