@@ -2,15 +2,6 @@ import { test } from "node:test"
 import assert from "node:assert/strict"
 import { readFileSync } from "node:fs"
 
-// The one trusted-event predicate that gates every self-hosted route: pushes,
-// manual dispatches, and pull requests whose head branch lives in this
-// repository. Fork pull requests and dependabot keep GitHub-hosted runners.
-// This routing reduces exposure only; a fork pull request runs its own copy of
-// the workflow, so the self-hosted services stay stopped until the repository
-// admission policy is accepted.
-const TRUSTED =
-  "(github.event_name == 'push' || github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]' && github.actor != 'dependabot[bot]'))"
-
 const workflow = (name) => readFileSync(new URL(`../.github/workflows/${name}`, import.meta.url), "utf8")
 const repositoryFile = (name) => readFileSync(new URL(`../${name}`, import.meta.url), "utf8")
 
@@ -26,58 +17,35 @@ const namedSteps = (source, name) => {
   return steps
 }
 
-await test("self-hosted routes are gated by the trusted-event predicate and keep a hosted fallback", () => {
+await test("active CI routes use GitHub-hosted runners and evidence labels", () => {
   for (const file of ["ci-typecheck.yml", "ci-test.yml"]) {
     const lines = workflow(file).split("\n")
     const routes = lines.filter((line) => line.trimStart().startsWith("runs-on:"))
-    const selfHostedRoutes = routes.filter(
-      (line) => line.includes("self-hosted") || line.includes("matrix.settings.selfHosted"),
-    )
-    assert(selfHostedRoutes.length > 0, `${file}: no self-hosted route`)
-    for (const line of selfHostedRoutes) {
-      assert(line.includes(TRUSTED), `${file}: ungated self-hosted route\n${line.trim()}`)
-      assert(
-        line.includes("'ubuntu-latest'") || line.includes("matrix.settings.host"),
-        `${file}: self-hosted route lost its hosted fallback\n${line.trim()}`,
-      )
-    }
     const labels = lines.filter((line) => line.trimStart().startsWith("runner-label:"))
     assert.equal(labels.length, routes.length, `${file}: one evidence label per route`)
-    for (const line of labels) {
-      assert(line.includes(TRUSTED), `${file}: ungated evidence label\n${line.trim()}`)
-      assert(
-        line.includes("self-hosted") || line.includes("matrix.settings.selfHosted"),
-        `${file}: evidence label lacks the self-hosted platform\n${line.trim()}`,
-      )
-    }
+    assert(!lines.some((line) => line.includes("self-hosted")), `${file}: self-hosted route remains`)
+    assert(!lines.some((line) => line.includes("TRUSTED")), `${file}: trusted-event routing remains`)
   }
 })
 
-await test("the typecheck job selects the standard self-hosted Linux labels only when trusted", () => {
+await test("the typecheck job and evidence check use the same hosted Linux label", () => {
   const typecheck = workflow("ci-typecheck.yml")
-  assert(
-    typecheck.includes(`runs-on: \${{ ${TRUSTED} && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}`),
-    "typecheck route",
-  )
-  assert(
-    typecheck.includes(`runner-label: \${{ ${TRUSTED} && 'self-hosted,Linux,X64' || 'ubuntu-latest' }}`),
-    "typecheck evidence label",
-  )
+  assert(typecheck.includes("runs-on: ubuntu-latest"), "typecheck hosted route")
+  assert(typecheck.includes("runner-label: ubuntu-latest"), "typecheck evidence label")
 })
 
-await test("the test matrix keeps names and OS keys while carrying standard self-hosted label arrays", () => {
+await test("the test matrix keeps names and OS keys while routing to its hosted label", () => {
   const file = workflow("ci-test.yml")
-  assert(file.includes(`runs-on: \${{ ${TRUSTED} && matrix.settings.selfHosted || matrix.settings.host }}`))
+  assert(file.includes("runs-on: \${{ matrix.settings.host }}"))
   for (const line of [
-    `runner-label: \${{ ${TRUSTED} && join(matrix.settings.selfHosted, ',') || matrix.settings.host }}`,
-    "selfHosted: [self-hosted, Linux, X64]",
-    "selfHosted: [self-hosted, Windows, X64]",
+    "runner-label: \${{ matrix.settings.host }}",
+    "host: ubuntu-latest",
+    "host: windows-latest",
     "name: Unit Tests (${{ matrix.settings.name }})",
     "name: E2E Tests (${{ matrix.settings.name }})",
   ])
     assert(file.includes(line), line)
-  assert.equal(file.split("selfHosted: [self-hosted, Linux, X64]").length - 1, 2, "linux matrix rows")
-  assert.equal(file.split("selfHosted: [self-hosted, Windows, X64]").length - 1, 1, "windows matrix row")
+  assert(!file.includes("selfHosted:"), "self-hosted matrix labels remain")
 })
 
 await test("every main PR runs the full Linux unit and Linux/Windows E2E gates", () => {
@@ -93,50 +61,39 @@ await test("every main PR runs the full Linux unit and Linux/Windows E2E gates",
   const unit = file.slice(file.indexOf("\n  unit-tests:"), file.indexOf("\n  e2e-tests:"))
   const e2e = file.slice(file.indexOf("\n  e2e-tests:"))
   assert(unit.includes("name: Unit Tests (${{ matrix.settings.name }})"), "Linux unit status check")
-  for (const step of ["GITHUB_ACTIONS=false bun turbo test", "go test ./...", "bun run test:httpapi:ci"])
+  for (const step of [
+    "GITHUB_ACTIONS=false bun turbo test --concurrency=1",
+    "go test ./...",
+    "bun run test:httpapi:ci",
+  ])
     assert(unit.includes(step), `unit gate: ${step}`)
   assert(!/^    if:/m.test(e2e.slice(0, e2e.indexOf("    strategy:"))), "E2E job must run on every triggered PR")
-  for (const name of ["linux", "windows"])
-    assert(e2e.includes(`- name: ${name}\n`), `${name} E2E matrix entry`)
+  for (const name of ["linux", "windows"]) assert(e2e.includes(`- name: ${name}\n`), `${name} E2E matrix entry`)
   assert(e2e.includes("run: bun --cwd packages/app test:e2e:local"), "Playwright E2E gate")
 })
 
-await test("self-hosted Linux jobs never require sudo: prerequisites are checked and fail actionably", () => {
+await test("hosted Linux jobs install missing prerequisites and Playwright dependencies", () => {
   const file = workflow("ci-test.yml")
-  assert(!file.includes("run: sudo apt-get"), "a step still installs with sudo directly")
-  assert(file.includes('if [ "$RUNNER_ENVIRONMENT" = "self-hosted" ]; then'), "ripgrep self-hosted branch")
+  assert(file.includes("if command -v rg >/dev/null 2>&1; then"), "ripgrep prerequisite check")
+  assert(file.includes("sudo apt-get update && sudo apt-get install -y ripgrep"), "hosted ripgrep install")
+  assert(!file.includes("RUNNER_ENVIRONMENT"), "self-hosted prerequisite branch remains")
   assert(
-    file.includes(
-      "::error::ripgrep (rg) is required but missing on this self-hosted runner. Provision it on the host; CI jobs run without sudo.",
-    ),
-    "ripgrep actionable failure",
+    file.includes("steps.evidence.outputs.reused != 'true' && (runner.os == 'Linux')"),
+    "Linux Playwright dependencies are installed",
   )
-  assert(
-    file.includes("(runner.environment == 'github-hosted')"),
-    "Playwright system dependencies install on hosted runners only",
-  )
-  assert(
-    file.includes("(runner.environment == 'self-hosted')"),
-    "Playwright Chromium verification runs on self-hosted runners",
-  )
-  assert(
-    file.includes(
-      "::error::Chromium cannot start on this self-hosted runner. Provision the Playwright Chromium system dependencies on the host; CI jobs run without sudo.",
-    ),
-    "Playwright actionable failure",
-  )
+  assert(!file.includes("runner.environment == 'self-hosted'"), "self-hosted Chromium check remains")
 })
 
-await test("manual release routes trusted Linux and Windows work while keeping macOS hosted", () => {
+await test("manual release routes every platform to GitHub-hosted runners", () => {
   const file = workflow("release-fork.yml")
 
   assert(!file.includes("pull_request:"), "release workflow must not accept pull request code")
   assert(file.includes("if: github.event_name == 'workflow_dispatch'"), "release work is not dispatch-gated")
-  assert(file.includes("runner: [self-hosted, Linux, X64]"), "Linux build route")
-  assert(file.includes("runner: [self-hosted, Windows, X64]"), "Windows build route")
-  assert(file.includes("runner: macos-latest"), "macOS hosted route")
-  assert.equal(file.split("runs-on: [self-hosted, Linux, X64]").length - 1, 5, "trusted Linux jobs")
-  assert(!file.includes("runs-on: ubuntu-latest"), "trusted Linux job left on a hosted runner")
+  assert(file.includes("runner: ubuntu-latest"), "Linux build route")
+  assert(file.includes("runner: windows-latest"), "Windows build route")
+  assert(file.includes("runner: macos-latest"), "macOS build route")
+  assert.equal(file.split("runs-on: ubuntu-latest").length - 1, 5, "Linux jobs use hosted runners")
+  assert(!file.includes("self-hosted"), "self-hosted release route remains")
 })
 
 await test("manual releases reject non-main refs and publish stable artifacts only", () => {
@@ -263,7 +220,10 @@ await test("release publication uses an anonymous fail-closed Linux bootstrap", 
 
   assert(publishSetup, "publish bootstrap missing")
   assert(publishSetup.includes('GH_CLI_VERSION: "2.101.0"'), "inline version pin")
-  assert(publishSetup.includes("9bca2d1c16825f109907a23307628a2f0698fbf99662b73a5cf0b020293072b8"), "inline Linux SHA pin")
+  assert(
+    publishSetup.includes("9bca2d1c16825f109907a23307628a2f0698fbf99662b73a5cf0b020293072b8"),
+    "inline Linux SHA pin",
+  )
   assert(publishSetup.includes('"${RUNNER_OS:-}" != "Linux"'), "inline OS rejection")
   assert(publishSetup.includes('"${RUNNER_ARCH:-}" != "X64"'), "inline architecture rejection")
   assert(!publishSetup.includes("GH_TOKEN"), "bootstrap step must not receive GH_TOKEN")

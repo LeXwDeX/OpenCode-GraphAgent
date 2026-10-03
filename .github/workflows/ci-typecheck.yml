@@ -9,12 +9,7 @@
 #           state-machine and persistence changes before they merge to main.
 # Notes   : No push trigger on feat/* or fix/* (frequent changes); PRs cover
 #           them.
-# Trust   : push, manual dispatch and same-repository pull requests use the
-#           repository self-hosted Linux runner; fork pull requests and
-#           dependabot keep GitHub-hosted runners. Routing is exposure
-#           reduction, not a security boundary (a fork PR runs its own copy of
-#           this workflow), so the self-hosted services stay stopped until the
-#           repository admission policy is accepted.
+# Runners : All events use GitHub-hosted Ubuntu runners.
 # ============================================================================
 
 name: 🔍 CI · Typecheck
@@ -37,9 +32,7 @@ permissions:
 jobs:
   typecheck:
     name: Typecheck
-    # Trusted events only; GitHub-hosted remains the fallback for fork pull
-    # requests and dependabot.
-    runs-on: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]' && github.actor != 'dependabot[bot]')) && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
@@ -56,7 +49,7 @@ jobs:
         with:
           check: typecheck
           job-name: Typecheck
-          runner-label: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]' && github.actor != 'dependabot[bot]')) && 'self-hosted,Linux,X64' || 'ubuntu-latest' }}
+          runner-label: ubuntu-latest
 
       - name: Setup Bun
         if: steps.evidence.outputs.reused != 'true'
