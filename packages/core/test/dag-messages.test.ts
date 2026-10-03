@@ -394,15 +394,23 @@ describe("durable DAG agent mailboxes", () => {
         yield* db.run(sql`ALTER TABLE workflow_node DROP COLUMN captured_output_present`)
         yield* db.run(sql`ALTER TABLE workflow_node DROP COLUMN captured_snapshot_id`)
         yield* db.run(
-          sql`DELETE FROM migration WHERE id IN ('20261002224523_dag_agent_messages','20261003000100_dag_capture_presence')`,
+          sql`DELETE FROM migration WHERE id IN (
+            '20261002224523_dag_agent_messages',
+            '20261002233822_dag_result_nudge',
+            '20261003000100_dag_capture_presence'
+          )`,
         )
         yield* DatabaseMigration.apply(db)
         yield* DatabaseMigration.apply(db)
         expect(
           yield* db.get(sql`SELECT status,captured_output,captured_output_present FROM workflow_node WHERE id = 'n'`),
         ).toEqual({ status: "running", captured_output: "null", captured_output_present: 1 })
+        const columns = yield* db.all<{ name: string }>(sql`PRAGMA table_info(agent_mailbox)`)
+        expect(columns.map((column) => column.name)).toContain("result_nudge_revision")
         const messages = yield* DagMessages.Service
         expect(value(yield* messages.send(parent, request())).state).toBe("queued")
+        expect(value(yield* messages.claimResultNudge(child, 1))).toBe(true)
+        expect(value(yield* messages.claimResultNudge(child, 1))).toBe(false)
       }).pipe(Effect.orDie),
     ))
   test("rejects foreign session, project/directory impersonation and peer sends", async () =>
