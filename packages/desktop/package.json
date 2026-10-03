@@ -14,7 +14,7 @@
     "predev": "bun ./scripts/predev.ts",
     "dev": "electron-vite dev",
     "prebuild": "bun ./scripts/prebuild.ts",
-    "build": "electron-vite build",
+    "build": "bun ./scripts/build.ts",
     "preview": "electron-vite preview",
     "verify:runtime-assets": "bun ./scripts/verify-runtime-assets.ts",
     "package": "bun run verify:runtime-assets && electron-builder --config electron-builder.config.ts",

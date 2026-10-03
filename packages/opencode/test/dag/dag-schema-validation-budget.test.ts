@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test"
+import { Worker } from "node:worker_threads"
 import { Effect, Exit, Fiber, Layer } from "effect"
 import {
   clearCaptureSlot,
@@ -22,19 +23,17 @@ afterEach(() => clearCaptureSlot(session))
 
 /** Observe admission without starting a competing validation or adding a runtime API. */
 function observeWorkerPost() {
-  const NativeWorker = globalThis.Worker
+  const original = Object.getOwnPropertyDescriptor(Worker.prototype, "postMessage")
+  if (!original || typeof original.value !== "function") throw new Error("Worker postMessage is unavailable")
   const posted = Promise.withResolvers<void>()
-  globalThis.Worker = class extends NativeWorker {
-    override postMessage(message: unknown, options?: Transferable[] | StructuredSerializeOptions) {
-      if (Array.isArray(options)) super.postMessage(message, options)
-      else super.postMessage(message, options)
-      posted.resolve()
-    }
+  Worker.prototype.postMessage = function (...args: Parameters<Worker["postMessage"]>) {
+    original.value.apply(this, args)
+    posted.resolve()
   }
   return {
     ready: Effect.promise(() => posted.promise).pipe(Effect.timeout("2 seconds")),
     restore: () => {
-      globalThis.Worker = NativeWorker
+      Object.defineProperty(Worker.prototype, "postMessage", original)
     },
   }
 }
@@ -126,16 +125,14 @@ describe("bounded schema validation", () => {
       payload: null,
     })
   })
-  test("an unexpected silent worker exit still produces a finite deadline result", async () => {
-    const url = URL.createObjectURL(new Blob(["onmessage = () => process.exit(0)"], { type: "text/javascript" }))
-    try {
-      const result = await validateInWorker({}, null, new AbortController().signal, 30, url)
-      expect(result).toMatchObject({ ok: false })
-      if (result.ok) throw new Error("expected worker exit deadline")
-      expect(result.error).toContain("host resource budget")
-    } finally {
-      URL.revokeObjectURL(url)
-    }
+  test("an unexpected silent worker exit produces an explicit finite failure", async () => {
+    const url = new URL(
+      'data:text/javascript,import {parentPort} from "node:worker_threads";parentPort.on("message",()=>process.exit(0))',
+    )
+    const result = await validateInWorker({}, null, new AbortController().signal, 250, url)
+    expect(result).toMatchObject({ ok: false })
+    if (result.ok) throw new Error("expected worker exit failure")
+    expect(result.error).toContain("worker exited before returning a result")
     expect(await validateInWorker({ type: "null" }, null, new AbortController().signal)).toEqual({
       ok: true,
       payload: null,

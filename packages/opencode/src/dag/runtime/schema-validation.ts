@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: 2026 LeXwDeX
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-declare const OPENCODE_SCHEMA_VALIDATION_WORKER_PATH: string
+import { Worker } from "node:worker_threads"
+
+declare const OPENCODE_SCHEMA_VALIDATION_WORKER_PATH: string | URL
+declare const OPENCODE_SCHEMA_VALIDATION_WORKER_RELATIVE: boolean
 
 // Host resource budget, including worker startup and both provider spellings.
 // This is independent of the workflow's model deadline.
@@ -25,7 +28,7 @@ export function validateInWorker(
       settled = true
       if (timer !== undefined) clearTimeout(timer)
       signal.removeEventListener("abort", cancel)
-      worker?.terminate()
+      void worker?.terminate()
       resolve(result)
     }
     const cancel = () => finish({ ok: false, error: "schema validation cancelled" })
@@ -36,17 +39,25 @@ export function validateInWorker(
       budgetMS,
     )
     try {
-      const target =
+      const configured =
         typeof OPENCODE_SCHEMA_VALIDATION_WORKER_PATH !== "undefined"
           ? OPENCODE_SCHEMA_VALIDATION_WORKER_PATH
           : new URL("./schema-validation-worker.ts", import.meta.url)
-      worker = new Worker(workerTarget ?? target)
-      worker.onmessage = (event: MessageEvent<Validation>) => finish(event.data)
-      worker.onerror = (event) => {
-        event.preventDefault()
-        finish({ ok: false, error: `schema validation worker failed: ${event.message}` })
-      }
-      worker.onmessageerror = () => finish({ ok: false, error: "schema validation worker response could not be read" })
+      const target =
+        typeof OPENCODE_SCHEMA_VALIDATION_WORKER_RELATIVE !== "undefined" && OPENCODE_SCHEMA_VALIDATION_WORKER_RELATIVE
+          ? new URL(configured, import.meta.url)
+          : configured
+      worker = new Worker(workerTarget ?? target, { execArgv: [] })
+      worker.on("message", (result: Validation) => finish(result))
+      worker.on("error", (error: Error) =>
+        finish({ ok: false, error: `schema validation worker failed: ${error.message}` }),
+      )
+      worker.on("messageerror", () =>
+        finish({ ok: false, error: "schema validation worker response could not be read" }),
+      )
+      worker.on("exit", (code) =>
+        finish({ ok: false, error: `schema validation worker exited before returning a result (${code})` }),
+      )
       worker.postMessage({ schema, payload })
     } catch (error) {
       finish({ ok: false, error: `schema validation worker failed: ${String(error)}` })

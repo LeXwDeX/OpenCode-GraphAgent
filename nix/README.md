@@ -6,12 +6,18 @@ and package builds check the installed executables. The desktop package uses
 its own exact Electron pin from `packages/desktop/package.json`; its embedded
 Node runtime is independent of the development Node pin.
 
+Desktop builds use the same `bun run build` entrypoint locally, in CI and in
+Nix. Its wrapper checks the repository's exact Bun and Node pins, resolves
+electron-vite from the installed package and gives
+the build's Node process a 4096 MiB old-space budget, preserving other caller
+`NODE_OPTIONS` flags. This budget covers Rollup parsing the bundled backend;
+it does not change the packaged Electron application's runtime heap.
+
 The reviewed [`nixpkgs-unstable` input](https://github.com/NixOS/nixpkgs/tree/c9fe7d12cd78d1adcd12dd15e24432dde5b155a0)
 provides Bun 1.4.2, Node 24.21.0 and Go 1.27.1. Nixpkgs 26.11 removed Intel
 macOS support. Only `x86_64-darwin` therefore selects the official
 [26.05 Darwin input](https://github.com/NixOS/nixpkgs/tree/68e5b9f7e82a76a5171d10b5d316e0ae5e1df6e9),
-which supplies the same Node and Go pins and receives upstream support through
-2026. That platform calls the current official Bun recipe with the legacy
+which supplies the same Node and Go pins and receives upstream support through 2026. That platform calls the current official Bun recipe with the legacy
 Darwin toolchain and the upstream Intel baseline archive. This is specific to
 Nix packaging; it does not change the ordinary CLI installer platform contract.
 

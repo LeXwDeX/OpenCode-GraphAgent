@@ -1,13 +1,15 @@
 // SPDX-FileCopyrightText: 2026 LeXwDeX
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { validateAgainstSchema } from "./schema-validator"
+import { parentPort } from "node:worker_threads"
+import { validateAgainstSchema } from "./schema-validator.ts"
 
-declare const self: Worker
+const port = parentPort
+if (!port) throw new Error("schema validation worker requires a parent port")
 
-self.onmessage = (event: MessageEvent<{ schema: Record<string, unknown>; payload: unknown }>) => {
-  const { schema } = event.data
-  let payload = event.data.payload
+port.on("message", (input: { schema: Record<string, unknown>; payload: unknown }) => {
+  const { schema } = input
+  let payload = input.payload
   let result = validateAgainstSchema(payload, schema)
   // Some providers stringify the JSON payload. Preserve the tool's existing
   // repair, within the same resource budget as the first validation.
@@ -21,5 +23,5 @@ self.onmessage = (event: MessageEvent<{ schema: Record<string, unknown>; payload
     }
     if (parsed) result = validateAgainstSchema(payload, schema)
   }
-  self.postMessage({ ...result, payload })
-}
+  port.postMessage({ ...result, payload })
+})

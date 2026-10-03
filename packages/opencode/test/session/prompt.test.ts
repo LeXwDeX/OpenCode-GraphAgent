@@ -640,6 +640,132 @@ const seedAgentConversation = Effect.fn("test.seedAgentConversation")(function* 
   }
 })
 
+const answerPreparedAgentQuestion = Effect.fn("test.answerPreparedAgentQuestion")(function* (input: {
+  prepared: SessionPrompt.IdleAdmission
+  parentID: SessionID
+  parentCaller: DagMessages.Caller
+  question: string
+  childPrompt: ReturnType<SessionPrompt.Interface["prompt"]>
+  questionTimeout?: Duration.Input
+  beforeActivate?: Effect.Effect<unknown, Error>
+}) {
+  const mailbox = yield* DagMessages.Service
+  const status = yield* SessionStatus.Service
+  yield* Effect.addFinalizer(() => input.prepared.abort)
+  const child = yield* input.childPrompt.pipe(Effect.forkScoped)
+  const accepted = yield* pollWithTimeout(
+    mailbox
+      .receive(input.parentCaller)
+      .pipe(
+        Effect.map((received) =>
+          received.ok ? received.value.find((message) => message.content === input.question) : undefined,
+        ),
+      ),
+    "node question was never durably accepted",
+    input.questionTimeout,
+  )
+  expect(accepted.state).toBe("queued")
+  expect(yield* status.get(input.parentID)).toMatchObject({ type: "busy" })
+  if (input.beforeActivate) yield* input.beforeActivate
+  yield* input.prepared.activate
+  yield* input.prepared.result
+  const result = yield* Fiber.join(child)
+  expect(result.info.role).toBe("assistant")
+  if (result.info.role === "assistant") expect(result.info.error).toBeUndefined()
+  return accepted
+})
+
+it.instance("DAG prepared parent answers while its node is waiting without acknowledging a mailbox read", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const mailbox = yield* DagMessages.Service
+    const { parent, child, childCaller, parentCaller, workflowID } = yield* seedAgentConversation()
+    const question = "DAG_WAITING_NODE_QUESTION"
+    const answer = "DAG_PREPARED_PARENT_ANSWER"
+    const fromChild = (hit: { body: unknown }) => JSON.stringify(hit.body).includes("DAG_WAITING_CHILD")
+    const fromParent = (hit: { body: unknown }) => JSON.stringify(hit.body).includes("DAG_PREPARED_MAIN")
+    yield* llm.toolMatch(fromChild, "agent", {
+      params: {
+        action: "send",
+        workflow_id: workflowID,
+        recipient: "parent",
+        idempotency_key: "waiting-question",
+        content: question,
+      },
+    })
+    yield* llm.toolMatch(fromChild, "agent", {
+      params: { action: "receive", workflow_id: workflowID, wait_ms: 30_000 },
+    })
+    yield* llm.textMatch(fromChild, "Node received its answer")
+    yield* llm.toolMatch(fromParent, "agent", {
+      params: {
+        action: "send",
+        workflow_id: workflowID,
+        recipient: "node",
+        node_id: "worker",
+        attempt_id: DagMessages.nodeAttemptID(child.id, 0),
+        idempotency_key: "waiting-answer",
+        content: answer,
+      },
+    })
+    yield* llm.textMatch(fromParent, "Main answered")
+    const prepared = yield* prompt.prepareIfIdle({
+      sessionID: parent.id,
+      model: ref,
+      parts: [{ type: "text", text: "DAG_PREPARED_MAIN" }],
+    })
+    if (Option.isNone(prepared)) throw new Error("Synthetic main admission was unexpectedly busy")
+    const accepted = yield* answerPreparedAgentQuestion({
+      prepared: prepared.value,
+      parentID: parent.id,
+      parentCaller,
+      question,
+      childPrompt: prompt.prompt({
+        sessionID: child.id,
+        model: ref,
+        parts: [{ type: "text", text: "DAG_WAITING_CHILD" }],
+      }),
+      beforeActivate: pollWithTimeout(
+        sessions
+          .messages({ sessionID: child.id })
+          .pipe(
+            Effect.map((history) =>
+              history
+                .flatMap((message) => message.parts)
+                .some(
+                  (part) =>
+                    part.type === "tool" &&
+                    part.tool === "agent" &&
+                    part.state.status === "running" &&
+                    part.state.input.params &&
+                    record(part.state.input.params) &&
+                    part.state.input.params.action === "receive",
+                )
+                ? true
+                : undefined,
+            ),
+          ),
+        "node did not wait for the main answer",
+      ),
+    })
+    expect(accepted).toMatchObject({ sender: { sessionID: child.id }, recipient: { sessionID: parent.id } })
+    expect(yield* mailbox.receive(parentCaller)).toMatchObject({ value: [{ id: accepted.id, state: "delivered" }] })
+    expect(yield* mailbox.receive(childCaller)).toMatchObject({
+      value: [
+        { content: answer, state: "delivered", sender: { sessionID: parent.id }, recipient: { sessionID: child.id } },
+      ],
+    })
+    const inputs = (yield* llm.hits).filter(
+      (hit) => !JSON.stringify(hit.body).includes("Generate a title for this conversation"),
+    )
+    expect(inputs.filter(fromChild)).toHaveLength(3)
+    expect(inputs.filter(fromParent)).toHaveLength(2)
+    expect(JSON.stringify(inputs.filter(fromChild).at(-1)?.body)).toContain(answer)
+  }),
+)
+
 it.instance("DAG messages enter an actual model input once and receive does not acknowledge them", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig(providerCfg)
@@ -1262,25 +1388,41 @@ for (const modelID of ["qwen-max", "glm", "deepseek"]) {
         })
         expect(Option.isSome(prepared)).toBe(true)
         if (Option.isNone(prepared)) throw new Error("Synthetic main admission was unexpectedly busy")
-        yield* prompt.prompt({
-          sessionID: child.id,
-          model: selectedModel,
-          parts: [
-            {
-              type: "text",
-              text: `Use only agent. Read the main update in your context and ask its author a question before finishing: {"params":{"action":"send","workflow_id":${JSON.stringify(workflowID)},"recipient":"parent","idempotency_key":"live-question-glm","content":${JSON.stringify(question)}}}. Then finish briefly.`,
-            },
-          ],
+        const accepted = yield* answerPreparedAgentQuestion({
+          prepared: prepared.value,
+          parentID: parent.id,
+          parentCaller,
+          question,
+          questionTimeout: "60 seconds",
+          childPrompt: prompt.prompt({
+            sessionID: child.id,
+            model: selectedModel,
+            parts: [
+              {
+                type: "text",
+                text: `Use only agent. Read the main update in your context and ask its author a question before finishing: {"params":{"action":"send","workflow_id":${JSON.stringify(workflowID)},"recipient":"parent","idempotency_key":"live-question-glm","content":${JSON.stringify(question)}}}. Then finish briefly.`,
+              },
+            ],
+          }),
         })
-        expect(yield* (yield* SessionStatus.Service).get(parent.id)).toMatchObject({ type: "busy" })
-        yield* prepared.value.activate
-        yield* prepared.value.result
-        expect(yield* mailbox.receive(childCaller)).toMatchObject({
-          value: [{ state: "delivered" }, { content: answer, state: "queued" }],
+        expect(accepted).toMatchObject({
+          sender: { sessionID: child.id },
+          recipient: { sessionID: parent.id },
+          workflowID,
         })
+        expect(yield* mailbox.receive(parentCaller)).toMatchObject({ value: [{ id: accepted.id, state: "delivered" }] })
         yield* prompt.loop({ sessionID: child.id })
         expect(yield* mailbox.receive(childCaller)).toMatchObject({
-          value: [{ state: "delivered" }, { content: answer, state: "delivered" }],
+          value: [
+            { id: received.ok ? received.value[0]?.id : undefined, content, recipientSequence: 1, state: "delivered" },
+            {
+              content: answer,
+              recipientSequence: 2,
+              state: "delivered",
+              sender: { sessionID: parent.id },
+              recipient: { sessionID: child.id, attemptID: DagMessages.nodeAttemptID(child.id, 0) },
+            },
+          ],
         })
       }
       if (modelID === "deepseek") {
@@ -1297,19 +1439,38 @@ for (const modelID of ["qwen-max", "glm", "deepseek"]) {
             .filter((part) => part.type === "tool"),
         ).toHaveLength(0)
         const before = yield* mailbox.latestSnapshot(parentCaller)
-        const running = yield* prompt.prompt({
-          sessionID: parent.id,
-          model: { providerID: ProviderV2.ID.make(providerID), modelID: ModelV2.ID.make(modelID) },
-          parts: [{ type: "text", text: "Answer briefly without tools. If a new DAG agent update arrives, account for its context in your next answer." }],
-        }).pipe(Effect.forkChild)
-        yield* pollWithTimeout(mailbox.latestSnapshot(parentCaller).pipe(Effect.map((snapshot) =>
-          snapshot.ok && snapshot.value?.associated && (!before.ok || snapshot.value.id !== before.value?.id)
-            ? true : undefined,
-        )), "live main model input was never associated")
+        const running = yield* prompt
+          .prompt({
+            sessionID: parent.id,
+            model: { providerID: ProviderV2.ID.make(providerID), modelID: ModelV2.ID.make(modelID) },
+            parts: [
+              {
+                type: "text",
+                text: "Answer briefly without tools. If a new DAG agent update arrives, account for its context in your next answer.",
+              },
+            ],
+          })
+          .pipe(Effect.forkChild)
+        yield* pollWithTimeout(
+          mailbox
+            .latestSnapshot(parentCaller)
+            .pipe(
+              Effect.map((snapshot) =>
+                snapshot.ok && snapshot.value?.associated && (!before.ok || snapshot.value.id !== before.value?.id)
+                  ? true
+                  : undefined,
+              ),
+            ),
+          "live main model input was never associated",
+        )
         expect(yield* (yield* SessionStatus.Service).get(parent.id)).toMatchObject({ type: "busy" })
-        expect(yield* mailbox.send(childCaller, {
-          workflowID, idempotencyKey: "live-late-deepseek", content: "LIVE_LATE_UPDATE: the node verified its output",
-        })).toMatchObject({ ok: true })
+        expect(
+          yield* mailbox.send(childCaller, {
+            workflowID,
+            idempotencyKey: "live-late-deepseek",
+            content: "LIVE_LATE_UPDATE: the node verified its output",
+          }),
+        ).toMatchObject({ ok: true })
         yield* Fiber.join(running)
         expect(yield* mailbox.receive(parentCaller)).toMatchObject({
           value: [{ content: "LIVE_LATE_UPDATE: the node verified its output", state: "delivered" }],

@@ -82,6 +82,7 @@ stdenv.mkDerivation (finalAttrs: {
     bun --bun ${./scripts/prime-desktop-assets.ts} ${runtimeArchive}
     cd packages/desktop
 
+    # The canonical desktop build applies its bounded Node heap budget here too.
     bun run build
     npx electron-builder --dir \
       --config electron-builder.config.ts \
