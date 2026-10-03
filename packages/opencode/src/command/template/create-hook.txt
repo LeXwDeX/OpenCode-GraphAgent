@@ -16,7 +16,7 @@ Load the `configure-hooks` skill first. It defines the 26 events, 5 hook types, 
 
 Ask the user for each field, one at a time:
 
-**Event** — choose one of the 26 events in the `configure-hooks` skill:
+**Event** — choose from the `configure-hooks` skill's 26-event list. It names all 26 events:
 
 - Tool lifecycle: `PreToolUse`, `PostToolUse`, `PostToolUseFailure`
 - Permission: `PermissionRequest`, `PermissionDenied`
