@@ -8,6 +8,41 @@ import { ModelsDev } from "@opencode-ai/core/models-dev"
 import { generateText, jsonSchema, type ModelMessage } from "ai"
 import { createAmazonBedrock } from "@ai-sdk/amazon-bedrock"
 
+describe("ProviderTransform.sortVariants", () => {
+  test("orders known reasoning efforts independently of insertion order", () => {
+    const variants = Object.fromEntries(
+      ["max", "medium", "ultra", "high", "low", "xhigh", "none", "minimal"].map((name) => [name, { effort: name }]),
+    )
+    const result = ProviderTransform.sortVariants(variants)
+
+    expect(Object.keys(result)).toEqual(["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"])
+    expect(Object.keys(variants)).toEqual(["max", "medium", "ultra", "high", "low", "xhigh", "none", "minimal"])
+    for (const name of Object.keys(variants)) expect(result[name]).toBe(variants[name])
+  })
+
+  test("keeps custom names in their relative order after known efforts", () => {
+    const variants = {
+      "custom-large": { budgetTokens: 8000 },
+      high: { effort: "high" },
+      "custom-small": { budgetTokens: 2000 },
+      low: { effort: "low" },
+    }
+
+    expect(Object.keys(ProviderTransform.sortVariants(variants))).toEqual([
+      "low",
+      "high",
+      "custom-large",
+      "custom-small",
+    ])
+  })
+
+  test("supports empty, single and custom-only variant sets", () => {
+    expect(ProviderTransform.sortVariants({})).toEqual({})
+    expect(ProviderTransform.sortVariants({ high: {} })).toEqual({ high: {} })
+    expect(Object.keys(ProviderTransform.sortVariants({ quality: {}, fast: {} }))).toEqual(["quality", "fast"])
+  })
+})
+
 describe("ProviderTransform.options - setCacheKey", () => {
   const sessionID = "test-session-123"
 

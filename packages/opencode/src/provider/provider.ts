@@ -1648,6 +1648,7 @@ export const layer = Layer.effect(
                 (v) => omit(v, ["disabled"]),
               )
             }
+            model.variants = ProviderTransform.sortVariants(model.variants)
           }
 
           if (Object.keys(provider.models).length === 0) {

@@ -1429,6 +1429,55 @@ it.instance(
 )
 
 it.instance(
+  "model variants are ordered by reasoning effort after config merging",
+  Effect.gen(function* () {
+    yield* set("ANTHROPIC_API_KEY", "test-api-key")
+    const providers = yield* list
+    const model = providers[ProviderV2.ID.anthropic].models["claude-sonnet-4-20250514"]
+    expect(Object.keys(model.variants!)).toEqual([
+      "none",
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+      "ultra",
+      "custom-large",
+      "custom-small",
+    ])
+    expect(model.variants!.high.thinking.budgetTokens).toBe(20000)
+    expect(model.variants!.max.thinking.budgetTokens).toBe(31999)
+    expect(model.variants!.minimal).toBeUndefined()
+    expect(model.variants!.low.reasoningEffort).toBe("low")
+    expect(model.variants!["custom-large"].budgetTokens).toBe(8000)
+    expect(model.variants!["custom-small"].budgetTokens).toBe(2000)
+  }),
+  {
+    config: {
+      provider: {
+        anthropic: {
+          models: {
+            "claude-sonnet-4-20250514": {
+              variants: {
+                ultra: { effort: "ultra" },
+                "custom-large": { budgetTokens: 8000 },
+                xhigh: { effort: "xhigh" },
+                medium: { effort: "medium" },
+                minimal: { disabled: true },
+                low: { reasoningEffort: "low" },
+                none: { thinking: { type: "disabled" } },
+                high: { thinking: { budgetTokens: 20000 } },
+                "custom-small": { budgetTokens: 2000 },
+              },
+            },
+          },
+        },
+      },
+    },
+  },
+)
+
+it.instance(
   "model variants can be customized via config",
   Effect.gen(function* () {
     yield* set("ANTHROPIC_API_KEY", "test-api-key")
