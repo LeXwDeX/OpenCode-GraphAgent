@@ -445,6 +445,70 @@ describe("message settlement through durable DAG events", () => {
         }),
       ),
     ))
+  test("submit_result fences slot replacement after validation before durable capture", async () =>
+    run(
+      Effect.gen(function* () {
+        yield* seed
+        const messages = yield* DagMessages.Service
+        const store = yield* DagStore.Service
+        const turn = MessageID.ascending()
+        yield* associate(turn)
+        const schema = { type: "object" }
+        registerCaptureSlot(child.sessionID, schema)
+        try {
+          const tool = yield* SubmitResultTool
+          const definition = yield* tool.init()
+          const context: Tool.Context = {
+            sessionID: SessionID.make(child.sessionID),
+            messageID: turn,
+            agent: "build",
+            abort: new AbortController().signal,
+            messages: [],
+            ask: () => Effect.void,
+            metadata: () => Effect.void,
+          }
+          const result = yield* definition.execute({ payload: {} }, context).pipe(
+            Effect.provideService(DagMessages.Service, {
+              ...messages,
+              revisions: (caller) =>
+                messages.revisions(caller).pipe(
+                  Effect.tap(() =>
+                    Effect.sync(() => {
+                      clearCaptureSlot(child.sessionID)
+                      registerCaptureSlot(child.sessionID, schema)
+                    }),
+                  ),
+                ),
+            }),
+          )
+          expect(result.metadata.captured).not.toBe(true)
+          expect((yield* store.getNode("dag_messages", "n"))?.capturedOutputPresent).toBe(false)
+        } finally {
+          clearCaptureSlot(child.sessionID)
+        }
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            Layer.mock(Agent.Service, {
+              get: () => Effect.succeed({ name: "build", mode: "all", permission: [], options: {} }),
+            }),
+            Layer.mock(Truncate.Service, {
+              output: (content: string) => Effect.succeed({ content, truncated: false }),
+            }),
+          ),
+        ),
+        Effect.provideService(InstanceRef, {
+          directory: process.cwd(),
+          worktree: process.cwd(),
+          project: {
+            id: ProjectV2.ID.make("p"),
+            worktree: process.cwd(),
+            sandboxes: [],
+            time: { created: 1, updated: 1 },
+          },
+        }),
+      ),
+    ))
   for (const action of ["cancel", "complete", "fail"] as const)
     test(`workflow ${action} atomically rejects child input and preserves accepted parent reports`, async () =>
       run(

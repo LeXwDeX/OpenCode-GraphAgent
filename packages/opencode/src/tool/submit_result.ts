@@ -1,13 +1,12 @@
 import * as Tool from "./tool"
 import DESCRIPTION from "./submit_result.txt"
 import { Effect, Option, Schema } from "effect"
-import { validatePayload, getCaptureSnapshot } from "@/dag/runtime/capture"
+import { validatePayloadAsync, isCaptureValidationCurrent, getCaptureSnapshot } from "@/dag/runtime/capture"
 import { DagStore } from "@opencode-ai/core/dag/store"
 import { DagMessages } from "@opencode-ai/core/dag/messages"
 import { InstanceState } from "@/effect/instance-state"
 
 const id = "submit_result"
-const parseJsonOption = Schema.decodeUnknownOption(Schema.UnknownFromJsonString)
 
 export const Parameters = Schema.Struct({
   payload: Schema.Unknown.annotate({
@@ -34,11 +33,9 @@ export const SubmitResultTool = Tool.define<typeof Parameters, Metadata, never>(
               metadata: {} as Metadata,
             }
           }
-          const initial = validatePayload(ctx.sessionID, params.payload)
-          const parsed =
-            !initial.ok && typeof params.payload === "string" ? parseJsonOption(params.payload) : Option.none()
-          const payload = Option.isSome(parsed) ? parsed.value : params.payload
-          const result = Option.isSome(parsed) ? validatePayload(ctx.sessionID, payload) : initial
+          const result = yield* Effect.promise((signal) =>
+            validatePayloadAsync(ctx.sessionID, params.payload, AbortSignal.any([signal, ctx.abort])),
+          )
           if (!result.ok) {
             if (result.notAvailable) {
               return {
@@ -54,9 +51,15 @@ export const SubmitResultTool = Tool.define<typeof Parameters, Metadata, never>(
               metadata: {} as Metadata,
             }
           }
+          const payload = result.payload
           let snapshotID = getCaptureSnapshot(ctx.sessionID)
           const messages = yield* Effect.serviceOption(DagMessages.Service)
-          const commit = () => storeOpt.value.setCapturedOutput(ctx.sessionID, payload, snapshotID).pipe(Effect.orDie)
+          const commit = () =>
+            Effect.gen(function* () {
+              if (ctx.abort.aborted || !isCaptureValidationCurrent(ctx.sessionID, result)) return false
+              yield* storeOpt.value.setCapturedOutput(ctx.sessionID, payload, snapshotID).pipe(Effect.orDie)
+              return true
+            })
           if (Option.isSome(messages)) {
             const instance = yield* InstanceState.context
             const caller = { projectID: instance.project.id, directory: instance.directory, sessionID: ctx.sessionID }
@@ -88,13 +91,18 @@ export const SubmitResultTool = Tool.define<typeof Parameters, Metadata, never>(
               },
               commit(),
             )
-            if (!result.ok)
+            if (!result.ok || !result.value)
               return {
                 title: "submit_result input changed",
-                output: `Submission was not captured (${result.reason}). Consume the current agent input before submitting an updated result. Previously completed tools remain recorded; do not repeat their writes.`,
+                output: `Submission was not captured (${result.ok ? "capture slot changed or cancelled" : result.reason}). Consume the current agent input before submitting an updated result. Previously completed tools remain recorded; do not repeat their writes.`,
                 metadata: {},
               }
-          } else yield* commit()
+          } else if (!(yield* commit()))
+            return {
+              title: "submit_result input changed",
+              output: "Submission was not captured because its capture slot changed or validation was cancelled.",
+              metadata: {},
+            }
           return {
             title: "Structured output submitted",
             output: "submit_result succeeded. Your structured output has been captured.",
