@@ -27,6 +27,20 @@ def output_hash(log, derivation):
     return actual
 
 
+def reviewed_inputs(lock, expected, legacy):
+    """Keep package pins and Nix's Bash input separate, resolving actual lock edges."""
+    nodes = lock["nodes"]
+    inputs = nodes[lock["root"]]["inputs"]
+    if inputs.get("nixpkgs") != ["nixpkgs-darwin"]:
+        raise RuntimeError("nix develop must resolve Bash from the supported Darwin input")
+    unstable = nodes[inputs["nixpkgs-unstable"]]["locked"]
+    darwin = nodes[inputs["nixpkgs-darwin"]]["locked"]
+    if unstable["rev"] != expected:
+        raise RuntimeError("flake.lock does not match the reviewed unstable nixpkgs revision")
+    if darwin["rev"] != legacy:
+        raise RuntimeError("Legacy Darwin input does not match the reviewed revision")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--system", required=True)
@@ -47,11 +61,8 @@ def main():
         raise RuntimeError("The runner must build its native platform; cross evaluation is not acceptance")
     expected = Path("nix/nixpkgs-revision").read_text().strip()
     lock = json.loads(Path("flake.lock").read_text())
-    if lock["nodes"]["nixpkgs"]["locked"]["rev"] != expected:
-        raise RuntimeError("flake.lock does not match the reviewed nixpkgs revision")
     legacy = Path("nix/nixpkgs-darwin-revision").read_text().strip()
-    if lock["nodes"]["nixpkgs-darwin"]["locked"]["rev"] != legacy:
-        raise RuntimeError("Legacy Darwin input does not match the reviewed revision")
+    reviewed_inputs(lock, expected, legacy)
     shutil.copyfile("flake.lock", evidence / "flake.lock")
     version_check = run("toolchain", ["nix", "develop", "--command", "node", "script/toolchain.mjs", "check", "--go"])
     if version_check.returncode:
@@ -69,7 +80,7 @@ def main():
     (evidence / "hashes.json").write_text(json.dumps(candidate, indent=2) + "\n")
     (evidence / "measurement.json").write_text(json.dumps({
         "system": args.system, "source_commit": os.environ.get("GITHUB_SHA"),
-        "nixpkgs_revision": expected, "nixpkgs_darwin_revision": legacy, "updater_derivation": drv.stdout,
+        "nixpkgs_unstable_revision": expected, "nixpkgs_darwin_revision": legacy, "updater_derivation": drv.stdout,
         "node_modules_hash": measured, "applied": args.apply,
     }, indent=2) + "\n")
     if args.apply:

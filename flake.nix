@@ -2,13 +2,16 @@
   description = "OpenCode development flake";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+    # nix develop resolves Bash through this conventional input, including on Intel Darwin.
+    nixpkgs.follows = "nixpkgs-darwin";
+    nixpkgs-unstable.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
     nixpkgs-darwin.url = "github:NixOS/nixpkgs/nixpkgs-26.05-darwin";
   };
 
   outputs =
-    { self, nixpkgs, nixpkgs-darwin, ... }:
+    { self, nixpkgs-unstable, nixpkgs-darwin, ... }:
     let
+      nixpkgs = nixpkgs-unstable;
       systems = [
         "aarch64-linux"
         "x86_64-linux"

@@ -1,6 +1,35 @@
 import base64
+import copy
 import unittest
-from verify_build import output_hash
+from verify_build import output_hash, reviewed_inputs
+
+
+class ReviewedInputsTest(unittest.TestCase):
+    def setUp(self):
+        self.lock = {"root": "root", "nodes": {
+            "root": {"inputs": {
+                "nixpkgs": ["nixpkgs-darwin"],
+                "nixpkgs-unstable": "packages",
+                "nixpkgs-darwin": "shell",
+            }},
+            "packages": {"locked": {"rev": "current"}},
+            "shell": {"locked": {"rev": "legacy"}},
+        }}
+
+    def test_resolves_input_edges_instead_of_assuming_lock_node_names(self):
+        reviewed_inputs(self.lock, "current", "legacy")
+
+    def test_rejects_the_unsupported_default_bash_input(self):
+        for target in ["packages", ["nixpkgs-unstable"]]:
+            lock = copy.deepcopy(self.lock)
+            lock["nodes"]["root"]["inputs"]["nixpkgs"] = target
+            with self.assertRaisesRegex(RuntimeError, "resolve Bash"):
+                reviewed_inputs(lock, "current", "legacy")
+
+    def test_rejects_changed_package_revisions(self):
+        for expected, legacy in [("stale", "legacy"), ("current", "stale")]:
+            with self.assertRaises(RuntimeError):
+                reviewed_inputs(self.lock, expected, legacy)
 
 
 class HashEvidenceTest(unittest.TestCase):

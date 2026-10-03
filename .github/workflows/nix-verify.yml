@@ -58,6 +58,7 @@ jobs:
           NIX_SYSTEM: ${{ matrix.system }}
           REGENERATE_HASHES: ${{ inputs.regenerate_hashes || false }}
         run: |
+          python3 nix/scripts/test_verify_build.py
           args=(--system "$NIX_SYSTEM")
           if [[ "$REGENERATE_HASHES" == true ]]; then args+=(--apply); fi
           python3 nix/scripts/verify_build.py "${args[@]}"

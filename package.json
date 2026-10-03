@@ -251,7 +251,9 @@
     "@pierre/trees": "1.0.0-beta.4",
     "@tanstack/virtual-core": "3.17.0",
     "bun-pty": "0.4.8",
-    "@types/hast": "catalog:"
+    "@types/hast": "catalog:",
+    "astro": "7.3.5",
+    "@astrojs/starlight": "0.41.11"
   },
   "patchedDependencies": {
     "@npmcli/agent@4.0.2": "patches/@npmcli%2Fagent@4.0.2.patch",

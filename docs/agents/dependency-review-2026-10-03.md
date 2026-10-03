@@ -232,7 +232,7 @@ The VS Code manifest now pins the same Bun 1.4.2 metadata and runs the repositor
 
 Final tracked lock SHA-256:
 
-- `bun.lock`: `654a6b438d1378cf5c9bd98542f725b8fdb4058c6eabf49ad961a756c309c753`
+- `bun.lock`: `1876b82eec8fd47e16984a69410034f3bd234013f08ffd6a3c398beaee603433`
 - `sdks/vscode/bun.lock`: `40f4a579ad9c1288f00443a7e1c000c847d73a1e75d6fa6d18bc8b8c2da43d33`
 
 CI test discovery follow-up:
@@ -248,3 +248,10 @@ Independent delivery review:
 - The shared validator passes with Bun 1.4.2, Node 24.21.0 and Go 1.27.1. Its eight Node tests pass. CI verification and browser jobs install the central Node pin before repository scripts; release jobs use the shared Bun action, which also installs and validates Node. Container build arguments read the same version sources.
 - [Official adapter metadata](https://registry.npmjs.org/marked-shiki/1.2.1) permits `marked-shiki` 1.2.1 with Shiki 4.4.3. A rendering probe passes through Marked 17 and that adapter, and Shiki 4.4.3 successfully executes the 3.23.0 notation diff, highlight and focus transformers. The version-number difference alone does not demonstrate a rendering regression; this probe does not claim complete transformer or browser coverage.
 - Stats Docker previously deleted its pruned lock and resolved dependencies again. The installer now retains Turbo's lock after workspace-glob normalization. An isolated Turbo 2.11.5 prune followed by the actual Bun 1.4.2 frozen production install succeeds (111 packages installed); its lock stays byte-identical, and all 549 pruned package records match records in the committed lock, including version, metadata, URL and integrity. Container build scripts do not contain a similar lock re-resolution step. Docker itself was unavailable, so this verifies dependency preparation rather than a completed container build.
+
+Astro peer graph follow-up:
+
+- Native Dependabot inspection found two Astro advisories whose ranges also matched an obsolete `toolbeam-docs-theme/astro@5.7.13` lock record and its Sharp 0.33.5 closure. The web host already pins Astro 7.3.5 and Starlight 0.41.11. A clean Bun 1.4.2 frozen install of the aggregate source resolves the theme to those host versions and installs no Astro 5; no exploitable old image-decoder or routing path was established. This is a peer-lock consistency repair, not a claim of a confirmed deployed vulnerability.
+- `toolbeam-docs-theme` 0.4.8 remains the latest published release and declares older peer ranges. Two ordinary exact root overrides now bind its peers to the already selected host versions. [Bun's documented override contract](https://bun.sh/docs/pm/overrides) applies root overrides to peers; ordinary rules preserve lock format version 1. Existing version, metadata, integrity and URL records are retained unchanged; Bun removes 167 obsolete package records and adds none. No release-age exception or validation gate is changed.
+- In isolated copies, both the original frozen graph (2,166 packages installed) and the repaired frozen graph (2,165 packages installed) complete the actual web package build with Node 24.21.0 and Bun 1.4.2. Each produces 649 HTML files, the Pagefind search index, sitemap and both configuration schemas. All 649 route/title/header/footer structures match, and both generated schema artifacts are byte-identical. The repaired lock remains byte-identical after a frozen recheck.
+- Wrangler logs and its local registry use private `XDG_CONFIG_HOME` and `WRANGLER_LOG_PATH` for these builds; the first attempt using default macOS preferences was blocked by the filesystem sandbox before prerendering. The successful runs keep the actual Cloudflare adapter and passthrough image configuration. Existing component-override, markdown-deprecation and chunk-size warnings remain; this proof does not certify every theme option, browser interaction or deployed artifact.
