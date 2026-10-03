@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 LeXwDeX
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 declare const OPENCODE_SCHEMA_VALIDATION_WORKER_PATH: string
 
 // Host resource budget, including worker startup and both provider spellings.
