@@ -4,7 +4,7 @@ description: Import hooks from Claude Code config to OpenCode hooks.json
 
 # Import Claude Hooks
 
-This command migrates hook configurations from Claude Code's `.claude/settings.json` files to OpenCode's dedicated `hooks.json` format. OpenCode no longer reads `.claude/` directories — this provides a one-time migration path.
+Migrate hooks from Claude Code's `.claude/settings.json` files to OpenCode's `hooks.json` format. OpenCode no longer reads `.claude/` directories. This command provides a one-time migration path.
 
 ## Process
 
@@ -79,17 +79,17 @@ Example migration:
   ]
 }
 ```
-Note: `${CLAUDE_PLUGIN_ROOT}` is a runtime placeholder that OpenCode will expand based on the hook's location. Since we're moving to `.opencode/`, the expansion will now point there.
+`${CLAUDE_PLUGIN_ROOT}` is a runtime placeholder. OpenCode expands it from the hook's location. After migration to `.opencode/`, it points there.
 
 #### Command-envelope compatibility (`inputFormat`)
 
-Claude Code hook scripts read `tool_name` values like `Bash`/`Read`/`Grep` and input keys like `file_path` from the hook stdin envelope. OpenCode's native envelope uses `bash`/`read`/`grep` and `filePath` instead. Command-type hooks can opt into Claude Code naming:
+Claude Code hook scripts read `tool_name` values such as `Bash`/`Read`/`Grep` and keys such as `file_path` from stdin. OpenCode uses `bash`/`read`/`grep` and `filePath`. Command hooks can opt into Claude Code naming:
 
-- For every approved hook with `"type": "command"`, add `"inputFormat": "claude-code"` to the migrated entry, unless the user explicitly chose (via the edit step) to adapt the script to native naming.
+- For each approved `"type": "command"` hook, add `"inputFormat": "claude-code"` unless the user chose during editing to adapt the script to OpenCode naming.
 - Only command hooks support this field — do not add it to `mcp` / `http` / `prompt` / `agent` entries.
 - Never modify previously existing entries already present in the target hooks.json; only entries imported in this run are tagged.
 
-Non-command hook types receive no such translation. For each imported `mcp` / `http` / `prompt` / `agent` entry, tell the user its envelope compatibility was NOT verified and must be evaluated manually — importing as-is is not a silent guarantee.
+Other hook types receive no translation. For each imported `mcp` / `http` / `prompt` / `agent` entry, warn that stdin-envelope compatibility was not verified and needs manual review. Do not imply that importing it verifies compatibility.
 
 ### 4. Write to hooks.json
 
@@ -98,7 +98,7 @@ Approved hooks go to:
 - **Global scope** (from `~/.claude/settings.json`): `~/.config/opencode/hooks.json`
 - **Project scope** (from `.claude/settings.json` or `.claude/settings.local.json`): `.opencode/hooks.json`
 
-Format: top-level event keys (NOT wrapped in `{"hooks": {...}}`). Each event maps to an array of matcher blocks; each block wraps an optional `matcher` and a `hooks` array:
+Use top-level event keys. Do not wrap them in `{"hooks": {...}}`. Each event maps to matcher blocks with an optional `matcher` and a `hooks` array:
 
 ```json
 {
@@ -133,7 +133,7 @@ After migration, report:
 - For every imported non-command hook: a warning that stdin-envelope compatibility was not verified and needs manual evaluation
 - Deprecation warnings (if hooks were found in .opencode/settings.json)
 - Reminder: "You can now safely delete .claude/ directories if you no longer use Claude Code with this project."
-- The imported hooks are now visible in the **Active Hooks** block of the system prompt (rendered dynamically each turn from the live `hooks.json` state) — no manual AGENTS.md update is needed. Visibility alone proves nothing about behavior: trigger the hook for real and confirm the expected stdin/output behavior before calling the migration done.
+- Imported hooks appear in the system prompt's **Active Hooks** block. It renders from live `hooks.json` state each turn, so no `AGENTS.md` update is needed. Visibility does not prove behavior. Trigger each hook and confirm its stdin and output before calling migration done.
 
 ## Hooks.json Format Reference
 
@@ -162,7 +162,7 @@ Each hook entry has:
 - `type`: `"command"` | `"mcp"` | `"http"` | `"prompt"` | `"agent"`
 - `command` / `url` / `prompt`: the hook action (field depends on type — `command` for command/mcp, `url` for http, `prompt` for prompt/agent)
 - `timeout`: optional seconds (default 60)
-- `inputFormat`: optional, command hooks only — `"opencode"` (default) or `"claude-code"` (translate envelope `tool_name`/`tool_input` toward Claude Code naming; contract in the `configure-hooks` skill)
+- `inputFormat`: optional, command hooks only — `"opencode"` (default) or `"claude-code"`. The latter maps envelope `tool_name`/`tool_input` toward Claude Code naming; see `configure-hooks` for the contract.
 
 Merge semantics: concat-append (hooks accumulate across layers and within a file, not replace).
 

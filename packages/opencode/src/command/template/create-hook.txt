@@ -4,11 +4,11 @@ description: Create a new hook interactively and write it to the correct hooks.j
 
 # Create Hook
 
-This command guides interactive authoring of a **single new hook entry** into the correct `hooks.json` file. It merge-appends (never overwrites) and validates the event name before writing.
+Interactively create one hook entry in the correct `hooks.json` file. Validate its event name, then merge-append it without overwriting existing entries.
 
 ## Prerequisites
 
-Load the `configure-hooks` skill first — it documents the canonical 26-event list, the 5 hook types, and the `hooks.json` format. Reference it instead of guessing event names or field shapes.
+Load the `configure-hooks` skill first. It defines the 26 events, 5 hook types, and `hooks.json` format. Use it for event names and field shapes.
 
 ## Process
 
@@ -16,7 +16,16 @@ Load the `configure-hooks` skill first — it documents the canonical 26-event l
 
 Ask the user for each field, one at a time:
 
-**Event** — one of the 26 valid events (see the `configure-hooks` skill for the full list). Tool lifecycle: `PreToolUse`, `PostToolUse`, `PostToolUseFailure`. Permission: `PermissionRequest`, `PermissionDenied`. Session: `Setup`, `SessionStart`, `SessionEnd`, `Stop`, `StopFailure`. Subagents: `SubagentStart`, `SubagentStop`. Prompt/compaction: `UserPromptSubmit`, `PreCompact`, `PostCompact`. Tasks: `TaskCreated`, `TaskCompleted`. MCP elicitation: `Elicitation`, `ElicitationResult`. Other: `Notification`, `ConfigChange`, `WorktreeCreate`, `WorktreeRemove`, `InstructionsLoaded`, `CwdChanged`, `FileChanged`.
+**Event** — choose one of the 26 events in the `configure-hooks` skill:
+
+- Tool lifecycle: `PreToolUse`, `PostToolUse`, `PostToolUseFailure`
+- Permission: `PermissionRequest`, `PermissionDenied`
+- Session: `Setup`, `SessionStart`, `SessionEnd`, `Stop`, `StopFailure`
+- Subagents: `SubagentStart`, `SubagentStop`
+- Prompt and compaction: `UserPromptSubmit`, `PreCompact`, `PostCompact`
+- Tasks: `TaskCreated`, `TaskCompleted`
+- MCP elicitation: `Elicitation`, `ElicitationResult`
+- Other: `Notification`, `ConfigChange`, `WorktreeCreate`, `WorktreeRemove`, `InstructionsLoaded`, `CwdChanged`, `FileChanged`
 
 **Reject invalid event names before doing anything else** — show the valid list and re-ask. Do NOT write the file for an unknown event.
 
@@ -49,7 +58,7 @@ For non-tool events, omit the matcher entirely.
 
 - `timeout` — seconds before the hook is killed (default 60)
 - `statusMessage` — short label shown in the UI while the hook runs
-- `inputFormat` (command hooks only) — `"opencode"` (default) or `"claude-code"`. Offer `"claude-code"` only when the script was written for Claude Code's hook stdin (expects `Bash`/`Read`/`Grep`-style tool names and `file_path`-style keys) and is being reused unchanged; see the `configure-hooks` skill's `inputFormat` section for the exact contract.
+- `inputFormat` (command hooks only) — `"opencode"` (default) or `"claude-code"`. Offer `"claude-code"` only for an unchanged script written for Claude Code's hook stdin. Such scripts expect `Bash`/`Read`/`Grep`-style tool names and `file_path`-style keys. See the `configure-hooks` skill for the contract.
 
 **Scope** — `project` or `global`:
 
@@ -58,7 +67,7 @@ For non-tool events, omit the matcher entirely.
 
 ### 2. Build the JSON entry
 
-Construct the hook entry matching the `hooks.json` format. The event key maps to an array of matcher blocks; each block has an optional `matcher` and a `hooks` array:
+Build the entry in `hooks.json` format. Each event key maps to an array of matcher blocks. Each block has an optional `matcher` and a `hooks` array:
 
 ```json
 {
@@ -89,7 +98,7 @@ For non-tool events, omit the `matcher` field:
 
 ### 3. Confirm with the user
 
-Show the complete JSON entry (including the event name, matcher block, and hook object) and ask for confirmation before writing. If the user wants changes, edit and re-show.
+Show the full JSON entry, including the event name, matcher block, and hook object. Ask for confirmation before writing. If the user requests changes, edit and show it again.
 
 ### 4. Write to hooks.json (merge-append)
 

@@ -1,6 +1,6 @@
 Create or update `AGENTS.md` for this repository.
 
-The goal is a compact instruction file that helps future OpenCode sessions avoid mistakes and ramp up quickly. Every line should answer: "Would an agent likely miss this without help?" If not, leave it out.
+Write a compact instruction file that helps future OpenCode sessions avoid mistakes. Keep a line only if an agent might otherwise miss it.
 
 User-provided focus or constraints (honor these):
 $ARGUMENTS
@@ -14,7 +14,7 @@ Read the highest-value sources first:
 - existing instruction files (`AGENTS.md`, `CLAUDE.md`, `.cursor/rules/`, `.cursorrules`, `.github/copilot-instructions.md`)
 - repo-local OpenCode config such as `opencode.json`
 
-If architecture is still unclear after reading config and docs, inspect a small number of representative code files to find the real entrypoints, package boundaries, and execution flow. Prefer reading the files that explain how the system is wired together over random leaf files.
+If config and docs do not clarify the architecture, inspect a few representative files. Find the real entrypoints, package boundaries, and execution flow. Prefer files that show how the system is wired over random leaf files.
 
 Prefer executable sources of truth over prose. If docs conflict with config or scripts, trust the executable source and only keep what you can verify.
 
@@ -60,6 +60,6 @@ Exclude:
 
 When in doubt, omit.
 
-Prefer short sections and bullets. If the repo is simple, keep the file simple. If the repo is large, summarize the few structural facts that actually change how an agent should work.
+Use short sections and bullets. For large repos, include only structural facts that change how an agent should work.
 
-If `AGENTS.md` already exists at `${path}`, improve it in place rather than rewriting blindly. Preserve verified useful guidance, delete fluff or stale claims, and reconcile it with the current codebase.
+If `${path}` already contains `AGENTS.md`, edit it in place. Keep verified guidance, remove fluff and stale claims, and align it with the current codebase.

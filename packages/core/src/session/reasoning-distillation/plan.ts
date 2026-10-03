@@ -51,19 +51,28 @@ const allowedPurposes = new Set<string>(ReasoningDistillationPolicy.allowedPurpo
 const defaultEstimateTokens = (text: string): number => Math.ceil(text.length / 4)
 
 /** Shared organizer contract for the overlap and self-witness failures observed in release acceptance. */
-export const COVERAGE_CONTRACT = `来源编号由程序绑定到原文的精确范围；sources、preserved、coverage.source 和 merge.witness 只引用 R 列出的编号，不生成字符偏移。
-coverage 必须将 R 的每个来源编号恰好覆盖一次，不重复、不遗漏。每段只选一种动作：
-- keep：用 claimID 指向 sources 包含该段的 claim；该段不再放入 preserved。
-- preserve：原文保留；coverage 的 preserve 段与 preserved 数组逐项一一对应，边界相同。全部提炼为 claims 时 preserved 为 []，不能把它当作原文备份。
-- merge：witness 是另一个来源编号；那一段必须已有 keep 或 preserve 项。禁止指向自身或其他 merge/drop 项。
-- drop：必须给出具体 reason；无价值噪声可丢弃，不能丢弃影响后续判断的信息。全部来源都是噪声时允许 claims=[]、preserved=[]，每段 coverage 均为 drop。
-claims 的 text/scope 只陈述 R 中的命题及适用范围，不加入整理器自身的权限或动作说明。`
+export const COVERAGE_CONTRACT = `程序将来源编号绑定到原文精确范围。sources、preserved、coverage.source、merge.witness 只引用 R 的编号，不生成字符偏移。
+coverage 对每个编号恰好覆盖一次。每段只选一种动作：
+- keep：claimID 指向 sources 含该段的 claim。该段不进入 preserved。
+- preserve：原文保留。coverage 的 preserve 项与 preserved 一一对应，边界相同。全部提炼为 claims 时 preserved=[]，不得用它备份原文。
+- merge：witness 指向另一编号，且该段已有 keep 或 preserve 项。不得指向自身、merge 或 drop 项。
+- drop：给出具体 reason。只丢弃无价值噪声，保留影响后续判断的信息。全部来源均为噪声时，claims=[]、preserved=[]，coverage 全为 drop。
+text/scope 只写 R 的命题及适用范围，不写整理器的权限或动作。`
 
-export const DENOISING_CONTRACT = `按语义去噪并合并重复命题，动态输出 0 到 N 条有用信息，不凑数量、不凑类别或栏目。最终文本只写仍有效且对未来行动有用的命题。已被明确纠正的猜测、误读和自我纠错过程连同其旧数值、旧选项及“旧猜测未执行”等附属否定一并删除；不要在最终结论后补述“先前误以为……”；这类旧内容可用带具体原因的 coverage drop 覆盖，不需要旧 claim 或 supersedes。保留有未来决策价值的最终约束、数值、否定、真实失败原因、回滚、未决不确定性和真实状态变化。不要把认知纠错误当成环境或执行状态变化；真实尝试、失败、回滚及其原因仍需保留。不同 scope 的命题不可混并；暂时性推测不得写成已验证事实。仅在旧判断本身仍对后续理解有意义时保留旧 claim 并使用 supersedes。中文原文可改写以去重，技术标识符必须逐字保留。`
+export const DENOISING_CONTRACT = `按语义去噪，合并重复命题。输出 0 到 N 条仍有效且对未来行动有用的信息，不凑数量、类别或栏目。
+删除明确纠正的猜测、误读、自我纠错，以及旧数值、旧选项和“旧猜测未执行”等附属否定。不补述“先前误以为……”。用有具体 reason 的 coverage drop 覆盖，无需旧 claim 或 supersedes。
+保留有未来决策价值的最终约束、数值、否定、真实尝试、失败、回滚及原因、未决不确定性和真实状态变化。认知纠错不是环境或执行状态变化。
+不同 scope 不合并。暂时性推测不得写成已验证事实。旧判断仍有后续理解价值时才保留旧 claim 并用 supersedes。
+中文原文可改写去重。技术标识符逐字保留。`
 
-export const REVIEW_RETENTION_CONTRACT = `独立对照完整 R 与最终发送文本，以未来行动所需的语义是否保留及去噪目标是否达到为准。允许删除重复、填充和已放弃的无价值推测，包括所有来源均为噪声而最终发送文本为空；若最终文本仍复述明确失效的猜测、旧数值、自我纠错或“旧猜测未执行”等附属否定，即使最终结论也正确，也判 retention contradicted。只有旧判断本身仍对未来行动有用时才保留取代关系。最终有效的约束、数值、否定、失败/回滚原因、未决不确定性、scope 和真实状态变化不可遗漏或改义；不能把真实失败/回滚当作纯认知噪声。只检查 claims 的逐条支持不足以判定整体保留；不能用 coverage 的 drop reason 代替独立核验。`
+export const REVIEW_RETENTION_CONTRACT = `独立对照完整 R 与最终发送文本，检查未来行动所需的语义和去噪结果。
+可删除重复、填充及已放弃的无价值推测。全部来源均为噪声时，最终文本可为空。
+最终文本若复述明确失效的猜测、旧数值、自我纠错或“旧猜测未执行”等附属否定，即使最终结论正确，也判 retention contradicted。旧判断仍有未来行动价值时才保留取代关系。
+不得遗漏或改变最终有效的约束、数值、否定、失败/回滚原因、未决不确定性、scope 和真实状态变化。真实失败/回滚不是认知噪声。
+逐条 claim 支持不能证明整体保留。coverage 的 drop reason 不能代替独立核验。`
 
-export const ORGANIZER_OUTPUT_FORMAT = `格式示例（只示意格式，不要求产出一条或任何固定类别；来源编号必须来自当前 R）：{"claims":[{"id":"c1","kind":"decision","text":"...","scope":"...","sources":["R0.0"],"evidence":[],"status":"unverified"}],"preserved":[],"coverage":[{"source":"R0.0","action":"keep","claimID":"c1"}]}。kind 取 fact/constraint/decision/rejection/assumption/state_delta；status 取 verified/unverified/assumed；supersedes 仅引用仍有意义且被真实取代的旧 claim ID。`
+export const ORGANIZER_OUTPUT_FORMAT = `格式示例（不限定数量或类别；来源编号取自当前 R）：{"claims":[{"id":"c1","kind":"decision","text":"...","scope":"...","sources":["R0.0"],"evidence":[],"status":"unverified"}],"preserved":[],"coverage":[{"source":"R0.0","action":"keep","claimID":"c1"}]}。
+kind 取 fact/constraint/decision/rejection/assumption/state_delta。status 取 verified/unverified/assumed。supersedes 只引用仍有意义且被真实取代的旧 claim ID。`
 
 /** Exact UTF-16 ranges include separators so coverage can be checked without model-counted offsets. */
 const sourceRanges = (text: string, slotIndex: number) => {

@@ -93,10 +93,10 @@ When a DAG is useful, these are possible phases to adapt to the remaining
 work. They are not a mandatory sequence, even for a large task:
 
 1. **Explore + brainstorm** — exploration nodes fan out over the codebase while independent generators propose approaches; a required synthesizer converges them into a design plus architecture inventory.
-2. **Design review gate** — an advanced-tier gate node (`report_to_parent: true`, normalized verdict `output_schema`) rules on the design. `required: true` fails the workflow only when the gate node fails to execute or satisfy its output contract; a successful `REVISE` or `REJECT` is a business verdict, not an execution failure. Route the static ACCEPT path through a downstream `condition`, and dispose of a reported non-ACCEPT verdict per the Verdict Disposal Contract.
+2. **Design review gate** — An advanced-tier gate (`report_to_parent: true`, normalized verdict `output_schema`) reviews the design. `required: true` fails the workflow only if the gate fails to execute or meet its output contract. A successful `REVISE` or `REJECT` is a business verdict, not an execution failure. Route the static ACCEPT path through a downstream `condition`. Handle a reported non-ACCEPT verdict under the Verdict Disposal Contract.
 3. **Parallel execution** — the accepted design decomposes into module-level worker nodes with disjoint write sets, fanning into a required assembler.
 4. **Verify + diff review + audit** — production assurance follows `implementation → verification(PASS) → diff review → final gate/audit` with fingerprint echo; `REJECT` routes through corrected implementation and verification before a new diff review. Progress tracking is updated to reflect what shipped.
-5. **Expansion decision** — iterate (bounded `control(replan)` of affected nodes), extend (additional parallel nodes in the same workflow), or complete (`control(complete)`). For failed work, prefer `control(recover)` to retry the affected subtree in place; cancelled workflows require explicit `resume_cancelled: true`. Start a continuation workflow only when the original cannot be adapted or recovered.
+5. **Expansion decision** — Iterate with bounded `control(replan)` on affected nodes, extend the workflow with parallel nodes, or complete it with `control(complete)`. For failed work, prefer `control(recover)` to retry the affected subtree in place. Cancelled workflows require `resume_cancelled: true`. Start a continuation workflow only if the original cannot be adapted or recovered.
 
 A well-specified task may need implementation and verification without separate
 exploration, design, or synthesis nodes. Existing evidence can remove whole
@@ -357,8 +357,8 @@ Workflows are not static. After creating a workflow, use `extend` and `control(r
 
 - **Scale up**: a node reports the work is larger than expected → `extend` with additional parallel nodes to split the load.
 - **Cut short**: a node proves the remaining work is unnecessary → `control(complete)` to early-complete and skip pending nodes.
-- **Redirect**: a gate or review reveals a wrong direction → `control(pause)` first to freeze scheduling, then `control(replan)` with `restart: true` on the affected nodes and `cancel: true` on their downstream dependents. A successful replan auto-resumes a paused workflow; issue `control(resume)` manually only when the replan output reports the automatic resume raced with another control op.
-- **Grant more time**: a node is still making progress but timeout-escalated → `control(extend_timeout)` with a larger `timeout_ms` to extend its deadline in place. This is the lightweight adjudication for a timeout escalation — no replan, no graph rewrite, no lost child session, no consumed replan attempt. Prefer it over `control(replan)` unless you must also change the graph.
+- **Redirect**: If a gate or review shows the workflow is going in the wrong direction, call `control(pause)` to freeze scheduling. Then call `control(replan)` with `restart: true` on affected nodes and `cancel: true` on their downstream dependents. A successful replan resumes the workflow automatically. Call `control(resume)` manually only if the output says automatic resume raced with another control operation.
+- **Grant more time**: If a node is progressing after a timeout escalation, call `control(extend_timeout)` with a larger `timeout_ms`. It extends the deadline in place. It uses no replan, graph rewrite, new child session, or replan attempt. Prefer it over `control(replan)` unless the graph must also change.
 
 Only nodes with `report_to_parent: true` produce intermediate parent
 checkpoints, and those reports are delivered at the next actionable wake
@@ -373,7 +373,7 @@ a reporting leaf naturally completed the graph).
 
 ### Escalation: change approach after repeated failures
 
-When the same node or workflow keeps failing — via `orchestrator_unresponsive` (state-based: the turn ended with the workflow left RUNNING and stalled; a rejected replan/extend parks it paused and recoverable rather than failed, and `control(pause)` before stopping to ask keeps it safe), a replan-attempt ceiling rejection, or repeated review failures — **change your approach** rather than retrying the identical plan. Try a different decomposition, a different model, a simpler prompt, or break the node into smaller steps. Repeating the same failing plan wastes budget without progress. Never cancel the whole graph merely to avoid an `orchestrator_unresponsive` verdict: pausing and asking the user is always safer than destroying in-flight work.
+**Change your approach** when a node or workflow repeatedly fails. Triggers include `orchestrator_unresponsive` (the turn ended with the workflow still RUNNING and stalled), a replan-attempt ceiling rejection, or repeated review failures. A rejected replan or extend parks the workflow as paused and recoverable, not failed. Call `control(pause)` before stopping to ask the user. Try a different decomposition, model, or prompt, or split the node into smaller steps. Repeating the same failing plan wastes budget. Never cancel the graph just to avoid `orchestrator_unresponsive`; pause and ask the user instead of destroying in-flight work.
 
 ### Crash recovery: a recovered workflow arrives paused
 
@@ -383,7 +383,7 @@ implicitly. The workflow then PAUSES instead of terminalizing, and you receive
 the failed-node wake. Downstream nodes stay `pending`, so the graph is still
 replannable. Available choices include:
 
-- **Recover (preferred for an unchanged graph)**: read `status` and call `control(recover)` with the failed `node_ids` and `expected_graph_rev`. It creates new attempts for the affected subtree and resumes scheduling. If prompts or topology must change, use the pause → replan path instead.
+- **Recover (preferred for an unchanged graph)**: Read `status`, then call `control(recover)` with the failed `node_ids` and `expected_graph_rev`. It creates attempts for the affected subtree and resumes scheduling. If prompts or topology must change, use pause → replan instead.
 - **Resume as-is**: accept the failure. A required-node failure terminalizes the workflow as `failed` (attributed to the node ids); optional failures degrade and continue.
 - **Cancel**: abandon the workflow.
 
@@ -572,7 +572,7 @@ checkpoint naturally completed the current graph; an early
 in a YAML file, then call
 `{ action: "extend", workflow_id: "dag_...", spec_path: "extend.yaml" }`.
 
-**status** — Read the durable state of one workflow and all of its nodes. Pass `workflow_id`. Use it when the user explicitly asks for current state or once before a decision that requires fresh state, such as replan/control. Do not poll a running workflow merely to wait: node reports and terminal outcomes wake the parent session automatically.
+**status** — Read durable state for one workflow and all its nodes. Pass `workflow_id`. Use it when the user asks for current state, or once before a decision that needs fresh state, such as replan or control. Do not poll just to wait; node reports and terminal outcomes wake the parent automatically.
 
 **result** — Read one node's complete durable output in bounded pages. Pass
 `workflow_id` and `node_id`; when the response is truncated, pass its
@@ -583,14 +583,14 @@ omitted content from its preview.
 
 **control** — Control a running workflow:
 
-- `pause` — let running nodes finish, don't spawn new ones (pause does NOT stop nodes that are already running). For a live graph, pause before composing a replan to prevent scheduling races. For explicit cancellation, use `cancel` directly.
-- `resume` — resume scheduling. Unneeded after a successful replan or extend: both auto-resume a paused workflow; resume manually only when their output reports the automatic resume raced with another control op and the workflow is still paused.
+- `pause` — Let running nodes finish and stop spawning new ones. Pause does not stop nodes already running. For a live graph, pause before composing a replan to prevent scheduling races. For explicit cancellation, use `cancel` directly.
+- `resume` — Resume scheduling. A successful replan or extend auto-resumes a paused workflow. Resume manually only if its output says automatic resume raced with another control operation and the workflow is still paused.
 - `cancel` — cancel the entire workflow
-- `recover` — retry selected `node_ids` and their downstream closure under the same workflow ID. Requires `expected_graph_rev` from status; stale revisions, unavailable reusable artifacts, and exhausted attempt/node budgets are rejected. Pause a live workflow first. Cancellation requires explicit `resume_cancelled: true`. Returns old-to-new attempt IDs and reused/preserved/superseded sets; unrelated pending work is preserved.
-- `replan` — put `fragment: { ... }` with the graph fields and node definitions in YAML and pass its `spec_path`; running nodes can be `restart: true` or `cancel: true`; pending nodes absent from the fragment are cancelled. Valid while paused — the pause → write file → replan sequence is the safe path: a successful replan auto-resumes the workflow, an explicit resume belongs only in the rare case the replan output reports the automatic resume raced with another control op and the workflow is still paused. A replan rejected by validation does NOT fail or cancel the workflow — it is parked paused and stays recoverable, so a validation rejection is never a reason to cancel the whole graph; fix the fragment (the diagnostic names the exact field) and replan again.
-- `extend_timeout` — grant a RUNNING node (typically one that timeout-escalated) more execution time WITHOUT a replan: pass `node_id` and a fresh `timeout_ms` (applied from now). It keeps the same child session and attempt, consumes no replan, rewrites no graph, and the deadline watcher self-heals to the new deadline. Refused for a healthy node whose deadline has not elapsed (`not_due` — this keeps the cumulative escalation cap meaningful) and for an escalation not yet delivered to you (`escalation_undelivered`). Prefer this over replan for a timeout escalation; reach for replan only when you must also change the graph.
+- `recover` — Retry selected `node_ids` and their downstream closure under the same workflow ID. Pass `expected_graph_rev` from `status`. The action is rejected for stale revisions, unavailable reusable artifacts, or exhausted attempt/node budgets. Pause a live workflow first. Cancellation requires `resume_cancelled: true`. The response lists old-to-new attempt IDs and reused/preserved/superseded sets. Unrelated pending work stays unchanged.
+- `replan` — Put `fragment: { ... }` with graph fields and node definitions in YAML, then pass `spec_path`. Set `restart: true` or `cancel: true` for running nodes. Pending nodes missing from the fragment are cancelled. Replan is valid while paused. Safest order: pause, write the file, then replan. Success resumes the workflow automatically. Resume manually only if output says automatic resume raced with another control operation and the workflow is still paused. Validation rejection does not fail or cancel the workflow; it stays paused and recoverable. Do not cancel the graph after rejection. Fix the field named by the diagnostic and replan.
+- `extend_timeout` — Give a RUNNING node (usually after timeout escalation) more time without a replan. Pass `node_id` and a fresh `timeout_ms`; the new deadline starts now. The node keeps its child session and attempt. No replan is consumed and the graph is unchanged. The deadline watcher updates to the new deadline. The action is refused for a healthy node whose deadline has not elapsed (`not_due`) and for an escalation not yet delivered (`escalation_undelivered`). Prefer this over replan for timeout escalation. Use replan only if the graph must also change.
 - `complete` — early-complete: remaining pending nodes are skipped (non-violation)
-- `step` — advance exactly one ready node (the first by node ID lexicographic order), then wait. Use for controlled debugging or staged verification of a critical path. Unlike `pause`, which freezes all scheduling, `step` advances one node and re-waits. A second `step` while the stepped node is still running is rejected. Use `resume` to return to full-speed scheduling. Nodes are selected in lexicographic ID order for determinism.
+- `step` — Advance exactly one ready node, selected by lexicographic node ID, then wait. Use it for controlled debugging or staged verification of a critical path. Unlike `pause`, it advances one node and waits again. A second `step` is rejected while that node is running. Use `resume` to restore full-speed scheduling. Lexicographic selection keeps the order deterministic.
 
 ### Node Fields
 

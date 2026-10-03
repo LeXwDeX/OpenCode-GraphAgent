@@ -4,6 +4,7 @@ import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { RUNTIME_CAPABILITIES } from "@opencode-ai/core/system-context/capabilities"
+import { DEFAULT_WRITING_STYLE } from "@opencode-ai/core/system-context/writing-style"
 import { SessionID } from "../../src/session/schema"
 import { RuntimeFlags } from "../../src/effect/runtime-flags"
 import { Plugin } from "../../src/plugin"
@@ -43,7 +44,14 @@ function fixture(providerName: string, modelName: string, npm: string) {
   }
   return {
     model,
-    provider: { id: providerID, name: providerName, source: "config", env: [], options: {}, models: {} } satisfies Provider.Info,
+    provider: {
+      id: providerID,
+      name: providerName,
+      source: "config",
+      env: [],
+      options: {},
+      models: {},
+    } satisfies Provider.Info,
   }
 }
 
@@ -86,6 +94,7 @@ describe("runtime capabilities in model requests", () => {
       Effect.gen(function* () {
         const prepared = yield* prepare(yield* request(provider, model, npm))
         expect(prepared.system.join("\n")).toContain(RUNTIME_CAPABILITIES)
+        expect(prepared.system.join("\n").split(DEFAULT_WRITING_STYLE)).toHaveLength(2)
         expect(prepared.messages[0]).toEqual({ role: "system", content: prepared.system[0] })
         expect(prepared.tools).toEqual({})
       }),
@@ -104,8 +113,10 @@ describe("runtime capabilities in model requests", () => {
       const system = prepared.system.join("\n")
       expect(system).toStartWith("Custom agent instructions.")
       expect(system).toContain(RUNTIME_CAPABILITIES)
+      expect(system.split(DEFAULT_WRITING_STYLE)).toHaveLength(2)
       expect(system).toContain("## Active Hooks")
       expect(system).toContain("User instructions.")
+      expect(system.indexOf(DEFAULT_WRITING_STYLE)).toBeLessThan(system.indexOf("User instructions."))
       expect(system.split("## GraphAgent / OpenCode capabilities")).toHaveLength(2)
     }),
   )
@@ -118,6 +129,7 @@ describe("runtime capabilities in model requests", () => {
         auth: { type: "oauth", access: "synthetic", refresh: "synthetic", expires: 0 },
       })
       expect(prepared.params.options.instructions).toContain(RUNTIME_CAPABILITIES)
+      expect(prepared.params.options.instructions).toContain(DEFAULT_WRITING_STYLE)
       expect(prepared.messages).toEqual(input.messages)
     }),
   )
@@ -127,6 +139,7 @@ describe("runtime capabilities in model requests", () => {
       const input = yield* request()
       const prepared = yield* prepare({ ...input, isWorkflow: true })
       expect(prepared.system.join("\n")).toContain(RUNTIME_CAPABILITIES)
+      expect(prepared.system.join("\n")).toContain(DEFAULT_WRITING_STYLE)
       expect(prepared.messages).toEqual(input.messages)
     }),
   )
@@ -135,6 +148,7 @@ describe("runtime capabilities in model requests", () => {
     Effect.gen(function* () {
       const prepared = yield* prepare({ ...(yield* request()), small: true })
       expect(prepared.system.join("\n")).not.toContain(RUNTIME_CAPABILITIES)
+      expect(prepared.system.join("\n")).toContain(DEFAULT_WRITING_STYLE)
     }),
   )
 })

@@ -29,22 +29,22 @@ export const FRESHNESS_THRESHOLD = 120_000
 export const GOAL_TURN_MAX_STEPS = 50
 
 export const JUDGE_SYSTEM_PROMPT = `You are an autonomous-goal completion judge.
-You will receive:
+You receive:
 1. The user's original goal.
 2. The agent's most recent response.
 
-Return ONLY a JSON object (no markdown, no explanation). Keep reason under 160 characters:
+Return only a JSON object. Do not add markdown or explanation. Keep the reason under 160 characters:
 {"verdict": "done" | "continue" | "blocked", "reason": "one sentence explanation"}
 
-"verdict" = "done" means ONE of:
-  - The agent explicitly confirmed the goal is complete with evidence.
-  - The goal produced a clear, verifiable deliverable (file created, test passed, etc.).
+Use "done" only when at least one condition is true:
+- The agent explicitly says the goal is complete and gives evidence.
+- The goal produced a clear, verifiable result, such as a created file or passing test.
 
-"verdict" = "blocked" means the agent cannot make progress without user input or an external-state change.
+Use "blocked" when progress requires user input or an external-state change.
 
-"verdict" = "continue" means the agent is still making progress or has more steps.
+Use "continue" while the agent is making progress or has more steps.
 
-Be conservative: if in doubt, return "verdict": "continue".`
+When unsure, choose "continue".`
 
 export const JUDGE_USER_PROMPT_TEMPLATE = `Goal: {goal}
 
@@ -65,7 +65,7 @@ Agent's most recent response (last {snippetChars} chars):
 {response}
 ---
 
-Is the goal done? Check every sub-goal against concrete evidence. Return only the verdict and one concise reason; do not list each sub-goal. Do not accept vague claims like "all requirements met".`
+Is the goal done? Check each sub-goal against concrete evidence. Return only the verdict and one short reason. Do not list sub-goals or accept vague claims such as "all requirements met".`
 
 export interface ContinuationInput {
   readonly goal: string
@@ -91,7 +91,7 @@ export function renderContinuation(input: ContinuationInput): string {
   if (input.lastJudgeReason) lines.push(`Judge feedback: ${input.lastJudgeReason}`)
   lines.push("")
   lines.push(
-    "You are in autonomous mode — interactive questions are disabled and will not receive answers. Do not ask the user for clarification or confirmation. Make all decisions independently based on your best judgment.",
+    "You are in autonomous mode. Interactive questions are disabled and will not receive answers. Do not ask the user for clarification or confirmation. Make decisions independently using your best judgment.",
   )
   lines.push("")
   lines.push("Continue working toward this goal. Take the next concrete step.")
