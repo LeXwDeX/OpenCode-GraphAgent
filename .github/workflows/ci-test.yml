@@ -13,12 +13,7 @@
 #           every push to `main`. Required status checks retain their names.
 # Notes   : `cancel-in-progress: false` — every main push gets a full run
 #           No trigger on feat/* or fix/* (frequent changes).
-# Trust   : push, manual dispatch and same-repository pull requests use the
-#           repository self-hosted Linux/Windows runners; fork pull requests
-#           and dependabot keep GitHub-hosted runners. Routing is exposure
-#           reduction, not a security boundary (a fork PR runs its own copy of
-#           this workflow), so the self-hosted services stay stopped until the
-#           repository admission policy is accepted.
+# Runners : All events use GitHub-hosted Ubuntu and Windows runners.
 # ============================================================================
 
 name: 🧪 CI · Test
@@ -56,16 +51,13 @@ jobs:
         settings:
           - name: linux
             host: ubuntu-latest
-            selfHosted: [self-hosted, Linux, X64]
           # windows dropped: this fork runs on free windows-latest runners
           # (not the paid Blacksmith 4vCPU hosts upstream uses), and the
           # opencode:test suite (3048 tests, many spawning real CLI
           # subprocesses) doesn't fit the standard runner's slower
           # process-spawn/IO within a reasonable CI budget. E2E Tests
           # (windows) is unaffected and still covers the platform.
-    # Trusted events only; GitHub-hosted remains the fallback for fork pull
-    # requests and dependabot.
-    runs-on: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]' && github.actor != 'dependabot[bot]')) && matrix.settings.selfHosted || matrix.settings.host }}
+    runs-on: ${{ matrix.settings.host }}
     defaults:
       run:
         shell: bash
@@ -87,7 +79,7 @@ jobs:
         with:
           check: unit
           job-name: Unit Tests (${{ matrix.settings.name }})
-          runner-label: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]' && github.actor != 'dependabot[bot]')) && join(matrix.settings.selfHosted, ',') || matrix.settings.host }}
+          runner-label: ${{ matrix.settings.host }}
 
       - name: Setup Go
         if: steps.evidence.outputs.reused != 'true' && (runner.os == 'Linux')
@@ -120,15 +112,9 @@ jobs:
         # tool.glob tests hit ripgrep; without the system binary, binary.ts
         # downloads rg from GitHub releases every run (temp XDG per preload),
         # gambling on network stability — ECONNRESET fails the test.
-        # GitHub-hosted runners install it with sudo; the self-hosted runner
-        # account has no sudo, so require host provisioning and fail clearly.
         run: |
           if command -v rg >/dev/null 2>&1; then
             exit 0
-          fi
-          if [ "$RUNNER_ENVIRONMENT" = "self-hosted" ]; then
-            echo "::error::ripgrep (rg) is required but missing on this self-hosted runner. Provision it on the host; CI jobs run without sudo."
-            exit 1
           fi
           sudo apt-get update && sudo apt-get install -y ripgrep
 
@@ -214,13 +200,9 @@ jobs:
         settings:
           - name: linux
             host: ubuntu-latest
-            selfHosted: [self-hosted, Linux, X64]
           - name: windows
             host: windows-latest
-            selfHosted: [self-hosted, Windows, X64]
-    # Trusted events only; GitHub-hosted remains the fallback for fork pull
-    # requests and dependabot.
-    runs-on: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]' && github.actor != 'dependabot[bot]')) && matrix.settings.selfHosted || matrix.settings.host }}
+    runs-on: ${{ matrix.settings.host }}
     env:
       PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/.playwright-browsers
     defaults:
@@ -245,7 +227,7 @@ jobs:
         with:
           check: e2e
           job-name: E2E Tests (${{ matrix.settings.name }})
-          runner-label: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]' && github.actor != 'dependabot[bot]')) && join(matrix.settings.selfHosted, ',') || matrix.settings.host }}
+          runner-label: ${{ matrix.settings.host }}
 
       - name: Setup Bun
         if: steps.evidence.outputs.reused != 'true'
@@ -271,11 +253,7 @@ jobs:
           key: ${{ runner.os }}-${{ runner.arch }}-playwright-${{ steps.playwright-version.outputs.version }}-chromium
 
       - name: Install Playwright system dependencies
-        # GitHub-hosted runners install the Chromium system libraries here.
-        # The self-hosted runner account has no sudo: the host is provisioned
-        # up front and the verification step below fails actionably when a
-        # library is missing.
-        if: steps.evidence.outputs.reused != 'true' && (runner.os == 'Linux') && (runner.environment == 'github-hosted')
+        if: steps.evidence.outputs.reused != 'true' && (runner.os == 'Linux')
         working-directory: packages/app
         run: bunx playwright install-deps chromium
 
@@ -283,18 +261,6 @@ jobs:
         if: steps.evidence.outputs.reused != 'true' && (steps.playwright-cache.outputs.cache-hit != 'true')
         working-directory: packages/app
         run: bunx playwright install chromium
-
-      - name: Verify Playwright Chromium dependencies
-        # Self-hosted only: execute the resolved browser so the dynamic loader
-        # proves every required system library is present. No sudo is used.
-        if: steps.evidence.outputs.reused != 'true' && (runner.os == 'Linux') && (runner.environment == 'self-hosted')
-        working-directory: packages/app
-        run: |
-          browser="$(node -e "process.stdout.write(require('@playwright/test').chromium.executablePath())")"
-          if ! "$browser" --version; then
-            echo "::error::Chromium cannot start on this self-hosted runner. Provision the Playwright Chromium system dependencies on the host; CI jobs run without sudo."
-            exit 1
-          fi
 
       - name: Verify DAG artifact storage on Windows
         if: steps.evidence.outputs.reused != 'true' && runner.os == 'Windows'

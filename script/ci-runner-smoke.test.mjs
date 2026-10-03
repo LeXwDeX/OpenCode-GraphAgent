@@ -2,7 +2,7 @@ import { test } from "node:test"
 import assert from "node:assert/strict"
 import { readFileSync } from "node:fs"
 
-// The dispatch-only probe for the repository-scoped self-hosted runners. It
+// The dispatch-only probe for GitHub-hosted runners. It
 // must never execute repository code, request a token, run on macOS or expose
 // anything beyond runner attribution, so every property below is asserted
 // against the workflow text directly (no YAML dependency).
@@ -29,18 +29,10 @@ await test("runner smoke is dispatch-only with a required linux/windows choice",
     assert(!trigger.includes(forbidden), `forbidden trigger: ${forbidden}`)
 })
 
-await test("runner smoke selects exactly one standard self-hosted platform per dispatch", () => {
+await test("runner smoke selects exactly one GitHub-hosted platform per dispatch", () => {
   const routes = workflow.split("\n").filter((line) => line.includes("runs-on:"))
   assert.equal(routes.length, 2, "one route per platform")
-  assert(
-    routes.some((line) => line.includes("[self-hosted, Linux, X64]")),
-    "linux labels",
-  )
-  assert(
-    routes.some((line) => line.includes("[self-hosted, Windows, X64]")),
-    "windows labels",
-  )
-  for (const line of routes) assert(!/macos|darwin|arm64/i.test(line), `macOS route: ${line.trim()}`)
+  assert.deepEqual(routes.map((line) => line.trim()).sort(), ["runs-on: ubuntu-latest", "runs-on: windows-latest"])
   assert(workflow.includes("if: inputs.platform == 'linux'"), "linux guard")
   assert(workflow.includes("if: inputs.platform == 'windows'"), "windows guard")
 })

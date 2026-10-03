@@ -63,7 +63,7 @@ jobs:
   version:
     name: Resolve GraphAgent Version
     if: github.event_name == 'workflow_dispatch'
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
       channel: ${{ steps.release-version.outputs.channel }}
@@ -107,7 +107,7 @@ jobs:
   package-templates:
     name: Package Reference Templates
     if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
       contents: read
@@ -178,11 +178,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: [self-hosted, Linux, X64]
+          - runner: ubuntu-latest
             name: linux
           - runner: macos-latest
             name: macos
-          - runner: [self-hosted, Windows, X64]
+          - runner: windows-latest
             name: windows
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
@@ -316,7 +316,7 @@ jobs:
     name: Prepare Release Candidate
     needs: [version, build-cli, package-templates]
     if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - name: Checkout Repository
@@ -415,7 +415,7 @@ jobs:
     name: Create GitHub Release
     needs: [version, prepare-release]
     if: inputs.create_release && github.ref == 'refs/heads/main'
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: write
@@ -487,7 +487,7 @@ jobs:
   register:
     name: Register Workflow
     if: github.event_name == 'push'
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Register Workflow

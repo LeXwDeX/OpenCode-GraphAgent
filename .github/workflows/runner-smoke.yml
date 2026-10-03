@@ -1,10 +1,9 @@
 # ============================================================================
 # Runner smoke
 # ----------------------------------------------------------------------------
-# Purpose : Dispatch-only probe for the repository-scoped self-hosted runners
-#           on 192.168.34.92 (Ubuntu) and 192.168.34.93 (Windows)
+# Purpose : Dispatch-only probe for GitHub-hosted runners
 # Trigger : Manual `workflow_dispatch` with a required linux/windows choice
-# Jobs    : exactly one platform job per dispatch, standard self-hosted labels
+# Jobs    : exactly one platform job per dispatch, standard GitHub-hosted labels
 # Notes   : no checkout, no third-party actions, no secrets and no token; each
 #           job is bounded to 10 minutes and reports runner/account identity
 #           and installed tool versions only.
@@ -16,7 +15,7 @@ on:
   workflow_dispatch:
     inputs:
       platform:
-        description: Platform to exercise on its self-hosted runner
+        description: Platform to exercise on its GitHub-hosted runner
         required: true
         type: choice
         options:
@@ -34,7 +33,7 @@ jobs:
   smoke-linux:
     name: Runner smoke (linux)
     if: inputs.platform == 'linux'
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions: {}
     steps:
@@ -71,7 +70,7 @@ jobs:
   smoke-windows:
     name: Runner smoke (windows)
     if: inputs.platform == 'windows'
-    runs-on: [self-hosted, Windows, X64]
+    runs-on: windows-latest
     timeout-minutes: 10
     permissions: {}
     steps:
