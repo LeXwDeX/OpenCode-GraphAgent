@@ -289,6 +289,7 @@ bun dev serve        # headless API 服务（端口 4096）
 
 ## 文档
 
+- [`docs/architecture.md`](./docs/architecture.md) —— 系统总览、客户端/API 边界与源码索引
 - [存盘工作流编写指南](./packages/core/src/plugin/skill/create-dag-workflow.md) —— `create-dag-workflow` skill 正文
 - [Graph Engineering 工作流目录](./.opencode/workflows/GRAPH-ENGINEERING.md) —— 参考拓扑与自适应协议
 - [`docs/harness-dag.md`](./docs/harness-dag.md) —— deep 模式准入与审查生命周期
