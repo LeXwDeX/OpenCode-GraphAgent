@@ -1,7 +1,7 @@
 ---
 import { Base64 } from "js-base64"
 import StarlightPage from "@astrojs/starlight/components/StarlightPage.astro"
-import type { Session } from "opencode/session/index"
+import type { Session } from "@opencode-ai/sdk/v2/types"
 import config from "../../../config.mjs"
 import Share from "../../components/Share.tsx"
 
@@ -72,7 +72,7 @@ const messages = {
 const id = Astro.params.id || ""
 const res = await fetch(`${apiUrl}/share_data?id=${id}`)
 const data = (await res.json()) as {
-  info?: Session.Info
+  info?: Session
   messages: Record<string, { role?: string; modelID?: string }>
 }
 

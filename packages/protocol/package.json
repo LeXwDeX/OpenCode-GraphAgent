@@ -8,7 +8,8 @@
     "./*": "./src/*.ts"
   },
   "scripts": {
-    "typecheck": "tsgo --noEmit"
+    "typecheck": "tsgo --noEmit",
+    "test": "bun test"
   },
   "dependencies": {
     "@opencode-ai/schema": "workspace:*",

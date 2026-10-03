@@ -89,20 +89,22 @@
     "compile-tests": "tsc -p . --outDir out",
     "watch-tests": "tsc -p . -w --outDir out",
     "pretest": "bun run compile-tests && bun run compile && bun run lint",
-    "check-types": "tsc --noEmit",
-    "lint": "eslint src",
-    "test": "vscode-test"
+    "check-types": "bun run toolchain:check && tsc --noEmit",
+    "lint": "bun run toolchain:check && eslint src",
+    "test": "bun run toolchain:check && vscode-test",
+    "toolchain:check": "node ../../script/toolchain.mjs check"
   },
   "devDependencies": {
-    "@types/vscode": "^1.94.0",
-    "@types/mocha": "^10.0.10",
-    "@types/node": "20.x",
-    "@typescript-eslint/eslint-plugin": "^8.31.1",
-    "@typescript-eslint/parser": "^8.31.1",
-    "eslint": "^9.25.1",
-    "esbuild": "^0.25.3",
-    "typescript": "^5.8.3",
-    "@vscode/test-cli": "^0.0.11",
-    "@vscode/test-electron": "^2.5.2"
-  }
+    "@types/vscode": "1.94.0",
+    "@types/mocha": "10.0.10",
+    "@types/node": "20.19.43",
+    "@typescript-eslint/eslint-plugin": "8.71.0",
+    "@typescript-eslint/parser": "8.71.0",
+    "eslint": "10.11.0",
+    "esbuild": "0.25.12",
+    "typescript": "5.9.3",
+    "@vscode/test-cli": "0.0.15",
+    "@vscode/test-electron": "2.5.2"
+  },
+  "packageManager": "bun@1.4.2"
 }

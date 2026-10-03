@@ -3,10 +3,11 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+    nixpkgs-darwin.url = "github:NixOS/nixpkgs/nixpkgs-26.05-darwin";
   };
 
   outputs =
-    { self, nixpkgs, ... }:
+    { self, nixpkgs, nixpkgs-darwin, ... }:
     let
       systems = [
         "aarch64-linux"
@@ -14,24 +15,43 @@
         "aarch64-darwin"
         "x86_64-darwin"
       ];
-      forEachSystem = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
+      forEachSystem = f: nixpkgs.lib.genAttrs systems (system:
+        let input = if system == "x86_64-darwin" then nixpkgs-darwin else nixpkgs;
+        in f (input.legacyPackages.${system}.extend toolchainOverlay));
       rev = self.shortRev or self.dirtyShortRev or "dirty";
+      toolchain = import ./nix/toolchain.nix { inherit (nixpkgs) lib; };
+      toolchainOverlay = final: prev: {
+        # nixpkgs omits Intel Darwin although Bun still publishes its baseline binary.
+        bun = if prev.stdenv.hostPlatform.system == "x86_64-darwin" then
+          (toolchain.requireVersion "bun" (prev.callPackage "${nixpkgs}/pkgs/by-name/bu/bun/package.nix" { })).overrideAttrs (old: {
+            src = final.fetchurl {
+              url = "https://github.com/oven-sh/bun/releases/download/bun-v1.4.2/bun-darwin-x64-baseline.zip";
+              hash = "sha256-utW71s8U0JgNEV9ZVMn/kE32GdXplNLaH/zNPzFjALA=";
+            };
+            meta = old.meta // { platforms = old.meta.platforms ++ [ "x86_64-darwin" ]; };
+          }) else prev.bun;
+      };
     in
     {
       devShells = forEachSystem (pkgs: {
         default = pkgs.mkShell {
-          packages = with pkgs; [
-            bun
-            nodejs_20
-            pkg-config
-            openssl
-            git
+          packages = [
+            (toolchain.requireVersion "bun" pkgs.bun)
+            (toolchain.requireVersion "node" pkgs.nodejs_24)
+            (toolchain.requireVersion "go" (pkgs.go_1_27 or pkgs.go))
+            pkgs.pkg-config
+            pkgs.openssl
+            pkgs.git
           ];
+          shellHook = ''
+            export GOTOOLCHAIN=local
+            node ${self}/script/toolchain.mjs check --go
+          '';
         };
       });
 
       overlays = {
-        default =
+        default = nixpkgs.lib.composeManyExtensions [ toolchainOverlay (
           final: _prev:
           let
             node_modules = final.callPackage ./nix/node_modules.nix {
@@ -45,7 +65,8 @@
             opencode-desktop = final.callPackage ./nix/desktop.nix {
               inherit opencode;
             };
-          };
+          }
+        ) ];
       };
 
       packages = forEachSystem (

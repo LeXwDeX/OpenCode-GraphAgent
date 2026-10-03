@@ -1,8 +1,8 @@
 #!/usr/bin/env bun
 
 import { $ } from "bun"
-import path from "path"
 import { fileURLToPath } from "url"
+import { checkToolchain, readToolchain } from "../../../script/toolchain.mjs"
 
 const rootDir = fileURLToPath(new URL("../../..", import.meta.url))
 process.chdir(rootDir)
@@ -11,11 +11,8 @@ const reg = process.env.REGISTRY ?? "ghcr.io/anomalyco"
 const tag = process.env.TAG ?? "24.04"
 const push = process.argv.includes("--push") || process.env.PUSH === "1"
 
-const root = path.join(rootDir, "package.json")
-const pkg = await Bun.file(root).json()
-const manager = pkg.packageManager ?? ""
-const bun = manager.startsWith("bun@") ? manager.slice(4) : ""
-if (!bun) throw new Error("packageManager must be bun@<version>")
+checkToolchain()
+const { bun, node, rust } = readToolchain()
 
 const images = ["base", "bun-node", "rust", "tauri-linux", "publish"]
 
@@ -49,25 +46,28 @@ for (const name of images) {
   if (name === "bun-node") {
     if (push) {
       console.log(
-        `docker buildx build --platform ${platform} -f ${file} -t ${image} --build-arg REGISTRY=${reg} --build-arg BUN_VERSION=${bun} --push .`,
+        `docker buildx build --platform ${platform} -f ${file} -t ${image} --build-arg REGISTRY=${reg} --build-arg BUN_VERSION=${bun} --build-arg NODE_VERSION=${node} --push .`,
       )
-      await $`docker buildx build --platform ${platform} -f ${file} -t ${image} --build-arg REGISTRY=${reg} --build-arg BUN_VERSION=${bun} --push .`
+      await $`docker buildx build --platform ${platform} -f ${file} -t ${image} --build-arg REGISTRY=${reg} --build-arg BUN_VERSION=${bun} --build-arg NODE_VERSION=${node} --push .`
     }
     if (!push) {
-      console.log(`docker build -f ${file} -t ${image} --build-arg REGISTRY=${reg} --build-arg BUN_VERSION=${bun} .`)
-      await $`docker build -f ${file} -t ${image} --build-arg REGISTRY=${reg} --build-arg BUN_VERSION=${bun} .`
+      console.log(
+        `docker build -f ${file} -t ${image} --build-arg REGISTRY=${reg} --build-arg BUN_VERSION=${bun} --build-arg NODE_VERSION=${node} .`,
+      )
+      await $`docker build -f ${file} -t ${image} --build-arg REGISTRY=${reg} --build-arg BUN_VERSION=${bun} --build-arg NODE_VERSION=${node} .`
     }
   }
   if (name !== "base" && name !== "bun-node") {
+    const args = name === "rust" ? ["--build-arg", `RUST_TOOLCHAIN=${rust}`] : []
     if (push) {
       console.log(
-        `docker buildx build --platform ${platform} -f ${file} -t ${image} --build-arg REGISTRY=${reg} --push .`,
+        `docker buildx build --platform ${platform} -f ${file} -t ${image} --build-arg REGISTRY=${reg} ${args.join(" ")} --push .`,
       )
-      await $`docker buildx build --platform ${platform} -f ${file} -t ${image} --build-arg REGISTRY=${reg} --push .`
+      await $`docker buildx build --platform ${platform} -f ${file} -t ${image} --build-arg REGISTRY=${reg} ${args} --push .`
     }
     if (!push) {
-      console.log(`docker build -f ${file} -t ${image} --build-arg REGISTRY=${reg} .`)
-      await $`docker build -f ${file} -t ${image} --build-arg REGISTRY=${reg} .`
+      console.log(`docker build -f ${file} -t ${image} --build-arg REGISTRY=${reg} ${args.join(" ")} .`)
+      await $`docker build -f ${file} -t ${image} --build-arg REGISTRY=${reg} ${args} .`
     }
   }
 

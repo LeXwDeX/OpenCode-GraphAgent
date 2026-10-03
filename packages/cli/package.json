@@ -13,7 +13,8 @@
   "scripts": {
     "build": "bun run script/build.ts",
     "dev": "bun run src/index.ts",
-    "typecheck": "tsgo --noEmit"
+    "typecheck": "tsgo --noEmit",
+    "test": "bun test"
   },
   "dependencies": {
     "@effect/platform-node": "catalog:",
@@ -23,7 +24,7 @@
     "@opencode-ai/tui": "workspace:*",
     "@opentui/core": "catalog:",
     "@opentui/solid": "catalog:",
-    "@parcel/watcher": "2.5.1",
+    "@parcel/watcher": "catalog:",
     "effect": "catalog:",
     "solid-js": "catalog:"
   },

@@ -6,13 +6,13 @@ let getLegacyTerminalStorageKeys: (dir: string, legacySessionID?: string) => str
 let migrateTerminalState: (value: unknown) => unknown
 
 beforeAll(async () => {
-  mock.module("@solidjs/router", () => ({
+  await mock.module("@solidjs/router", () => ({
     useNavigate: () => () => undefined,
     useParams: () => ({}),
     useLocation: () => ({}),
     useSearchParams: () => [{}, () => undefined],
   }))
-  mock.module("@opencode-ai/ui/context", () => ({
+  await mock.module("@opencode-ai/ui/context", () => ({
     createSimpleContext: () => ({
       use: () => undefined,
       provider: () => undefined,

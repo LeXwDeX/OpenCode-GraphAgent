@@ -49,7 +49,7 @@ function createOwner(callback: (owner: Owner) => void) {
 }
 
 beforeAll(async () => {
-  mock.module("@tanstack/solid-query", () => ({
+  await mock.module("@tanstack/solid-query", () => ({
     useQuery: (options: () => { queryKey?: unknown[]; enabled?: boolean }) => {
       querySingles.push(options)
       return {

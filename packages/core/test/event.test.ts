@@ -477,6 +477,70 @@ describe("EventV2", () => {
     }),
   )
 
+  it.effect("projects a repeated payload after an intervening event type", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const { db } = yield* Database.Service
+      const aggregateID = EventV2.ID.create()
+      const projected = new Array<[string, number | undefined]>()
+      const commits = new Array<number>()
+      const record = (event: EventV2.Payload) => Effect.sync(() => projected.push([event.type, event.durable?.seq]))
+      yield* events.project(SyncMessage, record)
+      yield* events.project(VersionedMessage, record)
+      const data = { id: aggregateID, text: "same" }
+      const commit = (seq: number) => Effect.sync(() => commits.push(seq))
+
+      yield* events.publish(SyncMessage, data, { commit })
+      yield* events.publish(VersionedMessage, data, { commit })
+      const repeated = yield* events.publish(SyncMessage, data, { commit })
+      const duplicate = yield* events.publish(SyncMessage, data, { commit })
+      const rows = yield* db
+        .select({ seq: EventTable.seq })
+        .from(EventTable)
+        .where(eq(EventTable.aggregate_id, aggregateID))
+        .orderBy(asc(EventTable.seq))
+        .all()
+        .pipe(Effect.orDie)
+
+      expect(repeated.durable?.seq).toBe(2)
+      expect(duplicate.durable).toBeUndefined()
+      expect(rows.map((row) => row.seq)).toEqual([0, 1, 2])
+      expect(projected).toEqual([
+        [SyncMessage.type, 0],
+        [VersionedMessage.type, 1],
+        [SyncMessage.type, 2],
+      ])
+      expect(commits).toEqual([0, 1, 2])
+    }),
+  )
+
+  it.effect("preserves intervening event types and consecutive deduplication inside a batch", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const { db } = yield* Database.Service
+      const aggregateID = EventV2.ID.create()
+      const data = { id: aggregateID, text: "same" }
+      const entries = [
+        { definition: SyncMessage, data },
+        { definition: VersionedMessage, data },
+        { definition: SyncMessage, data },
+        { definition: SyncMessage, data },
+      ]
+      const payloads = yield* events.publishMany(entries)
+      const rows = yield* db
+        .select({ seq: EventTable.seq })
+        .from(EventTable)
+        .where(eq(EventTable.aggregate_id, aggregateID))
+        .orderBy(asc(EventTable.seq))
+        .all()
+        .pipe(Effect.orDie)
+
+      expect(rows.map((row) => row.seq)).toEqual([0, 1, 2])
+      expect(payloads.map((event) => event.data)).toEqual(entries.map((entry) => entry.data))
+      expect(payloads.map((event) => event.durable?.seq)).toEqual([0, 1, 2, undefined])
+    }),
+  )
+
   it.effect("skips duplicates inside a publishMany batch and keeps payloads aligned", () =>
     Effect.gen(function* () {
       const events = yield* EventV2.Service

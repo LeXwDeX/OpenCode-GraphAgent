@@ -790,6 +790,7 @@ describe("GoalLoop — dispatch failure releases the lease without the trailing 
         "failure path never paused the goal",
         "5 seconds",
       )
+      expect(Option.isNone(yield* automation.claim(sid, goalOwner))).toBe(true)
       // Kill the trailing load: the handler is parked on the prompt gate, so
       // dropping the table here guarantees afterDispatch's goal.load defects.
       yield* db.run("DROP TABLE goal_state")
@@ -798,9 +799,10 @@ describe("GoalLoop — dispatch failure releases the lease without the trailing 
       yield* Effect.sleep("100 millis")
       expect(judgeCalls).toBeGreaterThanOrEqual(1)
 
-      // The registration must already be released — pre-fix it leaks until
-      // /goal clear because the trailing load (the only unregister) died.
-      expect(Option.isNone(yield* automation.claim(sid, goalOwner))).toBe(true)
+      // The paused goal was unclaimable before the durable store disappeared.
+      // Once the authority itself is unreadable, admission must fail closed
+      // instead of treating a failed durable read as an absent goal.
+      expect(Exit.isFailure(yield* automation.claim(sid, goalOwner).pipe(Effect.exit))).toBe(true)
     }),
   )
 })

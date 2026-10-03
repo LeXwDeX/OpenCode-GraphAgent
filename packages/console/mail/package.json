@@ -4,9 +4,9 @@
   "dependencies": {
     "@jsx-email/all": "2.2.3",
     "@jsx-email/cli": "1.4.3",
-    "@tsconfig/bun": "1.0.9",
-    "@types/react": "18.0.25",
-    "react": "18.2.0",
+    "@tsconfig/bun": "catalog:",
+    "@types/react": "catalog:",
+    "react": "catalog:",
     "solid-js": "catalog:"
   },
   "exports": {

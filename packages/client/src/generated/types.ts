@@ -1,10 +1,5 @@
 export type JsonValue =
-  | null
-  | boolean
-  | number
-  | string
-  | ReadonlyArray<JsonValue>
-  | { readonly [key: string]: JsonValue }
+  null | boolean | number | string | ReadonlyArray<JsonValue> | { readonly [key: string]: JsonValue }
 
 export type InvalidCursorError = { readonly _tag: "InvalidCursorError"; readonly message: string }
 export const isInvalidCursorError = (value: unknown): value is InvalidCursorError =>

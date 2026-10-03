@@ -5,13 +5,13 @@ let shouldListExpanded: typeof import("./file-tree").shouldListExpanded
 let dirsToExpand: typeof import("./file-tree").dirsToExpand
 
 beforeAll(async () => {
-  mock.module("@solidjs/router", () => ({
+  await mock.module("@solidjs/router", () => ({
     useNavigate: () => () => undefined,
     useParams: () => ({}),
     useLocation: () => ({}),
     useSearchParams: () => [{}, () => undefined],
   }))
-  mock.module("@/context/file", () => ({
+  await mock.module("@/context/file", () => ({
     useFile: () => ({
       tree: {
         state: () => undefined,
@@ -22,15 +22,15 @@ beforeAll(async () => {
       },
     }),
   }))
-  mock.module("@opencode-ai/ui/collapsible", () => ({
+  await mock.module("@opencode-ai/ui/collapsible", () => ({
     Collapsible: {
       Trigger: (props: { children?: unknown }) => props.children,
       Content: (props: { children?: unknown }) => props.children,
     },
   }))
-  mock.module("@opencode-ai/ui/file-icon", () => ({ FileIcon: () => null }))
-  mock.module("@opencode-ai/ui/icon", () => ({ Icon: () => null }))
-  mock.module("@opencode-ai/ui/tooltip", () => ({ Tooltip: (props: { children?: unknown }) => props.children }))
+  await mock.module("@opencode-ai/ui/file-icon", () => ({ FileIcon: () => null }))
+  await mock.module("@opencode-ai/ui/icon", () => ({ Icon: () => null }))
+  await mock.module("@opencode-ai/ui/tooltip", () => ({ Tooltip: (props: { children?: unknown }) => props.children }))
   const mod = await import("./file-tree")
   shouldListRoot = mod.shouldListRoot
   shouldListExpanded = mod.shouldListExpanded

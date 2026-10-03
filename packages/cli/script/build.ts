@@ -8,6 +8,7 @@ import { Script } from "@opencode-ai/script"
 import { createSolidTransformPlugin } from "@opentui/solid/bun-plugin"
 import pkg from "../package.json"
 import { modelsData } from "./generate"
+import { resolveDependencyVersion } from "../../../script/toolchain.mjs"
 
 const dir = path.resolve(import.meta.dirname, "..")
 const binary = "lildax"
@@ -49,7 +50,10 @@ const targets = singleFlag
     })
   : allTargets
 
-if (!skipInstall) await $`bun install --os="*" --cpu="*" @opentui/core@${pkg.dependencies["@opentui/core"]}`
+if (!skipInstall) {
+  const version = resolveDependencyVersion("@opentui/core", pkg.dependencies["@opentui/core"])
+  await $`bun install --no-save --frozen-lockfile --os="*" --cpu="*" @opentui/core@${version}`
+}
 
 const localParserWorker = path.resolve(dir, "node_modules/@opentui/core/parser.worker.js")
 const rootParserWorker = path.resolve(dir, "../../node_modules/@opentui/core/parser.worker.js")

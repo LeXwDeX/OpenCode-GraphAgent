@@ -1,0 +1,29 @@
+{
+  "sources": {
+    "x86_64-linux": {
+      "file": "electron-v42.11.9-linux-x64.zip",
+      "sha256": "sha256-srpwfzocjbg/dy+IExzgqahIt0SB483mPz1s7Pvpvk4=",
+      "bytes": 124926378,
+      "hex": "b2ba707f3a1c8db83f772f88131ce0a9a848b74481e3cde63f3d6cecfbe9be4e"
+    },
+    "aarch64-linux": {
+      "file": "electron-v42.11.9-linux-arm64.zip",
+      "sha256": "sha256-dOOMXNodrIrqUhEHxBDhxhD6+fJP09fCLZipFBuITcs=",
+      "bytes": 126111427,
+      "hex": "74e38c5cda1dac8aea521107c410e1c610faf9f24fd3d7c22d98a9141b884dcb"
+    },
+    "x86_64-darwin": {
+      "file": "electron-v42.11.9-darwin-x64.zip",
+      "sha256": "sha256-5OVoA47m28ZuSdNLEzvLCwcBnyMNkvqLQtXdOTmEO+8=",
+      "bytes": 125669864,
+      "hex": "e4e568038ee6dbc66e49d34b133bcb0b07019f230d92fa8b42d5dd3939843bef"
+    },
+    "aarch64-darwin": {
+      "file": "electron-v42.11.9-darwin-arm64.zip",
+      "sha256": "sha256-4ZljI+0M3mEfZasF1LV61ce0jeM1A18W7POWuZYg3SQ=",
+      "bytes": 121469328,
+      "hex": "e1996323ed0cde611f65ab05d4b57ad5c7b48de335035f16ecf396b99620dd24"
+    }
+  },
+  "version": "42.11.9"
+}

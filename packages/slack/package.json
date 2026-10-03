@@ -9,11 +9,12 @@
   },
   "dependencies": {
     "@opencode-ai/sdk": "workspace:*",
-    "@slack/bolt": "^3.17.1"
+    "@slack/bolt": "3.22.0"
   },
   "devDependencies": {
     "@types/node": "catalog:",
     "typescript": "catalog:",
-    "@typescript/native-preview": "catalog:"
+    "@typescript/native-preview": "catalog:",
+    "@types/bun": "catalog:"
   }
 }

@@ -10,13 +10,14 @@
     "build": "vite build",
     "build:cloudflare": "OPENCODE_DEPLOYMENT_TARGET=cloudflare vite build",
     "start": "vite start",
-    "shell-prod": "sst shell --target Teams --stage production"
+    "shell-prod": "sst shell --target Teams --stage production",
+    "test": "bun test --preload ./test/preload.ts"
   },
   "dependencies": {
     "@opencode-ai/core": "workspace:*",
     "@opencode-ai/session-ui": "workspace:*",
     "@opencode-ai/ui": "workspace:*",
-    "aws4fetch": "^1.0.20",
+    "aws4fetch": "catalog:",
     "@pierre/diffs": "catalog:",
     "@solidjs/router": "catalog:",
     "@solidjs/start": "catalog:",
@@ -24,9 +25,9 @@
     "@hono/standard-validator": "catalog:",
     "hono": "catalog:",
     "hono-openapi": "catalog:",
-    "js-base64": "3.7.7",
+    "js-base64": "catalog:",
     "luxon": "catalog:",
-    "nitro": "3.0.260429-beta",
+    "nitro": "catalog:",
     "solid-js": "catalog:",
     "zod": "catalog:"
   },

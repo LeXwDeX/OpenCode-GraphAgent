@@ -5,6 +5,7 @@ import { Location } from "../location"
 import { SystemContext } from "./index"
 import { InstructionContext } from "../instruction-context"
 import { SystemContextRegistry } from "./registry"
+import { RUNTIME_CAPABILITIES } from "./capabilities"
 
 const builtIns = Layer.effectDiscard(
   Effect.gen(function* () {
@@ -19,6 +20,13 @@ const builtIns = Layer.effectDiscard(
       "</env>",
     ].join("\n")
     const context = SystemContext.combine([
+      SystemContext.make({
+        key: SystemContext.Key.make("core/capabilities"),
+        codec: Schema.toCodecJson(Schema.String),
+        load: Effect.succeed(RUNTIME_CAPABILITIES),
+        baseline: (capabilities) => capabilities,
+        update: (_previous, capabilities) => capabilities,
+      }),
       SystemContext.make({
         key: SystemContext.Key.make("core/environment"),
         codec: Schema.toCodecJson(Schema.String),

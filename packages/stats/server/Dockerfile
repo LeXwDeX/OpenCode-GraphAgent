@@ -1,4 +1,5 @@
-FROM oven/bun:1.3.14-alpine AS base
+ARG BUN_VERSION
+FROM oven/bun:${BUN_VERSION}-alpine AS base
 
 WORKDIR /app
 
@@ -9,15 +10,15 @@ FROM base AS pruner
 
 COPY . .
 
-RUN bunx turbo@2.8.13 prune @opencode-ai/stats-server --docker --no-update-notifier --no-color
+RUN bun script/toolchain.mjs check --bun-only
+RUN bunx "turbo@$(bun script/toolchain.mjs get turbo)" prune @opencode-ai/stats-server --docker --no-update-notifier --no-color
 
 FROM base AS installer
 
 COPY --from=pruner /app/out/json/ ./
 
-# Bun 1.3.x needs the pruned workspace globs and lockfile metadata refreshed before the frozen production install.
+# Normalize workspace globs while retaining Turbo's exact transitive lock.
 RUN bun -e 'const packageJson = await Bun.file("package.json").json(); packageJson.workspaces.packages = Array.from(new Bun.Glob("packages/**/package.json").scanSync(".")).map((file) => file.slice(0, -"/package.json".length)).sort(); await Bun.write("package.json", JSON.stringify(packageJson, null, 2) + "\n")'
-RUN rm -f bun.lock && bun install --filter @opencode-ai/stats-server --lockfile-only --ignore-scripts
 RUN bun install --filter @opencode-ai/stats-server --frozen-lockfile --production --ignore-scripts
 
 FROM base AS runner

@@ -4,8 +4,8 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { ProjectV2 } from "@opencode-ai/core/project"
 import { EffectFlock } from "@opencode-ai/core/util/effect-flock"
-import { Context, Effect, Exit, Layer, Schema } from "effect"
-import { dirname, join } from "node:path"
+import { Context, Effect, Layer, Schema } from "effect"
+import { join } from "node:path"
 import { MemoryHome } from "./home"
 import { MemorySchema } from "./schema"
 import { MemoryStore } from "./store"
@@ -16,7 +16,12 @@ export interface Interface {
     newID: ProjectV2.ID,
   ) => Effect.Effect<
     void,
-    FSUtil.Error | EffectFlock.LockError | MemoryStore.StoreError | ConflictError | InvalidHomeError | SourceChangedError
+    | FSUtil.Error
+    | EffectFlock.LockError
+    | MemoryStore.StoreError
+    | ConflictError
+    | InvalidHomeError
+    | SourceChangedError
   >
 }
 
@@ -103,27 +108,16 @@ export const layer = Layer.effect(
     //    3 hold the source lock, phase 2 holds none — the store locks the target
     //    itself inside updateTopics), so no hold-and-wait cycle can form between
     //    concurrent migrations or with writers on either identity.
-    const migrateHomeUnsafe = Effect.fnUntraced(function* (
-      oldID: ProjectV2.ID,
-      newID: ProjectV2.ID,
-    ) {
+    const migrateHomeUnsafe = Effect.fnUntraced(function* (oldID: ProjectV2.ID, newID: ProjectV2.ID) {
       const source = home.directory(oldID)
       const target = home.directory(newID)
 
-      // Phase 1 — snapshot the source under the source lock. If the target does
-      // not exist yet the whole migration is a rename under the same lock.
+      // Phase 1 — snapshot the source under the source lock. Even a missing
+      // target can have a writer holding its lock with an empty snapshot, so
+      // moving the source there without the target lock would lose topics.
       const snapshot = yield* flock.withLock(
         Effect.gen(function* () {
           if (!(yield* fs.existsSafe(source))) return undefined
-          yield* fs.makeDirectory(dirname(target), { recursive: true })
-          if (!(yield* fs.existsSafe(target))) {
-            const renamed = yield* fs.rename(source, target).pipe(Effect.exit)
-            if (Exit.isSuccess(renamed)) return undefined
-            // A writer under newID created the target between existsSafe and
-            // rename (ENOTEMPTY/EEXIST race). Nothing was removed — fall
-            // through to the snapshot-merge path below, which converges.
-            if (!(yield* fs.existsSafe(target))) return yield* renamed
-          }
           yield* inspectHome(source)
           return yield* store.readSnapshot(oldID)
         }),
@@ -133,7 +127,7 @@ export const layer = Layer.effect(
       if (!snapshot) return
 
       // Phase 2 — merge into the target. updateTopics takes the target lock.
-      yield* inspectHome(target)
+      if (yield* fs.existsSafe(target)) yield* inspectHome(target)
       const targetTopics = yield* store.inspectTopics(newID)
       const targetByID = new Map(targetTopics.map((topic) => [topic.id, topic]))
       const conflicts = snapshot.topics
@@ -144,30 +138,29 @@ export const layer = Layer.effect(
         .map((topic) => topic.id)
       if (conflicts.length > 0) yield* new ConflictError({ topic_ids: conflicts })
 
-      const imported = snapshot.topics.filter((topic) => !targetByID.has(topic.id))
-      if (imported.length > 0) {
-        yield* store.updateTopics(newID, (topics) => {
-          const current = new Map(topics.map((topic) => [topic.id, topic]))
-          const conflicts = imported.filter((topic) => {
-            const existing = current.get(topic.id)
-            return existing && !sameContent(existing, topic)
-          })
-          if (conflicts.length > 0)
-            throw new MemoryStore.StoreError({
-              message: `Memory identity migration conflicted for Topics: ${conflicts.map((topic) => topic.id).join(", ")}`,
-            })
-          const changed = imported.filter((topic) => !current.has(topic.id))
-          changed.forEach((topic) => current.set(topic.id, topic))
-          return {
-            applied: {
-              topics: Array.from(current.values()).sort((left, right) => left.id.localeCompare(right.id)),
-              changed: changed.map((topic) => topic.id),
-              deleted: [],
-            },
-            result: undefined,
-          }
+      yield* store.updateTopics(newID, (topics) => {
+        const current = new Map(topics.map((topic) => [topic.id, topic]))
+        // Recheck the entire source against the snapshot read under the
+        // target lock, including topics changed or removed by live writers.
+        const conflicts = snapshot.topics.filter((topic) => {
+          const existing = current.get(topic.id)
+          return existing && !sameContent(existing, topic)
         })
-      }
+        if (conflicts.length > 0)
+          throw new MemoryStore.StoreError({
+            message: `Memory identity migration conflicted for Topics: ${conflicts.map((topic) => topic.id).join(", ")}`,
+          })
+        const changed = snapshot.topics.filter((topic) => !current.has(topic.id))
+        changed.forEach((topic) => current.set(topic.id, topic))
+        return {
+          applied: {
+            topics: Array.from(current.values()).sort((left, right) => left.id.localeCompare(right.id)),
+            changed: changed.map((topic) => topic.id),
+            deleted: [],
+          },
+          result: undefined,
+        }
+      })
 
       // Phase 3 — remove the source only if it has not changed since the
       // snapshot; otherwise leave everything in place for a converging retry.

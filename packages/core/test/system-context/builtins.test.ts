@@ -8,6 +8,7 @@ import { AbsolutePath } from "@opencode-ai/core/schema"
 import { SystemContext } from "@opencode-ai/core/system-context"
 import { SystemContextBuiltIns } from "@opencode-ai/core/system-context/builtins"
 import { SystemContextRegistry } from "@opencode-ai/core/system-context/registry"
+import { RUNTIME_CAPABILITIES } from "@opencode-ai/core/system-context/capabilities"
 import { location } from "../fixture/location"
 import { testEffect } from "../lib/effect"
 
@@ -61,6 +62,8 @@ describe("SystemContextBuiltIns", () => {
 
       expect(initialized.baseline).toBe(
         [
+          RUNTIME_CAPABILITIES,
+          "",
           "Here is some useful information about the environment you are running in:",
           "<env>",
           `  Working directory: ${directory}`,
@@ -88,6 +91,7 @@ describe("SystemContextBuiltIns", () => {
         _tag: "Updated",
         text: `Today's date is now: ${localDate(timestamp + 24 * 60 * 60 * 1000)}`,
       })
+      if (refreshed._tag === "Updated") expect(refreshed.text).not.toContain("## GraphAgent / OpenCode capabilities")
     }),
   )
 
@@ -109,6 +113,8 @@ describe("SystemContextBuiltIns", () => {
 
       expect((yield* SystemContext.initialize(yield* context.load())).baseline).toBe(
         [
+          RUNTIME_CAPABILITIES,
+          "",
           "Here is some useful information about the environment you are running in:",
           "<env>",
           `  Working directory: ${directory}`,

@@ -3,9 +3,11 @@
 
 import { describe, expect, it as bunIt } from "bun:test"
 import { Deferred, Effect, Fiber, Layer } from "effect"
+import { and, eq } from "drizzle-orm"
 import { Database } from "@opencode-ai/core/database/database"
 import { DagProjector } from "@opencode-ai/core/dag/projector"
 import { DagStore } from "@opencode-ai/core/dag/store"
+import { WorkflowNodeTable } from "@opencode-ai/core/dag/sql"
 import { EventV2 } from "@opencode-ai/core/event"
 import { Project } from "@opencode-ai/core/project"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
@@ -82,6 +84,42 @@ function start(dag: Dag.Interface, dagID: string, nodeID: string, childSessionID
 }
 
 describe("replan admitted-definition guard", () => {
+  for (const status of ["queued", "paused"] as const) {
+    it.effect(`rejects new dependencies on omitted ${status} nodes before changing durable state`, () =>
+      Effect.gen(function* () {
+        const sessionID = `ses_replan_omitted_${status}`
+        yield* setup(sessionID)
+        const dag = yield* Dag.Service
+        const old = { ...node("old"), report_to_parent: false }
+        const dagID = yield* create(dag, sessionID, [old])
+        yield* dag.nodeQueued(dagID, "old", Date.now() + 60_000)
+        if (status === "paused") {
+          // Persist a paused attempt snapshot: there is no public node-pause command.
+          const { db } = yield* Database.Service
+          yield* db.update(WorkflowNodeTable).set({ status }).where(and(
+            eq(WorkflowNodeTable.workflow_id, dagID), eq(WorkflowNodeTable.id, "old"),
+          )).run().pipe(Effect.orDie)
+        }
+        const before = yield* dag.store.getWorkflow(dagID)
+        const beforeNodes = yield* dag.store.getNodes(dagID)
+        const failure = yield* dag.replan(dagID, { nodes: [node("new", ["old"])] }).pipe(Effect.flip)
+        expect(failure.message).toContain('depends on "old" which is not present after merge')
+        expect(yield* dag.store.getWorkflow(dagID)).toEqual(before)
+        expect(yield* dag.store.getNodes(dagID)).toEqual(beforeNodes)
+
+        const preserved = yield* dag.replan(dagID, { nodes: [old, node("new", ["old"])] })
+        expect(preserved.cancel).toEqual([])
+        expect((yield* dag.store.getNode(dagID, "old"))?.status).toBe(status)
+        expect((yield* dag.store.getNode(dagID, "new"))?.dependsOn).toEqual(["old"])
+
+        const replaced = yield* dag.replan(dagID, { nodes: [node("replacement")] })
+        expect(replaced.cancel.sort()).toEqual(["new", "old"])
+        expect((yield* dag.store.getNode(dagID, "old"))?.superseded).toBe(true)
+        expect((yield* dag.store.getCurrentNodes(dagID)).map((entry) => entry.id)).toEqual(["replacement"])
+      }),
+    )
+  }
+
   it.effect("rejects running execution-field changes before mutation and preserves the old attempt", () =>
     Effect.gen(function* () {
       const sessionID = "ses_replan_definition_reject"
