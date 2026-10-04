@@ -11,7 +11,8 @@
     "preview": "astro preview",
     "astro": "astro",
     "typecheck": "astro check",
-    "test": "bun test"
+    "test": "bun test",
+    "test:browser:webkit": "OPENCODE_TEST_BROWSER=1 OPENCODE_TEST_BROWSER_ENGINE=webkit bun test test/sanitize-markdown.test.ts --timeout 30000"
   },
   "dependencies": {
     "@astrojs/cloudflare": "14.3.3",

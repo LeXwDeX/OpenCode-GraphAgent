@@ -7,8 +7,9 @@ profiles below are examples, not prerequisites for completing a task.
 ## Model Tiers and Evidence
 
 Tier placement is mechanical, not a model-ID choice: `required: true` nodes
-and `review`/`review-*` workers resolve to the advanced model tier of
-`dag.jsonc`; every other node resolves to standard. This mapping does not
+and `review`/`review-*` workers prefer the advanced model tier of
+`dag.jsonc`; every other node prefers standard. A single configured tier
+serves both groups. This mapping does not
 prescribe who may analyze, implement, or summarize. Set `required` according to
 whether execution failure should stop the workflow, not to manufacture roles.
 
@@ -175,8 +176,8 @@ need permission, report the blocker and ask the user. Do not silently replace
 models or bypass provider constraints.
 
 Prefer expressing "strong model for judgment, fast model for volume" through
-tier placement — `required: true` and `review`/`review-*` workers resolve to
-the advanced tier of `dag.jsonc`, everything else to standard — rather than
+tier placement — `required: true` and `review`/`review-*` workers prefer
+the advanced tier of `dag.jsonc`, everything else prefers standard — rather than
 graph-level model fields.
 
 ## Profile: Brainstorm
@@ -262,13 +263,15 @@ label. A non-`ACCEPT` verdict does not mandate more agents or a full template.
 
 Report blockers and the actual workflow state when stopping or asking for a
 decision. Do not claim rejected work passed. A replan or extend rejected by
-validation does NOT fail the workflow — it is parked paused and recoverable, so
-the runtime's `orchestrator_unresponsive` guard (state-based: it fails only a
-workflow left RUNNING and stalled at the end of a turn) cannot fire on it and
-cancelling the graph is never warranted; fix the fragment using the diagnostic
-and replan again. If you must stop to ask the user about a stalled RUNNING
-workflow, `control(pause)` it first — a paused workflow is never failed as
-unresponsive. For a timeout escalation on a node that is still progressing,
+validation does not itself fail or cancel the workflow. The tool attempts to
+park it paused, but automatic pause can fail or race with terminalization.
+Inspect the reported actual state. If it is paused, fix the fragment using
+the diagnostic and retry. If it remains RUNNING, explicitly pause or settle
+it before ending the turn; the `orchestrator_unresponsive` guard can still
+apply to a stalled RUNNING workflow. If the state is terminal or unknown,
+inspect status and choose the applicable recovery path. Do not cancel the
+graph merely to avoid an unresponsive verdict. For a running node with a
+pending formal timeout escalation already delivered to the parent,
 prefer `control(extend_timeout)` to grant more time in place — no replan, no
 lost child session. If ending the work, settle live scheduling rather than
 abandoning active children. Naturally completed workflows can be extended, but

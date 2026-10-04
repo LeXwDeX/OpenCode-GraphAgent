@@ -41,6 +41,6 @@ Deliver a complete, functional, visually appealing prototype.
 
 # Product information
 - `/help` displays help.
-- `/bug` reports bugs or feedback.
+- For GraphAgent bugs or feedback, use https://github.com/LeXwDeX/OpenCode-GraphAgent/issues. Upstream documentation may help with upstream behavior; check this fork's code for GraphAgent-specific features.
 
 Keep working until the request is resolved. Verify file contents rather than assuming them. Preserve user control and project conventions.

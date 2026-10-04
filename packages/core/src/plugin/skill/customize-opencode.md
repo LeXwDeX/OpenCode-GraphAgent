@@ -181,7 +181,7 @@ description: One sentence covering what this skill does AND when to trigger it. 
 (skill body in markdown: instructions, examples, references)
 ```
 
-- `name` is required, lowercase hyphen-separated, up to 64 chars, and matches the folder name.
+- For portable skill authoring, require a lowercase hyphen-separated `name`, up to 64 chars, matching the folder name. The directory-based runtime loader requires a string name but does not enforce these naming conventions. Treat successful loading as separate from compliance with the authoring rules.
 - `description` is effectively required: skills without one are filtered out and never surfaced to the model. Cover both _what_ the skill does and _when_ to use it. Write in third person ("Use when...", not "I help with..."). Front-load concrete trigger keywords and filenames; gate with "Use ONLY when..." if the skill should stay quiet on adjacent topics.
 - Optional: `license`, `compatibility`, `metadata` (string-string map).
 

@@ -702,10 +702,10 @@ export function spawnNode(
                     parts: [
                       {
                         type: "text",
-                        text: `You ended your turn without calling the submit_result tool, so this node recorded no output and will FAIL. Do not redo the work. Call submit_result NOW with a JSON payload matching the schema from your instructions, containing your full result. If a previous submit_result call failed validation, fix the payload shape and call it again.`,
+                        text: `You ended your turn without calling the submit_result tool, so this node recorded no structured output. Do not redo the work. If tools remain available, call submit_result with your full result matching the schema from your instructions. This follow-up retains your existing tool-call budget. If tools are disabled because that budget is exhausted, report the blocker in text; the node cannot succeed without a submitted result.`,
                       },
                     ],
-                  })
+                  }, { continueToolBudget: true })
                   inputSnapshot =
                     Option.isSome(messageService) && caller
                       ? yield* messageService.value.snapshotForTurn(caller, result.info.id)

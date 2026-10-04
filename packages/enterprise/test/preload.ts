@@ -1,5 +1,7 @@
 // Exercise the real signed S3 adapter against isolated process-local storage.
 // Override every credential/endpoint input before source modules are imported.
+import { createHash } from "node:crypto"
+
 const endpoint = "https://offline-test.r2.cloudflarestorage.com"
 const bucket = "offline-test-bucket"
 process.env.OPENCODE_STORAGE_ADAPTER = "r2"
@@ -22,12 +24,12 @@ const offlineFetch = async (input: RequestInfo | URL, init?: RequestInit) => {
     const after = url.searchParams.get("start-after")
     const limit = Number(url.searchParams.get("max-keys") ?? 1000)
     if (!Number.isInteger(limit) || limit < 1) throw new Error("Invalid storage list limit")
-    const keys = [...objects.keys()]
-      .sort()
-      .filter((key) => key.startsWith(prefix) && (!after || key > after))
-      .slice(0, limit)
+    const all = [...objects.keys()].sort().filter((key) => key.startsWith(prefix) && (!after || key > after))
+    const offset = Number(url.searchParams.get("continuation-token") ?? 0)
+    const keys = all.slice(offset, offset + limit)
+    const truncated = offset + keys.length < all.length
     return new Response(
-      `<ListBucketResult>${keys.map((key) => `<Contents><Key>${key}</Key></Contents>`).join("")}</ListBucketResult>`,
+      `<ListBucketResult><EncodingType>url</EncodingType><IsTruncated>${truncated}</IsTruncated>${truncated ? `<NextContinuationToken>${offset + keys.length}</NextContinuationToken>` : ""}${keys.map((key) => `<Contents><Key>${encodeURIComponent(key)}</Key></Contents>`).join("")}</ListBucketResult>`,
       {
         headers: { "Content-Type": "application/xml" },
       },
@@ -38,17 +40,29 @@ const offlineFetch = async (input: RequestInfo | URL, init?: RequestInit) => {
   switch (request.method) {
     case "GET": {
       const value = objects.get(key)
-      return value === undefined ? new Response(null, { status: 404 }) : new Response(value)
+      return value === undefined
+        ? new Response(null, { status: 404 })
+        : new Response(value, { headers: { ETag: etag(value) } })
     }
-    case "PUT":
-      objects.set(key, await request.text())
+    case "PUT": {
+      const body = await request.text()
+      const current = objects.get(key)
+      if (request.headers.get("if-none-match") === "*" && current !== undefined)
+        return new Response(null, { status: 412 })
+      const match = request.headers.get("if-match")
+      if (match && (current === undefined || match !== etag(current))) return new Response(null, { status: 412 })
+      objects.set(key, body)
       return new Response(null, { status: 200 })
+    }
     case "DELETE":
       objects.delete(key)
       return new Response(null, { status: 204 })
     default:
       throw new Error("Unexpected storage object method")
   }
+}
+function etag(body: string) {
+  return `"${createHash("sha256").update(body).digest("hex")}"`
 }
 // Bun exposes preconnect on fetch; the offline transport never opens sockets.
 globalThis.fetch = Object.assign(offlineFetch, { preconnect() {} })

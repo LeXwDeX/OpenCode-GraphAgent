@@ -31,7 +31,7 @@ export default Runtime.handler(
     if (body !== undefined && !headers.has("content-type")) headers.set("content-type", "application/json")
 
     const response = yield* Effect.tryPromise(() =>
-      fetch(new URL(request.path, transport.url), {
+      fetchRequest(fetch, transport.url, request.path, {
         method: request.method,
         headers,
         body,
@@ -53,8 +53,26 @@ export function resolveOperation(spec: OpenApi, operationID: string, params: Rec
 }
 
 export function rawRequest(input: readonly string[]) {
-  if (input.length !== 2 || !methods.has(input[0].toLowerCase()) || !input[1].startsWith("/")) return
+  if (
+    input.length !== 2 ||
+    !methods.has(input[0].toLowerCase()) ||
+    !input[1].startsWith("/") ||
+    input[1].startsWith("//") ||
+    input[1].includes("\\")
+  )
+    return
   return { method: input[0].toUpperCase(), path: input[1] }
+}
+
+export function requestURL(daemonURL: string, path: string) {
+  const base = new URL(daemonURL)
+  const url = new URL(path, base)
+  if (url.origin !== base.origin) throw new Error("API request URL must match the daemon origin")
+  return url
+}
+
+export function fetchRequest(fetcher: typeof fetch, daemonURL: string, path: string, init: RequestInit) {
+  return fetcher(requestURL(daemonURL, path), init)
 }
 
 function resolveRequest(

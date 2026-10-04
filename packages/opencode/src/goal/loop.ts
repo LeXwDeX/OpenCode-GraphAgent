@@ -561,10 +561,15 @@ const serviceLayer = Layer.effect(
         // where an httpapi cancel slips between admit and mark. If admission
         // is refused (session not idle), clear the speculative mark.
         yield* goal.markTurnDriven(sessionID)
-        const admitted = yield* SessionPrompt.admitIfIdle(promptSvc, automation, continuationLease, {
-          sessionID,
-          parts: [{ type: "text", text: continuationText, synthetic: true }],
-        })
+        // The judge continues the same user input; a manual new/resume command
+        // admits a new input and owns its fresh budget in SessionPrompt.
+        const admitted = yield* SessionPrompt.admitIfIdle(
+          promptSvc,
+          automation,
+          continuationLease,
+          { sessionID, parts: [{ type: "text", text: continuationText, synthetic: true }] },
+          { continueToolBudget: true },
+        )
         if (Option.isNone(admitted)) {
           yield* goal.clearTurnDriven(sessionID)
           return

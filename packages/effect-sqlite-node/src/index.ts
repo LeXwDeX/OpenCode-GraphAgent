@@ -71,9 +71,9 @@ export const make = (
 
       const run = (sql: string, params: ReadonlyArray<unknown> = []) =>
         Effect.withFiber<Array<Record<string, unknown>>, SqlError>((fiber) => {
-          const statement = db.prepare(sql)
-          statement.setReadBigInts(Context.get(fiber.context, Client.SafeIntegers))
           try {
+            const statement = db.prepare(sql)
+            statement.setReadBigInts(Context.get(fiber.context, Client.SafeIntegers))
             return Effect.succeed(statement.all(...(params as SQLInputValue[])) as Array<Record<string, unknown>>)
           } catch (cause) {
             return Effect.fail(
@@ -86,10 +86,10 @@ export const make = (
 
       const runValues = (sql: string, params: ReadonlyArray<unknown> = []) =>
         Effect.withFiber<ReadonlyArray<ReadonlyArray<unknown>>, SqlError>((fiber) => {
-          const statement = db.prepare(sql)
-          statement.setReadBigInts(Context.get(fiber.context, Client.SafeIntegers))
-          statement.setReturnArrays(true)
           try {
+            const statement = db.prepare(sql)
+            statement.setReadBigInts(Context.get(fiber.context, Client.SafeIntegers))
+            statement.setReturnArrays(true)
             return Effect.succeed(
               statement.all(...(params as SQLInputValue[])) as unknown as ReadonlyArray<ReadonlyArray<unknown>>,
             )

@@ -1,6 +1,6 @@
 import { describe, expect } from "bun:test"
 import { LLM } from "@opencode-ai/llm"
-import { LLMClient } from "@opencode-ai/llm/route"
+import { LLMClient, HttpTransport } from "@opencode-ai/llm/route"
 import { DateTime, Effect } from "effect"
 import { Headers } from "effect/unstable/http"
 import { Credential } from "@opencode-ai/core/credential"
@@ -41,6 +41,60 @@ const model = (api: Api, variants: ModelV2.Info["variants"] = []) =>
   })
 
 describe("SessionRunnerModel", () => {
+  it.effect("keeps raw model overlays from replacing runner tools or overriding none", () =>
+    Effect.gen(function* () {
+      const configured = model({ type: "aisdk", package: "@ai-sdk/openai", url: "https://openai.example/v1" })
+      const resolved = yield* SessionRunnerModel.fromCatalogModel(
+        ModelV2.Info.make({
+          ...configured,
+          request: {
+            ...configured.request,
+            body: {
+              ...configured.request.body,
+              tools: [{ type: "web_search_preview" }],
+              tool_choice: "required",
+            },
+          },
+        }),
+      )
+      expect(resolved.route.defaults.http?.body).toEqual({ custom_extension: { enabled: true } })
+      const prepared = yield* LLMClient.prepare(
+        LLM.request({ model: resolved, prompt: "Final answer", tools: [], toolChoice: "none" }),
+      )
+      expect(prepared.body).toMatchObject({ tool_choice: "none" })
+      expect(prepared.body).toMatchObject({ tools: undefined })
+      const wire = yield* HttpTransport.jsonRequestParts({
+        body: prepared.body,
+        request: LLM.request({
+          model: resolved,
+          prompt: "Final answer",
+          tools: [],
+          toolChoice: "none",
+          http: resolved.route.defaults.http,
+        }),
+        endpoint: resolved.route.endpoint,
+        auth: resolved.route.auth,
+        encodeBody: JSON.stringify,
+      })
+      expect(JSON.parse(wire.bodyText)).toMatchObject({ tool_choice: "none", custom_extension: { enabled: true } })
+      expect(JSON.parse(wire.bodyText)).not.toHaveProperty("tools")
+      const withLocalTool = yield* LLMClient.prepare(
+        LLM.request({
+          model: resolved,
+          prompt: "Work",
+          tools: [
+            {
+              name: "echo",
+              description: "Echo",
+              inputSchema: { type: "object", properties: {} },
+            },
+          ],
+        }),
+      )
+      expect(withLocalTool.body).toMatchObject({ tools: [{ type: "function", name: "echo" }] })
+    }),
+  )
+
   it.effect("maps catalog OpenAI AI SDK models into native Responses routes", () =>
     Effect.gen(function* () {
       const resolved = yield* SessionRunnerModel.fromCatalogModel(

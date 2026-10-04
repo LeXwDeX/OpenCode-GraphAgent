@@ -1,4 +1,4 @@
-Launch a new agent to handle complex, multistep tasks autonomously.
+Launch a new agent to handle complex, multistep tasks autonomously. Use only agent types exposed to the current session and respect inherited permissions. Each subagent uses the same `maxToolCalls` setting with its own per-input budget.
 
 When using the Task tool, you must specify a subagent_type parameter to select which agent type to use.
 
@@ -11,7 +11,7 @@ When NOT to use the Task tool:
 
 Usage notes:
 1. Launch multiple agents concurrently whenever possible, to maximize performance; to do that, use a single message with multiple tool uses
-2. After delegation, do not repeat the agent's work. Continue with an independent task or wait. Background tasks notify you when they finish.
+2. After delegation, do not repeat the agent's work. Continue with an independent task or wait. When experimental background execution is enabled, background tasks notify you when they finish.
 3. The agent returns one message. The user cannot see it. Send the user a concise summary. The result includes a `task_id` for continuing that session.
 4. Each new agent starts with fresh context. Pass `task_id` to resume a session with its history. For a fresh session, give a detailed task and specify what its final message must contain.
 5. The agent's outputs should generally be trusted
@@ -25,7 +25,7 @@ Usage notes:
 - `prompt` (REQUIRED): Detailed task for the agent to perform autonomously.
 - `task_id` (optional): Resume a previous task session by its ID.
 - `command`: The command that triggered this task.
-- `background` (boolean): Run as background task.
+- `background` (optional boolean): Available only when experimental background execution is enabled. Run as background task.
 
 ## Returns
 

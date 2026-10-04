@@ -222,13 +222,17 @@ export namespace User {
     Actor.assertAdmin()
     assertNotSelf(id)
 
-    return await Database.use((tx) =>
-      tx
+    return await Database.transaction(async (tx) => {
+      await tx
+        .update(KeyTable)
+        .set({ timeDeleted: sql`now()` })
+        .where(and(eq(KeyTable.userID, id), eq(KeyTable.workspaceID, Actor.workspace())))
+      return tx
         .update(UserTable)
         .set({
           timeDeleted: sql`now()`,
         })
-        .where(and(eq(UserTable.id, id), eq(UserTable.workspaceID, Actor.workspace()))),
-    )
+        .where(and(eq(UserTable.id, id), eq(UserTable.workspaceID, Actor.workspace())))
+    })
   })
 }

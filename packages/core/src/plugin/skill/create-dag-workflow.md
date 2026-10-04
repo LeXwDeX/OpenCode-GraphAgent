@@ -75,10 +75,10 @@ admission Q&A and write a one-off deep spec when depth is needed.
 
 ## Rules that a saved spec must respect
 
-- **Never write `model` on a node or in `node_defaults`.** Model choice is configuration-owned: `dag.jsonc` supplies the `advanced` tier for `required: true` and review nodes, `standard` for the rest, then the agent model, then the parent session model. A saved spec that pins a model breaks on machines without it.
+- **Never write `model` on a node or in `node_defaults`.** Model choice is configuration-owned: `dag.jsonc` supplies the `advanced` tier preference for `required: true` or `worker_type: review` / `review-*`, `standard` for the rest. A single configured tier serves both groups. Resolution then falls back to the agent model and the parent session model. A saved spec that pins a model breaks on machines without it.
 - **Every `worker_type` must exist** as a built-in (`explore`, `build`, `general`, `plan`) or a configured agent. A custom agent name makes the workflow project-scoped in practice, even if the file sits in the global directory.
-- **Referenced `prompt_template.id` must exist** under `.opencode/dag-prompts/`. A global workflow referencing a repo-local template will fail at spawn in other projects — use `inline` prompts there.
-- **Supply every required template variable.** An unresolved `{{var}}` fails the node loudly at spawn, so a missing input turns into a broken run, not a degraded one.
+- **Referenced `prompt_template.id` must exist** under project `.opencode/dag-prompts/` or global `<opencode config dir>/dag-prompts/`. Project assets shadow global assets; there is no bundled prompt fallback. Missing assets are rejected during environment validation. A global workflow needs its referenced assets installed in each target environment; use `inline` prompts for portable specs.
+- **Supply every required template variable.** Validation checks bindings before acceptance. Spawn resolves actual values; an unresolved `{{var}}` fails the node, so a valid binding alone does not prove runtime input availability.
 - **No cycles, no dangling `depends_on` ids.** Both are rejected at creation.
 - **Terminal nodes are immutable at runtime.** Design retries as new nodes added by a replan, not as in-place restarts of finished ones.
 

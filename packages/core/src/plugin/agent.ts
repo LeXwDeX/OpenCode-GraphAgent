@@ -135,7 +135,7 @@ export const Plugin = define({
       })
 
       draft.update(AgentV2.ID.make("plan"), (item) => {
-        item.description = "Plan mode. Disallows all edit tools."
+        item.description = "Plan mode. Allows edits to the plan file and denies other edits by default."
         item.mode = "primary"
         item.permissions.push(
           ...PermissionV2.merge(defaults, [

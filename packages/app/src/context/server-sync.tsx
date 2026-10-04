@@ -4,7 +4,6 @@ import { getFilename } from "@opencode-ai/core/util/path"
 import { type Accessor, batch, createMemo, getOwner, onCleanup, onMount, untrack } from "solid-js"
 import { createStore, produce, reconcile } from "solid-js/store"
 import { useLanguage } from "@/context/language"
-import type { InitError } from "../pages/error"
 import { ServerSDK } from "./server-sdk"
 import {
   bootstrapDirectory,
@@ -41,7 +40,7 @@ import { createServerSession } from "./server-session"
 
 type GlobalStore = {
   ready: boolean
-  error?: InitError
+  error?: unknown
   path: Path
   project: Project[]
   provider: NormalizedProviderListResponse
@@ -111,9 +110,8 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
   }))
 
   const [globalStore, setGlobalStore] = createStore<GlobalStore>({
-    get ready() {
-      return !bootstrap.isPending
-    },
+    ready: false,
+    error: undefined,
     project: [],
     provider_auth: {},
     get path() {
@@ -171,8 +169,12 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
         setGlobalStore: setBootStore,
         queryClient,
       })
-      bootedAt = Date.now()
-      return bootedAt
+      if (!globalStore.error) {
+        bootedAt = Date.now()
+        setGlobalStore("ready", true)
+        return bootedAt
+      }
+      return undefined
     },
   }))
 
@@ -455,6 +457,9 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
     get ready() {
       return globalStore.ready
     },
+    get retrying() {
+      return bootstrap.isFetching
+    },
     get error() {
       return globalStore.error
     },
@@ -464,6 +469,9 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
     queryOptions: queryOptionsApi,
     // bootstrap,
     updateConfig: updateConfigMutation.mutateAsync,
+    retryBootstrap: async () => {
+      await bootstrap.refetch()
+    },
     project: projectApi,
     session,
     mcp: {

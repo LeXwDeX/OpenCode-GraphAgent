@@ -2,6 +2,7 @@
 export function deactivate() {}
 
 import * as vscode from "vscode"
+import { appendPrompt, isOpenCodeHealthy } from "./connection";
 
 const TERMINAL_NAME = "opencode"
 
@@ -74,11 +75,10 @@ export function activate(context: vscode.ExtensionContext) {
     let connected = false
     do {
       await new Promise((resolve) => setTimeout(resolve, 200))
-      try {
-        await fetch(`http://localhost:${port}/app`)
+      if (await isOpenCodeHealthy(port)) {
         connected = true
         break
-      } catch {}
+      }
 
       tries--
     } while (tries > 0)
@@ -88,16 +88,6 @@ export function activate(context: vscode.ExtensionContext) {
       await appendPrompt(port, `In ${fileRef}`)
       terminal.show()
     }
-  }
-
-  async function appendPrompt(port: number, text: string) {
-    await fetch(`http://localhost:${port}/tui/append-prompt`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ text }),
-    })
   }
 
   function getActiveFile() {

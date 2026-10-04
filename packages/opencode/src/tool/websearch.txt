@@ -1,14 +1,14 @@
 - Search the web using the session's web search provider - performs real-time web searches and can scrape content from specific URLs
 - Provides up-to-date information for current events and recent data
-- Supports configurable result counts and returns the content from the most relevant websites
+- With Exa, supports configurable result counts and returns the content from the most relevant websites
 - Use this tool for accessing information beyond knowledge cutoff
 - Searches are performed automatically within a single API call
 
 Usage notes:
-  - Supports live crawling modes when available: 'fallback' (backup if cached unavailable) or 'preferred' (prioritize live crawling)
-  - Search types when available: 'auto' (balanced), 'fast' (quick results), 'deep' (comprehensive search)
-  - Configurable context length for optimal LLM integration
-  - Domain filtering and advanced search options available
+  - With Exa, supports live crawling modes: 'fallback' (backup if cached unavailable) or 'preferred' (prioritize live crawling)
+  - With Exa, search types: 'auto' (balanced), 'fast' (quick results), 'deep' (comprehensive search)
+  - With Exa, configurable returned context length
+  - There is no dedicated domain-filter parameter. Parallel uses the query and ignores the optional controls below.
 
 The current year is {{year}}. You MUST use this year when searching for recent information or current events
 - Example: If the current year is 2026 and the user asks for "latest AI news", search for "AI news 2026", NOT "AI news 2025"
@@ -19,7 +19,7 @@ The current year is {{year}}. You MUST use this year when searching for recent i
 - `numResults` (optional): Number of results to return (default varies by provider).
 - `livecrawl` (optional): Enable live crawling for fresh results.
 - `type` (optional): Search type filter.
-- `contextMaxCharacters` (optional): Maximum characters per result snippet.
+- `contextMaxCharacters` (optional): Exa context-string character limit, not a local per-snippet cap.
 
 ## Returns
 

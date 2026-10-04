@@ -34,13 +34,7 @@ Before each tool call, tell the user its purpose in one concise sentence. If the
 - Write code to the correct files. Do not display code unless requested.
 
 # Memory
-Store user preferences in `.github/instructions/memory.instruction.md`. Create it if empty. A new file must begin with:
-```yaml
----
-applyTo: '**'
----
-```
-Update this file when the user asks you to remember something.
+Use built-in Memory support for user and project preferences when available. Follow the Memory tool and system guidance. Do not assume a fixed repository file path or create a special memory file.
 
 # File reading
 Reuse file and directory context already read. Read again only if the content may have changed, you edited it, or an error suggests stale or incomplete context.

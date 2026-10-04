@@ -223,7 +223,7 @@ function collapseDuplicateComponents(spec: OpenApiSpec) {
   for (const name of Object.keys(schemas)) {
     const base = name.replace(/\d+$/, "")
     if (base === name || !schemas[base]) continue
-    if (stableSchema(schemas[name], schemas) !== stableSchema(schemas[base], schemas)) continue
+    if (!equivalentSchemas(schemas[name], schemas[base], schemas)) continue
     rewriteRefs(spec, name, base)
     delete schemas[name]
   }
@@ -236,7 +236,7 @@ function normalizeComponentNames(spec: OpenApiSpec) {
     const next = componentTypeName(name)
     if (next === name) continue
     if (schemas[next]) {
-      if (stableSchema(schemas[name], schemas) === stableSchema(schemas[next], schemas)) {
+      if (equivalentSchemas(schemas[name], schemas[next], schemas)) {
         rewriteRefs(spec, name, next)
         delete schemas[name]
       }
@@ -308,39 +308,168 @@ function nullable(schema: OpenApiSchema): OpenApiSchema {
   return { anyOf: [schema, { type: "null" }] }
 }
 
-function stableSchema(input: unknown, schemas: Record<string, OpenApiSchema>): string {
-  return JSON.stringify(canonicalizeSchema(input, schemas))
+// JSON Schema keywords define where nested values are schemas. All other
+// values (including const/default/enum/examples) are ordinary JSON data.
+const schemaMaps = new Set([
+  "properties",
+  "patternProperties",
+  "$defs",
+  "definitions",
+  "dependentSchemas",
+  "dependencies",
+])
+const schemaChildren = new Set([
+  "items",
+  "prefixItems",
+  "additionalItems",
+  "contains",
+  "additionalProperties",
+  "unevaluatedProperties",
+  "unevaluatedItems",
+  "propertyNames",
+  "not",
+  "if",
+  "then",
+  "else",
+  "allOf",
+  "anyOf",
+  "oneOf",
+  "contentSchema",
+])
+type SchemaPosition = "schema" | "map" | "data"
+function childPosition(position: SchemaPosition, key: string): SchemaPosition {
+  if (position === "map") return "schema"
+  if (position === "data") return "data"
+  if (schemaMaps.has(key)) return "map"
+  return schemaChildren.has(key) ? "schema" : "data"
 }
 
-function canonicalizeSchema(input: unknown, schemas: Record<string, OpenApiSchema>): unknown {
-  if (Array.isArray(input)) return input.map((item) => canonicalizeSchema(item, schemas))
-  if (!input || typeof input !== "object") return input
-  const schema = input as OpenApiSchema
-  if (schema.$ref) return { $ref: canonicalRef(schema.$ref, schemas) }
-  return Object.fromEntries(
-    Object.entries(input)
-      .filter(([key]) => key !== "description")
-      .sort(([a], [b]) => a.localeCompare(b))
-      .map(([key, value]) => [key, canonicalizeSchema(value, schemas)]),
-  )
-}
-
-function canonicalRef(ref: string, schemas: Record<string, OpenApiSchema>) {
-  const name = ref.replace("#/components/schemas/", "")
-  const base = name.replace(/\d+$/, "")
-  if (base !== name && schemas[base]) return `#/components/schemas/${base}`
-  return ref
-}
-
-function rewriteRefs(input: unknown, from: string, to: string): void {
-  if (Array.isArray(input)) {
-    for (const item of input) rewriteRefs(item, from, to)
-    return
+function equivalentSchemas(
+  left: unknown,
+  right: unknown,
+  schemas: Record<string, OpenApiSchema>,
+  comparing = new Set<string>(),
+  position: SchemaPosition = "schema",
+): boolean {
+  if (left === right) return true
+  if (Array.isArray(left) || Array.isArray(right)) {
+    return (
+      Array.isArray(left) &&
+      Array.isArray(right) &&
+      left.length === right.length &&
+      left.every((item, index) => equivalentSchemas(item, right[index], schemas, comparing, position))
+    )
   }
-  if (!input || typeof input !== "object") return
-  const schema = input as OpenApiSchema
-  if (schema.$ref === `#/components/schemas/${from}`) schema.$ref = `#/components/schemas/${to}`
-  for (const value of Object.values(input)) rewriteRefs(value, from, to)
+  if (!left || !right || typeof left !== "object" || typeof right !== "object") return false
+  const a = left as Record<string, unknown>
+  const b = right as Record<string, unknown>
+  const keys = Object.keys(a)
+    .filter((key) => position !== "schema" || key !== "description")
+    .sort()
+  const otherKeys = Object.keys(b)
+    .filter((key) => position !== "schema" || key !== "description")
+    .sort()
+  if (keys.length !== otherKeys.length || keys.some((key, index) => key !== otherKeys[index])) return false
+  return keys.every((key) => {
+    if (position !== "schema" || key !== "$ref" || a[key] === b[key])
+      return equivalentSchemas(a[key], b[key], schemas, comparing, childPosition(position, key))
+    const prefix = "#/components/schemas/"
+    const ar = a[key]
+    const br = b[key]
+    if (typeof ar !== "string" || typeof br !== "string" || !ar.startsWith(prefix) || !br.startsWith(prefix))
+      return false
+    const targetA = schemas[ar.slice(prefix.length)]
+    const targetB = schemas[br.slice(prefix.length)]
+    if (!targetA || !targetB) return false
+    // A repeated pair closes a recursive comparison. All other fields, including
+    // siblings of $ref, still have to match before either component is removed.
+    const pair = JSON.stringify([ar, br])
+    if (comparing.has(pair)) return true
+    comparing.add(pair)
+    const equal = equivalentSchemas(targetA, targetB, schemas, comparing)
+    comparing.delete(pair)
+    return equal
+  })
+}
+
+function rewriteRefs(spec: OpenApiSpec, from: string, to: string): void {
+  const visitSchema = (input: unknown, position: SchemaPosition = "schema"): void => {
+    if (position === "data") return
+    if (Array.isArray(input)) {
+      for (const item of input) visitSchema(item, position)
+      return
+    }
+    if (!input || typeof input !== "object") return
+    const object = input as Record<string, unknown>
+    if (position === "schema" && object.$ref === `#/components/schemas/${from}`)
+      object.$ref = `#/components/schemas/${to}`
+    for (const [key, value] of Object.entries(object)) visitSchema(value, childPosition(position, key))
+  }
+  for (const schema of Object.values(spec.components?.schemas ?? {})) visitSchema(schema)
+  // Only declared OpenAPI fields lead to schema-bearing objects. Map keys are
+  // user-defined names, not keywords or extensions; payload data stays opaque.
+  type DocumentKind =
+    | "root"
+    | "components"
+    | "path"
+    | "operation"
+    | "parameter"
+    | "header"
+    | "body"
+    | "response"
+    | "media"
+    | "encoding"
+    | "callback"
+    | "leaf"
+  const maps: Partial<Record<DocumentKind, Record<string, DocumentKind>>> = {
+    root: { paths: "path", webhooks: "path" },
+    components: {
+      parameters: "parameter",
+      requestBodies: "body",
+      responses: "response",
+      headers: "header",
+      securitySchemes: "leaf",
+      callbacks: "callback",
+      pathItems: "path",
+    },
+    path: { parameters: "parameter" },
+    operation: { parameters: "parameter", responses: "response", callbacks: "callback" },
+    parameter: { content: "media" },
+    header: { content: "media" },
+    body: { content: "media" },
+    response: { headers: "header", content: "media", links: "leaf" },
+    media: { encoding: "encoding" },
+    encoding: { headers: "header" },
+  }
+  const visitMap = (input: unknown, kind: DocumentKind, paths = false): void => {
+    if (Array.isArray(input)) {
+      for (const item of input) visitDocument(item, kind)
+      return
+    }
+    if (!input || typeof input !== "object") return
+    for (const [name, value] of Object.entries(input)) {
+      // Paths Objects allow specification extensions beside slash-led paths.
+      if (paths && name.startsWith("x-")) continue
+      visitDocument(value, kind)
+    }
+  }
+  const visitDocument = (input: unknown, kind: DocumentKind = "root"): void => {
+    if (!input || typeof input !== "object") return
+    if (kind === "callback") {
+      visitMap(input, "path", true)
+      return
+    }
+    for (const [key, value] of Object.entries(input)) {
+      if (key === "schema" && (kind === "parameter" || kind === "header" || kind === "media")) visitSchema(value)
+      else if (maps[kind]?.[key]) visitMap(value, maps[kind][key], kind === "root" && key === "paths")
+      else if (kind === "root" && key === "components") visitDocument(value, "components")
+      else if (kind === "operation" && key === "requestBody") visitDocument(value, "body")
+      else if (kind === "path" && ["get", "post", "put", "delete", "patch", "options", "head", "trace"].includes(key))
+        visitDocument(value, "operation")
+    }
+  }
+
+  visitDocument(spec)
 }
 
 function normalizeLegacyErrorResponses(operation: OpenApiOperation) {

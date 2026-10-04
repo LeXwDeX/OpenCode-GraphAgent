@@ -157,6 +157,14 @@ jobs:
         working-directory: config_assistant
         run: go test ./...
 
+      - name: Run VS Code connection tests
+        if: steps.evidence.outputs.reused != 'true' && runner.os == 'Linux'
+        working-directory: sdks/vscode
+        timeout-minutes: 5
+        run: |
+          bun install --frozen-lockfile
+          bun run test:unit
+
       - name: Check generated client
         if: steps.evidence.outputs.reused != 'true' && (runner.os == 'Linux')
         working-directory: packages/client

@@ -1,11 +1,13 @@
 import { describe, expect, test } from "bun:test"
 import { createStore } from "solid-js/store"
 import { QueryClient } from "@tanstack/solid-query"
-import type { Config, OpencodeClient, Project } from "@opencode-ai/sdk/v2/client"
+import { createOpencodeClient, type Config, type OpencodeClient, type Project } from "@opencode-ai/sdk/v2/client"
 import type { NormalizedProviderListResponse } from "@opencode-ai/session-ui/context"
-import { bootstrapDirectory, loadPathQuery, loadProvidersQuery } from "./bootstrap"
+import { bootstrapDirectory, bootstrapGlobal, loadPathQuery, loadProvidersQuery } from "./bootstrap"
+import type { GlobalStore } from "./bootstrap"
 import type { State, VcsCache } from "./types"
 import { ServerScope } from "@/utils/server-scope"
+import { ServerConnection } from "@/context/server"
 
 const provider = { all: new Map(), connected: [], default: {} } satisfies NormalizedProviderListResponse
 
@@ -92,10 +94,74 @@ describe("bootstrapDirectory", () => {
   })
 })
 
+describe("bootstrapGlobal", () => {
+  test("keeps the first failure observable and clears it after a successful retry", async () => {
+    let failConfig = true
+    const existingProject: Project = {
+      id: "existing-project",
+      worktree: "/existing-project",
+      time: { created: 1, updated: 1 },
+      sandboxes: [],
+    }
+    const [store, setStore] = createStore<GlobalStore>({
+      ready: false,
+      path: { state: "", config: "", worktree: "", directory: "", home: "" },
+      project: [],
+      provider,
+      provider_auth: {},
+      config: {} satisfies Config,
+      reload: undefined as undefined | "pending" | "complete",
+    })
+    const sdk = createOpencodeClient()
+    Object.defineProperty(sdk.global.config, "get", {
+      value: async () => {
+        if (failConfig) throw new Error("invalid config response")
+        return { data: { model: "provider/model" } }
+      },
+    })
+    Object.defineProperty(sdk.provider, "list", {
+      value: async () => ({ data: { all: [], connected: [], default: {} } }),
+    })
+    Object.defineProperty(sdk.path, "get", {
+      value: async () => ({ data: { state: "", config: "", worktree: "", directory: "", home: "" } }),
+    })
+    Object.defineProperty(sdk.project, "list", { value: async () => ({ data: [existingProject] }) })
+    const queryClient = new QueryClient()
+    const input = {
+      serverSDK: sdk,
+      scope: ServerScope.local,
+      requestFailedTitle: "Request failed",
+      translate: (key: string) => key,
+      formatMoreCount: (count: number) => ` (+${count} more)`,
+      setGlobalStore: setStore,
+      queryClient,
+    }
+
+    const failed = await bootstrapGlobal(input)
+    expect(failed).toHaveLength(1)
+    const firstFailure = failed[0]
+    if (!(firstFailure instanceof Error)) throw new Error("Expected the failed config request error")
+    expect(firstFailure.message).toBe("invalid config response")
+    expect(store.error).toBe(firstFailure)
+
+    failConfig = false
+    const retried = await bootstrapGlobal(input)
+    expect(retried).toEqual([])
+    expect(store.error).toBeUndefined()
+    setStore("ready", true)
+
+    failConfig = true
+    const refreshFailure = await bootstrapGlobal(input)
+    expect(refreshFailure).toHaveLength(1)
+    expect(store.ready).toBe(true)
+    expect(store.project).toEqual([existingProject])
+  })
+})
+
 describe("query keys", () => {
   test("partitions identical directories by server scope", () => {
-    const client = {} as OpencodeClient
-    const remote = "https://debian.example" as typeof ServerScope.local
+    const client = createOpencodeClient()
+    const remote = ServerScope.fromServerKey(ServerConnection.Key.make("https://debian.example"))
 
     expect([...loadPathQuery(ServerScope.local, "/repo", client).queryKey]).toEqual(["local", "/repo", "path"])
     expect([...loadPathQuery(remote, "/repo", client).queryKey]).toEqual(["https://debian.example", "/repo", "path"])

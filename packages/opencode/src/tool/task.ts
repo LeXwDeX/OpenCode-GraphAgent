@@ -20,7 +20,7 @@ import { SettingsHook, type TriggerResult } from "@/hook/settings"
 export interface TaskPromptOps {
   cancel(sessionID: SessionID): Effect.Effect<void>
   resolvePromptParts(template: string): Effect.Effect<SessionPrompt.PromptInput["parts"]>
-  prompt(input: SessionPrompt.PromptInput): Effect.Effect<SessionV1.WithParts>
+  prompt(input: SessionPrompt.PromptInput, options?: SessionPrompt.AdmissionOptions): Effect.Effect<SessionV1.WithParts>
 }
 
 const id = "task"
@@ -139,8 +139,7 @@ export const TaskTool = Tool.define(
         return yield* Effect.fail(new Error(`Unknown agent type: ${params.subagent_type} is not a valid agent type`))
       }
 
-      const session =
-        params.task_id !== undefined ? yield* sessions.get(SessionID.make(params.task_id)) : undefined
+      const session = params.task_id !== undefined ? yield* sessions.get(SessionID.make(params.task_id)) : undefined
       const childPermission = deriveSubagentSessionPermission({
         parentSessionPermission: parent.permission ?? [],
         subagent: next,
@@ -256,26 +255,29 @@ export const TaskTool = Tool.define(
       ) {
         const currentParent = yield* sessions.get(ctx.sessionID)
         yield* ops
-          .prompt({
-            sessionID: ctx.sessionID,
-            agent: currentParent.agent ?? ctx.agent,
-            variant,
-            parts: [
-              {
-                type: "text",
-                synthetic: true,
-                text: renderOutput({
-                  sessionID: nextSession.id,
-                  state,
-                  summary:
-                    state === "completed"
-                      ? `Background task completed: ${params.description}`
-                      : `Background task failed: ${params.description}`,
-                  text,
-                }),
-              },
-            ],
-          })
+          .prompt(
+            {
+              sessionID: ctx.sessionID,
+              agent: currentParent.agent ?? ctx.agent,
+              variant,
+              parts: [
+                {
+                  type: "text",
+                  synthetic: true,
+                  text: renderOutput({
+                    sessionID: nextSession.id,
+                    state,
+                    summary:
+                      state === "completed"
+                        ? `Background task completed: ${params.description}`
+                        : `Background task failed: ${params.description}`,
+                    text,
+                  }),
+                },
+              ],
+            },
+            { continueToolBudget: true },
+          )
           .pipe(Effect.ignore, Effect.forkIn(scope, { startImmediately: true }))
       })
 
@@ -421,14 +423,17 @@ export const TaskTool = Tool.define(
             // A failure here breaks the loop immediately (don't swallow the error
             // and re-loop forever — the prior Effect.catch did that).
             const cont = yield* ops
-              .prompt({
-                messageID: MessageID.ascending(),
-                sessionID: nextSession.id,
-                model: { modelID: model.modelID, providerID: model.providerID },
-                variant: next.model ? undefined : variant,
-                agent: next.name,
-                parts: [{ type: "text", synthetic: true, text: stopResult.blocked.reason || "Continue." }],
-              })
+              .prompt(
+                {
+                  messageID: MessageID.ascending(),
+                  sessionID: nextSession.id,
+                  model: { modelID: model.modelID, providerID: model.providerID },
+                  variant: next.model ? undefined : variant,
+                  agent: next.name,
+                  parts: [{ type: "text", synthetic: true, text: stopResult.blocked.reason || "Continue." }],
+                },
+                { continueToolBudget: true },
+              )
               .pipe(Effect.exit)
             if (Exit.isFailure(cont)) {
               lastStillBlocked = false

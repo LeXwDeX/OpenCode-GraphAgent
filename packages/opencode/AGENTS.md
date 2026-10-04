@@ -1,20 +1,17 @@
-# opencode database guide
+# opencode runtime guide
 
 ## Tool parameter schema contract
 
-Tool `parameters` must serialize to a JSON Schema **plain object root** (`type:
-"object"` with `properties`). Root-level combinators (`anyOf`/`oneOf`/`allOf`)
-violate the OpenAI tools contract: OpenAI tolerates them, DeepSeek rejects them
-with a schema error, and GLM silently emits empty tool arguments. A tool that
-needs a discriminated union must nest it under a property, e.g.
-`Schema.Struct({ params: <union> })`. `Tool.define` enforces this at
-construction time (`assertObjectRootedParameters`) — a violating tool fails
-registration instead of degrading at provider runtime.
+Tool `parameters` must serialize to a JSON Schema **object root** (`type:
+"object"` with `properties`). Do not put combinators (`anyOf`/`oneOf`/`allOf`)
+at the root. Nest a discriminated union under a property, for example
+`Schema.Struct({ params: <union> })`. Tool initialization calls
+`assertObjectRootedParameters` and rejects an invalid schema before use.
 
 ## Database
 
 - **Schema**: Drizzle schema lives in `packages/core/src/**/*.sql.ts`.
-- **Migrations**: database migrations live in `packages/core` and are applied by core.
+- **Migrations**: core applies migrations from `packages/core/src/database/migration/`. Run `bun run migration` from `packages/core` after schema changes. Include `schema.json`, `src/database/migration.gen.ts`, and `src/database/schema.gen.ts` with the migration; check them with `bun run migration --check`.
 
 ## Development server
 
@@ -115,14 +112,14 @@ See `specs/effect/migration.md` for the compact pattern reference and examples.
 
 ## Runtime vs InstanceState
 
-- Use `makeRuntime` (from `src/effect/run-service.ts`) for all services. It returns `{ runPromise, runFork, runCallback }` backed by a shared `memoMap` that deduplicates layers.
+- Use `makeRuntime` (from `src/effect/run-service.ts`) for service execution facades. It uses the shared `memoMap` to deduplicate layers and preserves instance/workspace context.
 - Use `InstanceState` (from `src/effect/instance-state.ts`) for per-directory or per-project state that needs per-instance cleanup. It uses `ScopedCache` keyed by directory — each open project gets its own state, automatically cleaned up on disposal.
 - If two open directories should not share one copy of the service, it needs `InstanceState`.
 - Do the work directly in the `InstanceState.make` closure — `ScopedCache` handles run-once semantics. Don't add fibers, `ensure()` callbacks, or `started` flags on top.
 - Use `Effect.addFinalizer` or `Effect.acquireRelease` inside the `InstanceState.make` closure for cleanup (subscriptions, process teardown, etc.).
 - Use `Effect.forkScoped` inside the closure for background stream consumers — the fiber is interrupted when the instance is disposed.
 - To make a service's `init()` non-blocking, fork `InstanceState.get(state)` at the `init()` call site (e.g. `Effect.forkIn(scope)`), not by forking work inside the `InstanceState.make` closure. Forking inside the closure leaves state incomplete for other methods that read it.
-- `src/project/bootstrap.ts` already wraps every service `init()` in `Effect.forkDetach`, so `init()` is fire-and-forget in production. Keep `init()` methods synchronous internally; the caller controls concurrency.
+- `src/project/bootstrap.ts` awaits config and plugin initialization before other services. It awaits the listed initialization methods; Memory is explicitly forked in the bootstrap scope. Keep initialization semantics explicit and bind background work to its owning scope.
 
 ## Effect v4 beta API
 

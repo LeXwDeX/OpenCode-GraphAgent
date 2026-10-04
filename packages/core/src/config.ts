@@ -22,6 +22,7 @@ import { ConfigPlugin } from "./config/plugin"
 import { ConfigProvider } from "./config/provider"
 import { ConfigReference } from "./config/reference"
 import { ConfigToolOutput } from "./config/tool-output"
+import { ToolBudget } from "./session/tool-budget"
 import { ConfigWatcher } from "./config/watcher"
 import { ConfigV1 } from "./v1/config/config"
 import { ConfigMigrateV1 } from "./v1/config/migrate"
@@ -42,6 +43,7 @@ export class Info extends Schema.Class<Info>("Config.Info")({
   default_agent: Schema.String.pipe(Schema.optional).annotate({
     description: "Default primary agent to use when no session agent is selected",
   }),
+  maxToolCalls: ToolBudget.MaxToolCalls.pipe(Schema.optional),
   question_timeout: PositiveInt.pipe(Schema.optional).annotate({
     description: "Seconds to wait for a question response before the agent continues independently (default: 60)",
   }),

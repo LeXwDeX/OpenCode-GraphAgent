@@ -30,25 +30,26 @@ export const description = `Search the web using the session's local web search 
 
 This is a provider-independent local tool backed by Exa or Parallel. Provider-hosted web search tools are separate and execute at the model provider.
 
-Optional controls support result count, live crawling ('fallback' or 'preferred'), search type ('auto', 'fast', or 'deep'), and maximum context characters.
+With Exa, optional controls support result count, live crawling ('fallback' or 'preferred'), search type ('auto', 'fast', or 'deep'), and maximum context-string characters. Parallel ignores these optional controls. There is no dedicated domain-filter parameter.
 
 The current year is ${new Date().getFullYear()}. Use this year when searching for recent information or current events.`
 
 export const Input = Schema.Struct({
   query: Schema.String.annotate({ description: "Websearch query" }),
   numResults: Schema.optional(PositiveInt.check(Schema.isLessThanOrEqualTo(MAX_NUM_RESULTS))).annotate({
-    description: `Number of search results to return (default: 8, maximum: ${MAX_NUM_RESULTS})`,
+    description: `Exa only; ignored by Parallel. Number of search results to return (default: 8, maximum: ${MAX_NUM_RESULTS})`,
   }),
   livecrawl: Schema.optional(Schema.Literals(["fallback", "preferred"])).annotate({
     description:
-      "Live crawl mode - 'fallback': use live crawling as backup if cached unavailable, 'preferred': prioritize live crawling (default: 'fallback')",
+      "Exa only; ignored by Parallel. Live crawl mode - 'fallback': use live crawling as backup if cached unavailable, 'preferred': prioritize live crawling (default: 'fallback')",
   }),
   type: Schema.optional(Schema.Literals(["auto", "fast", "deep"])).annotate({
-    description: "Search type - 'auto': balanced search (default), 'fast': quick results, 'deep': comprehensive search",
+    description:
+      "Exa only; ignored by Parallel. Search type - 'auto': balanced search (default), 'fast': quick results, 'deep': comprehensive search",
   }),
   contextMaxCharacters: Schema.optional(PositiveInt.check(Schema.isLessThanOrEqualTo(MAX_CONTEXT_CHARACTERS))).annotate(
     {
-      description: `Maximum characters for context string optimized for models (default: 10000, maximum: ${MAX_CONTEXT_CHARACTERS})`,
+      description: `Exa only; ignored by Parallel. Maximum characters for returned context string, not a local per-snippet cap (default: 10000, maximum: ${MAX_CONTEXT_CHARACTERS})`,
     },
   ),
 })

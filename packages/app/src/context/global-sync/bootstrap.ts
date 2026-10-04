@@ -22,8 +22,9 @@ import { loadMcpQuery } from "../server-sync"
 import { NormalizedProviderListResponse } from "@opencode-ai/session-ui/context"
 import { ScopedKey, type ServerScope } from "@/utils/server-scope"
 
-type GlobalStore = {
+export type GlobalStore = {
   ready: boolean
+  error?: unknown
   path: Path
   project: Project[]
   provider: NormalizedProviderListResponse
@@ -120,13 +121,20 @@ export async function bootstrapGlobal(input: {
         .fetchQuery(loadProjectsQuery(input.scope, input.serverSDK))
         .then((data) => input.setGlobalStore("project", data)),
   ]
-  await runAll(slow)
-  // showErrors({
-  //   errors: errors(),
-  //   title: input.requestFailedTitle,
-  //   translate: input.translate,
-  //   formatMoreCount: input.formatMoreCount,
-  // })
+  const failed = errors(await runAll(slow))
+  if (failed.length > 0) {
+    input.setGlobalStore("error", failed[0])
+    showErrors({
+      errors: failed,
+      title: input.requestFailedTitle,
+      translate: input.translate,
+      formatMoreCount: input.formatMoreCount,
+    })
+    return failed
+  }
+
+  input.setGlobalStore("error", undefined)
+  return failed
 }
 
 function groupBySession<T extends { id: string; sessionID: string }>(input: T[]) {
@@ -177,7 +185,11 @@ function warmSessions(input: {
   ).then(() => undefined)
 }
 
-export const loadProvidersQuery = (scope: ServerScope, directory: string | null, sdk: OpencodeClient) =>
+export const loadProvidersQuery = (
+  scope: ServerScope,
+  directory: string | null,
+  sdk: { provider: Pick<OpencodeClient["provider"], "list"> },
+) =>
   queryOptions({
     queryKey: [scope, directory, "providers"],
     queryFn: () => retry(() => sdk.provider.list().then((x) => normalizeProviderList(x.data!))),
@@ -189,7 +201,11 @@ export const loadAgentsQuery = (scope: ServerScope, directory: string | null, sd
     queryFn: () => retry(() => sdk.app.agents().then((x) => normalizeAgentList(x.data))),
   })
 
-export const loadPathQuery = (scope: ServerScope, directory: string | null, sdk: OpencodeClient) =>
+export const loadPathQuery = (
+  scope: ServerScope,
+  directory: string | null,
+  sdk: { path: Pick<OpencodeClient["path"], "get"> },
+) =>
   queryOptions<Path>({
     queryKey: [scope, directory, "path"],
     queryFn: () => retry(() => sdk.path.get().then((x) => x.data!)),

@@ -63,13 +63,19 @@ describe("QuestionTool", () => {
         [],
         true,
       )
-      expect(output).toContain('Question 1 fallback candidate: "First (Recommended)" (single selection only).')
-      expect(output).not.toContain('fallback candidate: "Second (Recommended)"')
-      expect(output).toContain("silence never grants new scope")
-      expect(output).not.toContain("User has answered your questions")
-      expect(QuestionTool.toModelOutput([{ question: "Free form", header: "Free", options: [] }], [], true)).toContain(
-        "Question 1 has no option fallback candidate",
+      expect(output).toContain("The user is temporarily away from the computer and did not answer.")
+      expect(output).toContain(
+        "Choose the best solution yourself based on the task, existing instructions, and available evidence.",
       )
+      expect(output).toContain('Question 1 fallback candidate: "First (Recommended)" (one suggested candidate).')
+      expect(output).toContain("Do not repeat this question in this turn.")
+      expect(output).not.toContain('fallback candidate: "Second (Recommended)"')
+      expect(output).toContain("recommendation, not a restriction")
+      expect(output).toContain("Silence never grants new scope")
+      expect(output).not.toContain("User has answered your questions")
+      const freeForm = QuestionTool.toModelOutput([{ question: "Free form", header: "Free", options: [] }], [], true)
+      expect(freeForm).toContain("Question 1 has no option fallback candidate")
+      expect(freeForm).toContain("does not by itself block work")
       expect(QuestionTool.toModelOutput([], [], false, true)).toContain("Do not repeat this question")
     }),
   )

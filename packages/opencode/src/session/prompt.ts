@@ -101,6 +101,7 @@ import { SessionAutomationLease } from "./automation-lease"
 import { ReasoningDistillation } from "./reasoning-distillation"
 import { DagMessages } from "@opencode-ai/core/dag/messages"
 import { setCaptureSnapshot } from "@/dag/runtime/capture"
+import { ToolBudget } from "@opencode-ai/core/session/tool-budget"
 
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -144,9 +145,14 @@ function isOrphanedInterruptedTool(part: SessionV1.ToolPart) {
   return part.state.status === "error" && part.state.metadata?.interrupted === true
 }
 
+export interface AdmissionOptions {
+  /** Internal follow-ups retain the current input's tool budget. */
+  readonly continueToolBudget?: boolean
+}
+
 export interface Interface {
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
-  readonly prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
+  readonly prompt: (input: PromptInput, options?: AdmissionOptions) => Effect.Effect<SessionV1.WithParts, Image.Error>
   /** Run a short commit while idle, serialized with prompt admission. Never start or await a turn here. */
   readonly withIdle: <A, E, R>(
     sessionID: SessionID,
@@ -155,8 +161,12 @@ export interface Interface {
   readonly prepareIfIdle: (
     input: PromptInput,
     persistAdmission?: Effect.Effect<void>,
+    options?: AdmissionOptions,
   ) => Effect.Effect<Option.Option<IdleAdmission>, Image.Error>
-  readonly promptIfIdle: (input: PromptInput) => Effect.Effect<Option.Option<SessionV1.WithParts>, Image.Error>
+  readonly promptIfIdle: (
+    input: PromptInput,
+    options?: AdmissionOptions,
+  ) => Effect.Effect<Option.Option<SessionV1.WithParts>, Image.Error>
   readonly loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts>
   readonly shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError>
   readonly command: (input: CommandInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
@@ -257,7 +267,9 @@ export const layer = Layer.effect(
     const rawSettingsHook = Option.getOrUndefined(yield* Effect.serviceOption(SettingsHook.Service))
     const rewake = Context.make(
       HookRewake.Service,
-      HookRewake.bind(({ sessionID, text }) => prompt({ sessionID, parts: [{ type: "text", text }] })),
+      HookRewake.bind(({ sessionID, text }) =>
+        prompt({ sessionID, parts: [{ type: "text", text }] }, { continueToolBudget: true }),
+      ),
     )
     const settingsHook: SettingsHook.Interface | undefined = rawSettingsHook && {
       ...rawSettingsHook,
@@ -269,6 +281,33 @@ export const layer = Layer.effect(
     const startContext = Option.getOrUndefined(yield* Effect.serviceOption(HookStartContext.Service))
     const goal = Option.getOrUndefined(yield* Effect.serviceOption(Goal.Service))
     const promptLocks = KeyedMutex.makeUnsafe<SessionID>()
+    const toolBudgets = yield* InstanceState.make(() =>
+      Effect.gen(function* () {
+        const budgets = new Map<SessionID, { active?: ToolBudget.Budget; pending: Map<MessageID, ToolBudget.Budget> }>()
+        yield* Effect.acquireRelease(
+          events.listen((event) =>
+            Effect.sync(() => {
+              if (event.type !== Session.Event.Deleted.type) return
+              const data = event.data
+              if (typeof data !== "object" || data === null || !("sessionID" in data)) return
+              if (typeof data.sessionID === "string") budgets.delete(SessionID.make(data.sessionID))
+            }),
+          ),
+          (unsubscribe) => unsubscribe,
+        )
+        yield* Effect.addFinalizer(() => Effect.sync(() => budgets.clear()))
+        return budgets
+      }),
+    )
+    const budgetState = Effect.fnUntraced(function* (sessionID: SessionID) {
+      const budgets = yield* InstanceState.get(toolBudgets)
+      let state = budgets.get(sessionID)
+      if (!state) {
+        state = { pending: new Map() }
+        budgets.set(sessionID, state)
+      }
+      return state
+    })
 
     const ordinaryUser = (message: SessionV1.WithParts): message is SessionV1.WithParts & { info: SessionV1.User } =>
       message.info.role === "user" &&
@@ -282,13 +321,30 @@ export const layer = Layer.effect(
             Effect.map((items) => items.filter((message) => !MessageV2.isIgnoredUser(message))),
             Effect.provideService(Database.Service, database),
           )
+          const state = yield* budgetState(sessionID)
+          let latestPending: { message: SessionV1.WithParts; budget: ToolBudget.Budget } | undefined
+          for (const message of messages) {
+            const budget = state.pending.get(message.info.id)
+            if (budget && (!latestPending || MessageV2.before(latestPending.message.info, message.info))) {
+              latestPending = { message, budget }
+            }
+          }
           const consumed = Date.now()
           for (const message of messages) {
             if (!ordinaryUser(message) || message.info.time.consumed !== undefined) continue
             message.info.time.consumed = consumed
+            // Persisted JSON loses Schema.Class prototypes. Rehydrate the output
+            // format before encoding the consumed user-message event.
+            if (message.info.format)
+              message.info.format = Schema.decodeUnknownSync(SessionV1.Format)(message.info.format)
             yield* sessions.updateMessage(message.info)
           }
-          return messages
+          // Activate only inputs included in this snapshot. Capture the budget
+          // under the same lock so later admissions cannot replace its owner.
+          const budget = latestPending?.budget ?? state.active ?? ToolBudget.create((yield* config.get()).maxToolCalls)
+          state.active = budget
+          for (const message of messages) state.pending.delete(message.info.id)
+          return { messages, budget }
         }),
       )
     })
@@ -400,7 +456,15 @@ export const layer = Layer.effect(
                 }),
               { behavior: "immediate" },
             )
-            .pipe(Effect.catchTag("SqlError", Effect.die)),
+            .pipe(
+              Effect.tap(() =>
+                Effect.gen(function* () {
+                  const budgets = yield* InstanceState.get(toolBudgets)
+                  budgets.get(input.sessionID)?.pending.delete(input.messageID)
+                }),
+              ),
+              Effect.catchTag("SqlError", Effect.die),
+            ),
         ),
     )
 
@@ -408,7 +472,8 @@ export const layer = Layer.effect(
       return {
         cancel: (sessionID: SessionID) => cancel(sessionID),
         resolvePromptParts: (template: string) => resolvePromptParts(template),
-        prompt: (input: PromptInput) => prompt(input).pipe(Effect.catch(Effect.die)),
+        prompt: (input: PromptInput, options?: AdmissionOptions) =>
+          prompt(input, options).pipe(Effect.catch(Effect.die)),
       } satisfies TaskPromptOps
     })
 
@@ -1638,6 +1703,7 @@ export const layer = Layer.effect(
     const admitPrompt = Effect.fn("SessionPrompt.admitPrompt")(function* (
       input: PromptInput,
       persistAdmission?: Effect.Effect<void>,
+      options?: AdmissionOptions,
     ) {
       const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
       yield* revert.cleanup(session)
@@ -1723,16 +1789,22 @@ export const layer = Layer.effect(
         yield* sessions.setPermission({ sessionID: session.id, permission: permissions })
       }
 
+      if (!options?.continueToolBudget) {
+        const state = yield* budgetState(input.sessionID)
+        state.pending.set(message.info.id, ToolBudget.create((yield* config.get()).maxToolCalls))
+      }
+
       return { message, run: input.noReply !== true }
     })
 
-    const prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error> = Effect.fn(
-      "SessionPrompt.prompt",
-    )(function* (input: PromptInput) {
+    const prompt: Interface["prompt"] = Effect.fn("SessionPrompt.prompt")(function* (
+      input: PromptInput,
+      options?: AdmissionOptions,
+    ) {
       const wait = yield* promptLocks.withLock(input.sessionID)(
         Effect.gen(function* () {
           if (goal && input.noReply !== true) yield* goal.clearTurnDriven(input.sessionID)
-          const admitted = yield* admitPrompt(input)
+          const admitted = yield* admitPrompt(input, undefined, options)
           if (!admitted.run) return Effect.succeed(admitted.message)
           return yield* state.ensureRunningHandle(
             input.sessionID,
@@ -1757,6 +1829,7 @@ export const layer = Layer.effect(
     const prepareIfIdle: Interface["prepareIfIdle"] = Effect.fn("SessionPrompt.prepareIfIdle")(function* (
       input: PromptInput,
       persistAdmission?: Effect.Effect<void>,
+      options?: AdmissionOptions,
     ) {
       return yield* promptLocks.withLock(input.sessionID)(
         Effect.uninterruptibleMask((restore) =>
@@ -1779,7 +1852,7 @@ export const layer = Layer.effect(
             )
             if (Option.isNone(wait)) return Option.none<IdleAdmission>()
 
-            const admitted = yield* restore(admitPrompt(input, persistAdmission)).pipe(Effect.exit)
+            const admitted = yield* restore(admitPrompt(input, persistAdmission, options)).pipe(Effect.exit)
             yield* Deferred.succeed(admission, admitted)
             if (Exit.isFailure(admitted)) {
               yield* Deferred.succeed(activation, undefined)
@@ -1795,15 +1868,16 @@ export const layer = Layer.effect(
       )
     })
 
-    const promptIfIdle: Interface["promptIfIdle"] = Effect.fn("SessionPrompt.promptIfIdle")((input: PromptInput) =>
-      Effect.uninterruptibleMask((restore) =>
-        Effect.gen(function* () {
-          const prepared = yield* restore(prepareIfIdle(input))
-          if (Option.isNone(prepared)) return Option.none()
-          yield* prepared.value.activate.pipe(Effect.onError(() => prepared.value.abort))
-          return Option.some(yield* restore(prepared.value.result))
-        }),
-      ),
+    const promptIfIdle: Interface["promptIfIdle"] = Effect.fn("SessionPrompt.promptIfIdle")(
+      (input: PromptInput, options?: AdmissionOptions) =>
+        Effect.uninterruptibleMask((restore) =>
+          Effect.gen(function* () {
+            const prepared = yield* restore(prepareIfIdle(input, undefined, options))
+            if (Option.isNone(prepared)) return Option.none()
+            yield* prepared.value.activate.pipe(Effect.onError(() => prepared.value.abort))
+            return Option.some(yield* restore(prepared.value.result))
+          }),
+        ),
     )
 
     const lastAssistant = Effect.fnUntraced(function* (sessionID: SessionID) {
@@ -1857,7 +1931,9 @@ export const layer = Layer.effect(
           const modelMessageID = MessageID.ascending()
           const identity = { projectID: ctx.project.id, directory: ctx.directory, sessionID }
           let agentSnapshot: DagMessages.Snapshot | undefined
-          let msgs = yield* claimSnapshot(sessionID)
+          let snapshot = yield* claimSnapshot(sessionID)
+          let msgs = snapshot.messages
+          let budget = snapshot.budget
           const previous = MessageV2.latest(msgs)
           const previousParts = msgs.findLast((message) => message.info.id === previous.assistant?.id)?.parts
           const needsStop =
@@ -1906,7 +1982,9 @@ export const layer = Layer.effect(
                 }
                 // A clean result becomes stale when newer accepted input is awaiting the model.
                 turnStopped = false
-                msgs = yield* claimSnapshot(sessionID)
+                snapshot = yield* claimSnapshot(sessionID)
+                msgs = snapshot.messages
+                budget = snapshot.budget
               }
             }
           }
@@ -2208,13 +2286,10 @@ export const layer = Layer.effect(
             yield* events.publish(Session.Event.Error, { sessionID, error: error.toObject() })
             throw error
           }
-          // GOAL-TURN-SCOPE: cap goal-driven turns (kick / continuation /
-          // resume-kick) so every goal turn reaches an idle boundary where the
-          // judge and the turn budget can engage. min() keeps a stricter
-          // user-configured agent.steps authoritative.
-          const goalMax = goal ? yield* goal.goalTurnMaxSteps(sessionID) : undefined
-          const maxSteps = Math.min(agent.steps ?? Infinity, goalMax ?? Infinity)
+          const maxSteps = agent.steps ?? Infinity
           const isLastStep = step >= maxSteps
+          const toolLimitReached = budget.exhausted
+          const toolsDisabled = isLastStep || toolLimitReached
           msgs = yield* SessionReminders.apply({ messages: msgs, agent, session }).pipe(
             Effect.provideService(RuntimeFlags.Service, flags),
             Effect.provideService(FSUtil.Service, fsys),
@@ -2288,25 +2363,27 @@ export const layer = Layer.effect(
             const bypassAgentCheck = lastUserMsg?.parts.some((p) => p.type === "agent") ?? false
             const promptOps = yield* ops()
 
-            const tools = yield* SessionTools.resolve({
-              agent,
-              session,
-              model,
-              processor: handle,
-              bypassAgentCheck,
-              messages: msgs,
-              promptOps,
-              hooks: settingsHook,
-              sourceLedger: toolSources,
-            }).pipe(
-              Effect.provideService(Plugin.Service, plugin),
-              Effect.provideService(Permission.Service, permission),
-              Effect.provideService(ToolRegistry.Service, registry),
-              Effect.provideService(MCP.Service, mcp),
-              Effect.provideService(Truncate.Service, truncate),
-            )
+            const tools = toolsDisabled
+              ? {}
+              : yield* SessionTools.resolve({
+                  agent,
+                  session,
+                  model,
+                  processor: handle,
+                  bypassAgentCheck,
+                  messages: msgs,
+                  promptOps,
+                  hooks: settingsHook,
+                  sourceLedger: toolSources,
+                }).pipe(
+                  Effect.provideService(Plugin.Service, plugin),
+                  Effect.provideService(Permission.Service, permission),
+                  Effect.provideService(ToolRegistry.Service, registry),
+                  Effect.provideService(MCP.Service, mcp),
+                  Effect.provideService(Truncate.Service, truncate),
+                )
 
-            if (lastUser.format?.type === "json_schema") {
+            if (!toolsDisabled && lastUser.format?.type === "json_schema") {
               tools["StructuredOutput"] = createStructuredOutputTool({
                 schema: lastUser.format.schema,
                 onSuccess(output) {
@@ -2356,7 +2433,7 @@ export const layer = Layer.effect(
               ...memoryDocs,
             ]
             const format = lastUser.format ?? { type: "text" as const }
-            if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
+            if (!toolsDisabled && format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
             const processInput: LLM.StreamInput = {
               user: lastUser,
               agent,
@@ -2366,11 +2443,19 @@ export const layer = Layer.effect(
               system,
               messages: [
                 ...modelMsgs,
-                ...(isLastStep ? [{ role: "assistant" as const, content: MAX_STEPS_PROMPT }] : []),
+                ...(toolsDisabled
+                  ? [
+                      {
+                        role: "assistant" as const,
+                        content: toolLimitReached ? ToolBudget.renderExhaustedPrompt(budget.max) : MAX_STEPS_PROMPT,
+                      },
+                    ]
+                  : []),
               ],
               tools,
+              toolBudget: budget,
               model,
-              toolChoice: format.type === "json_schema" ? "required" : undefined,
+              toolChoice: toolsDisabled ? "none" : format.type === "json_schema" ? "required" : undefined,
               purpose: "conversation",
               contextFolding: contextFoldingHistory,
             }
@@ -2435,18 +2520,35 @@ export const layer = Layer.effect(
 
             const finished = handle.message.finish && !["tool-calls", "unknown"].includes(handle.message.finish)
             if (finished && !handle.message.error) {
-              if (format.type === "json_schema") {
-                handle.message.error = new SessionV1.StructuredOutputError({
-                  message: "Model did not produce structured output",
-                  retries: 0,
+              // Surface any content-filter finish (e.g. Anthropic stop_reason:
+              // refusal) as an error. These turns may have produced no visible
+              // output at all — previously the session went idle silently — or
+              // partial text that was cut off by the provider's filter.
+              if (handle.message.finish === "content-filter") {
+                handle.message.error = new SessionV1.ContentFilterError({
+                  message: "The response was blocked by the provider's content filter",
                 }).toObject()
                 yield* sessions.updateMessage(handle.message)
+                yield* events.publish(Session.Event.Error, { sessionID, error: handle.message.error })
                 return "break" as const
               }
             }
 
-            if (result === "stop") return "break" as const
-            if (isLastStep) return "break" as const
+            if (format.type === "json_schema" && !handle.message.error && (finished || toolsDisabled)) {
+              handle.message.error = new SessionV1.StructuredOutputError({
+                message: toolLimitReached
+                  ? "Maximum tool calls reached before producing structured output"
+                  : isLastStep
+                    ? "Maximum agent steps reached before producing structured output"
+                    : "Model did not produce structured output",
+                retries: 0,
+              }).toObject()
+              yield* sessions.updateMessage(handle.message)
+              if (toolsDisabled) yield* events.publish(Session.Event.Error, { sessionID, error: handle.message.error })
+              return "break" as const
+            }
+
+            if (toolsDisabled || result === "stop") return "break" as const
             if (result === "compact") {
               yield* compaction.create({
                 sessionID,
@@ -2696,54 +2798,62 @@ export const layer = Layer.effect(
         if (dispatchResult?.type === "kick" && input.command === "goal") {
           const m = yield* currentModel(input.sessionID)
           const agentName = input.agent ?? (yield* agents.defaultAgent())
-          const userMsg: SessionV1.User = {
-            id: input.messageID ?? MessageID.ascending(),
-            role: "user",
-            sessionID: input.sessionID,
-            time: { created: Date.now() },
-            agent: agentName,
-            model: { providerID: m.providerID, modelID: m.modelID },
-          }
-          yield* sessions.updateMessage(userMsg)
-          const dispatchText = dispatchResult.announce ?? dispatchResult.text
-          const cmdText: SessionV1.TextPart = {
-            id: PartID.ascending(),
-            messageID: userMsg.id,
-            sessionID: input.sessionID,
-            type: "text",
-            text: `/${input.command} ${input.arguments}`.trim(),
-          }
-          yield* sessions.updatePart(cmdText)
-          // Non-synthetic so UserMessage renders it — the command confirmation
-          // (e.g. "⏸ 目标已暂停") must be visible. Matches the goal "done" case
-          // (loop.ts), which emits visible goal messages as non-synthetic parts.
-          const responsePart: SessionV1.TextPart = {
-            id: PartID.ascending(),
-            messageID: userMsg.id,
-            sessionID: input.sessionID,
-            type: "text",
-            text: dispatchText,
-          }
-          yield* sessions.updatePart(responsePart)
-          yield* sessions.touch(input.sessionID)
-          // GOAL-TURN-SCOPE: this loop() is a goal-driven turn (kick or
-          // resume-kick) — mark it so the step ceiling applies and ESC maps to
-          // a goal pause.
-          yield* goal?.markTurnDriven(input.sessionID)
-          // Drain SessionStart hook contexts before loop
-          if (startContext) {
-            const contexts = yield* startContext.consume(input.sessionID)
-            for (const ctx of contexts) {
-              yield* sessions.updatePart({
+          // Persist the input and register its budget before any snapshot can
+          // claim it. Run the model only after releasing the admission lock.
+          yield* promptLocks.withLock(input.sessionID)(
+            Effect.gen(function* () {
+              const budget = ToolBudget.create((yield* config.get()).maxToolCalls)
+              const userMsg: SessionV1.User = {
+                id: input.messageID ?? MessageID.ascending(),
+                role: "user",
+                sessionID: input.sessionID,
+                time: { created: Date.now() },
+                agent: agentName,
+                model: { providerID: m.providerID, modelID: m.modelID },
+              }
+              yield* sessions.updateMessage(userMsg)
+              const dispatchText = dispatchResult.announce ?? dispatchResult.text
+              const cmdText: SessionV1.TextPart = {
                 id: PartID.ascending(),
-                messageID: responsePart.messageID,
+                messageID: userMsg.id,
                 sessionID: input.sessionID,
                 type: "text",
-                text: ctx,
-                synthetic: true,
-              } satisfies SessionV1.TextPart)
-            }
-          }
+                text: `/${input.command} ${input.arguments}`.trim(),
+              }
+              yield* sessions.updatePart(cmdText)
+              // Non-synthetic so UserMessage renders it — the command confirmation
+              // (e.g. "⏸ 目标已暂停") must be visible. Matches the goal "done" case
+              // (loop.ts), which emits visible goal messages as non-synthetic parts.
+              const responsePart: SessionV1.TextPart = {
+                id: PartID.ascending(),
+                messageID: userMsg.id,
+                sessionID: input.sessionID,
+                type: "text",
+                text: dispatchText,
+              }
+              yield* sessions.updatePart(responsePart)
+              yield* sessions.touch(input.sessionID)
+              // GOAL-TURN-SCOPE: this loop() is a goal-driven turn (kick or
+              // resume-kick) — mark it so ESC maps to a goal pause.
+              yield* goal?.markTurnDriven(input.sessionID)
+              // Drain SessionStart hook contexts before loop
+              if (startContext) {
+                const contexts = yield* startContext.consume(input.sessionID)
+                for (const ctx of contexts) {
+                  yield* sessions.updatePart({
+                    id: PartID.ascending(),
+                    messageID: responsePart.messageID,
+                    sessionID: input.sessionID,
+                    type: "text",
+                    text: ctx,
+                    synthetic: true,
+                  } satisfies SessionV1.TextPart)
+                }
+              }
+              const state = yield* budgetState(input.sessionID)
+              state.pending.set(userMsg.id, budget)
+            }).pipe(Effect.uninterruptible),
+          )
           return yield* loop({ sessionID: input.sessionID })
         }
         return yield* commandTurn(
@@ -3136,8 +3246,9 @@ export function admitIfIdle(
   automation: SessionAutomationLease.Interface,
   token: SessionAutomationLease.Token,
   input: PromptInput,
+  options?: AdmissionOptions,
 ): Effect.Effect<Option.Option<Effect.Effect<SessionV1.WithParts>>, Image.Error> {
-  return automation.handoff(token, service.prepareIfIdle(input))
+  return automation.handoff(token, service.prepareIfIdle(input, undefined, options))
 }
 
 export * as SessionPrompt from "./prompt"

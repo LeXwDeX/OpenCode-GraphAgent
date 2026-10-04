@@ -64,6 +64,7 @@ import { testEffect } from "./lib/effect"
 
 const questions = QuestionV2.layer.pipe(Layer.provide(EventV2.defaultLayer))
 const requests: LLMRequest[] = []
+let maxToolCalls: number | undefined
 let reasoningConfig: ConfigReasoningDistillation.Info | undefined
 let auxiliary: LLMClientShape["generate"] | undefined
 const prepareDistillation = (request: LLMRequest) =>
@@ -246,6 +247,7 @@ const config = Layer.succeed(
           type: "document",
           info: new Config.Info({
             reasoningDistillation: reasoningConfig,
+            maxToolCalls,
             compaction: new ConfigCompaction.Info({
               buffer: 3_000,
               keep: new ConfigCompaction.Keep({ tokens: 1_000 }),
@@ -340,6 +342,7 @@ const setup = Effect.gen(function* () {
   const { db } = yield* Database.Service
   response = []
   reasoningConfig = undefined
+  maxToolCalls = undefined
   auxiliary = undefined
   systemBaseline = "Initial context"
   systemRemoved = false
@@ -2721,6 +2724,7 @@ describe("SessionRunnerLLM", () => {
   it.effect("durably fails blocked local tools when a provider turn is interrupted", () =>
     Effect.gen(function* () {
       yield* setup
+      maxToolCalls = 1
       const session = yield* SessionV2.Service
       yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Interrupt blocked tool" }), resume: false })
       executions.length = 0
@@ -2762,9 +2766,18 @@ describe("SessionRunnerLLM", () => {
       ])
       requests.length = 0
       responseStream = undefined
-      response = []
+      response = [
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.toolCall({ id: "after-cancel", name: "echo", input: { text: "forbidden" } }),
+        LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
+        LLMEvent.finish({ reason: "tool-calls" }),
+      ]
       yield* session.resume(sessionID)
-      expect(requests[0]?.messages.map((message) => message.role)).toEqual(["user", "assistant", "tool"])
+      expect(executions).toEqual(["blocked"])
+      expect(requests).toHaveLength(1)
+      expect(requests[0]?.tools).toEqual([])
+      expect(requests[0]?.toolChoice).toMatchObject({ type: "none" })
+      expect(requests[0]?.messages.map((message) => message.role)).toEqual(["user", "assistant", "tool", "assistant"])
     }),
   )
 
@@ -2825,6 +2838,239 @@ describe("SessionRunnerLLM", () => {
           ],
         },
       ])
+    }),
+  )
+
+  for (const configured of [undefined, 0]) {
+    it.effect(
+      `executes over 50 tool calls with ${configured === undefined ? "default" : "explicit zero"} unlimited budget`,
+      () =>
+        Effect.gen(function* () {
+          yield* setup
+          maxToolCalls = configured
+          const session = yield* SessionV2.Service
+          yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Execute every local call" }), resume: false })
+          requests.length = 0
+          executions.length = 0
+          responses = [
+            [
+              LLMEvent.stepStart({ index: 0 }),
+              ...Array.from({ length: 51 }, (_, i) =>
+                LLMEvent.toolCall({ id: `unlimited-${i}`, name: "echo", input: { text: `${i}` } }),
+              ),
+              LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
+              LLMEvent.finish({ reason: "tool-calls" }),
+            ],
+            [
+              LLMEvent.stepStart({ index: 0 }),
+              LLMEvent.toolCall({ id: "unlimited-next-request", name: "echo", input: { text: "next" } }),
+              LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
+              LLMEvent.finish({ reason: "tool-calls" }),
+            ],
+            [],
+          ]
+          yield* session.resume(sessionID)
+          expect(executions).toHaveLength(52)
+          expect(executions.at(-1)).toBe("next")
+          expect(requests).toHaveLength(3)
+          expect(requests.every((request) => request.tools.length > 0)).toBe(true)
+          expect(requests.every((request) => request.toolChoice?.type !== "none")).toBe(true)
+        }),
+    )
+  }
+
+  it.effect("counts each parallel call and settles excess calls before execution", () =>
+    Effect.gen(function* () {
+      yield* setup
+      maxToolCalls = 2
+      const session = yield* SessionV2.Service
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Three calls" }), resume: false })
+      requests.length = 0
+      executions.length = 0
+      responses = [
+        [
+          LLMEvent.stepStart({ index: 0 }),
+          ...["first", "second", "excess"].map((text) =>
+            LLMEvent.toolCall({ id: text, name: "echo", input: { text } }),
+          ),
+          LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
+          LLMEvent.finish({ reason: "tool-calls" }),
+        ],
+        [
+          LLMEvent.stepStart({ index: 0 }),
+          LLMEvent.toolCall({ id: "after-limit", name: "echo", input: { text: "forbidden" } }),
+          LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
+          LLMEvent.finish({ reason: "tool-calls" }),
+        ],
+      ]
+      yield* session.resume(sessionID)
+      expect(executions).toEqual(["first", "second"])
+      expect(requests).toHaveLength(2)
+      expect(requests[0]?.tools.length).toBeGreaterThan(0)
+      expect(requests[1]?.tools).toEqual([])
+      expect(requests[1]?.toolChoice).toMatchObject({ type: "none" })
+      const context = yield* session.context(sessionID)
+      const calls = context
+        .filter((m) => m.type === "assistant")
+        .flatMap((m) => m.content.filter((p) => p.type === "tool"))
+      expect(calls.map((p) => p.state.status)).toEqual(["completed", "completed", "error", "error"])
+      expect(calls[2]?.state).toMatchObject({
+        error: { message: expect.stringContaining("Maximum tool calls (2)") },
+      })
+    }),
+  )
+
+  it.effect("does not renew exhausted tool budget when resuming without new input", () =>
+    Effect.gen(function* () {
+      yield* setup
+      maxToolCalls = 1
+      const session = yield* SessionV2.Service
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "One execution" }), resume: false })
+      requests.length = 0
+      executions.length = 0
+      responses = [
+        [
+          LLMEvent.stepStart({ index: 0 }),
+          LLMEvent.toolCall({ id: "first", name: "echo", input: { text: "first" } }),
+          LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
+          LLMEvent.finish({ reason: "tool-calls" }),
+        ],
+        [],
+      ]
+      yield* session.resume(sessionID)
+      responses = [
+        [
+          LLMEvent.stepStart({ index: 0 }),
+          LLMEvent.toolCall({ id: "after-resume", name: "echo", input: { text: "forbidden" } }),
+          LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
+          LLMEvent.finish({ reason: "tool-calls" }),
+        ],
+      ]
+      yield* session.resume(sessionID)
+      expect(executions).toEqual(["first"])
+      expect(requests).toHaveLength(3)
+      expect(requests[2]?.tools).toEqual([])
+      expect(requests[2]?.toolChoice).toMatchObject({ type: "none" })
+      // Accepted fresh input renews the same Session's allowance.
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "New execution" }), resume: false })
+      responses = [
+        [
+          LLMEvent.stepStart({ index: 0 }),
+          LLMEvent.toolCall({ id: "new-input", name: "echo", input: { text: "new" } }),
+          LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
+          LLMEvent.finish({ reason: "tool-calls" }),
+        ],
+        [],
+      ]
+      yield* session.resume(sessionID)
+      expect(executions).toEqual(["first", "new"])
+      expect(requests[3]?.tools.length).toBeGreaterThan(0)
+    }),
+  )
+
+  it.effect("retains tool-call budget across provider requests and charges invalid calls", () =>
+    Effect.gen(function* () {
+      yield* setup
+      maxToolCalls = 2
+      const session = yield* SessionV2.Service
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Count invalid calls" }), resume: false })
+      requests.length = 0
+      executions.length = 0
+      responses = [
+        [
+          LLMEvent.stepStart({ index: 0 }),
+          LLMEvent.toolCall({ id: "invalid", name: "echo", input: {} }),
+          LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
+          LLMEvent.finish({ reason: "tool-calls" }),
+        ],
+        [
+          LLMEvent.stepStart({ index: 0 }),
+          LLMEvent.toolCall({ id: "valid", name: "echo", input: { text: "last" } }),
+          LLMEvent.toolCall({ id: "excess", name: "echo", input: { text: "excess" } }),
+          LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
+          LLMEvent.finish({ reason: "tool-calls" }),
+        ],
+        [],
+      ]
+      yield* session.resume(sessionID)
+      expect(executions).toEqual(["last"])
+      expect(requests).toHaveLength(3)
+      expect(requests[1]?.tools.length).toBeGreaterThan(0)
+      expect(requests[2]?.toolChoice).toMatchObject({ type: "none" })
+    }),
+  )
+
+  it.effect("keeps admitted calls charged across overflow compaction", () =>
+    Effect.gen(function* () {
+      const session = yield* setupOverflowRecovery
+      maxToolCalls = 2
+      executions.length = 0
+      responses = [
+        [
+          LLMEvent.stepStart({ index: 0 }),
+          LLMEvent.toolCall({ id: "before", name: "echo", input: { text: "before" } }),
+          LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
+          LLMEvent.finish({ reason: "tool-calls" }),
+        ],
+        [
+          LLMEvent.stepStart({ index: 0 }),
+          LLMEvent.providerError({ message: "prompt too long", classification: "context-overflow" }),
+        ],
+        fragmentFixture("text", "budget-summary", ["## Goal\n- Preserve budget"]).completeEvents,
+        [
+          LLMEvent.stepStart({ index: 0 }),
+          LLMEvent.toolCall({ id: "after", name: "echo", input: { text: "after" } }),
+          LLMEvent.toolCall({ id: "excess", name: "echo", input: { text: "excess" } }),
+          LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
+          LLMEvent.finish({ reason: "tool-calls" }),
+        ],
+        [],
+      ]
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Continue" }), resume: false })
+      yield* session.resume(sessionID)
+      expect(executions).toEqual(["before", "after"])
+      expect(requests).toHaveLength(5)
+      expect(requests[4]?.tools).toEqual([])
+      expect(requests[4]?.toolChoice).toMatchObject({ type: "none" })
+    }),
+  )
+
+  it.effect("resets tool-call budget only when new steering input is promoted", () =>
+    Effect.gen(function* () {
+      yield* setup
+      maxToolCalls = 1
+      const session = yield* SessionV2.Service
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Start work" }), resume: false })
+      requests.length = 0
+      executions.length = 0
+      responses = [
+        [
+          LLMEvent.stepStart({ index: 0 }),
+          LLMEvent.toolCall({ id: "before", name: "echo", input: { text: "before" } }),
+          LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
+          LLMEvent.finish({ reason: "tool-calls" }),
+        ],
+        [
+          LLMEvent.stepStart({ index: 0 }),
+          LLMEvent.toolCall({ id: "after", name: "echo", input: { text: "after" } }),
+          LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
+          LLMEvent.finish({ reason: "tool-calls" }),
+        ],
+        [],
+      ]
+      streamGate = yield* Deferred.make<void>()
+      streamStarted = yield* Deferred.make<void>()
+      const run = yield* session.resume(sessionID).pipe(Effect.forkChild)
+      yield* Deferred.await(streamStarted)
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "New input" }) })
+      yield* Deferred.succeed(streamGate, undefined)
+      yield* Fiber.join(run)
+      streamGate = undefined
+      streamStarted = undefined
+      expect(executions).toEqual(["before", "after"])
+      expect(requests).toHaveLength(3)
+      expect(requests[1]?.tools.length).toBeGreaterThan(0)
+      expect(requests[2]?.toolChoice).toMatchObject({ type: "none" })
     }),
   )
 

@@ -4,6 +4,7 @@ import { describe, expect } from "bun:test"
 import { Effect, Layer, Schema } from "effect"
 import { FastCheck } from "effect/testing"
 import { Config } from "@opencode-ai/core/config"
+import { ToolBudget } from "@opencode-ai/core/session/tool-budget"
 import { ConfigProvider } from "@opencode-ai/core/config/provider"
 import { ConfigMigrateV1 } from "@opencode-ai/core/v1/config/migrate"
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
@@ -52,6 +53,37 @@ const provider = {
 }
 
 describe("Config", () => {
+  it.effect("preserves optional tool budgets across config layers and v1 migration", () =>
+    Effect.sync(() => {
+      const decodeCurrent = Schema.decodeUnknownSync(Config.Info)
+      const decodeV1 = Schema.decodeUnknownSync(ConfigV1.Info)
+      expect(decodeCurrent({}).maxToolCalls).toBeUndefined()
+      expect(decodeV1({}).maxToolCalls).toBeUndefined()
+      expect(decodeCurrent({ maxToolCalls: Number.MAX_SAFE_INTEGER }).maxToolCalls).toBe(Number.MAX_SAFE_INTEGER)
+      expect(decodeCurrent({ maxToolCalls: 0 }).maxToolCalls).toBe(0)
+      expect(decodeV1({ maxToolCalls: 0 }).maxToolCalls).toBe(0)
+      expect(decodeCurrent(ConfigMigrateV1.migrate(decodeV1({ snapshot: false, maxToolCalls: 0 }))).maxToolCalls).toBe(
+        0,
+      )
+      const migrated = decodeCurrent(ConfigMigrateV1.migrate(decodeV1({ snapshot: false, maxToolCalls: 7 })))
+      expect(migrated.maxToolCalls).toBe(7)
+      const global = new Config.Document({ type: "document", info: decodeCurrent({ maxToolCalls: 9 }) })
+      const omitted = new Config.Document({ type: "document", info: decodeCurrent({ model: "test/model" }) })
+      const project = new Config.Document({ type: "document", info: decodeCurrent({ maxToolCalls: 3 }) })
+      const unlimitedProject = new Config.Document({ type: "document", info: decodeCurrent({ maxToolCalls: 0 }) })
+      expect(ToolBudget.resolveMaxToolCalls(Config.latest([global, unlimitedProject], "maxToolCalls"))).toBe(0)
+      expect(ToolBudget.resolveMaxToolCalls(Config.latest([global, omitted], "maxToolCalls"))).toBe(9)
+      expect(ToolBudget.resolveMaxToolCalls(Config.latest([global, project], "maxToolCalls"))).toBe(3)
+      expect(ToolBudget.resolveMaxToolCalls(Config.latest([omitted], "maxToolCalls"))).toBe(
+        ToolBudget.DEFAULT_MAX_TOOL_CALLS,
+      )
+      for (const maxToolCalls of [-1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+        expect(() => decodeCurrent({ maxToolCalls })).toThrow()
+        expect(() => decodeV1({ maxToolCalls })).toThrow()
+      }
+    }),
+  )
+
   it.effect("accepts only positive integer question timeouts", () =>
     Effect.sync(() => {
       expect(Schema.decodeUnknownSync(ConfigV1.Info)({ question_timeout: 1 }).question_timeout).toBe(1)

@@ -38,7 +38,7 @@ describe.concurrent("core.share", () => {
       data,
     })
 
-    const snapshot = await Storage.read<{ data: Share.Data[] }>(["share_snapshot", share.id])
+    const snapshot = await Storage.read<{ data: Share.Data[] }>(["share", share.id])
     expect(snapshot?.data).toHaveLength(1)
 
     await Share.remove({ id: share.id, secret: share.secret })
@@ -72,7 +72,7 @@ describe.concurrent("core.share", () => {
       data: data2,
     })
 
-    const snapshot = await Storage.read<{ data: Share.Data[] }>(["share_snapshot", share.id])
+    const snapshot = await Storage.read<{ data: Share.Data[] }>(["share", share.id])
     expect(snapshot?.data).toHaveLength(2)
 
     await Share.remove({ id: share.id, secret: share.secret })
@@ -212,11 +212,12 @@ describe.concurrent("core.share", () => {
       },
     ]
 
+    await Storage.write(["share", share.id], share)
     await Storage.remove(["share_snapshot", share.id])
     await Storage.write(["share_event", share.id, Identifier.descending()], data)
 
     const result = await Share.data(share.id)
-    const snapshot = await Storage.read<{ data: Share.Data[] }>(["share_snapshot", share.id])
+    const snapshot = await Storage.read<{ data: Share.Data[] }>(["share", share.id])
 
     expect(result).toHaveLength(1)
     expect(snapshot?.data).toHaveLength(1)

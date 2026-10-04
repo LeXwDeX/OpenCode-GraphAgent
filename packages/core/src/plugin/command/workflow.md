@@ -17,7 +17,7 @@ from runtime-enforced model, admission, and review contracts.
 
 ## Standard and deep workflow entry
 
-Omitting the top-level start parameter `mode` preserves `standard` behavior.
+Omitting `mode` at the root of the YAML start spec preserves `standard` behavior. The `start` tool call takes `action` and `spec_path`; put `mode` in the file.
 Consider `deep` when its admission and review contracts serve the task or the
 user explicitly requests it. Uncertainty or high impact can justify stronger
 checks without a prescribed mode or number of agents.
@@ -134,10 +134,11 @@ config:
 ```
 
 The listed node and default fields are exhaustive; workflow YAML has no
-model-selection field. Model selection is configuration-owned: critical nodes
-(`required: true` and review workers) use
-the `advanced` tier in `dag.jsonc`, other nodes use `standard`, then resolution
-falls back to the selected agent model and the parent-session model. If no
+model-selection field. Model selection is configuration-owned: nodes with
+`required: true` or `worker_type: review` / `review-*` prefer the `advanced`
+tier in `dag.jsonc`; other nodes prefer `standard`. A single configured tier
+serves both groups. Resolution then falls back to the selected agent model and
+the parent-session model. If no
 source provides a model, the workflow tool returns a blocked diagnostic and
 leaves the workflow uncreated. The parent can consider authorized recovery or
 report the configuration decision needed from the user.
@@ -162,7 +163,7 @@ config:
       name: explore
       worker_type: explore
       depends_on: []
-      prompt_template: { id: code-explore, input: { target: "auth module" } }
+      prompt_template: { inline: "Explore the auth module and report findings."}
       required: true
 
     - id: gate
@@ -255,26 +256,29 @@ config:
       name: implement
       worker_type: build
       depends_on: []
-      prompt_template: { id: implement, input: { spec: "Implement the requested change per the task description" } }
+      prompt_template: { inline: "Implement the requested change per the task description." }
       required: true
 
     - id: review-arch
       name: review-arch
       worker_type: general
       depends_on: [implement]
-      prompt_template: { id: review-arch }
+      prompt_template:
+        inline: "Review the implementation for architecture. Report evidence-backed findings and unverified claims."
 
     - id: review-logic
       name: review-logic
       worker_type: general
       depends_on: [implement]
-      prompt_template: { id: review-logic }
+      prompt_template:
+        inline: "Review the implementation for logic correctness. Report evidence-backed findings and unverified claims."
 
     - id: review-style
       name: review-style
       worker_type: general
       depends_on: [implement]
-      prompt_template: { id: review-style }
+      prompt_template:
+        inline: "Review the implementation for code style. Report evidence-backed findings and unverified claims."
 
     - id: arbitrate
       name: arbitrate
@@ -305,7 +309,9 @@ config:
         inline: "The arbiter did not accept. Verify each required action against the actual code and produce a corrected, evidence-backed action plan."
 ```
 
-Reviewer nodes use the `advanced` tier from `dag.jsonc`. The arbiter is
+The three reviewer nodes use `worker_type: general` without `required: true`,
+so they prefer `standard` from `dag.jsonc`. Node IDs and prompt IDs do not
+select a model tier. The arbiter prefers `advanced` because it is
 `required: true` — its execution failure signals
 that the artifact could not be confidently accepted, while its successful
 business verdict must still be interpreted. On `ACCEPT` the conditioned
@@ -358,7 +364,7 @@ Workflows are not static. After creating a workflow, use `extend` and `control(r
 - **Scale up**: a node reports the work is larger than expected → `extend` with additional parallel nodes to split the load.
 - **Cut short**: a node proves the remaining work is unnecessary → `control(complete)` to early-complete and skip pending nodes.
 - **Redirect**: If a gate or review shows the workflow is going in the wrong direction, call `control(pause)` to freeze scheduling. Then call `control(replan)` with `restart: true` on affected nodes and `cancel: true` on their downstream dependents. A successful replan resumes the workflow automatically. Call `control(resume)` manually only if the output says automatic resume raced with another control operation.
-- **Grant more time**: If a node is progressing after a timeout escalation, call `control(extend_timeout)` with a larger `timeout_ms`. It extends the deadline in place. It uses no replan, graph rewrite, new child session, or replan attempt. Prefer it over `control(replan)` unless the graph must also change.
+- **Grant more time**: A running node may be extended only after its formal timeout escalation is delivered to the parent. Call `control(extend_timeout)` with a larger `timeout_ms`. It extends the deadline in place and uses no replan, graph rewrite, new child session, or replan attempt. Prefer it over `control(replan)` unless the graph must also change.
 
 Only nodes with `report_to_parent: true` produce intermediate parent
 checkpoints, and those reports are delivered at the next actionable wake
@@ -440,12 +446,12 @@ decomposition while preserving useful evidence and settling active children.
 ### Graph-action acceptance is not execution
 
 `start`, `extend`, `control(replan)`, and `control(recover)` responses confirm that a graph was
-**accepted**, not that its nodes **execute**. Acceptance-time validation does
-not resolve template placeholders or map upstream outputs — spawn-time
-contract failures (`verdict_fail`: unresolved placeholders, broken
-input_mapping, condition-expression errors) kill freshly added nodes seconds
-after a successful "Added" response, leaving a silent window where the wave
-is believed to be running. Report only the state actually observed. A wake or
+**accepted**, not that its nodes **execute**. Acceptance-time validation checks
+variable bindings, input-mapping structure, and condition syntax. Environment
+validation also checks referenced prompt assets. It does not substitute real
+upstream outputs or prove runtime values. Missing output fields, runtime
+interpolation failures, or prompt assets changed after acceptance can still
+fail a node at spawn. Report only the state actually observed. A wake or
 `status` result can establish execution; an acceptance receipt alone cannot.
 After a rejected call, decide whether to repair and retry or report a blocker.
 Editing the spec alone does not apply a graph change, and repeating unchanged
@@ -463,12 +469,22 @@ create the workflow. Recovery does not grant permission to change models.
 - Diverse models in adversarial review — reduces single-model blind spots.
 
 The two-tier defaults in `dag.jsonc` implement the split mechanically:
-`required: true` nodes and `review`/`review-*` workers resolve to the
-`advanced` tier, every other node to `standard`.
+`required: true` nodes and `review`/`review-*` workers prefer the
+`advanced` tier; every other node prefers `standard`. A single configured
+tier serves both groups.
 
 ## Prompt Templates
 
-Templates are read-only prompt fragments under `.opencode/dag-prompts/*.md`. Reference them by ID; they are read on spawn. Some templates declare required `{{variable}}` inputs — supply them via static `prompt_template.input` or `input_mapping`, because an unresolved placeholder fails the node loudly at spawn. Available templates:
+Templates are read-only prompt fragments installed under project
+`.opencode/dag-prompts/*.md` or global `<opencode config dir>/dag-prompts/*.md`.
+Project assets shadow global assets. Prompt IDs have no bundled fallback;
+bundled workflow YAML does not install these fragments. Confirm that a
+referenced ID exists before using it. Missing assets are rejected during
+environment validation. Supply required `{{variable}}` inputs through static
+`prompt_template.input` or `input_mapping`; validation checks bindings, and
+spawn resolves the actual values. The names below describe example assets
+that require separate installation. Inspect each installed file for its
+current input and output contract:
 
 - `code-explore` (requires `target`): Search codebase structure, output file paths + responsibilities
 - `test-explore` (requires `target`): Search test structure, output coverage gaps
@@ -483,7 +499,7 @@ Templates are read-only prompt fragments under `.opencode/dag-prompts/*.md`. Ref
 - `patcher-assemble`: Assemble clean patch from completed work
 - `integration-test`: Run integration tests and report
 
-Templates without a required variable consume their upstream inputs through the structured context appended from `depends_on` outputs. The review templates additionally force an `unverified_claims` section, which a verification wave downstream can check against the actual code.
+Dependency outputs not interpolated into a prompt are appended as structured context. For review prompts, request an `unverified_claims` section that a downstream verification wave can check against the actual code. Confirm that an installed template includes this requirement before relying on it.
 
 For ad-hoc prompts, use `prompt_template: { inline: "...", input: {...} }`.
 Static `prompt_template.input` supplies literal, local template values; it does
@@ -587,8 +603,8 @@ omitted content from its preview.
 - `resume` — Resume scheduling. A successful replan or extend auto-resumes a paused workflow. Resume manually only if its output says automatic resume raced with another control operation and the workflow is still paused.
 - `cancel` — cancel the entire workflow
 - `recover` — Retry selected `node_ids` and their downstream closure under the same workflow ID. Pass `expected_graph_rev` from `status`. The action is rejected for stale revisions, unavailable reusable artifacts, or exhausted attempt/node budgets. Pause a live workflow first. Cancellation requires `resume_cancelled: true`. The response lists old-to-new attempt IDs and reused/preserved/superseded sets. Unrelated pending work stays unchanged.
-- `replan` — Put `fragment: { ... }` with graph fields and node definitions in YAML, then pass `spec_path`. Set `restart: true` or `cancel: true` for running nodes. Pending nodes missing from the fragment are cancelled. Replan is valid while paused. Safest order: pause, write the file, then replan. Success resumes the workflow automatically. Resume manually only if output says automatic resume raced with another control operation and the workflow is still paused. Validation rejection does not fail or cancel the workflow; it stays paused and recoverable. Do not cancel the graph after rejection. Fix the field named by the diagnostic and replan.
-- `extend_timeout` — Give a RUNNING node (usually after timeout escalation) more time without a replan. Pass `node_id` and a fresh `timeout_ms`; the new deadline starts now. The node keeps its child session and attempt. No replan is consumed and the graph is unchanged. The deadline watcher updates to the new deadline. The action is refused for a healthy node whose deadline has not elapsed (`not_due`) and for an escalation not yet delivered (`escalation_undelivered`). Prefer this over replan for timeout escalation. Use replan only if the graph must also change.
+- `replan` — Put `fragment: { ... }` with graph fields and node definitions in YAML, then pass `spec_path`. Set `restart: true` or `cancel: true` for running nodes. Pending nodes missing from the fragment are cancelled. Replan is valid while paused. Safest order: pause, write the file, then replan. Success resumes the workflow automatically. Resume manually only if output says automatic resume raced with another control operation and the workflow is still paused. A validation rejection does not itself fail or cancel the workflow. The tool attempts to park it paused; inspect the reported actual state. If it is paused, fix the field named by the diagnostic and replan. If automatic pause failed and it is still running, explicitly pause or settle it before ending the turn. For terminal or unknown state, inspect status and use the applicable recovery path. Do not cancel the whole graph merely because validation rejected a fragment.
+- `extend_timeout` — Give a RUNNING node with a pending formal timeout escalation already delivered to the parent more time without a replan. Pass `node_id` and a fresh `timeout_ms`; the new deadline starts now. The node keeps its child session and attempt. No replan is consumed and the graph is unchanged. The deadline watcher updates to the new deadline. The action is refused without a pending formal escalation (`no_escalation`) or before its wake is delivered (`escalation_undelivered`). An elapsed deadline alone does not authorize an extension. Prefer this over replan for timeout escalation. Use replan only if the graph must also change.
 - `complete` — early-complete: remaining pending nodes are skipped (non-violation)
 - `step` — Advance exactly one ready node, selected by lexicographic node ID, then wait. Use it for controlled debugging or staged verification of a critical path. Unlike `pause`, it advances one node and waits again. A second `step` is rejected while that node is running. Use `resume` to restore full-speed scheduling. Lexicographic selection keeps the order deterministic.
 

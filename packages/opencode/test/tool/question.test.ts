@@ -116,8 +116,14 @@ describe("tool.question", () => {
           ctx,
         )
         expect(result.title).toBe("Question timed out")
+        expect(result.output).toContain("The user is temporarily away from the computer and did not answer.")
+        expect(result.output).toContain(
+          "Choose the best solution yourself based on the task, existing instructions, and available evidence.",
+        )
         expect(result.output).toContain('fallback candidate: "Continue"')
-        expect(result.output).toContain("silence never grants new scope")
+        expect(result.output).toContain("recommendation, not a restriction")
+        expect(result.output).toContain("Silence never grants new scope")
+        expect(result.output).toContain("does not by itself block work")
         expect(result.metadata).toMatchObject({ answers: [] })
       }),
     { git: true },

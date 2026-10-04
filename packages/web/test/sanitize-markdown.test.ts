@@ -41,7 +41,7 @@ browserTest(
     const engine = process.env.OPENCODE_TEST_BROWSER_ENGINE === "webkit" ? webkit : chromium
     const browser = await engine.launch({
       headless: true,
-      executablePath: process.env.OPENCODE_TEST_BROWSER_EXECUTABLE,
+      ...(engine === chromium ? { executablePath: process.env.OPENCODE_TEST_BROWSER_EXECUTABLE } : {}),
     })
     try {
       const page = await browser.newPage()

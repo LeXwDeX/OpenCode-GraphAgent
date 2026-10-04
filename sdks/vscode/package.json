@@ -91,8 +91,9 @@
     "pretest": "bun run compile-tests && bun run compile && bun run lint",
     "check-types": "bun run toolchain:check && tsc --noEmit",
     "lint": "bun run toolchain:check && eslint src",
-    "test": "bun run toolchain:check && vscode-test",
-    "toolchain:check": "node ../../script/toolchain.mjs check"
+    "test": "bun run toolchain:check && bun run test:unit && vscode-test",
+    "toolchain:check": "node ../../script/toolchain.mjs check",
+    "test:unit": "bun run compile-tests && node --test out/unit/*.test.js"
   },
   "devDependencies": {
     "@types/vscode": "1.94.0",
