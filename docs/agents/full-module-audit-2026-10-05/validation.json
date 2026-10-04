@@ -1,7 +1,7 @@
 {
   "workspace": "/Users/suntao/.codex/worktrees/full-module-release/opencode-dag",
   "base": "23b9c4faf56ed9adfb766f23b47b592921137846",
-  "status": "All applicable local checks and Astra final review passed; native delivery pending",
+  "status": "All applicable local checks and Astra final plus supplemental reviews passed; native final-head delivery pending.",
   "broad": [
     {
       "check": "workspace tests",
@@ -74,6 +74,14 @@
     {
       "check": "CLI",
       "result": "final local host build and version smoke passed; version 0.0.0-full-audit-20261005; local hash manifest archived"
+    },
+    {
+      "check": "Console test isolation (CI-001)",
+      "result": "Native Linux failure independently reproduced by root and sol. Fixed-order probe 29 passed; complete package 36 passed plus the original 10 child assertions. Package typecheck and scoped lint passed. Astra supplemental review approved. New submitted-head native checks pending."
+    },
+    {
+      "check": "Schema test timing (CI-002)",
+      "result": "15 focused tests, package typecheck, independent delayed-startup probe and full final DAG gate passed. Production 250 ms, validation 1000 ms, heartbeat >=5 and ready-to-exit 3000 ms preserved. Historical native failing phase unknown. Astra supplemental review approved. New submitted-head native checks pending."
     }
   ]
 }
