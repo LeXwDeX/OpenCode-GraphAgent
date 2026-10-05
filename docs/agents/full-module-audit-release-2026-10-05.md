@@ -113,6 +113,8 @@ CI-001 的 Why 是 Linux 原生 CI 先加载 Stripe 测试的模块模拟，导�
 
 CI-002 的 Why 是 pathological regex 测试从子进程启动开始计时，把启动、模块加载、兼容性检查、校验和退出共用 3 秒。sol 记录各阶段，实际观察到结果输出后约 1.19 秒的退出耗时。原生失败日志没有阶段记录，当次原因仍未知。root 另注入 3.1 秒启动延迟，独立证明旧计时器会在校验开始前结束进程。Scope 仅为测试与 fixture。Approach 为设置有限的 15 秒启动期限，收到就绪消息后开始原有 3 秒校验与退出期限，并持续读取输出。生产 250 毫秒预算、校验最多 1 秒、至少 5 次 heartbeat 均保留。Acceptance 为延迟启动仍满足所有校验和退出断言。root 复跑通过：就绪后约 1.28 秒退出，校验约 250.45 毫秒，23 次 heartbeat。此项属于测试计时边界修复，不把历史 CI 超时写成已确认生产缺陷。证据见 `schema-test-timing.json`。
 
+CI-003 的 Why 是生产启动测试可能复用通过共享 memoMap 构建的测试 InstanceStore，其中 bootstrap 是空实现。root 和 sol 各自保留真实 fixture scope，再运行原有 AppRuntime 启动路径。两次均确认 InstanceStore 为同一对象、Goal 初始化与订阅均为 0，原 8 秒断言失败。关闭 fixture scope 的对照在约 215 毫秒内通过。原生 CI 未记录具体缓存持有者，不能据此断言历史触发点。Scope 仅为生产启动测试和 fixture。Approach 为用相同 Bun 可执行文件在独立子进程执行原有两项测试。测试正文逐字保留，8 秒轮询和每项 20 秒限制不变；父进程持续读取输出，检查两项均通过，并回收子进程。Acceptance 为父进程仍持有同一空 bootstrap 服务时，独立子进程仍通过全部原有断言。root 独立复跑通过；Goal 组为 144 项父进程测试通过，原两项另在子进程通过，类型检查和窄 lint 通过。此项属于测试隔离修复，不重复计入初始功能问题。Astra 独立运行和最终复审通过，无阻断项。证据见 `goal-test-isolation.json` 和 `goal-test-isolation-astra.json`。
+
 RT-005 按既有规则被否定。Desktop 选择附件的并发预算候选，未在当前串行 UI 调用入口确认。异常 watchdog 单次失败也未确认生产缺陷。未确认候选不会写成已修复漏洞。
 
 ## 发布与部署边界
