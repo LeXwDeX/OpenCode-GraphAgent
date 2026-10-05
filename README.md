@@ -326,6 +326,7 @@ Exact file boundaries are listed in [`NOTICE`](./NOTICE). The AGPL covers the DA
 
 ## Docs
 
+- [`docs/architecture.md`](./docs/architecture.md) — system overview, client/API boundaries, and source map
 - [Saved workflow authoring guide](./packages/core/src/plugin/skill/create-dag-workflow.md) — the `create-dag-workflow` skill body
 - [Graph Engineering workflow catalog](./.opencode/workflows/GRAPH-ENGINEERING.md) — reference topologies and adaptation contracts
 - [`docs/harness-dag.md`](./docs/harness-dag.md) — deep-mode admission & review lifecycle
