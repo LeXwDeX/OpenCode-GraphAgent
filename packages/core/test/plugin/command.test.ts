@@ -313,8 +313,8 @@ describe("CommandPlugin.Plugin", () => {
       expect(CommandPlugin.OrchestrationPolicyContent).toContain("## Model Tiers and Evidence")
       expect(CommandPlugin.OrchestrationPolicyContent).toContain("Either tier's claims need evidence")
       expect(CommandPlugin.OrchestrationPolicyContent).toContain("whether execution failure should stop the workflow")
-      // Tier placement is the mechanical lever (config.ts tierModel): required/review → advanced.
-      expect(CommandPlugin.OrchestrationPolicyContent).toContain("`review`/`review-*` workers resolve to")
+      // Tier placement is the mechanical lever (config.ts tierModel): required/review prefer advanced.
+      expect(CommandPlugin.OrchestrationPolicyContent).toContain("`review`/`review-*` workers prefer the advanced model tier")
       expect(CommandPlugin.OrchestrationPolicyContent).toContain("## Choosing Depth")
       expect(CommandPlugin.OrchestrationPolicyContent).toContain("not to meet a phase count")
       expect(CommandPlugin.WorkflowFactsContent).toContain("not minimum phases")

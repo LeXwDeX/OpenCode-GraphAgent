@@ -143,10 +143,20 @@ export const fromWebSocket = (
     yield* waitOpen(ws, input)
     const messages = yield* Queue.bounded<string | Uint8Array, LLMError | Cause.Done<void>>(128)
 
+    const offerMessage = (data: string | Uint8Array) => {
+      if (Queue.offerUnsafe(messages, data)) return
+      Queue.failCauseUnsafe(
+        messages,
+        Cause.fail(
+          transportError("message", "WebSocket receive buffer overflow", { url: input.url, kind: "overflow" }),
+        ),
+      )
+      if (ws.readyState === globalThis.WebSocket.OPEN) ws.close(1000, "Receive buffer overflow")
+    }
     const onMessage = (event: MessageEvent) => {
-      if (typeof event.data === "string") return Queue.offerUnsafe(messages, event.data)
+      if (typeof event.data === "string") return offerMessage(event.data)
       const binary = binaryMessage(event.data)
-      if (binary) return Queue.offerUnsafe(messages, binary)
+      if (binary) return offerMessage(binary)
       Queue.failCauseUnsafe(
         messages,
         Cause.fail(

@@ -45,6 +45,8 @@ import { toLLMMessagesWithBindings } from "./to-llm-message"
 import { CoreContextFolding } from "./context-folding"
 import * as CoreReasoningDistillation from "./reasoning-distillation"
 import { MAX_STEPS_PROMPT } from "./max-steps"
+import { ToolBudget } from "../tool-budget"
+import { SessionV1 } from "../../v1/session"
 import { Snapshot } from "../../snapshot"
 import { Flag } from "../../flag/flag"
 import { contextFoldingDiagnostic } from "../context-folding"
@@ -330,10 +332,24 @@ export const layer = Layer.effect(
         concurrency: "unbounded",
       }).pipe(Effect.map(SystemContext.combine))
 
+    type RunBudget = { budget: ToolBudget.Budget }
+    // Resuming a completed, failed or interrupted drain is still the same input.
+    // Keep admission state until a new input is promoted, the Session is deleted,
+    // or this Location-scoped runner is disposed.
+    const budgets = new Map<SessionSchema.ID, RunBudget>()
+    yield* Effect.addFinalizer(() => Effect.sync(() => budgets.clear()))
+    yield* events.subscribe(SessionV1.Event.Deleted).pipe(
+      Stream.runForEach((event) => Effect.sync(() => budgets.delete(SessionSchema.ID.make(event.data.sessionID)))),
+      Effect.forkScoped,
+    )
+    const newBudget = () =>
+      config.entries().pipe(Effect.map((entries) => ToolBudget.create(Config.latest(entries, "maxToolCalls"))))
+
     const runTurnAttempt = Effect.fn("SessionRunner.runTurn")(function* (
       sessionID: SessionSchema.ID,
       promotion: SessionInput.Delivery | undefined,
       step: number,
+      runBudget: RunBudget,
       recoverOverflow?: typeof compaction.compactAfterOverflow,
     ) {
       const session = yield* getSession(sessionID)
@@ -353,7 +369,10 @@ export const layer = Layer.effect(
           promoted += Number(yield* SessionInput.promoteNextQueued(db, events, session.id))
           promoted += yield* SessionInput.promoteSteers(db, events, session.id, cutoff)
         }
-        if (promoted > 0) currentStep = 1
+        if (promoted > 0) {
+          currentStep = 1
+          runBudget.budget = yield* newBudget()
+        }
       }
       const system =
         initialized ?? (yield* SessionContextEpoch.prepare(db, events, loadSystemContext(agent), session.id))
@@ -362,14 +381,25 @@ export const layer = Layer.effect(
       const entries = history.entries
       const context = entries.map((entry) => entry.message)
       const isLastStep = agent.info?.steps !== undefined && currentStep >= agent.info.steps
-      const toolMaterialization = isLastStep ? undefined : yield* tools.materialize(agent.info?.permissions)
+      const budgetExhausted = runBudget.budget.exhausted
+      const toolsDisabled = isLastStep || budgetExhausted
+      const toolMaterialization = toolsDisabled ? undefined : yield* tools.materialize(agent.info?.permissions)
       const promptCacheKey = /^ses_[0-9a-f]{64}$/.test(session.id) ? session.id.slice(4) : session.id
       const reasoningEnabled = ConfigReasoningDistillation.resolveEnabled({
         disabledByEnvironment: Flag.OPENCODE_DISABLE_REASONING_DISTILLATION,
         enabled: Config.latest(yield* config.entries(), "reasoningDistillation")?.enabled,
       }).enabled
       const conversion = toLLMMessagesWithBindings(context, model, { reasoningDistillationEnabled: reasoningEnabled })
-      const expectedMessages = [...conversion.messages, ...(isLastStep ? [Message.assistant(MAX_STEPS_PROMPT)] : [])]
+      const expectedMessages = [
+        ...conversion.messages,
+        ...(toolsDisabled
+          ? [
+              Message.assistant(
+                budgetExhausted ? ToolBudget.renderExhaustedPrompt(runBudget.budget.max) : MAX_STEPS_PROMPT,
+              ),
+            ]
+          : []),
+      ]
       const preparedRequest = LLM.request({
         model,
         providerOptions: { openai: { promptCacheKey } },
@@ -379,7 +409,7 @@ export const layer = Layer.effect(
           .map(SystemPart.make),
         messages: expectedMessages,
         tools: toolMaterialization?.definitions ?? [],
-        toolChoice: isLastStep ? "none" : undefined,
+        toolChoice: toolsDisabled ? "none" : undefined,
       })
       const dynamicFolding = yield* resolveDynamicFolding()
       const folding = yield* CoreContextFolding.project({
@@ -435,10 +465,33 @@ export const layer = Layer.effect(
             yield* publish(event)
             if (event.type !== "tool-call" || event.providerExecuted) return
             if (!toolMaterialization) {
-              yield* withPublication(publisher.failUnsettledTools("Tools are disabled after the maximum agent steps"))
+              yield* publish(
+                LLMEvent.toolResult({
+                  id: event.id,
+                  name: event.name,
+                  result: {
+                    type: "error",
+                    value: budgetExhausted
+                      ? ToolBudget.exhaustedMessage(runBudget.budget.max)
+                      : "Tools are disabled after the maximum agent steps",
+                  },
+                }),
+              )
               return
             }
             needsContinuation = true
+            // Admission is synchronous and precedes settlement, permissions and side effects.
+            // Failed, denied and invalid calls consume their admitted slot.
+            if (!runBudget.budget.tryReserve()) {
+              yield* publish(
+                LLMEvent.toolResult({
+                  id: event.id,
+                  name: event.name,
+                  result: { type: "error", value: ToolBudget.exhaustedMessage(runBudget.budget.max) },
+                }),
+              )
+              return
+            }
             const assistantMessageID = yield* publisher.assistantMessageID(event.id)
             yield* withPublication(batch.flush())
             yield* Effect.uninterruptibleMask((restore) =>
@@ -727,31 +780,32 @@ export const layer = Layer.effect(
       sessionID: SessionSchema.ID,
       promotion: SessionInput.Delivery | undefined,
       step: number,
+      runBudget: RunBudget,
     ) => Effect.Effect<{ readonly needsContinuation: boolean; readonly step: number }, RunError>
 
-    const runAfterOverflowCompaction: RunTurn = Effect.fnUntraced(function* (sessionID, promotion, step) {
-      return yield* runTurnAttempt(sessionID, promotion, step).pipe(
+    const runAfterOverflowCompaction: RunTurn = Effect.fnUntraced(function* (sessionID, promotion, step, runBudget) {
+      return yield* runTurnAttempt(sessionID, promotion, step, runBudget).pipe(
         Effect.catchDefect(
           Effect.fnUntraced(function* (defect) {
             if (!(defect instanceof TurnTransitionError)) return yield* Effect.die(defect)
             if (defect.transition._tag === "ContinueAfterOverflowCompaction")
               return yield* Effect.die("Post-compaction provider attempt cannot recover another overflow")
             yield* Effect.yieldNow
-            return yield* runAfterOverflowCompaction(sessionID, undefined, defect.transition.step)
+            return yield* runAfterOverflowCompaction(sessionID, undefined, defect.transition.step, runBudget)
           }),
         ),
       )
     })
 
-    const runTurn: RunTurn = Effect.fnUntraced(function* (sessionID, promotion, step) {
-      return yield* runTurnAttempt(sessionID, promotion, step, compaction.compactAfterOverflow).pipe(
+    const runTurn: RunTurn = Effect.fnUntraced(function* (sessionID, promotion, step, runBudget) {
+      return yield* runTurnAttempt(sessionID, promotion, step, runBudget, compaction.compactAfterOverflow).pipe(
         Effect.catchDefect(
           Effect.fnUntraced(function* (defect) {
             if (!(defect instanceof TurnTransitionError)) return yield* Effect.die(defect)
             yield* Effect.yieldNow
             if (defect.transition._tag === "ContinueAfterOverflowCompaction")
-              return yield* runAfterOverflowCompaction(sessionID, undefined, defect.transition.step)
-            return yield* runTurn(sessionID, undefined, defect.transition.step)
+              return yield* runAfterOverflowCompaction(sessionID, undefined, defect.transition.step, runBudget)
+            return yield* runTurn(sessionID, undefined, defect.transition.step, runBudget)
           }),
         ),
       )
@@ -775,10 +829,15 @@ export const layer = Layer.effect(
         let promotion: SessionInput.Delivery | undefined = hasSteer ? "steer" : hasQueue ? "queue" : undefined
         let shouldRun = input.force || hasSteer || hasQueue
         while (shouldRun) {
+          let runBudget = budgets.get(input.sessionID)
+          if (!runBudget) {
+            runBudget = { budget: yield* newBudget() }
+            budgets.set(input.sessionID, runBudget)
+          }
           let needsContinuation = true
           let step = 1
           while (needsContinuation) {
-            const result = yield* runTurn(input.sessionID, promotion, step)
+            const result = yield* runTurn(input.sessionID, promotion, step, runBudget)
             needsContinuation = result.needsContinuation
             step = result.step + 1
             promotion = "steer"

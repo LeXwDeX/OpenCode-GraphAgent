@@ -57,7 +57,7 @@ For non-tool events, omit the matcher entirely.
 **Optional fields** — ask if the user wants to set any:
 
 - `timeout` — seconds before the hook is killed (default 60)
-- `statusMessage` — short label shown in the UI while the hook runs
+- `statusMessage` — short label logged before the hook runs; it does not guarantee visible UI progress
 - `inputFormat` (command hooks only) — `"opencode"` (default) or `"claude-code"`. Offer `"claude-code"` only for an unchanged script written for Claude Code's hook stdin. Such scripts expect `Bash`/`Read`/`Grep`-style tool names and `file_path`-style keys. See the `configure-hooks` skill for the contract.
 
 **Scope** — `project` or `global`:

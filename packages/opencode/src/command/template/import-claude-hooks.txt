@@ -4,7 +4,7 @@ description: Import hooks from Claude Code config to OpenCode hooks.json
 
 # Import Claude Hooks
 
-Migrate hooks from Claude Code's `.claude/settings.json` files to OpenCode's `hooks.json` format. OpenCode no longer reads `.claude/` directories. This command provides a one-time migration path.
+Migrate hooks from Claude Code's `.claude/settings.json` files to OpenCode's `hooks.json` format. Hooks are not loaded directly from `.claude/settings*.json`; use this command to migrate them. OpenCode can still load `.claude/skills` by default unless that compatibility loading is disabled.
 
 ## Process
 
@@ -132,7 +132,7 @@ After migration, report:
 - Number of command hooks tagged `inputFormat: "claude-code"`
 - For every imported non-command hook: a warning that stdin-envelope compatibility was not verified and needs manual evaluation
 - Deprecation warnings (if hooks were found in .opencode/settings.json)
-- Reminder: "You can now safely delete .claude/ directories if you no longer use Claude Code with this project."
+- Keep `.claude/settings*.json`, scripts, and skills in place during migration. After a successful migration and validation, you may remove specific confirmed-unused Claude hook configuration if you no longer need it. Do not recommend deleting the entire `.claude/` directory.
 - Imported hooks appear in the system prompt's **Active Hooks** block. It renders from live `hooks.json` state each turn, so no `AGENTS.md` update is needed. Visibility does not prove behavior. Trigger each hook and confirm its stdin and output before calling migration done.
 
 ## Hooks.json Format Reference
@@ -168,7 +168,7 @@ Merge semantics: concat-append (hooks accumulate across layers and within a file
 
 ## Important Notes
 
-- `.claude/` directories are **never** read by OpenCode. This command is the only way to migrate.
+- Hooks are not loaded directly from `.claude/settings*.json`; this command migrates those hook definitions into `hooks.json`. `.claude/skills` may still be loaded by default unless compatibility loading is disabled.
 - The `hooks` field in `.opencode/settings.json` is deprecated and ignored (deprecation warning logged).
 - All three `hooks.json` layers (global, project, worktree) are polled every ~2 seconds; edits take effect within a few seconds without a restart.
 - Hooks are merge-append, not override. Importing duplicate events will add to the list.

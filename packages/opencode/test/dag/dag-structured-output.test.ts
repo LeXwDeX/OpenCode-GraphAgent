@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test"
 import { Effect, Layer, Semaphore, Fiber } from "effect"
 import type { SessionV1 } from "@opencode-ai/core/v1/session"
+import { ToolBudget } from "@opencode-ai/core/session/tool-budget"
 import { SessionPrompt } from "@/session/prompt"
 import { MessageID } from "@/session/schema"
 import { Dag } from "@/dag/dag"
@@ -343,6 +344,34 @@ describe("validatePayload", () => {
 // --- Integration tests for submit_result structured output ---
 
 describe("spawnNode submit_result capture", () => {
+  for (const max of [1, 2]) {
+    it(`missing-output nudge retains the child budget with ${max} tool slot(s)`, async () => {
+      const { events, dagLayer } = makeEventTracker()
+      const schema = { type: "object", required: ["status"] }
+      let budget = ToolBudget.create(max)
+      let prompts = 0
+      let executions = 0
+      const promptLayer = Layer.mock(SessionPrompt.Service, {
+        prompt: (_input, options) => Effect.sync(() => {
+          if (!options?.continueToolBudget) budget = ToolBudget.create(max)
+          prompts += 1
+          // Initial work consumes one slot without submitting. Only the nudge
+          // can submit, and only if the original budget still has a slot.
+          if (budget.tryReserve()) {
+            executions += 1
+            if (prompts > 1) capturedStore.set("node-1", { status: "ok" })
+          }
+          return reply("work completed")
+        }),
+      })
+      await runSpawn(dagLayer, promptLayer, schema)
+      expect(prompts).toBe(2)
+      expect(executions).toBe(max)
+      expect(events.some((event) => event.type === "nodeCompleted")).toBe(max === 2)
+      expect(events.some((event) => event.type === "nodeFailed" && event.trigger === "verdict_fail")).toBe(max === 1)
+    })
+  }
+
   it("(a) valid payload via submit_result → nodeCompleted with captured payload", async () => {
     const { events, dagLayer } = makeEventTracker()
     const schema = { type: "object", required: ["tests_passed", "diff"] }

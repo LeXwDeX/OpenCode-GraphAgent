@@ -155,7 +155,7 @@ export const layer = Layer.effect(
           },
           plan: {
             name: "plan",
-            description: "Plan mode. Disallows all edit tools.",
+            description: "Plan mode. Allows edits to the plan file and denies other edits by default.",
             options: {},
             permission: Permission.merge(
               defaults,
@@ -181,7 +181,7 @@ export const layer = Layer.effect(
           },
           general: {
             name: "general",
-            description: `General-purpose agent for researching complex questions and executing multi-step tasks. Use this agent to execute multiple units of work in parallel.`,
+            description: `General-purpose agent for researching complex questions and executing multi-step tasks.`,
             permission: Permission.merge(
               defaults,
               Permission.fromConfig({

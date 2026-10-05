@@ -39,25 +39,81 @@ function observeWorkerPost() {
 }
 
 describe("bounded schema validation", () => {
-  test("pathological regex keeps the host responsive and reports a resource deadline", async () => {
+  async function pathologicalFixture(startupDelay = 0) {
     const child = Bun.spawn(
-      [process.execPath, new URL("./fixture/schema-validation-budget.ts", import.meta.url).pathname],
+      [
+        process.execPath,
+        new URL("./fixture/schema-validation-budget.ts", import.meta.url).pathname,
+        String(startupDelay),
+      ],
       {
         stdout: "pipe",
         stderr: "pipe",
       },
     )
-    const watchdog = setTimeout(() => child.kill(), 3_000)
+    let deadline = "startup"
+    let timedOut: string | undefined
+    const kill = () => {
+      timedOut = deadline
+      child.kill()
+    }
+    // Importing the fixture and its two compatibility checks is a separate,
+    // finite startup phase. Validation and exit retain the original 3s bound.
+    let watchdog = setTimeout(kill, 15_000)
+    let ready = false
+    let data: { result: { ok: boolean; error: string }; beats: number; elapsed: number } | undefined
+    const stderr = new Response(child.stderr).text()
+    const output = (async () => {
+      const reader = child.stdout.getReader()
+      const decoder = new TextDecoder()
+      let pending = ""
+      try {
+        for (;;) {
+          const chunk = await reader.read()
+          if (chunk.done) break
+          pending += decoder.decode(chunk.value, { stream: true })
+          let newline: number
+          while ((newline = pending.indexOf("\n")) !== -1) {
+            const line = pending.slice(0, newline)
+            pending = pending.slice(newline + 1)
+            if (!line.trim()) continue
+            const message = JSON.parse(line)
+            if (message.ready === true) {
+              if (ready) throw new Error("duplicate schema fixture readiness")
+              ready = true
+              deadline = "validation/exit"
+              clearTimeout(watchdog)
+              watchdog = setTimeout(kill, 3_000)
+            } else data = message
+          }
+        }
+        if (pending.trim()) throw new Error("incomplete schema fixture output")
+      } finally {
+        reader.releaseLock()
+      }
+    })()
     try {
-      expect(await child.exited).toBe(0)
-      const data = JSON.parse(await new Response(child.stdout).text())
+      const [exit, , phases] = await Promise.all([child.exited, output, stderr])
+      if (exit !== 0) throw new Error(`schema fixture exit ${exit}, watchdog ${timedOut ?? "none"}\n${phases}`)
+      expect(exit).toBe(0)
+      expect(ready).toBe(true)
+      if (!data) throw new Error(`schema fixture returned no result\n${phases}`)
       expect(data.result.ok).toBe(false)
       expect(data.result.error).toContain("host resource budget")
       expect(data.beats).toBeGreaterThanOrEqual(5)
+      expect(data.elapsed).toBeLessThanOrEqual(1_000)
+      return { data, phases }
     } finally {
       clearTimeout(watchdog)
       child.kill()
+      await child.exited
     }
+  }
+  test("pathological regex keeps the host responsive and reports a resource deadline", async () => {
+    await pathologicalFixture()
+  })
+  test("startup delay does not consume the pathological validation watchdog", async () => {
+    await pathologicalFixture(3_250)
   })
   for (const [pattern, payload, ok] of [
     ["^(?=a)a+$", "aaa", true],

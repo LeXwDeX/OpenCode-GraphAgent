@@ -1,3 +1,4 @@
+import { providerRequestHeaders } from "./provider/headers"
 import type { APIEvent } from "@solidjs/start/server"
 import { and, Database, eq, isNull, lt, or, sql } from "@opencode-ai/console-core/drizzle/index.js"
 import { KeyTable } from "@opencode-ai/console-core/schema/key.sql.js"
@@ -192,7 +193,7 @@ export async function handler(
       const res = await fetchWith429Retry(reqUrl, {
         method: "POST",
         headers: (() => {
-          const headers = new Headers(input.request.headers)
+          const headers = providerRequestHeaders(input.request.headers)
           providerInfo.modifyHeaders(headers, providerInfo.apiKey, stickyId)
           Object.entries(providerInfo.headerModifier ?? {}).forEach(([k, v]) => {
             if (v === "$ip") return headers.set(k, ip)
@@ -686,7 +687,14 @@ export async function handler(
             isNull(LiteTable.timeDeleted),
           ),
         )
-        .where(and(eq(KeyTable.key, zenApiKey), isNull(KeyTable.timeDeleted)))
+        .where(
+          and(
+            eq(KeyTable.key, zenApiKey),
+            isNull(KeyTable.timeDeleted),
+            isNull(UserTable.timeDeleted),
+            isNull(WorkspaceTable.timeDeleted),
+          ),
+        )
         .then((rows) => rows[0]),
     )
 

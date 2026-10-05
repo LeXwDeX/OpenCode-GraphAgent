@@ -53,9 +53,12 @@ keeps the required prebuild hooks enabled without fetching inside a normal
 Nix build sandbox. An isolated local cache was verified with public fallback
 and network fetches disabled.
 
-`nix/hashes.json` still predates the workspace dependency update. Native package
-builds remain unaccepted until each supported platform produces its actual
-node_modules hash and both normal CLI and desktop derivations build.
+The committed workspace hashes and both normal CLI and desktop derivations
+passed native verification for all four platforms at commit
+`67ce58b7badea7d0a4dab7106c6c6699041e46ef` in
+[workflow run 37085826496](https://github.com/LeXwDeX/OpenCode-GraphAgent/actions/runs/37085826496).
+This historical result does not certify later source or dependency changes.
+Each affected revision still requires its own native measurements and builds.
 
 Nix outputs are development builds (`0.0.0-dev.<revision>` and channel `dev`).
 They do not derive a product release version from the opencode package version.

@@ -2559,6 +2559,581 @@ it.instance("loop continues when finish is tool-calls", () =>
   }),
 )
 
+for (const [runtime, runner] of [
+  ["ai-sdk", it],
+  ["native", nativeIt],
+] as const) {
+  runner.instance(`step limit disables execution tools and stops a provider tool call (${runtime})`, () =>
+    Effect.gen(function* () {
+      const { dir, llm } = yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        agent: { build: { steps: 2 } },
+      }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const fs = yield* FSUtil.Service
+      const chat = yield* sessions.create({
+        title: "Pinned",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      const firstFile = path.join(dir, "before-limit.txt")
+      const blockedFile = path.join(dir, "after-limit.txt")
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "Write a file, then summarize." }],
+      })
+      yield* llm.tool("write", { filePath: firstFile, content: "allowed" })
+      // The provider deliberately ignores toolChoice=none on the last step.
+      yield* llm.tool("write", { filePath: blockedFile, content: "must not execute" })
+      yield* llm.text("must not request another step")
+
+      yield* prompt.loop({ sessionID: chat.id })
+
+      expect(yield* fs.readFileString(firstFile)).toBe("allowed")
+      expect(yield* fs.exists(blockedFile)).toBe(false)
+      const inputs = yield* llm.inputs
+      expect(inputs).toHaveLength(2)
+      expect(JSON.stringify(inputs[0].tools)).toContain('"write"')
+      expect(inputs[1].tools ?? []).toEqual([])
+      expect(inputs[1].tool_choice ?? "none").toBe("none")
+      expect(JSON.stringify(inputs[1].messages)).toContain("Tools are disabled until next user input")
+      expect(yield* llm.pending).toBe(1)
+    }),
+  )
+
+  runner.instance(`step limit returns a text summary without a false structured-output instruction (${runtime})`, () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        agent: { build: { steps: 1 } },
+      }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        noReply: true,
+        format: new SessionV1.OutputFormatJsonSchema({
+          type: "json_schema",
+          schema: { type: "object", properties: { answer: { type: "number" } }, required: ["answer"] },
+          retryCount: 0,
+        }),
+        parts: [{ type: "text", text: "Return a structured answer." }],
+      })
+      yield* llm.text("The step limit was reached before the structured answer was ready.")
+
+      const result = yield* prompt.loop({ sessionID: chat.id })
+
+      const inputs = yield* llm.inputs
+      expect(inputs).toHaveLength(1)
+      expect(inputs[0].tools ?? []).toEqual([])
+      expect(inputs[0].tool_choice ?? "none").toBe("none")
+      expect(JSON.stringify(inputs[0].messages)).not.toContain("MUST use the StructuredOutput tool")
+      expect(result.info.role).toBe("assistant")
+      if (result.info.role !== "assistant") throw new Error("Expected an assistant response")
+      expect(result.info.error?.name).toBe("StructuredOutputError")
+      if (result.info.error?.name !== "StructuredOutputError") throw new Error("Expected the step limit error")
+      expect(result.info.error.data.message).toContain("Maximum agent steps reached")
+      expect(result.parts.some((part) => part.type === "text" && part.text.includes("step limit"))).toBe(true)
+    }),
+  )
+
+  runner.instance(`step limit preserves structured output completed before the final step (${runtime})`, () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        agent: { build: { steps: 2 } },
+      }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        noReply: true,
+        format: new SessionV1.OutputFormatJsonSchema({
+          type: "json_schema",
+          schema: { type: "object", properties: { answer: { type: "number" } }, required: ["answer"] },
+          retryCount: 0,
+        }),
+        parts: [{ type: "text", text: "Return 4 as the answer." }],
+      })
+      yield* llm.tool("StructuredOutput", { answer: 4 })
+
+      const result = yield* prompt.loop({ sessionID: chat.id })
+
+      expect(yield* llm.calls).toBe(1)
+      expect(result.info.role).toBe("assistant")
+      if (result.info.role !== "assistant") throw new Error("Expected an assistant response")
+      expect(result.info.error).toBeUndefined()
+      expect(result.info.structured).toEqual({ answer: 4 })
+      expect((yield* llm.inputs)[0].tool_choice).toBe("required")
+    }),
+  )
+
+  for (const setting of ["default", "zero"] as const) {
+    runner.instance(`tool call budget is unlimited with ${setting} configuration (${runtime})`, () =>
+      Effect.gen(function* () {
+        const { llm } = yield* useServerConfig((url) => ({
+          ...providerCfg(url),
+          ...(setting === "zero" ? { maxToolCalls: 0 } : {}),
+        }))
+        const prompt = yield* SessionPrompt.Service
+        const sessions = yield* Session.Service
+        const registry = yield* ToolRegistry.Service
+        const chat = yield* sessions.create({
+          title: "Unlimited budget",
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        })
+        const glob = (yield* registry.all()).find((item) => item.id === "glob")
+        if (!glob) throw new Error("glob tool is not registered")
+        const original = glob.execute.bind(glob)
+        let executed = 0
+        glob.execute = (args, ctx) => original(args, ctx).pipe(Effect.tap(() => Effect.sync(() => executed++)))
+        yield* Effect.addFinalizer(() => Effect.sync(() => void (glob.execute = original)))
+
+        yield* prompt.prompt({
+          sessionID: chat.id,
+          noReply: true,
+          parts: [{ type: "text", text: "Run the requested file searches." }],
+        })
+        yield* llm.push(
+          raw({
+            chunks: [
+              {
+                id: "chatcmpl-unlimited-parallel",
+                object: "chat.completion.chunk",
+                choices: [
+                  {
+                    index: 0,
+                    delta: {
+                      role: "assistant",
+                      tool_calls: Array.from({ length: 51 }, (_, index) => ({
+                        index,
+                        id: `call-unlimited-${index}`,
+                        type: "function",
+                        function: {
+                          name: "glob",
+                          arguments: JSON.stringify({ pattern: `unlimited-${index}.txt` }),
+                        },
+                      })),
+                    },
+                    finish_reason: null,
+                  },
+                ],
+              },
+            ],
+            tail: [
+              {
+                id: "chatcmpl-unlimited-parallel",
+                object: "chat.completion.chunk",
+                choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
+                usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+              },
+            ],
+          }),
+          reply().tool("glob", { pattern: "unlimited-next-request.txt" }),
+          reply().text("Searches completed.").stop(),
+        )
+        yield* prompt.loop({ sessionID: chat.id })
+
+        expect(executed).toBe(52)
+        const tools = (yield* sessions.messages({ sessionID: chat.id }))
+          .flatMap((message) => message.parts)
+          .filter((part): part is SessionV1.ToolPart => part.type === "tool")
+        expect(tools).toHaveLength(52)
+        expect(tools.every((part) => part.state.status === "completed")).toBe(true)
+        const inputs = yield* llm.inputs
+        expect(inputs).toHaveLength(3)
+        for (const input of inputs) {
+          expect(JSON.stringify(input.tools)).toContain('"glob"')
+          expect(input.tool_choice).not.toBe("none")
+          expect(JSON.stringify(input.messages)).not.toContain("Maximum tool calls")
+        }
+      }),
+    )
+  }
+
+  runner.instance(`tool call budget counts parallel calls, spans requests and resets on new input (${runtime})`, () =>
+    Effect.gen(function* () {
+      const { dir, llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), maxToolCalls: 2 }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const fs = yield* FSUtil.Service
+      const chat = yield* sessions.create({
+        title: "Pinned",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      const files = ["first", "second", "excess", "forged", "fresh-first", "fresh-second"].map((name) =>
+        path.join(dir, `${name}.txt`),
+      )
+      yield* prompt.prompt({ sessionID: chat.id, noReply: true, parts: [{ type: "text", text: "Write three files." }] })
+      yield* llm.push(
+        raw({
+          chunks: [
+            {
+              id: "chatcmpl-budget-parallel",
+              object: "chat.completion.chunk",
+              choices: [
+                {
+                  index: 0,
+                  delta: {
+                    role: "assistant",
+                    tool_calls: files.slice(0, 3).map((filePath, index) => ({
+                      index,
+                      id: `call-budget-${index}`,
+                      type: "function",
+                      function: { name: "write", arguments: JSON.stringify({ filePath, content: "allowed" }) },
+                    })),
+                  },
+                  finish_reason: "tool_calls",
+                },
+              ],
+            },
+          ],
+        }),
+        reply().tool("write", { filePath: files[3], content: "must not execute" }),
+      )
+      yield* prompt.loop({ sessionID: chat.id })
+
+      expect(yield* fs.readFileString(files[0])).toBe("allowed")
+      expect(yield* fs.readFileString(files[1])).toBe("allowed")
+      expect(yield* fs.exists(files[2])).toBe(false)
+      expect(yield* fs.exists(files[3])).toBe(false)
+      const history = yield* sessions.messages({ sessionID: chat.id })
+      const rejected = history
+        .flatMap((message) => message.parts)
+        .find(
+          (part): part is ErrorToolPart =>
+            part.type === "tool" && part.callID === "call-budget-2" && part.state.status === "error",
+        )
+      expect(rejected?.state.error).toContain("Maximum tool calls (2) reached")
+      const firstInputs = yield* llm.inputs
+      expect(firstInputs).toHaveLength(2)
+      expect(firstInputs[1].tools ?? []).toEqual([])
+      expect(firstInputs[1].tool_choice ?? "none").toBe("none")
+
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        noReply: true,
+        parts: [{ type: "text", text: "Write two more files." }],
+      })
+      yield* llm.push(
+        reply().tool("write", { filePath: files[4], content: "fresh" }),
+        reply().tool("write", { filePath: files[5], content: "fresh" }),
+        reply().text("Two more files are complete.").stop(),
+      )
+      yield* prompt.loop({ sessionID: chat.id })
+      expect(yield* fs.readFileString(files[4])).toBe("fresh")
+      expect(yield* fs.readFileString(files[5])).toBe("fresh")
+      const inputs = yield* llm.inputs
+      expect(inputs).toHaveLength(5)
+      expect(JSON.stringify(inputs[2].tools)).toContain('"write"')
+      expect(JSON.stringify(inputs[3].tools)).toContain('"write"')
+      expect(inputs[4].tools ?? []).toEqual([])
+    }),
+  )
+
+  runner.instance(`deleting a queued input does not reset the active tool budget (${runtime})`, () =>
+    Effect.gen(function* () {
+      const { dir, llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), maxToolCalls: 1 }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const registry = yield* ToolRegistry.Service
+      const fs = yield* FSUtil.Service
+      const chat = yield* sessions.create({
+        title: "Queued budget delete",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      const first = path.join(dir, "queued-budget-first.txt")
+      const malicious = path.join(dir, "queued-budget-malicious.txt")
+      const started = yield* Deferred.make<void>()
+      const gate = yield* Deferred.make<void>()
+      const write = (yield* registry.all()).find((item) => item.id === "write")
+      if (!write) throw new Error("write tool is not registered")
+      const original = write.execute.bind(write)
+      let paused = false
+      write.execute = (args, ctx) => {
+        if (!paused && record(args) && args.filePath === first) {
+          paused = true
+          return Effect.gen(function* () {
+            yield* Deferred.succeed(started, undefined)
+            yield* Deferred.await(gate)
+            return yield* original(args, ctx)
+          })
+        }
+        return original(args, ctx)
+      }
+      yield* Effect.addFinalizer(() => Effect.sync(() => void (write.execute = original)))
+      yield* llm.push(
+        reply().tool("write", { filePath: first, content: "first write" }),
+        reply().tool("write", { filePath: malicious, content: "must be blocked" }),
+        reply().text("done").stop(),
+      )
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "Input A" }],
+      })
+      const run = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+      yield* awaitWithTimeout(Deferred.await(started), "first write did not start")
+
+      const id = MessageID.ascending()
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        messageID: id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "Input B to delete" }],
+      })
+      const queued = (yield* sessions.messages({ sessionID: chat.id })).find((message) => message.info.id === id)
+      const text = queued?.parts.find((part): part is SessionV1.TextPart => part.type === "text")
+      if (!queued || !text) throw new Error("expected queued B message")
+      expect(
+        yield* prompt.deleteQueuedMessage({
+          sessionID: chat.id,
+          messageID: id,
+          partID: text.id,
+          expectedText: text.text,
+          expectedPartIDs: queued.parts.map((part) => part.id),
+        }),
+      ).toBeTrue()
+
+      yield* Deferred.succeed(gate, undefined)
+      yield* Fiber.await(run)
+      expect(yield* fs.readFileString(first)).toBe("first write")
+      expect(yield* fs.exists(malicious)).toBe(false)
+      const inputs = yield* llm.inputs
+      expect(inputs).toHaveLength(2)
+      expect(inputs[1].tools ?? []).toEqual([])
+      expect(inputs[1].tool_choice ?? "none").toBe("none")
+      expect(JSON.stringify(inputs[1].messages)).not.toContain("Input B to delete")
+    }),
+  )
+
+  runner.instance(`queued input receives its own tool budget only when claimed (${runtime})`, () =>
+    Effect.gen(function* () {
+      const { dir, llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), maxToolCalls: 1 }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const registry = yield* ToolRegistry.Service
+      const fs = yield* FSUtil.Service
+      const chat = yield* sessions.create({
+        title: "Queued budget retained",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      const first = path.join(dir, "queued-budget-a.txt")
+      const second = path.join(dir, "queued-budget-b.txt")
+      const excess = path.join(dir, "queued-budget-b-excess.txt")
+      const started = yield* Deferred.make<void>()
+      const gate = yield* Deferred.make<void>()
+      const write = (yield* registry.all()).find((item) => item.id === "write")
+      if (!write) throw new Error("write tool is not registered")
+      const original = write.execute.bind(write)
+      let paused = false
+      write.execute = (args, ctx) => {
+        if (!paused && record(args) && args.filePath === first) {
+          paused = true
+          return Effect.gen(function* () {
+            yield* Deferred.succeed(started, undefined)
+            yield* Deferred.await(gate)
+            return yield* original(args, ctx)
+          })
+        }
+        return original(args, ctx)
+      }
+      yield* Effect.addFinalizer(() => Effect.sync(() => void (write.execute = original)))
+      yield* llm.push(
+        reply().tool("write", { filePath: first, content: "A" }),
+        reply().tool("write", { filePath: second, content: "B" }),
+        reply().tool("write", { filePath: excess, content: "must be blocked" }),
+        reply().text("B is complete.").stop(),
+      )
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "Input A" }],
+      })
+      const run = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+      yield* awaitWithTimeout(Deferred.await(started), "first write did not start")
+      const id = MessageID.ascending()
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        messageID: id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "Input B retained" }],
+      })
+      yield* Deferred.succeed(gate, undefined)
+      yield* Fiber.await(run)
+
+      expect(yield* fs.readFileString(first)).toBe("A")
+      expect(yield* fs.readFileString(second)).toBe("B")
+      expect(yield* fs.exists(excess)).toBe(false)
+      const inputs = yield* llm.inputs
+      expect(inputs).toHaveLength(3)
+      expect(inputs[0].tools ?? []).not.toEqual([])
+      expect(JSON.stringify(inputs[0].messages)).not.toContain("Input B retained")
+      expect(JSON.stringify(inputs[1].messages)).toContain("Input B retained")
+      expect(inputs[1].tools ?? []).not.toEqual([])
+      expect(inputs[2].tools ?? []).toEqual([])
+      expect(inputs[2].tool_choice ?? "none").toBe("none")
+    }),
+  )
+
+  runner.instance(`tool call budget survives internal admission and manual loop restart (${runtime})`, () =>
+    Effect.gen(function* () {
+      const { dir, llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), maxToolCalls: 1 }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const fs = yield* FSUtil.Service
+      const chat = yield* sessions.create({
+        title: "Pinned",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      const first = path.join(dir, "budget-before-followup.txt")
+      const blocked = path.join(dir, "budget-after-followup.txt")
+      yield* prompt.prompt({ sessionID: chat.id, noReply: true, parts: [{ type: "text", text: "Write once." }] })
+      yield* llm.push(reply().tool("write", { filePath: first, content: "allowed" }), reply().text("Complete.").stop())
+      yield* prompt.loop({ sessionID: chat.id })
+
+      yield* prompt.prompt(
+        {
+          sessionID: chat.id,
+          noReply: true,
+          parts: [{ type: "text", text: "Internal result follow-up.", synthetic: true }],
+        },
+        { continueToolBudget: true },
+      )
+      yield* llm.tool("write", { filePath: blocked, content: "must not execute" })
+      yield* prompt.loop({ sessionID: chat.id })
+      expect(yield* fs.readFileString(first)).toBe("allowed")
+      expect(yield* fs.exists(blocked)).toBe(false)
+      const inputs = yield* llm.inputs
+      expect(inputs).toHaveLength(3)
+      expect(inputs[2].tools ?? []).toEqual([])
+      expect(inputs[2].tool_choice ?? "none").toBe("none")
+      expect(JSON.stringify(inputs[2].messages)).toContain("Maximum tool calls (1)")
+    }),
+  )
+
+  runner.instance(`tool call budget includes structured output and reports exhaustion clearly (${runtime})`, () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), maxToolCalls: 1 }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({
+        title: "Pinned",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        noReply: true,
+        format: new SessionV1.OutputFormatJsonSchema({
+          type: "json_schema",
+          schema: { type: "object", properties: { answer: { type: "number" } }, required: ["answer"] },
+          retryCount: 0,
+        }),
+        parts: [{ type: "text", text: "List text files, then return structured output." }],
+      })
+      yield* llm.push(reply().tool("glob", { pattern: "*.txt" }), reply().text("The tool budget is exhausted.").stop())
+      const result = yield* prompt.loop({ sessionID: chat.id })
+      if (result.info.role !== "assistant") throw new Error("Expected an assistant response")
+      expect(result.info.error?.name).toBe("StructuredOutputError")
+      if (result.info.error?.name !== "StructuredOutputError")
+        throw new Error("Expected a structured output limit error")
+      expect(result.info.error.data.message).toContain("Maximum tool calls reached")
+      const inputs = yield* llm.inputs
+      expect(inputs[1].tools ?? []).toEqual([])
+      expect(JSON.stringify(inputs[1].messages)).not.toContain("MUST use the StructuredOutput tool")
+
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        noReply: true,
+        format: new SessionV1.OutputFormatJsonSchema({
+          type: "json_schema",
+          schema: { type: "object", properties: { answer: { type: "number" } }, required: ["answer"] },
+          retryCount: 0,
+        }),
+        parts: [{ type: "text", text: "Return 4 immediately." }],
+      })
+      yield* llm.tool("StructuredOutput", { answer: 4 })
+      const completed = yield* prompt.loop({ sessionID: chat.id })
+      if (completed.info.role !== "assistant") throw new Error("Expected an assistant response")
+      expect(completed.info.error).toBeUndefined()
+      expect(completed.info.structured).toEqual({ answer: 4 })
+    }),
+  )
+
+  runner.instance(`tool call budget is retained through automatic compaction (${runtime})`, () =>
+    Effect.gen(function* () {
+      const { dir, llm } = yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        maxToolCalls: 1,
+        compaction: { auto: true, max_context_tokens: 25_000 },
+      }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const fs = yield* FSUtil.Service
+      const chat = yield* sessions.create({
+        title: "Pinned",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      const first = path.join(dir, "budget-before-compaction.txt")
+      const blocked = path.join(dir, "budget-after-compaction.txt")
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        noReply: true,
+        parts: [{ type: "text", text: "Write once, then continue." }],
+      })
+      yield* llm.push(
+        reply().tool("write", { filePath: first, content: "allowed" }).usage({ input: 30_000, output: 10 }),
+        reply().text("One file was written. Summarize the remaining work.").stop(),
+        reply().tool("write", { filePath: blocked, content: "must not execute" }),
+      )
+      yield* prompt.loop({ sessionID: chat.id })
+      expect(yield* fs.readFileString(first)).toBe("allowed")
+      expect(yield* fs.exists(blocked)).toBe(false)
+      const history = yield* sessions.messages({ sessionID: chat.id })
+      expect(history.some((message) => message.parts.some((part) => part.type === "compaction"))).toBe(true)
+      const inputs = yield* llm.inputs
+      expect(inputs).toHaveLength(3)
+      expect(inputs[2].tools ?? []).toEqual([])
+      expect(inputs[2].tool_choice ?? "none").toBe("none")
+      expect(JSON.stringify(inputs[2].messages)).toContain("Maximum tool calls (1)")
+    }),
+  )
+
+  runner.instance(`tool call budget also bounds completed calls with invalid arguments (${runtime})`, () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), maxToolCalls: 2 }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({
+        title: "Pinned",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      yield* prompt.prompt({ sessionID: chat.id, noReply: true, parts: [{ type: "text", text: "Write a file." }] })
+      yield* llm.push(
+        reply().tool("write", {}),
+        reply().tool("write", {}),
+        reply().text("Arguments were invalid; no file was written.").stop(),
+      )
+      yield* prompt.loop({ sessionID: chat.id })
+      const inputs = yield* llm.inputs
+      expect(inputs).toHaveLength(3)
+      expect(inputs[2].tools ?? []).toEqual([])
+      expect(inputs[2].tool_choice ?? "none").toBe("none")
+      expect(JSON.stringify(inputs[2].messages)).toContain("Maximum tool calls (2)")
+    }),
+  )
+}
+
 it.instance("glob tool keeps instance context during prompt runs", () =>
   Effect.gen(function* () {
     const { dir, llm } = yield* useServerConfig(providerCfg)
@@ -6077,3 +6652,91 @@ distillationIt.instance("tool steps form one distillation turn and include all n
     })
   }),
 )
+
+for (const command of ["new", "resume", "ordinary"] as const) {
+  it.instance(`manual goal ${command} gets a fresh actual tool-call budget`, () =>
+    Effect.gen(function* () {
+      const { dir, llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), maxToolCalls: 1 }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const goal = yield* Goal.Service
+      const fs = yield* FSUtil.Service
+      const chat = yield* sessions.create({
+        title: "Synthetic Goal budget",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      const first = path.join(dir, "first.txt")
+      const second = path.join(dir, "manual-goal.txt")
+      const blocked = path.join(dir, "past-new-budget.txt")
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        noReply: true,
+        parts: [{ type: "text", text: "Write the first fixture" }],
+      })
+      yield* llm.push(reply().tool("write", { filePath: first, content: "first" }), reply().text("first done").stop())
+      yield* prompt.loop({ sessionID: chat.id })
+      expect(yield* fs.exists(first)).toBe(true)
+      if (command === "resume") {
+        yield* goal.set(chat.id, "Write the second fixture")
+        yield* goal.pauseForUserCancel(chat.id, "synthetic pause")
+      }
+      yield* llm.push(
+        reply().tool("write", { filePath: second, content: "second" }),
+        reply().tool("write", { filePath: blocked, content: "must not execute" }),
+      )
+      if (command === "ordinary") {
+        yield* prompt.prompt({
+          sessionID: chat.id,
+          noReply: true,
+          parts: [{ type: "text", text: "Write the second fixture" }],
+        })
+        yield* prompt.loop({ sessionID: chat.id })
+      } else {
+        yield* prompt.command({
+          sessionID: chat.id,
+          command: "goal",
+          arguments: command === "new" ? "Write the second fixture" : "resume",
+        })
+      }
+      const inputs = yield* llm.inputs
+      expect(JSON.stringify(inputs[2].tools ?? []).includes('"name":"write"')).toBe(true)
+      expect(yield* fs.exists(second)).toBe(true)
+      expect(yield* fs.exists(blocked)).toBe(false)
+    }),
+  )
+}
+
+for (const maxToolCalls of [1, 0] as const) {
+  let judgeCalls = 0
+  const automaticBudget = testEffect(
+    goalRuntime(() =>
+      Effect.sync(() => JSON.stringify({ verdict: ++judgeCalls === 1 ? "continue" : "done", reason: "synthetic" })),
+    ),
+  )
+  automaticBudget.instance(`Goal automatic continuation preserves input tool budget (${maxToolCalls})`, () =>
+    Effect.gen(function* () {
+      judgeCalls = 0
+      const { dir, llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), maxToolCalls }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const goal = yield* Goal.Service
+      const fs = yield* FSUtil.Service
+      const chat = yield* sessions.create({ permission: [{ permission: "*", pattern: "*", action: "allow" }] })
+      const first = path.join(dir, "goal-first.txt")
+      const second = path.join(dir, "goal-automatic.txt")
+      yield* llm.push(
+        reply().tool("write", { filePath: first, content: "first" }),
+        reply().text("first turn done").stop(),
+        reply().tool("write", { filePath: second, content: "automatic" }),
+        reply().text("goal done").stop(),
+      )
+      yield* (yield* GoalLoop.Service).init()
+      yield* prompt.command({ sessionID: chat.id, command: "goal", arguments: "Write synthetic fixtures" })
+      yield* pollWithTimeout(goal.lastOutcome(chat.id), "Goal automatic budget fixture did not settle", "5 seconds")
+      expect(yield* fs.exists(first)).toBe(true)
+      expect(yield* fs.exists(second)).toBe(maxToolCalls === 0)
+      const inputs = yield* llm.inputs
+      expect(JSON.stringify(inputs[2].tools ?? []).includes('"name":"write"')).toBe(maxToolCalls === 0)
+    }),
+  )
+}

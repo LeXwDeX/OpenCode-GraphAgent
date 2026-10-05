@@ -3,7 +3,6 @@ import { Effect, Layer, Schema } from "effect"
 import { eq } from "drizzle-orm"
 import { Goal } from "@/goal/goal"
 import { GoalState } from "@/goal/state"
-import { GoalPrompts } from "@/goal/prompts"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { SessionStatus } from "@/session/status"
 import { Database } from "@opencode-ai/core/database/database"
@@ -13,10 +12,9 @@ import { logLines } from "effect/testing/TestConsole"
 import { testEffect } from "../lib/effect"
 
 // GOAL-TURN-SCOPE regression tests: the turn-provenance mark (kick /
-// continuation / resume-kick) drives (a) the goal-turn step ceiling surfaced by
-// goalTurnMaxSteps, (b) ESC-on-goal-turn mapping to a durable pause, and (c)
-// mark lifecycle across terminal transitions. Uses the real Goal layer (same
-// shape as goal.test.ts) so the durable row, the event bus, and the
+// continuation / resume-kick) drives ESC-on-goal-turn mapping to a durable
+// pause and mark lifecycle across terminal transitions. Uses the real Goal
+// layer (same shape as goal.test.ts) so the durable row, the event bus, and the
 // process-local mark are all exercised.
 
 const testLayer = Goal.layer.pipe(
@@ -31,49 +29,48 @@ const testLayer = Goal.layer.pipe(
 
 const it = testEffect(testLayer)
 
-describe("Goal turn-scope — markTurnDriven / goalTurnMaxSteps", () => {
-  it.live("unmarked session reports no ceiling", () =>
+describe("Goal turn-scope — markTurnDriven / isTurnDriven", () => {
+  it.live("unmarked session is not goal-driven", () =>
     Effect.gen(function* () {
       const goal = yield* Goal.Service
       const sid = SessionID.descending()
       yield* goal.set(sid, "test goal", 5)
-      expect(yield* goal.goalTurnMaxSteps(sid)).toBeUndefined()
+      expect(yield* goal.isTurnDriven(sid)).toBe(false)
     }),
   )
 
-  it.live("marked + active goal reports GOAL_TURN_MAX_STEPS", () =>
+  it.live("marked + active goal is goal-driven", () =>
     Effect.gen(function* () {
       const goal = yield* Goal.Service
       const sid = SessionID.descending()
       yield* goal.set(sid, "test goal", 5)
       yield* goal.markTurnDriven(sid)
       expect(yield* goal.isTurnDriven(sid)).toBe(true)
-      expect(yield* goal.goalTurnMaxSteps(sid)).toBe(GoalPrompts.GOAL_TURN_MAX_STEPS)
     }),
   )
 
-  it.live("stale mark (goal cleared) self-retires and reports no ceiling", () =>
+  it.live("stale mark (goal cleared) self-retires", () =>
     Effect.gen(function* () {
       const goal = yield* Goal.Service
       const sid = SessionID.descending()
       yield* goal.set(sid, "test goal", 5)
       yield* goal.markTurnDriven(sid)
       yield* goal.clear(sid)
-      // The durable row is gone: the next goalTurnMaxSteps probe must drop the
-      // mark instead of capping an unrelated turn.
-      expect(yield* goal.goalTurnMaxSteps(sid)).toBeUndefined()
+      // Recreate a leaked mark after the durable row has been cleared.
+      yield* goal.markTurnDriven(sid)
       expect(yield* goal.isTurnDriven(sid)).toBe(false)
     }),
   )
 
-  it.live("stale mark (goal paused) self-retires and reports no ceiling", () =>
+  it.live("stale mark (goal paused) self-retires", () =>
     Effect.gen(function* () {
       const goal = yield* Goal.Service
       const sid = SessionID.descending()
       yield* goal.set(sid, "test goal", 5)
       yield* goal.markTurnDriven(sid)
       yield* goal.pause(sid, "user-paused")
-      expect(yield* goal.goalTurnMaxSteps(sid)).toBeUndefined()
+      yield* goal.markTurnDriven(sid)
+      expect(yield* goal.isTurnDriven(sid)).toBe(false)
     }),
   )
 })
@@ -93,8 +90,6 @@ describe("Goal turn-scope — pauseForUserCancel (ESC semantics)", () => {
       expect(state?.status).toBe("paused")
       expect(state?.paused_reason).toBe("用户中断（ESC）— /goal resume 继续")
       expect(yield* goal.isTurnDriven(sid)).toBe(false)
-      // A paused goal reports no step ceiling even if the mark somehow leaked.
-      expect(yield* goal.goalTurnMaxSteps(sid)).toBeUndefined()
     }),
   )
 

@@ -10,17 +10,19 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 export const Parameters = Schema.Struct({
   query: Schema.String.annotate({ description: "Websearch query" }),
   numResults: Schema.optional(Schema.Number).annotate({
-    description: "Number of search results to return (default: 8)",
+    description: "Exa only; ignored by Parallel. Number of search results to return (default: 8)",
   }),
   livecrawl: Schema.optional(Schema.Literals(["fallback", "preferred"])).annotate({
     description:
-      "Live crawl mode - 'fallback': use live crawling as backup if cached content unavailable, 'preferred': prioritize live crawling (default: 'fallback')",
+      "Exa only; ignored by Parallel. Live crawl mode - 'fallback': use live crawling as backup if cached content unavailable, 'preferred': prioritize live crawling (default: 'fallback')",
   }),
   type: Schema.optional(Schema.Literals(["auto", "fast", "deep"])).annotate({
-    description: "Search type - 'auto': balanced search (default), 'fast': quick results, 'deep': comprehensive search",
+    description:
+      "Exa only; ignored by Parallel. Search type - 'auto': balanced search (default), 'fast': quick results, 'deep': comprehensive search",
   }),
   contextMaxCharacters: Schema.optional(Schema.Number).annotate({
-    description: "Maximum characters for context string optimized for LLMs (default: 10000)",
+    description:
+      "Exa only; ignored by Parallel. Maximum characters for returned context string, not a local per-snippet cap (default: 10000)",
   }),
 })
 

@@ -6,6 +6,7 @@ import path from "path"
 import { FileSystem } from "../filesystem"
 import { FSUtil } from "../fs-util"
 import { Location } from "../location"
+import { LocationMutation } from "../location-mutation"
 import { PermissionV2 } from "../permission"
 import { Ripgrep } from "../ripgrep"
 import { RelativePath } from "../schema"
@@ -19,7 +20,8 @@ export const Input = Schema.Struct({
     description: "Regex pattern to search for in file contents",
   }),
   path: RelativePath.pipe(Schema.optional).annotate({
-    description: "Relative directory to search. Defaults to the active Location.",
+    description:
+      "Search path relative to the active Location, or an absolute path. External absolute paths require external_directory approval. Relative paths must stay inside the Location. Paths inside it cannot escape through symlinks.",
   }),
   include: FileSystem.GrepInput.fields.include.annotate({
     description: 'File glob to include in the search (for example, "*.js" or "*.{ts,tsx}")',
@@ -55,13 +57,14 @@ export const layer = Layer.effectDiscard(
     const ripgrep = yield* Ripgrep.Service
     const location = yield* Location.Service
     const permission = yield* PermissionV2.Service
+    const mutation = yield* LocationMutation.Service
 
     yield* tools
       .register({
         [name]: Tool.make({
           contextFolding: { instructions: "none" },
           description:
-            "Search file contents by regular expression within the active Location or an absolute managed tool-output file. Use a path to narrow the search, include to filter files by glob, and limit to bound the match count. Returns concise file resources, line numbers, and bounded line previews.",
+            "Search file contents by regular expression. Paths default to the active Location; external absolute files or directories require external_directory approval. Relative paths must stay inside the Location. Paths inside it cannot escape through symlinks. Use a path to narrow the search, include to filter files by glob, and limit to bound the match count. Returns concise file resources, line numbers, and bounded line previews.",
           input: Input,
           output: Output,
           toModelOutput: ({ output }) => [
@@ -77,6 +80,14 @@ export const layer = Layer.effectDiscard(
           ],
           execute: (input, context) =>
             Effect.gen(function* () {
+              const resolved = yield* mutation.resolve({ path: input.path ?? ".", kind: "directory" })
+              if (resolved.externalDirectory)
+                yield* permission.assert({
+                  ...LocationMutation.externalDirectoryPermission(resolved.externalDirectory),
+                  sessionID: context.sessionID,
+                  agent: context.agent,
+                  source: { type: "tool", messageID: context.assistantMessageID, callID: context.toolCallID },
+                })
               yield* permission.assert({
                 action: name,
                 resources: [input.pattern],
@@ -91,7 +102,7 @@ export const layer = Layer.effectDiscard(
                 agent: context.agent,
                 source: { type: "tool", messageID: context.assistantMessageID, callID: context.toolCallID },
               })
-              const target = path.resolve(location.directory, input.path ?? ".")
+              const target = resolved.canonical
               const info = yield* fs.stat(target).pipe(Effect.catch(() => Effect.succeed(undefined)))
               return yield* ripgrep
                 .grep({

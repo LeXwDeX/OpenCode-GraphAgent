@@ -157,10 +157,9 @@ export interface Interface {
      */
     readonly pauseAndPublish: (sessionID: SessionID, reason: string) => Effect.Effect<GoalState.Info | undefined>
     /**
-     * Goal-turn provenance + step ceiling (GOAL-TURN-SCOPE). Marks the session's
-     * CURRENT turn as goal-driven (kick / judge continuation / resume-kick) so
-     * (a) the prompt loop can cap its steps via goalTurnMaxSteps, and
-     * (b) SessionPrompt.cancel can map a user ESC on a goal turn into a goal
+     * Goal-turn provenance (GOAL-TURN-SCOPE). Marks the session's CURRENT
+     * turn as goal-driven (kick / judge continuation / resume-kick) so
+     * SessionPrompt.cancel can map a user ESC on a goal turn into a goal
      * pause instead of letting the idle event auto-resurrect the goal.
      * The mark is process-local InstanceState: cleared when the turn ends
      * (afterIdle entry, pause, clear, markDone) and safe to overwrite.
@@ -183,14 +182,8 @@ export interface Interface {
      * — no durable authority claims the goal as active.
      */
     readonly pauseForUserCancel: (sessionID: SessionID, reason: string) => Effect.Effect<GoalState.Info | undefined>
-    /** True when the session's current turn is goal-driven. */
+    /** True for a marked active goal; stale inactive marks are retired, unreadable state keeps the mark. */
     readonly isTurnDriven: (sessionID: SessionID) => Effect.Effect<boolean>
-    /**
-     * Step ceiling for a goal-driven turn: min of GOAL_TURN_MAX_STEPS and the
-     * current goal's identity. Returns undefined when the turn is NOT
-     * goal-driven (the prompt loop then falls back to agent.steps unchanged).
-     */
-    readonly goalTurnMaxSteps: (sessionID: SessionID) => Effect.Effect<number | undefined>
   }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Goal") {}
@@ -228,8 +221,8 @@ const serviceLayer = Layer.effect(
     // no-op (goal already inactive — nothing claims it as active); only if
     // the pause exhausts its retries is the mark RETAINED so it agrees with
     // the still-active durable row and lease (GOAL-02). A stale mark is
-    // harmless: goalTurnMaxSteps re-validates against the durable goal row
-    // before reporting a ceiling.
+    // retired by isTurnDriven after checking the durable goal row. Read
+    // failures retain the mark so ESC can retry a failed pause.
     const turnDriven = new Set<SessionID>()
 
     const markTurnDriven = Effect.fnUntraced(function* (sessionID: SessionID) {
@@ -241,19 +234,20 @@ const serviceLayer = Layer.effect(
     })
 
     const isTurnDriven = Effect.fnUntraced(function* (sessionID: SessionID) {
-      return turnDriven.has(sessionID)
-    })
-
-    const goalTurnMaxSteps = Effect.fnUntraced(function* (sessionID: SessionID) {
-      if (!turnDriven.has(sessionID)) return undefined
-      // Re-validate against the durable row: a mark left over from a turn that
-      // ended with the goal cleared/paused must not cap an unrelated turn.
-      const state = yield* loadState(sessionID)
-      if (!state || state.status !== "active") {
-        turnDriven.delete(sessionID)
-        return undefined
+      if (!turnDriven.has(sessionID)) return false
+      // Revalidate leaked marks against durable state before routing ESC.
+      const state = yield* loadState(sessionID).pipe(Effect.exit)
+      if (Exit.isFailure(state)) {
+        if (Cause.hasInterrupts(state.cause)) return yield* Effect.interrupt
+        // A store failure cannot prove the goal inactive. Keep ESC provenance
+        // so pauseForUserCancel can retry once the store recovers.
+        return true
       }
-      return GoalPrompts.GOAL_TURN_MAX_STEPS
+      if (!state.value || state.value.status !== "active") {
+        turnDriven.delete(sessionID)
+        return false
+      }
+      return true
     })
 
     // ESC-on-goal-turn: durable pause + lease release + mark clear. Called
@@ -1134,7 +1128,6 @@ const serviceLayer = Layer.effect(
       markTurnDriven,
       clearTurnDriven,
       isTurnDriven,
-      goalTurnMaxSteps,
       pauseForUserCancel,
     })
   }),

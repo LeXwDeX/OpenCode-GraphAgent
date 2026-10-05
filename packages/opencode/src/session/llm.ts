@@ -42,6 +42,7 @@ import { organizeReasoning, ReasoningDistillationPolicy } from "@opencode-ai/cor
 import { Token } from "@opencode-ai/core/util/token"
 import { type ReasoningHistorySnapshot as ReasoningDistillationHistorySnapshot } from "./reasoning-distillation"
 import { InstanceState } from "@/effect/instance-state"
+import { ToolBudget } from "@opencode-ai/core/session/tool-budget"
 
 export function strictJSON(text: string): unknown {
   // Models sometimes wrap JSON in a markdown fence despite "output JSON only"
@@ -78,6 +79,8 @@ export type StreamInput = {
   messages: ModelMessage[]
   small?: boolean
   tools: Record<string, Tool>
+  /** Shared across every provider request for the current user input. */
+  toolBudget?: ToolBudget.Budget
   retries?: number
   toolChoice?: "auto" | "required" | "none"
   purpose?: RequestPurpose
@@ -166,14 +169,68 @@ const live: Layer.Layer<
       )
 
       const isWorkflow = language instanceof GitLabWorkflowLanguageModel
+      const toolBudget = input.toolBudget ?? ToolBudget.create(cfg.maxToolCalls)
+      const toolChoice = toolBudget.exhausted ? "none" : input.toolChoice
       const prepared = yield* LLMRequestPrep.prepare({
         ...input,
+        tools: toolChoice === "none" ? {} : input.tools,
         provider: item,
         auth: info,
         plugin,
         flags,
         isWorkflow,
       })
+      const admissions = new Map<string, { allowed: boolean; executed: boolean }>()
+      const admitToolCall = (id: string) => {
+        const prior = admissions.get(id)
+        if (prior) return prior
+        const admission = { allowed: toolBudget.tryReserve(), executed: false }
+        admissions.set(id, admission)
+        return admission
+      }
+      const observeToolCall = (event: LLMEvent) =>
+        Effect.sync(() => {
+          // Invalid arguments may fail before the executor. Completed local
+          // calls still consume budget, without charging execution a second time.
+          if (event.type === "tool-call" && !event.providerExecuted && toolChoice !== "none") admitToolCall(event.id)
+        })
+      if (toolChoice === "none") {
+        // Copilot requires a placeholder definition when history contains tool
+        // calls. Preserve that wire compatibility while refusing all execution.
+        const noop = prepared.tools._noop
+        prepared.tools = noop
+          ? {
+              _noop: {
+                ...noop,
+                execute: () => {
+                  throw new Error("Tools are disabled for this request")
+                },
+              },
+            }
+          : {}
+      } else {
+        // Gate the final tool set so registry, MCP, structured-output and native
+        // execution all reserve from the same budget before any tool side effect.
+        prepared.tools = Object.fromEntries(
+          Object.entries(prepared.tools).map(([name, item]) => {
+            const execute = item.execute
+            if (!execute) return [name, item]
+            return [
+              name,
+              {
+                ...item,
+                execute: (...args) => {
+                  const admission = admitToolCall(args[1].toolCallId)
+                  if (!admission.allowed) throw new Error(ToolBudget.exhaustedMessage(toolBudget.max))
+                  if (admission.executed) throw new Error(`Duplicate tool call: ${args[1].toolCallId}`)
+                  admission.executed = true
+                  return execute(...args)
+                },
+              } satisfies Tool,
+            ]
+          }),
+        )
+      }
       const compatibility = yield* plugin.contextFoldingCompatibility()
       const dynamicFolding = ConfigCompaction.resolveDynamic({
         disabledByEnvironment: Flag.OPENCODE_DISABLE_PRUNE,
@@ -310,7 +367,7 @@ const live: Layer.Layer<
           llmClient,
           messages: prepared.messages,
           tools: prepared.tools,
-          toolChoice: input.toolChoice,
+          toolChoice,
           temperature: prepared.params.temperature,
           topP: prepared.params.topP,
           topK: prepared.params.topK,
@@ -339,6 +396,7 @@ const live: Layer.Layer<
           return {
             type: "native" as const,
             stream: native.stream,
+            observeToolCall,
           }
         }
         yield* Effect.logInfo("llm runtime selected", {
@@ -367,6 +425,7 @@ const live: Layer.Layer<
       // LLMAISDK.toLLMEvents below normalizes fullStream parts for the processor.
       return {
         type: "ai-sdk" as const,
+        observeToolCall,
         result: streamText({
           // System messages are deliberately assembled by LLMRequestPrep.
           allowSystemInMessages: true,
@@ -408,7 +467,7 @@ const live: Layer.Layer<
           providerOptions: ProviderTransform.providerOptions(input.model, prepared.params.options),
           activeTools: Object.keys(prepared.tools).filter((x) => x !== "invalid"),
           tools: prepared.tools,
-          toolChoice: input.toolChoice,
+          toolChoice,
           maxOutputTokens: prepared.params.maxOutputTokens,
           abortSignal: input.abort,
           headers: prepared.headers,
@@ -442,7 +501,7 @@ const live: Layer.Layer<
                         sourceMessages: sourceMessages ?? [],
                         messageTransformOptions: prepared.messageTransformOptions,
                         tools: prepared.tools,
-                        toolChoice: input.toolChoice,
+                        toolChoice,
                         maxOutputTokens: prepared.params.maxOutputTokens,
                         params: prepared.params,
                         system: folding.system,
@@ -494,7 +553,7 @@ const live: Layer.Layer<
 
             const result = yield* run({ ...input, abort: ctrl.signal })
 
-            if (result.type === "native") return result.stream
+            if (result.type === "native") return result.stream.pipe(Stream.tap(result.observeToolCall))
 
             // Adapter seam: both runtimes expose the same LLMEvent stream. Native
             // already returns one; AI SDK streams are converted here.
@@ -504,6 +563,7 @@ const live: Layer.Layer<
             ).pipe(
               Stream.mapEffect((event) => LLMAISDK.toLLMEvents(state, event)),
               Stream.flatMap((events) => Stream.fromIterable(events)),
+              Stream.tap(result.observeToolCall),
             )
           }),
         ),

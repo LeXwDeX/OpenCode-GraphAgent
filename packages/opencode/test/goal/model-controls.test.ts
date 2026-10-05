@@ -2,7 +2,6 @@ import { describe, expect } from "bun:test"
 import { Deferred, Effect, Fiber, Layer, Option } from "effect"
 import { Agent } from "@/agent/agent"
 import { Goal } from "@/goal/goal"
-import { GoalPrompts } from "@/goal/prompts"
 import { SessionAutomationLease } from "@/session/automation-lease"
 import { MessageID, SessionID } from "@/session/schema"
 import { SessionStatus } from "@/session/status"
@@ -35,7 +34,7 @@ function context(sessionID: SessionID): Tool.Context {
 }
 
 describe("model goal controls", () => {
-  it.instance("tool creates literal goal text during a busy turn and keeps ESC/step protection", () =>
+  it.instance("tool creates literal goal text during a busy turn and keeps ESC protection", () =>
     Effect.gen(function* () {
       const goal = yield* Goal.Service
       const status = yield* SessionStatus.Service
@@ -48,7 +47,7 @@ describe("model goal controls", () => {
       expect(state?.goal).toBe("pause")
       expect(state?.max_turns).toBe(20)
       expect(yield* status.get(sid)).toEqual({ type: "busy" })
-      expect(yield* goal.goalTurnMaxSteps(sid)).toBe(GoalPrompts.GOAL_TURN_MAX_STEPS)
+      expect(yield* goal.isTurnDriven(sid)).toBe(true)
       yield* goal.pauseForUserCancel(sid, "user stopped")
       expect((yield* goal.load(sid))?.status).toBe("paused")
     }),

@@ -603,11 +603,11 @@ exports[`tool parameters JSON Schema (wire shape) websearch 1`] = `
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "properties": {
     "contextMaxCharacters": {
-      "description": "Maximum characters for context string optimized for LLMs (default: 10000)",
+      "description": "Exa only; ignored by Parallel. Maximum characters for returned context string, not a local per-snippet cap (default: 10000)",
       "type": "number",
     },
     "livecrawl": {
-      "description": "Live crawl mode - 'fallback': use live crawling as backup if cached content unavailable, 'preferred': prioritize live crawling (default: 'fallback')",
+      "description": "Exa only; ignored by Parallel. Live crawl mode - 'fallback': use live crawling as backup if cached content unavailable, 'preferred': prioritize live crawling (default: 'fallback')",
       "enum": [
         "fallback",
         "preferred",
@@ -615,7 +615,7 @@ exports[`tool parameters JSON Schema (wire shape) websearch 1`] = `
       "type": "string",
     },
     "numResults": {
-      "description": "Number of search results to return (default: 8)",
+      "description": "Exa only; ignored by Parallel. Number of search results to return (default: 8)",
       "type": "number",
     },
     "query": {
@@ -623,7 +623,7 @@ exports[`tool parameters JSON Schema (wire shape) websearch 1`] = `
       "type": "string",
     },
     "type": {
-      "description": "Search type - 'auto': balanced search (default), 'fast': quick results, 'deep': comprehensive search",
+      "description": "Exa only; ignored by Parallel. Search type - 'auto': balanced search (default), 'fast': quick results, 'deep': comprehensive search",
       "enum": [
         "auto",
         "fast",
@@ -818,7 +818,7 @@ exports[`tool parameters JSON Schema (wire shape) workflow 1`] = `
               "type": "string",
             },
             "operation": {
-              "description": "Grant a RUNNING (typically timeout-escalated) node more execution time without a replan — no graph rewrite, no agent restart, no replan attempt consumed. Refused for a healthy node whose deadline has not elapsed (keeps the escalation cap meaningful) and for an escalation not yet delivered to you.",
+              "description": "Grant a RUNNING node with a pending formal timeout escalation already delivered to the parent more execution time without a replan — no graph rewrite, no agent restart, no replan attempt consumed. Refused without a pending escalation (no_escalation) or before its wake is delivered (escalation_undelivered). An elapsed deadline alone does not authorize an extension; the cumulative escalation cap still applies.",
               "enum": [
                 "extend_timeout",
               ],

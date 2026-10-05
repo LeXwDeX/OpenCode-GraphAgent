@@ -139,22 +139,33 @@ const scenarios: Scenario[] = [
   http.protected.get("/skill", "app.skills").json(200, array, "status"),
   http.protected.get("/lsp", "lsp.status").json(200, array),
   http.protected.get("/formatter", "formatter.status").json(200, array),
-  http.protected.get("/config", "config.get").json(200, undefined, "status"),
+  http.protected
+    .get("/config", "config.get")
+    .inProject({ config: { maxToolCalls: 0 } })
+    .json(
+      200,
+      (body) => {
+        object(body)
+        check(body.maxToolCalls === 0, "config get should accept an explicit unlimited maxToolCalls")
+      },
+      "status",
+    ),
   http.protected
     .patch("/config", "config.update")
     .mutating()
-    .at((ctx) => ({ path: "/config", headers: ctx.headers(), body: { username: "httpapi-local" } }))
+    .at((ctx) => ({ path: "/config", headers: ctx.headers(), body: { username: "httpapi-local", maxToolCalls: 41 } }))
     .json(
       200,
       (body) => {
         object(body)
         check(body.username === "httpapi-local", "local config update should return patched config")
+        check(body.maxToolCalls === 41, "local config update should return maxToolCalls")
       },
       "status",
     ),
   http.protected
     .patch("/config", "config.update.invalid")
-    .at((ctx) => ({ path: "/config", headers: ctx.headers(), body: { username: 1 } }))
+    .at((ctx) => ({ path: "/config", headers: ctx.headers(), body: { maxToolCalls: -1 } }))
     .status(400),
   http.protected.get("/config/providers", "config.providers").json(),
   http.protected.get("/project", "project.list").json(200, array, "status"),

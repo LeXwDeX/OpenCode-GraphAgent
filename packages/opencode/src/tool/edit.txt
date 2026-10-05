@@ -1,10 +1,10 @@
-Performs exact string replacements in files. 
+Replaces text in files. Provide exact oldString content; compatibility matching may tolerate whitespace or nearby context differences.
 
 Usage:
-- You must use your `Read` tool at least once in the conversation before editing. This tool will error if you attempt an edit without reading the file. 
+- Read the existing file with the `Read` tool before editing. This is an operating requirement; the tool does not enforce a prior-read check.
 - When editing text from Read output, preserve the exact indentation after the line-number prefix. The prefix is a line number, colon, and space (for example, `1: `). Match only the file content after that prefix. Do not include the prefix in `oldString` or `newString`.
 - ALWAYS prefer editing existing files in the codebase. NEVER write new files unless explicitly required.
 - Only use emojis if the user explicitly requests it. Avoid adding emojis to files unless asked.
-- The edit will FAIL if `oldString` is not found in the file with an error "oldString not found in content".
-- The edit fails if `oldString` appears more than once. Add context to make it unique, or use `replaceAll` to change every match.
+- The edit fails if no acceptable match is found: "Could not find oldString in the file. It must match exactly, including whitespace, indentation, and line endings."
+- The edit fails when it cannot identify a unique match: "Found multiple matches for oldString. Provide more surrounding context to make the match unique." Add context or use `replaceAll` to change every match.
 - Use `replaceAll` for replacing and renaming strings across the file. This parameter is useful if you want to rename a variable for instance.

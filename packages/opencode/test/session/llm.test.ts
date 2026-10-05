@@ -32,6 +32,7 @@ import { ContextFolding } from "@/session/context-folding"
 import { Flag } from "@opencode-ai/core/flag/flag"
 import { Hash } from "@opencode-ai/core/util/hash"
 import { logLines } from "effect/testing/TestConsole"
+import { ToolBudget } from "@opencode-ai/core/session/tool-budget"
 
 type ConfigModel = NonNullable<NonNullable<ConfigV1.Info["provider"]>[string]["models"]>[string]
 
@@ -1567,6 +1568,287 @@ describe("session.llm.stream", () => {
           },
         },
       }),
+    },
+  )
+
+  it.instance(
+    "keeps Copilot no-op available when tool choice is none",
+    () =>
+      Effect.gen(function* () {
+        const fixture = loadFixture(alibabaQwenFixture.providerID, alibabaQwenFixture.modelID)
+        const providerID = "test-github-copilot"
+        const request = waitRequest(
+          "/chat/completions",
+          createEventResponse(
+            [
+              { id: "chatcmpl-noop", object: "chat.completion.chunk", choices: [{ delta: { role: "assistant" } }] },
+              { id: "chatcmpl-noop", object: "chat.completion.chunk", choices: [{ delta: {}, finish_reason: "stop" }] },
+            ],
+            true,
+          ),
+        )
+        const resolved = yield* Provider.use.getModel(ProviderV2.ID.make(providerID), ModelV2.ID.make(fixture.model.id))
+        const sessionID = SessionID.make("session-copilot-noop")
+        const agent = { name: "test", mode: "primary", options: {}, permission: [] } satisfies Agent.Info
+        const user = {
+          id: MessageID.make("msg-copilot-noop"),
+          sessionID,
+          role: "user",
+          time: { created: Date.now() },
+          agent: agent.name,
+          model: { providerID: ProviderV2.ID.make(providerID), modelID: resolved.id },
+          tools: {},
+        } satisfies SessionV1.User
+
+        yield* drain({
+          user,
+          sessionID,
+          model: resolved,
+          agent,
+          system: ["test"],
+          toolChoice: "none",
+          messages: [
+            {
+              role: "assistant",
+              content: [{ type: "tool-call", toolCallId: "prior-call", toolName: "read", input: {} }],
+            },
+            {
+              role: "tool",
+              content: [
+                {
+                  type: "tool-result",
+                  toolCallId: "prior-call",
+                  toolName: "read",
+                  output: { type: "text", value: "prior" },
+                },
+              ],
+            },
+            { role: "user", content: "Continue" },
+          ],
+          tools: {},
+        })
+
+        const capture = yield* Effect.promise(() => request)
+        expect(capture.body.tool_choice).toBe("none")
+        expect(
+          (capture.body.tools as Array<{ function?: { name?: string } }>).map((item) => item.function?.name),
+        ).toEqual(["_noop"])
+      }),
+    {
+      config: () => ({
+        enabled_providers: ["test-github-copilot"],
+        provider: {
+          "test-github-copilot": {
+            npm: "@ai-sdk/openai-compatible",
+            options: { apiKey: "local-test-key", baseURL: `${state.server!.url.origin}/v1` },
+            models: {
+              [loadFixture(alibabaQwenFixture.providerID, alibabaQwenFixture.modelID).model.id]: configModel(
+                loadFixture(alibabaQwenFixture.providerID, alibabaQwenFixture.modelID).model,
+              ) as ConfigModel,
+            },
+          },
+        },
+      }),
+    },
+  )
+
+  it.instance(
+    "keeps exhausted Copilot tool budget disabled on the wire",
+    () =>
+      Effect.gen(function* () {
+        const fixture = loadFixture(alibabaQwenFixture.providerID, alibabaQwenFixture.modelID)
+        const providerID = "test-github-copilot"
+        const request = waitRequest(
+          "/chat/completions",
+          new Response(createChatStream("done"), { headers: { "Content-Type": "text/event-stream" } }),
+        )
+        const resolved = yield* Provider.use.getModel(ProviderV2.ID.make(providerID), ModelV2.ID.make(fixture.model.id))
+        const sessionID = SessionID.make("session-copilot-budget")
+        const agent = { name: "test", mode: "primary", options: {}, permission: [] } satisfies Agent.Info
+        const user = {
+          id: MessageID.make("msg-copilot-budget"),
+          sessionID,
+          role: "user",
+          time: { created: Date.now() },
+          agent: agent.name,
+          model: { providerID: ProviderV2.ID.make(providerID), modelID: resolved.id },
+          tools: { run: true },
+        } satisfies SessionV1.User
+        const budget = ToolBudget.create(1)
+        expect(budget.tryReserve()).toBe(true)
+        let executed = false
+
+        yield* drain({
+          user,
+          sessionID,
+          model: resolved,
+          agent,
+          system: ["test"],
+          toolBudget: budget,
+          messages: [
+            {
+              role: "assistant",
+              content: [{ type: "tool-call", toolCallId: "prior-call", toolName: "run", input: {} }],
+            },
+            {
+              role: "tool",
+              content: [
+                {
+                  type: "tool-result",
+                  toolCallId: "prior-call",
+                  toolName: "run",
+                  output: { type: "text", value: "prior" },
+                },
+              ],
+            },
+            { role: "user", content: "Continue" },
+          ],
+          tools: {
+            run: tool({
+              description: "Must not run",
+              inputSchema: z.object({}),
+              execute: async () => {
+                executed = true
+                return "ran"
+              },
+            }),
+          },
+        })
+
+        const capture = yield* Effect.promise(() => request)
+        expect(capture.body.tool_choice).toBe("none")
+        expect(
+          (capture.body.tools as Array<{ function?: { name?: string } }>).map((item) => item.function?.name),
+        ).toEqual(["_noop"])
+        expect(executed).toBe(false)
+      }),
+    {
+      config: () => {
+        const model = loadFixture(alibabaQwenFixture.providerID, alibabaQwenFixture.modelID).model
+        return {
+          enabled_providers: ["test-github-copilot"],
+          provider: {
+            "test-github-copilot": {
+              npm: "@ai-sdk/openai-compatible",
+              options: { apiKey: "local-test-key", baseURL: `${state.server!.url.origin}/v1` },
+              models: { [model.id]: configModel(model) as ConfigModel },
+            },
+          },
+        }
+      },
+    },
+  )
+
+  it.instance(
+    "turns an unsolicited Copilot no-op call into a tool error",
+    () =>
+      Effect.gen(function* () {
+        const fixture = loadFixture(alibabaQwenFixture.providerID, alibabaQwenFixture.modelID)
+        const providerID = "test-github-copilot"
+        const response = createEventResponse(
+          [
+            { id: "chatcmpl-malicious", object: "chat.completion.chunk", choices: [{ delta: { role: "assistant" } }] },
+            {
+              id: "chatcmpl-malicious",
+              object: "chat.completion.chunk",
+              choices: [
+                {
+                  delta: {
+                    tool_calls: [
+                      {
+                        index: 0,
+                        id: "call-malicious-noop",
+                        type: "function",
+                        function: { name: "_noop", arguments: "{}" },
+                      },
+                    ],
+                  },
+                },
+              ],
+            },
+            {
+              id: "chatcmpl-malicious",
+              object: "chat.completion.chunk",
+              choices: [{ delta: {}, finish_reason: "tool_calls" }],
+            },
+          ],
+          true,
+        )
+        const request = waitRequest("/chat/completions", response)
+        const resolved = yield* Provider.use.getModel(ProviderV2.ID.make(providerID), ModelV2.ID.make(fixture.model.id))
+        const sessionID = SessionID.make("session-copilot-malicious-noop")
+        const agent = { name: "test", mode: "primary", options: {}, permission: [] } satisfies Agent.Info
+        const user = {
+          id: MessageID.make("msg-copilot-malicious-noop"),
+          sessionID,
+          role: "user",
+          time: { created: Date.now() },
+          agent: agent.name,
+          model: { providerID: ProviderV2.ID.make(providerID), modelID: resolved.id },
+          tools: { run: true },
+        } satisfies SessionV1.User
+        let executed = false
+        const events = yield* LLM.Service.use((svc) =>
+          svc
+            .stream({
+              user,
+              sessionID,
+              model: resolved,
+              agent,
+              system: ["test"],
+              toolChoice: "none",
+              messages: [
+                {
+                  role: "assistant",
+                  content: [{ type: "tool-call", toolCallId: "prior-call", toolName: "run", input: {} }],
+                },
+                {
+                  role: "tool",
+                  content: [
+                    {
+                      type: "tool-result",
+                      toolCallId: "prior-call",
+                      toolName: "run",
+                      output: { type: "text", value: "prior" },
+                    },
+                  ],
+                },
+                { role: "user", content: "Continue" },
+              ],
+              tools: {
+                run: tool({
+                  description: "Must not run",
+                  inputSchema: z.object({}),
+                  execute: async () => {
+                    executed = true
+                    return "ran"
+                  },
+                }),
+              },
+            })
+            .pipe(Stream.runCollect),
+        )
+        yield* Effect.promise(() => request)
+
+        expect(
+          Array.from(events).some((event) => event.type === "tool-error" && event.id === "call-malicious-noop"),
+        ).toBe(true)
+        expect(executed).toBe(false)
+      }),
+    {
+      config: () => {
+        const model = loadFixture(alibabaQwenFixture.providerID, alibabaQwenFixture.modelID).model
+        return {
+          enabled_providers: ["test-github-copilot"],
+          provider: {
+            "test-github-copilot": {
+              npm: "@ai-sdk/openai-compatible",
+              options: { apiKey: "local-test-key", baseURL: `${state.server!.url.origin}/v1` },
+              models: { [model.id]: configModel(model) as ConfigModel },
+            },
+          },
+        }
+      },
     },
   )
 
@@ -3166,8 +3448,7 @@ describe("session.llm.stream", () => {
         const capture = yield* Effect.promise(() => request)
         const body = capture.body
         const config = body.generationConfig as
-          | { temperature?: number; topP?: number; maxOutputTokens?: number }
-          | undefined
+          { temperature?: number; topP?: number; maxOutputTokens?: number } | undefined
 
         expect(capture.url.pathname).toBe(pathSuffix)
         expect(body.contents).toEqual([{ role: "user", parts: [{ text: "Hello" }] }])

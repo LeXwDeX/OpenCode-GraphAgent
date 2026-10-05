@@ -92,7 +92,7 @@ const ControlExtendTimeout = Schema.Struct({
   action: Schema.Literal("control"),
   operation: Schema.Literal("extend_timeout").annotate({
     description:
-      "Grant a RUNNING (typically timeout-escalated) node more execution time without a replan — no graph rewrite, no agent restart, no replan attempt consumed. Refused for a healthy node whose deadline has not elapsed (keeps the escalation cap meaningful) and for an escalation not yet delivered to you.",
+      "Grant a RUNNING node with a pending formal timeout escalation already delivered to the parent more execution time without a replan — no graph rewrite, no agent restart, no replan attempt consumed. Refused without a pending escalation (no_escalation) or before its wake is delivered (escalation_undelivered). An elapsed deadline alone does not authorize an extension; the cumulative escalation cap still applies.",
   }),
   workflow_id: Dag.ID.annotate({ description: "Target workflow ID" }),
   node_id: Dag.NodeID.annotate({ description: "Running node whose deadline to extend" }),

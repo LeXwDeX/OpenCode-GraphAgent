@@ -1,5 +1,4 @@
 import { Message, Model, Part, Session, SnapshotFileDiff } from "@opencode-ai/sdk/v2"
-import { iife } from "@opencode-ai/core/util/iife"
 import z from "zod"
 import { Storage } from "./storage"
 
@@ -60,6 +59,8 @@ export namespace Share {
         return "session_diff"
       case "model":
         return "model"
+      default:
+        throw new Error("Unsupported share data type")
     }
   }
 
@@ -79,39 +80,39 @@ export namespace Share {
     return (await Storage.read<Snapshot>(["share_snapshot", shareID]))?.data
   }
 
-  async function writeSnapshot(shareID: string, data: Data[]) {
-    await Storage.write<Snapshot>(["share_snapshot", shareID], { data })
+  type State = Info & { version?: 2; data?: Data[]; deleted?: boolean; revision?: string }
+
+  // One durable record orders authorization, data, revocation and recreation.
+  // Tombstones are retained so a stale writer cannot recreate a deleted generation.
+  async function state(id: string) {
+    return Storage.readVersion<State>(["share", id])
+  }
+
+  function publicInfo(value: State): Info {
+    return { id: value.id, sessionID: value.sessionID, secret: value.secret }
   }
 
   async function legacy(shareID: string) {
-    const compaction: Compaction = (await Storage.read<Compaction>(["share_compaction", shareID])) ?? {
-      data: [],
-      event: undefined,
-    }
-    const list = await Storage.list({
-      prefix: ["share_event", shareID],
-      before: compaction.event,
-    }).then((x) => x.toReversed())
-    if (list.length === 0) {
-      if (compaction.data.length > 0) await writeSnapshot(shareID, compaction.data)
-      return compaction.data
-    }
-
-    const next = merge(
+    const snapshot = await readSnapshot(shareID)
+    const compaction = (await Storage.read<Compaction>(["share_compaction", shareID])) ?? { data: [] }
+    const list = (await Storage.list({ prefix: ["share_event", shareID], before: compaction.event })).toReversed()
+    const oldPaths = await Storage.list({ prefix: ["share_data", shareID] })
+    const oldData = (
+      await Promise.all(
+        oldPaths.map(async (path) => {
+          const type = path[2]
+          if (!["session", "message", "part", "session_diff", "model"].includes(type)) return []
+          const data = await Storage.read<unknown>(path)
+          return data === undefined ? [] : [Data.parse({ type, data })]
+        }),
+      )
+    ).flat()
+    return merge(
+      oldData,
       compaction.data,
-      await Promise.all(list.map(async (event) => await Storage.read<Data[]>(event))).then((x) =>
-        x.flatMap((item) => item ?? []),
-      ),
+      (await Promise.all(list.map((event) => Storage.read<Data[]>(event)))).flatMap((x) => x ?? []),
+      snapshot ?? [],
     )
-
-    await Promise.all([
-      Storage.write(["share_compaction", shareID], {
-        event: list.at(-1)?.at(-1),
-        data: next,
-      }),
-      writeSnapshot(shareID, next),
-    ])
-    return next
   }
 
   export const create = fn(z.object({ sessionID: z.string() }), async (body) => {
@@ -121,29 +122,49 @@ export namespace Share {
       sessionID: body.sessionID,
       secret: crypto.randomUUID(),
     }
-    const exists = await get(info.id)
-    if (exists) throw new Errors.AlreadyExists(info.id)
-    await Promise.all([Storage.write(["share", info.id], info), writeSnapshot(info.id, [])])
-    return info
+    for (let attempt = 0; attempt < 64; attempt++) {
+      const current = await state(info.id)
+      if (current && !current.value.deleted) throw new Errors.AlreadyExists(info.id)
+      if (
+        await Storage.compareAndSwap(
+          ["share", info.id],
+          { ...info, version: 2, data: [], revision: crypto.randomUUID() },
+          current?.etag,
+        )
+      )
+        return info
+    }
+    throw new Errors.Conflict(info.id)
   })
 
   export async function get(id: string) {
-    return Storage.read<Info>(["share", id])
+    const current = await state(id)
+    return current && !current.value.deleted ? publicInfo(current.value) : undefined
   }
 
   export const remove = fn(Info.pick({ id: true, secret: true }), async (body) => {
-    const share = await get(body.id)
-    if (!share) throw new Errors.NotFound(body.id)
-    if (share.secret !== body.secret) throw new Errors.InvalidSecret(body.id)
-    await Storage.remove(["share", body.id])
-    const groups = await Promise.all([
-      Storage.list({ prefix: ["share_event", body.id] }),
-      Storage.list({ prefix: ["share_data", body.id] }),
-    ])
-    await Promise.all([Storage.remove(["share_snapshot", body.id]), Storage.remove(["share_compaction", body.id])])
-    for (const item of groups.flat()) {
-      await Storage.remove(item)
+    for (let attempt = 0; attempt < 64; attempt++) {
+      const current = await state(body.id)
+      if (!current || current.value.deleted) throw new Errors.NotFound(body.id)
+      if (current.value.secret !== body.secret) throw new Errors.InvalidSecret(body.id)
+      if (
+        !(await Storage.compareAndSwap(
+          ["share", body.id],
+          { version: 2, deleted: true, revision: crypto.randomUUID() },
+          current.etag,
+        ))
+      )
+        continue
+      // New generations use only the authoritative record, never these legacy objects.
+      const groups = await Promise.all([
+        Storage.list({ prefix: ["share_event", body.id] }),
+        Storage.list({ prefix: ["share_data", body.id] }),
+      ])
+      await Promise.all([Storage.remove(["share_snapshot", body.id]), Storage.remove(["share_compaction", body.id])])
+      for (const item of groups.flat()) await Storage.remove(item)
+      return
     }
+    throw new Errors.Conflict(body.id)
   })
 
   export const removeAdmin = fn(Info.pick({ id: true }), async (body) => {
@@ -153,66 +174,53 @@ export namespace Share {
   })
 
   export const sync = fn(
-    z.object({
-      share: Info.pick({ id: true, secret: true }),
-      data: Data.array(),
-    }),
+    z.object({ share: Info.pick({ id: true, secret: true }), data: Data.array() }),
     async (input) => {
-      const share = await get(input.share.id)
-      if (!share) throw new Errors.NotFound(input.share.id)
-      if (share.secret !== input.share.secret) throw new Errors.InvalidSecret(input.share.id)
-      const data = (await readSnapshot(input.share.id)) ?? (await legacy(input.share.id))
-      await writeSnapshot(input.share.id, merge(data, input.data))
+      for (let attempt = 0; attempt < 64; attempt++) {
+        const current = await state(input.share.id)
+        if (!current || current.value.deleted) throw new Errors.NotFound(input.share.id)
+        if (current.value.secret !== input.share.secret) throw new Errors.InvalidSecret(input.share.id)
+        const data = current.value.version === 2 ? (current.value.data ?? []) : await legacy(input.share.id)
+        if (
+          await Storage.compareAndSwap(
+            ["share", input.share.id],
+            { ...current.value, version: 2, data: merge(data, input.data), revision: crypto.randomUUID() },
+            current.etag,
+          )
+        )
+          return
+      }
+      throw new Errors.Conflict(input.share.id)
     },
   )
 
   export async function data(shareID: string) {
-    if (!(await get(shareID))) throw new Errors.NotFound(shareID)
-    return (await readSnapshot(shareID)) ?? legacy(shareID)
+    for (let attempt = 0; attempt < 64; attempt++) {
+      const current = await state(shareID)
+      if (!current || current.value.deleted) throw new Errors.NotFound(shareID)
+      if (current.value.version === 2) return current.value.data ?? []
+      const data = await legacy(shareID)
+      if (
+        await Storage.compareAndSwap(
+          ["share", shareID],
+          { ...current.value, version: 2, data, revision: crypto.randomUUID() },
+          current.etag,
+        )
+      )
+        return data
+    }
+    throw new Errors.Conflict(shareID)
   }
 
-  export const syncOld = fn(
-    z.object({
-      share: Info.pick({ id: true, secret: true }),
-      data: Data.array(),
-    }),
-    async (input) => {
-      const share = await get(input.share.id)
-      if (!share) throw new Errors.NotFound(input.share.id)
-      if (share.secret !== input.share.secret) throw new Errors.InvalidSecret(input.share.id)
-      const promises = []
-      for (const item of input.data) {
-        promises.push(
-          iife(async () => {
-            switch (item.type) {
-              case "session":
-                await Storage.write(["share_data", input.share.id, "session"], item.data)
-                break
-              case "message": {
-                const data = item.data as Message
-                await Storage.write(["share_data", input.share.id, "message", data.id], item.data)
-                break
-              }
-              case "part": {
-                const data = item.data as Part
-                await Storage.write(["share_data", input.share.id, "part", data.messageID, data.id], item.data)
-                break
-              }
-              case "session_diff":
-                await Storage.write(["share_data", input.share.id, "session_diff"], item.data)
-                break
-              case "model":
-                await Storage.write(["share_data", input.share.id, "model"], item.data)
-                break
-            }
-          }),
-        )
-      }
-      await Promise.all(promises)
-    },
-  )
+  // Historical callers participate in the same durable generation fence.
+  export const syncOld = sync
 
   export const Errors = {
+    Conflict: class extends Error {
+      constructor(public id: string) {
+        super(`Share update conflict: ${id}`)
+      }
+    },
     NotFound: class extends Error {
       constructor(public id: string) {
         super(`Share not found: ${id}`)

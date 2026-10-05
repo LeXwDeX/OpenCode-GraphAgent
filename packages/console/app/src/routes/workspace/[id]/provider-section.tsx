@@ -15,10 +15,6 @@ const PROVIDERS = [
 
 type Provider = (typeof PROVIDERS)[number]
 
-function maskCredentials(credentials: string) {
-  return `${credentials.slice(0, 8)}...${credentials.slice(-8)}`
-}
-
 const removeProvider = action(async (form: FormData) => {
   "use server"
   const provider = form.get("provider") as string | null
@@ -96,10 +92,7 @@ function ProviderRow(props: { provider: Provider }) {
     <tr data-slot="provider-row">
       <td data-slot="provider-name">{props.provider.name}</td>
       <td data-slot="provider-key">
-        <Show
-          when={store.editing}
-          fallback={<span>{providerData() ? maskCredentials(providerData()!.credentials) : "-"}</span>}
-        >
+        <Show when={store.editing} fallback={<span>{providerData()?.credentialsDisplay ?? "-"}</span>}>
           <form id={`provider-form-${props.provider.key}`} action={saveProvider} method="post" data-slot="edit-form">
             <div data-slot="input-wrapper">
               <input

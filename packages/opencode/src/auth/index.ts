@@ -1,13 +1,13 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import path from "path"
+import { randomUUID } from "node:crypto"
 import { Effect, Layer, Record, Result, Schema, Context } from "effect"
 import { NonNegativeInt } from "@opencode-ai/core/schema"
 import { Global } from "@opencode-ai/core/global"
 import { FSUtil } from "@opencode-ai/core/fs-util"
+import { EffectFlock } from "@opencode-ai/core/util/effect-flock"
 
 export const OAUTH_DUMMY_KEY = "opencode-oauth-dummy-key"
-
-const file = path.join(Global.Path.data, "auth.json")
 
 const fail = (message: string) => (cause: unknown) => new AuthError({ message, cause })
 
@@ -53,47 +53,79 @@ export const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const fsys = yield* FSUtil.Service
+    const global = yield* Global.Service
+    const flock = yield* EffectFlock.Service
+    const file = path.join(global.data, "auth.json")
     const decode = Schema.decodeUnknownOption(Info)
 
-    const all = Effect.fn("Auth.all")(function* () {
+    const read = Effect.fn("Auth.read")(function* (strict = false) {
       if (process.env.OPENCODE_AUTH_CONTENT) {
         try {
           return JSON.parse(process.env.OPENCODE_AUTH_CONTENT)
         } catch (err) {}
       }
 
-      const data = (yield* fsys.readJson(file).pipe(Effect.orElseSucceed(() => ({})))) as Record<string, unknown>
+      const source = fsys.readJson(file)
+      const data = (yield* (
+        strict
+          ? source.pipe(Effect.catchReason("PlatformError", "NotFound", () => Effect.succeed({})))
+          : source.pipe(Effect.orElseSucceed(() => ({})))
+      ).pipe(Effect.mapError(fail("Failed to read auth data")))) as Record<string, unknown>
       return Record.filterMap(data, (value) => Result.fromOption(decode(value), () => undefined))
     })
+
+    const all = Effect.fn("Auth.all")(() => read())
 
     const get = Effect.fn("Auth.get")(function* (providerID: string) {
       return (yield* all())[providerID]
     })
 
-    const set = Effect.fn("Auth.set")(function* (key: string, info: Info) {
-      const norm = key.replace(/\/+$/, "")
-      const data = yield* all()
-      if (norm !== key) delete data[key]
-      delete data[norm + "/"]
-      yield* fsys
-        .writeJson(file, { ...data, [norm]: info }, 0o600)
-        .pipe(Effect.mapError(fail("Failed to write auth data")))
+    const mutate = Effect.fn("Auth.mutate")(function* (update: (data: Record<string, Info>) => void) {
+      yield* Effect.gen(function* () {
+        const data = yield* read(true)
+        update(data)
+        yield* fsys.ensureDir(global.data)
+        yield* Effect.gen(function* () {
+          const temporary = yield* Effect.acquireRelease(
+            Effect.sync(() => `${file}.${randomUUID()}.tmp`),
+            (temporary) => fsys.remove(temporary).pipe(Effect.ignore),
+          )
+          yield* fsys.writeFileString(temporary, JSON.stringify(data, null, 2), { flag: "wx", mode: 0o600 })
+          yield* fsys.rename(temporary, file)
+        }).pipe(Effect.scoped)
+      }).pipe(
+        flock.withLock(`auth:${file}`, path.join(global.data, ".auth-locks")),
+        Effect.mapError(fail("Failed to write auth data")),
+      )
     })
 
-    const remove = Effect.fn("Auth.remove")(function* (key: string) {
-      const norm = key.replace(/\/+$/, "")
-      const data = yield* all()
-      delete data[key]
-      delete data[norm]
-      yield* fsys.writeJson(file, data, 0o600).pipe(Effect.mapError(fail("Failed to write auth data")))
-    })
+    const set = Effect.fn("Auth.set")((key: string, info: Info) =>
+      mutate((data) => {
+        const norm = key.replace(/\/+$/, "")
+        if (norm !== key) delete data[key]
+        delete data[norm + "/"]
+        data[norm] = info
+      }),
+    )
+
+    const remove = Effect.fn("Auth.remove")((key: string) =>
+      mutate((data) => {
+        const norm = key.replace(/\/+$/, "")
+        delete data[key]
+        delete data[norm]
+      }),
+    )
 
     return Service.of({ get, all, set, remove })
   }),
 )
 
-export const defaultLayer = layer.pipe(Layer.provide(FSUtil.defaultLayer))
+export const defaultLayer = layer.pipe(
+  Layer.provide(EffectFlock.defaultLayer),
+  Layer.provide(FSUtil.defaultLayer),
+  Layer.provide(Global.defaultLayer),
+)
 
-export const node = LayerNode.make(layer, [FSUtil.node])
+export const node = LayerNode.make(layer, [FSUtil.node, Global.node, EffectFlock.node])
 
 export * as Auth from "."

@@ -57,6 +57,8 @@ import { sessionTitle } from "@/utils/session-title"
 import { pathKey } from "@/utils/path-key"
 import { useGlobal } from "@/context/global"
 import { useCommand } from "@/context/command"
+import { formatServerError } from "@/utils/server-errors"
+import { HomeBootstrapError } from "./home-bootstrap-error"
 import { Binary } from "@opencode-ai/core/util/binary"
 import { ServerRowMenu } from "@/components/server/server-row-menu"
 import { ServerHealthIndicator } from "@/components/server/server-row"
@@ -414,105 +416,118 @@ export function NewHome() {
   }
 
   return (
-    <div class="rounded-[10px] shadow-[var(--v2-elevation-raised)] m-2 min-h-0 lg:overflow-hidden bg-v2-background-bg-base self-stretch flex-1">
-      <div class="mx-auto grid h-full w-full max-w-[1080px] grid-rows-[auto_minmax(0,1fr)_auto] gap-4 px-3 pb-3 lg:grid-cols-[280px_minmax(0,720px)] lg:grid-rows-1 lg:gap-8 lg:px-6 lg:pb-16">
-        <HomeProjectColumn
-          projects={projects()}
-          selected={state.selection}
-          focusServer={focusServer}
-          selectProject={selectProject}
-          openNewSession={openProjectNewSession}
-          chooseProject={(conn) => void chooseProject(conn)}
-          editProject={editProject}
-          closeProject={(conn, directory) => {
-            const next = closeHomeProject(
-              state.selection,
-              ServerConnection.key(conn),
-              global.ensureServerCtx(conn).projects,
-              directory,
-            )
-            if (next) setSelection(next)
-          }}
-          clearNotifications={clearNotifications}
-          unseenCount={unseenCount}
-          openSettings={openSettings}
-          openHelp={() => platform.openLink("https://opencode.ai/desktop-feedback")}
-          language={language}
+    <Show
+      when={sync().ready || !sync().error}
+      fallback={
+        <HomeBootstrapError
+          error={formatServerError(sync().error, language.t, language.t("common.requestFailed"))}
+          retrying={sync().retrying}
+          retryLabel={language.t("home.bootstrap.retry")}
+          loadingLabel={language.t("common.loading")}
+          onRetry={() => void sync().retryBootstrap()}
         />
-
-        <section
-          class="min-h-0 min-w-0 flex-1 flex flex-col pt-6 lg:pt-12"
-          aria-label={language.t("sidebar.project.recentSessions")}
-        >
-          <HomeSessionSearch
-            value={state.search}
-            placeholder={searchPlaceholder()}
-            open={searchOpen()}
-            loading={sessionLoad.isLoading}
-            results={searchResults()}
-            showProjectName={!selectedProject()}
-            server={state.selection.server}
-            activeServer={state.selection.server === server.key}
-            noResultsLabel={language.t("home.sessions.search.noResults", { query: search() })}
-            bindFocus={(focus) => {
-              focusSessionSearch = focus
+      }
+    >
+      <div class="rounded-[10px] shadow-[var(--v2-elevation-raised)] m-2 min-h-0 lg:overflow-hidden bg-v2-background-bg-base self-stretch flex-1">
+        <div class="mx-auto grid h-full w-full max-w-[1080px] grid-rows-[auto_minmax(0,1fr)_auto] gap-4 px-3 pb-3 lg:grid-cols-[280px_minmax(0,720px)] lg:grid-rows-1 lg:gap-8 lg:px-6 lg:pb-16">
+          <HomeProjectColumn
+            projects={projects()}
+            selected={state.selection}
+            focusServer={focusServer}
+            selectProject={selectProject}
+            openNewSession={openProjectNewSession}
+            chooseProject={(conn) => void chooseProject(conn)}
+            editProject={editProject}
+            closeProject={(conn, directory) => {
+              const next = closeHomeProject(
+                state.selection,
+                ServerConnection.key(conn),
+                global.ensureServerCtx(conn).projects,
+                directory,
+              )
+              if (next) setSelection(next)
             }}
-            onInput={(value) => setState("search", value)}
-            onFocus={() => setState("searchFocused", true)}
-            onClose={closeSearch}
-            onSelect={selectSearchSession}
+            clearNotifications={clearNotifications}
+            unseenCount={unseenCount}
+            openSettings={openSettings}
+            openHelp={() => platform.openLink("https://opencode.ai/desktop-feedback")}
+            language={language}
           />
-          <ScrollView class="mt-3 min-h-0 flex-1">
-            <Show
-              when={!sessionLoad.isLoading}
-              fallback={
-                <div class="pt-3">
-                  <HomeSessionSkeleton label={language.t("common.loading")} />
-                </div>
-              }
-            >
+
+          <section
+            class="min-h-0 min-w-0 flex-1 flex flex-col pt-6 lg:pt-12"
+            aria-label={language.t("sidebar.project.recentSessions")}
+          >
+            <HomeSessionSearch
+              value={state.search}
+              placeholder={searchPlaceholder()}
+              open={searchOpen()}
+              loading={sessionLoad.isLoading}
+              results={searchResults()}
+              showProjectName={!selectedProject()}
+              server={state.selection.server}
+              activeServer={state.selection.server === server.key}
+              noResultsLabel={language.t("home.sessions.search.noResults", { query: search() })}
+              bindFocus={(focus) => {
+                focusSessionSearch = focus
+              }}
+              onInput={(value) => setState("search", value)}
+              onFocus={() => setState("searchFocused", true)}
+              onClose={closeSearch}
+              onSelect={selectSearchSession}
+            />
+            <ScrollView class="mt-3 min-h-0 flex-1">
               <Show
-                when={groups().length > 0}
-                fallback={<HomeSessionsEmpty onNewSession={newSessionProject() ? openNewSession : undefined} />}
+                when={!sessionLoad.isLoading}
+                fallback={
+                  <div class="pt-3">
+                    <HomeSessionSkeleton label={language.t("common.loading")} />
+                  </div>
+                }
               >
-                <div class="pt-3 flex flex-col gap-6">
-                  <For each={groups()}>
-                    {(group, index) => (
-                      <div class="flex min-w-0 flex-col gap-4">
-                        <HomeSessionGroupHeader
-                          title={group.title}
-                          onNewSession={index() === 0 && newSessionProject() ? openNewSession : undefined}
-                        />
-                        <div class="flex min-w-0 flex-col gap-px">
-                          <For each={group.sessions}>
-                            {(record) => (
-                              <HomeSessionRow
-                                record={record}
-                                showProjectName={!selectedProject()}
-                                server={state.selection.server}
-                                activeServer={state.selection.server === server.key}
-                                openSession={openSession}
-                                archiveSession={archiveSession}
-                              />
-                            )}
-                          </For>
+                <Show
+                  when={groups().length > 0}
+                  fallback={<HomeSessionsEmpty onNewSession={newSessionProject() ? openNewSession : undefined} />}
+                >
+                  <div class="pt-3 flex flex-col gap-6">
+                    <For each={groups()}>
+                      {(group, index) => (
+                        <div class="flex min-w-0 flex-col gap-4">
+                          <HomeSessionGroupHeader
+                            title={group.title}
+                            onNewSession={index() === 0 && newSessionProject() ? openNewSession : undefined}
+                          />
+                          <div class="flex min-w-0 flex-col gap-px">
+                            <For each={group.sessions}>
+                              {(record) => (
+                                <HomeSessionRow
+                                  record={record}
+                                  showProjectName={!selectedProject()}
+                                  server={state.selection.server}
+                                  activeServer={state.selection.server === server.key}
+                                  openSession={openSession}
+                                  archiveSession={archiveSession}
+                                />
+                              )}
+                            </For>
+                          </div>
                         </div>
-                      </div>
-                    )}
-                  </For>
-                </div>
+                      )}
+                    </For>
+                  </div>
+                </Show>
               </Show>
-            </Show>
-          </ScrollView>
-        </section>
-        <HomeUtilityNav
-          class="flex lg:hidden"
-          openSettings={openSettings}
-          openHelp={() => platform.openLink("https://opencode.ai/desktop-feedback")}
-          language={language}
-        />
+            </ScrollView>
+          </section>
+          <HomeUtilityNav
+            class="flex lg:hidden"
+            openSettings={openSettings}
+            openHelp={() => platform.openLink("https://opencode.ai/desktop-feedback")}
+            language={language}
+          />
+        </div>
       </div>
-    </div>
+    </Show>
   )
 }
 
@@ -1343,6 +1358,20 @@ export function LegacyHome() {
         {server.name}
       </Button>
       <Switch>
+        <Match when={!sync().ready && !!sync().error}>
+          <div class="flex flex-col items-center gap-3">
+            <HomeBootstrapError
+              error={formatServerError(sync().error, language.t, language.t("common.requestFailed"))}
+              retrying={sync().retrying}
+              retryLabel={language.t("home.bootstrap.retry")}
+              loadingLabel={language.t("common.loading")}
+              onRetry={() => void sync().retryBootstrap()}
+            />
+            <Button class="px-3" disabled={serverUnreachable()} onClick={chooseProject}>
+              {language.t("command.project.open")}
+            </Button>
+          </div>
+        </Match>
         <Match when={sync().data.project.length > 0}>
           <div class="mt-20 w-full flex flex-col gap-4">
             <div class="flex gap-2 items-center justify-between pl-3">

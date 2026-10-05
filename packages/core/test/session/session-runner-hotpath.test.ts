@@ -298,6 +298,7 @@ const foldingBuiltins = Layer.mergeAll(
   ),
   GrepTool.layer.pipe(
     Layer.provide(registry),
+    Layer.provide(mutation),
     Layer.provide(searchFileSystem),
     Layer.provide(ripgrep),
     Layer.provide(location),
@@ -305,6 +306,7 @@ const foldingBuiltins = Layer.mergeAll(
   ),
   GlobTool.layer.pipe(
     Layer.provide(registry),
+    Layer.provide(mutation),
     Layer.provide(ripgrep),
     Layer.provide(location),
     Layer.provide(permission),

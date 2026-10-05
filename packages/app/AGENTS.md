@@ -5,15 +5,15 @@
 
 ## Debugging
 
-- NEVER try to restart the app, or the server process, EVER.
+- Preserve the user's running app and server processes. Start separate task-owned processes for validation. Stop only the test processes you started, and clean them up when done.
 
 ## Local Dev
 
-- `opencode dev web` proxies `https://app.opencode.ai`, so local UI/CSS changes will not show there.
+- `bun dev web` from the repository root starts the backend and opens its web interface. Use the app dev server below to verify local UI/CSS changes.
 - For local UI changes, run the backend and app dev servers separately.
 - Backend (from `packages/opencode`): `bun run --conditions=browser ./src/index.ts serve --port 4096`
 - App (from `packages/app`): `bun dev -- --port 4444`
-- Open `http://localhost:4444` to verify UI changes (it targets the backend at `http://localhost:4096`).
+- Open `http://localhost:4444` to verify UI changes. A fresh browser profile defaults to `http://localhost:4096`; a saved default server takes precedence. Confirm the selected server before testing. Override the dev default with `VITE_OPENCODE_SERVER_HOST` / `VITE_OPENCODE_SERVER_PORT` when using another backend port.
 
 ## SolidJS
 

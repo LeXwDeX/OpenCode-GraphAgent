@@ -2024,6 +2024,10 @@ export type AttachmentConfig = {
 
 export type Config = {
   $schema?: string
+  /**
+   * Maximum tool execution attempts per input-driven model run; 0 means unlimited (default); each parallel tool call counts separately
+   */
+  maxToolCalls?: number
   shell?: string
   logLevel?: LogLevel
   server?: ServerConfig

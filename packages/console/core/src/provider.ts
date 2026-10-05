@@ -9,9 +9,19 @@ export namespace Provider {
   export const list = fn(z.void(), () =>
     Database.use((tx) =>
       tx
-        .select()
+        .select({
+          id: ProviderTable.id,
+          provider: ProviderTable.provider,
+          credentials: ProviderTable.credentials,
+        })
         .from(ProviderTable)
         .where(and(eq(ProviderTable.workspaceID, Actor.workspace()), isNull(ProviderTable.timeDeleted))),
+    ).then((providers) =>
+      providers.map(({ credentials, ...provider }) => ({
+        ...provider,
+        credentialsDisplay:
+          credentials.length > 24 ? `${credentials.slice(0, 4)}...${credentials.slice(-4)}` : "********",
+      })),
     ),
   )
 

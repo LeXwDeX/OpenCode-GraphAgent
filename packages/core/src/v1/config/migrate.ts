@@ -37,6 +37,7 @@ export function migrate(info: typeof ConfigV1.Info.Type) {
     shell: info.shell,
     model: info.model,
     small_model: info.small_model,
+    maxToolCalls: info.maxToolCalls,
     default_agent: info.default_agent,
     question_timeout: info.question_timeout,
     autoupdate: info.autoupdate,
