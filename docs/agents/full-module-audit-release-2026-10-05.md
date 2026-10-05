@@ -115,6 +115,10 @@ CI-002 的 Why 是 pathological regex 测试从子进程启动开始计时，把
 
 CI-003 的 Why 是生产启动测试可能复用通过共享 memoMap 构建的测试 InstanceStore，其中 bootstrap 是空实现。root 和 sol 各自保留真实 fixture scope，再运行原有 AppRuntime 启动路径。两次均确认 InstanceStore 为同一对象、Goal 初始化与订阅均为 0，原 8 秒断言失败。关闭 fixture scope 的对照在约 215 毫秒内通过。原生 CI 未记录具体缓存持有者，不能据此断言历史触发点。Scope 仅为生产启动测试和 fixture。Approach 为用相同 Bun 可执行文件在独立子进程执行原有两项测试。测试正文逐字保留，8 秒轮询和每项 20 秒限制不变；父进程持续读取输出，检查两项均通过，并回收子进程。Acceptance 为父进程仍持有同一空 bootstrap 服务时，独立子进程仍通过全部原有断言。root 独立复跑通过；Goal 组为 144 项父进程测试通过，原两项另在子进程通过，类型检查和窄 lint 通过。此项属于测试隔离修复，不重复计入初始功能问题。Astra 独立运行和最终复审通过，无阻断项。证据见 `goal-test-isolation.json` 和 `goal-test-isolation-astra.json`。
 
+CI-004 的 Why 是 App 提交测试的全局 SDK 模拟影响初始化测试。原生 CI 的两处错误发生在测试构造 SDK 时，尚未进入初始化断言。root 和 luna 各自固定提交测试先加载，均复现 6 项通过、2 项失败。Scope 仅为初始化测试。Approach 为用文件内局部 SDK fixture 替代不必要的工厂调用。fixture 仅包含被调用的四个方法，类型断言不证明这些方法签名经过静态验证。此修复，保留真实 bootstrapGlobal 调用、3 项测试和 14 个断言。Acceptance 为固定顺序的 8 项测试、26 个断言均通过；完整 App 单元 454 项、浏览器 17 项通过，类型检查和窄 lint 通过。Astra 最终复审通过，无阻断项。证据见 `app-test-sdk-fixture.json` 和 `app-test-astra.json`。
+
+CI-005 的 Why 是额外随机顺序验收发现 App 单元测试加载模拟 DOM，却默认读取 Solid 服务端入口。root 和 luna 分别复跑 seed 2，均为 422 项通过、4 项失败和 1 项未处理错误，错误是 client-only API 在服务端调用。两次改用浏览器条件后，454 项均通过。安装版 exports 和实际模块解析路径也分别确认。Scope 仅为 App 测试命令。Approach 为给单元测试和 watch 命令添加已有浏览器测试使用的 `--conditions=browser`，不修改依赖或生产代码。Acceptance 为完整 App 单元、浏览器和相同 seed 2 均通过。此项来自额外验收，不是已证明的历史原生 CI 故障。Astra 最终复审通过，无阻断项。证据见 `app-test-conditions.json` 和 `app-test-astra.json`。
+
 RT-005 按既有规则被否定。Desktop 选择附件的并发预算候选，未在当前串行 UI 调用入口确认。异常 watchdog 单次失败也未确认生产缺陷。未确认候选不会写成已修复漏洞。
 
 ## 发布与部署边界

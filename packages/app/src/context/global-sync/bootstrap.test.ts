@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import { createStore } from "solid-js/store"
 import { QueryClient } from "@tanstack/solid-query"
-import { createOpencodeClient, type Config, type OpencodeClient, type Project } from "@opencode-ai/sdk/v2/client"
+import { type Config, type OpencodeClient, type Project } from "@opencode-ai/sdk/v2/client"
 import type { NormalizedProviderListResponse } from "@opencode-ai/session-ui/context"
 import { bootstrapDirectory, bootstrapGlobal, loadPathQuery, loadProvidersQuery } from "./bootstrap"
 import type { GlobalStore } from "./bootstrap"
@@ -10,6 +10,17 @@ import { ServerScope } from "@/utils/server-scope"
 import { ServerConnection } from "@/context/server"
 
 const provider = { all: new Map(), connected: [], default: {} } satisfies NormalizedProviderListResponse
+
+function clientFixture(): OpencodeClient {
+  // The bootstrap tests exercise only these SDK methods and never invoke unrelated client operations.
+  // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion -- keep the fixture small and local.
+  return {
+    global: { config: { get: async () => ({ data: {} }) } },
+    provider: { list: async () => ({ data: { all: [], connected: [], default: {} } }) },
+    path: { get: async () => ({ data: { state: "", config: "", worktree: "", directory: "", home: "" } }) },
+    project: { list: async () => ({ data: [] }) },
+  } as unknown as OpencodeClient
+}
 
 describe("bootstrapDirectory", () => {
   test("marks a loading directory partial during bootstrap and complete after success", async () => {
@@ -112,7 +123,7 @@ describe("bootstrapGlobal", () => {
       config: {} satisfies Config,
       reload: undefined as undefined | "pending" | "complete",
     })
-    const sdk = createOpencodeClient()
+    const sdk = clientFixture()
     Object.defineProperty(sdk.global.config, "get", {
       value: async () => {
         if (failConfig) throw new Error("invalid config response")
@@ -160,7 +171,7 @@ describe("bootstrapGlobal", () => {
 
 describe("query keys", () => {
   test("partitions identical directories by server scope", () => {
-    const client = createOpencodeClient()
+    const client = clientFixture()
     const remote = ServerScope.fromServerKey(ServerConnection.Key.make("https://debian.example"))
 
     expect([...loadPathQuery(ServerScope.local, "/repo", client).queryKey]).toEqual(["local", "/repo", "path"])
