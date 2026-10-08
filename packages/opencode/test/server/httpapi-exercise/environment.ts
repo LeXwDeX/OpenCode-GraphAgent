@@ -1,5 +1,6 @@
 import { Flag } from "@opencode-ai/core/flag/flag"
 import { Effect } from "effect"
+import { mkdirSync } from "fs"
 import path from "path"
 
 const preserveExerciseGlobalRoot = !!process.env.OPENCODE_HTTPAPI_EXERCISE_GLOBAL
@@ -13,6 +14,30 @@ process.env.XDG_CACHE_HOME = path.join(exerciseGlobalRoot, "cache")
 process.env.OPENCODE_DISABLE_SHARE = "true"
 export const exerciseConfigDirectory = path.join(exerciseGlobalRoot, "config", "opencode")
 export const exerciseDataDirectory = path.join(exerciseGlobalRoot, "data", "opencode")
+// Requests without a directory resolve to process.cwd(). Auth probes and global
+// scenarios execute real handlers, so they must never resolve to the invoking
+// checkout (POST /experimental/worktree would create a worktree and branch there).
+export const exerciseWorkingDirectory = path.join(exerciseGlobalRoot, "cwd")
+export const invokingDirectory = process.cwd()
+mkdirSync(exerciseWorkingDirectory, { recursive: true })
+
+// Called by the exercise entry point only: unit tests import this module too and
+// must keep their own working directory.
+export const enterExerciseWorkingDirectory = () => process.chdir(exerciseWorkingDirectory)
+
+// Worktrees registered on the invoking checkout; the exercise must leave this set unchanged.
+export const invokingWorktrees = () => {
+  const result = Bun.spawnSync(["git", "-C", invokingDirectory, "worktree", "list", "--porcelain"], {
+    stdout: "pipe",
+    stderr: "ignore",
+  })
+  if (result.exitCode !== 0) return []
+  return result.stdout
+    .toString()
+    .split("\n")
+    .filter((line) => line.startsWith("worktree "))
+    .map((line) => line.slice("worktree ".length))
+}
 
 const preserveExerciseDatabase = !!process.env.OPENCODE_HTTPAPI_EXERCISE_DB
 export const exerciseDatabasePath =
@@ -35,6 +60,9 @@ export const cleanupExercisePaths = Effect.promise(async () => {
       ),
     )
   }
-  if (!preserveExerciseGlobalRoot)
+  if (!preserveExerciseGlobalRoot) {
+    // Never remove the directory the process is running in.
+    if (process.cwd() === exerciseWorkingDirectory) process.chdir(invokingDirectory)
     await fs.rm(exerciseGlobalRoot, { recursive: true, force: true }).catch(() => undefined)
+  }
 })

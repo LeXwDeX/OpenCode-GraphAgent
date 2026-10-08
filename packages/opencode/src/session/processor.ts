@@ -647,6 +647,8 @@ export const layer = Layer.effect(
                 })
             }
             yield* completeToolCall(value.id, output)
+            // A hook `continue:false` (PreToolUse/PostToolUse) ends the agent turn after this result.
+            if (output.metadata.hookStopped === true) ctx.blocked = true
             return
           }
 

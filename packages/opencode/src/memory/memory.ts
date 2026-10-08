@@ -3,6 +3,7 @@ export * as Memory from "./memory"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { ProjectV2 } from "@opencode-ai/core/project"
+import { AbsolutePath } from "@opencode-ai/core/schema"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Cause, Context, Deferred, Effect, Exit, Layer, Option, Ref, Schema, Scope, Semaphore } from "effect"
 import path from "node:path"
@@ -98,6 +99,10 @@ export const layer: Layer.Layer<
     const lock = yield* MemoryLock.Service
     const modelCalls = yield* MemoryModel.Service
     const store = yield* MemoryStore.Service
+    // Optional so narrow test layers keep the unchecked primary directory.
+    const filesystem = yield* Effect.serviceOption(FSUtil.Service)
+    const projectIdentity = yield* Effect.serviceOption(ProjectV2.Service)
+    const verifiedDirectories = new Set<string>()
     const globalStarted = yield* Ref.make(false)
     const initializationLock = Semaphore.makeUnsafe(1)
     const state = yield* InstanceState.make(() => Effect.succeed({ sessions: new Map<SessionID, SessionCache>() }))
@@ -213,6 +218,39 @@ export const layer: Layer.Layer<
       initUnsafe().pipe(Effect.catchCause((cause) => Effect.logWarning("global MEMORY init failed", { cause }))),
     )
 
+    // A live checkout of this Project: it exists and, when identity resolution
+    // is wired, still resolves to this Project (a deleted path may be reused by
+    // an unrelated repository).
+    const ownsDirectory = Effect.fnUntraced(function* (projectID: ProjectV2.ID, directory: string) {
+      if (Option.isNone(filesystem)) return true
+      if (!(yield* filesystem.value.existsSafe(directory))) return false
+      if (Option.isNone(projectIdentity)) return true
+      const key = `${projectID}\0${directory}`
+      if (verifiedDirectories.has(key)) return true
+      const owned = yield* projectIdentity.value.resolve(AbsolutePath.make(directory)).pipe(
+        Effect.map((resolved) => resolved.id === projectID),
+        Effect.catchCause(() => Effect.succeed(false)),
+      )
+      if (owned) verifiedDirectories.add(key)
+      return owned
+    })
+
+    // Project Configuration lives in the Project's primary directory
+    // (ADR-0001), but the row's `worktree` is the first-seen checkout and is
+    // never repointed. When it is gone or now belongs to another repository,
+    // writing there would recreate `.opencode/memory.jsonc` in a dead path or
+    // plant this Project's policy in a foreign repo. Fall back to the first
+    // live checkout of this Project in sorted order (deterministic across
+    // worktrees, so they agree on one policy file); the current checkout
+    // resolved to this Project and always qualifies.
+    const primaryDirectory = Effect.fnUntraced(function* (current: Project.Info, worktree: string) {
+      if (current.worktree === worktree || (yield* ownsDirectory(current.id, current.worktree))) return current.worktree
+      for (const directory of Array.from(new Set([worktree, ...current.sandboxes])).sort()) {
+        if (directory === worktree || (yield* ownsDirectory(current.id, directory))) return directory
+      }
+      return worktree
+    })
+
     const configuration = Effect.fn("Memory.configuration")(function* () {
       const ctx = yield* InstanceState.context
       // No fallback to the instance context: a missing row means the identity
@@ -228,11 +266,14 @@ export const layer: Layer.Layer<
       // activates once the repository gains a real identity.
       if (current.id === ProjectV2.ID.global) return undefined
       if (current.vcs !== "git" || !current.time.initialized) return undefined
+      const primary = yield* primaryDirectory(current, ctx.worktree)
       const migration = yield* admission
         .ensure({
           projectID: current.id,
-          projectDirectory: current.worktree,
-          directories: Array.from(new Set([current.worktree, ...current.sandboxes, ctx.worktree])),
+          projectDirectory: primary,
+          // A stale primary is left out entirely: admission writes and removes
+          // files in the directories it scans.
+          directories: Array.from(new Set([primary, ...current.sandboxes, ctx.worktree])),
           updated: current.time.updated,
         })
         .pipe(Effect.catchTag("MemoryAdmission.IdentityRetired", () => Effect.succeed(undefined)))
@@ -248,7 +289,7 @@ export const layer: Layer.Layer<
         })
         return undefined
       }
-      return { ctx, project: current, loaded: yield* configStore.load(current.worktree) }
+      return { ctx, project: current, primary, loaded: yield* configStore.load(primary) }
     })
 
     const resolveModel = Effect.fn("Memory.resolveModel")(function* (config: MemorySchema.Config) {
@@ -867,7 +908,7 @@ export const layer: Layer.Layer<
       return yield* lock.withProject(value.project.id)(
         Effect.gen(function* () {
           yield* configStore.writeProject(
-            value.project.worktree,
+            value.primary,
             MemorySchema.updateConfig(config, { enabled }),
             loaded.level === "project" ? loaded.path : undefined,
           )
@@ -906,10 +947,14 @@ export const defaultLayer: Layer.Layer<Service> = Layer.suspend(() =>
     Layer.provide(MemoryLock.defaultLayer),
     Layer.provide(MemoryModel.defaultLayer),
     Layer.provide(MemoryStore.defaultLayer),
+    Layer.provide(FSUtil.defaultLayer),
+    Layer.provide(ProjectV2.defaultLayer),
   ),
 )
 
 export const node = LayerNode.make(layer, [
+  FSUtil.node,
+  ProjectV2.node,
   Config.node,
   Provider.node,
   Project.node,
@@ -1043,8 +1088,54 @@ function isRealUser(message: SessionV1.WithParts): message is SessionV1.WithPart
   if (message.info.role !== "user") return false
   if (message.parts.some((part) => part.type === "compaction")) return false
   const text = message.parts.filter((part): part is SessionV1.TextPart => part.type === "text" && !part.synthetic)
-  if (text.some((part) => part.text.trim().startsWith("/"))) return false
+  if (text.some((part) => isCommandLine(part.text))) return false
   return text.some((part) => part.text.trim())
+}
+
+// Command turns persist their invocation as `/${name}` or `/${name} ${args}`
+// (SessionPrompt.command), where `name` is a registered command name: a config
+// key, a command file path without its extension (nested names like `git/commit`
+// are allowed), an MCP `server:prompt`, or a skill. Such names never begin with a
+// filesystem root and never end in a file extension or a `:line` suffix, so a
+// pasted absolute path (`/Users/me/app/x.ts:12 throws`) is real user input.
+const FILESYSTEM_ROOTS = new Set([
+  "Applications",
+  "Library",
+  "System",
+  "Users",
+  "Volumes",
+  "bin",
+  "dev",
+  "etc",
+  "home",
+  "media",
+  "mnt",
+  "nix",
+  "opt",
+  "private",
+  "proc",
+  "root",
+  "run",
+  "sbin",
+  "srv",
+  "tmp",
+  "usr",
+  "var",
+  "workspace",
+  "workspaces",
+])
+
+function isCommandLine(value: string) {
+  const text = value.trim()
+  if (!text.startsWith("/")) return false
+  const name = text.slice(1).split(/\s/, 1)[0] ?? ""
+  if (!name) return false
+  const segments = name.split("/")
+  if (segments.some((segment) => segment.length === 0)) return false
+  if (segments.length > 1 && FILESYSTEM_ROOTS.has(segments[0])) return false
+  if (/:\d+(?::\d+)?$/.test(name)) return false
+  if (segments.length > 1 && /\.[A-Za-z0-9]+$/.test(segments.at(-1)!)) return false
+  return true
 }
 
 function isFinalAssistant(
@@ -1100,8 +1191,10 @@ function renderSelection(topics: MemorySchema.Topic[], config: MemorySchema.Conf
             content: item.content,
             rationale: item.rationale,
           }
+          // max_tokens is a cap that must hold: estimateReserve counts CJK
+          // near one token per character, where length/4 undercounts 2-4x.
           if (
-            Token.estimate(render([...result.rows, { ...row, items: [...items.values, next] }])) >
+            Token.estimateReserve(render([...result.rows, { ...row, items: [...items.values, next] }])) >
             config.injection.max_tokens
           )
             return { ...items, overflow: true }

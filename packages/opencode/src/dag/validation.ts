@@ -29,7 +29,7 @@ import { DEFAULT_WORKFLOW_CONFIG } from "./dag"
 import { DagBlocks } from "./blocks"
 import { AdmissionInput, ExecutionMode } from "./admission"
 import { validateReviewLifecycle } from "./review-lifecycle"
-import { conditionReference, parseInputMappingReference } from "./runtime/eval"
+import { conditionReference, conditionSyntaxError, parseInputMappingReference } from "./runtime/eval"
 import { unsupportedSchemaKeywords } from "./runtime/capture"
 import { placeholderKeys, templateSourceById } from "./templates/resolve"
 
@@ -538,6 +538,9 @@ export interface StructuralInput {
   /** Node ids already present in a live workflow; valid dependency targets for
    * replan/extend fragments whose depends_on may reference them. */
   known_node_ids?: ReadonlySet<string>
+  /** Graph node_defaults for nodes that omit a field (authoring graphs are not
+   * default-normalized). */
+  node_defaults?: { readonly required?: boolean }
 }
 
 // Legacy byte-compat: Dag.create has always reported one structural class at
@@ -604,10 +607,29 @@ function danglingDependencyDiagnostics(nodes: readonly NodeConfig[], knownNodeId
   ]
 }
 
-function conditionDiagnostics(nodes: readonly NodeConfig[]): Diagnostic[] {
+function conditionDiagnostics(nodes: readonly NodeConfig[], grandfathered?: ReadonlySet<string>): Diagnostic[] {
+  // The evaluator supports one comparison; anything else (===, !==, &&, ||)
+  // would otherwise be accepted here and mis-route silently at spawn time.
+  // Grandfathered nodes carry a condition persisted before this check existed:
+  // re-rejecting it would block every later mutation of the workflow, and the
+  // runtime already fails such a node loudly (evaluateCondition ok:false).
+  const syntax = nodes.flatMap((node) => {
+    if (grandfathered?.has(node.id)) return []
+    const error = conditionSyntaxError(node.condition)
+    if (!error) return []
+    return [
+      diagnostic({
+        code: DIAGNOSTIC_CODES.dagInvalid,
+        path: `nodes[${node.id}].condition`,
+        message: `node "${node.id}" ${error}`,
+        hint: 'Use a single comparison such as gate.output.verdict == "ACCEPT"; express "not equal" with !=',
+      }),
+    ]
+  })
   const errors = conditionReferenceErrors(nodes)
-  if (errors.length === 0) return []
+  if (errors.length === 0) return syntax
   return [
+    ...syntax,
     diagnostic({
       code: DIAGNOSTIC_CODES.dagInvalid,
       path: "nodes",
@@ -804,12 +826,24 @@ export function reviewLifecycleDiagnostics(input: {
   name?: string
   mode?: ExecutionMode
   nodes: readonly NodeConfig[]
+  /** Authoring graphs are not default-normalized; the final-gate check
+   * resolves `required` through these defaults like Dag.create would. */
+  node_defaults?: { readonly required?: boolean }
+  /** Review nodes whose persisted PASS gate predates the evaluated check;
+   * they keep the legacy textual check (see validateReviewLifecycle). */
+  grandfathered?: ReadonlySet<string>
 }) {
-  const reviewLifecycle = validateReviewLifecycle({
-    name: input.name ?? "validation",
-    mode: input.mode,
-    nodes: [...input.nodes],
-  })
+  const reviewLifecycle = validateReviewLifecycle(
+    {
+      name: input.name ?? "validation",
+      mode: input.mode,
+      nodes: [...input.nodes],
+      ...(input.node_defaults?.required !== undefined
+        ? { node_defaults: { required: input.node_defaults.required } }
+        : {}),
+    },
+    { grandfathered: input.grandfathered },
+  )
   return {
     errors: reviewLifecycle.errors.map((error) =>
       diagnostic({
@@ -835,17 +869,30 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value)
 }
 
+// validateRequiredNodes builds its required-only graph with addEdge, which
+// throws CycleError as soon as an edge closes a required cycle — before its
+// own hasCycle() check can report it. Map that throw to the same result so a
+// required cycle is a diagnostic, never a defect.
+function requiredNodeValidation(nodes: readonly NodeConfig[]): { valid: boolean; errors: string[] } {
+  try {
+    return validateRequiredNodes({
+      nodes: nodes.map((node) => ({
+        id: node.id,
+        depends_on: node.depends_on,
+        required: node.required ?? false,
+      })),
+    })
+  } catch (error) {
+    if (error instanceof CycleError) return { valid: false, errors: ["Required nodes form a cycle"] }
+    throw error
+  }
+}
+
 // Duplicate ids make topology checks ambiguous (projector would silently
 // merge the rows), so callers run these only on id-unique graphs.
 function topologyDiagnostics(nodes: readonly NodeConfig[]): Diagnostic[] {
   const diagnostics: Diagnostic[] = []
-  const required = validateRequiredNodes({
-    nodes: nodes.map((node) => ({
-      id: node.id,
-      depends_on: node.depends_on,
-      required: node.required ?? false,
-    })),
-  })
+  const required = requiredNodeValidation(nodes)
   if (!required.valid) {
     diagnostics.push(
       ...tagLegacyClass(
@@ -901,7 +948,7 @@ function outputSchemaKeywordDiagnostics(nodes: readonly NodeConfig[]): Diagnosti
  * decide how to surface the diagnostics (tool output vs. create rejection). */
 export function structuralDiagnostics(input: StructuralInput): Diagnostic[] {
   const duplicates = duplicateNodeIds(input.nodes)
-  const review = reviewLifecycleDiagnostics({ mode: input.mode, nodes: input.nodes })
+  const review = reviewLifecycleDiagnostics({ mode: input.mode, nodes: input.nodes, node_defaults: input.node_defaults })
   return sortDiagnostics([
     ...tagLegacyClass(duplicateIdDiagnostics(duplicates), 0),
     ...tagLegacyClass(danglingDependencyDiagnostics(input.nodes, input.known_node_ids), 1),
@@ -940,6 +987,12 @@ export interface ReplanStructuralInput {
    * verdicts are delivered — the checkpoint gate exempts them so additive
    * waves/reopens can attach dependents without a condition (DAG-02). */
   terminalNodeIds?: ReadonlySet<string>
+  /** Merged-graph nodes carried with their persisted condition (not authored
+   * or changed by this mutation). The condition-syntax and evaluated PASS-gate
+   * checks added after those definitions were accepted are not re-applied to
+   * them, so a legacy workflow stays mutable; new fragment conditions are
+   * still held to the full grammar. */
+  grandfatheredNodeIds?: ReadonlySet<string>
   config: { mode?: ExecutionMode; max_total_nodes?: number }
 }
 
@@ -954,12 +1007,13 @@ export function replanStructuralDiagnostics(input: ReplanStructuralInput): Diagn
     name: input.merged.name,
     mode: input.merged.mode,
     nodes: input.merged.nodes,
+    grandfathered: input.grandfatheredNodeIds,
   })
   return sortDiagnostics([
     ...tagLegacyClass(duplicateIdDiagnostics(duplicates), 0),
     ...tagLegacyClass(danglingDependencyDiagnostics(input.rerunNodes, knownIds), 1),
     ...tagLegacyClass(inputMappingDiagnostics(input.rerunNodes, input.merged.nodes), 1),
-    ...tagLegacyClass(conditionDiagnostics(input.rerunNodes), 2),
+    ...tagLegacyClass(conditionDiagnostics(input.rerunNodes, input.grandfatheredNodeIds), 2),
     ...tagLegacyClass(bindingDiagnostics(input.rerunNodes), 3),
     ...tagLegacyClass(ceilingExceeded(input.existingNodeCount + input.addCount, input.config.max_total_nodes), 4),
     ...tagLegacyClass(review.errors, 5),
@@ -1104,9 +1158,8 @@ function promptIdDiagnostics(node: NodeConfig, directory: string | undefined): E
         }),
       ]
     }
-    // readById rejects via a thrown error (defect channel) — sandbox it into
-    // a failure so a missing asset becomes a diagnostic, not a die.
-    const source = yield* templateSourceById(prompt.id, directory).pipe(Effect.sandbox, Effect.option)
+    // A missing or unsafe asset id is a typed failure; it becomes a diagnostic.
+    const source = yield* templateSourceById(prompt.id, directory).pipe(Effect.option)
     if (Option.isNone(source)) {
       return [
         diagnostic({
@@ -1159,6 +1212,7 @@ export function validatePostCompile(input: {
             nodes: input.nodes,
             mode: input.config.mode,
             max_total_nodes: input.config.max_total_nodes,
+            node_defaults: input.config.node_defaults,
           })),
       // DAG-02: the checkpoint gate is NOT a whole-graph structural check —
       // fragment actions (replan/extend) must satisfy it exactly like start.

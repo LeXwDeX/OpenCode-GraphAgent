@@ -13,6 +13,13 @@ export interface RecoveryPlan {
   preserved: string[]
 }
 
+const TERMINATION_REASONS = new Set(["workflow_failed", "workflow_cancelled"])
+
+/** Rows that workflow termination interrupted (never a node's own verdict). */
+function isTerminationCollateral(node: DagStore.NodeRow) {
+  return (node.status === "skipped" || node.status === "aborted") && TERMINATION_REASONS.has(node.errorReason ?? "")
+}
+
 /** A new graph revision replaces affected attempts; durable old rows stay intact. */
 export function planRecovery(
   config: WorkflowConfig,
@@ -32,7 +39,11 @@ export function planRecovery(
   for (const node of current) {
     if (!definitions.has(node.id)) throw new Error(`Recovery cannot read the execution definition for node: ${node.id}`)
   }
-  const affected = new Set(selected)
+  // Workflow termination (Dag.fail / Dag.cancel) skipped pending work and
+  // aborted in-flight work without a node-level verdict. Recovery resumes that
+  // interrupted work: left in place, scheduling would read these rows as
+  // legitimately skipped and complete the workflow without running them.
+  const affected = new Set([...selected, ...current.filter(isTerminationCollateral).map((node) => node.id)])
   for (let changed = true; changed; ) {
     changed = false
     for (const node of current) {

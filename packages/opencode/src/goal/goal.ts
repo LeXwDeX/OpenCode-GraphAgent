@@ -154,8 +154,15 @@ export interface Interface {
      * Callers that need to stop a running loop from outside (user slash
      * commands) should call `pause()` instead — it interrupts the loop
      * fiber AND publishes the paused event.
+     *
+     * `expected` binds a delayed loop decision to the Goal instance and
+     * revision it observed; a mismatch is a no-op.
      */
-    readonly pauseAndPublish: (sessionID: SessionID, reason: string) => Effect.Effect<GoalState.Info | undefined>
+    readonly pauseAndPublish: (
+      sessionID: SessionID,
+      reason: string,
+      expected?: { readonly goalID: string; readonly revision: number },
+    ) => Effect.Effect<GoalState.Info | undefined>
     /**
      * Goal-turn provenance (GOAL-TURN-SCOPE). Marks the session's CURRENT
      * turn as goal-driven (kick / judge continuation / resume-kick) so
@@ -343,6 +350,18 @@ const serviceLayer = Layer.effect(
       }
     })
 
+    // D-3 discipline outside the startup scan: an undecodable goal_state row
+    // (corruption, or a payload from a newer schema) must not make every
+    // reader die. Callers that can treat it as "no goal" use this lenient
+    // decode and LOG the skip; loadState stays strict for user-facing reads.
+    const decodePayload = (payload: string) => {
+      try {
+        return { ok: true as const, state: Schema.decodeUnknownSync(GoalState.Info)(JSON.parse(payload)) }
+      } catch (error) {
+        return { ok: false as const, error }
+      }
+    }
+
     function loadState(sessionID: SessionID) {
       return db
         .select()
@@ -390,10 +409,17 @@ const serviceLayer = Layer.effect(
                     .from(GoalStateTable)
                     .where(eq(GoalStateTable.session_id, sessionID))
                     .get()
-                  const current = row
-                    ? Schema.decodeUnknownSync(GoalState.Info)(JSON.parse(row.payload))
-                    : undefined
-                  const next = decide(current)
+                  const decoded = row ? decodePayload(row.payload) : undefined
+                  // An undecodable row reads as "no goal" so clear/purge can
+                  // still remove it; any other mutation of it fails as before
+                  // rather than overwriting data this build cannot read.
+                  const next = decide(decoded?.ok ? decoded.state : undefined)
+                  if (decoded && !decoded.ok) {
+                    if (next.tag !== "delete") throw decoded.error
+                    yield* Effect.logWarning(`goal transition deleting undecodable goal_state row for ${sessionID}`, {
+                      error: String(decoded.error),
+                    })
+                  }
                   if (next.tag === "save") {
                     const payload = JSON.stringify(Schema.encodeSync(GoalState.Info)(next.state))
                     if (row) {
@@ -593,9 +619,14 @@ const serviceLayer = Layer.effect(
     // is atomic, so an interrupt landing between persisting the paused row
     // and publishing goal.updated(paused) can never leave a paused DB row
     // with no corresponding event on the bus.
-    const pauseAndPublish = Effect.fnUntraced(function* (sessionID: SessionID, reason: string) {
+    const pauseAndPublish = Effect.fnUntraced(function* (
+      sessionID: SessionID,
+      reason: string,
+      expected?: { readonly goalID: string; readonly revision: number },
+    ) {
       return yield* transition(sessionID, (state) => {
-        if (!state || state.status !== "active") return { tag: "noop", value: undefined }
+        if (!state || state.status !== "active" || (expected && !matchesExpected(state, expected)))
+          return { tag: "noop", value: undefined }
         const updated = GoalState.advance(state, {
           status: "paused",
           paused_reason: reason,
@@ -1096,10 +1127,27 @@ const serviceLayer = Layer.effect(
     // registrations if the lease's DAG consumers outlive the Goal service.
     // The resolver only reads DB state, never takes another lease lock, so
     // updateAfterJudge remains safe inside automation.use's existing lock.
+    // An undecodable row is not an active goal: the lease runs this on every
+    // claim/use/register, so a decode throw would kill DAG automation for the
+    // session too. Database read failures still die (fail closed).
     yield* automation.installGoalAuthority((sessionID) =>
-      loadState(sessionID).pipe(
-        Effect.map((state) => state?.status === "active" ? state.goal_id ?? "legacy" : undefined),
-      ),
+      db
+        .select({ payload: GoalStateTable.payload })
+        .from(GoalStateTable)
+        .where(eq(GoalStateTable.session_id, sessionID))
+        .get()
+        .pipe(
+          Effect.orDie,
+          Effect.flatMap((row) => {
+            if (!row) return Effect.succeed(undefined)
+            const decoded = decodePayload(row.payload)
+            if (decoded.ok)
+              return Effect.succeed(decoded.state.status === "active" ? (decoded.state.goal_id ?? "legacy") : undefined)
+            return Effect.logWarning(`goal authority treats undecodable goal_state row for ${sessionID} as inactive`, {
+              error: String(decoded.error),
+            }).pipe(Effect.as(undefined))
+          }),
+        ),
     )
 
     return Service.of({

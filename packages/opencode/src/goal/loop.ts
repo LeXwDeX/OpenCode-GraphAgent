@@ -106,6 +106,8 @@ export function isStaleZombie(
 // bounded end instead of a silent drop.
 const SCAN_BUSY_RETRY_DELAY = "2 seconds"
 
+const PREEMPT_PAUSE_REASON = "最新的用户消息尚未得到回复，目标已暂停。使用 /goal resume 继续。"
+
 const serviceLayer = Layer.effect(
   Service,
   Effect.gen(function* () {
@@ -341,6 +343,12 @@ const serviceLayer = Layer.effect(
       // skipped wholesale (see suppressJudge above) — execution falls through
       // to the shared continuation dispatch below.
       if (!suppressJudge) {
+        // A user message newer than the judged reply (noReply prompt, a
+        // command turn, ESC before any reply, a blocked submit) means the
+        // reply is no longer the work boundary: skip the judge and let the
+        // idle-fenced commit below pause the goal visibly instead of
+        // discarding a verdict and leaving the goal active with no driver.
+        const preempted = shouldPreempt(msgs)
         const responseText = lastAssistant.parts
           .filter((p): p is Extract<(typeof lastAssistant.parts)[number], { type: "text" }> => p.type === "text")
           .map((p) => p.text)
@@ -355,10 +363,11 @@ const serviceLayer = Layer.effect(
         // permanently "active" with no continuation — the agent appeared to
         // stop working on its own.
         const callLLM = Option.getOrUndefined(yield* Effect.serviceOption(GoalLoopJudgeLLM))
-        const verdict = responseText
+        const judgeText = preempted ? "" : responseText
+        const verdict = judgeText
           ? yield* GoalJudge.run(
               goalState.goal,
-              responseText,
+              judgeText,
               goalState.subgoals ?? [],
               // Judge LLM call: prefer the test-injected callable so e2e tests
               // can script verdicts without Provider/network; otherwise build the
@@ -402,13 +411,16 @@ const serviceLayer = Layer.effect(
                     }
                   })),
             )
-          : {
-              verdict: "continue" as const,
-              reason: "上一轮无文本输出（纯工具调用），跳过判定直接继续",
-              parseFailed: false,
-            }
+          : preempted
+            ? undefined
+            : {
+                verdict: "continue" as const,
+                reason: "上一轮无文本输出（纯工具调用），跳过判定直接继续",
+                parseFailed: false,
+              }
 
-        const updateResult = Option.getOrUndefined(
+        const expected = { goalID: goalState.goal_id ?? "legacy", revision: goalState.revision ?? 0 }
+        const committed = Option.getOrUndefined(
           yield* automation
             .use(
               observedLease,
@@ -417,16 +429,25 @@ const serviceLayer = Layer.effect(
                   sessionID,
                   Effect.gen(function* () {
                     const current = yield* workMessages(sessionID)
+                    // Under the idle admission fence a newer user message is
+                    // not a running turn: it is waiting for a reply that will
+                    // not come (a real prompt admitted before this fence has
+                    // made the Session busy). Pause, bound to the observed
+                    // Goal instance and revision.
+                    if (shouldPreempt(current))
+                      return { preempted: yield* goal.pauseAndPublish(sessionID, PREEMPT_PAUSE_REASON, expected) }
                     const latest = [...current].reverse().find((m) => m.info.role === "assistant")
-                    if (latest?.info.id !== lastAssistant.info.id || shouldPreempt(current)) return undefined
-                    return yield* goal.updateAfterJudge(
-                      sessionID,
-                      verdict.verdict,
-                      verdict.reason,
-                      verdict.parseFailed,
-                      { goalID: goalState.goal_id ?? "legacy", revision: goalState.revision ?? 0 },
-                      lastAssistant.info.id,
-                    )
+                    if (!verdict || latest?.info.id !== lastAssistant.info.id) return undefined
+                    return {
+                      update: yield* goal.updateAfterJudge(
+                        sessionID,
+                        verdict.verdict,
+                        verdict.reason,
+                        verdict.parseFailed,
+                        expected,
+                        lastAssistant.info.id,
+                      ),
+                    }
                   }),
                 )
                 .pipe(Effect.map(Option.getOrUndefined)),
@@ -438,7 +459,25 @@ const serviceLayer = Layer.effect(
               ),
             ),
         )
-        if (!updateResult) return
+        if (committed && "preempted" in committed) {
+          if (!committed.preempted) return
+          yield* automation.unregister(sessionID, goalOwner)
+          evaluatedRevisions.delete(sessionID)
+          yield* promptSvc
+            .prompt({
+              sessionID,
+              noReply: true,
+              parts: [{ type: "text", text: `⏸ 目标已暂停 — ${PREEMPT_PAUSE_REASON}` }],
+            })
+            .pipe(
+              Effect.catchCause((cause) =>
+                Effect.logWarning("goal pause message delivery failed", { sessionID, cause: Cause.pretty(cause) }),
+              ),
+            )
+          return
+        }
+        const updateResult = committed?.update
+        if (!updateResult || !verdict) return
 
         // D-4: record the committed revision as evaluated-by-this-process
         // (every verdict — continue, done, blocked — is a completed

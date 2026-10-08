@@ -124,13 +124,14 @@ export function renderGoalSystemBlock(state: GoalState.Info): string {
 }
 
 export function renderJudgeUserPrompt(goal: string, response: string, subgoals: ReadonlyArray<string>): string {
-  const snippet = response.slice(-JUDGE_RESPONSE_SNIPPET_CHARS)
-  if (subgoals.length === 0)
-    return JUDGE_USER_PROMPT_TEMPLATE.replace("{goal}", goal)
-      .replace("{snippetChars}", String(JUDGE_RESPONSE_SNIPPET_CHARS))
-      .replace("{response}", snippet)
-  return JUDGE_USER_PROMPT_WITH_SUBGOALS_TEMPLATE.replace("{goal}", goal)
-    .replace("{subgoals}", subgoals.map((s, i) => `${i + 1}. ${s}`).join("\n"))
-    .replace("{snippetChars}", String(JUDGE_RESPONSE_SNIPPET_CHARS))
-    .replace("{response}", snippet)
+  const values: Record<string, string> = {
+    goal,
+    subgoals: subgoals.map((s, i) => `${i + 1}. ${s}`).join("\n"),
+    snippetChars: String(JUDGE_RESPONSE_SNIPPET_CHARS),
+    response: response.slice(-JUDGE_RESPONSE_SNIPPET_CHARS),
+  }
+  const template = subgoals.length === 0 ? JUDGE_USER_PROMPT_TEMPLATE : JUDGE_USER_PROMPT_WITH_SUBGOALS_TEMPLATE
+  // Single pass with a function replacer: inserted text is never re-scanned
+  // for placeholders, and `$&`, `$'`, `` $` `` in it are never expanded.
+  return template.replace(/\{(goal|subgoals|snippetChars|response)\}/g, (_, key: string) => values[key])
 }

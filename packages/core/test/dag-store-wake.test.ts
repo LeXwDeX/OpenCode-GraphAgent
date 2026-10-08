@@ -1,12 +1,16 @@
+// oxlint-disable typescript-eslint/no-unsafe-type-assertion -- mocked service slices and seeded rows use `as never` shims.
 import { describe, expect, test } from "bun:test"
 import path from "path"
 import { sql } from "drizzle-orm"
-import { Effect, Exit, Layer } from "effect"
+import { DateTime, Effect, Exit, Layer } from "effect"
 import { Database } from "@opencode-ai/core/database/database"
+import { EventV2 } from "@opencode-ai/core/event"
+import { DagProjector } from "@opencode-ai/core/dag/projector"
 import { WorkflowNodeTable, WorkflowTable } from "@opencode-ai/core/dag/sql"
 import { DagStore } from "@opencode-ai/core/dag/store"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
 import { SessionTable } from "@opencode-ai/core/session/sql"
+import { DagEvent } from "@opencode-ai/schema/dag-event"
 import { tmpdir } from "./fixture/tmpdir"
 
 function storeLayer(filename: string) {
@@ -173,6 +177,125 @@ describe("DagStore wake batch", () => {
         Effect.provide(storeLayer(filename)),
         Effect.scoped,
       ),
+    )
+  })
+})
+
+function projectedStoreLayer() {
+  const database = Database.layerFromPath(":memory:")
+  const eventLayer = EventV2.layer.pipe(Layer.provide(database))
+  const projector = DagProjector.layer.pipe(Layer.provide(Layer.merge(database, eventLayer)))
+  const store = DagStore.layer.pipe(Layer.provide(database))
+  return Layer.mergeAll(database, eventLayer, projector, store)
+}
+
+const episodeDagID = DagEvent.DagID.make("dag_wake_episode")
+
+/** Create, start, and pause a workflow, then acknowledge its paused reminder as the loop's wake does. */
+const pauseAndAcknowledgeReminder = Effect.gen(function* () {
+  const database = yield* Database.Service
+  const events = yield* EventV2.Service
+  const store = yield* DagStore.Service
+  yield* database.db
+    .insert(ProjectTable)
+    .values({ id: "project-1" as never, worktree: process.cwd() as never, sandboxes: [] })
+    .run()
+    .pipe(Effect.orDie)
+  yield* database.db
+    .insert(SessionTable)
+    .values({
+      id: "ses_parent" as never,
+      project_id: "project-1" as never,
+      slug: "parent",
+      directory: process.cwd() as never,
+      title: "Parent",
+      version: "test",
+    })
+    .run()
+    .pipe(Effect.orDie)
+  yield* events.publish(DagEvent.WorkflowCreated, {
+    dagID: episodeDagID,
+    projectID: "project-1" as never,
+    sessionID: "ses_parent" as never,
+    title: "wake",
+    config: "{}",
+    status: "pending",
+    timestamp: yield* DateTime.now,
+    directory: process.cwd(),
+  } as never)
+  yield* events.publish(DagEvent.WorkflowStarted, { dagID: episodeDagID, timestamp: yield* DateTime.now })
+  yield* events.publish(DagEvent.WorkflowPaused, { dagID: episodeDagID, timestamp: yield* DateTime.now })
+  const paused = (yield* store.getWorkflow(episodeDagID))!
+  expect(paused.wakeReported).toBe(false)
+  yield* store.markWakeBatchReported({ nodes: [], workflows: [paused] })
+  expect((yield* store.getWorkflow(episodeDagID))!.wakeReported).toBe(true)
+})
+
+describe("workflow wake episodes", () => {
+  test("resuming after a reported pause reminder starts a fresh wake episode", async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        yield* pauseAndAcknowledgeReminder
+        const events = yield* EventV2.Service
+        const store = yield* DagStore.Service
+        yield* events.publish(DagEvent.WorkflowResumed, { dagID: episodeDagID, timestamp: yield* DateTime.now })
+        expect(yield* store.getWorkflow(episodeDagID)).toMatchObject({ status: "running", wakeReported: false })
+      }).pipe(Effect.provide(projectedStoreLayer()), Effect.scoped),
+    )
+  })
+
+  test("completion after a reported pause reminder is still reported to the parent", async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        yield* pauseAndAcknowledgeReminder
+        const events = yield* EventV2.Service
+        const store = yield* DagStore.Service
+        yield* events.publish(DagEvent.WorkflowResumed, { dagID: episodeDagID, timestamp: yield* DateTime.now })
+        yield* events.publish(DagEvent.WorkflowCompleted, {
+          dagID: episodeDagID,
+          durationMs: 0 as never,
+          timestamp: yield* DateTime.now,
+        })
+        expect((yield* store.getWorkflow(episodeDagID))!.status).toBe("completed")
+        expect((yield* store.getUnreportedWakeWorkflows("ses_parent")).map((w) => w.id)).toEqual([episodeDagID])
+        expect(yield* store.getSessionsWithUnreportedWakes()).toEqual(["ses_parent"])
+      }).pipe(Effect.provide(projectedStoreLayer()), Effect.scoped),
+    )
+  })
+
+  test("cancelling a paused workflow after its reminder was reported still wakes the parent", async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        yield* pauseAndAcknowledgeReminder
+        const events = yield* EventV2.Service
+        const store = yield* DagStore.Service
+        yield* events.publish(DagEvent.WorkflowCancelled, { dagID: episodeDagID, timestamp: yield* DateTime.now })
+        expect((yield* store.getWorkflow(episodeDagID))!.status).toBe("cancelled")
+        expect((yield* store.getUnreportedWakeWorkflows("ses_parent")).map((w) => w.id)).toEqual([episodeDagID])
+      }).pipe(Effect.provide(projectedStoreLayer()), Effect.scoped),
+    )
+  })
+
+  test("a repeated terminal event does not re-arm an acknowledged terminal wake", async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        yield* pauseAndAcknowledgeReminder
+        const events = yield* EventV2.Service
+        const store = yield* DagStore.Service
+        yield* events.publish(DagEvent.WorkflowCancelled, { dagID: episodeDagID, timestamp: yield* DateTime.now })
+        yield* store.markWakeBatchReported({ nodes: [], workflows: yield* store.getUnreportedWakeWorkflows("ses_parent") })
+        expect(yield* store.getUnreportedWakeWorkflows("ses_parent")).toEqual([])
+
+        yield* events.publish(DagEvent.WorkflowCancelled, { dagID: episodeDagID, timestamp: yield* DateTime.now })
+        yield* events.publish(DagEvent.WorkflowFailed, {
+          dagID: episodeDagID,
+          reason: "late",
+          failedNodes: [] as never,
+          timestamp: yield* DateTime.now,
+        })
+        expect(yield* store.getWorkflow(episodeDagID)).toMatchObject({ status: "cancelled", wakeReported: true })
+        expect(yield* store.getUnreportedWakeWorkflows("ses_parent")).toEqual([])
+      }).pipe(Effect.provide(projectedStoreLayer()), Effect.scoped),
     )
   })
 })

@@ -16,7 +16,7 @@
 import { Effect } from "effect"
 
 export interface TriggerResult {
-  /** additionalContext strings appended (deduplicated per session) */
+  /** additionalContext strings appended (deduplicated per session; tool events only within the trigger) */
   additionalContexts: string[]
   /** systemMessage strings emitted by hooks */
   systemMessages: string[]

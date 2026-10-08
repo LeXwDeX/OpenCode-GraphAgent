@@ -881,6 +881,150 @@ describe("Project-owned MEMORY persistence", () => {
   )
 
   it.live(
+    "a store persisted under the earlier content rules stays readable and committable after the credential rules",
+    () =>
+      Effect.gen(function* () {
+        const root = yield* tmpdirScoped()
+        yield* Effect.gen(function* () {
+          const store = yield* MemoryStore.Service
+          // Legitimate prose that the earlier rules admitted but the extended
+          // admission-time credential rules would now refuse.
+          const legacy = {
+            ...topic("已确认的报销凭证归档规则"),
+            id: "project-voucher",
+            items: [
+              {
+                id: "decision-voucher",
+                kind: "decision",
+                content: "已确认决定：报销凭证统一按月归档",
+                rationale: "该做法由用户确认并长期适用",
+                confirmed_at: now,
+              },
+            ],
+          } satisfies MemorySchema.Topic
+          expect(MemoryStore.isAllowedMemoryItem(legacy.items[0])).toBe(false)
+          yield* replaceTopics(store, projectID, [legacy])
+          expect(yield* store.readSnapshot(projectID)).toEqual({ revision: 1, topics: [legacy] })
+
+          const add = (content: string) =>
+            store.updateTopics(projectID, (topics) => {
+              const applied = MemoryStore.applyActions({
+                topics,
+                topicLimit: 10,
+                now,
+                id: () => "01new",
+                actions: [
+                  {
+                    type: "create_topic",
+                    name: "回答偏好",
+                    summary: "用户确认的回答偏好",
+                    categories: ["preference"],
+                    keywords: ["回答"],
+                    related_topics: [],
+                    item: { kind: "preference", content, rationale: "用户明确确认该要求长期有效" },
+                  },
+                ],
+              })
+              return { applied, result: undefined }
+            })
+
+          // An unrelated new item commits alongside the persisted topic.
+          const committed = yield* add("用户要求回答使用简洁中文")
+          expect(committed.revision).toBe(2)
+          const snapshot = yield* store.readSnapshot(projectID)
+          expect(snapshot.revision).toBe(2)
+          expect(snapshot.topics.map((value) => value.id)).toEqual(["project-voucher", "topic-01new"])
+
+          // A new credential-bearing item is still refused at admission.
+          const refused = yield* Effect.exit(add("用户要求服务器登录密码保持为 Tr0ub4dor"))
+          expect(Exit.isFailure(refused)).toBe(true)
+          expect((yield* store.readSnapshot(projectID)).revision).toBe(2)
+        }).pipe(Effect.provide(layers(root)))
+      }),
+    { timeout: 30_000 },
+  )
+
+  it.live(
+    "a failed manifest publish leaves no orphan generation behind and the store stays committable",
+    () =>
+      Effect.gen(function* () {
+        const root = yield* tmpdirScoped()
+        const fs = yield* FSUtil.Service
+        const home = MemoryHome.make(root)
+        let failManifest = false
+        const failingFS = Layer.succeed(FSUtil.Service, {
+          ...fs,
+          rename: (from, to) =>
+            failManifest && to === home.manifest(projectID)
+              ? Effect.die(new Error("simulated manifest publish failure"))
+              : fs.rename(from, to),
+        })
+        const storeLayer = MemoryStore.layer.pipe(
+          Layer.provide(failingFS),
+          Layer.provide(EffectFlock.defaultLayer),
+          Layer.provide(Layer.succeed(MemoryHome.Service, home)),
+        )
+        yield* Effect.gen(function* () {
+          const store = yield* MemoryStore.Service
+          yield* replaceTopics(store, projectID, [topic()])
+          failManifest = true
+          for (let i = 0; i < 3; i++) {
+            const failed = yield* Effect.exit(replaceTopics(store, projectID, [topic(`第${i}次失败的发布`)]))
+            expect(Exit.isFailure(failed)).toBe(true)
+          }
+          const names = (yield* fs.readDirectoryEntries(home.generations(projectID))).map((entry) => entry.name)
+          // Only the live revision-1 generation: no renamed revision-2 orphans, no staging.
+          expect(names).toHaveLength(1)
+          expect(names[0]?.startsWith("1-")).toBe(true)
+          failManifest = false
+          const next = topic("第二版边界")
+          yield* replaceTopics(store, projectID, [next])
+          expect(yield* store.readSnapshot(projectID)).toEqual({ revision: 2, topics: [next] })
+        }).pipe(Effect.provide(storeLayer))
+      }),
+    { timeout: 30_000 },
+  )
+
+  it.live(
+    "generation GC never deletes the live generation when orphans reuse its revision",
+    () =>
+      Effect.gen(function* () {
+        const root = yield* tmpdirScoped()
+        yield* Effect.gen(function* () {
+          const fs = yield* FSUtil.Service
+          const home = yield* MemoryHome.Service
+          const store = yield* MemoryStore.Service
+          yield* replaceTopics(store, projectID, [topic()]) // revision 1
+
+          // Orphans at revision 2: the shape a crash between rename and manifest
+          // publish leaves behind (older runtimes also left them on failure).
+          // Their names sort above any random uuid, so before the fix they
+          // outranked and evicted the live revision-2 generation.
+          const live = (yield* fs.readDirectoryEntries(home.generations(projectID))).find((entry) =>
+            entry.name.startsWith("1-"),
+          )!.name
+          for (const suffix of ["fffd", "fffe", "ffff"]) {
+            const orphan = path.join(home.generations(projectID), `2-ffffffff-ffff-4fff-bfff-ffffffff${suffix}`)
+            yield* fs.makeDirectory(orphan, { recursive: true })
+            yield* fs.copyFile(
+              path.join(home.generations(projectID), live, "project-architecture.yaml"),
+              path.join(orphan, "project-architecture.yaml"),
+            )
+          }
+
+          const next = topic("第二版边界")
+          yield* replaceTopics(store, projectID, [next]) // revision 2
+          expect(yield* store.readSnapshot(projectID)).toEqual({ revision: 2, topics: [next] })
+          const names = (yield* fs.readDirectoryEntries(home.generations(projectID))).map((entry) => entry.name)
+          // The orphans are swept; the live generation and its predecessor remain.
+          expect(names.some((name) => name.startsWith("2-ffffffff"))).toBe(false)
+          expect(names.map((name) => Number.parseInt(name, 10)).sort((a, b) => a - b)).toEqual([1, 2])
+        }).pipe(Effect.provide(layers(root)))
+      }),
+    { timeout: 30_000 },
+  )
+
+  it.live(
     "write paths fail closed on a corrupt manifest (pins the strict re-read before write)",
     () =>
       Effect.gen(function* () {

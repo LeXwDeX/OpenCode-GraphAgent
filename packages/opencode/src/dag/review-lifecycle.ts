@@ -6,7 +6,15 @@ export * as DagReviewLifecycle from "./review-lifecycle"
 import type { NodeConfig, WorkflowConfig } from "./dag"
 import { evaluateCondition } from "./runtime/eval"
 
-export function validateReviewLifecycle(config: WorkflowConfig) {
+/** `grandfathered`: review nodes carried with a persisted definition (runtime
+ * replan/extend/recover). Their PASS gate keeps the legacy textual check it
+ * was accepted under, so a gate such as `verify.output.status == PASS` on an
+ * existing — possibly terminal, unfixable — review never blocks later
+ * mutations. Newly authored reviews always get the evaluated check. */
+export function validateReviewLifecycle(
+  config: WorkflowConfig,
+  options: { grandfathered?: ReadonlySet<string> } = {},
+) {
   const issues = config.nodes.flatMap((node) => {
     if (!node.review) {
       if (!isReviewWorker(node.worker_type)) return []
@@ -15,7 +23,7 @@ export function validateReviewLifecycle(config: WorkflowConfig) {
     }
     if (node.review.phase === "design") return []
     return [
-      ...validateDiffReview(config, node.id),
+      ...validateDiffReview(config, node.id, options.grandfathered?.has(node.id) ?? false),
       ...((config.mode ?? "standard") === "deep"
         ? validateFinalReviewGate(config, node.id)
         : []),
@@ -195,7 +203,7 @@ export function reviewContractForNode(node: NodeConfig) {
   ].join(" ")
 }
 
-function validateDiffReview(config: WorkflowConfig, reviewID: string) {
+function validateDiffReview(config: WorkflowConfig, reviewID: string, grandfathered: boolean) {
   const review = config.nodes.find((node) => node.id === reviewID)
   if (!review?.review || review.review.phase !== "diff") return []
 
@@ -245,7 +253,9 @@ function validateDiffReview(config: WorkflowConfig, reviewID: string) {
     ...(verificationOutput
       ? []
       : [`${reviewID}: input_mapping must map verification output from ${verificationID}`]),
-    ...(review.condition?.includes(verificationID) && review.condition.includes("PASS")
+    ...((grandfathered
+      ? legacyMentionsVerificationPass(review.condition, verificationID)
+      : requiresVerificationPass(review.condition, verificationID))
       ? []
       : [`${reviewID}: condition must require PASS from verification node ${verificationID}`]),
     ...(hasReviewResultSchema(review.output_schema)
@@ -264,7 +274,7 @@ function validateFinalReviewGate(config: WorkflowConfig, reviewID: string) {
 function finalReviewGates(config: WorkflowConfig, reviewID: string) {
   return config.nodes.filter((node) =>
     node.id !== reviewID
-    && node.required
+    && (node.required ?? config.node_defaults?.required ?? false)
     && dependsTransitively(config, node.id, reviewID)
     && Object.values(node.input_mapping ?? {}).some((source) =>
       source === `${reviewID}.output` || source.startsWith(`${reviewID}.output.`),
@@ -291,6 +301,27 @@ function acceptsReviewVerdict(condition: string | undefined, reviewID: string) {
   const accepted = evaluateCondition(condition, output("ACCEPT"))
   const rejected = evaluateCondition(condition, output("REJECT"))
   return accepted.ok && accepted.value && rejected.ok && !rejected.value
+}
+
+/** The diff review's condition must actually gate on a PASS verdict: it has to
+ * run on PASS and stay closed on FAIL or a missing verdict. Evaluated, not
+ * substring-matched — `verdict != "PASS"` mentions PASS but inverts the gate.
+ * Both the structured `{ verdict }` and the raw-string output shapes the
+ * runtime accepts as PASS evidence are recognized. */
+/** The pre-evaluation textual check, kept only for grandfathered reviews. */
+function legacyMentionsVerificationPass(condition: string | undefined, verificationID: string) {
+  return condition !== undefined && condition.includes(verificationID) && condition.includes("PASS")
+}
+
+function requiresVerificationPass(condition: string | undefined, verificationID: string) {
+  const gates = (pass: unknown, fail: unknown, missing: unknown) => {
+    const run = (output: unknown) => evaluateCondition(condition, { [verificationID]: { output } })
+    const passed = run(pass)
+    const failed = run(fail)
+    const absent = run(missing)
+    return passed.ok && passed.value && failed.ok && !failed.value && !(absent.ok && absent.value)
+  }
+  return gates({ verdict: "PASS" }, { verdict: "FAIL" }, {}) || gates("PASS", "FAIL", "")
 }
 
 function hasReviewResultSchema(schema: Record<string, unknown> | undefined) {

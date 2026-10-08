@@ -1020,6 +1020,42 @@ describe("workflow tool execution", () => {
     }),
   )
 
+  // A spec path is a file read: read/validate echo the parsed document (even
+  // for non-workflow YAML) and start/extend/replan consume it, so read deny
+  // rules must apply before the file is opened — not only external_directory.
+  runtime.effect("asks read permission for a spec path before reading it", () =>
+    Effect.gen(function* () {
+      const specPath = yield* writeWorkflowSpec("read-permission-secret", { secret: "do-not-echo" })
+      const info = yield* WorkflowTool
+      const workflow = yield* info.init()
+      for (const action of ["read", "validate", "start"] as const) {
+        const requests: Array<{ permission: string; patterns: readonly string[] }> = []
+        const exit = yield* workflow
+          .execute(
+            { params: { action, spec_path: specPath } },
+            {
+              ...toolContext(),
+              ask: (request) => {
+                requests.push(request)
+                return request.permission === "read" ? Effect.die(new Error("read denied")) : Effect.void
+              },
+            },
+          )
+          .pipe(Effect.exit)
+
+        expect(Exit.isFailure(exit), action).toBe(true)
+        if (Exit.isFailure(exit)) {
+          expect(Cause.pretty(exit.cause), action).toContain("read denied")
+          expect(Cause.pretty(exit.cause), action).not.toContain("do-not-echo")
+        }
+        expect(
+          requests.filter((request) => request.permission === "read"),
+          action,
+        ).toEqual([expect.objectContaining({ permission: "read", patterns: ["read-permission-secret.yaml"] })])
+      }
+    }),
+  )
+
   runtime.effect("rejects reads and mutations from a session that does not own the workflow", () =>
     Effect.gen(function* () {
       published.length = 0

@@ -81,6 +81,20 @@ const PROHIBITED_CONTENT = [
   /[\w.+-]+@[\w.-]+\.[a-z]{2,}/i,
 ] as const
 
+// Credentials under any common label, enforced only when new or changed
+// content is admitted (applyActions / isAllowedMemory*). Decoding persisted
+// topics keeps PROHIBITED_CONTENT alone, so stores written under the earlier
+// rules stay strictly readable and committable. A bare English "token" stays
+// allowed ("token budget" is legitimate durable context); only credential-shaped
+// token phrases are blocked. 令牌 likewise stays allowed in its usage senses.
+const ADMISSION_CONTENT = [
+  ...PROHIBITED_CONTENT,
+  /\b(?:api[_\s-]?keys?|secrets?|passwords?|passwd|passphrases?|credentials?|private[_\s-]?keys?|(?:access|auth(?:entication)?|bearer|api|refresh|deploy|oauth|personal[_\s-]access)[_\s-]?tokens?)\b/i,
+  /(?:密码|密钥|秘钥|私钥|口令|凭据|凭证|令牌(?!桶|预算|数|上限|限额|限制|计数|用量|消耗|配额))/,
+] as const
+
+type ContentRules = ReadonlyArray<RegExp>
+
 const ITEM_INTENT = {
   preference:
     /^(?:(?:the\s+)?user\s+(?:prefers?|requires?|always|never)|(?:responses?|answers?)\s+(?:must|should|use|avoid)|用户(?:长期)?(?:偏好|要求)|回答(?:保持|使用|避免)|始终|永远|不要)/i,
@@ -240,24 +254,46 @@ export const layer = Layer.effect(
       } satisfies Snapshot
     })
 
-    const gcGenerations = Effect.fnUntraced(function* (projectID: ProjectV2.ID) {
+    // `live` is the generation the manifest was just published to; it is never
+    // collected. The manifest only advances under the project lock, so any other
+    // generation at or above the live revision is the orphan of a failed or
+    // crashed publish whose revision number was reused. Orphans are removed
+    // outright: ranked among retained generations they could evict the live one.
+    const gcGenerations = Effect.fnUntraced(function* (
+      projectID: ProjectV2.ID,
+      live: { readonly revision: number; readonly generation: string },
+    ) {
       const generations = home.generations(projectID)
       const entries = yield* fs.readDirectoryEntries(generations)
-      const stale = entries
-        .filter((entry) => entry.type === "directory" && !entry.name.startsWith("."))
-        .sort(
-          (a, b) => Number.parseInt(b.name, 10) - Number.parseInt(a.name, 10) || b.name.localeCompare(a.name),
-        )
-        .slice(RETAINED_GENERATIONS)
-        .map((entry) => join(generations, entry.name))
+      const candidates = entries
+        .filter((entry) => entry.type === "directory" && /^\d+-/.test(entry.name) && entry.name !== live.generation)
+        .map((entry) => ({ name: entry.name, revision: Number.parseInt(entry.name, 10) }))
+      const orphans = candidates.filter((entry) => entry.revision >= live.revision).map((entry) => entry.name)
+      const stale = candidates
+        .filter((entry) => entry.revision < live.revision)
+        .sort((a, b) => b.revision - a.revision || b.name.localeCompare(a.name))
+        .slice(RETAINED_GENERATIONS - 1)
+        .map((entry) => entry.name)
       // Orphan staging directories are rename leftovers from crashed writes.
       const staging = entries
         .filter((entry) => entry.name.startsWith(".") && entry.name.endsWith(".tmp"))
-        .map((entry) => join(generations, entry.name))
-      yield* Effect.forEach([...stale, ...staging], (path) => fs.remove(path, { force: true, recursive: true }), {
-        discard: true,
-      })
+        .map((entry) => entry.name)
+      yield* Effect.forEach(
+        [...orphans, ...stale, ...staging],
+        (name) => fs.remove(join(generations, name), { force: true, recursive: true }),
+        { discard: true },
+      )
     })
+
+    // A failed publish removes its renamed generation so it cannot linger as an
+    // orphan — unless the manifest did land on it, in which case it is live.
+    const discardUnpublished = (projectID: ProjectV2.ID, generation: string, directory: string) =>
+      Effect.gen(function* () {
+        const text = yield* fs.readFileStringSafe(home.manifest(projectID))
+        const manifest = text === undefined ? Option.none() : decodeManifest(text)
+        if (Option.isSome(manifest) && manifest.value.generation === generation) return
+        yield* fs.remove(directory, { force: true, recursive: true })
+      }).pipe(Effect.ignore)
 
     const writeSnapshot = Effect.fnUntraced(function* (
       projectID: ProjectV2.ID,
@@ -280,17 +316,25 @@ export const layer = Layer.effect(
           changed: topics.map((topic) => topic.id),
           deleted: [],
         })
-        yield* fs.rename(staging, directory)
-        yield* MemoryFile.atomicWrite(
-          fs,
-          home.manifest(projectID),
-          JSON.stringify({ schema_version: 1, revision, generation }) + "\n",
+        // Publication (rename + manifest) is one uninterruptible region: an
+        // interrupt cannot split it, and a failure inside it discards the
+        // renamed generation rather than leaving an orphan at the next revision.
+        yield* Effect.gen(function* () {
+          yield* fs.rename(staging, directory)
+          yield* MemoryFile.atomicWrite(
+            fs,
+            home.manifest(projectID),
+            JSON.stringify({ schema_version: 1, revision, generation }) + "\n",
+          )
+        }).pipe(
+          Effect.onError(() => discardUnpublished(projectID, generation, directory)),
+          Effect.uninterruptible,
         )
       }).pipe(Effect.onError(() => fs.remove(staging, { force: true, recursive: true }).pipe(Effect.ignore)))
       yield* fs.remove(home.topics(projectID), { force: true, recursive: true }).pipe(Effect.ignore)
       // GC is best-effort: the commit has already landed, a cleanup failure
       // must never fail it.
-      yield* gcGenerations(projectID).pipe(
+      yield* gcGenerations(projectID, { revision, generation }).pipe(
         Effect.catchCause((cause) => Effect.logWarning("memory generation GC failed", { cause: cause })),
       )
     })
@@ -377,9 +421,11 @@ export function decodeTopic(value: unknown, expectedID?: string) {
   if (new Set(topic.items.map((item) => item.id)).size !== topic.items.length) return undefined
   if (new Set(topic.metadata.categories).size !== topic.metadata.categories.length) return undefined
   if (topic.metadata.related_topics.includes(topic.id)) return undefined
-  if ([topic.name, topic.summary, ...topic.metadata.keywords].some((value) => !isAllowedMemoryText(value)))
+  // Persisted content is checked under the original rules; the admission-only
+  // credential rules apply to new or changed values in applyActions.
+  if ([topic.name, topic.summary, ...topic.metadata.keywords].some((value) => !allowedText(value, PROHIBITED_CONTENT)))
     return undefined
-  if (topic.items.some((item) => !isAllowedMemoryItem(item))) return undefined
+  if (topic.items.some((item) => !allowedItem(item, PROHIBITED_CONTENT))) return undefined
   return topic
 }
 
@@ -531,22 +577,32 @@ export function markMatched(topics: MemorySchema.Topic[], topicIDs: string[], no
   return { topics: next, changed, deleted: [] }
 }
 
+/** Admission check for new or changed text. */
 export function isAllowedMemoryText(value: string) {
+  return allowedText(value, ADMISSION_CONTENT)
+}
+
+/** Admission check for a new or changed item. */
+export function isAllowedMemoryItem(item: Pick<MemorySchema.TopicItem, "kind" | "content" | "rationale">) {
+  return allowedItem(item, ADMISSION_CONTENT)
+}
+
+function allowedText(value: string, rules: ContentRules) {
   const text = value.trim()
   if (!text || text.length > 1_000) return false
   if (text.includes("\n") || text.includes("\r")) return false
-  return !PROHIBITED_CONTENT.some((pattern) => pattern.test(text))
+  return !rules.some((pattern) => pattern.test(text))
 }
 
-export function isAllowedMemoryItem(item: Pick<MemorySchema.TopicItem, "kind" | "content" | "rationale">) {
-  if (!isAllowedMemoryText(item.content) || !isAllowedMemoryText(item.rationale)) return false
+function allowedItem(item: Pick<MemorySchema.TopicItem, "kind" | "content" | "rationale">, rules: ContentRules) {
+  if (!allowedText(item.content, rules) || !allowedText(item.rationale, rules)) return false
   const intent = item.content.match(ITEM_INTENT[item.kind])
   if (!intent || !DURABLE_CONFIRMATION.test(item.rationale)) return false
   const payload = item.content
     .slice((intent.index ?? 0) + intent[0].length)
     .replace(/^[\s:：—–-]+/, "")
     .trim()
-  return payload.length > 0 && isAllowedMemoryText(payload)
+  return payload.length > 0 && allowedText(payload, rules)
 }
 
 export function indexes(topics: MemorySchema.Topic[]) {

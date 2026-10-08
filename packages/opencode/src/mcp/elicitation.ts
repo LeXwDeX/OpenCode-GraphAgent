@@ -302,7 +302,7 @@ export const handleElicitation = Effect.fn("MCP.elicitation.handle")(function* (
   // Route the ask through the Notification emitter (non-blocking, tolerant).
   if (notification) {
     yield* notification
-      .notify({ message: input.message || "MCP elicitation", notificationType: "elicitation" })
+      .notify({ message: input.message || "MCP elicitation", notificationType: "elicitation", sessionID })
       .pipe(Effect.ignore)
   }
 

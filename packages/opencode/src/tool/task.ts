@@ -16,6 +16,7 @@ import { EffectBridge } from "@/effect/bridge"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Database } from "@opencode-ai/core/database/database"
 import { SettingsHook, type TriggerResult } from "@/hook/settings"
+import { TaskSubagents } from "@/hook/task-subagents"
 
 export interface TaskPromptOps {
   cancel(sessionID: SessionID): Effect.Effect<void>
@@ -309,20 +310,26 @@ export const TaskTool = Tool.define(
         }
       }
 
-      const info = yield* background.start({
-        id: nextSession.id,
-        type: id,
-        title: params.description,
-        metadata,
-        onPromote: Effect.all([
-          ctx.metadata({
-            title: params.description,
-            metadata: { ...metadata, background: true, jobId: nextSession.id },
-          }),
-          notify(nextSession.id),
-        ]),
-        run: runTask().pipe(Effect.onInterrupt(() => ops.cancel(nextSession.id))),
-      })
+      // Foreground task call: this tool fires SubagentStop for the child, so the
+      // child's own prompt loop must skip the main-agent Stop (see TaskSubagents).
+      // Released when the foreground wait ends (including promotion to background).
+      const releaseSubagent = runInBackground ? Effect.void : yield* TaskSubagents.register(nextSession.id)
+      const info = yield* background
+        .start({
+          id: nextSession.id,
+          type: id,
+          title: params.description,
+          metadata,
+          onPromote: Effect.all([
+            ctx.metadata({
+              title: params.description,
+              metadata: { ...metadata, background: true, jobId: nextSession.id },
+            }),
+            notify(nextSession.id),
+          ]),
+          run: runTask().pipe(Effect.onInterrupt(() => ops.cancel(nextSession.id))),
+        })
+        .pipe(Effect.onError(() => releaseSubagent))
 
       function backgroundResult() {
         return {
@@ -346,7 +353,7 @@ export const TaskTool = Tool.define(
         return backgroundResult()
       }
 
-      const runCancel = yield* EffectBridge.make()
+      const runCancel = yield* EffectBridge.make().pipe(Effect.onError(() => releaseSubagent))
       const cancel = ops.cancel(nextSession.id)
 
       function onAbort() {
@@ -354,7 +361,7 @@ export const TaskTool = Tool.define(
       }
 
       return yield* Effect.gen(function* () {
-        const output = yield* Effect.acquireUseRelease(
+        let output = yield* Effect.acquireUseRelease(
           Effect.sync(() => {
             ctx.abort.addEventListener("abort", onAbort)
           }),
@@ -389,8 +396,8 @@ export const TaskTool = Tool.define(
         // subagent for another turn; the next SubagentStop then carries
         // stop_hook_active=true so a well-behaved hook stops blocking (anti-loop,
         // mirroring the prompt.ts Stop path). Skipped when promoted to background
-        // (the subagent is still running, not stopped) — the background completion
-        // path fires SubagentStop via its own release below.
+        // (the subagent is still running, not stopped); once this foreground wait
+        // ends the child is no longer in TaskSubagents, so its own loop fires Stop.
         const promoted = Boolean((output.metadata as { background?: boolean } | undefined)?.background)
         if (settingsHook && !promoted) {
           let subagentStopBlocked = false
@@ -439,6 +446,15 @@ export const TaskTool = Tool.define(
               lastStillBlocked = false
               break
             }
+            // The parent receives the continuation's final answer, not the stale first one.
+            output = {
+              ...output,
+              output: renderOutput({
+                sessionID: nextSession.id,
+                state: "completed",
+                text: cont.value.parts.findLast((item) => item.type === "text")?.text ?? "",
+              }),
+            }
           }
           if (lastStillBlocked) {
             yield* Effect.logWarning("SubagentStop continuation limit reached; forcing stop", {
@@ -449,7 +465,7 @@ export const TaskTool = Tool.define(
           }
         }
         return output
-      })
+      }).pipe(Effect.ensuring(releaseSubagent))
     })
 
     return {

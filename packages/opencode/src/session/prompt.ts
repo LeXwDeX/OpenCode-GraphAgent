@@ -90,6 +90,7 @@ import { SessionTools } from "./tools"
 import { ToolSourceLedger } from "./tool-source-ledger"
 import { LLMEvent } from "@opencode-ai/llm"
 import { SettingsHook, HOOK_REWAKE_SENTINEL, type TriggerResult } from "@/hook/settings"
+import { TaskSubagents } from "@/hook/task-subagents"
 import { applyPreHookDecision } from "@/hook/pre-hook-decision"
 import { dispatchTrust } from "@/hook/workspace-trust"
 import { HookStartContext } from "@/hook/start-context"
@@ -1707,60 +1708,66 @@ export const layer = Layer.effect(
     ) {
       const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
       yield* revert.cleanup(session)
-      const message = yield* createUserMessage(input, persistAdmission)
-      yield* sessions.touch(input.sessionID)
 
       // SettingsHook: UserPromptSubmit — gives hooks a chance to block or modify the turn.
-      // Loop guard (hook-async-rewake): skip hooks for rewake prompts (those whose
-      // text starts with HOOK_REWAKE_SENTINEL) to prevent hook → rewake → hook loops.
+      // Runs BEFORE the prompt is persisted: a blocked prompt (e.g. a secret scanner)
+      // must never be stored as model-visible history (Claude Code erases it from
+      // context). Loop guard (hook-async-rewake): skip hooks for rewake prompts (those
+      // whose text starts with HOOK_REWAKE_SENTINEL) to prevent hook → rewake → hook loops.
       let hookAdditionalContexts: string[] = []
+      let hookResult: TriggerResult | undefined
       const promptText = input.parts.map((p: any) => (p.type === "text" ? p.text : "")).join("\n")
       const isRewake = promptText.startsWith(HOOK_REWAKE_SENTINEL)
       if (settingsHook && !isRewake) {
-        const hookResult = yield* settingsHook
+        hookResult = yield* settingsHook
           .trigger(
             { event: "UserPromptSubmit", prompt: promptText },
             { sessionID: input.sessionID, transcriptPath: "" },
           )
-          .pipe(Effect.catch(() => Effect.succeed({ blocked: undefined, additionalContexts: [] as string[] } as any)))
+          .pipe(Effect.catch(() => Effect.succeed<TriggerResult>({ additionalContexts: [], systemMessages: [] })))
         hookAdditionalContexts = hookResult.additionalContexts ?? []
+      }
+
+      if (hookResult && (hookResult.blocked || hookResult.preventContinuation)) {
+        const reason = hookResult.stopReason ?? hookResult.blocked?.reason ?? "Hook requested stop"
+        // The submitted parts are replaced by one user-visible notice. `ignored`
+        // keeps it out of model input (and makes the message no model work
+        // boundary); it is not synthetic so clients render it in the transcript.
+        const message = yield* createUserMessage(
+          { ...input, parts: [{ type: "text", text: `[Hook stopped] ${reason}`, ignored: true }] },
+          persistAdmission,
+        )
+        yield* sessions.touch(input.sessionID)
+        // systemMessages are logged only: nothing about a blocked prompt reaches the model.
+        yield* SettingsHook.landSystemMessages(hookResult, { sessionID: input.sessionID })
+        if (agentMessages) {
+          const ctx = yield* InstanceState.context
+          yield* agentMessages.discardPending(
+            { projectID: ctx.project.id, directory: ctx.directory, sessionID: input.sessionID },
+            "hook_blocked",
+          )
+        }
+        return { message, run: false as const }
+      }
+
+      const message = yield* createUserMessage(input, persistAdmission)
+      yield* sessions.touch(input.sessionID)
+
+      if (hookResult) {
         // Land UserPromptSubmit systemMessages (logged always; injected as synthetic
-        // parts when the turn proceeds so the model sees them — no silent drop).
+        // parts so the model sees them — no silent drop).
         yield* SettingsHook.landSystemMessages(hookResult, {
           sessionID: input.sessionID,
-          inject:
-            hookResult.blocked || hookResult.preventContinuation
-              ? undefined
-              : (text) =>
-                  sessions.updatePart({
-                    id: PartID.ascending(),
-                    messageID: message.info.id,
-                    sessionID: input.sessionID,
-                    type: "text",
-                    text,
-                    synthetic: true,
-                  } satisfies SessionV1.TextPart),
+          inject: (text) =>
+            sessions.updatePart({
+              id: PartID.ascending(),
+              messageID: message.info.id,
+              sessionID: input.sessionID,
+              type: "text",
+              text,
+              synthetic: true,
+            } satisfies SessionV1.TextPart),
         })
-        if (hookResult.blocked || hookResult.preventContinuation) {
-          const reason = hookResult.stopReason ?? hookResult.blocked?.reason ?? "Hook requested stop"
-          const part = yield* sessions.updatePart({
-            id: PartID.ascending(),
-            messageID: message.info.id,
-            sessionID: input.sessionID,
-            type: "text",
-            text: `[Hook stopped] ${reason}`,
-            synthetic: true,
-          } satisfies SessionV1.TextPart)
-          message.parts.push(part)
-          if (agentMessages) {
-            const ctx = yield* InstanceState.context
-            yield* agentMessages.discardPending(
-              { projectID: ctx.project.id, directory: ctx.directory, sessionID: input.sessionID },
-              "hook_blocked",
-            )
-          }
-          return { message, run: false as const }
-        }
       }
 
       // SettingsHook: drain HookStartContext queued by SessionStart hooks (only if not blocked)
@@ -2031,8 +2038,13 @@ export const layer = Layer.effect(
             } else {
               yield* Effect.logInfo("exiting loop", { "session.id": sessionID })
               let agentContinuationPrevented = false
+              // Main-agent Stop/StopFailure do not fire for foreground task-tool
+              // subagents: task.ts fires SubagentStop (and drives its continuation)
+              // for them. Only positively registered sessions are skipped; any other
+              // child (SDK-created, DAG node, background task) still fires Stop.
+              const taskSubagent = TaskSubagents.has(sessionID)
               // SettingsHook: Stop on clean turn exit, StopFailure when it ended in error.
-              if (settingsHook) {
+              if (settingsHook && !taskSubagent) {
                 const lastAssistantMessage =
                   lastAssistantMsg?.parts
                     .filter((part): part is SessionV1.TextPart => part.type === "text")
@@ -2061,53 +2073,55 @@ export const layer = Layer.effect(
                     yield* agentMessages.markStopped(identity, input.value.id, "hook_blocked")
                   yield* agentMessages.discardPending(identity, "hook_blocked")
                 }
-                // Consume Stop-hook outputs so nothing is silently dropped: inject
-                // additionalContexts as synthetic text parts (model-visible on the
-                // continuation turn, recorded in history on exit) and land any
-                // systemMessages via the shared outlet (log + inject here).
-                for (const ctx of stopResult.additionalContexts ?? []) {
-                  yield* sessions.updatePart({
-                    id: PartID.ascending(),
-                    messageID: lastUser.id,
-                    sessionID,
-                    type: "text",
-                    text: ctx,
-                    synthetic: true,
-                  } satisfies SessionV1.TextPart)
-                }
-                yield* SettingsHook.landSystemMessages(stopResult, {
-                  sessionID,
-                  inject: (message) =>
-                    sessions.updatePart({
-                      id: PartID.ascending(),
-                      messageID: lastUser.id,
-                      sessionID,
-                      type: "text",
-                      text: message,
-                      synthetic: true,
-                    } satisfies SessionV1.TextPart),
-                })
                 // Stop-hook block → drive another model turn. The next Stop then carries
                 // stop_hook_active=true so a well-behaved hook stops blocking (anti-loop).
                 // Capped by MAX_STOP_CONTINUATIONS so a hook that ignores the signal
                 // can't loop forever; at the limit we log.warn and force a normal exit.
+                const continuing =
+                  !agentInputBlocked &&
+                  !turnError &&
+                  stopResult.blocked !== undefined &&
+                  !stopResult.preventContinuation &&
+                  stopContinuationCount < SettingsHook.MAX_STOP_CONTINUATIONS
+                // Consume Stop-hook outputs so nothing is silently dropped. On a
+                // continuation they go into a new synthetic user message AFTER the
+                // assistant reply (block reason last, so the request ends with the
+                // instruction to continue — mirrors task.ts SubagentStop). On exit they
+                // are recorded on the turn's user message (model-visible next prompt).
+                const feedback: string[] = [...(stopResult.additionalContexts ?? [])]
+                yield* SettingsHook.landSystemMessages(stopResult, {
+                  sessionID,
+                  inject: (message) => Effect.sync(() => feedback.push(message)),
+                })
+                if (continuing) feedback.push(stopResult.blocked?.reason || "Continue.")
+                const target = continuing ? MessageID.ascending() : lastUser.id
+                if (target !== lastUser.id) {
+                  yield* sessions.updateMessage({
+                    id: target,
+                    sessionID,
+                    role: "user",
+                    agent: lastUser.agent,
+                    model: lastUser.model,
+                    format: lastUser.format,
+                    system: lastUser.system,
+                    tools: lastUser.tools,
+                    time: { created: Date.now() },
+                  })
+                }
+                for (const text of feedback) {
+                  yield* sessions.updatePart({
+                    id: PartID.ascending(),
+                    messageID: target,
+                    sessionID,
+                    type: "text",
+                    text,
+                    synthetic: true,
+                  } satisfies SessionV1.TextPart)
+                }
                 if (!agentInputBlocked && !turnError && stopResult.blocked && !stopResult.preventContinuation) {
-                  if (stopContinuationCount < SettingsHook.MAX_STOP_CONTINUATIONS) {
+                  if (continuing) {
                     stopContinuationCount++
                     stopHookBlocked = true
-                    // Inject the block reason as a synthetic part so the model knows why
-                    // it is being asked to continue (mirrors task.ts SubagentStop).
-                    const reason = stopResult.blocked.reason
-                    if (reason) {
-                      yield* sessions.updatePart({
-                        id: PartID.ascending(),
-                        messageID: lastUser.id,
-                        sessionID,
-                        type: "text",
-                        text: reason,
-                        synthetic: true,
-                      } satisfies SessionV1.TextPart)
-                    }
                     forceContinue = true
                     continue
                   }

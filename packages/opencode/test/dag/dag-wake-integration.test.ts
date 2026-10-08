@@ -707,7 +707,9 @@ describe("DagLoop atomic wake integration", () => {
                 {
                   ...node("review-security", ["analysis"]),
                   required: false,
-                  condition: "analysis.output.verdict ==",
+                  // Well-formed (create accepts it) but unevaluable at spawn:
+                  // a numeric comparison on a prose output fails the node.
+                  condition: "analysis.output.verdict > 0",
                 },
                 {
                   ...node("arbitrate", ["review-quality", "review-security"]),

@@ -160,9 +160,11 @@ export interface HookCommand {
    * Conditional gate, evaluated by `extensions/condition-filter.ts` in
    * `ForkHooks.beforeRunEntry` BEFORE each matched entry runs (returning false
    * skips the entry). Syntax:
-   *   - `ToolName(glob)` — e.g. `Bash(npm install *)`, `Edit(*.ts)`; the tool
-   *     name is matched case-insensitively and the glob is matched against the
-   *     tool's primary argument (Bash→command, Edit/Write/Read→filePath).
+   *   - `ToolName(pattern)` — e.g. `Bash(npm install *)`, `Edit(*.ts)`; the tool
+   *     name is matched case-insensitively and the pattern against the tool's
+   *     primary argument with Claude Code permission-rule semantics (Bash→each
+   *     subcommand, `*` spans anything; Edit/Write/Read→gitignore-like path
+   *     matching relative to the project root).
    *   - `*`, empty, or undefined — always matches (no filtering).
    * For NON-tool events (UserPromptSubmit, Stop, SessionStart, …) the condition
    * is ignored and always matches (CC behavior). A malformed condition (not
@@ -1360,21 +1362,61 @@ function buildStdinEnvelope(payload: HookPayload, ctx: TriggerContext, cwd: stri
 }
 
 /**
- * Decide which target string to feed the matcher for a given event.
- * Tool-bound events match against `tool_name`; others match all matchers
- * (CC behavior — non-tool events typically have empty matcher).
+ * Decide which target string to feed the matcher for a given event (Claude
+ * Code matcher table). Tool-bound events match `tool_name`; lifecycle events
+ * match their event-specific field. `undefined` means the event has no matcher
+ * support here, so any matcher is ignored and every group runs (CC behavior).
  */
-function matcherTarget(payload: HookPayload): string {
-  if (
-    payload.event === "PreToolUse" ||
-    payload.event === "PostToolUse" ||
-    payload.event === "PostToolUseFailure" ||
-    payload.event === "PermissionRequest" ||
-    payload.event === "PermissionDenied"
-  ) {
-    return payload.toolName
+function matcherTarget(payload: HookPayload): string | undefined {
+  switch (payload.event) {
+    case "PreToolUse":
+    case "PostToolUse":
+    case "PostToolUseFailure":
+    case "PermissionRequest":
+    case "PermissionDenied":
+      return payload.toolName
+    case "SessionStart":
+      return payload.source
+    case "SessionEnd":
+      return payload.reason
+    case "PreCompact":
+    case "PostCompact":
+      return payload.trigger ?? ""
+    case "Notification":
+      return payload.notificationType ?? ""
+    case "SubagentStart":
+    case "SubagentStop":
+      return payload.agentType ?? ""
+    case "Setup":
+      return payload.trigger
+    case "FileChanged":
+      return payload.path ? path.basename(payload.path) : ""
+    default:
+      return undefined
   }
-  return ""
+}
+
+/**
+ * Tool events report fresh feedback per call (e.g. a PostToolUse validator
+ * repeating the same lint error), so their additionalContext is deduplicated
+ * only within one trigger. Every other event keeps per-session dedup: its
+ * context (SessionStart, Stop, …) stays in history after the first injection.
+ */
+const PER_TRIGGER_DEDUP_EVENTS: ReadonlySet<HookEvent> = new Set(["PreToolUse", "PostToolUse", "PostToolUseFailure"])
+
+/** Identity of a handler for per-trigger dedup: identical handlers run once (CC behavior). */
+function handlerKey(entry: HookCommand): string {
+  return JSON.stringify([
+    entry.type,
+    entry.type === "command" ? expandCommand(entry) : entry.type === "http" ? httpUrl(entry) : commandText(entry),
+    entry.prompt,
+    entry.shell,
+    entry.inputFormat,
+    entry.async === true,
+    entry.asyncRewake === true,
+    // A plugin's or skill's copy of the same handler stays separate.
+    entry.__sourceDir,
+  ])
 }
 
 // ── Effect service ──────────────────────────────────────────────
@@ -2187,9 +2229,20 @@ export const layer = Layer.effect(
 
       const target = matcherTarget(payload)
       const envelope = buildStdinEnvelope(payload, ctx, s.cwd)
+      // Identical handlers matched by several groups/layers run once per trigger.
+      const ran = new Set<string>()
+      // additionalContext dedup: only within this trigger for tool events,
+      // per session otherwise (see PER_TRIGGER_DEDUP_EVENTS).
+      const local = new Set<string>()
+      const addContext = (text: string) => {
+        if (local.has(text)) return
+        local.add(text)
+        if (!PER_TRIGGER_DEDUP_EVENTS.has(payload.event) && !addSeen(s.seen, ctx.sessionID, text)) return
+        result.additionalContexts.push(text)
+      }
 
       for (const group of matchers) {
-        if (!matches(group.matcher, target)) continue
+        if (target !== undefined && !matches(group.matcher, target)) continue
 
         let claimed = false
         for (const entry of group.hooks) {
@@ -2207,6 +2260,9 @@ export const layer = Layer.effect(
           // [FORK:hook-ext] Pre-dispatch filter — skip entry if condition not met
           if (forkHooks?.beforeRunEntry && !forkHooks.beforeRunEntry(entry, envelope, payload.event)) continue
 
+          const key = handlerKey(entry)
+          if (ran.has(key)) continue
+
           const onceBucket = s.once.get(ctx.sessionID) ?? new WeakSet<HookCommand>()
           if (entry.once && onceBucket.has(entry)) continue
 
@@ -2218,6 +2274,7 @@ export const layer = Layer.effect(
             onceBucket.add(entry)
             s.once.set(ctx.sessionID, onceBucket)
           }
+          ran.add(key)
           if (entry.statusMessage) log.info("hook status", { event: payload.event, message: entry.statusMessage })
 
           // ── Async fork (hook-async-rewake) ──────────────────────
@@ -2300,9 +2357,7 @@ export const layer = Layer.effect(
               (payload.event === "UserPromptSubmit" || payload.event === "SessionStart")
             ) {
               const text = rawStdout.trim()
-              if (text && !text.startsWith("{") && addSeen(s.seen, ctx.sessionID, text)) {
-                result.additionalContexts.push(text)
-              }
+              if (text && !text.startsWith("{")) addContext(text)
             }
             continue
           }
@@ -2322,14 +2377,9 @@ export const layer = Layer.effect(
           // Property-based narrowing — works across union variants without depending on
           // hookEventName tag (which the fallback variant may also accept).
           if (hso && "additionalContext" in hso && typeof hso.additionalContext === "string") {
-            const additionalContext = hso.additionalContext
-            // Per-session dedup (F2): the same context surfaces once per
-            // session, not once per process lifetime. ctx here is the
-            // TriggerContext (sessionID is its bucket key); the local was
-            // renamed off `ctx` so the outer TriggerContext stays reachable.
-            if (addSeen(s.seen, ctx.sessionID, additionalContext)) {
-              result.additionalContexts.push(additionalContext)
-            }
+            // Per-session dedup (F2) applies to non-tool events; the bucket is
+            // keyed by TriggerContext.sessionID (see addContext).
+            addContext(hso.additionalContext)
           }
           if (hso && "permissionDecision" in hso && hso.permissionDecision) {
             const incoming = hso.permissionDecision

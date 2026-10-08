@@ -18,6 +18,8 @@ export interface NotifyInput {
   title?: string
   /** Producer category — "permission" | "elicitation" | … */
   notificationType: string
+  /** Session that needs attention; reported to the hook as `session_id`. */
+  sessionID?: string
 }
 
 export interface Interface {
@@ -46,11 +48,16 @@ export const layer = Layer.effect(
       if (!settingsHook) return
       const nResult = yield* settingsHook
         .trigger(
-          { event: "Notification", message: input.message, title: input.title, notificationType: input.notificationType },
-          { sessionID: "", transcriptPath: "" },
+          {
+            event: "Notification",
+            message: input.message,
+            title: input.title,
+            notificationType: input.notificationType,
+          },
+          { sessionID: input.sessionID ?? "", transcriptPath: "" },
         )
         .pipe(Effect.catch(() => Effect.succeed({ additionalContexts: [], systemMessages: [] })))
-      yield* SettingsHook.landSystemMessages(nResult, { sessionID: "" })
+      yield* SettingsHook.landSystemMessages(nResult, { sessionID: input.sessionID ?? "" })
     })
 
     return Service.of({ notify })

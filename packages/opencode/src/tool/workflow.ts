@@ -20,6 +20,7 @@ import { TerminalViolationError } from "@opencode-ai/core/dag/core/types"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { stringify as yamlStringify } from "yaml"
 import { assertExternalDirectoryEffect } from "./external-directory"
+import { InstanceRef } from "@/effect/instance-ref"
 import path from "node:path"
 
 const id = "workflow"
@@ -1069,6 +1070,16 @@ function resolveSpecPath(specPath: string, directory: string, ctx: Tool.Context)
         bypass: Boolean(ctx.extra?.["bypassCwdCheck"]),
       })
     }
+    // An arbitrary path is a file read like any other: read/validate echo the
+    // parsed document and start/extend/replan consume it, so it must honor
+    // `read` permission rules (same worktree-relative pattern as the read tool).
+    const instance = yield* InstanceRef
+    yield* ctx.ask({
+      permission: "read",
+      patterns: [path.relative(instance?.worktree ?? directory, filepath)],
+      always: ["*"],
+      metadata: {},
+    })
     return filepath
   })
 }

@@ -8,6 +8,7 @@ import { Database } from "@opencode-ai/core/database/database"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { DagProjector } from "@opencode-ai/core/dag/projector"
 import { DagStore } from "@opencode-ai/core/dag/store"
+import { WorkflowRuntime, toSchedulingNodes } from "@opencode-ai/core/dag/core/scheduling"
 import { EventV2 } from "@opencode-ai/core/event"
 import { EventSequenceTable, EventTable } from "@opencode-ai/core/event/sql"
 import { WorkflowNodeTable, WorkflowTable } from "@opencode-ai/core/dag/sql"
@@ -288,6 +289,85 @@ describe("DAG local recovery", () => {
       expect(exhausted._tag).toBe("Failure")
       if (exhausted._tag === "Failure") expect(exhausted.failure.message).toContain("attempt ceiling")
       expect((yield* dag.store.getNodes(id)).length).toBe(2)
+    }),
+  )
+})
+
+// Dag.fail / Dag.cancel terminalize collateral rows without a node verdict:
+// pending work becomes skipped(workflow_failed|workflow_cancelled) and running
+// work aborted. Recovery must resume that work, not treat it as finished.
+describe("DAG local recovery of workflow-termination collateral", () => {
+  // Mirrors loop.ts rebuild: the runtime is seeded from getCurrentNodes.
+  const runtimeOf = Effect.fn(function* (dag: Dag.Interface, id: string) {
+    return new WorkflowRuntime(toSchedulingNodes(yield* dag.store.getCurrentNodes(id)), 4)
+  })
+
+  it.effect("reruns independent work skipped by workflow_failed alongside the selected failure", () =>
+    Effect.gen(function* () {
+      const { dag, id } = yield* setup([node("a"), node("c", ["a"]), node("e", ["a"])])
+      yield* complete(dag, id, "a", "a done")
+      yield* start(dag, id, "c")
+      yield* dag.nodeFailed(id, "c", "boom", "exec_failed")
+      yield* dag.fail(id, "required node(s) failed: c")
+      expect(yield* dag.store.getNode(id, "e")).toMatchObject({ status: "skipped", errorReason: "workflow_failed" })
+
+      const wf = (yield* dag.store.getWorkflow(id))!
+      const recovered = yield* dag.recover(id, { nodeIDs: ["c"], expectedGraphRev: wf.graphRev })
+      expect((yield* dag.store.getWorkflow(id))?.status).toBe("running")
+      expect(recovered.superseded.sort()).toEqual(["c", "e"])
+      expect(recovered.reused).toEqual(["a"])
+      const retryC = recovered.replacements.find((r) => r.previous === "c")!.current
+      const retryE = recovered.replacements.find((r) => r.previous === "e")!.current
+      const config = Dag.parseWorkflowConfig((yield* dag.store.getWorkflow(id))!.config)!
+      expect(config.nodes.find((n) => n.id === retryE)?.prompt_template.input?.__workflow_recovery).toMatchObject({
+        previous_node_id: "e",
+        previous_status: "skipped",
+        previous_error: "workflow_failed",
+      })
+      expect((yield* runtimeOf(dag, id)).getReadyNodes().sort()).toEqual([retryC, retryE].sort())
+
+      yield* complete(dag, id, retryC, "c done")
+      const runtime = yield* runtimeOf(dag, id)
+      expect(runtime.isComplete()).toBe(false)
+      expect(runtime.getReadyNodes()).toEqual([retryE])
+    }),
+  )
+
+  it.effect("reruns a required node aborted by cancellation when resuming the cancelled workflow", () =>
+    Effect.gen(function* () {
+      const { dag, id } = yield* setup([node("a"), node("b"), node("d", ["b"])])
+      yield* start(dag, id, "a")
+      yield* dag.nodeFailed(id, "a", "boom", "exec_failed")
+      yield* start(dag, id, "b")
+      yield* dag.cancel(id)
+      expect(yield* dag.store.getNode(id, "b")).toMatchObject({ status: "aborted", errorReason: "workflow_cancelled" })
+      expect(yield* dag.store.getNode(id, "d")).toMatchObject({ status: "skipped", errorReason: "workflow_cancelled" })
+
+      const wf = (yield* dag.store.getWorkflow(id))!
+      const recovered = yield* dag.recover(id, { nodeIDs: ["a"], expectedGraphRev: wf.graphRev, resumeCancelled: true })
+      expect(recovered.superseded.sort()).toEqual(["a", "b", "d"])
+      const retryA = recovered.replacements.find((r) => r.previous === "a")!.current
+      const retryB = recovered.replacements.find((r) => r.previous === "b")!.current
+      yield* complete(dag, id, retryA, "a done")
+
+      const runtime = yield* runtimeOf(dag, id)
+      expect(runtime.isComplete()).toBe(false)
+      expect(runtime.getReadyNodes()).toEqual([retryB])
+    }),
+  )
+
+  it.effect("keeps condition-skipped nodes out of the rerun set", () =>
+    Effect.gen(function* () {
+      const { dag, id } = yield* setup([node("a"), node("b", ["a"]), node("gated")])
+      yield* start(dag, id, "gated")
+      yield* dag.nodeSkipped(id, "gated", "condition_false")
+      yield* start(dag, id, "a")
+      yield* dag.nodeFailed(id, "a", "boom", "exec_failed")
+      yield* dag.pause(id)
+      const wf = (yield* dag.store.getWorkflow(id))!
+      const recovered = yield* dag.recover(id, { nodeIDs: ["a"], expectedGraphRev: wf.graphRev })
+      expect(recovered.superseded.sort()).toEqual(["a", "b"])
+      expect(recovered.preserved).toEqual(["gated"])
     }),
   )
 })

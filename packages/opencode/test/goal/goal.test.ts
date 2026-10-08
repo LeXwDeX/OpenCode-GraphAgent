@@ -1,5 +1,6 @@
 import { describe, expect } from "bun:test"
-import { Deferred, Effect, Fiber, Layer, Option } from "effect"
+import { eq } from "drizzle-orm"
+import { Deferred, Effect, Exit, Fiber, Layer, Option } from "effect"
 import { Goal } from "@/goal/goal"
 import { GoalEvent } from "@/goal/events"
 import { GoalPrompts } from "@/goal/prompts"
@@ -8,6 +9,7 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 import { SessionStatus } from "@/session/status"
 import { SessionAutomationLease } from "@/session/automation-lease"
 import { Database } from "@opencode-ai/core/database/database"
+import { GoalStateTable } from "@opencode-ai/core/goal/sql"
 import { SessionID } from "@/session/schema"
 import { pollWithTimeout, testEffect } from "../lib/effect"
 
@@ -1142,3 +1144,65 @@ it.instance("Goal invalid resume budgets preserve the entire paused state", () =
     }
   }),
 )
+
+// D-3 beyond the startup scan: an undecodable goal_state row (corruption or a
+// newer payload schema) must stay removable through the product and must not
+// kill the shared automation lease, whose Goal authority runs on every claim.
+describe("Goal — undecodable goal_state row", () => {
+  const corruptIt = testEffect(
+    Goal.layer.pipe(
+      Layer.provide(SessionStatus.defaultLayer),
+      Layer.provideMerge(Database.defaultLayer),
+      Layer.provideMerge(EventV2Bridge.defaultLayer),
+      Layer.provideMerge(SessionAutomationLease.defaultLayer),
+    ),
+  )
+  const insertCorrupt = (sid: SessionID) =>
+    Effect.gen(function* () {
+      const { db } = yield* Database.Service
+      yield* db.insert(GoalStateTable).values({ session_id: sid, payload: "{corrupt", updated_at: Date.now() })
+    })
+  const rowExists = (sid: SessionID) =>
+    Effect.gen(function* () {
+      const { db } = yield* Database.Service
+      const row = yield* db.select().from(GoalStateTable).where(eq(GoalStateTable.session_id, sid)).get()
+      return row !== undefined
+    })
+
+  corruptIt.instance("/goal clear and /goal stop delete an undecodable row", () =>
+    Effect.gen(function* () {
+      const goal = yield* Goal.Service
+      for (const command of ["clear", "stop"]) {
+        const sid = SessionID.descending()
+        yield* insertCorrupt(sid)
+        const result = yield* goal.dispatch(sid, command).pipe(Effect.exit)
+        expect(Exit.isSuccess(result)).toBe(true)
+        expect(yield* rowExists(sid)).toBe(false)
+      }
+    }),
+  )
+
+  corruptIt.instance("purgeSession deletes an undecodable row so session deletion leaves no orphan", () =>
+    Effect.gen(function* () {
+      const goal = yield* Goal.Service
+      const sid = SessionID.descending()
+      yield* insertCorrupt(sid)
+      expect(Exit.isSuccess(yield* goal.purgeSession(sid).pipe(Effect.exit))).toBe(true)
+      expect(yield* rowExists(sid)).toBe(false)
+    }),
+  )
+
+  corruptIt.instance("the lease Goal authority treats an undecodable row as no active goal", () =>
+    Effect.gen(function* () {
+      const lease = yield* SessionAutomationLease.Service
+      const goal = yield* Goal.Service
+      const sid = SessionID.descending()
+      yield* insertCorrupt(sid)
+      const dagClaim = yield* lease.claim(sid, { kind: "dag" }).pipe(Effect.exit)
+      expect(Exit.isSuccess(dagClaim)).toBe(true)
+      // Non-delete mutations still refuse to overwrite a row this build cannot read.
+      expect(Exit.isSuccess(yield* goal.pauseAndPublish(sid, "x").pipe(Effect.exit))).toBe(false)
+      expect(yield* rowExists(sid)).toBe(true)
+    }),
+  )
+})

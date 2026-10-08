@@ -1,3 +1,4 @@
+// oxlint-disable typescript-eslint/no-unsafe-type-assertion -- mocked service slices and seeded rows use `as never` shims.
 import { describe, expect } from "bun:test"
 import { Cause, Deferred, Effect, Exit, Layer, Option } from "effect"
 import { GoalLoop, GoalLoopJudgeLLM } from "@/goal/loop"
@@ -1042,6 +1043,120 @@ describe("GoalLoop — no assistant in window → visible pause (branch 1)", () 
       expect(String(paused?.paused_reason)).toContain("无 assistant 回复")
       // Visible pause: a noReply prompt was injected (not a bare return).
       expect(promptCalls.some((p) => p.noReply)).toBe(true)
+    }),
+  )
+})
+
+// A non-ignored user message newer than the last reply (HTTP noReply prompt,
+// a /memory or /trust command turn, ESC before any reply) used to make every
+// idle evaluation spend a judge call and then discard the verdict, leaving the
+// goal active with no continuation and no visible pause. The loop now skips
+// the judge and pauses visibly under the idle fence; a real prompt that is
+// still running (Session busy) is left alone and judged once it is answered.
+describe("GoalLoop — unanswered user message after the last reply", () => {
+  let judgeCalls = 0
+  const promptCalls: { noReply?: boolean; text: string }[] = []
+  let window: unknown[] = []
+  const reset = () => {
+    judgeCalls = 0
+    promptCalls.length = 0
+  }
+  const message = (id: string, role: "user" | "assistant", created: number, text: string) =>
+    ({ info: { id, role, time: { created } }, parts: [{ type: "text", text }] }) as never
+
+  const branchLayer = GoalLoop.layer.pipe(
+    Layer.provide(Layer.succeed(Session.Service, { messages: () => Effect.succeed(window) } as never)),
+    Layer.provide(recordingPrompt(promptCalls)),
+    Layer.provide(Layer.succeed(Provider.Service, {} as never)),
+    Layer.provide(
+      Layer.succeed(
+        GoalLoopJudgeLLM,
+        GoalLoopJudgeLLM.of({
+          call: () =>
+            Effect.sync(() => {
+              judgeCalls += 1
+              return JSON.stringify({ verdict: "continue", reason: "more work" })
+            }),
+        }),
+      ),
+    ),
+    Layer.provideMerge(Goal.defaultLayer),
+    Layer.provideMerge(SessionStatus.defaultLayer),
+    Layer.provideMerge(EventV2Bridge.defaultLayer),
+  )
+  const it = testEffect(branchLayer)
+
+  it.instance("an idle Session with an unanswered user message pauses the goal visibly without judging", () =>
+    Effect.gen(function* () {
+      reset()
+      const now = Date.now()
+      window = [
+        message("asst-1", "assistant", now - 2_000, "I made progress; next I will add tests."),
+        message("user-noreply", "user", now - 1_000, "/memory status"),
+      ]
+      const loop = yield* GoalLoop.Service
+      const goal = yield* Goal.Service
+      const events = yield* EventV2Bridge.Service
+      yield* loop.init()
+      const sid = SessionID.descending()
+      yield* goal.set(sid, "ship the feature", 10)
+      yield* Effect.yieldNow
+
+      yield* events.publish(SessionStatus.Event.Status, { sessionID: sid, status: { type: "idle" } })
+      yield* pollWithTimeout(
+        Effect.gen(function* () {
+          return (yield* goal.load(sid))?.status === "paused" && promptCalls.length > 0 ? true : undefined
+        }),
+        "the unanswered user message never paused the goal",
+        "5 seconds",
+      )
+
+      const paused = yield* goal.load(sid)
+      expect(String(paused?.paused_reason)).toContain("尚未得到回复")
+      expect(Number(paused?.turns_used)).toBe(0)
+      expect(judgeCalls).toBe(0)
+      expect(promptCalls).toEqual([{ noReply: true, text: expect.stringContaining("⏸ 目标已暂停") }])
+    }),
+  )
+
+  it.instance("a running user turn is not paused; its answered reply is judged and continued", () =>
+    Effect.gen(function* () {
+      reset()
+      const now = Date.now()
+      window = [
+        message("asst-1", "assistant", now - 2_000, "I made progress; next I will add tests."),
+        message("user-real", "user", now - 1_000, "also update the docs"),
+      ]
+      const loop = yield* GoalLoop.Service
+      const goal = yield* Goal.Service
+      const events = yield* EventV2Bridge.Service
+      const status = yield* SessionStatus.Service
+      yield* loop.init()
+      const sid = SessionID.descending()
+      yield* goal.set(sid, "ship the feature", 10)
+      yield* Effect.yieldNow
+
+      // The user's prompt is admitted and running: an idle event observed for
+      // the previous boundary must not pause the goal or spend a judge call.
+      yield* status.set(sid, { type: "busy" })
+      yield* events.publish(SessionStatus.Event.Status, { sessionID: sid, status: { type: "idle" } })
+      yield* Effect.sleep("200 millis")
+      expect((yield* goal.load(sid))?.status).toBe("active")
+      expect(judgeCalls).toBe(0)
+      expect(promptCalls).toEqual([])
+
+      // The turn answers the user; its real idle event drives the goal on.
+      window = [...window, message("asst-2", "assistant", now, "Docs updated as requested.")]
+      yield* status.set(sid, { type: "idle" })
+      yield* pollWithTimeout(
+        Effect.sync(() => (promptCalls.some((p) => !p.noReply) ? true : undefined)),
+        "the answered user turn never drove a continuation",
+        "5 seconds",
+      )
+      expect(judgeCalls).toBe(1)
+      const state = yield* goal.load(sid)
+      expect(state?.status).toBe("active")
+      expect(Number(state?.turns_used)).toBe(1)
     }),
   )
 })
