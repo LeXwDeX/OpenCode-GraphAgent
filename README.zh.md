@@ -285,7 +285,7 @@ DAG 相关的东西都放在 `.opencode/` 下，在 opencode 配置目录（`OPE
 |---|---|---|
 | `.opencode/dag.jsonc` | 模型分层（`advanced` / `standard`）与子会话 `thinking_depth` | `<配置目录>/dag.jsonc`，首次使用时生成带注释的默认文件 |
 | `.opencode/workflows/*.yaml` | 存盘的工作流 spec，可按名字启动 | `<配置目录>/workflows/*.yaml` |
-| `.opencode/dag-prompts/*.md` | 由 `prompt_template.id` 引用的节点 prompt 模板 | ——（仅项目级） |
+| `.opencode/dag-prompts/*.md` | 由 `prompt_template.id` 引用的节点 prompt 模板（项目优先） | `<配置目录>/dag-prompts/*.md` |
 | `.opencode/workflow-reports/` | 节点报告文件（自动 gitignore） | —— |
 
 `dag.jsonc` 和工作流库都是惰性读取，改完下一次启动工作流就生效，不用重启。

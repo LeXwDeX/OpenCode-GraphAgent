@@ -350,7 +350,7 @@ Everything else inherits the main opencode configuration.
 |---|---|---|
 | `.opencode/dag.jsonc` | Model tiers (`advanced` / `standard`) and `thinking_depth` for child sessions | `<config dir>/dag.jsonc`, seeded with comments on first use |
 | `.opencode/workflows/*.yaml` | Saved workflow specs, startable by name | `<config dir>/workflows/*.yaml` |
-| `.opencode/dag-prompts/*.md` | Node prompt templates referenced by `prompt_template.id` | — (project-scoped) |
+| `.opencode/dag-prompts/*.md` | Node prompt templates referenced by `prompt_template.id` (project first) | `<config dir>/dag-prompts/*.md` |
 | `.opencode/workflow-reports/` | Node report files (auto-gitignored) | — |
 
 Both `dag.jsonc` and the workflow library are read lazily, so an edit applies to
