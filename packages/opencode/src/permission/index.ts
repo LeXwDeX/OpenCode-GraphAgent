@@ -22,6 +22,11 @@ export interface AskOptions {
    */
   readonly force?: boolean
   /**
+   * The user already confirmed this exact tool call in a forced ask: ask-level rules settle as allowed
+   * without another dialog or PermissionRequest hook. Deny rules still apply.
+   */
+  readonly confirmed?: boolean
+  /**
    * The tool's own arguments, merged into PermissionRequest/PermissionDenied
    * `tool_input` alongside the legacy permission fields (see hookToolInput).
    */
@@ -137,7 +142,7 @@ export const layer = Layer.effect(
         needsAsk = true
       }
 
-      if (!needsAsk) return
+      if (!needsAsk || (options?.confirmed === true && !force)) return
 
       const id = request.id ?? PermissionV1.ID.ascending()
       const info: PermissionV1.Request = {
@@ -176,7 +181,13 @@ export const layer = Layer.effect(
         }
         // A forced ask (PreToolUse hook `ask`) requires the user's confirmation:
         // a PermissionRequest hook may still deny it, but its allow is ignored.
-        if (hookResult.permissionDecision === "allow" && !force) return
+        if (hookResult.permissionDecision === "allow") {
+          if (!force) return
+          yield* Effect.logInfo("PermissionRequest hook allow ignored for a hook-forced ask", {
+            permission: info.permission,
+            "session.id": info.sessionID,
+          })
+        }
       }
       const deferred = yield* Deferred.make<void, PermissionV1.RejectedError | PermissionV1.CorrectedError>()
       pending.set(id, { info, deferred, force })

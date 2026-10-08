@@ -72,33 +72,41 @@ const PLAN_RULES = [
   { permission: "bash", pattern: "git *", action: "allow" as const },
 ]
 
-const setup = Effect.gen(function* () {
-  const instance = yield* TestInstance
-  directory = instance.directory
-  const store = yield* SessionHooks.Service
-  const id = SessionID.descending()
-  const ask = {
+type Rule = { permission: string; pattern: string; action: "allow" | "deny" | "ask" }
+
+const setupWith = (hookOutput: Record<string, unknown>, agentName: string, rules: Rule[]) =>
+  Effect.gen(function* () {
+    const instance = yield* TestInstance
+    directory = instance.directory
+    const store = yield* SessionHooks.Service
+    const id = SessionID.descending()
+    yield* store.add(id, {
+      event: "PreToolUse",
+      hooks: [{ type: "command", command: "printf '%s' " + quote(JSON.stringify(hookOutput)) }],
+    })
+    const tools = yield* SessionTools.resolve({
+      agent: { name: agentName, permission: rules, options: {} } as any,
+      model: ProviderTest.model(),
+      session: { id, directory, permission: [] } as any,
+      processor: {
+        message: { id: MessageID.ascending(), sessionID: id },
+        updateToolCall: () => Effect.succeed(undefined),
+        completeToolCall: () => Effect.void,
+      } as any,
+      bypassAgentCheck: false,
+      messages: [],
+      promptOps: {} as any,
+    })
+    return { tools: tools as Record<string, any>, directory }
+  })
+
+const setup = setupWith(
+  {
     hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "ask", permissionDecisionReason: "confirm" },
-  }
-  yield* store.add(id, {
-    event: "PreToolUse",
-    hooks: [{ type: "command", command: "printf '%s' " + quote(JSON.stringify(ask)) }],
-  })
-  const tools = yield* SessionTools.resolve({
-    agent: { name: "plan", permission: PLAN_RULES, options: {} } as any,
-    model: ProviderTest.model(),
-    session: { id, directory, permission: [] } as any,
-    processor: {
-      message: { id: MessageID.ascending(), sessionID: id },
-      updateToolCall: () => Effect.succeed(undefined),
-      completeToolCall: () => Effect.void,
-    } as any,
-    bypassAgentCheck: false,
-    messages: [],
-    promptOps: {} as any,
-  })
-  return { tools: tools as Record<string, any>, directory }
-})
+  },
+  "plan",
+  PLAN_RULES,
+)
 
 // Runs the tool, approves the hook's confirmation dialog once, returns the tool exit.
 const runApprovingHookAsk = (tools: Record<string, any>, name: string, args: Record<string, unknown>) =>
@@ -149,6 +157,63 @@ describe("hook permissionDecision ask with pattern-scoped rulesets", () => {
       expect(Exit.isSuccess(allowed)).toBe(true)
       const denied = yield* runApprovingHookAsk(tools, "bash", { command: "curl example.com" })
       expect(Exit.isFailure(denied)).toBe(true)
+    }),
+  )
+})
+
+// The user confirms exactly what will run: a hook-rewritten input is shown in the forced dialog, and that
+// confirmation settles the tool's own ask-level check for the same call. Deny rules still apply.
+const setupRewrite = (rules: Rule[]) =>
+  setupWith(
+    {
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: "ask",
+        permissionDecisionReason: "rewritten command",
+        updatedInput: { command: "git log --oneline" },
+      },
+    },
+    "build",
+    rules,
+  ).pipe(Effect.map((result) => result.tools))
+
+describe("hook permissionDecision ask confirms the effective input once", () => {
+  it.instance("shows the rewritten input and reason, then runs without a second dialog", () =>
+    Effect.gen(function* () {
+      const tools = yield* setupRewrite([{ permission: "bash", pattern: "*", action: "ask" }])
+      const permission = yield* Permission.Service
+      const fiber = yield* Effect.tryPromise(() =>
+        tools.bash.execute(
+          { command: "make clean" },
+          { toolCallId: "call-rewrite", messages: [], abortSignal: new AbortController().signal },
+        ),
+      ).pipe(Effect.forkScoped)
+      const pending = yield* pollWithTimeout(
+        permission.list().pipe(Effect.map((list) => (list.length > 0 ? list : undefined))),
+        "hook ask did not surface a permission dialog",
+      )
+      expect(pending).toHaveLength(1)
+      expect(pending[0].always).toEqual([])
+      expect(pending[0].metadata).toMatchObject({
+        hookAsk: true,
+        reason: "rewritten command",
+        input: { command: "git log --oneline" },
+      })
+      yield* permission.reply({ requestID: pending[0].id, reply: "once" })
+      const exit = yield* Fiber.await(fiber)
+      expect(Exit.isSuccess(exit)).toBe(true)
+      expect((yield* permission.list()).length).toBe(0)
+    }),
+  )
+
+  it.instance("a confirmed forced ask still loses to a deny rule on the effective input", () =>
+    Effect.gen(function* () {
+      const tools = yield* setupRewrite([
+        { permission: "bash", pattern: "*", action: "ask" },
+        { permission: "bash", pattern: "git log *", action: "deny" },
+      ])
+      const exit = yield* runApprovingHookAsk(tools, "bash", { command: "echo hi" })
+      expect(Exit.isFailure(exit)).toBe(true)
     }),
   )
 })

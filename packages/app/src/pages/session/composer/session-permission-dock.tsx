@@ -4,6 +4,7 @@ import { Button } from "@opencode-ai/ui/button"
 import { DockPrompt } from "@opencode-ai/session-ui/dock-prompt"
 import { Icon } from "@opencode-ai/ui/icon"
 import { useLanguage } from "@/context/language"
+import { hookAskInput } from "./hook-ask-input"
 
 export function SessionPermissionDock(props: {
   request: PermissionRequest
@@ -12,11 +13,22 @@ export function SessionPermissionDock(props: {
 }) {
   const language = useLanguage()
 
+  const hookReason = () => {
+    const reason = props.request.metadata?.reason
+    return props.request.metadata?.hookAsk === true && typeof reason === "string" ? reason : ""
+  }
+
   const toolDescription = () => {
     const key = `settings.permissions.tool.${props.request.permission}.description`
     const value = language.t(key as Parameters<typeof language.t>[0])
     if (value === key) return ""
     return value
+  }
+
+  // A hook-forced ask confirms the effective input; its pattern is only the tool name.
+  const shown = () => {
+    const input = hookAskInput(props.request)
+    return input ? [input] : props.request.patterns
   }
 
   return (
@@ -37,14 +49,16 @@ export function SessionPermissionDock(props: {
             <Button variant="ghost" size="normal" onClick={() => props.onDecide("reject")} disabled={props.responding}>
               {language.t("ui.permission.deny")}
             </Button>
-            <Button
-              variant="secondary"
-              size="normal"
-              onClick={() => props.onDecide("always")}
-              disabled={props.responding}
-            >
-              {language.t("ui.permission.allowAlways")}
-            </Button>
+            <Show when={props.request.always.length > 0}>
+              <Button
+                variant="secondary"
+                size="normal"
+                onClick={() => props.onDecide("always")}
+                disabled={props.responding}
+              >
+                {language.t("ui.permission.allowAlways")}
+              </Button>
+            </Show>
             <Button variant="primary" size="normal" onClick={() => props.onDecide("once")} disabled={props.responding}>
               {language.t("ui.permission.allowOnce")}
             </Button>
@@ -52,6 +66,13 @@ export function SessionPermissionDock(props: {
         </>
       }
     >
+      <Show when={hookReason()}>
+        <div data-slot="permission-row">
+          <span data-slot="permission-spacer" aria-hidden="true" />
+          <div data-slot="permission-hint">{hookReason()}</div>
+        </div>
+      </Show>
+
       <Show when={toolDescription()}>
         <div data-slot="permission-row">
           <span data-slot="permission-spacer" aria-hidden="true" />
@@ -59,11 +80,11 @@ export function SessionPermissionDock(props: {
         </div>
       </Show>
 
-      <Show when={props.request.patterns.length > 0}>
+      <Show when={shown().length > 0}>
         <div data-slot="permission-row">
           <span data-slot="permission-spacer" aria-hidden="true" />
           <div data-slot="permission-patterns">
-            <For each={props.request.patterns}>
+            <For each={shown()}>
               {(pattern) => <code class="text-12-regular text-text-base break-all">{pattern}</code>}
             </For>
           </div>

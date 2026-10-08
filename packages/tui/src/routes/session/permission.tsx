@@ -108,6 +108,9 @@ function TextBody(props: { title: string; description?: string; icon?: string })
   )
 }
 
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value)
+
 export function PermissionPrompt(props: { request: PermissionRequest; directory?: string }) {
   const sdk = useSDK()
   const project = useProject()
@@ -119,7 +122,15 @@ export function PermissionPrompt(props: { request: PermissionRequest; directory?
 
   const session = createMemo(() => sync.data.session.find((s) => s.id === props.request.sessionID))
 
+  // A hook-forced ask carries the input the tool will actually run with (including hook rewrites).
+  const hookAsk = () => props.request.metadata?.hookAsk === true
+  const hookReason = () => {
+    const reason = props.request.metadata?.reason
+    return hookAsk() && typeof reason === "string" ? reason : ""
+  }
   const input = createMemo(() => {
+    const effective = props.request.metadata?.input
+    if (hookAsk() && isRecord(effective)) return effective
     const tool = props.request.tool
     if (!tool) return {}
     const parts = sync.data.part[tool.messageID] ?? []
@@ -397,12 +408,26 @@ export function PermissionPrompt(props: { request: PermissionRequest; directory?
             </box>
           )
 
+          // "Allow always" is offered only when the request carries patterns it would persist.
+          const options: Record<string, string> =
+            props.request.always.length > 0
+              ? { once: "Allow once", always: "Allow always", reject: "Reject" }
+              : { once: "Allow once", reject: "Reject" }
           const body = (
             <Prompt
               title="Permission required"
               header={header()}
-              body={current.body}
-              options={{ once: "Allow once", always: "Allow always", reject: "Reject" }}
+              body={
+                <box flexDirection="column" gap={1}>
+                  <Show when={hookReason()}>
+                    <box paddingLeft={1}>
+                      <text fg={theme.warning}>{"Hook: " + hookReason()}</text>
+                    </box>
+                  </Show>
+                  {current.body}
+                </box>
+              }
+              options={options}
               escapeKey="reject"
               fullscreen
               onSelect={(option) => {
