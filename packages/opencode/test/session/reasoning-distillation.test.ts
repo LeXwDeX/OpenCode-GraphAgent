@@ -37,6 +37,7 @@ import {
   parseSupport,
   projectDistillationAISDK,
   reasoningHistory,
+  turnReasoning,
   resolveOrganizerTier,
   runJudge,
   runDistillationCycle,
@@ -1550,4 +1551,41 @@ test("reasoning preparation cadence includes every completed user turn", () => {
   ])
   expect(isDistillationTurn(NaN)).toBe(false)
   expect(isDistillationTurn(1.5)).toBe(false)
+})
+
+describe("completed-turn reasoning snapshot", () => {
+  test("includes only the turn's assistant reasoning, with editability and settlement", () => {
+    const assistant = (id: string, text: string, metadata?: Record<string, unknown>) => ({
+      info: { id, role: "assistant", time: { created: 1, completed: 2 } },
+      parts: [
+        {
+          id: `${id}-r`,
+          messageID: id,
+          sessionID: "s1",
+          type: "reasoning",
+          text,
+          metadata,
+          time: { start: 1, end: 2 },
+        },
+        { id: `${id}-t`, messageID: id, sessionID: "s1", type: "text", text: "answer", time: { start: 1, end: 2 } },
+      ],
+    })
+    const messages = [
+      { info: { id: "u1", role: "user", time: { created: 1 } }, parts: [] },
+      assistant("old", "旧轮次思考"),
+      { info: { id: "u2", role: "user", time: { created: 1 } }, parts: [] },
+      assistant("new-1", "本轮思考一"),
+      assistant("new-2", "本轮签名思考", { anthropic: { signature: "sig" } }),
+    ] as unknown as SessionV1.WithParts[]
+    const snapshot = turnReasoning(messages, new Set(["new-1", "new-2"]))
+    expect(snapshot.groups.map((group) => group.messageID)).toEqual(["new-1", "new-2"])
+    expect(snapshot.groups[0].parts[0]).toMatchObject({
+      partID: "new-1-r",
+      text: "本轮思考一",
+      settled: true,
+      canonicalEditable: true,
+    })
+    expect(snapshot.groups[1].parts[0]).toMatchObject({ signed: true, canonicalEditable: false })
+    expect(turnReasoning(messages, new Set()).groups).toEqual([])
+  })
 })

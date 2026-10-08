@@ -708,7 +708,8 @@ export const layer = Layer.effect(
                     const prepared = yield* llm.prepare(completedRequest)
                     const configuredSmall = Config.latest(yield* config.entries(), "small_model")
                     const auxiliaryModel = yield* models
-                      .resolveSmall(ProviderV2.ID.make(model.provider), configuredSmall)
+                      // A declared no-reasoning variant keeps the organizer fast; otherwise it requests low effort.
+                      .resolveSmall(ProviderV2.ID.make(model.provider), configuredSmall, ModelV2.VariantID.make("none"))
                       .pipe(Effect.catch(() => Effect.succeed(undefined)))
                     if (!auxiliaryModel) {
                       yield* Effect.logInfo("reasoning distillation skipped", {

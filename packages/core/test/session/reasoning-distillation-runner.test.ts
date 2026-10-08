@@ -197,7 +197,11 @@ describe("Core runner reasoning distillation adapter", () => {
         ...history(),
         content: [
           ...history().content,
-          { type: "reasoning" as const, id: "reasoning-2", text: "权限不足。任务未完成。" },
+          {
+            type: "reasoning" as const,
+            id: "reasoning-2",
+            text: "运行迁移时权限不足，无法写入目标目录。更换目录后仍失败，任务未完成，需要用户授权后再继续。",
+          },
         ],
       }
       const conversion = toLLMMessagesWithBindings([source], model)
@@ -729,6 +733,122 @@ describe("Core runner reasoning distillation adapter", () => {
         [true, true],
       ])
       expect(generated).toHaveLength(4)
+    }),
+  )
+
+  const turnSource = (index: number): SessionMessage.Assistant => ({
+    ...history(),
+    id: SessionMessage.ID.make(`msg_turn_${index}`),
+    content: [
+      {
+        type: "reasoning",
+        id: `reasoning-turn-${index}`,
+        text: `第 ${index} 轮：先猜测原因是缓存，再看看日志。确认真实原因是权限不足，最终决定改用安全路径并保留回滚步骤。`,
+      },
+    ],
+  })
+
+  const distillTurn = (
+    adapter: ReturnType<typeof CoreReasoningDistillation.make>,
+    sessionID: string,
+    index: number,
+    auxiliaryModel: Model = model,
+  ) =>
+    Effect.gen(function* () {
+      const source = turnSource(index)
+      const conversion = toLLMMessagesWithBindings([source], model)
+      const request = LLM.request({ model, messages: conversion.messages })
+      return yield* adapter.distill({
+        target: "canonical",
+        sessionID,
+        request,
+        auxiliaryModel,
+        prepared: yield* prepare(request),
+        sourceMessages: [source],
+        bindings: conversion.reasoningBindings,
+        config: new ConfigReasoningDistillation.Info({ compatibility: [] }),
+      })
+    })
+
+  it.effect("reconciles reservations with reported usage so long sessions keep distilling", () =>
+    Effect.gen(function* () {
+      let calls = 0
+      const adapter = CoreReasoningDistillation.make({
+        prepare: mockPrepare,
+        stream: () => Stream.empty,
+        generate: () =>
+          Effect.sync(() => {
+            calls++
+            return response("决定改用安全路径。", 300)
+          }),
+      })
+      for (let index = 1; index <= 20; index++) {
+        const result = yield* distillTurn(adapter, "ses_long_session", index)
+        expect(result.applied).toBe(true)
+        expect(result.usage?.paidAdmissionPaused).toBe(false)
+      }
+      expect(calls).toBe(20)
+    }),
+  )
+
+  it.effect("refunds a call without a response and pauses only after consecutive failures", () =>
+    Effect.gen(function* () {
+      let mode: "fail" | "ok" = "fail"
+      let calls = 0
+      const adapter = CoreReasoningDistillation.make({
+        prepare: mockPrepare,
+        stream: () => Stream.empty,
+        generate: () =>
+          Effect.suspend(() => {
+            calls++
+            return mode === "fail" ? Effect.die(new Error("timeout")) : Effect.succeed(response("决定改用安全路径。"))
+          }),
+      })
+      const failed = yield* distillTurn(adapter, "ses_failures", 1)
+      expect(failed.applied).toBe(false)
+      expect(failed.usage).toMatchObject({ reservedTokens: 0, paidAdmissionPaused: false })
+      mode = "ok"
+      expect((yield* distillTurn(adapter, "ses_failures", 2)).applied).toBe(true)
+      mode = "fail"
+      for (const index of [3, 4])
+        expect((yield* distillTurn(adapter, "ses_failures", index)).usage?.paidAdmissionPaused).toBe(false)
+      expect((yield* distillTurn(adapter, "ses_failures", 5)).usage?.paidAdmissionPaused).toBe(true)
+      const before = calls
+      const paused = yield* distillTurn(adapter, "ses_failures", 6)
+      expect(paused.skipReason).toBe("call-budget-exhausted")
+      expect(calls).toBe(before)
+    }),
+  )
+
+  it.effect("keeps a declared no-reasoning variant and uses the configured auxiliary timeout", () =>
+    Effect.gen(function* () {
+      const generated: LLMRequest[] = []
+      const adapter = CoreReasoningDistillation.make({
+        prepare: mockPrepare,
+        stream: () => Stream.empty,
+        generate: (request) =>
+          Effect.sync(() => {
+            generated.push(request)
+            return response("决定改用安全路径。")
+          }),
+      })
+      const none = Model.make({
+        id: "small-none",
+        provider: "distillation-provider",
+        route: model.route.with({ http: { body: { reasoning_effort: "none" } } }),
+      })
+      const previous = process.env.OPENCODE_REASONING_DISTILLATION_AUX_TIMEOUT_MS
+      process.env.OPENCODE_REASONING_DISTILLATION_AUX_TIMEOUT_MS = "45000"
+      try {
+        yield* distillTurn(adapter, "ses_none_variant", 1, none)
+      } finally {
+        if (previous === undefined) delete process.env.OPENCODE_REASONING_DISTILLATION_AUX_TIMEOUT_MS
+        else process.env.OPENCODE_REASONING_DISTILLATION_AUX_TIMEOUT_MS = previous
+      }
+      expect(generated).toHaveLength(1)
+      expect(generated[0].http?.body).toBeUndefined()
+      expect(generated[0].providerOptions).toBeUndefined()
+      expect(Duration.toMillis(Duration.fromInputUnsafe(generated[0].http!.timeout!))).toBe(45_000)
     }),
   )
 })

@@ -10,7 +10,8 @@ import {
 } from "@opencode-ai/llm"
 import { RequestExecutor } from "@opencode-ai/llm/route"
 import { Duration, Effect, Option, Semaphore } from "effect"
-import type { Info as ReasoningDistillationConfig } from "../../config/reasoning-distillation"
+import { resolveLanguage, type Info as ReasoningDistillationConfig } from "../../config/reasoning-distillation"
+import { Flag } from "../../flag/flag"
 import { Hash } from "../../util/hash"
 import { Token } from "../../util/token"
 import {
@@ -80,6 +81,7 @@ type LifecycleState = Readonly<{
   unknownUsageCalls: number
   latencyMs: number
   paidAdmissionPaused: boolean
+  consecutiveFailures: number
 }>
 
 const emptyState: LifecycleState = {
@@ -94,6 +96,7 @@ const emptyState: LifecycleState = {
   unknownUsageCalls: 0,
   latencyMs: 0,
   paidAdmissionPaused: false,
+  consecutiveFailures: 0,
 }
 
 type Slot = Readonly<ReasoningMessageBinding & { structureRewritable: boolean }>
@@ -656,12 +659,33 @@ export const make = (llm: LLMClientShape) => {
           text: slot.text,
         }))
         let reserved = 0
+        let responded = false
+        let interrupted = false
         let budgetSkipReason: DistillationSkipReason | undefined
+        // The organizer runs at low effort unless the model (e.g. its declared `none` variant) already disables
+        // reasoning; any other declared effort is overridden.
+        const declaresEffort = [auxiliaryModel.route.defaults.http?.body, auxiliaryModel.defaults?.http?.body].some(
+          (body) =>
+            isRecord(body) &&
+            (body.reasoning_effort === "none" ||
+              body.reasoningEffort === "none" ||
+              (isRecord(body.reasoning) && body.reasoning.effort === "none") ||
+              (isRecord(body.thinking) && body.thinking.type === "disabled")),
+        )
+        const timeout = Duration.millis(Flag.OPENCODE_REASONING_DISTILLATION_AUX_TIMEOUT_MS)
         const cancellation = new AbortController()
         const organized = yield* Effect.promise((signal) => {
-          signal.addEventListener("abort", () => cancellation.abort(), { once: true })
+          signal.addEventListener(
+            "abort",
+            () => {
+              interrupted = true
+              cancellation.abort()
+            },
+            { once: true },
+          )
           return organizeReasoning({
             slots,
+            language: resolveLanguage(input.config),
             callModel: async ({ prompt }) => {
               const promptTokens = Token.estimateReserve(prompt)
               const candidateReservation = promptTokens + ReasoningDistillationPolicy.tokens.maxOutputTokens
@@ -691,11 +715,12 @@ export const make = (llm: LLMClientShape) => {
                 tools: [],
                 toolChoice: "none",
                 generation: { temperature: 0, maxTokens: ReasoningDistillationPolicy.tokens.maxOutputTokens },
-                providerOptions: { openai: { reasoningEffort: "low" } },
+                ...(declaresEffort ? {} : { providerOptions: { openai: { reasoningEffort: "low" } } }),
                 http: {
-                  timeout: Duration.seconds(30),
-                  body:
-                    auxiliaryModel.route.protocol === "openai-responses"
+                  timeout,
+                  body: declaresEffort
+                    ? undefined
+                    : auxiliaryModel.route.protocol === "openai-responses"
                       ? { reasoning: { effort: "low" } }
                       : auxiliaryModel.route.protocol === "openai-chat" ||
                           auxiliaryModel.route.protocol === "openai-compatible-chat"
@@ -709,6 +734,7 @@ export const make = (llm: LLMClientShape) => {
                   llm.generate(request).pipe(Effect.provideService(RequestExecutor.MaxRetries, 0)),
                   { signal: cancellation.signal },
                 )
+                responded = true
                 const text = LLMResponse.text(response)
                 if (text.length > ReasoningDistillationPolicy.tokens.maxOutputTokens * 4) return undefined
                 return {
@@ -724,21 +750,33 @@ export const make = (llm: LLMClientShape) => {
         }).pipe(Effect.ensuring(Effect.sync(() => cancellation.abort())))
         if (reserved === 0)
           return {
-            ...unchanged(input.request, budgetSkipReason ?? "projection-failed"),
+            ...unchanged(
+              input.request,
+              budgetSkipReason ?? (organized.reason === "work-limit" ? "work-limit" : "no-rewritable-slot"),
+            ),
             modelCalls: 0,
             usage: usageSnapshot(state),
+            organizeReason: organized.reason,
           }
         const actual = organized.usageTokens
         const validActual =
           typeof actual === "number" && Number.isFinite(actual) && actual >= 0 ? Math.ceil(actual) : undefined
+        // Reconcile the worst-case reservation with what the provider reports. A call that never produced a
+        // response is refunded; unknown usage keeps its reservation and stops paid admission (fail closed).
+        const failed = !responded && !interrupted
+        const consecutiveFailures = failed ? state.consecutiveFailures + 1 : responded ? 0 : state.consecutiveFailures
         const next: LifecycleState = {
           ...state,
           calls: state.calls + 1,
-          reservedTokens: state.reservedTokens + reserved,
+          reservedTokens: state.reservedTokens + (!responded ? 0 : (validActual ?? reserved)),
           actualTokens: state.actualTokens + (validActual ?? 0),
-          unknownUsageCalls: state.unknownUsageCalls + (validActual === undefined ? 1 : 0),
+          unknownUsageCalls: state.unknownUsageCalls + (responded && validActual === undefined ? 1 : 0),
           latencyMs: state.latencyMs + organized.timing.modelMs,
-          paidAdmissionPaused: state.paidAdmissionPaused || validActual === undefined || validActual > reserved,
+          consecutiveFailures,
+          paidAdmissionPaused:
+            state.paidAdmissionPaused ||
+            (responded && (validActual === undefined || validActual > reserved)) ||
+            consecutiveFailures >= ReasoningDistillationPolicy.calls.maxConsecutiveFailures,
         }
         states.set(input.sessionID, next)
         return {

@@ -13,15 +13,23 @@ export class Compatibility extends Schema.Class<Compatibility>("ConfigV2.Reasoni
   upstreamVerified: Schema.Boolean,
 }) {}
 
+export const Language = Schema.Literals(["zh", "en"])
+export type Language = typeof Language.Type
+
 /**
- * Reasoning-distillation switch (default-off; explicit opt-in still requires compatibility authorization).
- * The feature only ever rewrites a reasoning slot that carries a §2.1 dual-evidence compatibility record; absent that
- * record every slot is P5-protected, so enabling the switch is safe and never rewrites an unproven provider.
+ * Reasoning-distillation switch (default-off). When enabled, settled canonical reasoning without signed, encrypted
+ * or unknown provider carriers is organized once per completed turn and the result replaces the stored text.
+ * `compatibility` records only gate the legacy native-wire projector; canonical adoption does not consult them.
  */
 export class Info extends Schema.Class<Info>("ConfigV2.ReasoningDistillation")({
   enabled: Schema.Boolean.pipe(Schema.optional),
+  /** Language of the organized prose; literals such as paths and commands stay verbatim. Defaults to `zh`. */
+  language: Language.pipe(Schema.optional),
   compatibility: Compatibility.pipe(Schema.Array, Schema.optional),
 }) {}
+
+/** Organizer language; Chinese by default because it is shorter for the same content. */
+export const resolveLanguage = (info: Pick<Info, "language"> | undefined): Language => info?.language ?? "zh"
 
 export type EnableSource = "environment" | "config" | "default"
 

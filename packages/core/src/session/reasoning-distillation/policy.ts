@@ -19,6 +19,8 @@ export const ReasoningDistillationPolicy = {
     maxCallsPerIdentity: 2,
     /** Hard project-runtime ceiling per session; failures and cancellations count. */
     maxCallsPerSession: 32,
+    /** Consecutive auxiliary failures without a response before a session stops calling until restart. */
+    maxConsecutiveFailures: 3,
     /** Paid-candidate admission window: amortized over at most this many subsequent real sends (§5.8). */
     amortizationWindow: 8,
   },
@@ -37,8 +39,10 @@ export const ReasoningDistillationPolicy = {
      * fresh budget and clears the pause flag (deliberate; durable metering
      * would need a schema/migration the v1 scope does not carry). */
     maxReservedTokensPerSession: 262_144,
-    /** A non-positive estimated saving skips the call/projection (§5.8). */
+    /** A replacement must be at least this many estimated tokens smaller than its source (§5.8). */
     minimumNetSavingsTokens: 1,
+    /** Reasoning below this estimated size is left as is: the organizer prompt alone costs more. */
+    minimumInputTokens: 32,
   },
   cache: {
     /** Initial entry cap; total derived-body cap; whichever hits first evicts by insertion order (§5.8). */

@@ -48,3 +48,14 @@ describe("ConfigReasoningDistillation.resolveEnabled (D02)", () => {
     expect(decoded.compatibility?.[0].upstreamVerified).toBe(true)
   })
 })
+
+describe("ConfigReasoningDistillation language", () => {
+  test("defaults to Chinese and accepts only zh or en", () => {
+    expect(ConfigReasoningDistillation.resolveLanguage(undefined)).toBe("zh")
+    expect(ConfigReasoningDistillation.resolveLanguage({})).toBe("zh")
+    const decode = Schema.decodeUnknownSync(ConfigReasoningDistillation.Info)
+    expect(ConfigReasoningDistillation.resolveLanguage(decode({ enabled: true, language: "en" }))).toBe("en")
+    expect(ConfigReasoningDistillation.resolveLanguage(decode({ language: "zh" }))).toBe("zh")
+    expect(() => decode({ language: "fr" })).toThrow()
+  })
+})

@@ -72,7 +72,12 @@ export type Error =
 
 export interface Interface {
   readonly resolve: (session: SessionSchema.Info) => Effect.Effect<Model, Error>
-  readonly resolveSmall: (providerID: ProviderV2.ID, configured?: string) => Effect.Effect<Model | undefined, Error>
+  /** `preferredVariant` is applied when the selected small model declares it, and ignored otherwise. */
+  readonly resolveSmall: (
+    providerID: ProviderV2.ID,
+    configured?: string,
+    preferredVariant?: ModelV2.VariantID,
+  ) => Effect.Effect<Model | undefined, Error>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/v2/SessionRunnerModel") {}
@@ -190,7 +195,7 @@ export const locationLayer = Layer.effect(
     const catalog = yield* Catalog.Service
     const integrations = yield* Integration.Service
     return Service.of({
-      resolveSmall: Effect.fn("SessionRunnerModel.resolveSmall")(function* (providerID, configured) {
+      resolveSmall: Effect.fn("SessionRunnerModel.resolveSmall")(function* (providerID, configured, preferredVariant) {
         const ref = configured === undefined ? undefined : ModelV2.parse(configured)
         const selected = ref
           ? (yield* catalog.model.available()).find(
@@ -204,7 +209,12 @@ export const locationLayer = Layer.effect(
         const connection = yield* integrations.connection.active(
           provider?.integrationID ?? Integration.ID.make(selected.providerID),
         )
-        const variant = yield* withVariant(selected, undefined)
+        const variant = yield* withVariant(
+          selected,
+          preferredVariant !== undefined && selected.variants.some((item) => item.id === preferredVariant)
+            ? preferredVariant
+            : undefined,
+        )
         return yield* fromCatalogModel(
           variant,
           connection ? yield* integrations.connection.resolve(connection) : undefined,
