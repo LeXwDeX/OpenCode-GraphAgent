@@ -10,12 +10,6 @@ Guidance for coding agents in GraphAgent, an opencode fork with a DAG workflow e
 - `packages/opencode`: agent runtime. Services compose in `AppLayer` (`src/effect/app-runtime.ts`). Effect v4 (beta) rules, `makeRuntime`/`InstanceState`, tool-schema, and module-shape contracts are owned by `packages/opencode/AGENTS.md` (pattern reference: `packages/opencode/specs/effect/migration.md`).
 - Curated workflow YAML, composable blocks, and reusable worker prompts live in `LeXwDeX/opencode-dag-config`. Release builds embed its snapshot through `DAG_TEMPLATES_DIR` (`packages/opencode/script/generate.ts`). Local builds without that variable omit builtin templates and use project/global libraries. Curated configuration-only changes belong in the configuration repo; runtime routing and policy prompts still live here.
 
-## Agent workflow
-
-- Use multiple agents. `sol` leads scheduling, plans, implementation, and joint review. Use `luna` for simple work, exploration, documentation, and repeated tasks with an established plan. Use `astra` only for the final review of the completed plan and changes before delivery.
-- Give each agent a bounded responsibility. Preserve existing worktree changes and other agents' edits. Keep independent discovery parallel; perform dependent edits and checks in order.
-- For structural discovery, use codebase-memory graph tools first when available. Confirm the project and generation, check coverage for every relied-on path, and read source for stale or missed coverage. Pass evidence and unresolved questions to delegated agents. Use text search for literals and configuration.
-
 ## Secondary development constraints
 
 - Before behavior changes, record Why, Scope, Approach, and Acceptance. Read the affected package rules and existing regression tests. Keep fixes focused; do not combine unrelated cleanup or dependency upgrades.
@@ -38,7 +32,7 @@ Guidance for coding agents in GraphAgent, an opencode fork with a DAG workflow e
 - Build: `cd packages/opencode && bun run build --single` builds the host CLI. Other packages own their build scripts; the root has no `build` script. A successful build does not replace typechecking.
 - Lint: `bun run lint` = `oxlint` with a `--max-warnings` ratchet. The ratchet only tightens: fix warnings, never raise the cap (contract: `_lint_ratchet_note` in `package.json` and the `.oxlintrc.json` header).
 - Tests: do not run bare `bun test` or `bun run test` at the root; both are guarded. Run Bun tests inside a package, preferably through its `test` script. Workspace CI uses `bun turbo test` from the root. The opencode and TUI test scripts pass `--timeout 30000`. App tests use `test:unit` / `test:browser` with the package's happydom preload.
-- macOS browser validation: from `packages/web`, use `bun run test:browser:webkit` for the shared Markdown WebKit regression. Use the installed Playwright SDK and its matching browser revision; install a missing WebKit through that same installed CLI. Do not substitute another cached revision or launch `Playwright.app` directly: the SDK invokes `pw_run.sh` with the bundled frameworks. If the Codex execution sandbox denies WindowServer/LaunchServices, use the execution tool's approved `require_escalated` mode before launching (including headless runs); do not repeat the launch inside that sandbox or change system/sandbox security policies.
+- macOS browser validation: from `packages/web`, use `bun run test:browser:webkit` for the shared Markdown WebKit regression. Use the installed Playwright SDK and its matching browser revision; install a missing WebKit through that same installed CLI. Do not substitute another cached revision or launch `Playwright.app` directly: the SDK invokes `pw_run.sh` with the bundled frameworks. Do not change system or sandbox security policies to launch it.
 - DAG gate: `cd packages/opencode && bun run test:dag-core` — behavior/coverage gate; run it before merging changes to DAG state-machine or persistence code.
 - Format: Prettier `semi: false`, `printWidth: 120`.
 
