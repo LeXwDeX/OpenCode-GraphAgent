@@ -6,6 +6,7 @@ import path from "path"
 import { InvalidResponseDataError, tool, type ModelMessage } from "ai"
 import { Cause, Effect, Exit, Fiber, Layer, Stream } from "effect"
 import { InstanceRef } from "../../src/effect/instance-ref"
+import { ReasoningDistillationPolicy } from "@opencode-ai/core/session/reasoning-distillation"
 import { HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
 import z from "zod"
 import { LLM, strictJSON } from "../../src/session/llm"
@@ -1006,14 +1007,14 @@ const auxiliaryResponse = (content: unknown) =>
     usage: { prompt_tokens: 10, completion_tokens: 10, total_tokens: 20 },
   })
 
-const auxiliaryTextResponse = (text: string, finishReason = "stop") =>
+const auxiliaryTextResponse = (text: string, finishReason = "stop", totalTokens = 20) =>
   Response.json({
     id: "chatcmpl-organize",
     object: "chat.completion",
     created: 0,
     model: "deepseek-test-r1",
     choices: [{ index: 0, message: { role: "assistant", content: text }, finish_reason: finishReason }],
-    usage: { prompt_tokens: 10, completion_tokens: 10, total_tokens: 20 },
+    usage: { prompt_tokens: totalTokens - 10, completion_tokens: 10, total_tokens: totalTokens },
   })
 
 const organizeInput = (
@@ -2560,6 +2561,92 @@ describe("session.llm.stream", () => {
         )
         expect(adopted).toHaveLength(1)
         expect(state.queue).toHaveLength(1)
+      }),
+    { config: () => distillationConfig("opencode-ai-sdk", { canonical: true }) },
+  )
+
+  it.instance(
+    "stops organizing once reported usage fills the per-session reservation ceiling",
+    () =>
+      Effect.gen(function* () {
+        const model = yield* Provider.use.getModel(
+          ProviderV2.ID.make("custom-provider"),
+          ModelV2.ID.make("deepseek-test-r1"),
+        )
+        const sessionID = SessionID.make("session-test-organize-ceiling")
+        const adopted: unknown[][] = []
+        // Usage equal to the output allowance never exceeds a reservation, so it is reconciled rather than
+        // paused; only the 262k session ceiling can stop later turns.
+        const turns = Array.from({ length: 12 }, (_, index) => index + 1)
+        for (const _ of turns)
+          void waitRequest(
+            "/chat/completions",
+            auxiliaryTextResponse("已确认方案A。", "stop", ReasoningDistillationPolicy.tokens.maxOutputTokens),
+          )
+        yield* distillSequenceWith(
+          llmLayerWithExecutor(RequestExecutor.defaultLayer),
+          turns.map((turn) => turnInput(model, sessionID, turn, adopted)),
+        )
+        expect(adopted.length).toBeGreaterThan(1)
+        expect(adopted.length).toBeLessThan(turns.length)
+        // No model call is made after the ceiling is reached.
+        expect(state.queue).toHaveLength(turns.length - adopted.length)
+        state.queue.length = 0
+      }),
+    { config: () => distillationConfig("opencode-ai-sdk", { canonical: true }) },
+  )
+
+  it.instance(
+    "aborts an interrupted organizer call and settles it before the next turn",
+    () =>
+      Effect.gen(function* () {
+        const model = yield* Provider.use.getModel(
+          ProviderV2.ID.make("custom-provider"),
+          ModelV2.ID.make("deepseek-test-r1"),
+        )
+        const sessionID = SessionID.make("session-test-organize-interrupted")
+        const adopted: unknown[][] = []
+        const started = deferred<Capture>()
+        // The first organizer response never completes. Leading JSON whitespace keeps the connection active
+        // (no server idle timeout), so only the client abort can settle the call.
+        state.queue.push({
+          path: "/chat/completions",
+          response: (req) => {
+            let keepAlive: ReturnType<typeof setInterval> | undefined
+            return new Response(
+              new ReadableStream({
+                start(controller) {
+                  keepAlive = setInterval(() => controller.enqueue(new TextEncoder().encode(" ")), 1_000)
+                  req.signal.addEventListener("abort", () => clearInterval(keepAlive), { once: true })
+                },
+                cancel() {
+                  clearInterval(keepAlive)
+                },
+              }),
+              { headers: { "content-type": "application/json" } },
+            )
+          },
+          resolve: started.resolve,
+        })
+        void waitRequest("/chat/completions", auxiliaryTextResponse("已确认方案A。"))
+        const ctx = yield* InstanceRef
+        if (!ctx) return yield* Effect.die("InstanceRef not provided")
+        yield* Effect.promise(() =>
+          Effect.runPromise(
+            Effect.gen(function* () {
+              const svc = yield* LLM.Service
+              const fiber = yield* svc.distill(turnInput(model, sessionID, 1, adopted)).pipe(Effect.forkChild)
+              yield* Effect.promise(() => started.promise)
+              yield* Fiber.interrupt(fiber)
+              yield* svc.distill(turnInput(model, sessionID, 2, adopted))
+            }).pipe(
+              Effect.provide(llmLayerWithExecutor(RequestExecutor.defaultLayer)),
+              Effect.provideService(InstanceRef, ctx),
+            ),
+          ),
+        )
+        expect(adopted).toHaveLength(1)
+        expect(state.queue).toHaveLength(0)
       }),
     { config: () => distillationConfig("opencode-ai-sdk", { canonical: true }) },
   )

@@ -16,6 +16,7 @@ import type { Tool } from "@/tool/tool"
 import { TestInstance } from "../fixture/fixture"
 import { testEffect, pollWithTimeout } from "../lib/effect"
 import { ProviderTest } from "../fake/provider"
+import { jsonSchema, tool } from "ai"
 
 // A PreToolUse `permissionDecision:"ask"` must always surface a dialog, even when
 // the agent's ruleset is a wildcard deny with pattern-scoped allows (plan agent
@@ -229,6 +230,101 @@ describe("hook permissionDecision ask confirms the effective input once", () => 
       ])
       const exit = yield* runApprovingHookAsk(tools, "bash", { command: "echo hi" })
       expect(Exit.isFailure(exit)).toBe(true)
+    }),
+  )
+})
+
+// MCP tools take the same forced-ask path: the dialog shows the rewritten arguments, approval runs exactly those
+// arguments without the tool's own second dialog, and rejection never reaches the MCP server.
+const mcpCalls: unknown[] = []
+const withMcpEcho = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+  Effect.gen(function* () {
+    const mcp = yield* MCP.Service
+    return yield* effect.pipe(
+      Effect.provideService(MCP.Service, {
+        ...mcp,
+        tools: () =>
+          Effect.succeed({
+            fixture_echo: tool({
+              inputSchema: jsonSchema<{ text: string }>({
+                type: "object",
+                properties: { text: { type: "string" } },
+                required: ["text"],
+              }),
+              execute: async (args: { text: string }) => {
+                mcpCalls.push(args)
+                return { content: [{ type: "text" as const, text: `MCP_COMPLETE ${args.text}` }] }
+              },
+            }),
+          }),
+      }),
+      Effect.provideService(
+        Truncate.Service,
+        Truncate.Service.of({ output: (text: string) => Effect.succeed({ content: text, truncated: false }) } as any),
+      ),
+    )
+  })
+
+const setupMcpRewrite = withMcpEcho(
+  setupWith(
+    {
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: "ask",
+        permissionDecisionReason: "rewritten arguments",
+        updatedInput: { text: "rewritten" },
+      },
+    },
+    "build",
+    [{ permission: "fixture_echo", pattern: "*", action: "ask" }],
+  ),
+).pipe(Effect.map((result) => result.tools))
+
+const runMcpEcho = (tools: Record<string, any>, reply: "once" | "reject") =>
+  Effect.gen(function* () {
+    const permission = yield* Permission.Service
+    mcpCalls.length = 0
+    const fiber = yield* Effect.tryPromise(() =>
+      tools.fixture_echo.execute(
+        { text: "original" },
+        { toolCallId: "call-mcp-echo", messages: [], abortSignal: new AbortController().signal },
+      ),
+    ).pipe(Effect.forkScoped)
+    const pending = yield* pollWithTimeout(
+      permission.list().pipe(Effect.map((list) => (list.length > 0 ? list : undefined))),
+      "MCP hook ask did not surface a permission dialog",
+    )
+    expect(pending).toHaveLength(1)
+    expect(pending[0].always).toEqual([])
+    expect(pending[0].metadata).toMatchObject({
+      hookAsk: true,
+      reason: "rewritten arguments",
+      input: { text: "rewritten" },
+    })
+    yield* permission.reply({ requestID: pending[0].id, reply })
+    const exit = yield* Fiber.await(fiber)
+    return { exit, remaining: yield* permission.list() }
+  })
+
+describe("hook permissionDecision ask on MCP tools", () => {
+  it.instance("confirms the rewritten MCP arguments once and runs them", () =>
+    Effect.gen(function* () {
+      const { exit, remaining } = yield* runMcpEcho(yield* setupMcpRewrite, "once")
+      expect(Exit.isSuccess(exit)).toBe(true)
+      if (Exit.isSuccess(exit)) expect(JSON.stringify(exit.value)).toContain("MCP_COMPLETE rewritten")
+      expect(mcpCalls).toEqual([{ text: "rewritten" }])
+      expect(remaining).toHaveLength(0)
+    }),
+  )
+
+  it.instance("a rejected MCP hook ask never calls the server", () =>
+    Effect.gen(function* () {
+      const { exit, remaining } = yield* runMcpEcho(yield* setupMcpRewrite, "reject")
+      expect(Exit.isSuccess(exit)).toBe(true)
+      if (Exit.isSuccess(exit))
+        expect(JSON.stringify(exit.value)).toContain("[Tool denied by hook] rewritten arguments")
+      expect(mcpCalls).toEqual([])
+      expect(remaining).toHaveLength(0)
     }),
   )
 })
