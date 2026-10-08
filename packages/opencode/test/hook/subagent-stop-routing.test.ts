@@ -182,3 +182,39 @@ it.live("SDK-created child session still fires Stop", () =>
     { git: true, config: providerCfg },
   ),
 )
+
+// task.ts fails a foreground child that ended in error without firing
+// SubagentStop, so the child's own loop must still emit StopFailure.
+it.live("failed foreground subagent still fires StopFailure", () =>
+  provideTmpdirServer(
+    Effect.fnUntraced(function* ({ llm, dir }) {
+      const capture = path.join(dir, "stop-failure-events.jsonl")
+      yield* Effect.promise(async () => {
+        await fs.mkdir(path.join(dir, ".opencode"), { recursive: true })
+        await fs.writeFile(
+          path.join(dir, ".opencode", "hooks.json"),
+          JSON.stringify({
+            StopFailure: [{ hooks: [{ type: "command", command: `cat >> '${capture}'; echo >> '${capture}'` }] }],
+          }),
+        )
+      })
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({
+        title: "Subagent failure routing",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      yield* llm.tool("task", { description: "sub task", prompt: "say something", subagent_type: "general" })
+      yield* llm.error(400, { error: { message: "subagent request rejected" } })
+      yield* llm.text("parent done")
+      yield* prompt.prompt({ sessionID: session.id, agent: "build", parts: [{ type: "text", text: "delegate" }] })
+      const events = (yield* Effect.promise(() => fs.readFile(capture, "utf8").catch(() => "")))
+        .split("\n")
+        .filter((line) => line.trim())
+        .map((line): { session_id: string; hook_event_name: string } => JSON.parse(line))
+      const child = events.filter((event) => event.session_id !== session.id)
+      expect(child.map((event) => event.hook_event_name)).toEqual(["StopFailure"])
+    }),
+    { git: true, config: providerCfg },
+  ),
+)

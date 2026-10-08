@@ -2038,13 +2038,15 @@ export const layer = Layer.effect(
             } else {
               yield* Effect.logInfo("exiting loop", { "session.id": sessionID })
               let agentContinuationPrevented = false
-              // Main-agent Stop/StopFailure do not fire for foreground task-tool
-              // subagents: task.ts fires SubagentStop (and drives its continuation)
-              // for them. Only positively registered sessions are skipped; any other
-              // child (SDK-created, DAG node, background task) still fires Stop.
-              const taskSubagent = TaskSubagents.has(sessionID)
+              // Main-agent Stop does not fire for a foreground task-tool subagent's
+              // clean exit: task.ts fires SubagentStop (and drives its continuation)
+              // for it. task.ts fails a child that ended in error or was cancelled
+              // without SubagentStop, so StopFailure still fires for those. Only
+              // positively registered sessions are skipped; any other child
+              // (SDK-created, DAG node, background task) still fires Stop.
+              const taskSubagentCleanExit = !turnError && TaskSubagents.has(sessionID)
               // SettingsHook: Stop on clean turn exit, StopFailure when it ended in error.
-              if (settingsHook && !taskSubagent) {
+              if (settingsHook && !taskSubagentCleanExit) {
                 const lastAssistantMessage =
                   lastAssistantMsg?.parts
                     .filter((part): part is SessionV1.TextPart => part.type === "text")

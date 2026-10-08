@@ -1404,19 +1404,20 @@ function matcherTarget(payload: HookPayload): string | undefined {
  */
 const PER_TRIGGER_DEDUP_EVENTS: ReadonlySet<HookEvent> = new Set(["PreToolUse", "PostToolUse", "PostToolUseFailure"])
 
-/** Identity of a handler for per-trigger dedup: identical handlers run once (CC behavior). */
+/**
+ * Identity of a handler for per-trigger dedup: only fully equivalent handlers
+ * run once (CC behavior). Every configured field takes part (headers, env
+ * allowlists, options, timeout, `__sourceDir` for plugin/skill copies), plus the
+ * expanded command or URL, so handlers that would execute differently all run.
+ */
 function handlerKey(entry: HookCommand): string {
-  return JSON.stringify([
-    entry.type,
-    entry.type === "command" ? expandCommand(entry) : entry.type === "http" ? httpUrl(entry) : commandText(entry),
-    entry.prompt,
-    entry.shell,
-    entry.inputFormat,
-    entry.async === true,
-    entry.asyncRewake === true,
-    // A plugin's or skill's copy of the same handler stays separate.
-    entry.__sourceDir,
-  ])
+  const target =
+    entry.type === "command" ? expandCommand(entry) : entry.type === "http" ? httpUrl(entry) : commandText(entry)
+  return JSON.stringify([target, entry], (_key, value: unknown) =>
+    value && typeof value === "object" && !Array.isArray(value)
+      ? Object.fromEntries(Object.entries(value).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)))
+      : value,
+  )
 }
 
 // ── Effect service ──────────────────────────────────────────────

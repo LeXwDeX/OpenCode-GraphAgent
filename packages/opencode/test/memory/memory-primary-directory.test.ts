@@ -134,4 +134,59 @@ describe("memory primary directory", () => {
       { timeout: 30_000 },
     )
   }
+
+  it.live(
+    "a primary verified earlier is re-checked after its path is reused by another repository",
+    () =>
+      Effect.gen(function* () {
+        const primary = yield* tmpdirScoped({ git: true })
+        const sandbox = yield* tmpdirScoped()
+        yield* provideInstance(primary)(
+          Effect.gen(function* () {
+            const project = yield* Project.Service
+            const { project: info } = yield* project.fromDirectory(primary)
+            yield* project.setInitialized(info.id)
+          }),
+        ).pipe(Effect.provide(testInstanceStoreLayer))
+        fs.cpSync(primary, sandbox, { recursive: true })
+
+        // Same Memory service throughout, as in a long-lived process.
+        yield* provideInstance(sandbox)(
+          Effect.gen(function* () {
+            const memory = yield* Memory.Service
+            expect(yield* memory.setEnabled(false)).toBe("Memory off")
+            expect(fs.existsSync(path.join(primary, ".opencode", "memory.jsonc"))).toBe(true)
+          }),
+        ).pipe(Effect.provide(testInstanceStoreLayer))
+
+        fs.rmSync(primary, { recursive: true, force: true })
+        fs.mkdirSync(primary, { recursive: true })
+        git(primary, "init")
+        git(
+          primary,
+          "-c",
+          "user.email=test@opencode.test",
+          "-c",
+          "user.name=Test",
+          "-c",
+          "commit.gpgsign=false",
+          "commit",
+          "--allow-empty",
+          "-m",
+          `unrelated root ${primary}`,
+        )
+
+        yield* provideInstance(sandbox)(
+          Effect.gen(function* () {
+            const memory = yield* Memory.Service
+            const config = yield* MemoryConfig.Service
+            // `off` must write Project configuration again (the global default is on).
+            expect(yield* memory.setEnabled(false)).toBe("Memory off")
+            expect(fs.existsSync(path.join(primary, ".opencode"))).toBe(false)
+            expect((yield* config.load(sandbox))?.config.enabled).toBe(false)
+          }),
+        ).pipe(Effect.provide(testInstanceStoreLayer))
+      }),
+    { timeout: 30_000 },
+  )
 })

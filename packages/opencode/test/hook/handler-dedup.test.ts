@@ -79,4 +79,34 @@ describe("identical hook handlers are deduplicated per trigger", () => {
         }),
     },
   )
+  it.instance(
+    "same command with different execution options each run",
+    () =>
+      Effect.gen(function* () {
+        const { directory: dir } = yield* TestInstance
+        const hook = yield* SettingsHook.Service
+        yield* hook.trigger(
+          { event: "PreToolUse", toolName: "bash", toolInput: { command: "ls" } },
+          { sessionID: "ses_handler_dedup_options", transcriptPath: "" },
+        )
+        const log = yield* Effect.promise(() => fs.readFile(path.join(dir, "count.log"), "utf8"))
+        expect(log.trim().split("\n").length).toBe(2)
+      }),
+    {
+      init: (dir) =>
+        Effect.promise(async () => {
+          const cmd = `echo x >> '${path.join(dir, "count.log")}'`
+          await fs.mkdir(path.join(dir, ".opencode"), { recursive: true })
+          await fs.writeFile(
+            path.join(dir, ".opencode", "hooks.json"),
+            JSON.stringify({
+              PreToolUse: [
+                { matcher: "bash", hooks: [{ type: "command", command: cmd, timeout: 5 }] },
+                { matcher: "*", hooks: [{ type: "command", command: cmd, timeout: 6 }] },
+              ],
+            }),
+          )
+        }),
+    },
+  )
 })
