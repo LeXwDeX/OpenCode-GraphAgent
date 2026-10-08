@@ -660,7 +660,6 @@ export const make = (llm: LLMClientShape) => {
         }))
         let reserved = 0
         let responded = false
-        let interrupted = false
         let budgetSkipReason: DistillationSkipReason | undefined
         // The organizer runs at low effort unless the model (e.g. its declared `none` variant) already disables
         // reasoning; any other declared effort is overridden.
@@ -675,14 +674,7 @@ export const make = (llm: LLMClientShape) => {
         const timeout = Duration.millis(Flag.OPENCODE_REASONING_DISTILLATION_AUX_TIMEOUT_MS)
         const cancellation = new AbortController()
         const organized = yield* Effect.promise((signal) => {
-          signal.addEventListener(
-            "abort",
-            () => {
-              interrupted = true
-              cancellation.abort()
-            },
-            { once: true },
-          )
+          signal.addEventListener("abort", () => cancellation.abort(), { once: true })
           return organizeReasoning({
             slots,
             language: resolveLanguage(input.config),
@@ -747,7 +739,16 @@ export const make = (llm: LLMClientShape) => {
               }
             },
           })
-        }).pipe(Effect.ensuring(Effect.sync(() => cancellation.abort())))
+        }).pipe(
+          Effect.ensuring(Effect.sync(() => cancellation.abort())),
+          // Interruption does not resume this generator: refund an admitted call that produced no response here,
+          // without counting it as a failure. The per-session lock is still held.
+          Effect.onInterrupt(() =>
+            Effect.sync(() => {
+              if (reserved > 0 && !responded) states.set(input.sessionID, { ...state, calls: state.calls + 1 })
+            }),
+          ),
+        )
         if (reserved === 0)
           return {
             ...unchanged(
@@ -763,7 +764,7 @@ export const make = (llm: LLMClientShape) => {
           typeof actual === "number" && Number.isFinite(actual) && actual >= 0 ? Math.ceil(actual) : undefined
         // Reconcile the worst-case reservation with what the provider reports. A call that never produced a
         // response is refunded; unknown usage keeps its reservation and stops paid admission (fail closed).
-        const failed = !responded && !interrupted
+        const failed = !responded
         const consecutiveFailures = failed ? state.consecutiveFailures + 1 : responded ? 0 : state.consecutiveFailures
         const next: LifecycleState = {
           ...state,

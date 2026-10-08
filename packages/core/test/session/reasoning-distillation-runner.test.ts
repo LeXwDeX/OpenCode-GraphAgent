@@ -820,6 +820,29 @@ describe("Core runner reasoning distillation adapter", () => {
     }),
   )
 
+  it.effect("refunds an interrupted organizer call without counting a failure", () =>
+    Effect.gen(function* () {
+      const started = yield* Deferred.make<void>()
+      let hang = true
+      const adapter = CoreReasoningDistillation.make({
+        prepare: mockPrepare,
+        stream: () => Stream.empty,
+        generate: () =>
+          hang
+            ? Deferred.succeed(started, undefined).pipe(Effect.andThen(Effect.never))
+            : Effect.succeed(response("决定改用安全路径。", 300)),
+      })
+      const fiber = yield* distillTurn(adapter, "ses_interrupted", 1).pipe(Effect.forkChild)
+      yield* Deferred.await(started)
+      yield* Fiber.interrupt(fiber)
+      hang = false
+      const next = yield* distillTurn(adapter, "ses_interrupted", 2)
+      expect(next.applied).toBe(true)
+      // Only the completed call's reported usage remains reserved.
+      expect(next.usage).toMatchObject({ reservedTokens: 300, paidAdmissionPaused: false })
+    }),
+  )
+
   it.effect("keeps a declared no-reasoning variant and uses the configured auxiliary timeout", () =>
     Effect.gen(function* () {
       const generated: LLMRequest[] = []
