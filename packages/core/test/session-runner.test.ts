@@ -1,6 +1,4 @@
 import { ConfigReasoningDistillation } from "../src/config/reasoning-distillation"
-import { adapterVersion } from "../src/session/runner/reasoning-distillation"
-import { Hash } from "../src/util/hash"
 import { describe, expect } from "bun:test"
 import {
   LLMResponse,
@@ -913,7 +911,7 @@ describe("SessionRunnerLLM", () => {
         ["Initial context\n\nBuild skills"],
         ["Initial context\n\nBuild skills"],
       ])
-      expect(systemTexts(requests[1]!)).toContainEqual(expect.stringContaining("Reviewer skills"))
+      expect(systemTexts(requests[1])).toContainEqual(expect.stringContaining("Reviewer skills"))
     }),
   )
 
@@ -1536,7 +1534,7 @@ describe("SessionRunnerLLM", () => {
         ["Initial context"],
         ["Initial context"],
       ])
-      expect(systemTexts(requests[1]!)).toContain("Replacement context")
+      expect(systemTexts(requests[1])).toContain("Replacement context")
     }),
   )
 
@@ -1872,8 +1870,8 @@ describe("SessionRunnerLLM", () => {
       yield* Effect.yieldNow
 
       expect(requests).toHaveLength(2)
-      expect(userTexts(requests[0]!)).toEqual(["Start working"])
-      expect(userTexts(requests[1]!)).toEqual(["Start working", "Change direction"])
+      expect(userTexts(requests[0])).toEqual(["Start working"])
+      expect(userTexts(requests[1])).toEqual(["Start working", "Change direction"])
       expect((yield* session.context(sessionID)).map((message) => message.type)).toEqual([
         "user",
         "assistant",
@@ -1924,9 +1922,9 @@ describe("SessionRunnerLLM", () => {
       streamStarted = undefined
 
       expect(requests).toHaveLength(3)
-      expect(userTexts(requests[0]!)).toEqual(["Start working"])
-      expect(userTexts(requests[1]!)).toEqual(["Start working"])
-      expect(userTexts(requests[2]!)).toEqual(["Start working", "Wait until continuation ends"])
+      expect(userTexts(requests[0])).toEqual(["Start working"])
+      expect(userTexts(requests[1])).toEqual(["Start working"])
+      expect(userTexts(requests[2])).toEqual(["Start working", "Wait until continuation ends"])
     }),
   )
 
@@ -1968,8 +1966,8 @@ describe("SessionRunnerLLM", () => {
       streamStarted = undefined
 
       expect(requests).toHaveLength(2)
-      expect(userTexts(requests[0]!)).toEqual(["Interrupt current work"])
-      expect(userTexts(requests[1]!)).toEqual(["Interrupt current work", "Run after interrupt"])
+      expect(userTexts(requests[0])).toEqual(["Interrupt current work"])
+      expect(userTexts(requests[1])).toEqual(["Interrupt current work", "Run after interrupt"])
     }),
   )
 
@@ -2011,8 +2009,8 @@ describe("SessionRunnerLLM", () => {
       streamStarted = undefined
 
       expect(requests).toHaveLength(2)
-      expect(userTexts(requests[0]!)).toEqual(["Interrupt current work"])
-      expect(userTexts(requests[1]!)).toEqual(["Interrupt current work", "Steer after interrupt"])
+      expect(userTexts(requests[0])).toEqual(["Interrupt current work"])
+      expect(userTexts(requests[1])).toEqual(["Interrupt current work", "Steer after interrupt"])
     }),
   )
 
@@ -2053,9 +2051,9 @@ describe("SessionRunnerLLM", () => {
       streamStarted = undefined
 
       expect(requests).toHaveLength(3)
-      expect(userTexts(requests[0]!)).toEqual(["Start working"])
-      expect(userTexts(requests[1]!)).toEqual(["Start working", "Queue first"])
-      expect(userTexts(requests[2]!)).toEqual(["Start working", "Queue first", "Queue second"])
+      expect(userTexts(requests[0])).toEqual(["Start working"])
+      expect(userTexts(requests[1])).toEqual(["Start working", "Queue first"])
+      expect(userTexts(requests[2])).toEqual(["Start working", "Queue first", "Queue second"])
     }),
   )
 
@@ -2088,8 +2086,8 @@ describe("SessionRunnerLLM", () => {
       yield* session.resume(sessionID)
 
       expect(requests).toHaveLength(2)
-      expect(userTexts(requests[0]!)).toEqual(["Start steering"])
-      expect(userTexts(requests[1]!)).toEqual(["Start steering", "Queue for later"])
+      expect(userTexts(requests[0])).toEqual(["Start steering"])
+      expect(userTexts(requests[1])).toEqual(["Start steering", "Queue for later"])
     }),
   )
 
@@ -2140,15 +2138,15 @@ describe("SessionRunnerLLM", () => {
       streamGate = undefined
 
       expect(requests).toHaveLength(4)
-      expect(userTexts(requests[0]!)).toEqual(["Start working"])
-      expect(userTexts(requests[1]!)).toEqual(["Start working", "Queue first"])
-      expect(userTexts(requests[2]!)).toEqual([
+      expect(userTexts(requests[0])).toEqual(["Start working"])
+      expect(userTexts(requests[1])).toEqual(["Start working", "Queue first"])
+      expect(userTexts(requests[2])).toEqual([
         "Start working",
         "Queue first",
         "Steer before next queued input",
         "Also steer before next queued input",
       ])
-      expect(userTexts(requests[3]!)).toEqual([
+      expect(userTexts(requests[3])).toEqual([
         "Start working",
         "Queue first",
         "Steer before next queued input",
@@ -2191,7 +2189,7 @@ describe("SessionRunnerLLM", () => {
       yield* Effect.yieldNow
 
       expect(requests).toHaveLength(2)
-      expect(userTexts(requests[1]!)).toEqual(["Start working", "First steer", "Second steer"])
+      expect(userTexts(requests[1])).toEqual(["Start working", "First steer", "Second steer"])
       yield* (yield* SessionExecution.Service).wake(sessionID)
       yield* Effect.yieldNow
       expect(requests).toHaveLength(2)
@@ -2223,7 +2221,7 @@ describe("SessionRunnerLLM", () => {
       yield* Effect.yieldNow
 
       expect(requests).toHaveLength(2)
-      expect(userTexts(requests[1]!)).toEqual(["Start working", "Recover with this"])
+      expect(userTexts(requests[1])).toEqual(["Start working", "Recover with this"])
     }),
   )
 
@@ -2402,7 +2400,7 @@ describe("SessionRunnerLLM", () => {
       yield* Effect.yieldNow
 
       expect(requests).toHaveLength(1)
-      expect(userTexts(requests[0]!)).toEqual(["Wait in queue"])
+      expect(userTexts(requests[0])).toEqual(["Wait in queue"])
     }),
   )
 
@@ -2428,7 +2426,7 @@ describe("SessionRunnerLLM", () => {
       yield* (yield* SessionExecution.Service).wake(sessionID)
       while (requests.length === 0) yield* Effect.yieldNow
 
-      expect(userTexts(requests[0]!)).toEqual(["Recover promoted input"])
+      expect(userTexts(requests[0])).toEqual(["Recover promoted input"])
     }),
   )
 
@@ -2450,7 +2448,7 @@ describe("SessionRunnerLLM", () => {
       yield* session.resume(sessionID)
 
       expect(requests).toHaveLength(1)
-      expect(userTexts(requests[0]!)).toEqual(["Run committed promotion"])
+      expect(userTexts(requests[0])).toEqual(["Run committed promotion"])
     }),
   )
 
@@ -2665,7 +2663,7 @@ describe("SessionRunnerLLM", () => {
         yield* Effect.yieldNow
         pending = yield* questions.list()
       }
-      yield* questions.reject(pending[0]!.id)
+      yield* questions.reject(pending[0].id)
       const exit = yield* Fiber.join(run)
 
       expect(exit._tag).toBe("Failure")
@@ -3487,111 +3485,131 @@ describe("SessionRunnerLLM", () => {
   )
 })
 
-it.effect("Core runner adopts every slot at turn completion and asynchronously replaces the next turn", () =>
-  Effect.gen(function* () {
-    yield* setup
-    currentModel = Model.make({
-      id: "distillation",
-      provider: "fake",
-      route: OpenAIChat.route.with({ limits: { context: 100_000, output: 4096 } }),
-    })
-    reasoningConfig = new ConfigReasoningDistillation.Info({
-      enabled: true,
-      compatibility: [
-        new ConfigReasoningDistillation.Compatibility({
-          runtime: "core-runner",
-          protocol: currentModel.route.protocol,
-          providerModelVariant: "fake/distillation/default",
-          endpointIdentity: Hash.sha256(currentModel.route.id),
-          adapterVersion,
-          optionsFingerprint: Hash.sha256(JSON.stringify({ openai: { promptCacheKey: sessionID } })),
-          transportVerified: true,
-          upstreamVerified: true,
-        }),
-      ],
-    })
-    const firstStarted = yield* Deferred.make<void>()
-    const releaseFirst = yield* Deferred.make<void>()
-    const secondStarted = yield* Deferred.make<void>()
-    const releaseSecond = yield* Deferred.make<void>()
-    let calls = 0
-    auxiliary = (request) =>
-      Effect.gen(function* () {
-        expect(String(request.model.id)).toBe("small-distillation")
-        const index = calls++
-        if (index === 0) {
-          yield* Deferred.succeed(firstStarted, undefined)
-          yield* Deferred.await(releaseFirst)
-        }
-        if (index === 1) {
-          yield* Deferred.succeed(secondStarted, undefined)
-          yield* Deferred.await(releaseSecond)
-        }
-        const output = { items: [0, 1].map((slot) => ({ slot, text: `采用-r-${index + 1}-${slot}` })) }
-        const result = LLMResponse.fromEvents([
-          LLMEvent.stepStart({ index: 0 }),
-          LLMEvent.textStart({ id: "aux" }),
-          LLMEvent.textDelta({ id: "aux", text: JSON.stringify(output) }),
-          LLMEvent.textEnd({ id: "aux" }),
-          LLMEvent.stepFinish({
-            index: 0,
-            reason: "stop",
-            usage: { inputTokens: 10, outputTokens: 10, totalTokens: 20 },
-          }),
-          LLMEvent.finish({ reason: "stop" }),
-        ])
-        if (!result) throw new Error("missing auxiliary response")
-        return result
-      })
-    const session = yield* SessionV2.Service
-    const events = yield* EventV2.Service
-    const answer = (turn: number) => [
-      LLMEvent.stepStart({ index: 0 }),
-      ...[0, 1].flatMap((slot) => [
-        LLMEvent.reasoningStart({ id: `r-${turn}-${slot}` }),
-        LLMEvent.reasoningDelta({ id: `r-${turn}-${slot}`, text: `original-${turn}-${slot}。`.repeat(1000) }),
-        LLMEvent.reasoningEnd({ id: `r-${turn}-${slot}` }),
-      ]),
-      LLMEvent.stepFinish({ index: 0, reason: "stop" }),
-      LLMEvent.finish({ reason: "stop" }),
-    ]
-    yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "first" }), resume: false })
-    const firstUpdates = yield* events.subscribe(SessionEvent.Reasoning.Ended).pipe(
-      Stream.filter((event) => event.data.distillation !== undefined),
-      Stream.take(2),
-      Stream.runDrain,
-      Effect.forkChild,
-    )
-    response = answer(1)
-    yield* session.resume(sessionID)
-    yield* Deferred.await(firstStarted)
-    expect(JSON.stringify(yield* session.context(sessionID))).not.toContain("采用-r-1-0")
-    yield* Deferred.succeed(releaseFirst, undefined)
-    yield* Fiber.join(firstUpdates)
-    expect(calls).toBe(1)
-    expect(JSON.stringify(yield* session.context(sessionID))).toContain("采用-r-1-0")
-    expect(JSON.stringify(yield* session.context(sessionID))).toContain("采用-r-1-1")
+const auxiliaryResponse = (text: string) => {
+  const result = LLMResponse.fromEvents([
+    LLMEvent.stepStart({ index: 0 }),
+    LLMEvent.textStart({ id: "aux" }),
+    LLMEvent.textDelta({ id: "aux", text }),
+    LLMEvent.textEnd({ id: "aux" }),
+    LLMEvent.stepFinish({ index: 0, reason: "stop", usage: { inputTokens: 10, outputTokens: 10, totalTokens: 20 } }),
+    LLMEvent.finish({ reason: "stop" }),
+  ])
+  if (!result) throw new Error("missing auxiliary response")
+  return result
+}
 
-    const secondUpdates = yield* events.subscribe(SessionEvent.Reasoning.Ended).pipe(
-      Stream.filter((event) => event.data.distillation !== undefined),
-      Stream.take(2),
-      Stream.runDrain,
-      Effect.forkChild,
-    )
-    yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "second" }), resume: false })
-    response = answer(2)
-    yield* session.resume(sessionID)
-    yield* Deferred.await(secondStarted)
-    expect(JSON.stringify(requests.at(-1)?.messages)).toContain("采用-r-1-0")
-    expect(JSON.stringify(requests.at(-1)?.messages)).not.toContain("original-1")
-    expect(JSON.stringify(yield* session.context(sessionID))).not.toContain("采用-r-2-0")
-    yield* Deferred.succeed(releaseSecond, undefined)
-    yield* Fiber.join(secondUpdates)
-    expect(calls).toBe(2)
-    yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "third" }), resume: false })
-    response = []
-    yield* session.resume(sessionID)
-    expect(JSON.stringify(requests.at(-1)?.messages)).toContain("采用-r-2-0")
-    expect(JSON.stringify(requests.at(-1)?.messages)).not.toContain("original-2")
-  }),
+const reasoningStep = (id: string, final: boolean) => [
+  LLMEvent.stepStart({ index: 0 }),
+  LLMEvent.reasoningStart({ id }),
+  LLMEvent.reasoningDelta({ id, text: `original-${id}。`.repeat(1000) }),
+  LLMEvent.reasoningEnd({ id }),
+  ...(final
+    ? [
+        LLMEvent.textStart({ id: `text-${id}` }),
+        LLMEvent.textDelta({ id: `text-${id}`, text: "Done" }),
+        LLMEvent.textEnd({ id: `text-${id}` }),
+        LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+        LLMEvent.finish({ reason: "stop" }),
+      ]
+    : [
+        LLMEvent.toolCall({ id: `call-${id}`, name: "echo", input: { text: "hello" } }),
+        LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
+        LLMEvent.finish({ reason: "tool-calls" }),
+      ]),
+]
+
+const withSettleWindow = <A, E, R>(ms: string, effect: Effect.Effect<A, E, R>) =>
+  Effect.acquireUseRelease(
+    Effect.sync(() => {
+      const previous = process.env.OPENCODE_REASONING_DISTILLATION_SETTLE_MS
+      process.env.OPENCODE_REASONING_DISTILLATION_SETTLE_MS = ms
+      return previous
+    }),
+    () => effect,
+    (previous) =>
+      Effect.sync(() => {
+        if (previous === undefined) delete process.env.OPENCODE_REASONING_DISTILLATION_SETTLE_MS
+        else process.env.OPENCODE_REASONING_DISTILLATION_SETTLE_MS = previous
+      }),
+  )
+
+it.effect("Core runner rewrites each step's reasoning before its first resend", () =>
+  withSettleWindow(
+    "5000",
+    Effect.gen(function* () {
+      yield* setup
+      currentModel = Model.make({
+        id: "distillation",
+        provider: "fake",
+        route: OpenAIChat.route.with({ limits: { context: 100_000, output: 4096 } }),
+      })
+      reasoningConfig = new ConfigReasoningDistillation.Info({ enabled: true })
+      const organized: string[] = []
+      auxiliary = (request) =>
+        Effect.sync(() => {
+          expect(String(request.model.id)).toBe("small-distillation")
+          const source = JSON.stringify(request.messages).match(/original-(r-\d)/)?.[1] ?? "unknown"
+          organized.push(source)
+          return auxiliaryResponse(`采用-${source}`)
+        })
+      const session = yield* SessionV2.Service
+      requests.length = 0
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "first" }), resume: false })
+      responses = [reasoningStep("r-1", false), reasoningStep("r-2", true)]
+      yield* session.resume(sessionID)
+      // The second step is the first resend of r-1: it already carries the rewrite.
+      expect(requests).toHaveLength(2)
+      expect(JSON.stringify(requests[1].messages)).toContain("采用-r-1")
+      expect(JSON.stringify(requests[1].messages)).not.toContain("original-r-1")
+
+      // r-2 ended with the turn; the next turn's request settles it first.
+      responses = [[]]
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "second" }), resume: false })
+      yield* session.resume(sessionID)
+      expect(requests).toHaveLength(3)
+      expect(JSON.stringify(requests[2].messages)).toContain("采用-r-2")
+      expect(JSON.stringify(requests[2].messages)).not.toContain("original-r-")
+      expect(organized.toSorted()).toEqual(["r-1", "r-2"])
+      expect(JSON.stringify(yield* session.context(sessionID))).toContain('"originalText"')
+    }),
+  ),
+)
+
+it.live("Core runner seals a rewrite that misses the settle window and keeps the original", () =>
+  withSettleWindow(
+    "20",
+    Effect.gen(function* () {
+      yield* setup
+      currentModel = Model.make({
+        id: "distillation",
+        provider: "fake",
+        route: OpenAIChat.route.with({ limits: { context: 100_000, output: 4096 } }),
+      })
+      reasoningConfig = new ConfigReasoningDistillation.Info({ enabled: true })
+      const started = yield* Deferred.make<void>()
+      const interrupted = yield* Deferred.make<void>()
+      auxiliary = () =>
+        Deferred.succeed(started, undefined).pipe(
+          Effect.andThen(Effect.never),
+          Effect.onInterrupt(() => Deferred.succeed(interrupted, undefined)),
+        )
+      const session = yield* SessionV2.Service
+      requests.length = 0
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "first" }), resume: false })
+      responses = [reasoningStep("r-1", false), reasoningStep("r-2", true)]
+      yield* session.resume(sessionID)
+      // Depending on timing the job is sealed before or during its model call; a started call is cancelled.
+      if (yield* Deferred.isDone(started)) yield* Deferred.await(interrupted)
+      expect(requests).toHaveLength(2)
+      expect(JSON.stringify(requests[1].messages)).toContain("original-r-1")
+      expect(JSON.stringify(requests[1].messages)).not.toContain("采用")
+      // A sealed part is never rewritten later, so the next turn resends the same prefix.
+      responses = [[]]
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "second" }), resume: false })
+      yield* session.resume(sessionID)
+      expect(JSON.stringify(requests[2].messages)).toContain("original-r-1")
+      expect(JSON.stringify(requests[2].messages)).toContain("original-r-2")
+      expect(JSON.stringify(yield* session.context(sessionID))).not.toContain('"originalText"')
+    }),
+  ),
 )

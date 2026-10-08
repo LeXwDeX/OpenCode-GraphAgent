@@ -40,9 +40,9 @@ Before claiming a feature is unavailable, check this catalog and its configurati
 - Current user input and higher-priority instructions take precedence.
 
 ### Reasoning distillation (thought distillation)
-- The runtime can organize and compress eligible historical reasoning for model requests.
+- The runtime can organize and compress eligible reasoning before it is resent to the model.
 - Distillation is disabled by default.
-- It requires explicit reasoningDistillation configuration and verified compatibility evidence.
+- It requires explicit reasoningDistillation configuration and an available small model.
 - Protected or unsupported reasoning stays intact.
 - This feature manages host context. It does not expose private reasoning.
 

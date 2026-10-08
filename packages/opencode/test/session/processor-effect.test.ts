@@ -199,7 +199,7 @@ const native = testEffect(
 const providerErrorLLM = Layer.succeed(
   LLM.Service,
   LLM.Service.of({
-    distill: () => Effect.void,
+    organizer: () => Effect.succeed(undefined),
     stream: () =>
       Stream.make(
         LLMEvent.stepStart({ index: 0 }),
@@ -225,7 +225,7 @@ const itProviderError = testEffect(providerErrorEnv)
 const fragmentFailureLLM = Layer.succeed(
   LLM.Service,
   LLM.Service.of({
-    distill: () => Effect.void,
+    organizer: () => Effect.succeed(undefined),
     stream: () =>
       Stream.make(
         LLMEvent.stepStart({ index: 0 }),
@@ -245,7 +245,7 @@ const itFragmentFailure = testEffect(fragmentFailureEnv)
 const classifiedProviderErrorLLM = Layer.succeed(
   LLM.Service,
   LLM.Service.of({
-    distill: () => Effect.void,
+    organizer: () => Effect.succeed(undefined),
     stream: () =>
       Stream.make(LLMEvent.providerError({ message: "request entity too large", classification: "context-overflow" })),
   }),

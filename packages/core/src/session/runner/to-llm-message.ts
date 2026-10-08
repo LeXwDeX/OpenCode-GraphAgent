@@ -88,46 +88,12 @@ export type ToolMessageBinding = Readonly<{
   result?: ToolResultPartValue
 }>
 
-export type ReasoningMessageBinding = Readonly<{
-  distilled?: boolean
-  aliasCount?: number
-  ref: Readonly<{ messageID: string; partID: string }>
-  /** Exact path in the canonical LLM request, resolved without matching on text. */
-  bodyPath: readonly (string | number)[]
-  text: string
-  signed: boolean
-  encrypted: boolean
-  settled: boolean
-}>
-
 export type LLMMessageConversion = Readonly<{
   messages: Message[]
   toolBindings: ToolMessageBinding[]
-  reasoningBindings: ReasoningMessageBinding[]
 }>
 
-type RelativeReasoningBinding = Omit<ReasoningMessageBinding, "bodyPath"> &
-  Readonly<{ messageIndex: number; contentIndex: number }>
-
-type MessageConversion = Readonly<{
-  messages: Message[]
-  toolBindings: ToolMessageBinding[]
-  reasoningBindings: RelativeReasoningBinding[]
-}>
-
-const isRecord = (value: unknown): value is Record<string, unknown> =>
-  typeof value === "object" && value !== null && !Array.isArray(value)
-
-const containsMetadataKey = (value: unknown, keys: ReadonlySet<string>, depth = 0): boolean => {
-  if (depth > 8) return false
-  if (Array.isArray(value)) return value.some((item) => containsMetadataKey(item, keys, depth + 1))
-  if (!isRecord(value)) return false
-  for (const [key, item] of Object.entries(value)) {
-    if (keys.has(key) && item !== undefined && item !== null && item !== "") return true
-    if (containsMetadataKey(item, keys, depth + 1)) return true
-  }
-  return false
-}
+type MessageConversion = LLMMessageConversion
 
 const assistant = (
   message: SessionMessage.Assistant,
@@ -137,13 +103,8 @@ const assistant = (
   const sameModel =
     String(message.model.providerID) === String(model.provider) && String(message.model.id) === String(model.id)
   const toolBindings: ToolMessageBinding[] = []
-  const reasoningBindings: RelativeReasoningBinding[] = []
-  let canonicalContentIndex = 0
   const content = message.content.flatMap((item): ContentPart[] => {
-    if (item.type === "text") {
-      if (item.text !== "") canonicalContentIndex++
-      return [{ type: "text", text: item.text }]
-    }
+    if (item.type === "text") return [{ type: "text", text: item.text }]
     if (item.type === "reasoning") {
       const replay = reasoningForReplay({
         text: item.text,
@@ -151,35 +112,14 @@ const assistant = (
         distillation: item.distillation,
         enabled: distillationEnabled,
       })
-      if (!sameModel) {
-        if (replay.text.length === 0) return []
-        canonicalContentIndex++
-        return [{ type: "text", text: replay.text }]
-      }
-      const part: ContentPart = {
-        type: "reasoning",
-        text: replay.text,
-        providerMetadata: replay.metadata && isProviderMetadata(replay.metadata) ? replay.metadata : undefined,
-      }
-      const meaningful =
-        replay.text !== "" || (replay.metadata !== undefined && Object.keys(replay.metadata).length > 0)
-      if (meaningful) {
-        reasoningBindings.push({
-          ref: { messageID: message.id, partID: item.id },
-          messageIndex: 0,
-          contentIndex: canonicalContentIndex,
+      if (!sameModel) return replay.text.length === 0 ? [] : [{ type: "text", text: replay.text }]
+      return [
+        {
+          type: "reasoning",
           text: replay.text,
-          signed: containsMetadataKey(replay.metadata, new Set(["signature", "reasoningOpaque"])),
-          encrypted: containsMetadataKey(
-            replay.metadata,
-            new Set(["encrypted_content", "encryptedContent", "reasoningEncryptedContent"]),
-          ),
-          settled: message.time.completed !== undefined,
-          distilled: item.distillation !== undefined,
-        })
-        canonicalContentIndex++
-      }
-      return [part]
+          providerMetadata: replay.metadata && isProviderMetadata(replay.metadata) ? replay.metadata : undefined,
+        },
+      ]
     }
     const call = toolCall(item, sameModel ? item.provider?.metadata : undefined)
     const result = toolResult(item, sameModel ? (item.provider?.resultMetadata ?? item.provider?.metadata) : undefined)
@@ -189,7 +129,6 @@ const assistant = (
       call,
       ...(result === undefined ? {} : { result }),
     })
-    canonicalContentIndex += item.provider?.executed === true && result ? 2 : 1
     return item.provider?.executed === true && result ? [call, result] : [call]
   })
   const meaningful = content.filter((part) => {
@@ -202,14 +141,13 @@ const assistant = (
     .map((item) => toolResult(item, sameModel ? (item.provider?.resultMetadata ?? item.provider?.metadata) : undefined))
     .filter((message) => message !== undefined)
     .map(Message.tool)
-  if (meaningful.length === 0) return { messages: results, toolBindings, reasoningBindings: [] }
+  if (meaningful.length === 0) return { messages: results, toolBindings }
   return {
     messages: [
       Message.make({ id: message.id, role: "assistant", content: meaningful, metadata: message.metadata }),
       ...results,
     ],
     toolBindings,
-    reasoningBindings,
   }
 }
 
@@ -217,7 +155,7 @@ function toLLMMessage(message: SessionMessage.Message, model: Model, distillatio
   switch (message.type) {
     case "agent-switched":
     case "model-switched":
-      return { messages: [], toolBindings: [], reasoningBindings: [] }
+      return { messages: [], toolBindings: [] }
     case "user":
       return {
         messages: [
@@ -232,16 +170,14 @@ function toLLMMessage(message: SessionMessage.Message, model: Model, distillatio
           }),
         ],
         toolBindings: [],
-        reasoningBindings: [],
       }
     case "synthetic":
       return {
         messages: [Message.make({ id: message.id, role: "user", content: message.text, metadata: message.metadata })],
         toolBindings: [],
-        reasoningBindings: [],
       }
     case "system":
-      return { messages: [Message.system(message.text)], toolBindings: [], reasoningBindings: [] }
+      return { messages: [Message.system(message.text)], toolBindings: [] }
     case "shell":
       return {
         messages: [
@@ -253,7 +189,6 @@ function toLLMMessage(message: SessionMessage.Message, model: Model, distillatio
           }),
         ],
         toolBindings: [],
-        reasoningBindings: [],
       }
     case "assistant":
       return assistant(message, model, distillationEnabled)
@@ -278,7 +213,6 @@ ${message.recent}
           }),
         ],
         toolBindings: [],
-        reasoningBindings: [],
       }
   }
   throw new Error(`Unsupported session message: ${String(message satisfies never)}`)
@@ -293,26 +227,9 @@ export const toLLMMessagesWithBindings = (
   const converted = messages.map((message) =>
     toLLMMessage(message, model, options.reasoningDistillationEnabled === true),
   )
-  let messageOffset = 0
-  const reasoningBindings: ReasoningMessageBinding[] = []
-  for (const item of converted) {
-    reasoningBindings.push(
-      ...item.reasoningBindings.map((binding) => ({
-        ref: binding.ref,
-        bodyPath: ["messages", messageOffset + binding.messageIndex, "content", binding.contentIndex, "text"],
-        text: binding.text,
-        signed: binding.signed,
-        encrypted: binding.encrypted,
-        settled: binding.settled,
-        distilled: binding.distilled,
-      })),
-    )
-    messageOffset += item.messages.length
-  }
   return {
     messages: converted.flatMap((item) => item.messages),
     toolBindings: converted.flatMap((item) => item.toolBindings),
-    reasoningBindings,
   }
 }
 

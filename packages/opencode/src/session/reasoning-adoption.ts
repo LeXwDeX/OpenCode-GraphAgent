@@ -1,6 +1,6 @@
 import { Database } from "@opencode-ai/core/database/database"
-import { SessionMessageTable } from "@opencode-ai/core/session/sql"
-import { eq } from "drizzle-orm"
+import { MessageTable, SessionMessageTable } from "@opencode-ai/core/session/sql"
+import { and, eq, gt, or } from "drizzle-orm"
 import { Cause, DateTime, Effect, Schema } from "effect"
 import { isDeepStrictEqual } from "node:util"
 import { EventV2 } from "@opencode-ai/core/event"
@@ -16,133 +16,119 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 import { Session } from "./session"
 import type { SessionID } from "./schema"
 
-/** Commit the same accepted text consumed by the outgoing request and by existing live/reload UI paths. */
+/**
+ * Commit one accepted rewrite of a settled reasoning part, and its v2 mirror when present. Validation runs inside the
+ * event transaction: the job must still be adoptable (not sealed by a send barrier, feature enabled), the session must
+ * not be reverted, no later assistant attempt may exist, and the persisted part (and mirror) must be exactly the
+ * organized source. Returns the adopted part.
+ */
 export const adoptReasoning = Effect.fn("Session.adoptReasoning")(function* (input: {
   sessionID: SessionID
-  sources: readonly SessionV1.WithParts[]
-  replacements: readonly ReasoningReplacement[]
-  canAdopt?: Effect.Effect<boolean>
+  part: SessionV1.ReasoningPart
+  replacement: ReasoningReplacement
+  canAdopt: Effect.Effect<boolean>
 }) {
-  if (input.replacements.length === 0) return false
   const session = yield* Session.Service
   const events = yield* EventV2Bridge.Service
   const { db } = yield* Database.Service
-  const entries: EventV2.BatchEvent[] = []
-  const sources: SessionV1.ReasoningPart[] = []
-  const seen = new Set<string>()
-  for (const replacement of input.replacements) {
-    const part = input.sources
-      .find((message) => message.info.id === replacement.messageID && message.info.role === "assistant")
-      ?.parts.find((part) => part.id === replacement.partID)
-    if (
-      !part ||
-      part.type !== "reasoning" ||
-      part.sessionID !== input.sessionID ||
-      part.text !== replacement.before ||
-      part.time.end === undefined ||
-      part.distillation ||
-      replacement.after === replacement.before ||
-      seen.has(part.id)
-    )
-      return false
-    const source = { text: part.text, metadata: part.metadata, settled: true, distilled: false }
-    const edited = replaceCanonicalReasoning(source, replacement.after)
-    if (!edited) return false
-    seen.add(part.id)
-    sources.push(part)
-    const distillation = adoptionProvenance(source)
-    entries.push({
+  const { part, replacement } = input
+  if (
+    part.sessionID !== input.sessionID ||
+    replacement.messageID !== part.messageID ||
+    replacement.partID !== part.id ||
+    part.text !== replacement.before ||
+    part.time.end === undefined ||
+    part.distillation ||
+    replacement.after === replacement.before
+  )
+    return undefined
+  const source = { text: part.text, metadata: part.metadata, settled: true, distilled: false }
+  const edited = replaceCanonicalReasoning(source, replacement.after)
+  if (!edited) return undefined
+  const distillation = adoptionProvenance(source)
+  const adopted: SessionV1.ReasoningPart = { ...part, text: edited.text, metadata: edited.metadata, distillation }
+  const entries: EventV2.BatchEvent[] = [
+    {
       definition: SessionV1.Event.PartUpdated,
+      data: { sessionID: input.sessionID, part: adopted, time: Date.now() },
+    },
+  ]
+  if (part.v2)
+    entries.push({
+      definition: SessionEvent.Reasoning.Ended,
       data: {
         sessionID: input.sessionID,
-        part: { ...part, text: edited.text, metadata: edited.metadata, distillation },
-        time: Date.now(),
+        assistantMessageID: SessionMessage.ID.make(part.v2.messageID),
+        reasoningID: part.v2.reasoningID,
+        text: edited.text,
+        providerMetadata: edited.metadata,
+        distillation,
+        timestamp: DateTime.makeUnsafe(Date.now()),
       },
     })
-    if (part.v2)
-      entries.push({
-        definition: SessionEvent.Reasoning.Ended,
-        data: {
-          sessionID: input.sessionID,
-          assistantMessageID: SessionMessage.ID.make(part.v2.messageID),
-          reasoningID: part.v2.reasoningID,
-          text: edited.text,
-          providerMetadata: edited.metadata,
-          distillation,
-          timestamp: DateTime.makeUnsafe(Date.now()),
-        },
-      })
-  }
-  // Validate before any projector runs, inside the same transaction as the entire event batch.
   const validate = Effect.gen(function* () {
-    if (input.canAdopt && !(yield* input.canAdopt)) yield* Effect.die("reasoning distillation was disabled")
+    if (!(yield* input.canAdopt)) yield* Effect.die("reasoning rewrite was sealed or disabled")
     const currentSession = yield* session.get(input.sessionID).pipe(Effect.orDie)
     if (currentSession.revert) yield* Effect.die("reasoning source was reverted")
-    const currentMessages = yield* session.messages({ sessionID: input.sessionID }).pipe(Effect.orDie)
-    for (const user of input.sources.filter((message) => message.info.role === "user")) {
-      if (
-        !isDeepStrictEqual(
-          currentMessages.find((message) => message.info.id === user.info.id),
-          user,
-        )
-      )
-        yield* Effect.die("reasoning source user was changed")
-    }
-    const sourceIDs = new Set(input.sources.map((message) => message.info.id))
-    if (currentMessages.some((message) => !sourceIDs.has(message.info.id)))
-      yield* Effect.die("reasoning turn was retried or continued")
-    const parentIDs = new Set(
-      input.sources
-        .filter(
-          (message) => message.info.role === "assistant" && sources.some((part) => part.messageID === message.info.id),
-        )
-        .map((message) => (message.info.role === "assistant" ? message.info.parentID : undefined)),
-    )
-    if (
-      currentMessages.some(
-        (message) =>
-          message.info.role === "assistant" && parentIDs.has(message.info.parentID) && !sourceIDs.has(message.info.id),
-      )
-    )
-      yield* Effect.die("reasoning turn was retried")
-    for (const source of sources) {
-      const current = yield* session.getPart({
-        sessionID: input.sessionID,
-        messageID: source.messageID,
-        partID: source.id,
-      })
-      if (!isDeepStrictEqual(current, source)) yield* Effect.die("stale reasoning adoption")
-      if (source.v2) {
-        const row = yield* db
-          .select()
-          .from(SessionMessageTable)
-          .where(eq(SessionMessageTable.id, SessionMessage.ID.make(source.v2.messageID)))
-          .get()
+    // Durable send fence: the in-memory barrier only covers this process. The prompt loop persists each attempt's
+    // assistant message before it re-reads this part for the request, so once any process has persisted a later
+    // attempt the part is never rewritten, and an adoption committed before that claim is in its request.
+    const own = yield* db
+      .select({ time: MessageTable.time_created })
+      .from(MessageTable)
+      .where(and(eq(MessageTable.id, part.messageID), eq(MessageTable.session_id, input.sessionID)))
+      .get()
+      .pipe(Effect.orDie)
+    if (!own) yield* Effect.die("reasoning source message was removed")
+    const later = own
+      ? yield* db
+          .select({ data: MessageTable.data })
+          .from(MessageTable)
+          .where(
+            and(
+              eq(MessageTable.session_id, input.sessionID),
+              or(
+                gt(MessageTable.time_created, own.time),
+                and(eq(MessageTable.time_created, own.time), gt(MessageTable.id, part.messageID)),
+              ),
+            ),
+          )
+          .all()
           .pipe(Effect.orDie)
-        const message = row
-          ? yield* Schema.decodeUnknownEffect(SessionMessage.Message)({ ...row.data, id: row.id, type: row.type }).pipe(
-              Effect.orDie,
-            )
-          : undefined
-        const content = message?.type === "assistant" ? message.content : []
-        const matches = content.filter((part) => part.id === source.v2?.reasoningID)
-        if (
-          row?.session_id !== input.sessionID ||
-          matches.length !== 1 ||
-          matches[0].type !== "reasoning" ||
-          matches[0].text !== source.text ||
-          matches[0].distillation ||
-          !isDeepStrictEqual(matches[0].providerMetadata, source.metadata)
+      : []
+    if (later.some((row) => row.data.role === "assistant"))
+      yield* Effect.die("reasoning was already resent by a later attempt")
+    const current = yield* session.getPart({ sessionID: input.sessionID, messageID: part.messageID, partID: part.id })
+    if (!isDeepStrictEqual(current, part)) yield* Effect.die("stale reasoning adoption")
+    if (!part.v2) return
+    const row = yield* db
+      .select()
+      .from(SessionMessageTable)
+      .where(eq(SessionMessageTable.id, SessionMessage.ID.make(part.v2.messageID)))
+      .get()
+      .pipe(Effect.orDie)
+    const message = row
+      ? yield* Schema.decodeUnknownEffect(SessionMessage.Message)({ ...row.data, id: row.id, type: row.type }).pipe(
+          Effect.orDie,
         )
-          yield* Effect.die("stale mirrored reasoning adoption")
-      }
-    }
+      : undefined
+    const content = message?.type === "assistant" ? message.content : []
+    const matches = content.filter((item) => item.id === part.v2?.reasoningID)
+    if (
+      row?.session_id !== input.sessionID ||
+      matches.length !== 1 ||
+      matches[0].type !== "reasoning" ||
+      matches[0].text !== part.text ||
+      matches[0].distillation ||
+      !isDeepStrictEqual(matches[0].providerMetadata, part.metadata)
+    )
+      yield* Effect.die("stale mirrored reasoning adoption")
   })
   return yield* events.publishMany(entries, { validate }).pipe(
-    Effect.as(true),
+    Effect.as<SessionV1.ReasoningPart | undefined>(adopted),
     Effect.catchCauseIf(
       (cause) => !Cause.hasInterrupts(cause),
-      () => Effect.logWarning("reasoning adoption failed; retaining current history").pipe(Effect.as(false)),
+      () => Effect.logInfo("reasoning adoption rejected; retaining current history").pipe(Effect.as(undefined)),
     ),
   )
 })

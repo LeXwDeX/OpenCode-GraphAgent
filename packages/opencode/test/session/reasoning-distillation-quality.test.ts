@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test"
+import { NO_USEFUL_REASONING_TEXT } from "@opencode-ai/core/session/reasoning-distillation"
 import { checkFixtureSemantics } from "../../script/reasoning-distillation-quality"
 
 const valid: Record<string, string[]> = {
@@ -13,7 +14,7 @@ const valid: Record<string, string[]> = {
   unresolved: [
     "日志提示可能是网络超时，也可能是锁竞争；目前没有证据排除其中任何一个，尚未确定原因。下一步只读检查超时日志，暂不修改配置。",
   ],
-  "all-noise": [""],
+  "all-noise": [NO_USEFUL_REASONING_TEXT.zh],
   "short-reasoning": [
     "周一初始库存 83；周二入库 47，库存 130；周三出库 29，库存 101；周四退回 floor(29/3)=9，库存 110；周五出库 floor(110/4)=27，库存 83。最终库存：83。",
   ],
@@ -34,25 +35,70 @@ for (const [id, texts] of Object.entries(valid)) {
 }
 
 test("meaningful rejection accepts cause after decision", () => {
-  const text = "已否决方案A：它不支持当前必须使用的离线协议，该限制仍成立，后续不要重新选A。最终选择方案B；B尚未执行，不能视为已完成。"
-  expect(Object.entries(checkFixtureSemantics("meaningful-rejection", [text])).filter(([, passed]) => !passed)).toEqual([])
+  const text =
+    "已否决方案A：它不支持当前必须使用的离线协议，该限制仍成立，后续不要重新选A。最终选择方案B；B尚未执行，不能视为已完成。"
+  expect(Object.entries(checkFixtureSemantics("meaningful-rejection", [text])).filter(([, passed]) => !passed)).toEqual(
+    [],
+  )
 })
 
 const mutations: { id: string; slot: number; from: string; to: string; fails: string }[] = [
   { id: "one-conclusion", slot: 0, from: "5 次", to: "3 次", fails: "final_retry_limit" },
   { id: "deduplicate", slot: 0, from: "不得写入", to: "可以写入", fails: "production_write_forbidden" },
-  { id: "different-scopes", slot: 0, from: "beta 服务：生产环境", to: "beta 服务：测试环境", fails: "beta_production_no_retry" },
-  { id: "different-scopes", slot: 0, from: "不能删除原始记录", to: "可以删除原始记录", fails: "delta_preserve_original" },
+  {
+    id: "different-scopes",
+    slot: 0,
+    from: "beta 服务：生产环境",
+    to: "beta 服务：测试环境",
+    fails: "beta_production_no_retry",
+  },
+  {
+    id: "different-scopes",
+    slot: 0,
+    from: "不能删除原始记录",
+    to: "可以删除原始记录",
+    fails: "delta_preserve_original",
+  },
   { id: "different-scopes", slot: 0, from: "仅允许读取缓存", to: "允许写入缓存", fails: "epsilon_read_only" },
   { id: "meaningful-rejection", slot: 0, from: "B尚未执行", to: "B已完成", fails: "b_not_executed" },
   { id: "unresolved", slot: 0, from: "尚未确定原因", to: "确定为锁竞争", fails: "cause_unresolved" },
-  { id: "all-noise", slot: 0, from: "", to: "下一步继续检查。", fails: "empty" },
+  { id: "all-noise", slot: 0, from: NO_USEFUL_REASONING_TEXT.zh, to: "下一步继续检查。", fails: "empty" },
   { id: "short-reasoning", slot: 0, from: "floor(29/3)=9", to: "floor(29/3)=27", fails: "thursday_floor_9_to_110" },
-  { id: "long-continuity", slot: 0, from: "尚未授权再次迁移", to: "已授权再次迁移", fails: "next_read_only_unapproved" },
-  { id: "multiple-slots", slot: 1, from: "恢复校验尚未完成", to: "恢复校验已完成", fails: "beta_done_pending_read_only" },
-  { id: "long-continuity", slot: 0, from: "尚未授权再次迁移。", to: "尚未授权再次迁移，但已授权再次迁移。", fails: "next_read_only_unapproved" },
-  { id: "long-continuity", slot: 0, from: "锁竞争是否根因仍未确认。", to: "锁竞争根因仍未确认，但已确认锁竞争是根因。", fails: "lock_unresolved" },
-  { id: "multiple-slots", slot: 0, from: "生产环境禁止执行。", to: "生产环境禁止执行，但生产环境可以执行。", fails: "alpha_test_retry_and_no_production" },
+  {
+    id: "long-continuity",
+    slot: 0,
+    from: "尚未授权再次迁移",
+    to: "已授权再次迁移",
+    fails: "next_read_only_unapproved",
+  },
+  {
+    id: "multiple-slots",
+    slot: 1,
+    from: "恢复校验尚未完成",
+    to: "恢复校验已完成",
+    fails: "beta_done_pending_read_only",
+  },
+  {
+    id: "long-continuity",
+    slot: 0,
+    from: "尚未授权再次迁移。",
+    to: "尚未授权再次迁移，但已授权再次迁移。",
+    fails: "next_read_only_unapproved",
+  },
+  {
+    id: "long-continuity",
+    slot: 0,
+    from: "锁竞争是否根因仍未确认。",
+    to: "锁竞争根因仍未确认，但已确认锁竞争是根因。",
+    fails: "lock_unresolved",
+  },
+  {
+    id: "multiple-slots",
+    slot: 0,
+    from: "生产环境禁止执行。",
+    to: "生产环境禁止执行，但生产环境可以执行。",
+    fails: "alpha_test_retry_and_no_production",
+  },
 ]
 
 for (const mutation of mutations) {

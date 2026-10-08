@@ -1,4 +1,6 @@
-/** Pure editability contract for a persisted reasoning part. Provider adapters do not decide what may be rewritten. */
+import { ReasoningCarrier } from "@opencode-ai/llm"
+
+/** Pure editability contract for a persisted reasoning part. */
 export type CanonicalReasoning = Readonly<{
   text: string
   metadata?: Record<string, unknown>
@@ -21,67 +23,19 @@ export type CanonicalEditability =
 const record = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value)
 
-/** Fail closed for nested signatures, encrypted payloads, cycles, or unbounded metadata. Arrays are traversed. */
-const protectedCarrier = (value: unknown): "protected-carrier" | "unknown-carrier" | undefined => {
-  const seen = new Set<object>()
-  let count = 0
-  let textBytes = 0
-  const visit = (item: unknown, depth: number): "protected-carrier" | "unknown-carrier" | undefined => {
-    if (typeof item === "string") {
-      textBytes += item.length
-      return textBytes > 1_000_000 ? "unknown-carrier" : undefined
-    }
-    if (item === null || item === undefined || typeof item === "number" || typeof item === "boolean") return undefined
-    if (typeof item !== "object" || depth > 8 || seen.has(item) || ++count > 512) return "unknown-carrier"
-    seen.add(item)
-    for (const [key, child] of Object.entries(item)) {
-      if (
-        key === "signature" ||
-        key === "reasoningOpaque" ||
-        key === "encrypted_content" ||
-        key === "encryptedContent" ||
-        key === "reasoningEncryptedContent" ||
-        key === "data"
-      )
-        return "protected-carrier"
-      const nested = visit(child, depth + 1)
-      if (nested) return nested
-    }
-    return undefined
-  }
-  return visit(value, 0)
-}
-
-/** Recognize only an exact, single plaintext mirror; unknown metadata is never edited by guessing. */
+/**
+ * Editability is policy owned here; which metadata binds the provider to the original text is decided by the engine
+ * that defines that metadata (`ReasoningCarrier`). Unknown carriers are never edited by guessing.
+ */
 export const assessCanonicalReasoning = (source: CanonicalReasoning): CanonicalEditability => {
   if (!source.text.trim()) return { editable: false, reason: "empty-source" }
   if (!source.settled) return { editable: false, reason: "unsettled-source" }
   if (source.distilled) return { editable: false, reason: "already-distilled" }
-  const metadata = source.metadata
-  if (metadata === undefined) return { editable: true, aliasPaths: [] }
-  if (!record(metadata)) return { editable: false, reason: "unknown-carrier" }
-  if (Object.keys(metadata).length === 0) return { editable: true, aliasPaths: [] }
-  const protectedReason = protectedCarrier(metadata)
-  if (protectedReason) return { editable: false, reason: protectedReason }
-  if (Object.keys(metadata).length !== 1) return { editable: false, reason: "unknown-carrier" }
-  const namespace = Object.keys(metadata)[0]
-  if (!namespace || !record(metadata[namespace])) return { editable: false, reason: "unknown-carrier" }
-  const carrier = metadata[namespace]
-  if (Object.keys(carrier).length !== 1 || !Array.isArray(carrier.reasoning_details))
-    return { editable: false, reason: "unknown-carrier" }
-  const details = carrier.reasoning_details
-  if (details.length !== 1 || !record(details[0])) return { editable: false, reason: "unknown-carrier" }
-  const detail = details[0]
-  if (Object.keys(detail).some((key) => !["type", "text", "format", "index"].includes(key)))
-    return { editable: false, reason: "unknown-carrier" }
-  if (
-    detail.type !== "reasoning.text" ||
-    (detail.format !== undefined && detail.format !== "unknown") ||
-    (detail.index !== undefined && detail.index !== 0)
-  )
-    return { editable: false, reason: "unknown-carrier" }
-  if (detail.text !== source.text) return { editable: false, reason: "metadata-mismatch" }
-  return { editable: true, aliasPaths: [[namespace, "reasoning_details", 0, "text"]] }
+  const carrier = ReasoningCarrier.classify(source.metadata, source.text)
+  if (carrier.kind === "plain") return { editable: true, aliasPaths: [] }
+  if (carrier.kind === "mirror") return { editable: true, aliasPaths: carrier.paths }
+  if (carrier.kind === "opaque") return { editable: false, reason: "protected-carrier" }
+  return { editable: false, reason: carrier.reason === "mismatch" ? "metadata-mismatch" : "unknown-carrier" }
 }
 
 /** Edit a private copy and verify every declared alias changed with the authoritative text. */
