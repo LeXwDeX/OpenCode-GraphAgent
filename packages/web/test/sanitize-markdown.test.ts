@@ -25,6 +25,8 @@ async function fixture(svg = false) {
       ...(svg ? ['<svg onload="window.__shareXss=true"><script>window.__shareXss=true</script></svg>'] : []),
       '<iframe srcdoc="<script>parent.__shareXss=true</script>"></iframe>',
       "[execute](javascript:alert(1))",
+      '<a href="data:text/html;base64,PHNjcmlwdD5wYXJlbnQuX19zaGFyZVhzcz10cnVlPC9zY3JpcHQ+">data link</a>',
+      '<a href="vbscript:msgbox(1)">vbscript link</a>',
       '<a href="https://example.com/" target="_blank" rel="noopener noreferrer">safe link</a>',
     ].map(async (value) => marked.parse(value)),
   )
@@ -56,7 +58,7 @@ browserTest(
             return {
               executed: Boolean(Reflect.get(window, "__shareXss")),
               executableElements: document.querySelectorAll("script,iframe,svg,[onerror],[onload]").length,
-              dangerousLinks: links.some((link) => link.protocol === "javascript:"),
+              dangerousLinks: links.some((link) => ["javascript:", "data:", "vbscript:"].includes(link.protocol)),
               safeLink: links.some((link) => link.href === "https://example.com/" && link.rel.includes("noopener")),
               code: document.querySelector("pre code")?.textContent,
               highlighted: Boolean(document.querySelector("pre code span[style]")),

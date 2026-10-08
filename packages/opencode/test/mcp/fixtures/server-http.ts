@@ -22,7 +22,7 @@ const server = Bun.serve({
       return await handler.fetch(req)
     } catch (e) {
       console.error("[fixture]", e)
-      return new Response(JSON.stringify({ error: String(e) }), { status: 500 })
+      return new Response(JSON.stringify({ error: "internal fixture error" }), { status: 500 })
     }
   },
 })

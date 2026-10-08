@@ -15,7 +15,11 @@ import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { SessionMessage } from "@opencode-ai/core/session/message"
 import * as CoreReasoningDistillation from "@opencode-ai/core/session/runner/reasoning-distillation"
-import { COVERAGE_CONTRACT, DENOISING_CONTRACT } from "@opencode-ai/core/session/reasoning-distillation"
+import {
+  COVERAGE_CONTRACT,
+  DENOISING_CONTRACT,
+  ReasoningDistillationPolicy,
+} from "@opencode-ai/core/session/reasoning-distillation"
 import { toLLMMessagesWithBindings } from "@opencode-ai/core/session/runner/to-llm-message"
 import { Hash } from "@opencode-ai/core/util/hash"
 import { DateTime, Deferred, Duration, Effect, Fiber, Stream } from "effect"
@@ -736,14 +740,16 @@ describe("Core runner reasoning distillation adapter", () => {
     }),
   )
 
-  const turnSource = (index: number): SessionMessage.Assistant => ({
+  const turnSource = (index: number, text?: string): SessionMessage.Assistant => ({
     ...history(),
     id: SessionMessage.ID.make(`msg_turn_${index}`),
     content: [
       {
         type: "reasoning",
         id: `reasoning-turn-${index}`,
-        text: `第 ${index} 轮：先猜测原因是缓存，再看看日志。确认真实原因是权限不足，最终决定改用安全路径并保留回滚步骤。`,
+        text:
+          text ??
+          `第 ${index} 轮：先猜测原因是缓存，再看看日志。确认真实原因是权限不足，最终决定改用安全路径并保留回滚步骤。`,
       },
     ],
   })
@@ -753,9 +759,10 @@ describe("Core runner reasoning distillation adapter", () => {
     sessionID: string,
     index: number,
     auxiliaryModel: Model = model,
+    text?: string,
   ) =>
     Effect.gen(function* () {
-      const source = turnSource(index)
+      const source = turnSource(index, text)
       const conversion = toLLMMessagesWithBindings([source], model)
       const request = LLM.request({ model, messages: conversion.messages })
       return yield* adapter.distill({
@@ -840,6 +847,51 @@ describe("Core runner reasoning distillation adapter", () => {
       expect(next.applied).toBe(true)
       // Only the completed call's reported usage remains reserved.
       expect(next.usage).toMatchObject({ reservedTokens: 300, paidAdmissionPaused: false })
+    }),
+  )
+
+  it.effect("stops calling once reported usage fills the per-session reservation ceiling", () =>
+    Effect.gen(function* () {
+      let calls = 0
+      const adapter = CoreReasoningDistillation.make({
+        prepare: mockPrepare,
+        stream: () => Stream.empty,
+        generate: () =>
+          Effect.sync(() => {
+            calls++
+            // Reported usage equal to the output allowance never exceeds a reservation, so it is reconciled
+            // rather than paused; the session ceiling alone must stop admission.
+            return response("决定改用安全路径。", ReasoningDistillationPolicy.tokens.maxOutputTokens)
+          }),
+      })
+      const results = []
+      for (let index = 1; index <= 15; index++) results.push(yield* distillTurn(adapter, "ses_ceiling", index))
+      const exhausted = results.findIndex((result) => result.skipReason === "call-budget-exhausted")
+      expect(exhausted).toBeGreaterThan(0)
+      expect(results.slice(0, exhausted).every((result) => result.applied)).toBe(true)
+      expect(results.slice(exhausted).every((result) => result.skipReason === "call-budget-exhausted")).toBe(true)
+      expect(results.at(-1)?.modelCalls).toBe(0)
+      expect(results.at(-1)?.usage?.paidAdmissionPaused).toBe(false)
+      expect(results.at(-1)?.usage?.reservedTokens).toBeLessThanOrEqual(
+        ReasoningDistillationPolicy.tokens.maxReservedTokensPerSession,
+      )
+      expect(calls).toBe(exhausted)
+    }),
+  )
+
+  it.effect("skips reasoning too large for one organizer call without calling the model", () =>
+    Effect.gen(function* () {
+      let calls = 0
+      const adapter = CoreReasoningDistillation.make({
+        prepare: mockPrepare,
+        stream: () => Stream.empty,
+        generate: () => Effect.sync(() => (calls++, response("决定改用安全路径。"))),
+      })
+      const oversized = "确认权限不足后改用安全路径。".repeat(ReasoningDistillationPolicy.tokens.maxInputTokens / 4)
+      const result = yield* distillTurn(adapter, "ses_oversized", 1, model, oversized)
+      expect(result).toMatchObject({ applied: false, skipReason: "work-limit", modelCalls: 0 })
+      expect(result.usage).toMatchObject({ reservedTokens: 0, paidAdmissionPaused: false })
+      expect(calls).toBe(0)
     }),
   )
 

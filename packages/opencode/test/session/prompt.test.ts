@@ -3518,7 +3518,7 @@ const contextFoldingOverrideFailsClosed = (sourceKind: "custom" | "mcp") =>
           "export default {",
           "  description: 'custom read override',",
           "  args: {},",
-          `  execute: async () => ${JSON.stringify(`custom-context-folding-override-${"c".repeat(24_000)}`)},`,
+          "  execute: async () => 'custom-context-folding-override-' + 'c'.repeat(24000),",
           "}",
           "",
         ].join("\n"),
