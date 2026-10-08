@@ -6,6 +6,7 @@ import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Effect, Layer } from "effect"
+import { NO_USEFUL_REASONING_TEXT } from "@opencode-ai/core/session/reasoning-distillation"
 import { adoptReasoning } from "@/session/reasoning-adoption"
 import { MessageV2 } from "@/session/message-v2"
 import { Session } from "@/session/session"
@@ -45,9 +46,9 @@ const replacement = "DISTILLED canonical reasoning with the same source identity
 const detail = { type: "reasoning.text", text: source, format: "unknown", index: 0 }
 const metadata = { openrouter: { reasoning_details: [detail] } }
 
-for (const output of [replacement, ""])
+for (const output of [replacement, NO_USEFUL_REASONING_TEXT.zh])
   it.instance(
-    `replays an adopted persistent reasoning object as one coherent pair (${output ? "content" : "empty"})`,
+    `replays an adopted persistent reasoning object as one coherent pair (${output === replacement ? "content" : "noise"})`,
     () =>
       Effect.gen(function* () {
         const sessions = yield* Session.Service
@@ -109,14 +110,17 @@ for (const output of [replacement, ""])
           time: { start: 3, end: 3 },
         })
 
-        const original = yield* sessions.messages({ sessionID: chat.id })
-        expect(
-          yield* adoptReasoning({
-            sessionID: chat.id,
-            sources: original,
-            replacements: [{ messageID: assistantID, partID: part.id, before: source, after: output }],
-          }),
-        ).toBe(true)
+        const stored = (yield* sessions.messages({ sessionID: chat.id }))
+          .flatMap((message) => message.parts)
+          .find((item) => item.id === part.id)
+        if (stored?.type !== "reasoning") throw new Error("missing stored reasoning")
+        const adopted = yield* adoptReasoning({
+          sessionID: chat.id,
+          part: stored,
+          replacement: { messageID: assistantID, partID: part.id, before: source, after: output },
+          canAdopt: Effect.succeed(true),
+        })
+        expect(adopted?.text).toBe(output)
 
         yield* sessions.updateMessage({ ...firstUser, id: nextUserID, time: { created: 4 } })
         yield* sessions.updatePart({

@@ -9,8 +9,8 @@ export const estimate = (input: string) => Math.max(0, Math.round(input.length /
 // `estimate` systematically undersized: a successful near-cap auxiliary call can then settle above its reserve and
 // trip the over-budget paid-admission pause without exceeding any configured limit. `estimateReserve` counts CJK
 // code points as one token each and keeps 4 chars/token for the rest; it is ceil-rounded because underestimating a
-// reserve is the expensive direction. Reserve/input-gating use this; savings-side estimates stay on `estimate`,
-// which understates savings and therefore errs toward fewer paid admissions.
+// reserve is the expensive direction. Reserve/input-gating use this. Comparing two texts in different scripts (is a
+// rewrite smaller than its source?) needs an unbiased estimate instead: see `estimateComparable`.
 const CJK_RANGES: ReadonlyArray<readonly [number, number]> = [
   [0x3000, 0x303f], // CJK punctuation
   [0x3040, 0x30ff], // hiragana + katakana
@@ -29,4 +29,18 @@ export const estimateReserve = (input: string) => {
   let other = 0
   for (const ch of input) (isCjk(ch.codePointAt(0) ?? 0) ? cjk++ : other++)
   return Math.max(0, cjk + Math.ceil(other / CHARS_PER_TOKEN))
+}
+
+// Calibrated on the configured relays (2026-10-08, DeepSeek and GLM tokenizers): English prose ≈3.0–3.3 chars per
+// token, CJK ≈0.53–0.63 tokens per character. `estimateReserve` deliberately overstates CJK and understates English,
+// which flips the sign when a Chinese rewrite of English reasoning is compared with its source. Use this only for
+// relative comparisons; reserves and limits keep the conservative estimators.
+const COMPARABLE_CJK_TOKENS_PER_CHAR = 0.55
+const COMPARABLE_CHARS_PER_TOKEN = 3
+
+export const estimateComparable = (input: string) => {
+  let cjk = 0
+  let other = 0
+  for (const ch of input) (isCjk(ch.codePointAt(0) ?? 0) ? cjk++ : other++)
+  return Math.max(0, Math.round(cjk * COMPARABLE_CJK_TOKENS_PER_CHAR + other / COMPARABLE_CHARS_PER_TOKEN))
 }

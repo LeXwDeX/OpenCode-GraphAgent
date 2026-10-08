@@ -4,6 +4,7 @@ import path from "node:path"
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible"
 import { generateText } from "ai"
 import {
+  NO_USEFUL_REASONING_TEXT,
   ReasoningDistillationPolicy,
   organizeReasoning,
   type OrganizeResult,
@@ -234,27 +235,33 @@ for (const fixture of cases.filter(
       partID: `part-${index}`,
       text,
     }))
-    let result: OrganizeResult | undefined
+    // Production organizes each part with its own call, concurrently.
+    let results: OrganizeResult[] | undefined
+    let organizeWallMs = 0
     const organize = async () => {
-      result = await organizeReasoning({
-        slots,
-        callModel: async ({ prompt }) => {
-          const stage = await call("organize", prompt)
-          return { text: stage.answer, usageTokens: stage.usage, finishReason: stage.finishReason }
-        },
-      })
+      const started = performance.now()
+      results = await Promise.all(
+        slots.map((slot) =>
+          organizeReasoning({
+            slot,
+            callModel: async ({ prompt }) => {
+              const stage = await call("organize", prompt)
+              return { text: stage.answer, usageTokens: stage.usage, finishReason: stage.finishReason }
+            },
+          }),
+        ),
+      )
+      organizeWallMs = performance.now() - started
     }
     if (fixture.benchmark && repeat % 2 === 0) await direct()
     await organize()
     if (fixture.benchmark && repeat % 2 === 1) await direct()
-    if (!result) throw new Error("Organizer result unavailable")
-    const organized = result as OrganizeResult
+    if (!results) throw new Error("Organizer result unavailable")
+    const organized = results
     const rewriteStarted = performance.now()
-    const after = slots.map(
-      (slot) => organized.replacements.find((replacement) => replacement.partID === slot.partID)?.after ?? slot.text,
-    )
+    const after = slots.map((slot, index) => organized[index]?.replacement?.after ?? slot.text)
     const adoption = slots.every((slot, index) => {
-      const replacement = organized.replacements.find((item) => item.partID === slot.partID)
+      const replacement = organized[index]?.replacement
       return (
         replacement !== undefined &&
         replaceCanonicalReasoning({ text: slot.text, settled: true, distilled: false }, replacement.after)?.text ===
@@ -265,19 +272,20 @@ for (const fixture of cases.filter(
     const combined = after.join("\n")
     const organizeStages = stages.filter((stage) => stage.role === "organize")
     const checks = {
-      organized: organized.status === "organized",
+      organized: organized.every((item) => item.status === "organized"),
       adoption,
       required: fixture.required.every((term) => combined.includes(term)),
       forbidden: fixture.forbidden.every((term) => !combined.includes(term)),
-      empty: !("empty" in fixture) || after[0] === "",
+      empty: !("empty" in fixture) || after[0] === NO_USEFUL_REASONING_TEXT.zh,
       noClaimTemplate: !/(?:^|\n)\s*(?:[-*]\s*)?[cC]\d+\s*[:：]/.test(combined),
-      oneModelRequest: organizeStages.length === 1 && organizeStages[0]!.requests === 1,
+      oneRequestPerPart:
+        organizeStages.length === slots.length && organizeStages.every((stage) => stage.requests === 1),
       effort: stages.every((stage) => stage.wire.effort === effort),
       independentSlots:
         fixture.id !== "multiple-slots" ||
         after.every(
           (text, index) =>
-            text.includes(["alpha", "beta", "gamma"][index]!) &&
+            text.includes(["alpha", "beta", "gamma"][index]) &&
             ["alpha", "beta", "gamma"].every((name, other) => other === index || !text.includes(name)),
         ),
       oldValueRemoved: fixture.id !== "one-conclusion" || !/(?:3|三)\s*次/.test(combined),
@@ -304,17 +312,18 @@ for (const fixture of cases.filter(
       id: fixture.id,
       repeat,
       model: selected,
-      mode: "single-call-organize",
+      mode: "per-part-organize",
       input: fixture.texts,
       passed,
       checks,
       after,
-      status: organized.status,
-      reason: organized.reason,
+      status: organized.map((item) => item.status),
+      reason: organized.map((item) => item.reason),
       timing: {
-        ...organized.timing,
+        organizeWallMs,
+        modelMs: organized.map((item) => item.timing.modelMs),
         canonicalRewriteMs,
-        helperAndCanonicalMs: organized.timing.totalMs + canonicalRewriteMs,
+        helperAndCanonicalMs: organizeWallMs + canonicalRewriteMs,
       },
       stages,
       continuation,
@@ -329,7 +338,7 @@ for (const fixture of cases.filter(
         checks,
         timing: report.timing,
         after,
-        reason: organized.reason,
+        reason: organized.map((item) => item.reason),
       }),
     )
   }

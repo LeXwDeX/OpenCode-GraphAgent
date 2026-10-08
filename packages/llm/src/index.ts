@@ -26,6 +26,7 @@ export type {
   ToolToModelOutput,
 } from "./tool"
 export * as LLM from "./llm"
+export { ReasoningCarrier } from "./reasoning-carrier"
 export type {
   Definition as ProviderDefinition,
   ModelFactory as ProviderModelFactory,

@@ -7,20 +7,25 @@ export const NO_USEFUL_REASONING = "<<NO_USEFUL_REASONING>>"
 export type OrganizeSlot = Readonly<{ messageID: string; partID: string; text: string }>
 export type OrganizeLanguage = "zh" | "en"
 export type OrganizeCall = (
-  input: Readonly<{ prompt: string; format: "text" | "json" }>,
+  input: Readonly<{ prompt: string }>,
 ) => Promise<Readonly<{ text: string; usageTokens?: number; finishReason?: string }> | undefined>
+export type OrganizeReason =
+  | "empty-input"
+  | "below-minimum"
+  | "work-limit"
+  | "invalid-output"
+  | "truncated"
+  | "model-failure"
+  | "unchanged"
+  | "no-savings"
 export type OrganizeResult = Readonly<{
   status: "organized" | "skipped"
-  replacements: readonly ReasoningReplacement[]
-  reason?:
-    | "empty-input"
-    | "below-minimum"
-    | "work-limit"
-    | "invalid-output"
-    | "truncated"
-    | "model-failure"
-    | "unchanged"
-    | "no-savings"
+  replacement?: ReasoningReplacement
+  reason?: OrganizeReason
+  /** Whether the model was called; a skipped result may still have spent a call. */
+  called: boolean
+  /** Text the model returned, for usage estimation when the provider reports none. */
+  output?: string
   usageTokens?: number
   timing: Readonly<{ modelMs: number; parseMs: number; totalMs: number }>
 }>
@@ -33,116 +38,81 @@ export const ORGANIZE_INSTRUCTIONS: Readonly<Record<OrganizeLanguage, string>> =
 /** Default (Chinese) organizer instruction; Chinese output is shorter for the same content. */
 export const ORGANIZE_INSTRUCTION = ORGANIZE_INSTRUCTIONS.zh
 
-const MULTI_SLOT_FORMAT: Readonly<Record<OrganizeLanguage, string>> = {
-  zh: `各 slot 独立整理，不把其它 slot 内容移入本 slot。按输入 slot 顺序，一次返回且只返回 JSON 对象 {"items":[{"slot":0,"text":"整理后的正文"}]}。每个 slot 必须出现恰好一次；某 slot 完全没有可用信息时，其 text 只返回精确标记 ${NO_USEFUL_REASONING}。不要返回宿主消息 ID。`,
-  en: `Organize each slot independently and never move content from another slot into it. In input slot order, return once and only a JSON object {"items":[{"slot":0,"text":"organized body"}]}. Every slot must appear exactly once; when a slot has no usable information at all, its text is only the exact marker ${NO_USEFUL_REASONING}. Do not return host message IDs.`,
-}
-
-const SINGLE_SLOT_FORMAT: Readonly<Record<OrganizeLanguage, string>> = {
+const OUTPUT_FORMAT: Readonly<Record<OrganizeLanguage, string>> = {
   zh: `只输出整理后的正文，不要 JSON 或说明。全文没有可用信息时，只输出精确标记 ${NO_USEFUL_REASONING}。\n\n原文：`,
   en: `Output only the organized body, without JSON or commentary. When the whole text has no usable information, output only the exact marker ${NO_USEFUL_REASONING}.\n\nOriginal:`,
 }
 
 /**
- * One auxiliary model call. Structural validation only; semantic fidelity is not certified here.
- * Slots too small to repay the call are left out, and a replacement that is not smaller than its source is dropped.
+ * Text that replaces an all-noise part. Never empty: protocols that carry reasoning in a dedicated field keep that
+ * field present, and protocols that reject empty reasoning blocks still receive a valid one.
+ */
+export const NO_USEFUL_REASONING_TEXT: Readonly<Record<OrganizeLanguage, string>> = {
+  zh: "（无有效推理）",
+  en: "(no useful reasoning)",
+}
+
+export const organizePrompt = (text: string, language: OrganizeLanguage = "zh") =>
+  `${ORGANIZE_INSTRUCTIONS[language]}\n${OUTPUT_FORMAT[language]}\n${text}`
+
+const COMPLETE_FINISH = ["stop", "end_turn", "complete", "completed"]
+
+/**
+ * Organize one reasoning part with one model call. Structural validation only; semantic fidelity is not certified.
+ * Parts too small to repay the call are left out, and a replacement that is not smaller than its source is dropped.
  */
 export async function organizeReasoning(
-  input: Readonly<{ slots: readonly OrganizeSlot[]; callModel: OrganizeCall; language?: OrganizeLanguage }>,
+  input: Readonly<{ slot: OrganizeSlot; callModel: OrganizeCall; language?: OrganizeLanguage }>,
 ): Promise<OrganizeResult> {
   const started = performance.now()
   let modelMs = 0
   let parseMs = 0
-  const skipped = (reason: NonNullable<OrganizeResult["reason"]>, usageTokens?: number): OrganizeResult => ({
+  let called = false
+  let output: Awaited<ReturnType<OrganizeCall>>
+  const skipped = (reason: OrganizeReason): OrganizeResult => ({
     status: "skipped",
-    replacements: [],
     reason,
-    usageTokens,
+    called,
+    output: output?.text,
+    usageTokens: output?.usageTokens,
     timing: { modelMs, parseMs, totalMs: performance.now() - started },
   })
-  if (input.slots.length === 0 || input.slots.some((slot) => !slot.text.trim())) return skipped("empty-input")
-  const slots = input.slots.filter(
-    (slot) => Token.estimateReserve(slot.text) >= ReasoningDistillationPolicy.tokens.minimumInputTokens,
-  )
-  if (slots.length === 0) return skipped("below-minimum")
+  const slot = input.slot
+  if (!slot.text.trim()) return skipped("empty-input")
+  if (Token.estimateReserve(slot.text) < ReasoningDistillationPolicy.tokens.minimumInputTokens)
+    return skipped("below-minimum")
   const language = input.language ?? "zh"
-  const instruction = ORGANIZE_INSTRUCTIONS[language]
-  const multi = slots.length > 1
-  const prompt = multi
-    ? `${instruction}\n${MULTI_SLOT_FORMAT[language]}\n${JSON.stringify(slots.map((slot, index) => ({ slot: index, text: slot.text })))}`
-    : `${instruction}\n${SINGLE_SLOT_FORMAT[language]}\n${slots[0]!.text}`
+  const prompt = organizePrompt(slot.text, language)
   if (Token.estimateReserve(prompt) > ReasoningDistillationPolicy.tokens.maxInputTokens) return skipped("work-limit")
-  let output: Awaited<ReturnType<OrganizeCall>>
   const modelStarted = performance.now()
+  called = true
   try {
-    output = await input.callModel({ prompt, format: multi ? "json" : "text" })
+    output = await input.callModel({ prompt })
   } catch {
-    modelMs = performance.now() - modelStarted
-    return skipped("model-failure")
+    output = undefined
   }
   modelMs = performance.now() - modelStarted
   if (!output) return skipped("model-failure")
-  if (output.text.length > ReasoningDistillationPolicy.tokens.maxOutputTokens * 4)
-    return skipped("truncated", output.usageTokens)
-  if (output.finishReason && !["stop", "end_turn", "complete", "completed"].includes(output.finishReason))
-    return skipped("truncated", output.usageTokens)
-  if (!output.text.trim()) return skipped("invalid-output", output.usageTokens)
+  if (output.text.length > ReasoningDistillationPolicy.tokens.maxOutputTokens * 4) return skipped("truncated")
+  if (output.finishReason && !COMPLETE_FINISH.includes(output.finishReason)) return skipped("truncated")
   const parseStarted = performance.now()
-  const invalid = () => {
-    parseMs = performance.now() - parseStarted
-    return skipped("invalid-output", output?.usageTokens)
-  }
-  let texts: string[]
-  if (multi) {
-    try {
-      const parsed: unknown = JSON.parse(output.text)
-      if (
-        !parsed ||
-        typeof parsed !== "object" ||
-        Array.isArray(parsed) ||
-        !Array.isArray((parsed as { items?: unknown }).items)
-      )
-        return invalid()
-      const items = (parsed as { items: unknown[] }).items
-      if (items.length !== slots.length) return invalid()
-      const mapped = new Map<number, string>()
-      for (const item of items) {
-        if (!item || typeof item !== "object" || Array.isArray(item)) return invalid()
-        const { slot, text } = item as { slot?: unknown; text?: unknown }
-        if (
-          !Number.isInteger(slot) ||
-          typeof slot !== "number" ||
-          slot < 0 ||
-          slot >= slots.length ||
-          typeof text !== "string" ||
-          mapped.has(slot)
-        )
-          return invalid()
-        mapped.set(slot, text)
-      }
-      texts = slots.map((_, index) => mapped.get(index)!)
-    } catch {
-      return invalid()
-    }
-  } else texts = [output.text]
+  const raw = output.text.trim()
   parseMs = performance.now() - parseStarted
-  // Only the explicit marker may clear a slot; an empty body is a model failure, not a noise verdict.
-  if (texts.some((text) => !text.trim())) return invalid()
-  const changed = slots.flatMap((slot, index) => {
-    const raw = texts[index]!.trim()
-    const after = raw === NO_USEFUL_REASONING ? "" : raw
-    return after === slot.text ? [] : [{ messageID: slot.messageID, partID: slot.partID, before: slot.text, after }]
-  })
-  if (changed.length === 0) return skipped("unchanged", output.usageTokens)
-  const replacements = changed.filter(
-    (item) =>
-      Token.estimateReserve(item.before) - Token.estimateReserve(item.after) >=
-      ReasoningDistillationPolicy.tokens.minimumNetSavingsTokens,
+  // Only the explicit marker may declare a part noise; an empty body is a model failure, not a noise verdict.
+  if (!raw) return skipped("invalid-output")
+  const after = raw === NO_USEFUL_REASONING ? NO_USEFUL_REASONING_TEXT[language] : raw
+  if (after === slot.text) return skipped("unchanged")
+  // Source and rewrite may use different scripts (English reasoning, Chinese prose), so compare unbiased estimates.
+  if (
+    Token.estimateComparable(slot.text) - Token.estimateComparable(after) <
+    ReasoningDistillationPolicy.tokens.minimumNetSavingsTokens
   )
-  if (replacements.length === 0) return skipped("no-savings", output.usageTokens)
+    return skipped("no-savings")
   return {
     status: "organized",
-    replacements,
+    replacement: { messageID: slot.messageID, partID: slot.partID, before: slot.text, after },
+    called,
+    output: output.text,
     usageTokens: output.usageTokens,
     timing: { modelMs, parseMs, totalMs: performance.now() - started },
   }

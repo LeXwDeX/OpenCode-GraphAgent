@@ -1,6 +1,12 @@
+import { NO_USEFUL_REASONING_TEXT } from "@opencode-ai/core/session/reasoning-distillation"
+
 /** Fixed-fixture semantic checks for the opt-in live acceptance harness. Not a production judge. */
 export function checkFixtureSemantics(id: string, texts: string[]): Record<string, boolean> {
-  const clean = (value: string) => value.replace(/[`*_#]/g, "").replace(/\s+/g, "").replace(/[：]/g, ":")
+  const clean = (value: string) =>
+    value
+      .replace(/[`*_#]/g, "")
+      .replace(/\s+/g, "")
+      .replace(/[：]/g, ":")
   const text = clean(texts.join("\n"))
   const segment = (value: string, start: string, end?: string) => {
     const from = value.indexOf(start)
@@ -37,7 +43,9 @@ export function checkFixtureSemantics(id: string, texts: string[]): Record<strin
       return {
         alpha_test_retry: /测试环境/.test(alpha) && retry(alpha, 2) && no(alpha, /生产环境|重试0次/),
         beta_production_no_retry:
-          /生产环境/.test(beta) && /(?:禁止|不得|不能|不允许)重试/.test(beta) && /(?:次数(?:为|是|:)?|重试)0(?:次)?/.test(beta),
+          /生产环境/.test(beta) &&
+          /(?:禁止|不得|不能|不允许)重试/.test(beta) &&
+          /(?:次数(?:为|是|:)?|重试)0(?:次)?/.test(beta),
         gamma_output_path: /输出/.test(gamma) && /(?:必须|应|保存到)/.test(gamma) && /\/tmp\/gamma\.json/.test(gamma),
         delta_preserve_original: /(?:不能|不得|禁止|不可)删除原始记录/.test(delta),
         epsilon_read_only: /仅允许读取缓存|只能读取缓存|缓存只读/.test(epsilon) && no(epsilon, /允许写|可以写/),
@@ -63,7 +71,7 @@ export function checkFixtureSemantics(id: string, texts: string[]): Record<strin
         config_unchanged: /(?:暂不|不得|不|禁止)(?:修改|变更)配置/.test(text),
       }
     case "all-noise":
-      return { empty: texts.length === 1 && texts[0] === "" }
+      return { empty: texts.length === 1 && texts[0] === NO_USEFUL_REASONING_TEXT.zh }
     case "short-reasoning": {
       const monday = segment(text, "周一", "周二")
       const tuesday = segment(text, "周二", "周三")
@@ -75,7 +83,9 @@ export function checkFixtureSemantics(id: string, texts: string[]): Record<strin
         tuesday_in_47_to_130: /入(?:库)?47.{0,12}(?:库存)?130/.test(tuesday),
         wednesday_out_29_to_101: /出(?:库)?29.{0,12}(?:库存)?101/.test(wednesday),
         thursday_floor_9_to_110: /(?:floor|向下取整|取整|⌊).{0,4}29\/3.{0,4}9.{0,12}(?:库存)?110/.test(thursday),
-        friday_floor_27_to_83: /出(?:库)?.{0,10}(?:floor|向下取整|取整|⌊).{0,4}110\/4.{0,4}27.{0,12}(?:库存)?83/.test(friday),
+        friday_floor_27_to_83: /出(?:库)?.{0,10}(?:floor|向下取整|取整|⌊).{0,4}110\/4.{0,4}27.{0,12}(?:库存)?83/.test(
+          friday,
+        ),
         final_83: /最终库存(?:为|是|:)?83/.test(text),
       }
     }
@@ -89,11 +99,14 @@ export function checkFixtureSemantics(id: string, texts: string[]): Record<strin
         test_only_production_read_only: /仅限测试环境/.test(text) && /生产数据库(?:只能|仅能)?只读/.test(text),
         phase_a_done_no_repeat: /备份.{0,10}schema校验已完成/.test(phase) && /不要重复|不得重复/.test(phase),
         migration_failed_rollback_no_retry:
-          /(?:实际)?执行失败/.test(migration) && /不支持online/.test(migration) && /已回滚/.test(migration) &&
+          /(?:实际)?执行失败/.test(migration) &&
+          /不支持online/.test(migration) &&
+          /已回滚/.test(migration) &&
           /不得重试M|禁止重试M/.test(migration) &&
           no(migration, /迁移M(?:已|已经)(?:成功|完成)|回滚(?:尚未|未)完成|回滚失败|(?:可以|允许)重试M/),
         next_read_only_unapproved:
-          /只读核对日志和备份哈希/.test(next) && /尚未授权再次迁移|未授权再次迁移/.test(next) &&
+          /只读核对日志和备份哈希/.test(next) &&
+          /尚未授权再次迁移|未授权再次迁移/.test(next) &&
           no(next, /(?:已|已经)授权再次迁移|(?:可以|允许)再次迁移/),
         timeout_and_retry: /超时(?:为|是|:)?45秒/.test(limits) && /测试任务.{0,8}重试2次/.test(limits),
         checkpoint: /检查点.{0,10}\/tmp\/recovery-checkpoint\.json/.test(text),
@@ -111,13 +124,17 @@ export function checkFixtureSemantics(id: string, texts: string[]): Record<strin
             ["alpha", "beta", "gamma"].every((name, other) => (index === other) === value.includes(name)),
           ),
         alpha_test_retry_and_no_production:
-          /alpha.{0,8}测试环境.{0,8}重试2次/.test(alpha) && /生产环境(?:禁止|不得|不能)执行/.test(alpha) &&
+          /alpha.{0,8}测试环境.{0,8}重试2次/.test(alpha) &&
+          /生产环境(?:禁止|不得|不能)执行/.test(alpha) &&
           no(alpha, /生产环境(?:可以|允许|已|已经)执行/),
         beta_done_pending_read_only:
-          /beta.{0,6}备份已完成/.test(beta) && /恢复校验尚未完成|恢复校验未完成/.test(beta) &&
-          /下一步只读核对\/tmp\/beta\.json/.test(beta) && no(beta, /恢复校验已完成/),
+          /beta.{0,6}备份已完成/.test(beta) &&
+          /恢复校验尚未完成|恢复校验未完成/.test(beta) &&
+          /下一步只读核对\/tmp\/beta\.json/.test(beta) &&
+          no(beta, /恢复校验已完成/),
         gamma_failed_rollback_no_reuse:
-          /gamma.{0,16}离线协议不兼容.{0,10}执行失败/.test(gamma) && /已回滚/.test(gamma) &&
+          /gamma.{0,16}离线协议不兼容.{0,10}执行失败/.test(gamma) &&
+          /已回滚/.test(gamma) &&
           /不得再次采用同一方案|不能再次采用同一方案/.test(gamma) &&
           no(gamma, /(?:未回滚|回滚失败|执行成功|可以再次采用同一方案|允许再次采用同一方案)/),
       }

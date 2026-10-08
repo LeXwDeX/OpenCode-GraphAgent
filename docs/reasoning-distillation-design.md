@@ -1,12 +1,13 @@
 # 内化推理蒸馏：开发设计与验收规格
 
-> **2026-09-29 产品契约（1.0.54）：** 默认关闭；开启后，已完成轮次的可编辑思考一次交给配置的小模型整理，直接采用替换正文并事务回写。单段使用正文，多段一次返回轻量编号/正文，不再默认执行 claim 提取、coverage 证明或第二次 judge。
-> 第一次和后续完成轮次均由应用作用域调度；调度与整理耗时分开统计。真实验收记录模型调用、解析与数据库写回，不能用前台先返回代替速度验收。
-> 保留有效条件、数值、未决事项、当前方案执行状态和实际失败/回滚；删除重复和没有后续价值的自我纠错。结构由内容决定，不固定类别或条数。
-> 整理后的说明文字用中文；路径、命令、符号、代码、URL、配置键、版本号和数值保持原样。此要求适用于当前单次整理路径，不要求恢复旧版 propose/judge 调用。
-> 显式 `small_model` 优先；不可用时保留原文，不回退主模型。辅助调用 low、零自动重试。历史 native-wire 实验路径的 small/agent/primary 枚举不是当前默认完成轮次的调用链。
-> 成功写回发送正常更新事件，TUI、重新打开的历史和后续请求读取同一正文；已经发出的请求保留原快照。原文和 metadata 留作关闭功能后的回放；签名/加密、过期或取消内容不写回。
-> 当前实现、真实测量和验收见 [单次整理验收记录](reasoning-denoise-acceptance.md)。下方旧版设计保留为历史背景，与此契约冲突的逐槽位双调用、同步首轮等描述已被取代。
+> **2026-10-08 产品契约（逐步重写）：** 默认关闭；开启后，每段思考一结束（`reasoning-end`）就交给配置的小模型单独整理，与本步剩余输出和工具执行并行；多段思考各自一次调用、并发执行、互不牵连。
+> 每次向模型发请求前先过“发送屏障”：等待本会话未完成的整理，至多 `OPENCODE_REASONING_DISTILLATION_SETTLE_MS`（默认 3000 ms），之后把剩余任务封存并中断。封存的任务永不写回，因此每段思考要么在第一次回传前完成替换，要么保持原文，不会因事后改写破坏已发请求的提示缓存前缀。写回按单段校验（未封存、会话未回退、持久化内容未变），后续消息不再导致整批作废。
+> 整理调用走 `@opencode-ai/llm` 引擎（opencode 宿主经 native 适配器；引擎不支持的 SDK 包才回退 AI SDK）：无工具、temperature 0、零自动重试，`none`/`low` 按协议翻译。预算按会话计 token（缺失用量按提示+输出估算，不再因此暂停），仅连续失败才暂停。
+> 整理后的说明文字默认中文（`language` 可选 en）；路径、命令、符号、代码、URL、配置键、版本号和数值保持原样。全文无信息时以非空占位“（无有效推理）”替换，保证 `reasoning_content` 等字段仍然存在。
+> 哪些 metadata 把思考绑定到原文（签名、加密、存储引用、明文镜像）由引擎 `ReasoningCarrier.classify` 判定；签名/加密/未知载体不改写。原文和原 metadata 留作关闭功能后的回放。
+> 设计与验收见 [逐步重写交付记录](reasoning-rewrite-engine-2026-10-08.md)。下方 1.0.54 契约与更早的旧版设计保留为历史背景，与此契约冲突处已被取代。
+>
+> **2026-09-29 产品契约（1.0.54，已被上方取代）：** 默认关闭；开启后，已完成轮次的可编辑思考一次交给配置的小模型整理，直接采用替换正文并事务回写。单段使用正文，多段一次返回轻量编号/正文，不再默认执行 claim 提取、coverage 证明或第二次 judge。
 
 ```json
 {
@@ -22,7 +23,7 @@ The original source is retained as host-owned provenance, excluded from provider
 Background work belongs to the running application scope; shutdown cancels unfinished work without changing history.
 
 - 日期：2026-09-22，第 4 版。
-- 状态：提案。产品实现未开始；文档检查通过不代表产品、模型质量或上游兼容性通过验收。
+- 状态：历史提案（第 4 版）。现行实现以文首产品契约为准；本节以下内容仅作背景。
 - 调研基线：`cedcfb3647e50d9a25633b65e4f3e599adc7fb6c`；`origin/dev` = `f3f4e50a0164c3b11b3b0126b2cd9c1ebe25dc37`。实施前重新核对开发分支。
 - 本次范围：完善设计，不修改产品代码、用户配置或原始历史，不部署、不创建 Issue 或提交。
 
@@ -253,8 +254,7 @@ type SupportResult =
 
 type ReasoningSlotShape = "interleaved-field" | "unsigned-reasoning" | "downgraded-text"
 type SlotEligibility =
-  | { allowed: true; capabilityFingerprint: string }
-  | { allowed: false; protection: "P1" | "P2" | "P3" | "P4" | "P5" }
+  { allowed: true; capabilityFingerprint: string } | { allowed: false; protection: "P1" | "P2" | "P3" | "P4" | "P5" }
 type WireReasoningMapping = {
   refs: readonly SourceRef[]
   shape: ReasoningSlotShape
@@ -298,12 +298,7 @@ type ModelProjection = {
   text: string // Rendered only from validated claims and preserved source spans; 输出一律中文（§5.4.1），技术标识符逐字保留
 }
 type AuditViolationKind =
-  | "fabricated"
-  | "concealed"
-  | "simulated_execution"
-  | "unbacked_completion"
-  | "evidence_swap"
-  | "unverifiable"
+  "fabricated" | "concealed" | "simulated_execution" | "unbacked_completion" | "evidence_swap" | "unverifiable"
 type AuditRecord = {
   subject: "source-agent" | "distiller"
   findings: readonly {

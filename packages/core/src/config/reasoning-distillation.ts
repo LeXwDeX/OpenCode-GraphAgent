@@ -17,14 +17,15 @@ export const Language = Schema.Literals(["zh", "en"])
 export type Language = typeof Language.Type
 
 /**
- * Reasoning-distillation switch (default-off). When enabled, settled canonical reasoning without signed, encrypted
- * or unknown provider carriers is organized once per completed turn and the result replaces the stored text.
- * `compatibility` records only gate the legacy native-wire projector; canonical adoption does not consult them.
+ * Reasoning-distillation switch (default-off). When enabled, each settled reasoning part whose provider carrier is
+ * plain or a plaintext mirror is organized by the small model as soon as it ends, and the result replaces the stored
+ * text before the part is first resent. `compatibility` is accepted for older configurations and ignored.
  */
 export class Info extends Schema.Class<Info>("ConfigV2.ReasoningDistillation")({
   enabled: Schema.Boolean.pipe(Schema.optional),
   /** Language of the organized prose; literals such as paths and commands stay verbatim. Defaults to `zh`. */
   language: Language.pipe(Schema.optional),
+  /** @deprecated Ignored; retained so existing configurations still load. */
   compatibility: Compatibility.pipe(Schema.Array, Schema.optional),
 }) {}
 

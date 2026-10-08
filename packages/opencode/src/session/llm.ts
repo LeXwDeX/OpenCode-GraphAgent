@@ -1,11 +1,10 @@
-import { type ReasoningReplacement } from "@opencode-ai/core/session/reasoning-distillation/adoption"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { llmClient } from "@opencode-ai/core/effect/layer-node-platform"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Provider } from "@/provider/provider"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
-import { Context, Effect, Layer, Semaphore } from "effect"
+import { Context, Effect, Layer } from "effect"
 import * as Stream from "effect/Stream"
 import { generateText, streamText, wrapLanguageModel, type ModelMessage, type Tool } from "ai"
 import { type LLMEvent } from "@opencode-ai/llm"
@@ -35,13 +34,13 @@ import {
   type RequestPurpose,
 } from "./context-folding"
 import { ConfigCompaction } from "@opencode-ai/core/config/compaction"
-import { ConfigReasoningDistillation } from "@opencode-ai/core/config/reasoning-distillation"
 import { Flag } from "@opencode-ai/core/flag/flag"
 import { contextFoldingDiagnostic, type ContextFoldingProjectionPlan } from "@opencode-ai/core/session/context-folding"
-import { organizeReasoning, ReasoningDistillationPolicy } from "@opencode-ai/core/session/reasoning-distillation"
-import { Token } from "@opencode-ai/core/util/token"
-import { type TurnReasoningSnapshot } from "./reasoning-distillation"
-import { InstanceState } from "@/effect/instance-state"
+import {
+  engineOrganizerCall,
+  ReasoningDistillationPolicy,
+  type OrganizeCall,
+} from "@opencode-ai/core/session/reasoning-distillation"
 import { ToolBudget } from "@opencode-ai/core/session/tool-budget"
 
 export function strictJSON(text: string): unknown {
@@ -52,18 +51,6 @@ export function strictJSON(text: string): unknown {
     ? trimmed.replace(/^```[a-zA-Z0-9_-]*[ \t]*\r?\n/, "").replace(/\r?\n[ \t]*```\s*$/, "")
     : trimmed
   return JSON.parse(unfenced)
-}
-
-/** Privacy-safe failure category for distillation fallback logs: error tag or
- * class name only — never the error message, which may echo wire content. */
-function errorCategory(cause: unknown): string {
-  if (typeof cause === "object" && cause !== null) {
-    const tag = (cause as { _tag?: unknown })._tag
-    if (typeof tag === "string") return tag
-    const name = (cause as { name?: unknown }).name
-    if (typeof name === "string") return name
-  }
-  return "unknown"
 }
 
 export const OUTPUT_TOKEN_MAX = ProviderTransform.OUTPUT_TOKEN_MAX
@@ -85,24 +72,21 @@ export type StreamInput = {
   toolChoice?: "auto" | "required" | "none"
   purpose?: RequestPurpose
   contextFolding?: ContextFoldingHistorySnapshot
-  reasoningDistillation?: TurnReasoningSnapshot
-  adoptReasoning?: (replacements: readonly ReasoningReplacement[]) => Effect.Effect<boolean>
 }
 
 export type StreamRequest = StreamInput & {
   abort: AbortSignal
 }
 
-export type DistillInput = Pick<
-  StreamInput,
-  "user" | "sessionID" | "model" | "reasoningDistillation" | "adoptReasoning"
-> & {
-  /** Monotonic timestamps for the preparation and scheduler queue stages. */
-  timing?: { prepareStarted: number; queued: number }
-}
+export type Organizer = Readonly<{
+  transport: "engine" | "ai-sdk"
+  model: string
+  call: (signal: AbortSignal) => OrganizeCall
+}>
 
 export interface Interface {
-  readonly distill: (input: DistillInput) => Effect.Effect<void, unknown>
+  /** The configured small model as a reasoning organizer; undefined when none is available (never the main model). */
+  readonly organizer: (input: { model: Provider.Model }) => Effect.Effect<Organizer | undefined>
   readonly stream: (input: StreamInput) => Stream.Stream<LLMEvent, unknown>
 }
 
@@ -132,23 +116,6 @@ const live: Layer.Layer<
     const events = yield* EventV2Bridge.Service
     const llmClient = yield* LLMClient.Service
     const flags = yield* RuntimeFlags.Service
-    const fastDistillationState = yield* InstanceState.make(() =>
-      Effect.succeed(
-        new Map<
-          string,
-          {
-            lock: Semaphore.Semaphore
-            turns: Set<string>
-            calls: number
-            reservedTokens: number
-            actualTokens: number
-            paidAdmissionPaused: boolean
-            consecutiveFailures: number
-          }
-        >(),
-      ),
-    )
-
     const run = Effect.fn("LLM.run")(function* (input: StreamRequest) {
       yield* Effect.logInfo("stream", {
         providerID: input.model.providerID,
@@ -570,232 +537,59 @@ const live: Layer.Layer<
         ),
       )
 
-    const distill: Interface["distill"] = (input) =>
-      Effect.scoped(
-        Effect.gen(function* () {
-          const workStarted = performance.now()
-          const prepareMs = input.timing ? input.timing.queued - input.timing.prepareStarted : undefined
-          const queueMs = input.timing ? workStarted - input.timing.queued : undefined
-          const collectStarted = performance.now()
-          const snapshot = input.reasoningDistillation
-          if (!snapshot || !input.adoptReasoning) return
-          const parts = snapshot.groups.flatMap((group) => group.parts)
-          const counts = new Map<string, number>()
-          for (const part of parts) {
-            const key = JSON.stringify([part.messageID, part.partID])
-            counts.set(key, (counts.get(key) ?? 0) + 1)
-          }
-          const slots = parts
-            .filter(
-              (part) =>
-                part.canonicalEditable === true &&
-                part.settled &&
-                !part.distilled &&
-                !part.signed &&
-                !part.encrypted &&
-                counts.get(JSON.stringify([part.messageID, part.partID])) === 1,
-            )
-            .map((part) => ({ messageID: part.messageID, partID: part.partID, text: part.text }))
-          const inputCharacters = slots.reduce((total, slot) => total + slot.text.length, 0)
-          const initialCollectMs = performance.now() - collectStarted
-          if (slots.length === 0) return
-          yield* InstanceState.useEffect(fastDistillationState, (states) => {
-            let state = states.get(input.sessionID)
-            if (!state) {
-              state = {
-                lock: Semaphore.makeUnsafe(1),
-                turns: new Set(),
-                calls: 0,
-                reservedTokens: 0,
-                actualTokens: 0,
-                paidAdmissionPaused: false,
-                consecutiveFailures: 0,
-              }
-              states.set(input.sessionID, state)
-            }
-            const current = state
-            return current.lock.withPermit(
-              Effect.gen(function* () {
-                const started = performance.now()
-                const cfg = yield* config.get()
-                if (
-                  !ConfigReasoningDistillation.resolveEnabled({
-                    disabledByEnvironment: Flag.OPENCODE_DISABLE_REASONING_DISTILLATION,
-                    enabled: cfg.reasoningDistillation?.enabled,
-                  }).enabled
-                )
-                  return
-                if (current.turns.has(input.user.id)) return
-                if (
-                  current.calls >= ReasoningDistillationPolicy.calls.maxCallsPerSession ||
-                  current.paidAdmissionPaused
-                ) {
-                  yield* Effect.logInfo("reasoning organization skipped", {
-                    "session.id": input.sessionID,
-                    "reasoning_distillation.reason": "call-budget-exhausted",
-                  })
-                  return
-                }
-                current.turns.add(input.user.id)
-                const modelSetupStarted = performance.now()
-                const selected = yield* provider.getSmallModel(input.model.providerID)
-                if (!selected) {
-                  yield* Effect.logInfo("reasoning organization skipped", {
-                    "session.id": input.sessionID,
-                    "reasoning_distillation.reason": "small-model-unavailable",
-                    "reasoning_distillation.model_calls": 0,
-                    "reasoning_distillation.input_characters": inputCharacters,
-                    "reasoning_distillation.collect_ms": initialCollectMs + performance.now() - modelSetupStarted,
-                    "reasoning_distillation.total_ms": initialCollectMs + performance.now() - started,
-                    "reasoning_distillation.prepare_ms": prepareMs ?? "unknown",
-                    "reasoning_distillation.queue_ms": queueMs ?? "unknown",
-                    "reasoning_distillation.end_to_end_ms": input.timing
-                      ? performance.now() - input.timing.prepareStarted
-                      : "unknown",
-                  })
-                  return
-                }
-                const language = yield* provider.getLanguage(selected)
-                const requestedEffort = selected.variants?.none?.reasoningEffort === "none" ? "none" : "low"
-                const collectMs = initialCollectMs + performance.now() - modelSetupStarted
-                const bridge = yield* EffectBridge.make()
-                const ctrl = yield* Effect.acquireRelease(
-                  Effect.sync(() => new AbortController()),
-                  (controller) => Effect.sync(() => controller.abort()),
-                )
-                let modelCalls = 0
-                let outputCharacters = 0
-                let reasoningCharacters = 0
-                let reportedTotalTokens: number | undefined
-                let failureCategory = "none"
-                // Start the organizer once; on interruption abort it and wait for its accounting while the
-                // per-session lock is still held, so a later turn never sees a half-settled budget.
-                const pending = organizeReasoning({
-                  slots,
-                  language: ConfigReasoningDistillation.resolveLanguage(cfg.reasoningDistillation),
-                  callModel: async ({ prompt }) => {
-                    const reservation =
-                      Token.estimateReserve(prompt) + ReasoningDistillationPolicy.tokens.maxOutputTokens
-                    if (
-                      current.reservedTokens + reservation >
-                      ReasoningDistillationPolicy.tokens.maxReservedTokensPerSession
-                    ) {
-                      failureCategory = "call-budget-exhausted"
-                      return undefined
-                    }
-                    current.calls++
-                    current.reservedTokens += reservation
-                    modelCalls++
-                    try {
-                      const result = await bridge.promise(
-                        Effect.tryPromise({
-                          try: (signal) =>
-                            generateText({
-                              model: language,
-                              prompt,
-                              temperature: 0,
-                              maxOutputTokens: ReasoningDistillationPolicy.tokens.maxOutputTokens,
-                              maxRetries: 0,
-                              providerOptions: { openaiCompatible: { reasoningEffort: requestedEffort } },
-                              abortSignal: AbortSignal.any([signal, ctrl.signal]),
-                            }),
-                          catch: (cause) => cause,
-                        }).pipe(Effect.timeout(`${Flag.OPENCODE_REASONING_DISTILLATION_AUX_TIMEOUT_MS} millis`)),
-                      )
-                      outputCharacters = result.text.length
-                      reasoningCharacters = result.reasoningText?.length ?? 0
-                      reportedTotalTokens =
-                        typeof result.totalUsage?.totalTokens === "number" ? result.totalUsage.totalTokens : undefined
-                      // Reconcile the worst-case reservation with reported usage; unknown usage keeps
-                      // the reservation and stops paid admission (fail closed).
-                      current.consecutiveFailures = 0
-                      current.actualTokens += reportedTotalTokens ?? 0
-                      if (reportedTotalTokens !== undefined && reportedTotalTokens <= reservation)
-                        current.reservedTokens -= reservation - reportedTotalTokens
-                      else current.paidAdmissionPaused = true
-                      return {
-                        text: result.text,
-                        usageTokens: reportedTotalTokens,
-                        finishReason: result.finishReason,
-                      }
-                    } catch (cause) {
-                      // No response: refund the reservation. Only repeated failures stop later turns.
-                      failureCategory = ctrl.signal.aborted ? "abort" : errorCategory(cause)
-                      current.reservedTokens -= reservation
-                      if (failureCategory !== "abort") current.consecutiveFailures++
-                      if (current.consecutiveFailures >= ReasoningDistillationPolicy.calls.maxConsecutiveFailures)
-                        current.paidAdmissionPaused = true
-                      return undefined
-                    }
-                  },
-                })
-                const organized = yield* Effect.tryPromise({ try: () => pending, catch: (cause) => cause }).pipe(
-                  Effect.onInterrupt(() =>
-                    Effect.sync(() => ctrl.abort()).pipe(
-                      Effect.andThen(
-                        Effect.promise(() =>
-                          pending.then(
-                            () => undefined,
-                            () => undefined,
-                          ),
-                        ),
-                      ),
-                    ),
-                  ),
-                )
-                let adopted = false
-                let adoptMs = 0
-                if (organized.status === "organized") {
-                  const latest = yield* config.get()
-                  if (
-                    !ctrl.signal.aborted &&
-                    ConfigReasoningDistillation.resolveEnabled({
-                      disabledByEnvironment: Flag.OPENCODE_DISABLE_REASONING_DISTILLATION,
-                      enabled: latest.reasoningDistillation?.enabled,
-                    }).enabled
-                  ) {
-                    const adoptStarted = performance.now()
-                    adopted = yield* input.adoptReasoning!(organized.replacements)
-                    adoptMs = performance.now() - adoptStarted
-                  }
-                }
-                yield* Effect.logInfo("reasoning organization", {
-                  "session.id": input.sessionID,
-                  "reasoning_distillation.role": "organize",
-                  "reasoning_distillation.provider": selected.providerID,
-                  "reasoning_distillation.model": selected.id,
-                  "reasoning_distillation.model_tier": "small",
-                  "reasoning_distillation.requested_effort": requestedEffort,
-                  "reasoning_distillation.slot_count": slots.length,
-                  "reasoning_distillation.input_characters": inputCharacters,
-                  "reasoning_distillation.model_calls": modelCalls,
-                  "reasoning_distillation.collect_ms": collectMs,
-                  "reasoning_distillation.model_ms": organized.timing.modelMs,
-                  "reasoning_distillation.parse_ms": organized.timing.parseMs,
-                  "reasoning_distillation.adopt_ms": adoptMs,
-                  "reasoning_distillation.total_ms": initialCollectMs + performance.now() - started,
-                  "reasoning_distillation.prepare_ms": prepareMs ?? "unknown",
-                  "reasoning_distillation.queue_ms": queueMs ?? "unknown",
-                  "reasoning_distillation.end_to_end_ms": input.timing
-                    ? performance.now() - input.timing.prepareStarted
-                    : "unknown",
-                  "reasoning_distillation.output_characters": outputCharacters,
-                  "reasoning_distillation.reasoning_characters": reasoningCharacters,
-                  "reasoning_distillation.reported_total_tokens": reportedTotalTokens ?? "unknown",
-                  "reasoning_distillation.status": organized.status,
-                  "reasoning_distillation.reason":
-                    failureCategory !== "none" ? failureCategory : (organized.reason ?? "none"),
-                  "reasoning_distillation.adopted": adopted,
-                  "reasoning_distillation.aux_reserved_tokens": current.reservedTokens,
-                  "reasoning_distillation.aux_actual_tokens": current.actualTokens,
-                  "reasoning_distillation.paid_admission_paused": current.paidAdmissionPaused,
-                })
-              }),
-            )
-          })
-        }),
+    const resolveOrganizer = Effect.fn("LLM.organizer")(function* (input: { model: Provider.Model }) {
+      const selected = yield* provider.getSmallModel(input.model.providerID)
+      if (!selected) return undefined
+      // A declared no-reasoning variant keeps the organizer fast; otherwise it requests low effort.
+      const effort = selected.variants?.none?.reasoningEffort === "none" ? "none" : "low"
+      const timeoutMs = Flag.OPENCODE_REASONING_DISTILLATION_AUX_TIMEOUT_MS
+      const [item, info] = yield* Effect.all(
+        [provider.getProvider(selected.providerID), auth.get(selected.providerID)],
+        {
+          concurrency: "unbounded",
+        },
       )
-    return Service.of({ stream, distill })
+      const engine = LLMNativeRuntime.organizerClient({ model: selected, provider: item, auth: info, llmClient })
+      if (engine.type === "supported")
+        return {
+          transport: "engine" as const,
+          model: `${selected.providerID}/${selected.id}`,
+          call: (signal: AbortSignal) =>
+            engineOrganizerCall({ llm: engine.llm, model: engine.model, effort, timeoutMs, signal }),
+        }
+      // Packages the engine does not route keep a provider-SDK fallback, isolated to this one call.
+      const language = yield* provider.getLanguage(selected)
+      return {
+        transport: "ai-sdk" as const,
+        model: `${selected.providerID}/${selected.id}`,
+        call:
+          (signal: AbortSignal): OrganizeCall =>
+          async ({ prompt }) => {
+            const result = await generateText({
+              model: language,
+              prompt,
+              temperature: 0,
+              maxOutputTokens: ProviderTransform.maxOutputTokens(
+                selected,
+                ReasoningDistillationPolicy.tokens.maxOutputTokens,
+              ),
+              maxRetries: 0,
+              providerOptions: { openaiCompatible: { reasoningEffort: effort } },
+              abortSignal: AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]),
+            })
+            return {
+              text: result.text,
+              usageTokens:
+                typeof result.totalUsage?.totalTokens === "number" ? result.totalUsage.totalTokens : undefined,
+              finishReason: result.finishReason,
+            }
+          },
+      }
+    })
+    // An unavailable provider or credential skips the rewrite; it never falls back to the main model.
+    const organizer: Interface["organizer"] = (input) =>
+      resolveOrganizer(input).pipe(Effect.catch(() => Effect.succeed(undefined)))
+    return Service.of({ stream, organizer })
   }),
 )
 

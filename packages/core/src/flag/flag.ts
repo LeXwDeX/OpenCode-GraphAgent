@@ -57,12 +57,18 @@ export const Flag = {
   get OPENCODE_DISABLE_REASONING_DISTILLATION() {
     return truthy("OPENCODE_DISABLE_REASONING_DISTILLATION")
   },
-  /** Auxiliary propose/judge call timeout in milliseconds (#643). Defaults to
-   * 30s; raise it when the organizer model's provider latency exceeds the
-   * default. Invalid or non-positive values fall back to the default. */
+  /** Organizer call timeout in milliseconds (#643). Defaults to 30s; raise it when the organizer model's provider
+   * latency exceeds the default. Invalid or non-positive values fall back to the default. */
   get OPENCODE_REASONING_DISTILLATION_AUX_TIMEOUT_MS() {
     const parsed = Number(process.env["OPENCODE_REASONING_DISTILLATION_AUX_TIMEOUT_MS"])
     return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : 30_000
+  },
+  /** How long a provider request waits for in-flight reasoning rewrites of the same session before sending; the rest
+   * are sealed and never adopted. Defaults to 3s; 0 never waits. Invalid or negative values fall back to the default. */
+  get OPENCODE_REASONING_DISTILLATION_SETTLE_MS() {
+    const raw = process.env["OPENCODE_REASONING_DISTILLATION_SETTLE_MS"]
+    const parsed = Number(raw)
+    return raw !== undefined && raw.trim() !== "" && Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : 3_000
   },
   get OPENCODE_EXPERIMENTAL_REFERENCES() {
     return enabledByExperimental("OPENCODE_EXPERIMENTAL_REFERENCES")
