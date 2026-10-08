@@ -111,6 +111,17 @@ function TextBody(props: { title: string; description?: string; icon?: string })
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value)
 
+/** Permissions whose dialog view renders the tool input directly (rather than tool-provided metadata). */
+const INPUT_VIEWS = new Set(["read", "glob", "grep", "list", "bash", "task", "webfetch", "websearch"])
+
+/** Bounded, readable preview of a hook-forced ask's effective input. */
+export const inputPreview = (input: Record<string, unknown>, maxLines = 24, maxChars = 2_000) => {
+  const lines = JSON.stringify(input, null, 2).split("\n")
+  const shown = lines.slice(0, maxLines).join("\n")
+  const clipped = shown.length > maxChars ? shown.slice(0, maxChars) : shown
+  return clipped.length < JSON.stringify(input, null, 2).length ? `${clipped}\n… (truncated)` : clipped
+}
+
 export function PermissionPrompt(props: { request: PermissionRequest; directory?: string }) {
   const sdk = useSDK()
   const project = useProject()
@@ -206,6 +217,21 @@ export function PermissionPrompt(props: { request: PermissionRequest; directory?
           const info = () => {
             const permission = props.request.permission
             const data = input()
+
+            // A hook-forced ask carries no tool metadata (diff, path); show the effective input itself for tools
+            // without a view built on that input.
+            if (hookAsk() && !INPUT_VIEWS.has(permission)) {
+              const path = [data.filePath, data.path].find((value): value is string => typeof value === "string")
+              return {
+                icon: "⚙",
+                title: path ? `Call tool ${permission} · ${pathFormatter.format(path)}` : `Call tool ${permission}`,
+                body: (
+                  <box paddingLeft={1}>
+                    <text fg={theme.text}>{inputPreview(data)}</text>
+                  </box>
+                ),
+              }
+            }
 
             if (permission === "edit") {
               const raw = props.request.metadata?.filepath

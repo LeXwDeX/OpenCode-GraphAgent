@@ -145,8 +145,14 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
     })
 
   // `confirmed`: the user already approved this exact call in a hook-forced ask, so ask-level rules
-  // do not prompt again for it; deny rules still apply.
-  const context = (args: Record<string, unknown>, options: ToolExecutionOptions, confirmed = false): Tool.Context => ({
+  // do not prompt again for it; deny rules still apply. `recorded` is the model's own input, which the
+  // tool part keeps (history and doom-loop detection compare model calls, not hook rewrites).
+  const context = (
+    args: Record<string, unknown>,
+    options: ToolExecutionOptions,
+    confirmed = false,
+    recorded: Record<string, unknown> = args,
+  ): Tool.Context => ({
     sessionID: input.session.id,
     abort: options.abortSignal!,
     messageID: input.processor.message.id,
@@ -163,7 +169,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
             title: val.title,
             metadata: val.metadata,
             status: "running",
-            input: args,
+            input: recorded,
             time: { start: Date.now() },
           },
         }
@@ -292,10 +298,10 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
                 }
                 preContexts = preResult.additionalContexts ?? []
                 dynamicInstructions ||= hookAddsInstructions(preResult)
+                // The tool's own permission checks see the effective input and the confirmation.
+                ctx = context(decision.effectiveArgs, options, hookConfirmed, args)
                 // effectiveArgs reflects any PreToolUse updatedInput rewrite (shallow merge).
                 args = decision.effectiveArgs
-                // The tool's own permission checks see the effective input and the confirmation.
-                ctx = context(args, options, hookConfirmed)
               }
               if (options.abortSignal?.aborted) return yield* Effect.interrupt
               const result = yield* Effect.suspend(() => {
@@ -760,8 +766,8 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
               hookConfirmed = true
             }
             preContexts = preResult.additionalContexts ?? []
+            ctx = context(decision.effectiveArgs, opts, hookConfirmed, args)
             args = decision.effectiveArgs
-            ctx = context(args, opts, hookConfirmed)
           }
           if (opts.abortSignal?.aborted) return yield* Effect.interrupt
           const result: Awaited<ReturnType<NonNullable<typeof execute>>> = yield* Effect.gen(function* () {

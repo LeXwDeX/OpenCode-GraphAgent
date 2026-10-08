@@ -45,9 +45,14 @@ const bashDefinition = {
   parameters: Schema.Struct({ command: Schema.String }),
   execute: (args: { command: string }, ctx: Tool.Context) =>
     ctx
-      .ask({ permission: "bash", patterns: [args.command], always: ["*"], metadata: {} })
-      .pipe(Effect.as({ title: "ran", output: "BASH_COMPLETE", metadata: {} })),
+      .metadata({ title: "running", metadata: {} })
+      .pipe(
+        Effect.andThen(ctx.ask({ permission: "bash", patterns: [args.command], always: ["*"], metadata: {} })),
+        Effect.as({ title: "ran", output: `BASH_COMPLETE ${args.command}`, metadata: {} }),
+      ),
 }
+// Tool-part inputs recorded through ctx.metadata, in call order.
+const recordedInputs: unknown[] = []
 const it = testEffect(
   Layer.mergeAll(
     Permission.layer.pipe(Layer.provide(EventV2Bridge.defaultLayer), Layer.provideMerge(hookLayer)),
@@ -90,7 +95,13 @@ const setupWith = (hookOutput: Record<string, unknown>, agentName: string, rules
       session: { id, directory, permission: [] } as any,
       processor: {
         message: { id: MessageID.ascending(), sessionID: id },
-        updateToolCall: () => Effect.succeed(undefined),
+        updateToolCall: (
+          _callID: string,
+          update: (match: { state: { status: string } }) => { state: { input?: unknown } },
+        ) =>
+          Effect.sync(() => {
+            recordedInputs.push(update({ state: { status: "running" } }).state.input)
+          }),
         completeToolCall: () => Effect.void,
       } as any,
       bypassAgentCheck: false,
@@ -199,9 +210,13 @@ describe("hook permissionDecision ask confirms the effective input once", () => 
         reason: "rewritten command",
         input: { command: "git log --oneline" },
       })
+      recordedInputs.length = 0
       yield* permission.reply({ requestID: pending[0].id, reply: "once" })
       const exit = yield* Fiber.await(fiber)
       expect(Exit.isSuccess(exit)).toBe(true)
+      if (Exit.isSuccess(exit)) expect(JSON.stringify(exit.value)).toContain("BASH_COMPLETE git log --oneline")
+      // The tool part keeps the model's own input; the rewrite is what ran.
+      expect(recordedInputs).toEqual([{ command: "make clean" }])
       expect((yield* permission.list()).length).toBe(0)
     }),
   )
