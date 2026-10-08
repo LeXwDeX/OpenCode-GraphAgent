@@ -19,6 +19,8 @@
 
 - 用 `specgit pr --status` 和有时间上限、稳定 session ID 的 `specgit watch` 观察当前 PR head，读取 JSON 中的实际检查结论。exit 0 仅表示读取成功；当前提交的全部必需门禁通过后才按现有授权使用原生 gh/glab 合并。合并和 Issue 关闭分别回读，checks goal 不代表 lifecycle 完成。
 - v1 的 finish、bind、生成式 acceptance workflow 和本地 merge guard 已退役；不重新生成或依赖这些资产，不削弱 GitHub 必需门禁。
+- 合并只用 merge commit（`gh pr merge --merge`）；压缩合并和变基合并已禁用，避免分支和 worktree 追踪失效。
+- `.specgit.yaml` 是每个检出各自的本地配置；新检出或 worktree 先执行 AGENTS.md 中的 `specgit init` / `specgit setup`。
 - `specgit status` 是离线本地证据；checkpoint 分支不匹配时返回所属分支或使用独立 worktree，不丢弃其他交付的 checkpoint。
 - 正式发布必须在用户明确授权范围内；已有授权不重复询问。预览、配置偏好和 hook 通知均不增加授权。
 - 回退（合并后 CI 挂）永不静默：开 issue、进下一班车、在 Brief 中显式列出。
