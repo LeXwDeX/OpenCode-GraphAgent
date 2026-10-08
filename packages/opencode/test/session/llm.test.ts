@@ -2630,7 +2630,7 @@ describe("session.llm.stream", () => {
         })
         void waitRequest("/chat/completions", auxiliaryTextResponse("已确认方案A。"))
         const ctx = yield* InstanceRef
-        if (!ctx) return yield* Effect.die("InstanceRef not provided")
+        if (!ctx) throw new Error("InstanceRef not provided")
         yield* Effect.promise(() =>
           Effect.runPromise(
             Effect.gen(function* () {

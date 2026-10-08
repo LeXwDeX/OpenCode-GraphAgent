@@ -260,7 +260,12 @@ const withMcpEcho = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
       }),
       Effect.provideService(
         Truncate.Service,
-        Truncate.Service.of({ output: (text: string) => Effect.succeed({ content: text, truncated: false }) } as any),
+        Truncate.Service.of({
+          cleanup: () => Effect.void,
+          write: (text) => Effect.succeed(text),
+          output: (text) => Effect.succeed({ content: text, truncated: false }),
+          limits: () => Effect.succeed({ maxLines: Number.MAX_SAFE_INTEGER, maxBytes: Number.MAX_SAFE_INTEGER }),
+        }),
       ),
     )
   })
