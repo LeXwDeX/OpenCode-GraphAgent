@@ -106,6 +106,16 @@ describe("agent tool contract", () => {
       expect(Result.isSuccess(decode({ params }))).toBe(false)
   })
 
+  it.effect("routes node questions to the parent and asks the parent for grounded answers", () =>
+    Effect.gen(function* () {
+      const tool = yield* AgentTool.pipe(Effect.provide(Layer.mock(DagAgentMessages.Service, {})))
+      const { description } = yield* tool.init()
+      expect(description).toContain("sends the question to its owning parent; nodes do not ask the user")
+      expect(description).toContain("reply_to its message with a conclusion you can stand behind")
+      expect(description).toContain("never present a guess as settled")
+    }),
+  )
+
   it.effect("passes trusted session and exact destination through to durable acceptance", () =>
     Effect.gen(function* () {
       let received: Parameters<DagAgentMessages.Interface["send"]>[0] | undefined
