@@ -312,8 +312,9 @@ export const TaskTool = Tool.define(
 
       // Foreground task call: this tool fires SubagentStop for the child, so the
       // child's own prompt loop must skip the main-agent Stop (see TaskSubagents).
-      // Released when the foreground wait ends (including promotion to background).
-      const releaseSubagent = runInBackground ? Effect.void : yield* TaskSubagents.register(nextSession.id)
+      // Released at promotion to background or when the foreground wait ends.
+      const subagent = runInBackground ? undefined : yield* TaskSubagents.register(nextSession.id)
+      const releaseSubagent = subagent?.release ?? Effect.void
       const info = yield* background
         .start({
           id: nextSession.id,
@@ -326,6 +327,8 @@ export const TaskTool = Tool.define(
               metadata: { ...metadata, background: true, jobId: nextSession.id },
             }),
             notify(nextSession.id),
+            // From here the child is a background task and fires its own Stop.
+            releaseSubagent,
           ]),
           run: runTask().pipe(Effect.onInterrupt(() => ops.cancel(nextSession.id))),
         })
@@ -396,9 +399,21 @@ export const TaskTool = Tool.define(
         // subagent for another turn; the next SubagentStop then carries
         // stop_hook_active=true so a well-behaved hook stops blocking (anti-loop,
         // mirroring the prompt.ts Stop path). Skipped when promoted to background
-        // (the subagent is still running, not stopped); once this foreground wait
-        // ends the child is no longer in TaskSubagents, so its own loop fires Stop.
+        // (the subagent is still running, not stopped); promotion released the
+        // TaskSubagents registration, so the child's own loop fires Stop.
         const promoted = Boolean((output.metadata as { background?: boolean } | undefined)?.background)
+        // Promotion raced a clean child exit that had already skipped its own
+        // Stop for this call: deliver SubagentStop once (no continuation, the
+        // task now runs in the background).
+        if (settingsHook && promoted && subagent && (yield* subagent.stopDelegated)) {
+          const stopResult = yield* settingsHook
+            .trigger(
+              { event: "SubagentStop", stopHookActive: false, agentID: nextSession.id, agentType: next.name },
+              { sessionID: ctx.sessionID, transcriptPath: "" },
+            )
+            .pipe(Effect.catch(() => Effect.succeed({ additionalContexts: [], systemMessages: [] } as TriggerResult)))
+          yield* SettingsHook.landSystemMessages(stopResult, { sessionID: ctx.sessionID })
+        }
         if (settingsHook && !promoted) {
           let subagentStopBlocked = false
           // Hard cap on blocked-SubagentStop continuation: a misbehaving hook that

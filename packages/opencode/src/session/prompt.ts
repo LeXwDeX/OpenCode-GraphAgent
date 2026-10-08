@@ -2044,7 +2044,7 @@ export const layer = Layer.effect(
               // without SubagentStop, so StopFailure still fires for those. Only
               // positively registered sessions are skipped; any other child
               // (SDK-created, DAG node, background task) still fires Stop.
-              const taskSubagentCleanExit = !turnError && TaskSubagents.has(sessionID)
+              const taskSubagentCleanExit = !turnError && TaskSubagents.delegateStop(sessionID)
               // SettingsHook: Stop on clean turn exit, StopFailure when it ended in error.
               if (settingsHook && !taskSubagentCleanExit) {
                 const lastAssistantMessage =
@@ -2733,6 +2733,7 @@ export const layer = Layer.effect(
               sessionID: input.sessionID,
               type: "text",
               text: `/memory ${input.arguments}`.trim(),
+              metadata: { command: "memory" },
             }
             yield* sessions.updatePart(commandPart)
             const now = Date.now()
@@ -2779,6 +2780,7 @@ export const layer = Layer.effect(
               sessionID: input.sessionID,
               type: "text",
               text: `/trust ${input.arguments}`.trim(),
+              metadata: { command: "trust" },
             }
             yield* sessions.updatePart(cmdText)
             const now = Date.now()
@@ -2835,6 +2837,7 @@ export const layer = Layer.effect(
                 sessionID: input.sessionID,
                 type: "text",
                 text: `/${input.command} ${input.arguments}`.trim(),
+                metadata: { command: input.command },
               }
               yield* sessions.updatePart(cmdText)
               // Non-synthetic so UserMessage renders it — the command confirmation
@@ -2913,6 +2916,7 @@ export const layer = Layer.effect(
               type: "text",
               ignored: true,
               text: `/${input.command} ${input.arguments}`.trim(),
+              metadata: { command: input.command },
             }
             yield* sessions.updatePart(cmdText)
             // Non-synthetic so UserMessage renders it — the command confirmation
@@ -3008,6 +3012,8 @@ export const layer = Layer.effect(
             {
               type: "text" as const,
               text: `/${input.command}${input.arguments ? ` ${input.arguments}` : ""}`,
+              // Marks the invocation so consumers (Memory) can tell commands from pasted paths.
+              metadata: { command: input.command },
             },
             ...uniqueTemplateParts.map((part) => (part.type === "text" ? { ...part, synthetic: true } : part)),
             ...(input.parts ?? []),

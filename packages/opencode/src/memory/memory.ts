@@ -1088,54 +1088,18 @@ function isRealUser(message: SessionV1.WithParts): message is SessionV1.WithPart
   if (message.info.role !== "user") return false
   if (message.parts.some((part) => part.type === "compaction")) return false
   const text = message.parts.filter((part): part is SessionV1.TextPart => part.type === "text" && !part.synthetic)
-  if (text.some((part) => isCommandLine(part.text))) return false
+  if (text.some(isCommandPart)) return false
   return text.some((part) => part.text.trim())
 }
 
 // Command turns persist their invocation as `/${name}` or `/${name} ${args}`
-// (SessionPrompt.command), where `name` is a registered command name: a config
-// key, a command file path without its extension (nested names like `git/commit`
-// are allowed), an MCP `server:prompt`, or a skill. Such names never begin with a
-// filesystem root and never end in a file extension or a `:line` suffix, so a
-// pasted absolute path (`/Users/me/app/x.ts:12 throws`) is real user input.
-const FILESYSTEM_ROOTS = new Set([
-  "Applications",
-  "Library",
-  "System",
-  "Users",
-  "Volumes",
-  "bin",
-  "dev",
-  "etc",
-  "home",
-  "media",
-  "mnt",
-  "nix",
-  "opt",
-  "private",
-  "proc",
-  "root",
-  "run",
-  "sbin",
-  "srv",
-  "tmp",
-  "usr",
-  "var",
-  "workspace",
-  "workspaces",
-])
-
-function isCommandLine(value: string) {
-  const text = value.trim()
-  if (!text.startsWith("/")) return false
-  const name = text.slice(1).split(/\s/, 1)[0] ?? ""
-  if (!name) return false
-  const segments = name.split("/")
-  if (segments.some((segment) => segment.length === 0)) return false
-  if (segments.length > 1 && FILESYSTEM_ROOTS.has(segments[0])) return false
-  if (/:\d+(?::\d+)?$/.test(name)) return false
-  if (segments.length > 1 && /\.[A-Za-z0-9]+$/.test(segments.at(-1)!)) return false
-  return true
+// (SessionPrompt.command) and mark it with `metadata.command`. Unmarked text is
+// user input — including pasted absolute paths (`/data/project/logs`) — except
+// the single-segment `/name args` shape of invocations persisted before command
+// parts were marked.
+function isCommandPart(part: SessionV1.TextPart) {
+  if (typeof part.metadata?.command === "string") return true
+  return /^\/[^\s/:]+(?:\s|$)/.test(part.text.trim())
 }
 
 function isFinalAssistant(

@@ -174,7 +174,9 @@ export const layer = Layer.effect(
           if (reason) return yield* new PermissionV1.CorrectedError({ feedback: `Permission hook: ${reason}` })
           return yield* new PermissionV1.RejectedError({})
         }
-        if (hookResult.permissionDecision === "allow") return
+        // A forced ask (PreToolUse hook `ask`) requires the user's confirmation:
+        // a PermissionRequest hook may still deny it, but its allow is ignored.
+        if (hookResult.permissionDecision === "allow" && !force) return
       }
       const deferred = yield* Deferred.make<void, PermissionV1.RejectedError | PermissionV1.CorrectedError>()
       pending.set(id, { info, deferred, force })

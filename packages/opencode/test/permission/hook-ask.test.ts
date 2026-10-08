@@ -14,13 +14,17 @@ import { SettingsHook, type HookPayload, type TriggerContext } from "../../src/h
 
 // Captures every hook payload so the tests can assert the envelope inputs.
 const triggered: Array<{ payload: HookPayload; ctx: TriggerContext }> = []
+// Decision a PermissionRequest hook returns; reset by each test that sets it.
+let permissionRequestDecision: "allow" | "deny" | undefined
 const captureHook = Layer.succeed(
   SettingsHook.Service,
   SettingsHook.Service.of({
     trigger: (payload, ctx) =>
       Effect.sync(() => {
         triggered.push({ payload, ctx })
-        return { additionalContexts: [], systemMessages: [] }
+        return payload.event === "PermissionRequest" && permissionRequestDecision
+          ? { additionalContexts: [], systemMessages: [], permissionDecision: permissionRequestDecision }
+          : { additionalContexts: [], systemMessages: [] }
       }),
     list: () => Effect.succeed([]),
   }),
@@ -178,5 +182,40 @@ it.instance(
       expect(notification?.payload).toMatchObject({ notificationType: "permission" })
       expect(notification?.ctx.sessionID).toBe(sessionID)
     }),
+  { git: true },
+)
+
+it.instance(
+  "a PermissionRequest hook allow does not answer a forced hook ask, but its deny still applies",
+  () =>
+    Effect.gen(function* () {
+      const permission = yield* Permission.Service
+      permissionRequestDecision = "allow"
+      // An ordinary ask is still auto-approved by the PermissionRequest hook.
+      yield* permission.ask({
+        sessionID,
+        permission: "edit",
+        patterns: ["src/c.ts"],
+        metadata: {},
+        always: [],
+        ruleset: [],
+      })
+      expect((yield* permission.list()).length).toBe(0)
+
+      const fiber = yield* hookAsk().pipe(Effect.forkScoped)
+      const pending = yield* waitForPending(1)
+      expect(pending[0].metadata).toMatchObject({ hookAsk: true })
+      yield* Fiber.interrupt(fiber)
+
+      permissionRequestDecision = "deny"
+      const exit = yield* hookAsk().pipe(Effect.exit)
+      expect(Exit.isFailure(exit)).toBe(true)
+    }).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          permissionRequestDecision = undefined
+        }),
+      ),
+    ),
   { git: true },
 )

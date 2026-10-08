@@ -148,6 +148,19 @@ describe("DagConfig.tierModel", () => {
     })
   })
 
+  it("treats a whitespace-only tier as unconfigured and trims tier components", () => {
+    const blankAdvanced = { model: { advanced: " / ", standard: "openai/gpt-5" } }
+    expect(DagConfig.tierModel(blankAdvanced, { required: true, workerType: "build" })).toEqual({
+      providerID: "openai",
+      modelID: "gpt-5",
+    })
+    const padded = { model: { standard: " openai / gpt-5 " } }
+    expect(DagConfig.tierModel(padded, { required: false, workerType: "build" })).toEqual({
+      providerID: "openai",
+      modelID: "gpt-5",
+    })
+  })
+
   it("keeps only the first slash as the provider separator", () => {
     const nested = { model: { standard: "local-proxy-compatible/qwen3.8-max-preview" } }
     expect(DagConfig.tierModel(nested, { required: false, workerType: "explore" })).toEqual({

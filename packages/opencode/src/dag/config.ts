@@ -146,6 +146,10 @@ async function seedGlobalDefault(): Promise<NodeJS.ErrnoException | undefined> {
 function parseModelRef(ref: string | undefined) {
   if (!ref) return undefined
   const slash = ref.indexOf("/")
-  if (slash <= 0 || slash === ref.length - 1) return undefined
-  return { providerID: ref.slice(0, slash), modelID: ref.slice(slash + 1) }
+  if (slash < 0) return undefined
+  // Whitespace-only components (e.g. " / ") count as unconfigured.
+  const providerID = ref.slice(0, slash).trim()
+  const modelID = ref.slice(slash + 1).trim()
+  if (!providerID || !modelID) return undefined
+  return { providerID, modelID }
 }

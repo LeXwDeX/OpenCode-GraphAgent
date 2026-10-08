@@ -839,9 +839,11 @@ describe("memory cadence evidence", () => {
     const sessionID = SessionID.make("ses_memory_pasted_path")
     const providerID = ProviderV2.ID.make("test")
     const modelID = ModelV2.ID.make("test-model")
-    const turn = (text: string) => {
+    const turn = (text: string, command?: string) => {
       const id = MessageID.ascending()
-      return [user(id, sessionID, text), { info: assistant(id, sessionID, providerID, modelID, "end_turn"), parts: [] }]
+      const message = user(id, sessionID, text)
+      if (command) message.parts = message.parts.map((part) => ({ ...part, metadata: { command } }))
+      return [message, { info: assistant(id, sessionID, providerID, modelID, "end_turn"), parts: [] }]
     }
 
     for (const text of [
@@ -849,10 +851,22 @@ describe("memory cadence evidence", () => {
       "/home/me/project/build.log shows the failure",
       "/srv/app/main.go:40:7 panics",
       "/tmp/output.log",
+      // Arbitrary mounts without an extension or line suffix.
+      "/data/project/logs",
+      "/repo/checkout is empty after the merge",
     ])
       expect(Memory.completedTurns(turn(text))).toBe(1)
 
-    for (const text of ["/memory on", "/goal write the docs", "/init", "/git/commit fix typo", "/server:prompt arg"])
+    // SessionPrompt.command marks its invocation part, whatever the name looks like.
+    for (const [text, command] of [
+      ["/memory on", "memory"],
+      ["/git/commit fix typo", "git/commit"],
+      ["/server:prompt arg", "server:prompt"],
+    ])
+      expect(Memory.completedTurns(turn(text, command))).toBe(0)
+
+    // Invocations persisted before command parts were marked.
+    for (const text of ["/memory on", "/goal write the docs", "/init"])
       expect(Memory.completedTurns(turn(text))).toBe(0)
   })
 
