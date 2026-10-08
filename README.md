@@ -266,10 +266,11 @@ pick, and proves it by starting it once. For one-off graphs, `workflow(action="d
 takes the structured graph as tool parameters and hands back a validated
 `spec_path`, so field drift never reaches the file.
 
-Node prompts come from `.opencode/dag-prompts/*.md` — 12 templates ship
-in-repo, referenced by `prompt_template.id`. Add your own `.md` file there to
-make a new template available; a global workflow should prefer `inline` prompts
-so it does not depend on a repo-local template.
+Node prompts referenced by `prompt_template.id` resolve from the project's
+`.opencode/dag-prompts/<id>.md`, then the global `<config dir>/dag-prompts/`.
+Add your own `.md` file there to make a new template available; a global
+workflow should prefer `inline` prompts so it does not depend on a repo-local
+template.
 
 ## The engine
 
@@ -283,7 +284,7 @@ Each node declares:
 |---|---|
 | `depends_on` | Dependency edges; cycle detection and dangling-reference validation at creation |
 | `worker_type` | Which agent runs the node (`explore`, `build`, `general`, or any configured agent) |
-| `prompt_template` | Prompt by `id` (from `.opencode/dag-prompts/`, 12 templates ship in-repo) or `inline`, with `{{var}}` interpolation |
+| `prompt_template` | Prompt by `id` (from project, then global `dag-prompts/`) or `inline`, with `{{var}}` interpolation |
 | `input_mapping` | Map upstream node outputs into template variables (`"count": "node-b.output.count"`) |
 | `condition` | Expression over upstream outputs; false → node skipped, pure descendants cascade-skip |
 | `output_schema` | JSON Schema; the child agent must call `submit_result` with a matching structured payload |
@@ -369,7 +370,7 @@ The operating doctrine that came out of it:
 
 Why a DAG at all: a single agent loop struggles once a task has staged dependencies, parallelizable independent work, or a quality gate in the middle. Splitting decisions from volume (advanced vs. standard tiers), asking before building (deep-mode admission), gating verdicts with mandatory disposal, and recovering from evidence rather than guesses are the four judgments this engine is built on.
 
-Curated reference topologies — design decision deep-dive, parallel project delivery, deep review of an existing subsystem, compact change review — ship through the workflow library's global scope (curated by the [`opencode-dag-config`](https://github.com/LeXwDeX/opencode-dag-config) repo) and a builtin tier embedded in release binaries. See the [Graph Engineering workflow catalog](./.opencode/workflows/GRAPH-ENGINEERING.md).
+Curated reference topologies — design decision deep-dive, parallel project delivery, deep review of an existing subsystem, compact change review — ship through the workflow library's global scope (curated by the [`opencode-dag-config`](https://github.com/LeXwDeX/opencode-dag-config) repo) and a builtin tier embedded in release binaries. See the [workflow library](https://github.com/LeXwDeX/opencode-dag-config) for the catalog.
 
 ---
 
@@ -432,9 +433,8 @@ Exact file boundaries are listed in [`NOTICE`](./NOTICE). The AGPL covers the DA
 - [`packages/opencode/src/memory/CONTEXT.md`](./packages/opencode/src/memory/CONTEXT.md) — Project Memory model and invariants
 - [Hooks guide](./packages/core/src/plugin/skill/configure-hooks.md) — events, schemas and verification
 - [Saved workflow authoring guide](./packages/core/src/plugin/skill/create-dag-workflow.md) — the `create-dag-workflow` skill body
-- [Graph Engineering workflow catalog](./.opencode/workflows/GRAPH-ENGINEERING.md) — reference topologies and adaptation contracts
+- [`opencode-dag-config`](https://github.com/LeXwDeX/opencode-dag-config) — curated workflows, composable blocks and worker prompts
 - [`docs/harness-dag.md`](./docs/harness-dag.md) — deep-mode admission & review lifecycle
-- [`.opencode/dag-prompts`](./.opencode/dag-prompts) — built-in node prompt templates
 - [`AGENTS.md`](./AGENTS.md) — contribution & development guide
 
 ## Links

@@ -207,7 +207,7 @@ config:
 
 内置的 **`create-dag-workflow`** skill 覆盖 spec 编写：工作流库作用域、文件结构、存盘 spec 必须守的规矩（不能钉死模型、`worker_type` 必须存在、模板必需变量必须给全），以及怎么验证。说一句「把这个存成可复用的工作流」，智能体会先跟你确认阶段和门禁，把文件写进你选的作用域，再真跑一次证明它能用。临时图则用 `workflow(action="draft")`：结构化图走工具参数，返回校验过的 `spec_path`，字段漂移到不了文件。
 
-节点 prompt 来自 `.opencode/dag-prompts/*.md` —— 随仓库附带 12 个，通过 `prompt_template.id` 引用。往那儿加一个 `.md` 就多一个模板；全局工作流建议用 `inline` prompt，否则会依赖某个仓库本地的模板。
+通过 `prompt_template.id` 引用的节点 prompt 先从项目的 `.opencode/dag-prompts/<id>.md` 解析，再找全局 `<config dir>/dag-prompts/`。往那儿加一个 `.md` 就多一个模板；全局工作流建议用 `inline` prompt，否则会依赖某个仓库本地的模板。
 
 ## 引擎
 
@@ -221,7 +221,7 @@ config:
 |---|---|
 | `depends_on` | 依赖边；创建时做环检测和悬空引用校验 |
 | `worker_type` | 执行节点的智能体（`explore`、`build`、`general` 或任意已配置 agent） |
-| `prompt_template` | 通过 `id` 引用模板（`.opencode/dag-prompts/`，随仓库附带 12 个）或 `inline` 内联，支持 `{{var}}` 插值 |
+| `prompt_template` | 通过 `id` 引用模板（先项目、后全局的 `dag-prompts/`）或 `inline` 内联，支持 `{{var}}` 插值 |
 | `input_mapping` | 把上游节点输出映射为模板变量（`"count": "node-b.output.count"`） |
 | `condition` | 基于上游输出的表达式；为假则跳过节点，纯依赖它的下游级联跳过 |
 | `output_schema` | JSON Schema；子智能体必须调用 `submit_result` 提交匹配的结构化结果 |
@@ -304,7 +304,7 @@ DAG 相关的东西都放在 `.opencode/` 下，在 opencode 配置目录（`OPE
 
 至于为什么是 DAG：任务一旦涉及分阶段依赖、可并行的独立工作，或者中间需要一道质量门禁，单智能体循环就不太够用了。决策和跑量分开（advanced/standard 分层）、建图前先问清楚（deep 准入）、门禁结论必须有下文（处置契约）、恢复靠证据不靠猜——这四个判断就是这个引擎的地基。
 
-强约束参考拓扑——设计决策深挖、并行项目落地、已完成子系统深度 Review、轻量变更审查——随工作流库分发：全局作用域由 [`opencode-dag-config`](https://github.com/LeXwDeX/opencode-dag-config) 仓库维护，正式版的二进制里还有内嵌的 builtin 层。入口见 [Graph Engineering 工作流目录](./.opencode/workflows/GRAPH-ENGINEERING.md)。
+强约束参考拓扑——设计决策深挖、并行项目落地、已完成子系统深度 Review、轻量变更审查——随工作流库分发：全局作用域由 [`opencode-dag-config`](https://github.com/LeXwDeX/opencode-dag-config) 仓库维护，正式版的二进制里还有内嵌的 builtin 层。目录见[工作流库](https://github.com/LeXwDeX/opencode-dag-config)。
 
 ---
 
@@ -367,9 +367,8 @@ bun dev serve        # headless API 服务（端口 4096）
 - [`packages/opencode/src/memory/CONTEXT.md`](./packages/opencode/src/memory/CONTEXT.md) —— 项目 Memory 的模型与不变量
 - [hooks 指南](./packages/core/src/plugin/skill/configure-hooks.md) —— 事件、schema 与验证方法
 - [存盘工作流编写指南](./packages/core/src/plugin/skill/create-dag-workflow.md) —— `create-dag-workflow` skill 正文
-- [Graph Engineering 工作流目录](./.opencode/workflows/GRAPH-ENGINEERING.md) —— 参考拓扑与自适应协议
+- [`opencode-dag-config`](https://github.com/LeXwDeX/opencode-dag-config) —— 精选工作流、可组合块与 worker prompt
 - [`docs/harness-dag.md`](./docs/harness-dag.md) —— deep 模式准入与审查生命周期
-- [`.opencode/dag-prompts`](./.opencode/dag-prompts) —— 内置节点 prompt 模板
 - [`AGENTS.md`](./AGENTS.md) —— 贡献与开发指南
 
 ## 链接
