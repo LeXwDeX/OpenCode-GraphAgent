@@ -135,10 +135,28 @@ export const makeRewriteScheduler = <A>(
     return adopted
   })
 
+  /**
+   * Drop a deleted session's jobs: seal them and stop their model calls. An adoption already committing finishes and
+   * is discarded; its transaction rejects a deleted session.
+   */
+  const cancel = Effect.fn("ReasoningRewrite.cancel")(function* (sessionID: string) {
+    const state = sessions.get(sessionID)
+    if (!state) return
+    sessions.delete(sessionID)
+    const fibers: Fiber.Fiber<void>[] = []
+    for (const entry of state.jobs.values()) {
+      if (entry.phase !== "organizing") continue
+      entry.sealed = true
+      if (entry.fiber) fibers.push(entry.fiber)
+    }
+    state.jobs.clear()
+    if (fibers.length > 0) yield* Fiber.interruptAll(fibers).pipe(Effect.forkIn(scope))
+  })
+
   /** Jobs not yet collected by a barrier; diagnostics and tests only. */
   const pending = (sessionID: string) => sessions.get(sessionID)?.jobs.size ?? 0
 
-  return { submit, settle, pending }
+  return { submit, settle, cancel, pending }
 }
 
 export type RewriteScheduler<A> = ReturnType<typeof makeRewriteScheduler<A>>

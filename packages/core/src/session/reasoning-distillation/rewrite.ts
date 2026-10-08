@@ -55,6 +55,7 @@ export const makeRewriteBudget = () => {
           : Token.estimateReserve(input.prompt) + Token.estimateReserve(input.output ?? "")
     },
     snapshot: (sessionID: string) => ({ ...state(sessionID) }),
+    forget: (sessionID: string) => void states.delete(sessionID),
   }
 }
 

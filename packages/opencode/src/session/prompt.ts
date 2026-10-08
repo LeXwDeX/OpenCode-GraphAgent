@@ -249,19 +249,6 @@ export const layer = Layer.effect(
     const todoSvc = yield* Todo.Service
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner
     const scope = yield* Scope.Scope
-    // Rewrite jobs and budgets belong to the directory: disposing the instance closes this scope, which interrupts
-    // pending organizer calls before they can spend tokens or touch the disposed instance's sessions.
-    const rewriteState = yield* InstanceState.make(() =>
-      Effect.gen(function* () {
-        const instanceScope = yield* Scope.Scope
-        return {
-          scheduler: makeRewriteScheduler<{ messageID: MessageID; partID: PartID }>(instanceScope, {
-            settleMs: () => Flag.OPENCODE_REASONING_DISTILLATION_SETTLE_MS,
-          }),
-          budget: makeRewriteBudget(),
-        }
-      }),
-    )
     const instruction = yield* Instruction.Service
     const state = yield* SessionRunState.Service
     const revert = yield* SessionRevert.Service
@@ -270,6 +257,30 @@ export const layer = Layer.effect(
     const llm = yield* LLM.Service
     const events = yield* EventV2Bridge.Service
     const flags = yield* RuntimeFlags.Service
+    // Rewrite jobs and budgets belong to the directory: disposing the instance closes this scope, which interrupts
+    // pending organizer calls before they can spend tokens or touch the disposed instance's sessions. Deleting a
+    // session cancels its own jobs the same way.
+    const rewriteState = yield* InstanceState.make(() =>
+      Effect.gen(function* () {
+        const instanceScope = yield* Scope.Scope
+        const scheduler = makeRewriteScheduler<{ messageID: MessageID; partID: PartID }>(instanceScope, {
+          settleMs: () => Flag.OPENCODE_REASONING_DISTILLATION_SETTLE_MS,
+        })
+        const budget = makeRewriteBudget()
+        yield* Effect.acquireRelease(
+          events.listen((event) => {
+            if (event.type !== Session.Event.Deleted.type) return Effect.void
+            const data = event.data
+            if (typeof data !== "object" || data === null || !("sessionID" in data)) return Effect.void
+            if (typeof data.sessionID !== "string") return Effect.void
+            budget.forget(data.sessionID)
+            return scheduler.cancel(data.sessionID)
+          }),
+          (unsubscribe) => unsubscribe,
+        )
+        return { scheduler, budget }
+      }),
+    )
     const reasoningDistillationEnabled = config.get().pipe(
       Effect.map(
         (cfg) =>
@@ -341,6 +352,24 @@ export const layer = Layer.effect(
             }),
         }),
       )
+    // Replace reasoning parts in history already held in memory with their stored versions.
+    const withStoredReasoning = Effect.fnUntraced(function* (
+      sessionID: SessionID,
+      msgs: SessionV1.WithParts[],
+      refs: ReadonlyArray<{ messageID: MessageID; partID: PartID }>,
+    ) {
+      if (refs.length === 0) return msgs
+      const stored = yield* Effect.forEach(refs, (ref) => sessions.getPart({ sessionID, ...ref }))
+      const byID = new Map<string, SessionV1.Part>(
+        stored.flatMap((part) => (part?.type === "reasoning" ? [[part.id, part] as const] : [])),
+      )
+      if (byID.size === 0) return msgs
+      return msgs.map((message) =>
+        message.parts.some((part) => byID.has(part.id))
+          ? { ...message, parts: message.parts.map((part) => byID.get(part.id) ?? part) }
+          : message,
+      )
+    })
     const agentMessages = Option.getOrUndefined(yield* Effect.serviceOption(DagMessages.Service))
     const { db } = database
     const rawSettingsHook = Option.getOrUndefined(yield* Effect.serviceOption(SettingsHook.Service))
@@ -2227,17 +2256,7 @@ export const layer = Layer.effect(
           const adoptedRefs = yield* InstanceState.useEffect(rewriteState, ({ scheduler }) =>
             scheduler.settle(sessionID),
           )
-          if (adoptedRefs.length > 0) {
-            const adopted = yield* Effect.forEach(adoptedRefs, (ref) => sessions.getPart({ sessionID, ...ref }))
-            const byID = new Map<string, SessionV1.Part>(
-              adopted.flatMap((part) => (part?.type === "reasoning" ? [[part.id, part] as const] : [])),
-            )
-            msgs = msgs.map((message) =>
-              message.parts.some((part) => byID.has(part.id))
-                ? { ...message, parts: message.parts.map((part) => byID.get(part.id) ?? part) }
-                : message,
-            )
-          }
+          msgs = yield* withStoredReasoning(sessionID, msgs, adoptedRefs)
           if (step === 1)
             yield* title({
               session,
@@ -2382,6 +2401,18 @@ export const layer = Layer.effect(
             sessionID,
           }
           yield* sessions.updateMessage(msg)
+          // Cross-process send fence: this persisted attempt is the claim. Adoption rejects every earlier part once it
+          // exists, and only the previous assistant message could still adopt before it, so re-reading that message's
+          // settled reasoning picks up a rewrite another process committed after this loop read its history.
+          msgs = yield* withStoredReasoning(
+            sessionID,
+            msgs,
+            (msgs.findLast((message) => message.info.role === "assistant")?.parts ?? []).flatMap((part) =>
+              part.type === "reasoning" && part.time.end !== undefined && !part.distillation
+                ? [{ messageID: part.messageID, partID: part.id }]
+                : [],
+            ),
+          )
 
           const finalizeInterruptedAssistant = Effect.gen(function* () {
             if (msg.time.completed) return

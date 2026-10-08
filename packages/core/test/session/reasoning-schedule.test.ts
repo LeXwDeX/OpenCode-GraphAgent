@@ -214,3 +214,37 @@ test("finished work that adopted nothing is dropped without waiting for a barrie
       expect(scheduler.pending("s")).toBe(0)
     }),
   ))
+
+test("cancelling a deleted session seals and interrupts its work without touching other sessions", () =>
+  run((scope) =>
+    Effect.gen(function* () {
+      const scheduler = makeRewriteScheduler<string>(scope, { settleMs: () => 1_000 })
+      const started = yield* Deferred.make<boolean>()
+      const interrupted = yield* Deferred.make<void>()
+      yield* scheduler.submit({
+        sessionID: "deleted",
+        key: "slow",
+        enabled,
+        run: (canAdopt) =>
+          Deferred.succeed(started, true).pipe(
+            Effect.andThen(Effect.never),
+            Effect.andThen(canAdopt),
+            Effect.map((ok) => (ok ? "never" : undefined)),
+            Effect.onInterrupt(() => Deferred.succeed(interrupted, undefined)),
+          ),
+      })
+      yield* scheduler.submit({
+        sessionID: "kept",
+        key: "a",
+        enabled,
+        run: (canAdopt) => canAdopt.pipe(Effect.map((ok) => (ok ? "kept-a" : undefined))),
+      })
+      yield* Deferred.await(started)
+      yield* scheduler.cancel("deleted")
+      yield* Deferred.await(interrupted)
+      expect(scheduler.pending("deleted")).toBe(0)
+      expect(yield* scheduler.settle("deleted")).toEqual([])
+      expect(yield* scheduler.settle("kept")).toEqual(["kept-a"])
+      yield* scheduler.cancel("missing")
+    }),
+  ))

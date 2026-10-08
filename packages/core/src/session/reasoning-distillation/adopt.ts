@@ -14,7 +14,10 @@ import { replaceCanonicalReasoning } from "./canonical"
  * Commit one accepted rewrite of a settled reasoning part. Validation runs inside the event transaction: the job must
  * still be adoptable (not sealed by a send barrier, feature enabled), the session must not be reverted, and the
  * persisted part must be exactly the source that was organized. Later user messages do not block adoption, but a later
- * assistant attempt does: the in-process send barrier covers this process, and that durable fence covers others.
+ * assistant attempt does: the in-process send barrier covers this process, and that durable fence covers others. This
+ * runner persists an attempt with its first stream event, after building the request, so another process that has
+ * read history but not yet started its step can still send the original once. That costs a prompt-cache miss on the
+ * following request, not history consistency; the opencode loop closes it by persisting the attempt first.
  */
 export const adoptReasoning = Effect.fn("CoreReasoningDistillation.adopt")(function* (input: {
   events: EventV2.Interface
@@ -59,22 +62,24 @@ export const adoptReasoning = Effect.fn("CoreReasoningDistillation.adopt")(funct
       : undefined
     const current = message?.type === "assistant" ? message.content.filter((item) => item.id === part.id) : []
     if (!row || row.session_id !== input.sessionID || current.length !== 1 || !isDeepStrictEqual(current[0], part))
-      return yield* Effect.die("stale reasoning adoption")
+      yield* Effect.die("stale reasoning adoption")
     // Durable send fence: the in-memory barrier only covers this process. Once any process has persisted a later
     // assistant attempt, that request may already carry the original, so the part is never rewritten afterwards.
-    const later = yield* input.db
-      .select({ id: SessionMessageTable.id })
-      .from(SessionMessageTable)
-      .where(
-        and(
-          eq(SessionMessageTable.session_id, input.sessionID),
-          eq(SessionMessageTable.type, "assistant"),
-          gt(SessionMessageTable.seq, row.seq),
-        ),
-      )
-      .limit(1)
-      .all()
-      .pipe(Effect.orDie)
+    const later = row
+      ? yield* input.db
+          .select({ id: SessionMessageTable.id })
+          .from(SessionMessageTable)
+          .where(
+            and(
+              eq(SessionMessageTable.session_id, input.sessionID),
+              eq(SessionMessageTable.type, "assistant"),
+              gt(SessionMessageTable.seq, row.seq),
+            ),
+          )
+          .limit(1)
+          .all()
+          .pipe(Effect.orDie)
+      : []
     if (later.length > 0) yield* Effect.die("reasoning was already resent by a later attempt")
   })
   return yield* input.events

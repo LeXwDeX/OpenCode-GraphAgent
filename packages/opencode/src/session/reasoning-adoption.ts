@@ -1,7 +1,7 @@
 import { Database } from "@opencode-ai/core/database/database"
-import { SessionMessageTable } from "@opencode-ai/core/session/sql"
-import { eq } from "drizzle-orm"
-import { Cause, DateTime, Effect, Option, Schema } from "effect"
+import { MessageTable, SessionMessageTable } from "@opencode-ai/core/session/sql"
+import { and, eq, gt, or } from "drizzle-orm"
+import { Cause, DateTime, Effect, Schema } from "effect"
 import { isDeepStrictEqual } from "node:util"
 import { EventV2 } from "@opencode-ai/core/event"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
@@ -70,12 +70,33 @@ export const adoptReasoning = Effect.fn("Session.adoptReasoning")(function* (inp
     if (!(yield* input.canAdopt)) yield* Effect.die("reasoning rewrite was sealed or disabled")
     const currentSession = yield* session.get(input.sessionID).pipe(Effect.orDie)
     if (currentSession.revert) yield* Effect.die("reasoning source was reverted")
-    // Durable send fence: the in-memory barrier only covers this process. Once any process has persisted a later
-    // assistant attempt, that request may already carry the original, so the part is never rewritten afterwards.
-    const latest = yield* session
-      .findMessage(input.sessionID, (message) => message.info.role === "assistant")
+    // Durable send fence: the in-memory barrier only covers this process. The prompt loop persists each attempt's
+    // assistant message before it re-reads this part for the request, so once any process has persisted a later
+    // attempt the part is never rewritten, and an adoption committed before that claim is in its request.
+    const own = yield* db
+      .select({ time: MessageTable.time_created })
+      .from(MessageTable)
+      .where(and(eq(MessageTable.id, part.messageID), eq(MessageTable.session_id, input.sessionID)))
+      .get()
       .pipe(Effect.orDie)
-    if (Option.isSome(latest) && latest.value.info.id !== part.messageID)
+    if (!own) yield* Effect.die("reasoning source message was removed")
+    const later = own
+      ? yield* db
+          .select({ data: MessageTable.data })
+          .from(MessageTable)
+          .where(
+            and(
+              eq(MessageTable.session_id, input.sessionID),
+              or(
+                gt(MessageTable.time_created, own.time),
+                and(eq(MessageTable.time_created, own.time), gt(MessageTable.id, part.messageID)),
+              ),
+            ),
+          )
+          .all()
+          .pipe(Effect.orDie)
+      : []
+    if (later.some((row) => row.data.role === "assistant"))
       yield* Effect.die("reasoning was already resent by a later attempt")
     const current = yield* session.getPart({ sessionID: input.sessionID, messageID: part.messageID, partID: part.id })
     if (!isDeepStrictEqual(current, part)) yield* Effect.die("stale reasoning adoption")

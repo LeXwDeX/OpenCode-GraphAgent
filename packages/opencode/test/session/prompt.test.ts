@@ -6639,6 +6639,99 @@ distillationIt.instance("disposing the directory cancels pending rewrites", () =
   }),
 )
 
+distillationIt.instance("deleting a session cancels its pending rewrites", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig((url) => ({
+      ...providerCfg(url),
+      reasoningDistillation: { enabled: true },
+    }))
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({
+      title: "Pinned",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    const started = yield* Deferred.make<void>()
+    const cancelled = yield* Deferred.make<void>()
+    controlledOrganizer = () =>
+      Effect.succeed({
+        transport: "engine" as const,
+        model: "test/small",
+        call: (signal: AbortSignal) => () => {
+          Deferred.doneUnsafe(started, Effect.void)
+          return new Promise<undefined>((resolve) =>
+            signal.addEventListener(
+              "abort",
+              () => {
+                Deferred.doneUnsafe(cancelled, Effect.void)
+                resolve(undefined)
+              },
+              { once: true },
+            ),
+          )
+        },
+      })
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "think" }],
+    })
+    yield* llm.push(reply().reason(longThought("final-thinking")).text("answer").stop())
+    yield* prompt.loop({ sessionID: chat.id })
+    yield* awaitWithTimeout(Deferred.await(started), "final-step rewrite did not start")
+    yield* sessions.remove(chat.id)
+    yield* awaitWithTimeout(Deferred.await(cancelled), "deleting the session did not cancel the pending rewrite")
+  }),
+)
+
+distillationIt.instance("a rewrite committed elsewhere before a step's claim is carried by that step's request", () =>
+  Effect.gen(function* () {
+    // This process does not rewrite; another process sharing the database does.
+    const { llm } = yield* useServerConfig((url) => ({
+      ...providerCfg(url),
+      reasoningDistillation: { enabled: false },
+    }))
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const { db } = yield* Database.Service
+    const chat = yield* sessions.create({
+      title: "Pinned",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "think" }],
+    })
+    yield* llm.push(reply().reason(longThought("final-thinking")).text("answer").stop())
+    yield* prompt.loop({ sessionID: chat.id })
+    const first = (yield* sessions.messages({ sessionID: chat.id })).find((message) => message.info.role === "assistant")
+    const reasoning = first?.parts.find((part) => part.type === "reasoning")
+    if (!first || !reasoning) throw new Error("missing first-turn reasoning")
+    // The other process commits its rewrite after the next loop read history but before it persisted its attempt:
+    // the trigger applies it in the claim's own transaction, ahead of the claim's re-read.
+    yield* db.run(
+      sql.raw(`CREATE TRIGGER foreign_reasoning_adoption AFTER INSERT ON message
+        WHEN json_extract(NEW.data, '$.role') = 'assistant' AND NEW.id != '${first.info.id}'
+        BEGIN UPDATE part SET data = json_set(data, '$.text', 'foreign-rewrite') WHERE id = '${reasoning.id}'; END`),
+    )
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "next" }],
+    })
+    yield* llm.text("next answer")
+    yield* prompt.loop({ sessionID: chat.id })
+    yield* db.run(sql.raw("DROP TRIGGER foreign_reasoning_adoption"))
+    const next = JSON.stringify((yield* llm.hits).at(-1)?.body)
+    expect(next).toContain("foreign-rewrite")
+    expect(next).not.toContain("final-thinking")
+  }),
+)
+
 distillationIt.instance("a rewrite that misses the settle window is sealed and never adopted", () =>
   withSettleWindow(
     "50",

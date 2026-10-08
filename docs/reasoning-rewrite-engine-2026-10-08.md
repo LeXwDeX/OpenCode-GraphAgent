@@ -114,6 +114,18 @@ Chinese organizer language is kept.
 - Adoption also checks a durable fence in both runtimes: it is refused once the session has an assistant message newer
   than the part's message, so a send attempt persisted by another process cannot be followed by a late rewrite. The
   in-process barrier remains the primary mechanism; the fence covers what it cannot see.
+- The opencode loop treats its persisted assistant message as the claim and re-reads the previous assistant
+  message's settled reasoning after it, before building the request. Only that message can still adopt before the
+  claim, so a rewrite another process commits between this loop's history read and its claim is carried by the
+  request, and one after the claim is refused. The fence is a direct query for later assistant rows instead of a paged
+  message scan inside the adoption transaction. A test commits a foreign rewrite in the claim's own transaction with a
+  SQLite trigger; without the re-read the request carries the original.
+- The core runner persists its attempt with the first stream event, after building the request, so a concurrent sender
+  in another process can still send the original once. That costs one prompt-cache miss, not history consistency;
+  closing it would mean starting the step before reading history, which changes the runner's overflow and compaction
+  paths.
+- Deleting a session cancels its pending jobs in both runtimes and releases its budget entry; a mutation test without
+  the cancellation times out.
 
 ### Smoke (built host binary, isolated)
 

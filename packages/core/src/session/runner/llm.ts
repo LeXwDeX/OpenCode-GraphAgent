@@ -433,7 +433,15 @@ export const layer = Layer.effect(
     const budgets = new Map<SessionSchema.ID, RunBudget>()
     yield* Effect.addFinalizer(() => Effect.sync(() => budgets.clear()))
     yield* events.subscribe(SessionV1.Event.Deleted).pipe(
-      Stream.runForEach((event) => Effect.sync(() => budgets.delete(SessionSchema.ID.make(event.data.sessionID)))),
+      Stream.runForEach((event) =>
+        Effect.gen(function* () {
+          const sessionID = SessionSchema.ID.make(event.data.sessionID)
+          budgets.delete(sessionID)
+          // Pending reasoning rewrites of a deleted session can never adopt; stop their model calls now.
+          rewriteBudget.forget(sessionID)
+          yield* rewrites.cancel(sessionID)
+        }),
+      ),
       Effect.forkScoped,
     )
     const newBudget = () =>
