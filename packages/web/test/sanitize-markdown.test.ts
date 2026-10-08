@@ -56,7 +56,7 @@ browserTest(
             return {
               executed: Boolean(Reflect.get(window, "__shareXss")),
               executableElements: document.querySelectorAll("script,iframe,svg,[onerror],[onload]").length,
-              dangerousLinks: links.some((link) => link.protocol === "javascript:"),
+              dangerousLinks: links.some((link) => ["javascript:", "data:", "vbscript:"].includes(link.protocol)),
               safeLink: links.some((link) => link.href === "https://example.com/" && link.rel.includes("noopener")),
               code: document.querySelector("pre code")?.textContent,
               highlighted: Boolean(document.querySelector("pre code span[style]")),
