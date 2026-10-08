@@ -127,6 +127,15 @@ Earlier exploratory runs with `glm-flash` (no `none` variant, `low` effort) took
 one run, made a step wait for the organizer inside the window. With a `none`-capable organizer the calls finish well
 inside tool execution time.
 
+### DEBUG regression and barrier visibility
+
+A DEBUG-level live matrix on the installed binary (DeepSeek `none` and glm-flash `low` organizers at the default window,
+a zero window, feature off) showed the intended behavior in every case: finished rewrites adopted before the next
+request; a glm-flash call that missed the window and a call still running at a zero window were sealed and the original
+stayed in every later request; no organizer calls when off; no server errors. Sealing was only inferable from missing
+outcome lines, so each barrier now logs `reasoning rewrite sealed` (info) when it seals work and
+`reasoning rewrite barrier` (debug) otherwise, with job, adopted and sealed counts and the wait time.
+
 ### Observations
 
 - In the smoke run the organizer judged the step-1 reasoning entirely noise. It restated the request, listed three

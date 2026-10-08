@@ -96,6 +96,7 @@ export const makeRewriteScheduler = <A>(
     if (!state || state.jobs.size === 0) return [] as A[]
     const entries = [...state.jobs.entries()]
     const waitMs = options.settleMs()
+    const started = performance.now()
     if (waitMs > 0 && entries.some(([, entry]) => entry.phase !== "done"))
       yield* Effect.forEach(entries, ([, entry]) => Deferred.await(entry.done), { discard: true }).pipe(
         Effect.timeoutOption(Duration.millis(waitMs)),
@@ -120,6 +121,17 @@ export const makeRewriteScheduler = <A>(
       if (entry.adopted !== undefined) adopted.push(entry.adopted)
     }
     if (state.jobs.size === 0 && sessions.get(sessionID) === state) sessions.delete(sessionID)
+    const fields = {
+      "session.id": sessionID,
+      "reasoning_distillation.barrier_jobs": entries.length,
+      "reasoning_distillation.barrier_adopted": adopted.length,
+      "reasoning_distillation.barrier_sealed": late.length,
+      "reasoning_distillation.barrier_wait_ms": performance.now() - started,
+      "reasoning_distillation.settle_window_ms": waitMs,
+    }
+    // Sealed parts are resent unchanged for good; make that visible without debug logging.
+    if (late.length > 0) yield* Effect.logInfo("reasoning rewrite sealed", fields)
+    else yield* Effect.logDebug("reasoning rewrite barrier", fields)
     return adopted
   })
 
