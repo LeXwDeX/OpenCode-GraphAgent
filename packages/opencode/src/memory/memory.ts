@@ -102,9 +102,6 @@ export const layer: Layer.Layer<
     // Optional so narrow test layers keep the unchecked primary directory.
     const filesystem = yield* Effect.serviceOption(FSUtil.Service)
     const projectIdentity = yield* Effect.serviceOption(ProjectV2.Service)
-    // Verified ownership keyed by Project and directory, valid only while the
-    // directory and its `.git` keep the same filesystem identity.
-    const verifiedDirectories = new Map<string, string>()
     const globalStarted = yield* Ref.make(false)
     const initializationLock = Semaphore.makeUnsafe(1)
     const state = yield* InstanceState.make(() => Effect.succeed({ sessions: new Map<SessionID, SessionCache>() }))
@@ -221,35 +218,18 @@ export const layer: Layer.Layer<
     )
 
     // A live checkout of this Project: it exists and, when identity resolution
-    // is wired, still resolves to this Project (a deleted path may be reused by
-    // an unrelated repository).
+    // is wired, still resolves to this Project. Identity is resolved on every
+    // use, never cached: a path can be deleted and reused by an unrelated
+    // repository, or repointed in place (`git remote set-url`), at any time.
+    // Only reached when the current checkout is not the primary.
     const ownsDirectory = Effect.fnUntraced(function* (projectID: ProjectV2.ID, directory: string) {
       if (Option.isNone(filesystem)) return true
       if (!(yield* filesystem.value.existsSafe(directory))) return false
       if (Option.isNone(projectIdentity)) return true
-      const key = `${projectID}\0${directory}`
-      // A deleted path re-created by another clone gets a new identity, so a
-      // cached verification never vouches for a reused directory.
-      const fingerprint = yield* Effect.forEach([directory, path.join(directory, ".git")], (entry) =>
-        filesystem.value.stat(entry).pipe(
-          Effect.map(
-            (info) =>
-              `${info.dev}:${Option.getOrElse(info.ino, () => -1)}:${Option.match(info.birthtime, {
-                onNone: () => "",
-                onSome: (date) => date.getTime(),
-              })}`,
-          ),
-          Effect.catchCause(() => Effect.succeed("missing")),
-        ),
-      ).pipe(Effect.map((parts) => parts.join("|")))
-      if (verifiedDirectories.get(key) === fingerprint) return true
-      const owned = yield* projectIdentity.value.resolve(AbsolutePath.make(directory)).pipe(
+      return yield* projectIdentity.value.resolve(AbsolutePath.make(directory)).pipe(
         Effect.map((resolved) => resolved.id === projectID),
         Effect.catchCause(() => Effect.succeed(false)),
       )
-      if (owned) verifiedDirectories.set(key, fingerprint)
-      else verifiedDirectories.delete(key)
-      return owned
     })
 
     // Project Configuration lives in the Project's primary directory
