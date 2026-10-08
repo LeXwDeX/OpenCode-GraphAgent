@@ -106,6 +106,15 @@ Chinese organizer language is kept.
 - Finished jobs that adopted nothing are dropped immediately, so sessions that never send again retain no work.
 - The opencode host keeps only adopted part identities until the next barrier and re-reads the parts there.
 
+### Review fixes
+
+- The opencode host keeps its scheduler and budget in `InstanceState`: disposing a directory closes the instance scope
+  and cancels pending organizer calls (a mutation test with the application scope fails). The job owns an
+  `AbortController` that is aborted on interruption, so cancellation reaches the provider request on every path.
+- Adoption also checks a durable fence in both runtimes: it is refused once the session has an assistant message newer
+  than the part's message, so a send attempt persisted by another process cannot be followed by a late rewrite. The
+  in-process barrier remains the primary mechanism; the fence covers what it cannot see.
+
 ### Smoke (built host binary, isolated)
 
 `bun run build --single --skip-install` with the pinned Node 24.21.0 produced

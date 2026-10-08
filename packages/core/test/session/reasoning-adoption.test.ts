@@ -194,7 +194,7 @@ describe("durable reasoning adoption", () => {
     }),
   )
 
-  it.effect("rejects adoption after a revert but accepts it after later messages", () =>
+  it.effect("rejects adoption after a revert or a later assistant attempt, but not after a later user message", () =>
     Effect.gen(function* () {
       const { db, store, sessionID, user, message, adopt } = yield* seed()
       yield* db
@@ -211,15 +211,21 @@ describe("durable reasoning adoption", () => {
         .where(eq(SessionTable.id, sessionID))
         .run()
         .pipe(Effect.orDie)
-      const later = { ...message, id: SessionMessage.ID.make("msg_later") }
-      const { id: _id, type, ...data } = Schema.encodeSync(SessionMessage.Assistant)(later)
-      yield* db
-        .insert(SessionMessageTable)
-        .values({ id: later.id, type, data, session_id: sessionID, seq: 2, time_created: 3 })
-        .run()
-        .pipe(Effect.orDie)
-      // The send barrier, not message ordering, guarantees no request has carried the original yet.
+      const insert = (value: SessionMessage.Message, seq: number) => {
+        const { id: _id, type: _type, ...data } = Schema.encodeSync(SessionMessage.Message)(value)
+        return db
+          .insert(SessionMessageTable)
+          .values({ id: value.id, type: value.type, data, session_id: sessionID, seq, time_created: seq + 1 })
+          .run()
+          .pipe(Effect.orDie)
+      }
+      // A queued user message is not a send attempt; the barrier still decides.
+      yield* insert({ ...user, id: SessionMessage.ID.make("msg_next_user"), text: "next" }, 2)
       expect(yield* adopt("r1", "first adopted")).toBe(true)
+      // Another process persisted a later assistant attempt: its request may carry the original.
+      yield* insert({ ...message, id: SessionMessage.ID.make("msg_later_attempt") }, 3)
+      expect(yield* adopt("r2", "second adopted")).toBe(false)
+      expect(JSON.stringify((yield* store.message(message.id))?.message)).toContain("second original")
     }),
   )
 })

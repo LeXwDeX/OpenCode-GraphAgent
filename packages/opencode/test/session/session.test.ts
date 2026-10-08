@@ -408,6 +408,18 @@ describe("adopted reasoning", () => {
       yield* session.remove(chat.id)
     }),
   )
+  it.instance("rejects adoption once a later assistant attempt exists", () =>
+    Effect.gen(function* () {
+      const { session, chat, info, reasoning, adopt } = yield* seed()
+      // Another process persisted the next attempt; its request may already carry the original reasoning.
+      yield* session.updateMessage({ ...info, id: MessageID.ascending(), time: { created: 3 } })
+      expect(yield* adopt()).toBeUndefined()
+      expect(yield* session.getPart({ sessionID: chat.id, messageID: info.id, partID: reasoning.id })).toEqual(
+        reasoning,
+      )
+      yield* session.remove(chat.id)
+    }),
+  )
   it.instance("a disabled switch blocks an already prepared adoption", () =>
     Effect.gen(function* () {
       const { session, chat, reasoning, adopt } = yield* seed()

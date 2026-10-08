@@ -107,11 +107,15 @@ export const runReasoningRewrite = <A>(input: {
         timing: timing(),
       } as const
     const call = input.call
+    // Own the cancellation: interrupting the job (a sealing barrier, or closing the owning directory's scope) must
+    // cancel the provider request even when the promise's own signal is not aborted on that path.
+    const controller = new AbortController()
     let aborted = false
+    controller.signal.addEventListener("abort", () => (aborted = true), { once: true })
     const organized = yield* Effect.promise((signal) => {
-      signal.addEventListener("abort", () => (aborted = true), { once: true })
-      return organizeReasoning({ slot: input.slot, callModel: call(signal), language: input.language })
-    })
+      signal.addEventListener("abort", () => controller.abort(), { once: true })
+      return organizeReasoning({ slot: input.slot, callModel: call(controller.signal), language: input.language })
+    }).pipe(Effect.onInterrupt(() => Effect.sync(() => controller.abort())))
     if (organized.called)
       input.budget.record(input.sessionID, {
         responded: organized.output !== undefined,

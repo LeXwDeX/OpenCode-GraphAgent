@@ -1,7 +1,7 @@
 import { Database } from "@opencode-ai/core/database/database"
 import { SessionMessageTable } from "@opencode-ai/core/session/sql"
 import { eq } from "drizzle-orm"
-import { Cause, DateTime, Effect, Schema } from "effect"
+import { Cause, DateTime, Effect, Option, Schema } from "effect"
 import { isDeepStrictEqual } from "node:util"
 import { EventV2 } from "@opencode-ai/core/event"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
@@ -19,7 +19,8 @@ import type { SessionID } from "./schema"
 /**
  * Commit one accepted rewrite of a settled reasoning part, and its v2 mirror when present. Validation runs inside the
  * event transaction: the job must still be adoptable (not sealed by a send barrier, feature enabled), the session must
- * not be reverted, and the persisted part (and mirror) must be exactly the organized source. Returns the adopted part.
+ * not be reverted, no later assistant attempt may exist, and the persisted part (and mirror) must be exactly the
+ * organized source. Returns the adopted part.
  */
 export const adoptReasoning = Effect.fn("Session.adoptReasoning")(function* (input: {
   sessionID: SessionID
@@ -69,6 +70,13 @@ export const adoptReasoning = Effect.fn("Session.adoptReasoning")(function* (inp
     if (!(yield* input.canAdopt)) yield* Effect.die("reasoning rewrite was sealed or disabled")
     const currentSession = yield* session.get(input.sessionID).pipe(Effect.orDie)
     if (currentSession.revert) yield* Effect.die("reasoning source was reverted")
+    // Durable send fence: the in-memory barrier only covers this process. Once any process has persisted a later
+    // assistant attempt, that request may already carry the original, so the part is never rewritten afterwards.
+    const latest = yield* session
+      .findMessage(input.sessionID, (message) => message.info.role === "assistant")
+      .pipe(Effect.orDie)
+    if (Option.isSome(latest) && latest.value.info.id !== part.messageID)
+      yield* Effect.die("reasoning was already resent by a later attempt")
     const current = yield* session.getPart({ sessionID: input.sessionID, messageID: part.messageID, partID: part.id })
     if (!isDeepStrictEqual(current, part)) yield* Effect.die("stale reasoning adoption")
     if (!part.v2) return

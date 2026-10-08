@@ -249,10 +249,19 @@ export const layer = Layer.effect(
     const todoSvc = yield* Todo.Service
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner
     const scope = yield* Scope.Scope
-    const rewrites = makeRewriteScheduler<{ messageID: MessageID; partID: PartID }>(scope, {
-      settleMs: () => Flag.OPENCODE_REASONING_DISTILLATION_SETTLE_MS,
-    })
-    const rewriteBudget = makeRewriteBudget()
+    // Rewrite jobs and budgets belong to the directory: disposing the instance closes this scope, which interrupts
+    // pending organizer calls before they can spend tokens or touch the disposed instance's sessions.
+    const rewriteState = yield* InstanceState.make(() =>
+      Effect.gen(function* () {
+        const instanceScope = yield* Scope.Scope
+        return {
+          scheduler: makeRewriteScheduler<{ messageID: MessageID; partID: PartID }>(instanceScope, {
+            settleMs: () => Flag.OPENCODE_REASONING_DISTILLATION_SETTLE_MS,
+          }),
+          budget: makeRewriteBudget(),
+        }
+      }),
+    )
     const instruction = yield* Instruction.Service
     const state = yield* SessionRunState.Service
     const revert = yield* SessionRevert.Service
@@ -278,58 +287,60 @@ export const layer = Layer.effect(
       part: SessionV1.ReasoningPart
       model: Provider.Model
     }) =>
-      rewrites.submit({
-        sessionID: input.sessionID,
-        key: input.part.id,
-        enabled: reasoningDistillationEnabled,
-        run: (canAdopt) =>
-          Effect.gen(function* () {
-            // Organize the persisted part: adoption compares against exactly what is stored.
-            const part = yield* sessions.getPart({
-              sessionID: input.sessionID,
-              messageID: input.part.messageID,
-              partID: input.part.id,
-            })
-            if (part?.type !== "reasoning") return undefined
-            const editability = assessCanonicalReasoning({
-              text: part.text,
-              metadata: part.metadata,
-              settled: part.time.end !== undefined,
-              distilled: part.distillation !== undefined,
-            })
-            if (!editability.editable) {
-              yield* Effect.logDebug("reasoning distillation skipped", {
-                "reasoning_distillation.runtime": "opencode",
-                "reasoning_distillation.reason": editability.reason,
+      InstanceState.useEffect(rewriteState, ({ scheduler, budget }) =>
+        scheduler.submit({
+          sessionID: input.sessionID,
+          key: input.part.id,
+          enabled: reasoningDistillationEnabled,
+          run: (canAdopt) =>
+            Effect.gen(function* () {
+              // Organize the persisted part: adoption compares against exactly what is stored.
+              const part = yield* sessions.getPart({
+                sessionID: input.sessionID,
+                messageID: input.part.messageID,
+                partID: input.part.id,
               })
-              return undefined
-            }
-            const cfg = yield* config.get()
-            const organizer = yield* llm.organizer({ model: input.model })
-            const outcome = yield* runReasoningRewrite({
-              budget: rewriteBudget,
-              sessionID: input.sessionID,
-              slot: { messageID: part.messageID, partID: part.id, text: part.text },
-              language: ConfigReasoningDistillation.resolveLanguage(cfg.reasoningDistillation),
-              call: organizer?.call,
-              adopt: (replacement) =>
-                adoptReasoning({ sessionID: input.sessionID, part, replacement, canAdopt }).pipe(
-                  Effect.provideService(Database.Service, database),
-                  Effect.provideService(Session.Service, sessions),
-                  Effect.provideService(EventV2Bridge.Service, events),
-                ),
-            })
-            yield* Effect.logInfo(
-              "reasoning distillation",
-              rewriteLogFields(outcome, {
-                runtime: "opencode",
-                "session.id": input.sessionID,
-                ...(organizer ? { model: organizer.model, transport: organizer.transport } : {}),
-              }),
-            )
-            return outcome.adopted && { messageID: outcome.adopted.messageID, partID: outcome.adopted.id }
-          }),
-      })
+              if (part?.type !== "reasoning") return undefined
+              const editability = assessCanonicalReasoning({
+                text: part.text,
+                metadata: part.metadata,
+                settled: part.time.end !== undefined,
+                distilled: part.distillation !== undefined,
+              })
+              if (!editability.editable) {
+                yield* Effect.logDebug("reasoning distillation skipped", {
+                  "reasoning_distillation.runtime": "opencode",
+                  "reasoning_distillation.reason": editability.reason,
+                })
+                return undefined
+              }
+              const cfg = yield* config.get()
+              const organizer = yield* llm.organizer({ model: input.model })
+              const outcome = yield* runReasoningRewrite({
+                budget,
+                sessionID: input.sessionID,
+                slot: { messageID: part.messageID, partID: part.id, text: part.text },
+                language: ConfigReasoningDistillation.resolveLanguage(cfg.reasoningDistillation),
+                call: organizer?.call,
+                adopt: (replacement) =>
+                  adoptReasoning({ sessionID: input.sessionID, part, replacement, canAdopt }).pipe(
+                    Effect.provideService(Database.Service, database),
+                    Effect.provideService(Session.Service, sessions),
+                    Effect.provideService(EventV2Bridge.Service, events),
+                  ),
+              })
+              yield* Effect.logInfo(
+                "reasoning distillation",
+                rewriteLogFields(outcome, {
+                  runtime: "opencode",
+                  "session.id": input.sessionID,
+                  ...(organizer ? { model: organizer.model, transport: organizer.transport } : {}),
+                }),
+              )
+              return outcome.adopted && { messageID: outcome.adopted.messageID, partID: outcome.adopted.id }
+            }),
+        }),
+      )
     const agentMessages = Option.getOrUndefined(yield* Effect.serviceOption(DagMessages.Service))
     const { db } = database
     const rawSettingsHook = Option.getOrUndefined(yield* Effect.serviceOption(SettingsHook.Service))
@@ -2213,7 +2224,9 @@ export const layer = Layer.effect(
           step++
           // Send barrier: adopt finished reasoning rewrites before this step builds its request; seal the rest so a
           // part is rewritten before its first resend or never.
-          const adoptedRefs = yield* rewrites.settle(sessionID)
+          const adoptedRefs = yield* InstanceState.useEffect(rewriteState, ({ scheduler }) =>
+            scheduler.settle(sessionID),
+          )
           if (adoptedRefs.length > 0) {
             const adopted = yield* Effect.forEach(adoptedRefs, (ref) => sessions.getPart({ sessionID, ...ref }))
             const byID = new Map<string, SessionV1.Part>(

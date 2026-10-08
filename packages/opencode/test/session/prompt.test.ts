@@ -1,4 +1,5 @@
 import { NodeFileSystem } from "@effect/platform-node"
+import { disposeInstance } from "@/effect/instance-registry"
 import { createHash } from "node:crypto"
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
@@ -6598,6 +6599,44 @@ distillationIt.instance("each step's reasoning is rewritten before its first res
       })
     }),
   ),
+)
+
+distillationIt.instance("disposing the directory cancels pending rewrites", () =>
+  Effect.gen(function* () {
+    const { llm, dir } = yield* useServerConfig((url) => ({
+      ...providerCfg(url),
+      reasoningDistillation: { enabled: true },
+    }))
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({
+      title: "Pinned",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    const started = yield* Deferred.make<AbortSignal>()
+    controlledOrganizer = () =>
+      Effect.succeed({
+        transport: "engine" as const,
+        model: "test/small",
+        call: (signal: AbortSignal) => () => {
+          Deferred.doneUnsafe(started, Effect.succeed(signal))
+          return new Promise<undefined>(() => {})
+        },
+      })
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "think" }],
+    })
+    yield* llm.push(reply().reason(longThought("final-thinking")).text("answer").stop())
+    yield* prompt.loop({ sessionID: chat.id })
+    // The final step's rewrite is still pending after the turn; disposing the directory must cancel its call.
+    const signal = yield* awaitWithTimeout(Deferred.await(started), "final-step rewrite did not start")
+    expect(signal.aborted).toBe(false)
+    yield* Effect.promise(() => disposeInstance(dir))
+    expect(signal.aborted).toBe(true)
+  }),
 )
 
 distillationIt.instance("a rewrite that misses the settle window is sealed and never adopted", () =>
