@@ -21,6 +21,13 @@ export const declaresNoReasoning = (model: LLMRequest["model"]) =>
         (isRecord(body.thinking) && body.thinking.type === "disabled")),
   )
 
+/** The organizer's output cap, lowered to the model's declared output limit so capped providers accept the call. */
+export const organizerMaxTokens = (model: LLMRequest["model"]) => {
+  const limit = model.defaults?.limits?.output ?? model.route.defaults.limits?.output
+  const cap = ReasoningDistillationPolicy.tokens.maxOutputTokens
+  return limit !== undefined && Number.isFinite(limit) && limit > 0 ? Math.min(limit, cap) : cap
+}
+
 const effortBody = (protocol: string, effort: "none" | "low") =>
   protocol === "openai-responses"
     ? { reasoning: { effort } }
@@ -46,7 +53,7 @@ export const engineOrganizerCall = (input: {
       prompt,
       tools: [],
       toolChoice: "none",
-      generation: { temperature: 0, maxTokens: ReasoningDistillationPolicy.tokens.maxOutputTokens },
+      generation: { temperature: 0, maxTokens: organizerMaxTokens(input.model) },
       ...(effort ? { providerOptions: { openai: { reasoningEffort: effort } } } : {}),
       http: {
         timeout: Duration.millis(input.timeoutMs),

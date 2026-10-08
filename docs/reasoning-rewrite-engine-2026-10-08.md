@@ -126,6 +126,8 @@ Chinese organizer language is kept.
   paths.
 - Deleting a session cancels its pending jobs in both runtimes and releases its budget entry; a mutation test without
   the cancellation times out.
+- The organizer's output cap (24,576) is lowered to the small model's declared output limit on the engine and the
+  AI-SDK fallback, so providers that enforce their cap do not reject every organizer call.
 
 ### Smoke (built host binary, isolated)
 

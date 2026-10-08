@@ -6707,7 +6707,9 @@ distillationIt.instance("a rewrite committed elsewhere before a step's claim is 
     })
     yield* llm.push(reply().reason(longThought("final-thinking")).text("answer").stop())
     yield* prompt.loop({ sessionID: chat.id })
-    const first = (yield* sessions.messages({ sessionID: chat.id })).find((message) => message.info.role === "assistant")
+    const first = (yield* sessions.messages({ sessionID: chat.id })).find(
+      (message) => message.info.role === "assistant",
+    )
     const reasoning = first?.parts.find((part) => part.type === "reasoning")
     if (!first || !reasoning) throw new Error("missing first-turn reasoning")
     // The other process commits its rewrite after the next loop read history but before it persisted its attempt:

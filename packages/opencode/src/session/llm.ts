@@ -569,7 +569,10 @@ const live: Layer.Layer<
               model: language,
               prompt,
               temperature: 0,
-              maxOutputTokens: ReasoningDistillationPolicy.tokens.maxOutputTokens,
+              maxOutputTokens: ProviderTransform.maxOutputTokens(
+                selected,
+                ReasoningDistillationPolicy.tokens.maxOutputTokens,
+              ),
               maxRetries: 0,
               providerOptions: { openaiCompatible: { reasoningEffort: effort } },
               abortSignal: AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]),

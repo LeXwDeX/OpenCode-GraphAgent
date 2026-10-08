@@ -34,7 +34,7 @@ describe("Token.estimateReserve", () => {
 describe("Token.estimateComparable", () => {
   // Mirrors a measured pair on the configured DeepSeek relay (English 114 tokens, its Chinese rewrite 106).
   const english =
-    "Let me compute: 1200 + 845 = 2045; 2045 + 377 = 2422.\n\nRuling out:\n1. Transcription: entries read directly, all in one line, clear. Good.\n2. Omission: exactly three entries named alpha, beta, gamma — matches \"three entries\". No others.\n3. Arithmetic: 1200+845+377 = 2422. Check grouping: 1200+377=1577, +845=2422. Consistent.\n\nAudited total = 2422."
+    'Let me compute: 1200 + 845 = 2045; 2045 + 377 = 2422.\n\nRuling out:\n1. Transcription: entries read directly, all in one line, clear. Good.\n2. Omission: exactly three entries named alpha, beta, gamma — matches "three entries". No others.\n3. Arithmetic: 1200+845+377 = 2422. Check grouping: 1200+377=1577, +845=2422. Consistent.\n\nAudited total = 2422.'
   const chinese =
     "计算：1200 + 845 = 2045；2045 + 377 = 2422。\n\n核对：\n- 转录：条目直接读取，均在同一行，清晰。\n- 遗漏：恰好有三个条目 alpha、beta、gamma，与“three entries”一致，没有其他条目。\n- 算术：1200+845+377 = 2422；按 1200+377=1577，再加 845 得 2422，一致。\n\n审计总额为 2422。"
 

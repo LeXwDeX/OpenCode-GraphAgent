@@ -72,9 +72,31 @@ describe("engine organizer transport", () => {
       expect(requests).toHaveLength(1)
       expect(requests[0].tools).toEqual([])
       expect(requests[0].generation?.temperature).toBe(0)
-      expect(requests[0].generation?.maxTokens).toBe(ReasoningDistillationPolicy.tokens.maxOutputTokens)
+      // The fixture model declares a 4096-token output limit.
+      expect(requests[0].generation?.maxTokens).toBe(4_096)
       expect(requests[0].http?.body).toEqual({ reasoning_effort: "low" })
       expect(Duration.toMillis(Duration.fromInputUnsafe(requests[0].http!.timeout!))).toBe(45_000)
+    }),
+  )
+
+  it.effect("caps the organizer output at the model's declared output limit", () =>
+    Effect.gen(function* () {
+      const requests: LLMRequest[] = []
+      const llm = client((request) => Effect.sync(() => (requests.push(request), response("ok"))))
+      for (const output of [4_096, 100_000]) {
+        const limited = Model.make({
+          id: "small",
+          provider: "provider",
+          route: model.route.with({ limits: { output } }),
+        })
+        yield* Effect.promise(() =>
+          engineOrganizerCall({ llm, model: limited, effort: "low", timeoutMs: 1_000 })({ prompt: "p" }),
+        )
+      }
+      expect(requests.map((request) => request.generation?.maxTokens)).toEqual([
+        4_096,
+        ReasoningDistillationPolicy.tokens.maxOutputTokens,
+      ])
     }),
   )
 

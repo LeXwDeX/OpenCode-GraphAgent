@@ -2108,6 +2108,8 @@ describe("session.llm.stream", () => {
           expect(capture.body).toMatchObject({
             model: "deepseek-test-small",
             temperature: 0,
+            // Capped at the small model's declared output limit.
+            max_tokens: 4_096,
             reasoning_effort: none ? "none" : "low",
           })
           expect(capture.body.tools).toBeUndefined()
