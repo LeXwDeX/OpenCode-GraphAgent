@@ -108,6 +108,20 @@ function TextBody(props: { title: string; description?: string; icon?: string })
   )
 }
 
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value)
+
+/** Permissions whose dialog view renders the tool input directly (rather than tool-provided metadata). */
+const INPUT_VIEWS = new Set(["read", "glob", "grep", "list", "bash", "task", "webfetch", "websearch"])
+
+/** Bounded, readable preview of a hook-forced ask's effective input. */
+export const inputPreview = (input: Record<string, unknown>, maxLines = 24, maxChars = 2_000) => {
+  const lines = JSON.stringify(input, null, 2).split("\n")
+  const shown = lines.slice(0, maxLines).join("\n")
+  const clipped = shown.length > maxChars ? shown.slice(0, maxChars) : shown
+  return clipped.length < JSON.stringify(input, null, 2).length ? `${clipped}\n… (truncated)` : clipped
+}
+
 export function PermissionPrompt(props: { request: PermissionRequest; directory?: string }) {
   const sdk = useSDK()
   const project = useProject()
@@ -119,7 +133,15 @@ export function PermissionPrompt(props: { request: PermissionRequest; directory?
 
   const session = createMemo(() => sync.data.session.find((s) => s.id === props.request.sessionID))
 
+  // A hook-forced ask carries the input the tool will actually run with (including hook rewrites).
+  const hookAsk = () => props.request.metadata?.hookAsk === true
+  const hookReason = () => {
+    const reason = props.request.metadata?.reason
+    return hookAsk() && typeof reason === "string" ? reason : ""
+  }
   const input = createMemo(() => {
+    const effective = props.request.metadata?.input
+    if (hookAsk() && isRecord(effective)) return effective
     const tool = props.request.tool
     if (!tool) return {}
     const parts = sync.data.part[tool.messageID] ?? []
@@ -195,6 +217,21 @@ export function PermissionPrompt(props: { request: PermissionRequest; directory?
           const info = () => {
             const permission = props.request.permission
             const data = input()
+
+            // A hook-forced ask carries no tool metadata (diff, path); show the effective input itself for tools
+            // without a view built on that input.
+            if (hookAsk() && !INPUT_VIEWS.has(permission)) {
+              const path = [data.filePath, data.path].find((value): value is string => typeof value === "string")
+              return {
+                icon: "⚙",
+                title: path ? `Call tool ${permission} · ${pathFormatter.format(path)}` : `Call tool ${permission}`,
+                body: (
+                  <box paddingLeft={1}>
+                    <text fg={theme.text}>{inputPreview(data)}</text>
+                  </box>
+                ),
+              }
+            }
 
             if (permission === "edit") {
               const raw = props.request.metadata?.filepath
@@ -397,12 +434,26 @@ export function PermissionPrompt(props: { request: PermissionRequest; directory?
             </box>
           )
 
+          // "Allow always" is offered only when the request carries patterns it would persist.
+          const options: Record<string, string> =
+            props.request.always.length > 0
+              ? { once: "Allow once", always: "Allow always", reject: "Reject" }
+              : { once: "Allow once", reject: "Reject" }
           const body = (
             <Prompt
               title="Permission required"
               header={header()}
-              body={current.body}
-              options={{ once: "Allow once", always: "Allow always", reject: "Reject" }}
+              body={
+                <box flexDirection="column" gap={1}>
+                  <Show when={hookReason()}>
+                    <box paddingLeft={1}>
+                      <text fg={theme.warning}>{"Hook: " + hookReason()}</text>
+                    </box>
+                  </Show>
+                  {current.body}
+                </box>
+              }
+              options={options}
               escapeKey="reject"
               fullscreen
               onSelect={(option) => {

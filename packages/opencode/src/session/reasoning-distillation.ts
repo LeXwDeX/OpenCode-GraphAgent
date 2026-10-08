@@ -1259,6 +1259,9 @@ export type ScopedReasoningEvidence = Readonly<{
 
 export const isDistillationTurn = (turn: number): boolean => Number.isSafeInteger(turn) && turn > 0
 
+/** The completed-turn reasoning the single-call organizer consumes; no evidence inventory is built. */
+export type TurnReasoningSnapshot = Readonly<{ groups: readonly PersistedReasoningGroup[] }>
+
 export type ReasoningHistorySnapshot = Readonly<{
   /** User turn owning the newest settled reasoning; tool steps do not increment it. */
   reasoningTurn?: number
@@ -1311,6 +1314,47 @@ const callResult = (part: SessionV1.ToolPart): CallResultCompleteness => {
  * Capture the persisted reasoning identities and authoritative tool-call inventory before conversion to AI-SDK
  * messages. The fingerprint binds ordered identities and content hashes; it contains no raw text or tool payloads.
  */
+const reasoningSource = (messageCompleted: () => boolean, part: SessionV1.ReasoningPart) => {
+  const canonical = assessCanonicalReasoning({
+    text: part.text,
+    metadata: part.metadata,
+    settled: part.time.end !== undefined && messageCompleted(),
+    distilled: part.distillation !== undefined,
+  })
+  return {
+    messageID: part.messageID,
+    partID: part.id,
+    text: part.text,
+    signed: containsMetadataKey(part.metadata, new Set(["signature", "reasoningOpaque"])),
+    encrypted: containsMetadataKey(
+      part.metadata,
+      new Set(["encrypted_content", "encryptedContent", "reasoningEncryptedContent"]),
+    ),
+    settled: part.time.end !== undefined,
+    distilled: part.distillation !== undefined,
+    canonicalEditable: canonical.editable,
+    canonicalAliasCount: canonical.editable ? canonical.aliasPaths.length : 0,
+    canonicalProtection: canonical.editable ? undefined : canonical.reason,
+  }
+}
+
+/**
+ * Reasoning of the given completed-turn assistant messages only. Runs on the turn-end path, so its cost is
+ * proportional to the turn rather than to the session.
+ */
+export const turnReasoning = (
+  messages: readonly SessionV1.WithParts[],
+  turnMessageIDs: ReadonlySet<string>,
+): TurnReasoningSnapshot => ({
+  groups: messages.flatMap((message) => {
+    const info = message.info
+    if (info.role !== "assistant" || !turnMessageIDs.has(info.id)) return []
+    const completed = () => info.time.completed !== undefined
+    const parts = message.parts.flatMap((part) => (part.type === "reasoning" ? [reasoningSource(completed, part)] : []))
+    return parts.length > 0 ? [{ messageID: message.info.id, parts }] : []
+  }),
+})
+
 export const reasoningHistory = (messages: readonly SessionV1.WithParts[]): ReasoningHistorySnapshot => {
   const groups: PersistedReasoningGroup[] = []
   const calls: ToolCallObservation[] = []
@@ -1344,7 +1388,9 @@ export const reasoningHistory = (messages: readonly SessionV1.WithParts[]): Reas
         contentFingerprints.push(fingerprintUnknown(part.state) ?? "unknown")
       }
     }
-    if (message.info.role !== "assistant") continue
+    const info = message.info
+    if (info.role !== "assistant") continue
+    const completed = () => info.time.completed !== undefined
     const parts: Array<
       InterleavedSourcePart & {
         inputFingerprint?: string
@@ -1354,29 +1400,7 @@ export const reasoningHistory = (messages: readonly SessionV1.WithParts[]): Reas
       }
     > = []
     for (const part of message.parts) {
-      if (part.type === "reasoning") {
-        const canonical = assessCanonicalReasoning({
-          text: part.text,
-          metadata: part.metadata,
-          settled: part.time.end !== undefined && message.info.time.completed !== undefined,
-          distilled: part.distillation !== undefined,
-        })
-        parts.push({
-          messageID: part.messageID,
-          partID: part.id,
-          text: part.text,
-          signed: containsMetadataKey(part.metadata, new Set(["signature", "reasoningOpaque"])),
-          encrypted: containsMetadataKey(
-            part.metadata,
-            new Set(["encrypted_content", "encryptedContent", "reasoningEncryptedContent"]),
-          ),
-          settled: part.time.end !== undefined,
-          distilled: part.distillation !== undefined,
-          canonicalEditable: canonical.editable,
-          canonicalAliasCount: canonical.editable ? canonical.aliasPaths.length : 0,
-          canonicalProtection: canonical.editable ? undefined : canonical.reason,
-        })
-      }
+      if (part.type === "reasoning") parts.push(reasoningSource(completed, part))
       if (part.type !== "tool") continue
       const status = callStatus(part)
       if (status === "pending" || status === "running") inventoryComplete = false
@@ -1395,7 +1419,7 @@ export const reasoningHistory = (messages: readonly SessionV1.WithParts[]): Reas
     }
     if (parts.length > 0) {
       groups.push({ messageID: message.info.id, parts })
-      if (parts.some((part) => part.settled)) reasoningTurn = turns.get(message.info.parentID) ?? reasoningTurn
+      if (parts.some((part) => part.settled)) reasoningTurn = turns.get(info.parentID) ?? reasoningTurn
       // Only the history available through this source message can certify its reasoning.
       // Later unrelated messages must not invalidate an already reviewed source.
       scopes[message.info.id] = {

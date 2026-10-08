@@ -95,6 +95,21 @@ const distillWith = (layer: Layer.Layer<LLM.Service>, input: LLM.StreamInput) =>
     )
   })
 
+// Runs every distill call in one runtime so per-session organizer state accumulates across turns.
+const distillSequenceWith = (layer: Layer.Layer<LLM.Service>, inputs: readonly LLM.StreamInput[]) =>
+  Effect.gen(function* () {
+    const ctx = yield* InstanceRef
+    if (!ctx) return yield* Effect.die("InstanceRef not provided")
+    return yield* Effect.promise(() =>
+      Effect.runPromise(
+        Effect.forEach(inputs, (input) => LLM.Service.use((svc) => svc.distill(input)), { discard: true }).pipe(
+          Effect.provide(layer),
+          Effect.provideService(InstanceRef, ctx),
+        ),
+      ),
+    )
+  })
+
 const drainSequenceWith = (layer: Layer.Layer<LLM.Service>, inputs: readonly LLM.StreamInput[], distill = false) =>
   Effect.gen(function* () {
     const ctx = yield* InstanceRef
@@ -963,7 +978,6 @@ const distillationMessages = (): ModelMessage[] => [
   { role: "user", content: `${distillationBackground}\n继续执行。` },
 ]
 const distillationHistory = (): LLM.StreamInput["reasoningDistillation"] => ({
-  reasoningTurn: 1,
   groups: [
     {
       messageID: "msg-reasoning-source",
@@ -980,9 +994,6 @@ const distillationHistory = (): LLM.StreamInput["reasoningDistillation"] => ({
       ],
     },
   ],
-  calls: [],
-  inventoryComplete: true,
-  inventoryFingerprint: Hash.sha256("empty-inventory"),
 })
 
 const auxiliaryResponse = (content: unknown) =>
@@ -1040,7 +1051,7 @@ const organizeInput = (
 
 const distillationConfig = (
   runtime: "opencode-ai-sdk" | "opencode-native",
-  options: { canonical?: boolean; none?: boolean } = {},
+  options: { canonical?: boolean; none?: boolean; language?: "zh" | "en" } = {},
 ): Partial<ConfigV1.Info> => {
   const endpoint = `${state.server!.url.origin}/v1`
   return {
@@ -1070,6 +1081,7 @@ const distillationConfig = (
     },
     reasoningDistillation: {
       enabled: true,
+      ...(options.language ? { language: options.language } : {}),
       compatibility: options.canonical
         ? []
         : [
@@ -2275,7 +2287,7 @@ describe("session.llm.stream", () => {
                   input("msg_user-distillation-first"),
                   {
                     ...input("msg_user-distillation-second"),
-                    reasoningDistillation: { ...distillationHistory()!, reasoningTurn: 2 },
+                    reasoningDistillation: distillationHistory(),
                   },
                 ],
                 true,
@@ -2417,7 +2429,7 @@ describe("session.llm.stream", () => {
               {
                 ...group.parts[0],
                 partID: "prt-reasoning-second",
-                text: "反复分析方案B与风险。",
+                text: "反复分析方案B与风险。".repeat(8),
               },
             ],
           })),
@@ -2487,6 +2499,91 @@ describe("session.llm.stream", () => {
       { config: () => distillationConfig("opencode-ai-sdk", { canonical: true }) },
     )
   }
+
+  const turnInput = (model: Provider.Model, sessionID: SessionID, turn: number, adopted: unknown[][]) => {
+    const input = organizeInput(model, sessionID, distillationHistory()!, (replacements) =>
+      Effect.sync(() => {
+        adopted.push([...replacements])
+        return true
+      }),
+    )
+    return { ...input, user: { ...input.user, id: MessageID.make(`msg_user-organize-${turn}`) } }
+  }
+
+  it.instance(
+    "reconciles reservations with reported usage so a long session keeps organizing",
+    () =>
+      Effect.gen(function* () {
+        const model = yield* Provider.use.getModel(
+          ProviderV2.ID.make("custom-provider"),
+          ModelV2.ID.make("deepseek-test-r1"),
+        )
+        const sessionID = SessionID.make("session-test-organize-long")
+        const adopted: unknown[][] = []
+        // Each prompt reserves ~45k tokens; without reconciliation the 262k ceiling stopped the sixth turn.
+        const turns = Array.from({ length: 12 }, (_, index) => index + 1)
+        for (const _ of turns) void waitRequest("/chat/completions", auxiliaryTextResponse("已确认方案A。"))
+        yield* distillSequenceWith(
+          llmLayerWithExecutor(RequestExecutor.defaultLayer),
+          turns.map((turn) => turnInput(model, sessionID, turn, adopted)),
+        )
+        expect(state.queue).toHaveLength(0)
+        expect(adopted).toHaveLength(12)
+      }),
+    { config: () => distillationConfig("opencode-ai-sdk", { canonical: true }) },
+  )
+
+  it.instance(
+    "refunds failed organizer calls and pauses only after consecutive failures",
+    () =>
+      Effect.gen(function* () {
+        const model = yield* Provider.use.getModel(
+          ProviderV2.ID.make("custom-provider"),
+          ModelV2.ID.make("deepseek-test-r1"),
+        )
+        const sessionID = SessionID.make("session-test-organize-failures")
+        const adopted: unknown[][] = []
+        const unavailable = () => new Response("unavailable", { status: 503 })
+        // fail, succeed, then three consecutive failures; the sixth turn must not call the model.
+        for (const response of [
+          unavailable(),
+          auxiliaryTextResponse("已确认方案A。"),
+          unavailable(),
+          unavailable(),
+          unavailable(),
+          auxiliaryTextResponse("unexpected"),
+        ])
+          void waitRequest("/chat/completions", response)
+        yield* distillSequenceWith(
+          llmLayerWithExecutor(RequestExecutor.defaultLayer),
+          [1, 2, 3, 4, 5, 6].map((turn) => turnInput(model, sessionID, turn, adopted)),
+        )
+        expect(adopted).toHaveLength(1)
+        expect(state.queue).toHaveLength(1)
+      }),
+    { config: () => distillationConfig("opencode-ai-sdk", { canonical: true }) },
+  )
+
+  it.instance(
+    "uses the configured English organizer instruction",
+    () =>
+      Effect.gen(function* () {
+        const model = yield* Provider.use.getModel(
+          ProviderV2.ID.make("custom-provider"),
+          ModelV2.ID.make("deepseek-test-r1"),
+        )
+        const organize = waitRequest("/chat/completions", auxiliaryTextResponse("Plan A confirmed."))
+        const adopted: unknown[][] = []
+        yield* distillWith(
+          llmLayerWithExecutor(RequestExecutor.defaultLayer),
+          turnInput(model, SessionID.make("session-test-organize-english"), 1, adopted),
+        )
+        const capture = yield* Effect.promise(() => organize)
+        expect(JSON.stringify(capture.body.messages)).toContain("Write all explanatory prose in English")
+        expect(adopted).toHaveLength(1)
+      }),
+    { config: () => distillationConfig("opencode-ai-sdk", { canonical: true, language: "en" }) },
+  )
 
   it.instance(
     "skips organization when the configured small model is unavailable",

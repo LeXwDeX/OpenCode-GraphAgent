@@ -191,7 +191,18 @@ project-controlled PATH are unavailable. Use the three file tools on Windows.
 
 `continue: false` stops prompt admission and wins over a Stop hook's request to
 continue. Permission hooks can reject using `permissionDecision: "deny"`, a block
-decision, or exit code 2. Post-tool block reasons and contexts are appended to
+decision, or exit code 2.
+
+A PreToolUse `permissionDecision: "ask"` is a forced ask: the user always
+confirms it, even after an earlier "always" approval, and the dialog shows the
+input the tool will run with, including any `updatedInput`, plus the hook's
+`permissionDecisionReason`. A PermissionRequest hook can deny a forced ask, but
+its `allow` is ignored (logged). Once confirmed, the tool's own ask-level
+permission checks for that call do not prompt again; deny rules still apply.
+`opencode run --dangerously-skip-permissions` is an automatic mode and approves
+forced asks once; without it, `run` rejects them.
+
+Post-tool block reasons and contexts are appended to
 model-facing tool feedback after execution; they cannot undo a completed write.
 `FileChanged` carries an absolute path and `add`, `change` or `delete`; patch
 renames report both the removed path and the added destination.

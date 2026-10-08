@@ -219,3 +219,35 @@ it.instance(
     ),
   { git: true },
 )
+
+it.instance(
+  "a call confirmed through a forced ask settles ask rules without a dialog, but deny still applies",
+  () =>
+    Effect.gen(function* () {
+      const permission = yield* Permission.Service
+      const request = (ruleset: PermissionV1.Rule[]) => ({
+        sessionID,
+        permission: "edit",
+        patterns: ["src/d.ts"],
+        metadata: {},
+        always: ["*"],
+        tool: { messageID: "msg_hook_ask", callID: "call_hook_ask" },
+        ruleset,
+      })
+      const before = triggered.length
+      yield* permission.ask(request([{ permission: "edit", pattern: "*", action: "ask" }]), { confirmed: true })
+      expect((yield* permission.list()).length).toBe(0)
+      expect(triggered.slice(before).some((entry) => entry.payload.event === "PermissionRequest")).toBe(false)
+
+      const denied = yield* permission
+        .ask(request([{ permission: "edit", pattern: "*", action: "deny" }]), { confirmed: true })
+        .pipe(Effect.exit)
+      expect(Exit.isFailure(denied)).toBe(true)
+
+      // `confirmed` never answers a forced ask itself.
+      const fiber = yield* permission.ask(request([]), { confirmed: true, force: true }).pipe(Effect.forkScoped)
+      expect(yield* waitForPending(1)).toHaveLength(1)
+      yield* Fiber.interrupt(fiber)
+    }),
+  { git: true },
+)

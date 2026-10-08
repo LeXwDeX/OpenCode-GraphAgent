@@ -40,7 +40,7 @@ import { Flag } from "@opencode-ai/core/flag/flag"
 import { contextFoldingDiagnostic, type ContextFoldingProjectionPlan } from "@opencode-ai/core/session/context-folding"
 import { organizeReasoning, ReasoningDistillationPolicy } from "@opencode-ai/core/session/reasoning-distillation"
 import { Token } from "@opencode-ai/core/util/token"
-import { type ReasoningHistorySnapshot as ReasoningDistillationHistorySnapshot } from "./reasoning-distillation"
+import { type TurnReasoningSnapshot } from "./reasoning-distillation"
 import { InstanceState } from "@/effect/instance-state"
 import { ToolBudget } from "@opencode-ai/core/session/tool-budget"
 
@@ -85,7 +85,7 @@ export type StreamInput = {
   toolChoice?: "auto" | "required" | "none"
   purpose?: RequestPurpose
   contextFolding?: ContextFoldingHistorySnapshot
-  reasoningDistillation?: ReasoningDistillationHistorySnapshot
+  reasoningDistillation?: TurnReasoningSnapshot
   adoptReasoning?: (replacements: readonly ReasoningReplacement[]) => Effect.Effect<boolean>
 }
 
@@ -143,6 +143,7 @@ const live: Layer.Layer<
             reservedTokens: number
             actualTokens: number
             paidAdmissionPaused: boolean
+            consecutiveFailures: number
           }
         >(),
       ),
@@ -608,6 +609,7 @@ const live: Layer.Layer<
                 reservedTokens: 0,
                 actualTokens: 0,
                 paidAdmissionPaused: false,
+                consecutiveFailures: 0,
               }
               states.set(input.sessionID, state)
             }
@@ -666,62 +668,81 @@ const live: Layer.Layer<
                 let reasoningCharacters = 0
                 let reportedTotalTokens: number | undefined
                 let failureCategory = "none"
-                const organized = yield* Effect.tryPromise({
-                  try: () =>
-                    organizeReasoning({
-                      slots,
-                      callModel: async ({ prompt }) => {
-                        const reservation =
-                          Token.estimateReserve(prompt) + ReasoningDistillationPolicy.tokens.maxOutputTokens
-                        if (
-                          current.reservedTokens + reservation >
-                          ReasoningDistillationPolicy.tokens.maxReservedTokensPerSession
-                        ) {
-                          failureCategory = "call-budget-exhausted"
-                          return undefined
-                        }
-                        current.calls++
-                        current.reservedTokens += reservation
-                        modelCalls++
-                        try {
-                          const result = await bridge.promise(
-                            Effect.tryPromise({
-                              try: (signal) =>
-                                generateText({
-                                  model: language,
-                                  prompt,
-                                  temperature: 0,
-                                  maxOutputTokens: ReasoningDistillationPolicy.tokens.maxOutputTokens,
-                                  maxRetries: 0,
-                                  providerOptions: { openaiCompatible: { reasoningEffort: requestedEffort } },
-                                  abortSignal: AbortSignal.any([signal, ctrl.signal]),
-                                }),
-                              catch: (cause) => cause,
-                            }).pipe(Effect.timeout(`${Flag.OPENCODE_REASONING_DISTILLATION_AUX_TIMEOUT_MS} millis`)),
-                          )
-                          outputCharacters = result.text.length
-                          reasoningCharacters = result.reasoningText?.length ?? 0
-                          reportedTotalTokens =
-                            typeof result.totalUsage?.totalTokens === "number"
-                              ? result.totalUsage.totalTokens
-                              : undefined
-                          current.actualTokens += reportedTotalTokens ?? 0
-                          if (reportedTotalTokens === undefined || reportedTotalTokens > reservation)
-                            current.paidAdmissionPaused = true
-                          return {
-                            text: result.text,
-                            usageTokens: reportedTotalTokens,
-                            finishReason: result.finishReason,
-                          }
-                        } catch (cause) {
-                          failureCategory = ctrl.signal.aborted ? "abort" : errorCategory(cause)
-                          current.paidAdmissionPaused = failureCategory !== "abort"
-                          return undefined
-                        }
-                      },
-                    }),
-                  catch: (cause) => cause,
+                // Start the organizer once; on interruption abort it and wait for its accounting while the
+                // per-session lock is still held, so a later turn never sees a half-settled budget.
+                const pending = organizeReasoning({
+                  slots,
+                  language: ConfigReasoningDistillation.resolveLanguage(cfg.reasoningDistillation),
+                  callModel: async ({ prompt }) => {
+                    const reservation =
+                      Token.estimateReserve(prompt) + ReasoningDistillationPolicy.tokens.maxOutputTokens
+                    if (
+                      current.reservedTokens + reservation >
+                      ReasoningDistillationPolicy.tokens.maxReservedTokensPerSession
+                    ) {
+                      failureCategory = "call-budget-exhausted"
+                      return undefined
+                    }
+                    current.calls++
+                    current.reservedTokens += reservation
+                    modelCalls++
+                    try {
+                      const result = await bridge.promise(
+                        Effect.tryPromise({
+                          try: (signal) =>
+                            generateText({
+                              model: language,
+                              prompt,
+                              temperature: 0,
+                              maxOutputTokens: ReasoningDistillationPolicy.tokens.maxOutputTokens,
+                              maxRetries: 0,
+                              providerOptions: { openaiCompatible: { reasoningEffort: requestedEffort } },
+                              abortSignal: AbortSignal.any([signal, ctrl.signal]),
+                            }),
+                          catch: (cause) => cause,
+                        }).pipe(Effect.timeout(`${Flag.OPENCODE_REASONING_DISTILLATION_AUX_TIMEOUT_MS} millis`)),
+                      )
+                      outputCharacters = result.text.length
+                      reasoningCharacters = result.reasoningText?.length ?? 0
+                      reportedTotalTokens =
+                        typeof result.totalUsage?.totalTokens === "number" ? result.totalUsage.totalTokens : undefined
+                      // Reconcile the worst-case reservation with reported usage; unknown usage keeps
+                      // the reservation and stops paid admission (fail closed).
+                      current.consecutiveFailures = 0
+                      current.actualTokens += reportedTotalTokens ?? 0
+                      if (reportedTotalTokens !== undefined && reportedTotalTokens <= reservation)
+                        current.reservedTokens -= reservation - reportedTotalTokens
+                      else current.paidAdmissionPaused = true
+                      return {
+                        text: result.text,
+                        usageTokens: reportedTotalTokens,
+                        finishReason: result.finishReason,
+                      }
+                    } catch (cause) {
+                      // No response: refund the reservation. Only repeated failures stop later turns.
+                      failureCategory = ctrl.signal.aborted ? "abort" : errorCategory(cause)
+                      current.reservedTokens -= reservation
+                      if (failureCategory !== "abort") current.consecutiveFailures++
+                      if (current.consecutiveFailures >= ReasoningDistillationPolicy.calls.maxConsecutiveFailures)
+                        current.paidAdmissionPaused = true
+                      return undefined
+                    }
+                  },
                 })
+                const organized = yield* Effect.tryPromise({ try: () => pending, catch: (cause) => cause }).pipe(
+                  Effect.onInterrupt(() =>
+                    Effect.sync(() => ctrl.abort()).pipe(
+                      Effect.andThen(
+                        Effect.promise(() =>
+                          pending.then(
+                            () => undefined,
+                            () => undefined,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                )
                 let adopted = false
                 let adoptMs = 0
                 if (organized.status === "organized") {
@@ -762,7 +783,8 @@ const live: Layer.Layer<
                   "reasoning_distillation.reasoning_characters": reasoningCharacters,
                   "reasoning_distillation.reported_total_tokens": reportedTotalTokens ?? "unknown",
                   "reasoning_distillation.status": organized.status,
-                  "reasoning_distillation.reason": organized.reason ?? failureCategory,
+                  "reasoning_distillation.reason":
+                    failureCategory !== "none" ? failureCategory : (organized.reason ?? "none"),
                   "reasoning_distillation.adopted": adopted,
                   "reasoning_distillation.aux_reserved_tokens": current.reservedTokens,
                   "reasoning_distillation.aux_actual_tokens": current.actualTokens,

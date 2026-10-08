@@ -2147,16 +2147,8 @@ export const layer = Layer.effect(
                 const current = sources.filter(
                   (message) => message.info.role === "assistant" && message.info.parentID === lastUser.id,
                 )
-                const history = ReasoningDistillation.reasoningHistory(sources)
                 const ids = new Set<string>(current.map((message) => message.info.id))
-                const snapshot = {
-                  ...history,
-                  groups: history.groups.map((group) =>
-                    ids.has(group.messageID)
-                      ? group
-                      : { ...group, parts: group.parts.map((part) => ({ ...part, distilled: true })) },
-                  ),
-                }
+                const snapshot = ReasoningDistillation.turnReasoning(sources, ids)
                 const enabled = reasoningDistillationEnabled
                 const previouslyDistilled = sources.some(
                   (message) =>
