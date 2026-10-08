@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test"
-import { Effect } from "effect"
+import { Cause, Effect, Exit } from "effect"
 import { sanitize, sanitizeInput } from "@/dag/templates/sanitize"
 import { renderTemplate, resolveTemplate } from "@/dag/templates/resolve"
 import * as os from "node:os"
@@ -244,6 +244,30 @@ describe("resolveTemplate", () => {
   it("fails for non-existent template id", async () => {
     const program = resolveTemplate({ id: "non-existent-template" }, "/tmp")
     await expect(Effect.runPromise(program)).rejects.toThrow("not found")
+  })
+
+  // The spawn path (DagLoop) fails the node via Effect.catch, which only sees
+  // typed failures. A missing asset raised as a defect escaped it, aborted the
+  // whole spawn round every time, and stranded the node forever.
+  it("reports a missing template id as a typed failure, not a defect", async () => {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "dag-template-missing-"))
+    try {
+      const exit = await Effect.runPromiseExit(renderTemplate({ id: "definitely-missing-template" }, directory))
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) {
+        expect(Cause.hasDies(exit.cause)).toBe(false)
+        expect(String(Cause.squash(exit.cause))).toContain("Template not found: definitely-missing-template")
+      }
+      const handled = await Effect.runPromise(
+        renderTemplate({ id: "definitely-missing-template" }, directory).pipe(
+          Effect.map(() => "rendered" as const),
+          Effect.catch(() => Effect.succeed("node-failed" as const)),
+        ),
+      )
+      expect(handled).toBe("node-failed")
+    } finally {
+      await fs.rm(directory, { recursive: true, force: true })
+    }
   })
 
   it("leaves unmatched placeholders as-is", async () => {

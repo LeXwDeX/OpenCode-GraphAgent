@@ -138,7 +138,7 @@ const serviceLayer = Layer.effect(
     // how many consecutive sweep ticks it has stayed flat while the node was
     // running and overdue. Reset on any counter movement, terminal status, or
     // disappearance from the query.
-    const flatStreak = new Map<string, { extensions: number; flatTicks: number }>()
+    const flatStreak = new Map<string, { attempt: string; extensions: number; flatTicks: number }>()
 
     // The node's escalation cadence, from the workflow's persisted config —
     // the same source spawn.ts derived the watcher's escalateIntervalMs from.
@@ -189,6 +189,7 @@ const serviceLayer = Layer.effect(
           workflowId: WorkflowNodeTable.workflow_id,
           nodeId: WorkflowNodeTable.id,
           childSessionId: WorkflowNodeTable.child_session_id,
+          replanAttempts: WorkflowNodeTable.replan_attempts,
           extensions: WorkflowNodeTable.timeout_extensions,
           deadlineMs: WorkflowNodeTable.deadline_ms,
           startedAt: WorkflowNodeTable.started_at,
@@ -217,12 +218,16 @@ const serviceLayer = Layer.effect(
           ),
         )
 
-      const observed = new Map<string, { extensions: number; flatTicks: number }>()
+      const observed = new Map<string, { attempt: string; extensions: number; flatTicks: number }>()
       for (const row of rows) {
         const key = `${row.workflowId}\0${row.nodeId}`
+        // The streak belongs to ONE execution attempt: a restarted/replanned
+        // attempt (new replan counter or child session) starts a fresh window.
+        const attempt = `${row.replanAttempts}\0${row.childSessionId ?? ""}`
         const prior = flatStreak.get(key)
-        const flatTicks = prior && prior.extensions === row.extensions ? prior.flatTicks + 1 : 0
-        observed.set(key, { extensions: row.extensions, flatTicks })
+        const flatTicks =
+          prior && prior.attempt === attempt && prior.extensions === row.extensions ? prior.flatTicks + 1 : 0
+        observed.set(key, { attempt, extensions: row.extensions, flatTicks })
         // Only nodes already flat for a tick pay the config lookup.
         if (flatTicks < 1) continue
         const escalateIntervalMs = yield* escalateIntervalFor(row.workflowId, row.nodeId)
@@ -260,10 +265,28 @@ const serviceLayer = Layer.effect(
               row.nodeId,
               `deadline supervision lost (no escalation progress across ${flatTicks} sweep ticks, escalate cadence ${escalateIntervalMs}ms) — swept, extensions ${row.extensions}`,
               "timeout",
+              // Settle only the attempt this tick observed frozen. The SELECT
+              // above and this write are separated by yields (config read,
+              // cancel, location lookup); a restart in that window starts a
+              // fresh attempt that the identity guard must protect.
+              {
+                replanAttempts: row.replanAttempts,
+                ...(row.childSessionId ? { childSessionID: row.childSessionId } : {}),
+              },
             )
             .pipe(Effect.asVoid),
         ).pipe(
           Effect.as(true),
+          // The observed attempt already settled or was replaced: nothing to
+          // sweep. The next tick re-reads the row (a new attempt restarts its
+          // own freeze window).
+          Effect.catchIf(isTransitionRejection, (error) =>
+            Effect.logDebug("DagSupervisionSweep skipped a settled or replaced attempt", {
+              dagID: row.workflowId,
+              nodeID: row.nodeId,
+              error,
+            }).pipe(Effect.as(false)),
+          ),
           Effect.catchCause((cause) =>
             Cause.hasInterrupts(cause)
               ? Effect.interrupt

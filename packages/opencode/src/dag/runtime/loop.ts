@@ -603,6 +603,12 @@ const serviceLayer = Layer.effect(
           if (!(yield* DagLocation.ownsWorkflow(dagID, ctx.directory))) return
           const wf = yield* store.getWorkflow(dagID).pipe(Effect.orDie)
           if (wf && isWorkflowTerminalStatus(wf.status as never)) return
+          // paused → completed/failed is not a legal transition: a node that
+          // settles while the workflow is paused leaves the graph complete but
+          // parked. Completion is re-checked when the workflow leaves pause
+          // (WorkflowResumed / WorkflowStepped / replan) or when it is
+          // cancelled; attempting it here would only fail the handler.
+          if (wf?.status === "paused") return
           // A required-node failure is a workflow FAILURE, not a cancellation —
           // "cancelled" is reserved for explicit user/agent cancels so the
           // terminal status attributes the outcome correctly (P2-1).
@@ -640,6 +646,17 @@ const serviceLayer = Layer.effect(
           (event: string) =>
           <A, E, R>(self: Effect.Effect<A, E, R>) =>
             self.pipe(Effect.catchCause((cause) => Effect.logWarning("DagLoop handler failed", { event, cause })))
+        // Node-terminal handlers fork the parent wake drain after their
+        // evalLock body even when that body fails or dies (e.g. a rejected
+        // workflow transition): the durable node row is already terminal and
+        // unreported, so the parent must still be woken. Interruption (scope
+        // teardown) skips the fork.
+        const forkWakeAfter =
+          (sessionID: string) =>
+          <A, E>(exit: Exit.Exit<A, E>) =>
+            Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)
+              ? Effect.void
+              : tryDeliverWake(sessionID).pipe(Effect.ignore, Effect.forkScoped, Effect.asVoid)
 
         startMessageContinuations = Effect.fn("DagLoop.startMessageContinuations")(function* (
           dagID: string,
@@ -1098,11 +1115,12 @@ const serviceLayer = Layer.effect(
                     }
                     if (!checkpointHeld) yield* checkCompletion(dagID)
                   }),
+                ).pipe(
+                  // P1-2: trigger wake check directly on node terminal — the
+                  // parent session may already be idle (no new idle event will
+                  // fire), so we can't rely on the idle subscription alone.
+                  Effect.onExit(forkWakeAfter(entry.parentSessionID)),
                 )
-                // P1-2: trigger wake check directly on node terminal —
-                // the parent session may already be idle (no new idle event
-                // will fire), so we can't rely on the idle subscription alone.
-                yield* tryDeliverWake(entry.parentSessionID).pipe(Effect.ignore, Effect.forkScoped)
               }).pipe(guarded(def === DagEvent.NodeSkipped ? "NodeSkipped" : def === DagEvent.NodeAborted ? "NodeAborted" : "NodeCompleted")),
             ),
             Effect.forkScoped({ startImmediately: true }),
@@ -1180,8 +1198,7 @@ const serviceLayer = Layer.effect(
                     // stepping must NOT auto-advance after a node fails.
                     yield* checkCompletion(dagID)
                   }),
-                )
-                yield* tryDeliverWake(entry.parentSessionID).pipe(Effect.ignore, Effect.forkScoped)
+                ).pipe(Effect.onExit(forkWakeAfter(entry.parentSessionID)))
               }).pipe(guarded("NodeFailed")),
           ),
           Effect.forkScoped({ startImmediately: true }),
@@ -1659,8 +1676,12 @@ const serviceLayer = Layer.effect(
           }
           wakeInFlight.add(sessionID)
           // Re-read after each stable batch so rows committed during delivery
-          // remain a separate batch.
-          try {
+          // remain a separate batch. The reservation is released by an Effect
+          // finalizer, not a generator `finally`: Effect does not resume a
+          // generator's `finally` when the fiber is interrupted (the lease
+          // timeout below), fails, or dies, so a generator release would leak
+          // the reservation and park every later wake in `wakePending`.
+          yield* Effect.gen(function* () {
             const deliveredUnresponsiveDagIDs = new Set<string>()
             for (;;) {
               const plan = yield* readWakeBatch(sessionID)
@@ -1931,16 +1952,24 @@ const serviceLayer = Layer.effect(
               )
               if (!didDeliver) return
             }
-          } finally {
-            const retry = wakePending.delete(sessionID)
-            wakeInFlight.delete(sessionID)
-            if (retry) yield* tryDeliverWake(sessionID).pipe(guarded("WakePendingRetry"), Effect.forkIn(stateScope))
-          }
+          }).pipe(
+            Effect.ensuring(
+              Effect.suspend(() => {
+                const retry = wakePending.delete(sessionID)
+                wakeInFlight.delete(sessionID)
+                return retry
+                  ? tryDeliverWake(sessionID).pipe(guarded("WakePendingRetry"), Effect.forkIn(stateScope), Effect.asVoid)
+                  : Effect.void
+              }),
+            ),
+          )
         })
         // The in-flight reservation must have a finite lifetime even when a
         // parent turn or a dependency never settles. Timing out interrupts the
-        // old delivery fiber, runs its finally release, and lets a queued or
-        // periodic stimulus retry through the ordinary idle admission gate.
+        // old delivery fiber; its `Effect.ensuring` finalizer releases the
+        // reservation (and re-forks a wake that was queued behind it), so a
+        // queued or periodic stimulus retries through the ordinary idle
+        // admission gate.
         tryDeliverWake = (sessionID) =>
           deliverWake(sessionID).pipe(
             Effect.timeoutOption("7 minutes"),
@@ -2131,6 +2160,7 @@ const serviceLayer = Layer.effect(
         // Converge the in-memory side: (a) the instance that no LONGER owns the
         // moved session's workflows evicts its stale runtime entries (fail-closed
         // — its directory must not keep acting on them), and (b) the NEW owner
+        // adopts the session's non-terminal workflows (recoverWorkflow) and
         // re-forks the serialized wake drain so a terminal wake that was wedged
         // behind the old mixed stamps delivers immediately (bounded time) instead
         // of waiting for a fresh idle event or a restart.
@@ -2157,12 +2187,35 @@ const serviceLayer = Layer.effect(
                     entry.fibers.clear()
                     entry.watchers.clear()
                     runtimes.delete(dagID)
+                    // The dag automation-lease registration is deliberately kept:
+                    // it is keyed by (session, workflow), not by directory, and
+                    // the lease service is process-wide. The workflow is still
+                    // live, the new owner's adoption re-registers the same key
+                    // idempotently, and unregistering here could land AFTER that
+                    // adoption and strip the lease from a running workflow. The
+                    // terminal handlers release it (this instance through its
+                    // no-entry, project-scoped path).
                   }),
                 )
               }
-              // New owner: the re-stamp moved ownership HERE, so wake rows that
-              // were wedged (mixed stamps → no owner) are now deliverable.
+              // New owner: the re-stamp moved ownership HERE.
               if (yield* DagLocation.ownsSession(sessionID, ctx.directory)) {
+                // Adopt every non-terminal workflow of the moved session through
+                // the ordinary recovery path. The old owner just cancelled its
+                // children and interrupted its fibers, so without adoption the
+                // durable rows stay running/paused/stepping with dead attempts
+                // and nothing ever schedules them again. recoverWorkflow keeps
+                // its own guards (directory ownership, runtimes/recovering
+                // reservations, tryClaimAdoption) and reconciles dead attempts
+                // with attempt identity, pausing on invented failures.
+                const moved = yield* store.listBySession(sessionID)
+                for (const wf of moved) {
+                  if (!["running", "paused", "stepping"].includes(wf.status)) continue
+                  if (runtimes.has(wf.id) || recovering.has(wf.id)) continue
+                  yield* recoverWorkflow(wf).pipe(guarded("SessionMovedAdoption"), Effect.forkScoped)
+                }
+                // Wake rows that were wedged (mixed stamps → no owner) are now
+                // deliverable.
                 yield* tryDeliverWake(sessionID).pipe(Effect.ignore, Effect.forkScoped)
               }
             }).pipe(guarded("SessionMoved")),

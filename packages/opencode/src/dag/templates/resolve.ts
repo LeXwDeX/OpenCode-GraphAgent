@@ -107,19 +107,13 @@ function readById(id: string, projectDir: string): Effect.Effect<string, Error> 
     // globally installed prompts.
     const globalPath = path.join(Flag.OPENCODE_CONFIG_DIR ?? Global.Path.config, "dag-prompts", `${id}.md`)
 
-    // Try project first (overrides global), then global
-    const result = yield* Effect.promise(async () => {
-      try {
-        return await fs.readFile(projectPath, "utf-8")
-      } catch {
-        try {
-          return await fs.readFile(globalPath, "utf-8")
-        } catch {
-          throw new Error(`Template not found: ${id} (checked project and global dirs)`)
-        }
-      }
+    // Try project first (overrides global), then global. A missing asset is a
+    // typed failure, not a defect: the spawn path fails the node through
+    // Effect.catch, which never sees the defect channel.
+    return yield* Effect.tryPromise({
+      try: () => fs.readFile(projectPath, "utf-8").catch(() => fs.readFile(globalPath, "utf-8")),
+      catch: () => new Error(`Template not found: ${id} (checked project and global dirs)`),
     })
-    return result
   })
 }
 

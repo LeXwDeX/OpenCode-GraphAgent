@@ -165,3 +165,30 @@ describe("GoalPrompts.renderContinuation (D4.2 merged injection)", () => {
     expect(text).toContain("Turns: 20/20 (0 remaining)")
   })
 })
+
+describe("GoalPrompts.renderJudgeUserPrompt", () => {
+  const responseSection = (prompt: string) => /---\n([\s\S]*)\n---/.exec(prompt)?.[1]
+
+  test("an agent response containing replacement patterns reaches the judge verbatim", () => {
+    const response = "Fixed it with: printf $'line1\\nline2' and kept $& and $` literal"
+    const prompt = GoalPrompts.renderJudgeUserPrompt("make the script print two lines", response, [])
+    expect(responseSection(prompt)).toBe(response)
+  })
+
+  test("a goal that mentions a placeholder does not capture the agent response", () => {
+    const prompt = GoalPrompts.renderJudgeUserPrompt(
+      "fix the email template so the {response} placeholder renders",
+      "AGENT-OUTPUT: template fixed, tests pass",
+      [],
+    )
+    expect(responseSection(prompt)).toBe("AGENT-OUTPUT: template fixed, tests pass")
+    expect(prompt).toContain("Goal: fix the email template so the {response} placeholder renders")
+  })
+
+  test("subgoals that mention placeholders are rendered literally", () => {
+    const prompt = GoalPrompts.renderJudgeUserPrompt("ship it", "AGENT-OUTPUT", ["render {response}", "keep {goal}"])
+    expect(prompt).toContain("1. render {response}\n2. keep {goal}")
+    expect(prompt).toContain("Goal: ship it")
+    expect(responseSection(prompt)).toBe("AGENT-OUTPUT")
+  })
+})

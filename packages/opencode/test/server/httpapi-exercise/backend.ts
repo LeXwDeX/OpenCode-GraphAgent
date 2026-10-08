@@ -1,6 +1,7 @@
 import { ConfigProvider, Effect, Layer } from "effect"
 import { HttpRouter } from "effect/unstable/http"
 import { parse } from "./assertions"
+import { exerciseWorkingDirectory } from "./environment"
 import { runtime, type Runtime } from "./runtime"
 import type { ActiveScenario, BackendApp, CallResult, CaptureMode, SeededContext } from "./types"
 
@@ -125,6 +126,8 @@ function toAuthProbeRequest(scenario: ActiveScenario, credentials: "missing" | "
   }
   const headers = {
     ...(spec.body === undefined ? {} : { "content-type": "application/json" }),
+    // Valid-credential probes run the real handler; keep them inside the exercise root.
+    "x-opencode-directory": exerciseWorkingDirectory,
     ...spec.headers,
     ...(credentials === "valid" ? { authorization: basic("opencode", "secret") } : {}),
   }

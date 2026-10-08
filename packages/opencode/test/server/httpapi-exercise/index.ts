@@ -23,7 +23,14 @@ import { TestLLMServer } from "../../lib/llm-server"
 import path from "path"
 import { array, boolean, check, isRecord, message, object, stable } from "./assertions"
 import { controlledPtyInput, http, route } from "./dsl"
-import { exerciseConfigDirectory, exerciseDataDirectory, exerciseDatabasePath, exerciseGlobalRoot } from "./environment"
+import {
+  enterExerciseWorkingDirectory,
+  exerciseConfigDirectory,
+  exerciseDataDirectory,
+  exerciseDatabasePath,
+  exerciseGlobalRoot,
+  invokingWorktrees,
+} from "./environment"
 import { color, printHeader, printResults } from "./report"
 import { coverageResult, parseOptions, routeKey, routeKeys, selectedScenarios } from "./routing"
 import { runScenario } from "./runner"
@@ -31,6 +38,8 @@ import { runtime } from "./runtime"
 import { runMainWithHardExit, teardown } from "./teardown"
 import { type Options, type Scenario } from "./types"
 import { startProgressWatchdog } from "./watchdog"
+
+enterExerciseWorkingDirectory()
 
 function cursor(input: Record<string, unknown>) {
   return Buffer.from(JSON.stringify(input)).toString("base64url")
@@ -2176,8 +2185,12 @@ const scenarios: Scenario[] = [
   http.protected
     .post("/dag/{dagID}/control", "dag.control")
     .mutating()
+    .withLlm()
     .seeded((ctx) =>
-      ctx.session({ title: "DAG extend owner" }).pipe(
+      // replan/extend fragments pass environment-profile Workflow Authoring
+      // like dag.start: the owner session carries the fake model so the node
+      // model resolves through the parent chain.
+      ctx.session({ title: "DAG extend owner", model: { providerID: "test", id: "test-model" } }).pipe(
         Effect.flatMap((s) =>
           ctx.dag({
             sessionID: s.id,
@@ -2212,6 +2225,112 @@ const scenarios: Scenario[] = [
         check(Array.isArray(body.add) && body.add.includes("n2"), "extend should report the added node")
       }),
     ),
+
+  // The public replan fragment stays a bare `{ nodes }`: the handler supplies
+  // the workflow name the authoring replan envelope requires.
+  http.protected
+    .post("/dag/{dagID}/control", "dag.control")
+    .mutating()
+    .withLlm()
+    .seeded((ctx) =>
+      ctx.session({ title: "DAG replan owner", model: { providerID: "test", id: "test-model" } }).pipe(
+        Effect.flatMap((s) =>
+          ctx.dag({
+            sessionID: s.id,
+            nodes: [{ id: "n1", name: "N1", worker_type: "general", depends_on: [], required: true }],
+          }),
+        ),
+      ),
+    )
+    .at((ctx) => ({
+      path: route("/dag/{dagID}/control", { dagID: ctx.state.dagID }),
+      headers: ctx.headers(),
+      body: {
+        operation: "replan",
+        fragment: {
+          nodes: [
+            {
+              id: "n2",
+              name: "N2",
+              worker_type: "general",
+              depends_on: [],
+              required: false,
+              prompt_template: { inline: "noop" },
+            },
+          ],
+        },
+      },
+    }))
+    .jsonEffect(200, (body) =>
+      Effect.sync(() => {
+        object(body)
+        check(body.status === "ok", "control replan should return ok")
+        check(Array.isArray(body.add) && body.add.includes("n2"), "replan should report the added node")
+      }),
+    ),
+
+  // replan/extend must pass Workflow Authoring like the workflow tool: a
+  // pinned node model is a controller-owned field (strict decode rejects it),
+  // and a node without prompt_template is a 400 diagnostic, not a 500 defect.
+  http.protected
+    .post("/dag/{dagID}/control", "dag.control.replan-pinned-model")
+    .mutating()
+    .seeded((ctx) =>
+      ctx.session({ title: "DAG replan pinned model owner" }).pipe(
+        Effect.flatMap((s) =>
+          ctx.dag({
+            sessionID: s.id,
+            nodes: [{ id: "n1", name: "N1", worker_type: "general", depends_on: [], required: true }],
+          }),
+        ),
+      ),
+    )
+    .at((ctx) => ({
+      path: route("/dag/{dagID}/control", { dagID: ctx.state.dagID }),
+      headers: ctx.headers(),
+      body: {
+        operation: "replan",
+        fragment: {
+          nodes: [
+            {
+              id: "n2",
+              name: "N2",
+              worker_type: "general",
+              depends_on: ["n1"],
+              required: false,
+              model: { providerID: "test", modelID: "test-model" },
+              prompt_template: { inline: "noop" },
+            },
+          ],
+        },
+      },
+    }))
+    .status(400),
+
+  http.protected
+    .post("/dag/{dagID}/control", "dag.control.extend-missing-prompt")
+    .mutating()
+    .seeded((ctx) =>
+      ctx.session({ title: "DAG extend missing prompt owner" }).pipe(
+        Effect.flatMap((s) =>
+          ctx.dag({
+            sessionID: s.id,
+            nodes: [{ id: "n1", name: "N1", worker_type: "general", depends_on: [], required: true }],
+          }),
+        ),
+      ),
+    )
+    .at((ctx) => ({
+      path: route("/dag/{dagID}/control", { dagID: ctx.state.dagID }),
+      headers: ctx.headers(),
+      body: {
+        operation: "extend",
+        fragment: {
+          nodes: [{ id: "n2", name: "N2", worker_type: "general", depends_on: ["n1"], required: false }],
+        },
+      },
+    }))
+    .status(400),
 
   // Project-isolation regressions: the instance API must treat foreign
   // sessions/workflows as nonexistent even though they share the same DB.
@@ -2407,6 +2526,7 @@ const main = Effect.gen(function* () {
   const selected = selectedScenarios(options, scenarios)
   const missing = effectRoutes.filter((route) => !scenarios.some((scenario) => route === routeKey(scenario)))
   const extra = scenarios.filter((scenario) => !effectRoutes.includes(routeKey(scenario)))
+  const worktreesBefore = new Set(invokingWorktrees())
 
   for (const scenario of scenarios) {
     if (scenario.kind === "active" && llmScenarios.has(scenario.name) && !scenario.project?.llm) {
@@ -2434,6 +2554,9 @@ const main = Effect.gen(function* () {
         )
   printResults(results, missing, extra)
 
+  const leakedWorktrees = invokingWorktrees().filter((worktree) => !worktreesBefore.has(worktree))
+  if (leakedWorktrees.length > 0)
+    return yield* Effect.fail(new Error(`exercise created worktrees on the invoking checkout: ${leakedWorktrees.join(", ")}`))
   if (results.some((result) => result.status === "fail"))
     return yield* Effect.fail(new Error("one or more scenarios failed"))
   if (options.failOnSkip && results.some((result) => result.status === "skip"))

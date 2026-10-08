@@ -3,6 +3,7 @@ export * as Memory from "./memory"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { ProjectV2 } from "@opencode-ai/core/project"
+import { AbsolutePath } from "@opencode-ai/core/schema"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Cause, Context, Deferred, Effect, Exit, Layer, Option, Ref, Schema, Scope, Semaphore } from "effect"
 import path from "node:path"
@@ -98,6 +99,9 @@ export const layer: Layer.Layer<
     const lock = yield* MemoryLock.Service
     const modelCalls = yield* MemoryModel.Service
     const store = yield* MemoryStore.Service
+    // Optional so narrow test layers keep the unchecked primary directory.
+    const filesystem = yield* Effect.serviceOption(FSUtil.Service)
+    const projectIdentity = yield* Effect.serviceOption(ProjectV2.Service)
     const globalStarted = yield* Ref.make(false)
     const initializationLock = Semaphore.makeUnsafe(1)
     const state = yield* InstanceState.make(() => Effect.succeed({ sessions: new Map<SessionID, SessionCache>() }))
@@ -213,6 +217,39 @@ export const layer: Layer.Layer<
       initUnsafe().pipe(Effect.catchCause((cause) => Effect.logWarning("global MEMORY init failed", { cause }))),
     )
 
+    // A live checkout of this Project: it exists and, when identity resolution
+    // is wired, still resolves to this Project. Identity is resolved on every
+    // use, never cached: a path can be deleted and reused by an unrelated
+    // repository, or repointed in place (`git remote set-url`), at any time.
+    const ownsDirectory = Effect.fnUntraced(function* (projectID: ProjectV2.ID, directory: string) {
+      if (Option.isNone(filesystem)) return true
+      if (!(yield* filesystem.value.existsSafe(directory))) return false
+      if (Option.isNone(projectIdentity)) return true
+      return yield* projectIdentity.value.resolve(AbsolutePath.make(directory)).pipe(
+        Effect.map((resolved) => resolved.id === projectID),
+        Effect.catchCause(() => Effect.succeed(false)),
+      )
+    })
+
+    // Project Configuration lives in the Project's primary directory
+    // (ADR-0001), but the row's `worktree` is the first-seen checkout and is
+    // never repointed. When it is gone or now belongs to another repository,
+    // writing there would recreate `.opencode/memory.jsonc` in a dead path or
+    // plant this Project's policy in a foreign repo. Fall back to the first
+    // live checkout of this Project in sorted order (deterministic across
+    // worktrees, so they agree on one policy file). The active checkout is
+    // verified too: when it was repointed or reused in place while this
+    // process lives, it no longer belongs to this Project and Memory stays
+    // inert (undefined) rather than reading or writing configuration there.
+    const primaryDirectory = Effect.fnUntraced(function* (current: Project.Info, worktree: string) {
+      if (!(yield* ownsDirectory(current.id, worktree))) return undefined
+      if (current.worktree === worktree || (yield* ownsDirectory(current.id, current.worktree))) return current.worktree
+      for (const directory of Array.from(new Set([worktree, ...current.sandboxes])).sort()) {
+        if (directory === worktree || (yield* ownsDirectory(current.id, directory))) return directory
+      }
+      return worktree
+    })
+
     const configuration = Effect.fn("Memory.configuration")(function* () {
       const ctx = yield* InstanceState.context
       // No fallback to the instance context: a missing row means the identity
@@ -228,11 +265,20 @@ export const layer: Layer.Layer<
       // activates once the repository gains a real identity.
       if (current.id === ProjectV2.ID.global) return undefined
       if (current.vcs !== "git" || !current.time.initialized) return undefined
+      const primary = yield* primaryDirectory(current, ctx.worktree)
+      if (!primary) return undefined
+      // Admission imports and removes legacy memory files in every directory it
+      // scans, so a recorded sandbox that was deleted or reused by another
+      // repository is left out like a stale primary (both of those are verified).
+      const sandboxes = yield* Effect.forEach(
+        current.sandboxes.filter((directory) => directory !== primary && directory !== ctx.worktree),
+        (directory) => ownsDirectory(current.id, directory).pipe(Effect.map((owned) => (owned ? [directory] : []))),
+      ).pipe(Effect.map((owned) => owned.flat()))
       const migration = yield* admission
         .ensure({
           projectID: current.id,
-          projectDirectory: current.worktree,
-          directories: Array.from(new Set([current.worktree, ...current.sandboxes, ctx.worktree])),
+          projectDirectory: primary,
+          directories: Array.from(new Set([primary, ...sandboxes, ctx.worktree])),
           updated: current.time.updated,
         })
         .pipe(Effect.catchTag("MemoryAdmission.IdentityRetired", () => Effect.succeed(undefined)))
@@ -248,7 +294,7 @@ export const layer: Layer.Layer<
         })
         return undefined
       }
-      return { ctx, project: current, loaded: yield* configStore.load(current.worktree) }
+      return { ctx, project: current, primary, loaded: yield* configStore.load(primary) }
     })
 
     const resolveModel = Effect.fn("Memory.resolveModel")(function* (config: MemorySchema.Config) {
@@ -867,7 +913,7 @@ export const layer: Layer.Layer<
       return yield* lock.withProject(value.project.id)(
         Effect.gen(function* () {
           yield* configStore.writeProject(
-            value.project.worktree,
+            value.primary,
             MemorySchema.updateConfig(config, { enabled }),
             loaded.level === "project" ? loaded.path : undefined,
           )
@@ -906,10 +952,14 @@ export const defaultLayer: Layer.Layer<Service> = Layer.suspend(() =>
     Layer.provide(MemoryLock.defaultLayer),
     Layer.provide(MemoryModel.defaultLayer),
     Layer.provide(MemoryStore.defaultLayer),
+    Layer.provide(FSUtil.defaultLayer),
+    Layer.provide(ProjectV2.defaultLayer),
   ),
 )
 
 export const node = LayerNode.make(layer, [
+  FSUtil.node,
+  ProjectV2.node,
   Config.node,
   Provider.node,
   Project.node,
@@ -1043,8 +1093,18 @@ function isRealUser(message: SessionV1.WithParts): message is SessionV1.WithPart
   if (message.info.role !== "user") return false
   if (message.parts.some((part) => part.type === "compaction")) return false
   const text = message.parts.filter((part): part is SessionV1.TextPart => part.type === "text" && !part.synthetic)
-  if (text.some((part) => part.text.trim().startsWith("/"))) return false
+  if (text.some(isCommandPart)) return false
   return text.some((part) => part.text.trim())
+}
+
+// Command turns persist their invocation as `/${name}` or `/${name} ${args}`
+// (SessionPrompt.command) and mark it with `metadata.command`. Unmarked text is
+// user input — including pasted absolute paths (`/data/project/logs`) — except
+// the single-segment `/name args` shape of invocations persisted before command
+// parts were marked.
+function isCommandPart(part: SessionV1.TextPart) {
+  if (typeof part.metadata?.command === "string") return true
+  return /^\/[^\s/:]+(?:\s|$)/.test(part.text.trim())
 }
 
 function isFinalAssistant(
@@ -1100,8 +1160,10 @@ function renderSelection(topics: MemorySchema.Topic[], config: MemorySchema.Conf
             content: item.content,
             rationale: item.rationale,
           }
+          // max_tokens is a cap that must hold: estimateReserve counts CJK
+          // near one token per character, where length/4 undercounts 2-4x.
           if (
-            Token.estimate(render([...result.rows, { ...row, items: [...items.values, next] }])) >
+            Token.estimateReserve(render([...result.rows, { ...row, items: [...items.values, next] }])) >
             config.injection.max_tokens
           )
             return { ...items, overflow: true }

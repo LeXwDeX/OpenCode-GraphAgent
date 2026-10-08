@@ -225,6 +225,25 @@ function normalizeFragmentNode(
   return normalizeNodeConfig(withTimeout, defaults)
 }
 
+/** Merged-graph nodes whose gate fields (condition, review wiring) are the
+ * persisted ones — not authored or changed by this mutation. Replan/extend
+ * exempt them from gate checks added after the definition was accepted;
+ * a fragment that changes a condition is held to the full grammar. */
+function persistedGateNodeIds(nodes: readonly NodeConfig[], persisted: ReadonlyMap<string, NodeConfig>) {
+  return new Set(
+    nodes
+      .filter((node) => {
+        const stored = persisted.get(node.id)
+        return (
+          stored !== undefined &&
+          stored.condition === node.condition &&
+          JSON.stringify(stored.review) === JSON.stringify(node.review)
+        )
+      })
+      .map((node) => node.id),
+  )
+}
+
 function normalizeWorkflowConfig(config: WorkflowConfig): WorkflowConfig & { nodes: NormalizedNodeConfig[] } {
   const defaults = normalizeNodeDefaults(config.node_defaults)
   return {
@@ -809,15 +828,18 @@ export const layer = Layer.effect(
       // create/replan parity the spec requires: one authority, two entry points
       // that differ only in scoping (fragment + rerun-only vs whole-graph).
       const maxReplanAttempts = wfConfig.max_node_replan_attempts ?? DEFAULT_WORKFLOW_CONFIG.maxNodeReplanAttempts
+      const terminalNodeIds = new Set(nodes.filter((n) => isNodeTerminalStatus(n.status as NodeStatus)).map((n) => n.id))
+      const merged = computeMergedConfig(wfConfig, normalizedFragment, plan)
       const replanDiagnostics = DagValidation.replanStructuralDiagnostics({
         fragmentNodes: normalizedFragment.nodes,
         rerunNodes,
         existingNodeIds: new Set(nodes.map((n) => n.id)),
         existingNodeCount: nodes.length,
         addCount: plan.add.length,
-        merged: computeMergedConfig(wfConfig, normalizedFragment, plan),
+        merged,
         config: { mode: wfConfig.mode, max_total_nodes: wfConfig.max_total_nodes },
-        terminalNodeIds: new Set(nodes.filter((n) => isNodeTerminalStatus(n.status as NodeStatus)).map((n) => n.id)),
+        terminalNodeIds,
+        grandfatheredNodeIds: persistedGateNodeIds(merged.nodes, cfgById),
       })
       const replanErrors = DagValidation.sortLegacyStructural(replanDiagnostics.filter((d) => d.severity === "error"))
       for (const warning of replanDiagnostics.filter((d) => d.severity === "warning")) {
@@ -929,6 +951,17 @@ export const layer = Layer.effect(
 
       // #6: build effective plan that excludes ceiling-breached restarts
       const effectivePlan = { ...plan, restart: effectiveRestart }
+      // A failed row leaves the current revision only when the merged graph
+      // routes around it. While a node that can still execute depends on it,
+      // superseding would drop that edge from the rebuilt graph and run the
+      // dependent as a root despite its failed upstream.
+      const cancelled = new Set(effectivePlan.cancel)
+      const liveDependencies = new Set([
+        ...nodes
+          .filter((n) => !terminalNodeIds.has(n.id) && !cancelled.has(n.id) && !ceilingBreached.includes(n.id))
+          .flatMap((n) => fragmentById.get(n.id)?.depends_on ?? n.dependsOn),
+        ...effectivePlan.add.flatMap((id) => fragmentById.get(id)?.depends_on ?? []),
+      ])
 
       // Persist the merged config using the effective plan (without ceiling-breached restarts)
       const mergedConfig = computeMergedConfig(wfConfig, normalizedFragment, effectivePlan)
@@ -960,8 +993,11 @@ export const layer = Layer.effect(
           // failure (the wake-up bug this train breaks). plan.cancel rows are
           // marked superseded by the NodeCancelled projection instead; this
           // list carries the genuine failures the fragment bypasses, which the
-          // engine never cancels. Durable rows stay untouched.
-          superseded: nodes.filter((n) => n.status === "failed").map((n) => DagEvent.NodeID.make(n.id)),
+          // engine never cancels. Durable rows stay untouched. A failure that a
+          // surviving node still depends on stays current (see liveDependencies).
+          superseded: nodes
+            .filter((n) => n.status === "failed" && !liveDependencies.has(n.id))
+            .map((n) => DagEvent.NodeID.make(n.id)),
           timestamp: yield* DateTime.now,
         },
       })
@@ -1104,6 +1140,9 @@ export const layer = Layer.effect(
         addCount: added.length,
         merged: plan.config,
         terminalNodeIds: new Set(plan.reused),
+        // Recovery authors no definitions: retries and termination collateral
+        // are copies of stored nodes, so every gate keeps its accepted form.
+        grandfatheredNodeIds: new Set(plan.config.nodes.map((node) => node.id)),
         config,
       }).filter((diagnostic) => diagnostic.severity === "error")
       if (diagnostics.length > 0) return yield* Effect.fail(new StructuralValidationError({ diagnostics }))

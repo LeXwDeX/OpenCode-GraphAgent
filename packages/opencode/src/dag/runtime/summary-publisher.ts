@@ -28,19 +28,23 @@ import { GlobalBus } from "@/bus/global"
  */
 
 // The events that can change a workflow's visible progress or topology.
-// WorkflowCreated/Started/Replanned/ConfigUpdated/Paused/Resumed/Completed/Failed/Cancelled
+// WorkflowCreated/Started/Replanned/ConfigUpdated/Paused/Resumed/Stepped/Completed/Failed/Cancelled
 // and every Node* event can all alter the aggregated summary.
 const SUMMARY_TRIGGER_EVENTS = [
   DagEvent.WorkflowCreated,
   DagEvent.WorkflowStarted,
   DagEvent.WorkflowPaused,
   DagEvent.WorkflowResumed,
+  // running → stepping changes summary.status.
+  DagEvent.WorkflowStepped,
   DagEvent.WorkflowCompleted,
   DagEvent.WorkflowFailed,
   DagEvent.WorkflowCancelled,
   DagEvent.WorkflowReplanned,
   DagEvent.WorkflowConfigUpdated,
   DagEvent.NodeRegistered,
+  // pending → queued raises summary.queuedNodes.
+  DagEvent.NodeQueued,
   DagEvent.NodeStarted,
   DagEvent.NodeCompleted,
   DagEvent.NodeFailed,
@@ -52,6 +56,8 @@ const SUMMARY_TRIGGER_EVENTS = [
   // without any status transition — without this trigger the TUI would keep
   // showing a plain RUNNING node until some unrelated node event fires.
   DagEvent.NodeTimeoutEscalated,
+  // An extension clears escalation_pending, so escalatedNodes drops back.
+  DagEvent.NodeDeadlineExtended,
 ] as const
 
 export interface Interface {

@@ -240,12 +240,69 @@ export const dagHandlers = HttpApiBuilder.group(InstanceHttpApi, "dag", (handler
       return wf(row)
     })
 
+    // Same authority as the workflow tool's replan/extend actions: a fragment
+    // passes Workflow Authoring (environment profile) before it reaches
+    // Dag.replan/extend, which only run structural checks. Strict decoding
+    // rejects controller-owned fields (model, recovery); environment checks
+    // resolve worker types, prompt assets and models; gated checkpoints must
+    // declare output_schema. Only prepared nodes reach the runtime mutation.
+    const prepareFragment = Effect.fn("DagHttpApi.prepareFragment")(function* (
+      workflow: DagStore.WorkflowRow,
+      action: "replan" | "extend",
+      fragment: Record<string, unknown>,
+    ) {
+      const config = Dag.parseWorkflowConfig(workflow.config)
+      const owner = yield* sessions.get(SessionID.make(workflow.sessionId)).pipe(
+        Effect.catch(() => Effect.succeed(undefined)),
+      )
+      const knownDependencies = (yield* dag.store.getNodes(workflow.id).pipe(Effect.orDie)).map((node) => node.id)
+      // The HTTP replan fragment has always been a bare `{ nodes }`; the
+      // authoring replan envelope requires a graph name, so supply the
+      // workflow's own name when the caller omits it.
+      const value =
+        action === "replan"
+          ? { fragment: { ...(fragment.name === undefined ? { name: config?.name ?? workflow.title } : {}), ...fragment } }
+          : fragment
+      const result = yield* authoring.prepare({
+        action,
+        source: { kind: "inline", value, source: `httpapi:dag.${action}` },
+        profile: "environment",
+        environment: {
+          directory: owner?.directory ?? (yield* InstanceState.context).directory,
+          parent: owner?.model ?? undefined,
+        },
+        known_dependencies: knownDependencies,
+        node_defaults: config?.node_defaults,
+      })
+      if (!result.valid || result.prepared?.action !== action) {
+        const diagnostics = result.errors
+          .map((diagnostic) => `- [${diagnostic.code}] ${diagnostic.path}: ${diagnostic.message}${diagnostic.hint ? ` (${diagnostic.hint})` : ""}`)
+          .join("\n")
+        return yield* Effect.fail(
+          new InvalidRequestError({ message: `${action} rejected by workflow validation:\n${diagnostics || "no prepared graph"}` }),
+        )
+      }
+      return result.prepared.nodes
+    })
+
+    /** Structural rejections from the runtime mutation seam (merged-graph
+     * checks authoring cannot see) are request errors, not defects. */
+    function mapFragmentRejection<Success>(effect: Effect.Effect<Success, Error>) {
+      return effect.pipe(
+        Effect.catch((error: Error): Effect.Effect<never, InvalidRequestError | ConflictError> =>
+          error instanceof Dag.StructuralValidationError
+            ? Effect.fail(new InvalidRequestError({ message: error.message }))
+            : mapTransitionConflict(Effect.fail(error)),
+        ),
+      )
+    }
+
     const control = Effect.fn("DagHttpApi.control")(function* (ctx: { params: { dagID: string }; payload: { operation: string; fragment?: unknown } }) {
       const { dagID } = ctx.params
       const op = ctx.payload.operation
 
       // Pre-check existence so non-existent workflows return 404, not a 500 defect.
-      yield* requireWorkflow(dagID)
+      const workflow = yield* requireWorkflow(dagID)
 
       // Control ops may fail with InvalidTransitionError/TerminalViolationError for
       // semantically invalid operations (e.g. pause on a completed workflow). Map those
@@ -275,7 +332,8 @@ export const dagHandlers = HttpApiBuilder.group(InstanceHttpApi, "dag", (handler
         if (!fragment || typeof fragment !== "object" || !Array.isArray((fragment as Record<string, unknown>).nodes)) {
           return yield* Effect.fail(new InvalidRequestError({ message: "replan requires 'fragment' with a 'nodes' array" }))
         }
-        const result = yield* mapTransitionConflict(dag.replan(dagID, fragment as { nodes: Dag.NodeConfig[] }))
+        const nodes = yield* prepareFragment(workflow, "replan", fragment as Record<string, unknown>)
+        const result = yield* mapFragmentRejection(dag.replan(dagID, { nodes }))
         return { status: "ok", ...result }
       }
       if (op === "extend") {
@@ -283,7 +341,8 @@ export const dagHandlers = HttpApiBuilder.group(InstanceHttpApi, "dag", (handler
         if (!fragment || typeof fragment !== "object" || !Array.isArray((fragment as Record<string, unknown>).nodes)) {
           return yield* Effect.fail(new InvalidRequestError({ message: "extend requires 'fragment' with a 'nodes' array" }))
         }
-        const result = yield* mapTransitionConflict(dag.extend(dagID, (fragment as { nodes: Dag.NodeConfig[] }).nodes))
+        const nodes = yield* prepareFragment(workflow, "extend", fragment as Record<string, unknown>)
+        const result = yield* mapFragmentRejection(dag.extend(dagID, nodes))
         return { status: "ok", ...result }
       }
       return yield* Effect.fail(new InvalidRequestError({ message: `Unknown operation: ${op}` }))

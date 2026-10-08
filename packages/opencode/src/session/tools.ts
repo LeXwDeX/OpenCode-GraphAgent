@@ -56,6 +56,12 @@ const hookAddsInstructions = (result: TriggerResult) =>
   result.blocked !== undefined ||
   result.preventContinuation === true
 
+/** Tool-result metadata marking a hook `continue:false`; the processor ends the turn on it. */
+const hookStopMetadata = (result: TriggerResult) => ({
+  hookStopped: true,
+  stopReason: result.stopReason ?? "Hook requested stop",
+})
+
 const outputFingerprint = (value: unknown) => {
   try {
     return Hash.sha256(JSON.stringify(value))
@@ -162,12 +168,15 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
       }),
     ask: (req) =>
       permission
-        .ask({
-          ...req,
-          sessionID: input.session.id,
-          tool: { messageID: input.processor.message.id, callID: options.toolCallId },
-          ruleset: Permission.merge(input.agent.permission, input.session.permission ?? []),
-        })
+        .ask(
+          {
+            ...req,
+            sessionID: input.session.id,
+            tool: { messageID: input.processor.message.id, callID: options.toolCallId },
+            ruleset: Permission.merge(input.agent.permission, input.session.permission ?? []),
+          },
+          { toolInput: args },
+        )
         .pipe(Effect.orDie),
   })
 
@@ -231,7 +240,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
                   return {
                     output: `[Hook stopped] ${decision.stopReason}`,
                     attachments: [],
-                    metadata: { hookStopped: true },
+                    metadata: { hookStopped: true, stopReason: decision.stopReason },
                   } as any
                 }
                 // permissionDecision:"ask" — invoke the confirmation dialog. We call
@@ -241,16 +250,24 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
                 // masked as a denial.
                 if (preResult.permissionDecision === "ask") {
                   const askReason = preResult.permissionDecisionReason
+                  // force: a hook "ask" always prompts — earlier "always" approvals cannot
+                  // skip it. The ruleset stays empty: this request carries no real pattern,
+                  // so pattern-scoped allows (e.g. `edit: {"*":"deny","plans/*.md":"allow"}`)
+                  // must not be pre-empted by a wildcard deny. The tool's own ctx.ask with
+                  // the real patterns still enforces deny rules afterwards.
                   const verdict = yield* permission
-                    .ask({
-                      permission: item.id,
-                      sessionID: ctx.sessionID,
-                      patterns: [item.id],
-                      always: [],
-                      metadata: { hookAsk: true, ...(askReason ? { reason: askReason } : {}) },
-                      tool: { messageID: input.processor.message.id, callID: options.toolCallId },
-                      ruleset: [],
-                    })
+                    .ask(
+                      {
+                        permission: item.id,
+                        sessionID: ctx.sessionID,
+                        patterns: [item.id],
+                        always: [],
+                        metadata: { hookAsk: true, ...(askReason ? { reason: askReason } : {}) },
+                        tool: { messageID: input.processor.message.id, callID: options.toolCallId },
+                        ruleset: [],
+                      },
+                      { force: true, toolInput: toRecord(args) },
+                    )
                     .pipe(Effect.exit)
                   const outcome = classifyPermissionAsk(verdict)
                   if (outcome !== "approved" && outcome !== "denied")
@@ -316,6 +333,12 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
                 yield* SettingsHook.landSystemMessages(postResult, { sessionID: ctx.sessionID })
                 dynamicInstructions ||= hookAddsInstructions(postResult)
                 output.output = withHookFeedback(output.output ?? "", postResult)
+                // continue:false ends the agent turn once this result is recorded (processor → "stop").
+                if (postResult.preventContinuation)
+                  output.metadata = {
+                    ...(isRecord(output.metadata) ? output.metadata : {}),
+                    ...hookStopMetadata(postResult),
+                  }
               }
               if (settingsHook) {
                 for (const change of toolFileChanges(
@@ -685,22 +708,31 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
               return { content: [{ type: "text", text: `[Tool denied by hook] ${decision.deniedReason}` }] } as any
             }
             if (decision.stopReason) {
-              return { content: [{ type: "text", text: `[Hook stopped] ${decision.stopReason}` }] } as any
+              const text = `[Hook stopped] ${decision.stopReason}`
+              return {
+                title: "",
+                output: text,
+                metadata: { hookStopped: true, stopReason: decision.stopReason },
+                content: [{ type: "text", text }],
+              } as any
             }
             // permissionDecision:"ask" — confirmation dialog (see native path note:
             // typed rejections deny; interrupts/defects propagate).
             if (preResult.permissionDecision === "ask") {
               const askReason = preResult.permissionDecisionReason
               const verdict = yield* permission
-                .ask({
-                  permission: key,
-                  sessionID: ctx.sessionID,
-                  patterns: [key],
-                  always: [],
-                  metadata: { hookAsk: true, ...(askReason ? { reason: askReason } : {}) },
-                  tool: { messageID: input.processor.message.id, callID: opts.toolCallId },
-                  ruleset: [],
-                })
+                .ask(
+                  {
+                    permission: key,
+                    sessionID: ctx.sessionID,
+                    patterns: [key],
+                    always: [],
+                    metadata: { hookAsk: true, ...(askReason ? { reason: askReason } : {}) },
+                    tool: { messageID: input.processor.message.id, callID: opts.toolCallId },
+                    ruleset: [],
+                  },
+                  { force: true, toolInput: toRecord(args) },
+                )
                 .pipe(Effect.exit)
               const outcome = classifyPermissionAsk(verdict)
               if (outcome !== "approved" && outcome !== "denied")
@@ -815,6 +847,8 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
               .pipe(Effect.catch(() => Effect.succeed<TriggerResult>({ additionalContexts: [], systemMessages: [] })))
             yield* SettingsHook.landSystemMessages(postResult, { sessionID: ctx.sessionID })
             output.output = withHookFeedback(output.output ?? "", postResult)
+            if (postResult.preventContinuation)
+              output.metadata = { ...output.metadata, ...hookStopMetadata(postResult) }
           }
           yield* recordSettlement(key, opts.toolCallId, {
             sourceKind: "mcp",

@@ -14,6 +14,49 @@
 
 const CONDITION_RE = /^(.+?)\s*(==|!=|>=|<=|>|<)\s*(.+)$/
 
+// Operand grammar. The left side is one dotted field path; the right side is a
+// single quoted string literal or one bare token (number, true/false/null, or
+// an unquoted word). `===`, `!==`, `&&`, `||` and chained comparisons still
+// match CONDITION_RE but leave operator residue in an operand — `x !== "A"`
+// lexes as `x != '= "A"'`, which is ALWAYS true — so they are rejected rather
+// than evaluated.
+const CONDITION_PATH_RE = /^[^\s"'=!<>&|]+$/
+const CONDITION_VALUE_RE = /^(?:"[^"]*"|'[^']*'|[^\s"'=!<>&|]+)$/
+
+const CONDITION_OPERATORS = ["==", "!=", ">=", "<=", ">", "<"] as const
+type ConditionOperator = (typeof CONDITION_OPERATORS)[number]
+const isConditionOperator = (value: string): value is ConditionOperator =>
+  CONDITION_OPERATORS.some((op) => op === value)
+
+function parseCondition(
+  condition: string,
+): { ok: true; lhs: string; op: ConditionOperator; rhs: string } | { ok: false; error: string } {
+  const match = condition.match(CONDITION_RE)
+  if (!match) return { ok: false, error: `condition unparseable: ${condition}` }
+  const lhs = match[1].trim()
+  const op = match[2]
+  const rhs = match[3].trim()
+  if (!isConditionOperator(op) || !CONDITION_PATH_RE.test(lhs) || !CONDITION_VALUE_RE.test(rhs)) {
+    return {
+      ok: false,
+      error:
+        `condition "${condition}" uses unsupported syntax: expected one comparison` +
+        " `<node-id>.output.<field> <op> <value>` with op ==, !=, >, <, >= or <= and value a number," +
+        " true/false/null, a bare word, or a quoted string (===, !==, && and || are not supported)",
+    }
+  }
+  return { ok: true, lhs, op, rhs }
+}
+
+/** Why a non-empty condition cannot be evaluated, or undefined when it is
+ * empty or well-formed. Acceptance-time validation rejects these so an
+ * unsupported expression never reaches spawn-time routing. */
+export function conditionSyntaxError(condition: string | undefined): string | undefined {
+  if (!condition || condition.trim() === "") return undefined
+  const parsed = parseCondition(condition)
+  return parsed.ok ? undefined : parsed.error
+}
+
 /**
  * Evaluate a node's `condition` expression.
  *
@@ -21,8 +64,8 @@ const CONDITION_RE = /^(.+?)\s*(==|!=|>=|<=|>|<)\s*(.+)$/
  * Supported syntax: `nodeID.output.field == value` or `nodeID.output.field > N`.
  *
  * Returns `{ ok: true, value }` — `value` is true (run the node) or false (skip).
- * Returns `{ ok: false, error }` when the expression cannot be parsed, or when
- * a numeric comparison's operand is not a number (missing field path, plain
+ * Returns `{ ok: false, error }` when the expression cannot be parsed or uses
+ * unsupported syntax (`===`, `!==`, `&&`, `||`), or when a numeric comparison's operand is not a number (missing field path, plain
  * text output) — the caller MUST fail the node rather than running or silently
  * skipping it on an unevaluable condition.
  *
@@ -40,12 +83,12 @@ export function evaluateCondition(
 ): { ok: true; value: boolean } | { ok: false; error: string } {
   if (!condition || condition.trim() === "") return { ok: true, value: true }
 
-  const match = condition.match(CONDITION_RE)
-  if (!match) return { ok: false, error: `condition unparseable: ${condition}` }
+  const parsed = parseCondition(condition)
+  if (!parsed.ok) return parsed
 
-  const [, lhsRaw, op, rhsRaw] = match
-  const lhs = resolvePath(lhsRaw.trim(), outputs)
-  const rhs = parseValue(rhsRaw.trim())
+  const op = parsed.op
+  const lhs = resolvePath(parsed.lhs, outputs)
+  const rhs = parseValue(parsed.rhs)
 
   // Numeric comparisons on non-numeric or non-finite operands (missing field
   // path, plain-text output, NaN, "Infinity" parsed by parseValue) must fail
@@ -54,16 +97,22 @@ export function evaluateCondition(
   // conditionReference guards against at create time.
   if (op === ">" || op === "<" || op === ">=" || op === "<=") {
     if (typeof lhs !== "number" || !Number.isFinite(lhs))
-      return { ok: false, error: `condition "${condition}": left operand resolved to ${describeOperand(lhs)}, expected a finite number` }
+      return {
+        ok: false,
+        error: `condition "${condition}": left operand resolved to ${describeOperand(lhs)}, expected a finite number`,
+      }
     if (typeof rhs !== "number" || !Number.isFinite(rhs))
-      return { ok: false, error: `condition "${condition}": right operand ${describeOperand(rhs)} is not a finite number` }
+      return {
+        ok: false,
+        error: `condition "${condition}": right operand ${describeOperand(rhs)} is not a finite number`,
+      }
     if (op === ">") return { ok: true, value: lhs > rhs }
     if (op === "<") return { ok: true, value: lhs < rhs }
     if (op === ">=") return { ok: true, value: lhs >= rhs }
     return { ok: true, value: lhs <= rhs }
   }
 
-  // CONDITION_RE only produces the six operators; after the numeric block
+  // parseCondition only produces the six operators; after the numeric block
   // only equality remains.
   if (op === "==") return { ok: true, value: lhs === rhs }
   return { ok: true, value: lhs !== rhs }
@@ -82,8 +131,8 @@ function describeOperand(value: unknown): string {
  * the condition is empty or unparseable. Used at create/replan time to reject
  * conditions referencing nodes outside `depends_on` — those would silently
  * resolve to undefined and evaluate false at spawn time (the worst failure
- * mode). Unparseable conditions are left to the runtime, which fails the node
- * loudly instead.
+ * mode). Lexically lenient on purpose: malformed operands are reported by
+ * conditionSyntaxError, and the runtime fails such a node loudly.
  */
 export function conditionReference(condition: string | undefined): string | null {
   if (!condition || condition.trim() === "") return null

@@ -73,6 +73,7 @@ function verdict(value: unknown): JudgeResult | undefined {
 
 function objectCandidates(input: string) {
   const values: string[] = []
+  let unclosed = false
   let start = -1
   let depth = 0
   let quoted = false
@@ -83,6 +84,8 @@ function objectCandidates(input: string) {
       if (char === "{") {
         start = index
         depth = 1
+        quoted = false
+        escaped = false
       }
       continue
     }
@@ -90,16 +93,24 @@ function objectCandidates(input: string) {
       if (escaped) escaped = false
       else if (char === "\\") escaped = true
       else if (char === '"') quoted = false
-      continue
-    }
-    if (char === '"') quoted = true
+    } else if (char === '"') quoted = true
     else if (char === "{") depth++
     else if (char === "}" && --depth === 0) {
       values.push(input.slice(start, index + 1))
       start = -1
     }
+    // A candidate still open at the end of the text may be a stray `{` in
+    // prose (e.g. quoted code) rather than truncated JSON: record it, then
+    // rescan from just after that brace so a complete object behind it is
+    // still found. The truncated-json category is kept for the caller.
+    if (start >= 0 && index === input.length - 1) {
+      unclosed = true
+      index = start
+      start = -1
+    }
   }
-  return { values, unclosed: start >= 0 }
+  // A `{` as the very last character opens a candidate the loop never scans.
+  return { values, unclosed: unclosed || start >= 0 }
 }
 
 function failed(category: JudgeFailureCategory, chars: number): JudgeResult {

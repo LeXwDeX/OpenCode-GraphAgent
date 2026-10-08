@@ -663,6 +663,54 @@ describe("memory controller policy", () => {
     expect(MemoryStore.isAllowedMemoryText("xoxb-1234567890-abcdef")).toBe(false)
   })
 
+  const zhRationale = "用户明确确认该要求长期有效"
+  const enRationale = "The user explicitly confirmed this long-term"
+
+  test.each([
+    ["用户要求服务器登录密码保持为 Tr0ub4dor", zhRationale],
+    ["用户偏好：数据库密钥固定为 Zx9Qa7LmPq", zhRationale],
+    ["用户要求部署令牌使用 Zx9Qa7LmPq", zhRationale],
+    ["用户要求口令保持为 Zx9Qa7LmPq", zhRationale],
+    ["用户要求云账号凭据保持为 Zx9Qa7LmPq", zhRationale],
+    ["User requires the staging credential to remain Zx9Qa7LmPq", enRationale],
+    ["User requires the backup passphrase to remain Zx9Qa7LmPq", enRationale],
+    ["User prefers the deploy token Zx9Qa7LmPq", enRationale],
+    ["User prefers the bearer token Zx9Qa7LmPq", enRationale],
+    ["User requires the api key Zx9Qa7LmPq", enRationale],
+  ])("rejects credential-bearing memory: %s", (content, rationale) => {
+    expect(MemoryStore.isAllowedMemoryItem({ kind: "preference", content, rationale })).toBe(false)
+  })
+
+  test.each([
+    ["用户偏好回答控制令牌预算并保持简洁", zhRationale],
+    ["用户要求回答使用简洁中文", zhRationale],
+    ["User prefers keeping the token budget small", enRationale],
+    ["User prefers token counts reported in summaries", enRationale],
+  ])("keeps legitimate memory that mentions tokens: %s", (content, rationale) => {
+    expect(MemoryStore.isAllowedMemoryItem({ kind: "preference", content, rationale })).toBe(true)
+  })
+
+  test("applyActions refuses to persist a Chinese-labelled credential", () => {
+    expect(() =>
+      MemoryStore.applyActions({
+        topics: [],
+        topicLimit: 10,
+        now,
+        actions: [
+          {
+            type: "create_topic",
+            name: "部署偏好",
+            summary: "用户确认的部署偏好",
+            categories: ["preference"],
+            keywords: ["部署"],
+            related_topics: [],
+            item: { kind: "preference", content: "用户要求服务器登录密码保持为 Tr0ub4dor", rationale: zhRationale },
+          },
+        ],
+      }),
+    ).toThrow("prohibited content")
+  })
+
   test("requires item-kind semantics and explicit durable confirmation", () => {
     const apply = (kind: "preference" | "decision" | "term", content: string, rationale: string) =>
       MemoryStore.applyActions({
@@ -760,9 +808,68 @@ describe("memory controller policy", () => {
       }),
     ).toEqual([])
   })
+
+  test("keeps CJK memory within max_tokens under the CJK-aware estimate", () => {
+    const filler = "回答使用简洁中文并保持礼貌语气与清晰结构"
+    const topics = [1, 2, 3].map((index) => {
+      const base = topic(`cjk-topic-${index}`)
+      return {
+        ...base,
+        metadata: { ...base.metadata, item_count: 2 },
+        items: [1, 2].map((n) => ({
+          ...base.items[0],
+          id: `cjk-topic-${index}-item-${n}`,
+          content: `已确认决定：${filler.repeat(20)}`,
+        })),
+      } satisfies MemorySchema.Topic
+    })
+    for (const value of topics) expect(MemoryStore.decodeTopic(value, value.id)).toBeDefined()
+    const cap = { ...config, injection: { max_topics: 3, max_tokens: MemorySchema.MAX_INJECTION_TOKENS } }
+
+    const rendered = Memory.renderTopics(topics, cap)
+    expect(rendered).toHaveLength(1)
+    expect(rendered[0]).toContain("cjk-topic-1")
+    // length/4 would admit all six items (~2800 CJK tokens against a 1200 cap).
+    expect(Token.estimateReserve(rendered[0])).toBeLessThanOrEqual(cap.injection.max_tokens)
+  })
 })
 
 describe("memory cadence evidence", () => {
+  test("treats a pasted absolute path as real user input but still skips slash commands", () => {
+    const sessionID = SessionID.make("ses_memory_pasted_path")
+    const providerID = ProviderV2.ID.make("test")
+    const modelID = ModelV2.ID.make("test-model")
+    const turn = (text: string, command?: string) => {
+      const id = MessageID.ascending()
+      const message = user(id, sessionID, text)
+      if (command) message.parts = message.parts.map((part) => ({ ...part, metadata: { command } }))
+      return [message, { info: assistant(id, sessionID, providerID, modelID, "end_turn"), parts: [] }]
+    }
+
+    for (const text of [
+      "/Users/me/app/src/x.ts:12 throws on startup",
+      "/home/me/project/build.log shows the failure",
+      "/srv/app/main.go:40:7 panics",
+      "/tmp/output.log",
+      // Arbitrary mounts without an extension or line suffix.
+      "/data/project/logs",
+      "/repo/checkout is empty after the merge",
+    ])
+      expect(Memory.completedTurns(turn(text))).toBe(1)
+
+    // SessionPrompt.command marks its invocation part, whatever the name looks like.
+    for (const [text, command] of [
+      ["/memory on", "memory"],
+      ["/git/commit fix typo", "git/commit"],
+      ["/server:prompt arg", "server:prompt"],
+    ])
+      expect(Memory.completedTurns(turn(text, command))).toBe(0)
+
+    // Invocations persisted before command parts were marked.
+    for (const text of ["/memory on", "/goal write the docs", "/init"])
+      expect(Memory.completedTurns(turn(text))).toBe(0)
+  })
+
   test("counts only completed real user-to-main-agent turns and removes code evidence", () => {
     const sessionID = SessionID.make("ses_memory_test")
     const providerID = ProviderV2.ID.make("test")

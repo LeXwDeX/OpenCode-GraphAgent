@@ -14,8 +14,22 @@ import { PermissionV1Event } from "@opencode-ai/schema/permission-v1"
 
 export const Event = PermissionV1Event
 
+export interface AskOptions {
+  /**
+   * Always surface the dialog unless a ruleset rule denies. Used for a hook's
+   * `permissionDecision:"ask"`: neither ruleset allows nor earlier "always"
+   * approvals may skip it, and an "always" reply elsewhere cannot settle it.
+   */
+  readonly force?: boolean
+  /**
+   * The tool's own arguments, merged into PermissionRequest/PermissionDenied
+   * `tool_input` alongside the legacy permission fields (see hookToolInput).
+   */
+  readonly toolInput?: Record<string, unknown>
+}
+
 export interface Interface {
-  readonly ask: (input: PermissionV1.AskInput) => Effect.Effect<void, PermissionV1.Error>
+  readonly ask: (input: PermissionV1.AskInput, options?: AskOptions) => Effect.Effect<void, PermissionV1.Error>
   readonly reply: (input: PermissionV1.ReplyInput) => Effect.Effect<void, PermissionV1.NotFoundError>
   readonly list: () => Effect.Effect<ReadonlyArray<PermissionV1.Request>>
 }
@@ -23,6 +37,7 @@ export interface Interface {
 interface PendingEntry {
   info: PermissionV1.Request
   deferred: Deferred.Deferred<void, PermissionV1.RejectedError | PermissionV1.CorrectedError>
+  force?: boolean
 }
 
 interface State {
@@ -40,6 +55,16 @@ export function evaluate(permission: string, pattern: string, ...rulesets: Permi
       pattern: "*",
     }
   )
+}
+
+/**
+ * Permission hook `tool_input`: the tool's arguments plus the legacy permission
+ * fields existing hooks read (`permission`, `patterns`, `metadata`, `always` /
+ * `pattern`, `ruleset`). On a key collision the legacy value wins, so hooks
+ * written against the legacy shape keep working.
+ */
+function hookToolInput(args: Record<string, unknown> | undefined, legacy: Record<string, unknown>) {
+  return { ...args, ...legacy }
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Permission") {}
@@ -73,13 +98,16 @@ export const layer = Layer.effect(
       }),
     )
 
-    const ask = Effect.fn("Permission.ask")(function* (input: PermissionV1.AskInput) {
+    const ask = Effect.fn("Permission.ask")(function* (input: PermissionV1.AskInput, options?: AskOptions) {
       const { approved, pending } = yield* InstanceState.get(state)
       const { ruleset, ...request } = input
-      let needsAsk = false
+      const force = options?.force === true
+      let needsAsk = force
 
       for (const pattern of request.patterns) {
-        const rule = evaluate(request.permission, pattern, ruleset, approved)
+        const rule = force
+          ? evaluate(request.permission, pattern, ruleset)
+          : evaluate(request.permission, pattern, ruleset, approved)
         yield* Effect.logInfo("evaluated", { permission: request.permission, pattern, action: rule })
         if (rule.action === "deny") {
           if (settingsHook) {
@@ -88,13 +116,14 @@ export const layer = Layer.effect(
                 {
                   event: "PermissionDenied",
                   toolName: request.permission,
-                  toolInput: {
+                  toolInput: hookToolInput(options?.toolInput, {
                     permission: request.permission,
                     pattern,
                     ruleset: ruleset.filter((r) => Wildcard.match(request.permission, r.permission)),
-                  },
-                  toolUseID: request.permission,
-                } as any,
+                  }),
+                  toolUseID: request.tool?.callID,
+                  reason: `Denied by permission rule for ${request.permission} (${pattern})`,
+                },
                 { sessionID: request.sessionID ?? "", transcriptPath: "" },
               )
               .pipe(Effect.catch(() => Effect.succeed({ additionalContexts: [], systemMessages: [] })))
@@ -128,14 +157,14 @@ export const layer = Layer.effect(
             {
               event: "PermissionRequest",
               toolName: request.permission,
-              toolInput: {
+              toolInput: hookToolInput(options?.toolInput, {
                 permission: request.permission,
                 patterns: request.patterns,
                 metadata: request.metadata,
                 always: request.always,
-              },
-              toolUseID: id,
-            } as any,
+              }),
+              toolUseID: request.tool?.callID,
+            },
             { sessionID: request.sessionID ?? "", transcriptPath: "" },
           )
           .pipe(Effect.catch(() => Effect.succeed({ additionalContexts: [], systemMessages: [] } as TriggerResult)))
@@ -145,10 +174,12 @@ export const layer = Layer.effect(
           if (reason) return yield* new PermissionV1.CorrectedError({ feedback: `Permission hook: ${reason}` })
           return yield* new PermissionV1.RejectedError({})
         }
-        if (hookResult.permissionDecision === "allow") return
+        // A forced ask (PreToolUse hook `ask`) requires the user's confirmation:
+        // a PermissionRequest hook may still deny it, but its allow is ignored.
+        if (hookResult.permissionDecision === "allow" && !force) return
       }
       const deferred = yield* Deferred.make<void, PermissionV1.RejectedError | PermissionV1.CorrectedError>()
-      pending.set(id, { info, deferred })
+      pending.set(id, { info, deferred, force })
       return yield* Effect.gen(function* () {
         yield* events.publish(Event.Asked, info)
         // Notification emitter — routes "agent needs attention" through the single
@@ -163,6 +194,7 @@ export const layer = Layer.effect(
             .notify({
               message: `Permission requested: ${request.permission} (${request.patterns.join(", ")})`,
               notificationType: "permission",
+              sessionID: request.sessionID,
             })
             .pipe(Effect.ignore, Effect.forkIn(scope), Effect.asVoid)
         }
@@ -216,6 +248,7 @@ export const layer = Layer.effect(
 
       for (const [id, item] of pending.entries()) {
         if (item.info.sessionID !== existing.info.sessionID) continue
+        if (item.force) continue
         const ok = item.info.patterns.every(
           (pattern) => evaluate(item.info.permission, pattern, approved).action === "allow",
         )

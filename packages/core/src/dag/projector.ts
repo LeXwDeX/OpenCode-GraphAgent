@@ -139,13 +139,34 @@ export const layer = Layer.effectDiscard(
         .run()
         .pipe(Effect.orDie),
     )
-    yield* events.project(DagEvent.WorkflowResumed, setWorkflowStatus(ws("running"), [...WorkflowStatusProjection.resumed.from]))
+    // Leaving a pause ends that pause episode. A reminder already delivered for
+    // it (wake_reported=true) must not suppress the next report, so the
+    // resumed run starts with a fresh, unreported wake marker.
+    yield* events.project(DagEvent.WorkflowResumed, (event) =>
+      db
+        .update(WorkflowTable)
+        .set({ status: "running", seq: event.durable!.seq, time_updated: toMillis(event.data.timestamp), wake_reported: false })
+        .where(and(eq(WorkflowTable.id, event.data.dagID), inArray(WorkflowTable.status, [...WorkflowStatusProjection.resumed.from])))
+        .run()
+        .pipe(Effect.orDie),
+    )
     yield* events.project(DagEvent.WorkflowStepped, setWorkflowStatus(ws("stepping"), [...WorkflowStatusProjection.stepped.from]))
 
     const setWorkflowTerminal = (status: WorkflowStatus, from: WorkflowStatus[]) => (event: { data: { dagID: DagEvent.DagID; timestamp: DateTime.Utc }; durable?: { seq: number } }) =>
       db
         .update(WorkflowTable)
-        .set({ status, seq: event.durable!.seq, completed_at: toMillis(event.data.timestamp), time_updated: toMillis(event.data.timestamp) })
+        .set({
+          status,
+          seq: event.durable!.seq,
+          completed_at: toMillis(event.data.timestamp),
+          time_updated: toMillis(event.data.timestamp),
+          // A terminal transition opens its own wake episode (same re-arm as
+          // node F2b): a paused reminder reported earlier must not swallow the
+          // terminal report. The non-terminal `from` guard keeps replay of an
+          // already-applied terminal event a 0-row update, so an acknowledged
+          // terminal wake is never re-armed.
+          wake_reported: false,
+        })
         .where(and(eq(WorkflowTable.id, event.data.dagID), inArray(WorkflowTable.status, from)))
         .run()
         .pipe(Effect.orDie)

@@ -91,13 +91,14 @@ export function load(projectDir: string, options: { autoSeed?: boolean } = {}): 
  * Resolve the configured default model for a node. Critical nodes
  * (required: true or review workers) take the advanced tier; everything else
  * takes standard. A single configured tier acts as the unified default.
+ * Fallback runs on the parsed refs: an empty or malformed tier (e.g. the
+ * seeded `"advanced": ""` uncommented) counts as unconfigured.
  */
 export function tierModel(info: Info, node: { required: boolean; workerType: string }) {
   const critical = node.required || isReviewWorker(node.workerType)
-  const ref = critical
-    ? info.model?.advanced ?? info.model?.standard
-    : info.model?.standard ?? info.model?.advanced
-  return parseModelRef(ref)
+  const advanced = parseModelRef(info.model?.advanced)
+  const standard = parseModelRef(info.model?.standard)
+  return critical ? (advanced ?? standard) : (standard ?? advanced)
 }
 
 function candidates(projectDir: string) {
@@ -145,6 +146,10 @@ async function seedGlobalDefault(): Promise<NodeJS.ErrnoException | undefined> {
 function parseModelRef(ref: string | undefined) {
   if (!ref) return undefined
   const slash = ref.indexOf("/")
-  if (slash <= 0 || slash === ref.length - 1) return undefined
-  return { providerID: ref.slice(0, slash), modelID: ref.slice(slash + 1) }
+  if (slash < 0) return undefined
+  // Whitespace-only components (e.g. " / ") count as unconfigured.
+  const providerID = ref.slice(0, slash).trim()
+  const modelID = ref.slice(slash + 1).trim()
+  if (!providerID || !modelID) return undefined
+  return { providerID, modelID }
 }

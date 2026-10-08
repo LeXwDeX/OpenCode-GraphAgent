@@ -5388,6 +5388,8 @@ it.instance("stores the slash invocation as visible text and hides the expanded 
     const texts = user?.parts.filter((part): part is SessionV1.TextPart => part.type === "text") ?? []
 
     expect(texts.filter((part) => !part.synthetic).map((part) => part.text)).toEqual(["/probe inspect layout"])
+    // Memory tells command invocations from pasted paths by this marker.
+    expect(texts.find((part) => !part.synthetic)?.metadata?.command).toBe("probe")
     expect(texts.filter((part) => part.synthetic).map((part) => part.text)).toContain(
       "Expanded command instructions:\ninspect layout",
     )
@@ -5412,6 +5414,10 @@ noLLMServer.instance(
         "/memory off",
         "Memory off",
       ])
+      expect(
+        off.parts.find((part): part is SessionV1.TextPart => part.type === "text" && part.text === "/memory off")
+          ?.metadata?.command,
+      ).toBe("memory")
       expect(on.parts.filter((part) => part.type === "text").map((part) => part.text)).toEqual([
         "/memory on",
         "Memory on",

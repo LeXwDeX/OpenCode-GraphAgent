@@ -119,6 +119,21 @@ describe("parseJudgeResponse", () => {
     expect(result).toEqual({ verdict: "done", reason: "set up {config}", parseFailed: false })
   })
 
+  test("a stray unbalanced brace in prose does not hide a later complete verdict", () => {
+    const raw = 'The agent left `if (ok) {` unclosed in main.ts.\n{"verdict":"blocked","reason":"needs the user API key"}'
+    expect(GoalJudge.parseJudgeResponse(raw)).toEqual({
+      verdict: "blocked",
+      reason: "needs the user API key",
+      parseFailed: false,
+    })
+  })
+
+  test("a stray brace before truncated JSON still reports truncated-json", () => {
+    const raw = 'Saw `{` in prose. {"verdict":"done","reason":"tests passed"'
+    expect(GoalJudge.parseJudgeResponse(raw).failureCategory).toBe("truncated-json")
+    expect(GoalJudge.parseJudgeResponse("no verdict yet {").failureCategory).toBe("truncated-json")
+  })
+
   test("an unclosed markdown fence with a complete object still parses safely", () => {
     const raw = '```json\n{"verdict":"continue","reason":"more work"}'
     expect(GoalJudge.parseJudgeResponse(raw)).toEqual({

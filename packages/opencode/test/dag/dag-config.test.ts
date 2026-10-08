@@ -127,6 +127,40 @@ describe("DagConfig.tierModel", () => {
     })
   })
 
+  // An empty tier (what uncommenting the seeded `// "advanced": ""` line
+  // produces) is unconfigured: the other tier remains the unified default
+  // instead of critical/required nodes silently falling through to the
+  // worker-agent or parent-session model.
+  it("falls back past an empty tier to the configured one", () => {
+    const emptyAdvanced = { model: { advanced: "", standard: "openai/gpt-5" } }
+    expect(DagConfig.tierModel(emptyAdvanced, { required: true, workerType: "build" })).toEqual({
+      providerID: "openai",
+      modelID: "gpt-5",
+    })
+    expect(DagConfig.tierModel(emptyAdvanced, { required: false, workerType: "review" })).toEqual({
+      providerID: "openai",
+      modelID: "gpt-5",
+    })
+    const emptyStandard = { model: { advanced: "anthropic/claude", standard: "" } }
+    expect(DagConfig.tierModel(emptyStandard, { required: false, workerType: "build" })).toEqual({
+      providerID: "anthropic",
+      modelID: "claude",
+    })
+  })
+
+  it("treats a whitespace-only tier as unconfigured and trims tier components", () => {
+    const blankAdvanced = { model: { advanced: " / ", standard: "openai/gpt-5" } }
+    expect(DagConfig.tierModel(blankAdvanced, { required: true, workerType: "build" })).toEqual({
+      providerID: "openai",
+      modelID: "gpt-5",
+    })
+    const padded = { model: { standard: " openai / gpt-5 " } }
+    expect(DagConfig.tierModel(padded, { required: false, workerType: "build" })).toEqual({
+      providerID: "openai",
+      modelID: "gpt-5",
+    })
+  })
+
   it("keeps only the first slash as the provider separator", () => {
     const nested = { model: { standard: "local-proxy-compatible/qwen3.8-max-preview" } }
     expect(DagConfig.tierModel(nested, { required: false, workerType: "explore" })).toEqual({
