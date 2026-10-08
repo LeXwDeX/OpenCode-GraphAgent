@@ -229,4 +229,34 @@ describe("memory primary directory", () => {
       }),
     { timeout: 30_000 },
   )
+
+  it.live(
+    "the active primary checkout repointed in place leaves Memory inert",
+    () =>
+      Effect.gen(function* () {
+        const primary = yield* tmpdirScoped({ git: true })
+        yield* provideInstance(primary)(
+          Effect.gen(function* () {
+            const project = yield* Project.Service
+            const { project: info } = yield* project.fromDirectory(primary)
+            yield* project.setInitialized(info.id)
+          }),
+        ).pipe(Effect.provide(testInstanceStoreLayer))
+
+        yield* provideInstance(primary)(
+          Effect.gen(function* () {
+            const memory = yield* Memory.Service
+            expect(yield* memory.setEnabled(false)).toBe("Memory off")
+            expect(fs.existsSync(path.join(primary, ".opencode", "memory.jsonc"))).toBe(true)
+
+            // The live instance keeps its Project while the checkout now belongs elsewhere.
+            fs.rmSync(path.join(primary, ".opencode"), { recursive: true, force: true })
+            git(primary, "remote", "add", "origin", "https://example.test/unrelated/repository.git")
+            expect(yield* memory.setEnabled(false)).not.toBe("Memory off")
+            expect(fs.existsSync(path.join(primary, ".opencode"))).toBe(false)
+          }),
+        ).pipe(Effect.provide(testInstanceStoreLayer))
+      }),
+    { timeout: 30_000 },
+  )
 })

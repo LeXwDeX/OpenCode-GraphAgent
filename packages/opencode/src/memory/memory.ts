@@ -221,7 +221,6 @@ export const layer: Layer.Layer<
     // is wired, still resolves to this Project. Identity is resolved on every
     // use, never cached: a path can be deleted and reused by an unrelated
     // repository, or repointed in place (`git remote set-url`), at any time.
-    // Only reached when the current checkout is not the primary.
     const ownsDirectory = Effect.fnUntraced(function* (projectID: ProjectV2.ID, directory: string) {
       if (Option.isNone(filesystem)) return true
       if (!(yield* filesystem.value.existsSafe(directory))) return false
@@ -238,9 +237,12 @@ export const layer: Layer.Layer<
     // writing there would recreate `.opencode/memory.jsonc` in a dead path or
     // plant this Project's policy in a foreign repo. Fall back to the first
     // live checkout of this Project in sorted order (deterministic across
-    // worktrees, so they agree on one policy file); the current checkout
-    // resolved to this Project and always qualifies.
+    // worktrees, so they agree on one policy file). The active checkout is
+    // verified too: when it was repointed or reused in place while this
+    // process lives, it no longer belongs to this Project and Memory stays
+    // inert (undefined) rather than reading or writing configuration there.
     const primaryDirectory = Effect.fnUntraced(function* (current: Project.Info, worktree: string) {
+      if (!(yield* ownsDirectory(current.id, worktree))) return undefined
       if (current.worktree === worktree || (yield* ownsDirectory(current.id, current.worktree))) return current.worktree
       for (const directory of Array.from(new Set([worktree, ...current.sandboxes])).sort()) {
         if (directory === worktree || (yield* ownsDirectory(current.id, directory))) return directory
@@ -264,6 +266,7 @@ export const layer: Layer.Layer<
       if (current.id === ProjectV2.ID.global) return undefined
       if (current.vcs !== "git" || !current.time.initialized) return undefined
       const primary = yield* primaryDirectory(current, ctx.worktree)
+      if (!primary) return undefined
       const migration = yield* admission
         .ensure({
           projectID: current.id,
