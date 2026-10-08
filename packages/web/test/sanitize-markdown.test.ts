@@ -25,6 +25,8 @@ async function fixture(svg = false) {
       ...(svg ? ['<svg onload="window.__shareXss=true"><script>window.__shareXss=true</script></svg>'] : []),
       '<iframe srcdoc="<script>parent.__shareXss=true</script>"></iframe>',
       "[execute](javascript:alert(1))",
+      '<a href="data:text/html;base64,PHNjcmlwdD5wYXJlbnQuX19zaGFyZVhzcz10cnVlPC9zY3JpcHQ+">data link</a>',
+      '<a href="vbscript:msgbox(1)">vbscript link</a>',
       '<a href="https://example.com/" target="_blank" rel="noopener noreferrer">safe link</a>',
     ].map(async (value) => marked.parse(value)),
   )
