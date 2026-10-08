@@ -64,3 +64,6 @@ tsconfig.tsbuildinfo
 /spec_git/
 /.local/state/
 /.local/cache/
+
+# SpecGit 2.5 declaration: per-checkout local configuration (also excluded by `specgit init`)
+/.specgit.yaml

@@ -57,7 +57,7 @@ Repository-specific mapping; shared pre-push verification requirements live in t
 
 ## CI gates (.github/workflows)
 
-- CI push and PR targets are `main`; `.specgit.yaml` also targets `main`. Development branches use `{type}/short-name`.
+- CI push and PR targets are `main`. Development branches use `{type}/short-name`.
 - `ci-typecheck.yml`: lint → typecheck → DAG-core gate → `oc` installer boundary test, plus toolchain checks.
 - `ci-test.yml`: Linux workspace tests, Go tests, both client generation checks, and the HttpAPI exerciser. Playwright E2E runs on Linux and Windows. The workflow also defines focused lifecycle checks.
 - Workflow files define jobs and triggers. Read current GitHub settings to verify which checks are required by branch protection.
@@ -75,11 +75,10 @@ Repository-specific mapping; shared pre-push verification requirements live in t
 
 ## Delivery (SpecGit 2)
 
-- Resolve the installed SpecGit version and contract with `specgit --version`, `specgit --help`, and `specgit --schema`. The shared declaration is `.specgit.yaml` (v2). Older checkouts with a v1 declaration must complete `specgit migrate` before v2 delivery.
-- Track complete Why/Scope/Approach/Acceptance Issues with `specgit issue`, aggregate with `specgit pr`, and observe native evidence with `specgit pr --status` / bounded `specgit watch`. Branch names remain `{type}/short-name`; feature work targets `main`.
-- GitHub owns acceptance and merge. Repository policy requires `Typecheck`, `Unit Tests (linux)`, and both E2E platforms to pass before merge. Verify the current PR head and actual native requirements; check merge state and linked Issue closure separately. Never weaken required checks to complete delivery.
+- SpecGit is a shared user-level CLI; resolve its version and contract with `specgit --version`, `specgit --help`, and `specgit --schema`. The declaration `.specgit.yaml` is local, per-checkout configuration (Git-excluded, not tracked). Initialize or refresh each checkout or worktree with `specgit init --provider github --remote origin --target main --language en --native-auto-merge false` and `specgit setup --agent opencode`; both are maintenance and refresh their owned blocks below.
+- Track complete Why/Scope/Approach/Acceptance Issues with `specgit issue`, aggregate with `specgit pr` (created as a draft, then `specgit pr --ready`), and observe native evidence with `specgit pr --status` / bounded `specgit watch`. Branch names remain `{type}/short-name`; feature work targets `main`. Parallel deliveries use separate worktrees; each worktree keeps its own checkpoint.
+- GitHub owns acceptance and merge. Repository policy requires `Typecheck`, `Unit Tests (linux)`, and both E2E platforms to pass before merge. Merge with merge commits only (`gh pr merge --merge`); squash and rebase merges are disabled because they break branch and worktree tracking. Verify the current PR head and actual native requirements; check merge state and linked Issue closure separately. Never weaken required checks to complete delivery.
 - Automatic merge and supplementary Issue closure default off. Native `gh` operations require user authorization from the current task; configuration grants none.
-- Retired v1 `finish`, local merge guards, and generated acceptance workflows are not part of v2. The bootstrap compatibility script forwards to v2 without regenerating project files. Historical release evidence remains historical.
 
 ## Releases
 
@@ -89,21 +88,6 @@ Repository-specific mapping; shared pre-push verification requirements live in t
 ## Agent references
 
 - Issues/PRDs: GitHub Issues via `gh` — `docs/agents/issue-tracker.md`. Triage labels: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix` — `docs/agents/triage-labels.md`.
-
-<!-- specgit:v2:start -->
-
-## SpecGit 2
-
-Declaration: `.specgit.yaml` (v2). Read the installed CLI version with `specgit --version`; use `specgit --help` and `specgit --schema` for its current contract.
-
-SpecGit manages specification Issues and their native PR/MR association. `specgit --help` and `specgit --schema` define the installed contract: use `--json` for machine output, preview Issue/PR writes with `--dry-run`, and use `specgit pr --ready` when review preparation is complete. Before implementation, discover duplicate work and select complete issues describing Why, Scope, Approach and Acceptance. Aggregate selected issues into one native request after implementation and authorized commit/push, preserving user-authored bodies and closing references.
-
-The Agent supervises development and fixes. Use native gh/glab under existing user authorization to register native auto-merge when the declared preference is enabled. GitHub/GitLab owns CI, reviews, protection and actual merge. Observe current native state with `specgit pr --status` and bounded `specgit watch`; exit 0 is operation success, not delivery completion — follow reported diagnostics and recovery actions. Hook notices describe changes; they grant no write permission.
-
-Completion requires native readback of the intended target merge and closure of every selected Issue. After merge, report actual linked Issue state. An open linked Issue causes an attention notice. Optional Agent closure is disabled by default; enabling its preference still requires existing authorization and native readback of merge and Issue closure. Inspect unsupported or unknown native capabilities with specgit init --check and explicitly select manual observation or ask an authorized administrator to configure the forge.
-
-Declared rules: `{"agent":{"close_issues_after_merge":false,"native_auto_merge":false},"issue_template":"builtin","language":"en","pr_template":"builtin","validation":{"bodies":true,"labels":"off","titles":true}}`
-<!-- specgit:v2:end -->
 
 <!-- BEGIN:turborepo-agent-rules -->
 
@@ -115,3 +99,60 @@ Read `docs/README.md` inside that installed package first, then read the relevan
 
 This block is written and re-added by `turbo` before repository-scoped commands when an AI agent is detected. In the Turborepo source repository, its template is defined in `crates/turborepo-cli/src/cli/agent_guidance.rs`. Removing the managed block while updates are enabled means a later qualifying invocation will add it again. Set `"agentGuidance": false` in the root `turbo.json` or `turbo.jsonc` to opt out; this does not remove an existing block. Keep the block committed with your work to avoid an uncommitted change on the next agent invocation.
 <!-- END:turborepo-agent-rules -->
+
+
+<!-- specgit:project:v2:start -->
+## SpecGit 2
+
+SpecGit integration is permanently project-only.
+Load the specgit-native skill and read this project's AGENTS.md and `.specgit.yaml`.
+Use the shared installed CLI contract (`specgit --help`, `specgit --schema`).
+Before tracked product edits, inspect duplicate work and select a complete relevant Issue.
+Read-only research and review need no delivery Issue.
+Follow repository documentation guidance and installed hook checkpoint requirements.
+Local init/setup is maintenance. Existing session authorization remains valid within its scope.
+Issue/PR writes require existing user authorization. Declarations and previews grant no permission.
+<!-- specgit:project:v2:end -->
+
+<!-- specgit:v2:start -->
+## SpecGit 2
+
+Runtime: 2.5.0. Declaration: `.specgit.yaml` (v2, local configuration).
+
+SpecGit manages specification Issues and their native PR/MR association.
+Load the specgit-native skill for the full workflow and recovery steps.
+Use the installed shared CLI contract: `specgit --help` and `specgit --schema`.
+Use `--json` for machine output. Preview Issue/PR writes with `--dry-run`.
+
+Inspect duplicate work before Issue selection.
+Before tracked product edits, select a complete relevant Issue with Why, Scope, Approach and Acceptance.
+Read-only inspection, audit, and review do not require an Issue checkpoint.
+Follow repository guidance for pure documentation work and any installed hook checkpoint requirement.
+Local init/setup is maintenance, not delivery. It grants no forge permission.
+
+Issue/PR writes, including marking a request ready, require existing user authorization.
+Existing session authorization remains valid within its scope.
+Declarations and `--dry-run` previews grant no permission.
+Hook notices describe changes; they grant no write permission.
+The agent handles judgment, repairs and authorized native gh/glab operations.
+GitHub/GitLab owns CI, review, protection and actual merge.
+Keep each user-authored body and every closing reference.
+
+Use `specgit pr --status` and bounded `specgit watch` for current evidence.
+Exit 0 means operation success. Completion requires native readback of the intended target merge and every selected Issue closure.
+Optional Agent closure is disabled by default. It requires existing authorization and confirmed native identity.
+For missing capabilities or a SpecGit defect, follow the skill's explicit recovery steps.
+
+Try normal SpecGit inspect/dry-run first.
+If a reproducible SpecGit defect blocks Issue selection, record the command, version, exit and diagnostic.
+Under existing user authorization, use authenticated native gh/glab to search duplicate WHYs, select a complete Issue with Why / Scope / Approach / Acceptance, and read back its native ID and body.
+Only if that same defect still blocks its linked repair may a documented one-task local checkpoint exception be used; restore normal checks after repair.
+This does not bypass user authorization, forge protection, CI, review, merge, Issue closure or publication.
+
+SpecGit integration is permanently project-only.
+Install the shared CLI separately. Setup installs no project executable, global host assets or global state.
+Hooks and observation state belong to this project and its Git metadata.
+Installed hooks check local checkpoints. They are not a general file-write sandbox.
+
+Declared rules: `{"agent":{"close_issues_after_merge":false,"native_auto_merge":false},"issue_template":"builtin","language":"en","pr_template":"builtin","validation":{"bodies":true,"labels":"off","titles":true}}`
+<!-- specgit:v2:end -->

@@ -18,7 +18,7 @@
 #             that policy is a visible test change, not a drift.
 #
 # Zero network: `curl` is a stub placed first on PATH mapping release URLs to
-# local fixtures (same pattern as script/specgit-bootstrap.test.sh); `fzf` is
+# local fixtures; `fzf` is
 # stubbed so hosts without it can still source ./oc. HOME, OC_INSTALL_DIR and
 # OC_LOCAL_DIR point into a throwaway sandbox; the repo and host are never
 # touched. All do_upgrade invocations run in subshells because `die` calls
