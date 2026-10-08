@@ -267,13 +267,18 @@ export const layer: Layer.Layer<
       if (current.vcs !== "git" || !current.time.initialized) return undefined
       const primary = yield* primaryDirectory(current, ctx.worktree)
       if (!primary) return undefined
+      // Admission imports and removes legacy memory files in every directory it
+      // scans, so a recorded sandbox that was deleted or reused by another
+      // repository is left out like a stale primary (both of those are verified).
+      const sandboxes = yield* Effect.forEach(
+        current.sandboxes.filter((directory) => directory !== primary && directory !== ctx.worktree),
+        (directory) => ownsDirectory(current.id, directory).pipe(Effect.map((owned) => (owned ? [directory] : []))),
+      ).pipe(Effect.map((owned) => owned.flat()))
       const migration = yield* admission
         .ensure({
           projectID: current.id,
           projectDirectory: primary,
-          // A stale primary is left out entirely: admission writes and removes
-          // files in the directories it scans.
-          directories: Array.from(new Set([primary, ...current.sandboxes, ctx.worktree])),
+          directories: Array.from(new Set([primary, ...sandboxes, ctx.worktree])),
           updated: current.time.updated,
         })
         .pipe(Effect.catchTag("MemoryAdmission.IdentityRetired", () => Effect.succeed(undefined)))

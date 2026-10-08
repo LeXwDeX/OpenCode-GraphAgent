@@ -259,4 +259,65 @@ describe("memory primary directory", () => {
       }),
     { timeout: 30_000 },
   )
+
+  it.live(
+    "admission leaves a recorded sandbox alone once it is reused by another repository",
+    () =>
+      Effect.gen(function* () {
+        const primary = yield* tmpdirScoped({ git: true })
+        const sandbox = yield* tmpdirScoped()
+        yield* provideInstance(primary)(
+          Effect.gen(function* () {
+            const project = yield* Project.Service
+            const { project: info } = yield* project.fromDirectory(primary)
+            yield* project.setInitialized(info.id)
+          }),
+        ).pipe(Effect.provide(testInstanceStoreLayer))
+        fs.cpSync(primary, sandbox, { recursive: true })
+        const projectID = yield* provideInstance(sandbox)(
+          Effect.gen(function* () {
+            const project = yield* Project.Service
+            const { project: info } = yield* project.fromDirectory(sandbox)
+            return info.id
+          }),
+        ).pipe(Effect.provide(testInstanceStoreLayer))
+        const recorded = yield* provideInstance(primary)(
+          Effect.gen(function* () {
+            const project = yield* Project.Service
+            return (yield* project.get(projectID))?.sandboxes ?? []
+          }),
+        ).pipe(Effect.provide(testInstanceStoreLayer))
+        expect(recorded).toContain(sandbox)
+
+        // The sandbox path now holds an unrelated repository with its own memory policy.
+        fs.rmSync(sandbox, { recursive: true, force: true })
+        fs.mkdirSync(sandbox, { recursive: true })
+        git(sandbox, "init")
+        git(
+          sandbox,
+          "-c",
+          "user.email=test@opencode.test",
+          "-c",
+          "user.name=Test",
+          "-c",
+          "commit.gpgsign=false",
+          "commit",
+          "--allow-empty",
+          "-m",
+          `unrelated root ${sandbox}`,
+        )
+        const foreignConfig = path.join(sandbox, ".opencode", "memory.jsonc")
+        fs.mkdirSync(path.dirname(foreignConfig), { recursive: true })
+        fs.writeFileSync(foreignConfig, '{ "enabled": true }\n')
+
+        yield* provideInstance(primary)(
+          Effect.gen(function* () {
+            const memory = yield* Memory.Service
+            expect(yield* memory.setEnabled(false)).toBe("Memory off")
+          }),
+        ).pipe(Effect.provide(testInstanceStoreLayer))
+        expect(fs.readFileSync(foreignConfig, "utf8")).toBe('{ "enabled": true }\n')
+      }),
+    { timeout: 30_000 },
+  )
 })
