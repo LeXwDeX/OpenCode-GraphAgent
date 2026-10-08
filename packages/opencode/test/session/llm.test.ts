@@ -6,7 +6,6 @@ import path from "path"
 import { InvalidResponseDataError, tool, type ModelMessage } from "ai"
 import { Cause, Effect, Exit, Fiber, Layer, Stream } from "effect"
 import { InstanceRef } from "../../src/effect/instance-ref"
-import { ReasoningDistillationPolicy } from "@opencode-ai/core/session/reasoning-distillation"
 import { HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
 import z from "zod"
 import { LLM, strictJSON } from "../../src/session/llm"
@@ -23,7 +22,6 @@ import type { Agent } from "../../src/agent/agent"
 import { MessageV2 } from "../../src/session/message-v2"
 import { SessionID, MessageID } from "../../src/session/schema"
 import { RuntimeFlags } from "@/effect/runtime-flags"
-import { Permission } from "@/permission"
 import { LLMAISDK } from "@/session/llm/ai-sdk"
 import { Session as SessionNs } from "@/session/session"
 import { ProviderV2 } from "@opencode-ai/core/provider"
@@ -31,7 +29,6 @@ import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderError } from "@/provider/error"
 import { ContextFolding } from "@/session/context-folding"
 import { Flag } from "@opencode-ai/core/flag/flag"
-import { Hash } from "@opencode-ai/core/util/hash"
 import { logLines } from "effect/testing/TestConsole"
 import { ToolBudget } from "@opencode-ai/core/session/tool-budget"
 
@@ -78,58 +75,6 @@ const drainWith = (layer: Layer.Layer<LLM.Service>, input: LLM.StreamInput) =>
           Effect.provide(layer),
           Effect.provideService(InstanceRef, ctx),
         ),
-      ),
-    )
-  })
-
-const distillWith = (layer: Layer.Layer<LLM.Service>, input: LLM.StreamInput) =>
-  Effect.gen(function* () {
-    const ctx = yield* InstanceRef
-    if (!ctx) return yield* Effect.die("InstanceRef not provided")
-    return yield* Effect.promise(() =>
-      Effect.runPromise(
-        LLM.Service.use((svc) => svc.distill(input)).pipe(
-          Effect.provide(layer),
-          Effect.provideService(InstanceRef, ctx),
-        ),
-      ),
-    )
-  })
-
-// Runs every distill call in one runtime so per-session organizer state accumulates across turns.
-const distillSequenceWith = (layer: Layer.Layer<LLM.Service>, inputs: readonly LLM.StreamInput[]) =>
-  Effect.gen(function* () {
-    const ctx = yield* InstanceRef
-    if (!ctx) return yield* Effect.die("InstanceRef not provided")
-    return yield* Effect.promise(() =>
-      Effect.runPromise(
-        Effect.forEach(inputs, (input) => LLM.Service.use((svc) => svc.distill(input)), { discard: true }).pipe(
-          Effect.provide(layer),
-          Effect.provideService(InstanceRef, ctx),
-        ),
-      ),
-    )
-  })
-
-const drainSequenceWith = (layer: Layer.Layer<LLM.Service>, inputs: readonly LLM.StreamInput[], distill = false) =>
-  Effect.gen(function* () {
-    const ctx = yield* InstanceRef
-    if (!ctx) return yield* Effect.die("InstanceRef not provided")
-    return yield* Effect.promise(() =>
-      Effect.runPromise(
-        Effect.forEach(
-          inputs,
-          (input, index) =>
-            LLM.Service.use((svc) =>
-              Effect.gen(function* () {
-                if (distill && index === 0) yield* svc.distill(input)
-                yield* svc.stream(input).pipe(Stream.runDrain)
-              }),
-            ),
-          {
-            discard: true,
-          },
-        ).pipe(Effect.provide(layer), Effect.provideService(InstanceRef, ctx)),
       ),
     )
   })
@@ -972,92 +917,27 @@ const foldingConfig = (): Partial<ConfigV1.Info> => ({
 // The aux prompt embeds this reasoning body; the CJK-aware reserve estimator counts CJK at ~1 token per
 // character, so the body must stay well under the 32_768-token aux input cap (80_000 CJK chars was only
 // admissible under the old length/4 underestimate that this estimator replaced).
-const distillationBody = "反复分析方案A与风险。".repeat(2_000)
-const distillationBackground = "背景材料。".repeat(100)
-const distillationMessages = (): ModelMessage[] => [
-  { role: "assistant", content: [{ type: "reasoning", text: distillationBody }] },
-  { role: "user", content: `${distillationBackground}\n继续执行。` },
-]
-const distillationHistory = (): LLM.StreamInput["reasoningDistillation"] => ({
-  groups: [
-    {
-      messageID: "msg-reasoning-source",
-      parts: [
-        {
-          messageID: "msg-reasoning-source",
-          partID: "prt-reasoning-source",
-          text: distillationBody,
-          signed: false,
-          encrypted: false,
-          settled: true,
-          canonicalEditable: true,
-        },
-      ],
-    },
-  ],
-})
-
-const auxiliaryResponse = (content: unknown) =>
-  Response.json({
-    id: "chatcmpl-auxiliary",
-    object: "chat.completion",
-    created: 0,
-    model: "deepseek-test-r1",
-    choices: [{ index: 0, message: { role: "assistant", content: JSON.stringify(content) }, finish_reason: "stop" }],
-    usage: { prompt_tokens: 10, completion_tokens: 10, total_tokens: 20 },
-  })
-
-const auxiliaryTextResponse = (text: string, finishReason = "stop", totalTokens = 20) =>
-  Response.json({
-    id: "chatcmpl-organize",
-    object: "chat.completion",
-    created: 0,
-    model: "deepseek-test-r1",
-    choices: [{ index: 0, message: { role: "assistant", content: text }, finish_reason: finishReason }],
-    usage: { prompt_tokens: totalTokens - 10, completion_tokens: 10, total_tokens: totalTokens },
-  })
-
-const organizeInput = (
-  model: Provider.Model,
-  sessionID: SessionID,
-  history: NonNullable<LLM.StreamInput["reasoningDistillation"]>,
-  adoptReasoning: NonNullable<LLM.StreamInput["adoptReasoning"]>,
-): LLM.StreamInput => {
-  const agent = {
-    name: "test",
-    mode: "primary",
-    options: {},
-    permission: [{ permission: "*", pattern: "*", action: "allow" }],
-  } satisfies Agent.Info
-  return {
-    user: {
-      id: MessageID.make("msg_user-organize"),
-      sessionID,
-      role: "user",
-      time: { created: Date.now() },
-      agent: agent.name,
-      model: { providerID: ProviderV2.ID.make("custom-provider"), modelID: model.id },
-    },
-    sessionID,
-    model,
-    agent,
-    system: [],
-    messages: distillationMessages(),
-    tools: {},
-    purpose: "conversation",
-    reasoningDistillation: history,
-    adoptReasoning,
-  }
+const auxiliaryTextResponse = (text: string, finishReason = "stop", totalTokens = 20) => {
+  const chunk = (value: Record<string, unknown>) =>
+    `data: ${JSON.stringify({ id: "chatcmpl-organize", object: "chat.completion.chunk", ...value })}`
+  const payload =
+    [
+      chunk({ choices: [{ delta: { role: "assistant", content: text } }] }),
+      chunk({ choices: [{ delta: {}, finish_reason: finishReason }] }),
+      chunk({
+        choices: [],
+        usage: { prompt_tokens: totalTokens - 10, completion_tokens: 10, total_tokens: totalTokens },
+      }),
+      "data: [DONE]",
+    ].join("\n\n") + "\n\n"
+  return new Response(payload, { headers: { "Content-Type": "text/event-stream" } })
 }
 
-const distillationConfig = (
-  runtime: "opencode-ai-sdk" | "opencode-native",
-  options: { canonical?: boolean; none?: boolean; language?: "zh" | "en" } = {},
-): Partial<ConfigV1.Info> => {
+const organizerConfig = (options: { none?: boolean; small?: string } = {}): Partial<ConfigV1.Info> => {
   const endpoint = `${state.server!.url.origin}/v1`
   return {
     enabled_providers: ["custom-provider"],
-    small_model: "custom-provider/deepseek-test-small",
+    small_model: options.small ?? "custom-provider/deepseek-test-small",
     provider: {
       "custom-provider": {
         name: "Custom Provider",
@@ -1067,7 +947,6 @@ const distillationConfig = (
           "deepseek-test-r1": {
             name: "DeepSeek R1",
             reasoning: true,
-            ...(options.canonical ? {} : { interleaved: { field: "reasoning_content" } }),
             limit: { context: 65_536, output: 4_096 },
           },
           "deepseek-test-small": {
@@ -1080,29 +959,28 @@ const distillationConfig = (
         options: { apiKey: "test-key", baseURL: endpoint },
       },
     },
-    reasoningDistillation: {
-      enabled: true,
-      ...(options.language ? { language: options.language } : {}),
-      compatibility: options.canonical
-        ? []
-        : [
-            {
-              runtime,
-              protocol: "openai-compatible",
-              providerModelVariant: "custom-provider/deepseek-test-r1/default",
-              endpointIdentity: Hash.sha256(endpoint),
-              adapterVersion:
-                runtime === "opencode-native"
-                  ? "opencode-reasoning-distillation-native-v1"
-                  : "opencode-reasoning-distillation-ai-sdk-v1",
-              optionsFingerprint: Hash.sha256(JSON.stringify({})),
-              transportVerified: true,
-              upstreamVerified: true,
-            },
-          ],
-    },
+    reasoningDistillation: { enabled: true },
   }
 }
+
+const organizeOnce = (prompt: string, signal = new AbortController().signal) =>
+  Effect.gen(function* () {
+    const model = yield* Provider.use.getModel(
+      ProviderV2.ID.make("custom-provider"),
+      ModelV2.ID.make("deepseek-test-r1"),
+    )
+    const organizer = yield* LLM.Service.use((svc) => svc.organizer({ model }))
+    if (!organizer) return { organizer, output: undefined, error: undefined }
+    const result = yield* Effect.promise(() =>
+      organizer
+        .call(signal)({ prompt })
+        .then(
+          (output) => ({ output, error: undefined }),
+          (error: unknown) => ({ output: undefined, error }),
+        ),
+    )
+    return { organizer, ...result }
+  })
 
 const loadedDcpCases = [
   {
@@ -2216,562 +2094,70 @@ describe("session.llm.stream", () => {
     },
   )
 
-  for (const runtime of ["opencode-ai-sdk", "opencode-native"] as const) {
-    for (const supportsNone of [false, true]) {
-      for (const adopted of [true, false]) {
-        it.instance(
-          `${runtime} organizes with ${supportsNone ? "none" : "low"} and replays persisted replacements; persistence accepted=${adopted}`,
-          () =>
-            Effect.gen(function* () {
-              const organize = waitRequest("/chat/completions", auxiliaryTextResponse("已确认方案A。"))
-              const first = waitRequest(
-                "/chat/completions",
-                new Response(createChatStream("first"), { headers: { "Content-Type": "text/event-stream" } }),
-              )
-              const second = waitRequest(
-                "/chat/completions",
-                new Response(createChatStream("second"), { headers: { "Content-Type": "text/event-stream" } }),
-              )
-
-              const resolved = yield* Provider.use.getModel(
-                ProviderV2.ID.make("custom-provider"),
-                ModelV2.ID.make("deepseek-test-r1"),
-              )
-              expect(resolved.limit).toMatchObject({ context: 65_536, output: 4_096 })
-              const sessionID = SessionID.make(`session-test-distillation-${runtime}`)
-              const agent = {
-                name: "test",
-                mode: "primary",
-                options: {},
-                permission: [{ permission: "*", pattern: "*", action: "allow" }],
-              } satisfies Agent.Info
-              const messages = distillationMessages()
-              const before = JSON.stringify(messages)
-              const applied: Array<readonly { before: string; after: string }[]> = []
-              const input = (id: string): LLM.StreamInput => ({
-                user: {
-                  id: MessageID.make(id),
-                  sessionID,
-                  role: "user",
-                  time: { created: Date.now() },
-                  agent: agent.name,
-                  model: { providerID: ProviderV2.ID.make("custom-provider"), modelID: resolved.id },
-                } satisfies SessionV1.User,
-                sessionID,
-                model: resolved,
-                agent,
-                system: [],
-                messages,
-                tools: {},
-                purpose: "conversation",
-                reasoningDistillation: distillationHistory(),
-                adoptReasoning: (replacements) =>
-                  Effect.sync(() => {
-                    applied.push(replacements)
-                    if (adopted) {
-                      const assistant = messages.find((message) => message.role === "assistant")
-                      if (assistant && Array.isArray(assistant.content)) {
-                        for (const part of assistant.content)
-                          if (part.type === "reasoning") part.text = replacements[0].after
-                      }
-                    }
-                    return adopted
-                  }),
-              })
-
-              yield* drainSequenceWith(
-                llmLayerWithExecutor(RequestExecutor.defaultLayer, {
-                  experimentalNativeLlm: runtime === "opencode-native",
-                  outputTokenMax: 4_096,
-                }),
-                [
-                  input("msg_user-distillation-first"),
-                  {
-                    ...input("msg_user-distillation-second"),
-                    reasoningDistillation: distillationHistory(),
-                  },
-                ],
-                true,
-              )
-
-              const [organizeCapture, firstCapture, secondCapture] = yield* Effect.promise(() =>
-                Promise.all([organize, first, second]),
-              )
-              expect(organizeCapture.body.stream).not.toBe(true)
-              expect(organizeCapture.body.model).toBe("deepseek-test-small")
-              expect(organizeCapture.body.reasoning_effort).toBe(supportsNone ? "none" : "low")
-              expect(firstCapture.body.model).toBe("deepseek-test-r1")
-              expect(JSON.stringify(organizeCapture.body.messages)).toContain("只输出整理后的正文")
-              const reasoning = (capture: Capture) =>
-                (capture.body.messages as Array<Record<string, unknown>> | undefined)?.find(
-                  (message) => message.role === "assistant",
-                )?.reasoning_content
-              expect(applied).toHaveLength(1)
-              expect(applied[0][0].before).toBe(distillationBody)
-              expect(applied[0][0].after).toContain("已确认方案A。")
-              if (adopted) {
-                expect(reasoning(firstCapture)).toBe(applied[0][0].after)
-                expect(reasoning(secondCapture)).toBe(applied[0][0].after)
-              } else {
-                expect(reasoning(firstCapture)).toBe(distillationBody)
-                expect(reasoning(secondCapture)).toBe(distillationBody)
-              }
-              if (!adopted) expect(JSON.stringify(messages)).toBe(before)
-            }),
-          { config: () => distillationConfig(runtime, { none: supportsNone }) },
-        )
-      }
-    }
-  }
-
-  for (const accepted of [true, false]) {
+  for (const none of [false, true])
     it.instance(
-      `canonical reasoning without an interleaved field uses persisted identity; adoption accepted=${accepted}`,
+      `the reasoning organizer calls the small model through the engine with ${none ? "none" : "low"} effort`,
       () =>
         Effect.gen(function* () {
-          const organize = waitRequest("/chat/completions", auxiliaryTextResponse("已确认方案A。"))
-          const resolved = yield* Provider.use.getModel(
-            ProviderV2.ID.make("custom-provider"),
-            ModelV2.ID.make("deepseek-test-r1"),
-          )
-          const model = { ...resolved, capabilities: { ...resolved.capabilities, interleaved: false as const } }
-          expect(model.capabilities.interleaved).toBe(false)
-          const history = distillationHistory()!
-          const annotated = {
-            ...history,
-            groups: history.groups.map((group) => ({
-              ...group,
-              parts: group.parts.map((part) => ({ ...part, canonicalEditable: true, canonicalAliasCount: 0 })),
-            })),
-          }
-          const adopted: Array<readonly { before: string; after: string }[]> = []
-          const sessionID = SessionID.make(`session-test-canonical-${accepted}`)
-          const agent = {
-            name: "test",
-            mode: "primary",
-            options: {},
-            permission: [{ permission: "*", pattern: "*", action: "allow" }],
-          } satisfies Agent.Info
-          const input: LLM.StreamInput = {
-            user: {
-              id: MessageID.make("msg_user-canonical"),
-              sessionID,
-              role: "user",
-              time: { created: Date.now() },
-              agent: agent.name,
-              model: { providerID: ProviderV2.ID.make("custom-provider"), modelID: resolved.id },
-            },
-            sessionID,
-            model,
-            agent,
-            system: [],
-            messages: distillationMessages(),
-            tools: {},
-            purpose: "conversation",
-            reasoningDistillation: annotated,
-            adoptReasoning: (replacements) =>
-              Effect.sync(() => {
-                adopted.push(replacements)
-                return accepted
-              }),
-          }
-          const ctx = yield* InstanceRef
-          if (!ctx) throw new Error("InstanceRef not provided")
-          yield* Effect.promise(() =>
-            Effect.runPromise(
-              LLM.Service.use((svc) =>
-                Effect.gen(function* () {
-                  yield* svc.distill(input)
-                }),
-              ).pipe(
-                Effect.provide(llmLayerWithExecutor(RequestExecutor.defaultLayer, { outputTokenMax: 4_096 })),
-                Effect.provideService(InstanceRef, ctx),
-              ),
-            ),
-          )
-          const organized = yield* Effect.promise(() => organize)
-          expect(organized.body.stream).not.toBe(true)
-          expect(adopted).toHaveLength(1)
-          expect(adopted[0][0]).toMatchObject({
-            before: distillationBody,
-            after: expect.stringContaining("已确认方案A。"),
+          const request = waitRequest("/chat/completions", auxiliaryTextResponse("已确认方案A。", "stop", 42))
+          const result = yield* organizeOnce("整理以下思考")
+          expect(result.organizer).toMatchObject({ transport: "engine", model: "custom-provider/deepseek-test-small" })
+          expect(result.error).toBeUndefined()
+          expect(result.output).toEqual({ text: "已确认方案A。", usageTokens: 42, finishReason: "stop" })
+          const capture = yield* Effect.promise(() => request)
+          expect(capture.body).toMatchObject({
+            model: "deepseek-test-small",
+            temperature: 0,
+            reasoning_effort: none ? "none" : "low",
           })
+          expect(capture.body.tools).toBeUndefined()
+          expect(JSON.stringify(capture.body.messages)).toContain("整理以下思考")
+          expect(state.queue).toHaveLength(0)
         }),
-      { config: () => distillationConfig("opencode-ai-sdk", { canonical: true }) },
+      { config: () => organizerConfig({ none }) },
     )
-  }
 
   it.instance(
-    "organizes multiple canonical reasoning slots with exactly one model call",
+    "the reasoning organizer never retries a failed call",
     () =>
       Effect.gen(function* () {
-        const organize = waitRequest(
-          "/chat/completions",
-          auxiliaryTextResponse(
-            JSON.stringify({
-              items: [
-                { slot: 0, text: "整理方案A" },
-                { slot: 1, text: "整理方案B" },
-              ],
-            }),
-          ),
-        )
-        const model = yield* Provider.use.getModel(
-          ProviderV2.ID.make("custom-provider"),
-          ModelV2.ID.make("deepseek-test-r1"),
-        )
-        const base = distillationHistory()!
-        const history = {
-          ...base,
-          groups: base.groups.map((group) => ({
-            ...group,
-            parts: [
-              ...group.parts,
-              {
-                ...group.parts[0],
-                partID: "prt-reasoning-second",
-                text: "反复分析方案B与风险。".repeat(8),
-              },
-            ],
-          })),
-        }
-        const adopted: Array<readonly { partID: string; before: string; after: string }[]> = []
-        yield* distillWith(
-          llmLayerWithExecutor(RequestExecutor.defaultLayer),
-          organizeInput(model, SessionID.make("session-test-organize-multiple"), history, (replacements) =>
-            Effect.sync(() => {
-              adopted.push(replacements)
-              return true
-            }),
-          ),
-        )
-        const capture = yield* Effect.promise(() => organize)
-        expect(capture.body.stream).not.toBe(true)
-        const messages: unknown = capture.body.messages
-        const prompt = Array.isArray(messages)
-          ? messages.find((message) => message?.role === "user")?.content
-          : undefined
-        if (typeof prompt !== "string") throw new Error("organization prompt is missing")
-        const sources: unknown = JSON.parse(prompt.slice(prompt.lastIndexOf("\n") + 1))
-        if (!Array.isArray(sources)) throw new Error("organization sources are missing")
-        expect(sources.map((source) => source?.slot)).toEqual([0, 1])
-        expect(adopted).toHaveLength(1)
-        expect(adopted[0].map((item) => [item.partID, item.after])).toEqual([
-          ["prt-reasoning-source", "整理方案A"],
-          ["prt-reasoning-second", "整理方案B"],
-        ])
-      }),
-    { config: () => distillationConfig("opencode-ai-sdk", { canonical: true }) },
-  )
-
-  for (const [name, response, expected] of [
-    ["all noise", auxiliaryTextResponse("<<NO_USEFUL_REASONING>>"), ""],
-    ["empty response", auxiliaryTextResponse(""), undefined],
-    ["truncated response", auxiliaryTextResponse("不完整", "length"), undefined],
-  ] as const) {
-    it.instance(
-      `single-call organization handles ${name} without corrupting original reasoning`,
-      () =>
-        Effect.gen(function* () {
-          const organize = waitRequest("/chat/completions", response)
-          const model = yield* Provider.use.getModel(
-            ProviderV2.ID.make("custom-provider"),
-            ModelV2.ID.make("deepseek-test-r1"),
-          )
-          const adopted: Array<readonly { before: string; after: string }[]> = []
-          yield* distillWith(
-            llmLayerWithExecutor(RequestExecutor.defaultLayer),
-            organizeInput(
-              model,
-              SessionID.make(`session-test-organize-${name}`),
-              distillationHistory()!,
-              (replacements) =>
-                Effect.sync(() => {
-                  adopted.push(replacements)
-                  return true
-                }),
-            ),
-          )
-          const capture = yield* Effect.promise(() => organize)
-          expect(capture.body.stream).not.toBe(true)
-          expect(adopted).toHaveLength(expected === undefined ? 0 : 1)
-          if (expected !== undefined) expect(adopted[0][0]).toMatchObject({ before: distillationBody, after: expected })
-        }),
-      { config: () => distillationConfig("opencode-ai-sdk", { canonical: true }) },
-    )
-  }
-
-  const turnInput = (model: Provider.Model, sessionID: SessionID, turn: number, adopted: unknown[][]) => {
-    const input = organizeInput(model, sessionID, distillationHistory()!, (replacements) =>
-      Effect.sync(() => {
-        adopted.push([...replacements])
-        return true
-      }),
-    )
-    return { ...input, user: { ...input.user, id: MessageID.make(`msg_user-organize-${turn}`) } }
-  }
-
-  it.instance(
-    "reconciles reservations with reported usage so a long session keeps organizing",
-    () =>
-      Effect.gen(function* () {
-        const model = yield* Provider.use.getModel(
-          ProviderV2.ID.make("custom-provider"),
-          ModelV2.ID.make("deepseek-test-r1"),
-        )
-        const sessionID = SessionID.make("session-test-organize-long")
-        const adopted: unknown[][] = []
-        // Each prompt reserves ~45k tokens; without reconciliation the 262k ceiling stopped the sixth turn.
-        const turns = Array.from({ length: 12 }, (_, index) => index + 1)
-        for (const _ of turns) void waitRequest("/chat/completions", auxiliaryTextResponse("已确认方案A。"))
-        yield* distillSequenceWith(
-          llmLayerWithExecutor(RequestExecutor.defaultLayer),
-          turns.map((turn) => turnInput(model, sessionID, turn, adopted)),
-        )
-        expect(state.queue).toHaveLength(0)
-        expect(adopted).toHaveLength(12)
-      }),
-    { config: () => distillationConfig("opencode-ai-sdk", { canonical: true }) },
-  )
-
-  it.instance(
-    "refunds failed organizer calls and pauses only after consecutive failures",
-    () =>
-      Effect.gen(function* () {
-        const model = yield* Provider.use.getModel(
-          ProviderV2.ID.make("custom-provider"),
-          ModelV2.ID.make("deepseek-test-r1"),
-        )
-        const sessionID = SessionID.make("session-test-organize-failures")
-        const adopted: unknown[][] = []
-        const unavailable = () => new Response("unavailable", { status: 503 })
-        // fail, succeed, then three consecutive failures; the sixth turn must not call the model.
-        for (const response of [
-          unavailable(),
-          auxiliaryTextResponse("已确认方案A。"),
-          unavailable(),
-          unavailable(),
-          unavailable(),
-          auxiliaryTextResponse("unexpected"),
-        ])
-          void waitRequest("/chat/completions", response)
-        yield* distillSequenceWith(
-          llmLayerWithExecutor(RequestExecutor.defaultLayer),
-          [1, 2, 3, 4, 5, 6].map((turn) => turnInput(model, sessionID, turn, adopted)),
-        )
-        expect(adopted).toHaveLength(1)
+        const failed = waitRequest("/chat/completions", new Response("unavailable", { status: 503 }))
+        void waitRequest("/chat/completions", auxiliaryTextResponse("retried"))
+        const result = yield* organizeOnce("整理以下思考")
+        yield* Effect.promise(() => failed)
+        expect(result.output).toBeUndefined()
+        expect(result.error).toBeDefined()
         expect(state.queue).toHaveLength(1)
       }),
-    { config: () => distillationConfig("opencode-ai-sdk", { canonical: true }) },
+    { config: () => organizerConfig() },
   )
 
   it.instance(
-    "stops organizing once reported usage fills the per-session reservation ceiling",
+    "aborting the organizer cancels its request",
     () =>
       Effect.gen(function* () {
-        const model = yield* Provider.use.getModel(
-          ProviderV2.ID.make("custom-provider"),
-          ModelV2.ID.make("deepseek-test-r1"),
-        )
-        const sessionID = SessionID.make("session-test-organize-ceiling")
-        const adopted: unknown[][] = []
-        // Usage equal to the output allowance never exceeds a reservation, so it is reconciled rather than
-        // paused; only the 262k session ceiling can stop later turns.
-        const turns = Array.from({ length: 12 }, (_, index) => index + 1)
-        for (const _ of turns)
-          void waitRequest(
-            "/chat/completions",
-            auxiliaryTextResponse("已确认方案A。", "stop", ReasoningDistillationPolicy.tokens.maxOutputTokens),
-          )
-        yield* distillSequenceWith(
-          llmLayerWithExecutor(RequestExecutor.defaultLayer),
-          turns.map((turn) => turnInput(model, sessionID, turn, adopted)),
-        )
-        expect(adopted.length).toBeGreaterThan(1)
-        expect(adopted.length).toBeLessThan(turns.length)
-        // No model call is made after the ceiling is reached.
-        expect(state.queue).toHaveLength(turns.length - adopted.length)
-        state.queue.length = 0
+        const controller = new AbortController()
+        const pending = waitStreamingRequest("/chat/completions")
+        const fiber = yield* organizeOnce("整理以下思考", controller.signal).pipe(Effect.forkChild)
+        yield* Effect.promise(() => pending.request)
+        controller.abort()
+        const result = yield* Fiber.join(fiber)
+        expect(result.output).toBeUndefined()
+        expect(result.error).toBeDefined()
       }),
-    { config: () => distillationConfig("opencode-ai-sdk", { canonical: true }) },
+    { config: () => organizerConfig() },
   )
 
   it.instance(
-    "aborts an interrupted organizer call and settles it before the next turn",
+    "no organizer is offered when the configured small model is unavailable",
     () =>
       Effect.gen(function* () {
-        const model = yield* Provider.use.getModel(
-          ProviderV2.ID.make("custom-provider"),
-          ModelV2.ID.make("deepseek-test-r1"),
-        )
-        const sessionID = SessionID.make("session-test-organize-interrupted")
-        const adopted: unknown[][] = []
-        const started = deferred<Capture>()
-        // The first organizer response never completes. Leading JSON whitespace keeps the connection active
-        // (no server idle timeout), so only the client abort can settle the call.
-        state.queue.push({
-          path: "/chat/completions",
-          response: (req) => {
-            let keepAlive: ReturnType<typeof setInterval> | undefined
-            return new Response(
-              new ReadableStream({
-                start(controller) {
-                  keepAlive = setInterval(() => controller.enqueue(new TextEncoder().encode(" ")), 1_000)
-                  req.signal.addEventListener("abort", () => clearInterval(keepAlive), { once: true })
-                },
-                cancel() {
-                  clearInterval(keepAlive)
-                },
-              }),
-              { headers: { "content-type": "application/json" } },
-            )
-          },
-          resolve: started.resolve,
-        })
-        void waitRequest("/chat/completions", auxiliaryTextResponse("已确认方案A。"))
-        const ctx = yield* InstanceRef
-        if (!ctx) throw new Error("InstanceRef not provided")
-        yield* Effect.promise(() =>
-          Effect.runPromise(
-            Effect.gen(function* () {
-              const svc = yield* LLM.Service
-              const fiber = yield* svc.distill(turnInput(model, sessionID, 1, adopted)).pipe(Effect.forkChild)
-              yield* Effect.promise(() => started.promise)
-              yield* Fiber.interrupt(fiber)
-              yield* svc.distill(turnInput(model, sessionID, 2, adopted))
-            }).pipe(
-              Effect.provide(llmLayerWithExecutor(RequestExecutor.defaultLayer)),
-              Effect.provideService(InstanceRef, ctx),
-            ),
-          ),
-        )
-        expect(adopted).toHaveLength(1)
-        expect(state.queue).toHaveLength(0)
-      }),
-    { config: () => distillationConfig("opencode-ai-sdk", { canonical: true }) },
-  )
-
-  it.instance(
-    "uses the configured English organizer instruction",
-    () =>
-      Effect.gen(function* () {
-        const model = yield* Provider.use.getModel(
-          ProviderV2.ID.make("custom-provider"),
-          ModelV2.ID.make("deepseek-test-r1"),
-        )
-        const organize = waitRequest("/chat/completions", auxiliaryTextResponse("Plan A confirmed."))
-        const adopted: unknown[][] = []
-        yield* distillWith(
-          llmLayerWithExecutor(RequestExecutor.defaultLayer),
-          turnInput(model, SessionID.make("session-test-organize-english"), 1, adopted),
-        )
-        const capture = yield* Effect.promise(() => organize)
-        expect(JSON.stringify(capture.body.messages)).toContain("Write all explanatory prose in English")
-        expect(adopted).toHaveLength(1)
-      }),
-    { config: () => distillationConfig("opencode-ai-sdk", { canonical: true, language: "en" }) },
-  )
-
-  it.instance(
-    "skips organization when the configured small model is unavailable",
-    () =>
-      Effect.gen(function* () {
-        const model = yield* Provider.use.getModel(
-          ProviderV2.ID.make("custom-provider"),
-          ModelV2.ID.make("deepseek-test-r1"),
-        )
-        const adopted: Array<readonly { before: string; after: string }[]> = []
         void waitRequest("/chat/completions", auxiliaryTextResponse("unexpected"))
-        yield* distillWith(
-          llmLayerWithExecutor(RequestExecutor.defaultLayer),
-          organizeInput(
-            model,
-            SessionID.make("session-test-small-model-unavailable"),
-            distillationHistory()!,
-            (replacements) =>
-              Effect.sync(() => {
-                adopted.push(replacements)
-                return true
-              }),
-          ),
-        )
-        expect(adopted).toHaveLength(0)
+        const result = yield* organizeOnce("整理以下思考")
+        expect(result.organizer).toBeUndefined()
         expect(state.queue).toHaveLength(1)
       }),
-    {
-      config: () => ({
-        ...distillationConfig("opencode-ai-sdk", { canonical: true }),
-        small_model: "custom-provider/missing",
-      }),
-    },
-  )
-
-  it.instance(
-    "a protected canonical source never falls back to a proven legacy wire rewrite",
-    () =>
-      Effect.gen(function* () {
-        const resolved = yield* Provider.use.getModel(
-          ProviderV2.ID.make("custom-provider"),
-          ModelV2.ID.make("deepseek-test-r1"),
-        )
-        expect(resolved.capabilities.interleaved).toEqual({ field: "reasoning_content" })
-        const history = distillationHistory()!
-        let adoptionCalls = 0
-        const sessionID = SessionID.make("session-test-protected-canonical")
-        const agent = {
-          name: "test",
-          mode: "primary",
-          options: {},
-          permission: [{ permission: "*", pattern: "*", action: "allow" }],
-        } satisfies Agent.Info
-        const input: LLM.StreamInput = {
-          user: {
-            id: MessageID.make("msg_user-protected-canonical"),
-            sessionID,
-            role: "user",
-            time: { created: Date.now() },
-            agent: agent.name,
-            model: { providerID: ProviderV2.ID.make("custom-provider"), modelID: resolved.id },
-          },
-          sessionID,
-          model: resolved,
-          agent,
-          system: [],
-          messages: distillationMessages(),
-          tools: {},
-          purpose: "conversation",
-          reasoningDistillation: {
-            ...history,
-            groups: history.groups.map((group) => ({
-              ...group,
-              parts: group.parts.map((part) => ({
-                ...part,
-                canonicalEditable: false,
-                canonicalProtection: "protected-carrier",
-              })),
-            })),
-          },
-          adoptReasoning: () =>
-            Effect.sync(() => {
-              adoptionCalls++
-              return true
-            }),
-        }
-        void waitRequest("/chat/completions", auxiliaryResponse({}))
-        const ctx = yield* InstanceRef
-        if (!ctx) throw new Error("InstanceRef not provided")
-        yield* Effect.promise(() =>
-          Effect.runPromise(
-            LLM.Service.use((svc) => svc.distill(input)).pipe(
-              Effect.provide(llmLayerWithExecutor(RequestExecutor.defaultLayer, { outputTokenMax: 4_096 })),
-              Effect.provideService(InstanceRef, ctx),
-            ),
-          ),
-        )
-        expect(adoptionCalls).toBe(0)
-        expect(state.queue).toHaveLength(1)
-      }),
-    { config: () => distillationConfig("opencode-ai-sdk") },
+    { config: () => organizerConfig({ small: "custom-provider/missing" }) },
   )
 
   it.instance(

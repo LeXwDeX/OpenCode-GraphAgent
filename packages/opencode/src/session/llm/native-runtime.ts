@@ -59,11 +59,6 @@ type StreamInput = {
     readonly history?: ContextFoldingHistorySnapshot
     readonly system: SystemTransmission
   }
-  readonly reasoningDistillation?: (input: {
-    readonly request: LLMRequest
-    readonly sourceMessages: readonly ModelMessage[]
-    readonly transformedMessages: readonly ModelMessage[]
-  }) => Effect.Effect<LLMRequest, never>
 }
 
 export function status(input: Pick<StreamInput, "model" | "provider" | "auth">): RuntimeStatus {
@@ -94,7 +89,7 @@ function statusWithFetch(
   }
 }
 
-export function stream(input: StreamInput): Effect.Effect<StreamResult, never> {
+export function stream(input: StreamInput): Effect.Effect<StreamResult> {
   return Effect.gen(function* () {
     const fetch = providerFetch(input)
     const current = statusWithFetch(input, fetch)
@@ -155,17 +150,10 @@ export function stream(input: StreamInput): Effect.Effect<StreamResult, never> {
             system: folding.system,
           })
         : undefined
-    const foldedRequest =
+    const request =
       projection?.applied === true
         ? LLMRequest.update(canonical, { messages: projection.request.messages as typeof canonical.messages })
         : canonical
-    const request = input.reasoningDistillation
-      ? yield* input.reasoningDistillation({
-          request: foldedRequest,
-          sourceMessages: sourceMessages ?? [],
-          transformedMessages,
-        })
-      : foldedRequest
     const stream = Stream.scoped(
       Stream.unwrap(
         Effect.gen(function* () {
@@ -221,6 +209,38 @@ export function stream(input: StreamInput): Effect.Effect<StreamResult, never> {
       stream: fetch ? stream.pipe(Stream.provideService(FetchHttpClient.Fetch, fetch)) : stream,
     }
   })
+}
+
+export type OrganizerClient =
+  | {
+      readonly type: "supported"
+      readonly llm: LLMClientShape
+      readonly model: LLMRequest["model"]
+    }
+  | { readonly type: "unsupported"; readonly reason: string }
+
+/**
+ * Engine client for a tool-less auxiliary request (the reasoning organizer) on the same native transport gate as
+ * conversation streams, independent of the experimental native-conversation flag.
+ */
+export function organizerClient(
+  input: Pick<StreamInput, "model" | "provider" | "auth" | "llmClient">,
+): OrganizerClient {
+  const fetch = providerFetch(input)
+  const current = statusWithFetch(input, fetch)
+  if (current.type === "unsupported") return current
+  const model = LLMNative.model(
+    { model: input.model, apiKey: current.apiKey, baseURL: current.baseURL, messages: [] },
+    providerHeaders(input.provider.options.headers),
+  )
+  const llm: LLMClientShape = fetch
+    ? {
+        ...input.llmClient,
+        generate: (request) =>
+          input.llmClient.generate(request).pipe(Effect.provideService(FetchHttpClient.Fetch, fetch)),
+      }
+    : input.llmClient
+  return { type: "supported", llm, model }
 }
 
 function providerFetch(input: Pick<StreamInput, "provider" | "auth">): typeof globalThis.fetch | undefined {

@@ -1,182 +1,216 @@
 import { expect, test } from "bun:test"
-import { Deferred, Effect, Exit, Scope } from "effect"
-import { makeTurnScheduler } from "../../src/session/reasoning-distillation/schedule"
+import { Deferred, Effect, Scope } from "effect"
+import { makeRewriteScheduler } from "../../src/session/reasoning-distillation/schedule"
 
-const submit = (
-  sessionID: string,
-  turnID: string,
-  work: Effect.Effect<void, unknown>,
-  enabled = Effect.succeed(true),
-) => ({
-  sessionID,
-  turnID,
-  work,
-  enabled,
-})
-
-test("first turn returns immediately; later turns serialize and duplicates are ignored", async () => {
-  await Effect.runPromise(
+const run = <A>(body: (scope: Scope.Scope) => Effect.Effect<A, unknown>) =>
+  Effect.runPromise(
     Effect.scoped(
       Effect.gen(function* () {
-        const schedule = makeTurnScheduler(yield* Scope.Scope)
-        const calls: string[] = []
-        const started = yield* Deferred.make<void>()
-        const release = yield* Deferred.make<void>()
-        const done = yield* Deferred.make<void>()
-        yield* schedule(
-          submit(
-            "s",
-            "1",
-            Effect.gen(function* () {
-              calls.push("start")
-              yield* Deferred.succeed(started, undefined)
-              yield* Deferred.await(release)
-              calls.push("end")
-            }),
-          ),
-        )
-        yield* Deferred.await(started)
-        yield* schedule(
-          submit(
-            "s",
-            "2",
-            Effect.gen(function* () {
-              calls.push("second")
-              yield* Deferred.succeed(done, undefined)
-            }),
-          ),
-        )
-        yield* schedule(
-          submit(
-            "s",
-            "2",
-            Effect.sync(() => calls.push("duplicate")),
-          ),
-        )
-        expect(calls).toEqual(["start"])
-        yield* Deferred.succeed(release, undefined)
-        yield* Deferred.await(done)
-        expect(calls).toEqual(["start", "end", "second"])
+        return yield* body(yield* Scope.Scope)
       }),
     ),
   )
-})
 
-test("background proposal and judgment can complete adoption after submission returns", async () => {
-  await Effect.runPromise(
-    Effect.scoped(
-      Effect.gen(function* () {
-        const schedule = makeTurnScheduler(yield* Scope.Scope)
-        const proposalStarted = yield* Deferred.make<void>()
-        const releaseProposal = yield* Deferred.make<void>()
-        const adopted = yield* Deferred.make<void>()
-        const phases: string[] = []
-        yield* schedule(
-          submit(
-            "s",
-            "completed-turn",
-            Effect.gen(function* () {
-              phases.push("propose")
-              yield* Deferred.succeed(proposalStarted, undefined)
-              yield* Deferred.await(releaseProposal)
-              phases.push("judge")
-              phases.push("adopt")
-              yield* Deferred.succeed(adopted, undefined)
-            }),
-          ),
-        )
-        yield* Deferred.await(proposalStarted)
-        expect(phases).toEqual(["propose"])
-        yield* Deferred.succeed(releaseProposal, undefined)
-        yield* Deferred.await(adopted)
-        expect(phases).toEqual(["propose", "judge", "adopt"])
-      }),
-    ),
-  )
-})
+const enabled = Effect.succeed(true)
 
-test("sessions proceed independently and queued work respects disable", async () => {
-  await Effect.runPromise(
-    Effect.scoped(
-      Effect.gen(function* () {
-        const schedule = makeTurnScheduler(yield* Scope.Scope)
-        let enabled = false
-        let ran = false
-        const flag = Effect.sync(() => enabled)
-        yield* schedule(
-          submit(
-            "off",
-            "1",
-            Effect.sync(() => {
-              ran = true
-            }),
-            flag,
-          ),
-        )
-        enabled = true
-        const started = yield* Deferred.make<void>()
-        const release = yield* Deferred.make<void>()
-        yield* schedule(
-          submit("a", "1", Deferred.succeed(started, undefined).pipe(Effect.andThen(Deferred.await(release))), flag),
-        )
-        yield* Deferred.await(started)
-        yield* schedule(
-          submit(
-            "a",
-            "2",
-            Effect.sync(() => {
-              ran = true
-            }),
-            flag,
-          ),
-        )
-        const other = yield* Deferred.make<void>()
-        yield* schedule(submit("b", "1", Deferred.succeed(other, undefined), flag))
-        yield* Deferred.await(other)
-        expect(ran).toBe(false)
-        enabled = false
-        yield* Deferred.succeed(release, undefined)
-        yield* Effect.yieldNow
-        expect(ran).toBe(false)
-      }),
-    ),
-  )
-})
-
-test("a failed turn leaves later work runnable", async () => {
-  await Effect.runPromise(
-    Effect.scoped(
-      Effect.gen(function* () {
-        const schedule = makeTurnScheduler(yield* Scope.Scope)
-        const done = yield* Deferred.make<void>()
-        yield* schedule(submit("s", "1", Effect.fail("auxiliary failed")))
-        yield* schedule(submit("s", "2", Deferred.succeed(done, undefined)))
-        yield* Deferred.await(done)
-      }),
-    ),
-  )
-})
-
-test("closing the service scope interrupts background work", async () => {
-  await Effect.runPromise(
+test("a barrier collects adopted results once and leaves nothing pending", () =>
+  run((scope) =>
     Effect.gen(function* () {
-      const scope = yield* Scope.make()
-      const schedule = makeTurnScheduler(scope)
+      const scheduler = makeRewriteScheduler<string>(scope, { settleMs: () => 1_000 })
+      for (const key of ["a", "b"])
+        yield* scheduler.submit({
+          sessionID: "s",
+          key,
+          enabled,
+          run: (canAdopt) => canAdopt.pipe(Effect.map((ok) => (ok ? `adopted-${key}` : undefined))),
+        })
+      expect((yield* scheduler.settle("s")).toSorted()).toEqual(["adopted-a", "adopted-b"])
+      expect(scheduler.pending("s")).toBe(0)
+      expect(yield* scheduler.settle("s")).toEqual([])
+      expect(yield* scheduler.settle("other")).toEqual([])
+    }),
+  ))
+
+test("a barrier waits for in-flight work finishing within the settle window", () =>
+  run((scope) =>
+    Effect.gen(function* () {
+      const scheduler = makeRewriteScheduler<string>(scope, { settleMs: () => 2_000 })
+      const started = yield* Deferred.make<void>()
+      yield* scheduler.submit({
+        sessionID: "s",
+        key: "a",
+        enabled,
+        run: (canAdopt) =>
+          Effect.gen(function* () {
+            yield* Deferred.succeed(started, undefined)
+            yield* Effect.sleep("30 millis")
+            return (yield* canAdopt) ? "late-but-in-window" : undefined
+          }),
+      })
+      yield* Deferred.await(started)
+      expect(yield* scheduler.settle("s")).toEqual(["late-but-in-window"])
+    }),
+  ))
+
+test("work still organizing after the window is sealed, interrupted and can never adopt", () =>
+  run((scope) =>
+    Effect.gen(function* () {
+      const scheduler = makeRewriteScheduler<string>(scope, { settleMs: () => 20 })
       const started = yield* Deferred.make<void>()
       const interrupted = yield* Deferred.make<void>()
-      yield* schedule(
-        submit(
-          "s",
-          "1",
-          Deferred.succeed(started, undefined).pipe(
-            Effect.andThen(Effect.never),
-            Effect.onInterrupt(() => Deferred.succeed(interrupted, undefined)),
-          ),
-        ),
-      )
+      let captured: Effect.Effect<boolean> | undefined
+      yield* scheduler.submit({
+        sessionID: "s",
+        key: "slow",
+        enabled,
+        run: (canAdopt) =>
+          Effect.gen(function* () {
+            captured = canAdopt
+            yield* Deferred.succeed(started, undefined)
+            yield* Effect.never
+            return "never"
+          }).pipe(Effect.onInterrupt(() => Deferred.succeed(interrupted, undefined))),
+      })
       yield* Deferred.await(started)
-      yield* Scope.close(scope, Exit.succeed(undefined))
+      const begun = performance.now()
+      expect(yield* scheduler.settle("s")).toEqual([])
+      expect(performance.now() - begun).toBeLessThan(1_000)
       yield* Deferred.await(interrupted)
+      expect(yield* captured!).toBe(false)
+      expect(scheduler.pending("s")).toBe(0)
     }),
-  )
-})
+  ))
+
+test("an adoption that passed the seal check is awaited and included", () =>
+  run((scope) =>
+    Effect.gen(function* () {
+      const scheduler = makeRewriteScheduler<string>(scope, { settleMs: () => 0 })
+      const adopting = yield* Deferred.make<void>()
+      yield* scheduler.submit({
+        sessionID: "s",
+        key: "a",
+        enabled,
+        run: (canAdopt) =>
+          Effect.gen(function* () {
+            if (!(yield* canAdopt)) return undefined
+            yield* Deferred.succeed(adopting, undefined)
+            yield* Effect.sleep("30 millis")
+            return "committed"
+          }),
+      })
+      yield* Deferred.await(adopting)
+      expect(yield* scheduler.settle("s")).toEqual(["committed"])
+    }),
+  ))
+
+test("a zero window seals pending work immediately", () =>
+  run((scope) =>
+    Effect.gen(function* () {
+      const scheduler = makeRewriteScheduler<string>(scope, { settleMs: () => 0, concurrency: 1 })
+      const release = yield* Deferred.make<void>()
+      const results: (string | undefined)[] = []
+      for (const key of ["a", "b"])
+        yield* scheduler.submit({
+          sessionID: "s",
+          key,
+          enabled,
+          run: (canAdopt) =>
+            Effect.gen(function* () {
+              yield* Deferred.await(release)
+              const value = (yield* canAdopt) ? key : undefined
+              results.push(value)
+              return value
+            }),
+        })
+      expect(yield* scheduler.settle("s")).toEqual([])
+      yield* Deferred.succeed(release, undefined)
+      yield* Effect.sleep("20 millis")
+      expect(results.every((value) => value === undefined)).toBe(true)
+    }),
+  ))
+
+test("disabled work is not scheduled and disabling later blocks adoption", () =>
+  run((scope) =>
+    Effect.gen(function* () {
+      const scheduler = makeRewriteScheduler<string>(scope, { settleMs: () => 1_000 })
+      let ran = false
+      yield* scheduler.submit({
+        sessionID: "s",
+        key: "off",
+        enabled: Effect.succeed(false),
+        run: () => Effect.sync(() => (ran = true)).pipe(Effect.as("x")),
+      })
+      expect(ran).toBe(false)
+      expect(scheduler.pending("s")).toBe(0)
+      let on = true
+      const started = yield* Deferred.make<void>()
+      const proceed = yield* Deferred.make<void>()
+      yield* scheduler.submit({
+        sessionID: "s",
+        key: "toggled",
+        enabled: Effect.sync(() => on),
+        run: (canAdopt) =>
+          Effect.gen(function* () {
+            yield* Deferred.succeed(started, undefined)
+            yield* Deferred.await(proceed)
+            return (yield* canAdopt) ? "adopted" : undefined
+          }),
+      })
+      yield* Deferred.await(started)
+      on = false
+      yield* Deferred.succeed(proceed, undefined)
+      expect(yield* scheduler.settle("s")).toEqual([])
+    }),
+  ))
+
+test("concurrency is bounded per session, duplicates are ignored and sessions are independent", () =>
+  run((scope) =>
+    Effect.gen(function* () {
+      const scheduler = makeRewriteScheduler<string>(scope, { settleMs: () => 2_000, concurrency: 2 })
+      let active = 0
+      let peak = 0
+      let calls = 0
+      const job = (sessionID: string, key: string) =>
+        scheduler.submit({
+          sessionID,
+          key,
+          enabled,
+          run: () =>
+            Effect.gen(function* () {
+              calls++
+              active++
+              peak = Math.max(peak, active)
+              yield* Effect.sleep("15 millis")
+              active--
+              return `${sessionID}:${key}`
+            }),
+        })
+      for (const key of ["a", "b", "c", "d"]) yield* job("s", key)
+      yield* job("s", "a")
+      yield* job("t", "a")
+      expect((yield* scheduler.settle("s")).toSorted()).toEqual(["s:a", "s:b", "s:c", "s:d"])
+      expect(yield* scheduler.settle("t")).toEqual(["t:a"])
+      expect(calls).toBe(5)
+      expect(peak).toBeLessThanOrEqual(3)
+    }),
+  ))
+
+test("finished work that adopted nothing is dropped without waiting for a barrier", () =>
+  run((scope) =>
+    Effect.gen(function* () {
+      const scheduler = makeRewriteScheduler<string>(scope, { settleMs: () => 1_000 })
+      const done = yield* Deferred.make<void>()
+      yield* scheduler.submit({
+        sessionID: "s",
+        key: "skipped",
+        enabled,
+        run: () => Deferred.succeed(done, undefined).pipe(Effect.as(undefined)),
+      })
+      yield* scheduler.submit({ sessionID: "s", key: "adopted", enabled, run: () => Effect.succeed("kept") })
+      yield* Deferred.await(done)
+      yield* Effect.sleep("10 millis")
+      expect(scheduler.pending("s")).toBe(1)
+      expect(yield* scheduler.settle("s")).toEqual(["kept"])
+      expect(scheduler.pending("s")).toBe(0)
+    }),
+  ))

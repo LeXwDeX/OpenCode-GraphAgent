@@ -58,6 +58,8 @@ type Input = {
   assistantMessage: SessionV1.Assistant
   sessionID: SessionID
   model: Provider.Model
+  /** Called once per reasoning part that ended normally, after it is persisted. Must not block the stream. */
+  onReasoningSettled?: (part: SessionV1.ReasoningPart) => Effect.Effect<void>
 }
 
 export interface Interface {
@@ -262,8 +264,9 @@ export const layer = Layer.effect(
         // oxlint-disable-next-line no-self-assign -- reactivity trigger
         ctx.reasoningMap[reasoningID].text = ctx.reasoningMap[reasoningID].text
         ctx.reasoningMap[reasoningID].time = { ...ctx.reasoningMap[reasoningID].time, end: Date.now() }
-        yield* session.updatePart(ctx.reasoningMap[reasoningID])
+        const settled = yield* session.updatePart(ctx.reasoningMap[reasoningID])
         delete ctx.reasoningMap[reasoningID]
+        if (input.onReasoningSettled && !ctx.assistantMessage.summary) yield* input.onReasoningSettled(settled)
       })
 
       const flushV2Fragments = Effect.fn("SessionProcessor.flushV2Fragments")(function* () {
@@ -583,7 +586,7 @@ export const layer = Layer.effect(
                     ),
                     Effect.exit,
                   )
-                : Effect.succeed(Exit.succeed<SessionV1.FilePart>(attachment)),
+                : Effect.succeed(Exit.succeed(attachment)),
             )
             const omitted = normalized.filter(Exit.isFailure).length
             const attachments = normalized.filter(Exit.isSuccess).map((item) => item.value)

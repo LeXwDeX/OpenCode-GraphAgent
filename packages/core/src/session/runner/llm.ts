@@ -1,6 +1,8 @@
-import { makeTurnScheduler } from "../reasoning-distillation/schedule"
 import { adoptReasoning } from "../reasoning-distillation/adopt"
 import { assessCanonicalReasoning } from "../reasoning-distillation/canonical"
+import { declaresNoReasoning, engineOrganizerCall } from "../reasoning-distillation/engine"
+import { makeRewriteBudget, rewriteLogFields, runReasoningRewrite } from "../reasoning-distillation/rewrite"
+import { makeRewriteScheduler } from "../reasoning-distillation/schedule"
 import {
   LLM,
   LLMClient,
@@ -43,7 +45,6 @@ import { SessionRunnerModel } from "./model"
 import { createLLMEventPublisher } from "./publish-llm-event"
 import { toLLMMessagesWithBindings } from "./to-llm-message"
 import { CoreContextFolding } from "./context-folding"
-import * as CoreReasoningDistillation from "./reasoning-distillation"
 import { MAX_STEPS_PROMPT } from "./max-steps"
 import { ToolBudget } from "../tool-budget"
 import { SessionV1 } from "../../v1/session"
@@ -133,7 +134,10 @@ export const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const scope = yield* Scope.Scope
-    const scheduleDistillation = makeTurnScheduler(scope)
+    const rewrites = makeRewriteScheduler<true>(scope, {
+      settleMs: () => Flag.OPENCODE_REASONING_DISTILLATION_SETTLE_MS,
+    })
+    const rewriteBudget = makeRewriteBudget()
     const events = yield* EventV2.Service
     const llm = yield* LLMClient.Service
     const agents = yield* AgentV2.Service
@@ -150,7 +154,6 @@ export const layer = Layer.effect(
     const db = (yield* Database.Service).db
     const configEntries = yield* config.entries()
     const compaction = SessionCompaction.make({ events, llm, config: configEntries })
-    const reasoningDistillation = CoreReasoningDistillation.make(llm)
     const resolveDynamicFolding = Effect.fnUntraced(function* () {
       let dynamic: boolean | undefined
       let prune: boolean | undefined
@@ -175,6 +178,97 @@ export const layer = Layer.effect(
 
     const getContext = Effect.fn("SessionRunner.getContext")(function* (sessionID: SessionSchema.ID) {
       return yield* store.context(sessionID)
+    })
+
+    const reasoningRewriteEnabled = Effect.suspend(() => config.entries()).pipe(
+      Effect.map(
+        (entries) =>
+          ConfigReasoningDistillation.resolveEnabled({
+            disabledByEnvironment: Flag.OPENCODE_DISABLE_REASONING_DISTILLATION,
+            enabled: Config.latest(entries, "reasoningDistillation")?.enabled,
+          }).enabled,
+      ),
+    )
+
+    // Start rewriting a reasoning part as soon as it ends, overlapping the rest of the step and its tools. The next
+    // provider request of the session settles these jobs first (see runTurnAttempt).
+    const scheduleReasoningRewrite = Effect.fnUntraced(function* (input: {
+      sessionID: SessionSchema.ID
+      messageID: SessionMessage.ID
+      reasoningID: string
+      provider: string
+    }) {
+      yield* rewrites.submit({
+        sessionID: input.sessionID,
+        key: JSON.stringify([input.messageID, input.reasoningID]),
+        enabled: reasoningRewriteEnabled,
+        run: (canAdopt) =>
+          Effect.gen(function* () {
+            const stored = yield* store.message(input.messageID)
+            const parts =
+              stored?.sessionID === input.sessionID && stored.message.type === "assistant"
+                ? stored.message.content.filter((item) => item.id === input.reasoningID)
+                : []
+            const part = parts.length === 1 && parts[0].type === "reasoning" ? parts[0] : undefined
+            if (!part) return undefined
+            const editability = assessCanonicalReasoning({
+              text: part.text,
+              metadata: part.providerMetadata,
+              settled: true,
+              distilled: part.distillation !== undefined,
+            })
+            if (!editability.editable) {
+              yield* Effect.logDebug("reasoning distillation skipped", {
+                "reasoning_distillation.runtime": "core-runner",
+                "reasoning_distillation.reason": editability.reason,
+              })
+              return undefined
+            }
+            const entries = yield* config.entries()
+            const auxiliaryModel = yield* models
+              // A declared no-reasoning variant keeps the organizer fast; otherwise it requests low effort.
+              .resolveSmall(
+                ProviderV2.ID.make(input.provider),
+                Config.latest(entries, "small_model"),
+                ModelV2.VariantID.make("none"),
+              )
+              .pipe(Effect.catch(() => Effect.succeed(undefined)))
+            const outcome = yield* runReasoningRewrite({
+              budget: rewriteBudget,
+              sessionID: input.sessionID,
+              slot: { messageID: input.messageID, partID: part.id, text: part.text },
+              language: ConfigReasoningDistillation.resolveLanguage(Config.latest(entries, "reasoningDistillation")),
+              call: auxiliaryModel
+                ? (signal) =>
+                    engineOrganizerCall({
+                      llm,
+                      model: auxiliaryModel,
+                      effort: declaresNoReasoning(auxiliaryModel) ? "default" : "low",
+                      timeoutMs: Flag.OPENCODE_REASONING_DISTILLATION_AUX_TIMEOUT_MS,
+                      signal,
+                    })
+                : undefined,
+              adopt: (replacement) =>
+                adoptReasoning({
+                  events,
+                  db,
+                  sessionID: input.sessionID,
+                  messageID: input.messageID,
+                  part,
+                  replacement,
+                  canAdopt,
+                }).pipe(Effect.map((adopted) => (adopted ? (true as const) : undefined))),
+            })
+            yield* Effect.logInfo(
+              "reasoning distillation",
+              rewriteLogFields(outcome, {
+                runtime: "core-runner",
+                ...(auxiliaryModel ? { model: String(auxiliaryModel.id) } : {}),
+              }),
+            )
+            return outcome.adopted
+          }),
+      })
     })
 
     type HistoryCursor = {
@@ -377,6 +471,9 @@ export const layer = Layer.effect(
       const system =
         initialized ?? (yield* SessionContextEpoch.prepare(db, events, loadSystemContext(agent), session.id))
       const model = yield* models.resolve(session)
+      // Send barrier: adopt finished reasoning rewrites before this request reads history; seal the rest so a part is
+      // rewritten before its first resend or never. Adoption changes earlier messages, so drop the incremental cursor.
+      if ((yield* rewrites.settle(session.id)).length > 0) cursors.delete(session.id)
       const history = yield* readHistory(session.id, system.baselineSeq)
       const entries = history.entries
       const context = entries.map((entry) => entry.message)
@@ -463,6 +560,17 @@ export const layer = Layer.effect(
               }
             }
             yield* publish(event)
+            if (event.type === "reasoning-end" && reasoningEnabled) {
+              // Persist the settled part before its rewrite job reads it.
+              yield* withPublication(batch.flush())
+              yield* scheduleReasoningRewrite({
+                sessionID: session.id,
+                messageID: yield* publisher.startAssistant(),
+                reasoningID: event.id,
+                provider: model.provider,
+              })
+              return
+            }
             if (event.type !== "tool-call" || event.providerExecuted) return
             if (!toolMaterialization) {
               yield* publish(
@@ -617,162 +725,6 @@ export const layer = Layer.effect(
           yield* withPublication(batch.flush())
           if (stream._tag === "Failure") return yield* Effect.failCause(stream.cause)
           if (settled._tag === "Failure") return yield* Effect.failCause(settled.cause)
-          const enabled = config.entries().pipe(
-            Effect.map(
-              (entries) =>
-                ConfigReasoningDistillation.resolveEnabled({
-                  disabledByEnvironment: Flag.OPENCODE_DISABLE_REASONING_DISTILLATION,
-                  enabled: Config.latest(entries, "reasoningDistillation")?.enabled,
-                }).enabled,
-            ),
-          )
-          if (!publisher.hasProviderError() && !needsContinuation && (yield* enabled)) {
-            const completed = yield* getContext(session.id)
-            const userIndex = completed.findLastIndex((message) => message.type === "user")
-            const turnID = completed[userIndex]?.id
-            if (turnID) {
-              const turnIDs = new Set(completed.slice(userIndex + 1).map((message) => message.id))
-              const latestConversion = toLLMMessagesWithBindings(completed, model, {
-                reasoningDistillationEnabled: true,
-              })
-              yield* restore(
-                scheduleDistillation({
-                  sessionID: session.id,
-                  turnID,
-                  previouslyDistilled: completed
-                    .slice(0, userIndex)
-                    .some(
-                      (message) =>
-                        message.type === "assistant" &&
-                        message.content.some((part) => part.type === "reasoning" && part.distillation !== undefined),
-                    ),
-                  enabled,
-                  work: Effect.gen(function* () {
-                    const maintenanceStarted = performance.now()
-                    const reasoningConfig = Config.latest(yield* config.entries(), "reasoningDistillation")
-                    if (!reasoningConfig) return
-                    const sources = completed
-                      .filter(
-                        (message): message is SessionMessage.Assistant =>
-                          message.type === "assistant" && turnIDs.has(message.id),
-                      )
-                      .flatMap((message) =>
-                        message.content.filter((part) => part.type === "reasoning").map((part) => ({ message, part })),
-                      )
-                    const counts = new Map<string, number>()
-                    for (const { message, part } of sources) {
-                      const key = JSON.stringify([message.id, part.id])
-                      counts.set(key, (counts.get(key) ?? 0) + 1)
-                    }
-                    const protectionReasons: Record<string, number> = {}
-                    const canonicalBindings = sources.flatMap(({ message, part }) => {
-                      const eligible = assessCanonicalReasoning({
-                        text: part.text,
-                        metadata: part.providerMetadata,
-                        settled: message.time.completed !== undefined,
-                        distilled: part.distillation !== undefined,
-                      })
-                      const reason =
-                        counts.get(JSON.stringify([message.id, part.id])) !== 1
-                          ? "non-unique-identity"
-                          : eligible.editable
-                            ? undefined
-                            : eligible.reason
-                      if (reason) protectionReasons[reason] = (protectionReasons[reason] ?? 0) + 1
-                      if (reason) return []
-                      return [
-                        {
-                          ref: { messageID: message.id, partID: part.id },
-                          bodyPath: [] as const,
-                          text: part.text,
-                          signed: false,
-                          encrypted: false,
-                          settled: true,
-                          distilled: false,
-                          aliasCount: eligible.editable ? eligible.aliasPaths.length : 0,
-                        },
-                      ]
-                    })
-                    yield* Effect.logInfo("reasoning distillation canonical selection", {
-                      "reasoning_distillation.canonical_candidates": canonicalBindings.length,
-                      "reasoning_distillation.protection_reasons": protectionReasons,
-                    })
-                    if (canonicalBindings.length === 0) {
-                      yield* Effect.logInfo("reasoning distillation skipped", {
-                        "reasoning_distillation.target": "canonical",
-                        "reasoning_distillation.skip_reason": "no-editable-canonical-source",
-                      })
-                      return
-                    }
-                    const completedRequest = LLM.updateRequest(request, { messages: latestConversion.messages })
-                    const prepared = yield* llm.prepare(completedRequest)
-                    const configuredSmall = Config.latest(yield* config.entries(), "small_model")
-                    const auxiliaryModel = yield* models
-                      // A declared no-reasoning variant keeps the organizer fast; otherwise it requests low effort.
-                      .resolveSmall(ProviderV2.ID.make(model.provider), configuredSmall, ModelV2.VariantID.make("none"))
-                      .pipe(Effect.catch(() => Effect.succeed(undefined)))
-                    if (!auxiliaryModel) {
-                      yield* Effect.logInfo("reasoning distillation skipped", {
-                        "reasoning_distillation.target": "canonical",
-                        "reasoning_distillation.skip_reason": "small-model-unavailable",
-                      })
-                      return
-                    }
-                    const distilled = yield* reasoningDistillation.distill({
-                      sessionID: session.id,
-                      variant: session.model?.variant,
-                      request: completedRequest,
-                      auxiliaryModel,
-                      prepared,
-                      sourceMessages: completed,
-                      bindings: canonicalBindings,
-                      target: "canonical",
-                      config: reasoningConfig,
-                    })
-                    const adoptStarted = performance.now()
-                    const adopted =
-                      distilled.applied &&
-                      (yield* enabled) &&
-                      (yield* adoptReasoning(
-                        events,
-                        db,
-                        session.id,
-                        completed,
-                        distilled.replacements ?? [],
-                        enabled,
-                      ).pipe(
-                        Effect.tap((adopted) =>
-                          Effect.sync(() => {
-                            if (adopted) cursors.delete(session.id)
-                          }),
-                        ),
-                      ))
-                    const adoptMs = performance.now() - adoptStarted
-                    yield* Effect.logInfo("reasoning distillation", {
-                      "reasoning_distillation.runtime": "core-runner",
-                      "reasoning_distillation.applied": adopted,
-                      "reasoning_distillation.attempted": distilled.attempted,
-                      "reasoning_distillation.skip_reason": distilled.skipReason ?? "none",
-                      "reasoning_distillation.aux_actual_tokens": distilled.usage?.actualTokens ?? 0,
-                      "reasoning_distillation.model_ms": distilled.timing?.modelMs ?? 0,
-                      "reasoning_distillation.parse_ms": distilled.timing?.parseMs ?? 0,
-                      "reasoning_distillation.collect_ms": Math.max(
-                        0,
-                        adoptStarted -
-                          maintenanceStarted -
-                          (distilled.timing?.modelMs ?? 0) -
-                          (distilled.timing?.parseMs ?? 0),
-                      ),
-                      "reasoning_distillation.adopt_ms": adoptMs,
-                      "reasoning_distillation.total_ms": performance.now() - maintenanceStarted,
-                      "reasoning_distillation.model_calls": distilled.modelCalls ?? 0,
-                      "reasoning_distillation.organize_reason": distilled.organizeReason ?? "none",
-                    })
-                  }).pipe(Effect.asVoid),
-                }),
-              )
-            }
-          }
           return { needsContinuation: !publisher.hasProviderError() && needsContinuation, step: currentStep }
         }),
       )

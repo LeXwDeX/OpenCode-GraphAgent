@@ -269,7 +269,7 @@ const snapshotFenceAgentLayer: Layer.Layer<AgentSvc.Service> = Layer.succeed(
 )
 
 type PromptLayerOptions = {
-  distill?: LLM.Interface["distill"]
+  organizer?: LLM.Interface["organizer"]
   mcpInstructions?: MCP.ServerInstructions[]
   mcpTools?: Record<string, AITool>
   processor?: "blocking"
@@ -313,12 +313,12 @@ function makePrompt(input?: PromptLayerOptions) {
         Layer.provide(RuntimeFlags.layer({ experimentalEventSystem: true, experimentalNativeLlm: true })),
       )
     : LLM.defaultLayer
-  const llmLayer = input?.distill
+  const llmLayer = input?.organizer
     ? Layer.effect(
         LLM.Service,
         Effect.gen(function* () {
           const service = yield* LLM.Service
-          return LLM.Service.of({ ...service, distill: input.distill! })
+          return LLM.Service.of({ ...service, organizer: input.organizer! })
         }),
       ).pipe(Layer.provide(baseLLM))
     : baseLLM
@@ -2263,8 +2263,8 @@ unix("Stop hard limit: a hook that always blocks is capped at MAX_STOP_CONTINUAT
     // 1 initial Stop (stop_hook_active=false) + MAX continuation Stops (true),
     // then the hard limit forces exit — no infinite loop.
     expect(stops).toHaveLength(max + 1)
-    expect(stops[0]!.stopHookActive).toBe(false)
-    for (let i = 1; i <= max; i++) expect(stops[i]!.stopHookActive).toBe(true)
+    expect(stops[0].stopHookActive).toBe(false)
+    for (let i = 1; i <= max; i++) expect(stops[i].stopHookActive).toBe(true)
   }),
 )
 
@@ -2368,8 +2368,8 @@ unix(
       // times (first with stop_hook_active=false, rest true), then the loop
       // exits — a misbehaving hook can't re-prompt the subagent forever.
       expect(subStops).toHaveLength(max)
-      expect(subStops[0]!.stopHookActive).toBe(false)
-      for (let i = 1; i < max; i++) expect(subStops[i]!.stopHookActive).toBe(true)
+      expect(subStops[0].stopHookActive).toBe(false)
+      for (let i = 1; i < max; i++) expect(subStops[i].stopHookActive).toBe(true)
     }),
   30_000,
 )
@@ -4103,7 +4103,7 @@ it.instance("subtask child inherits parent session external_directory allow", ()
 
     const kids = yield* sessions.children(chat.id)
     expect(kids).toHaveLength(1)
-    const child = kids[0]!
+    const child = kids[0]
     const rules = child.permission ?? []
     expect(rules).toEqual(
       expect.arrayContaining([{ permission: "external_directory", pattern: "/tmp/allowed/*", action: "allow" }]),
@@ -6502,161 +6502,162 @@ for (const dynamic of [false, true]) {
   )
 }
 
-let controlledDistill: LLM.Interface["distill"] = () => Effect.die("distillation fixture not configured")
-const distillationIt = testEffect(makeHttp({ distill: (input) => Effect.suspend(() => controlledDistill(input)) }))
+let controlledOrganizer: LLM.Interface["organizer"] = () => Effect.die("organizer fixture not configured")
+const distillationIt = testEffect(makeHttp({ organizer: (input) => Effect.suspend(() => controlledOrganizer(input)) }))
 
-for (const continuesBeforeAdoption of [false, true] as const)
-  distillationIt.instance(
-    `first full turn returns; background adoption ${continuesBeforeAdoption ? "rejects later-turn race" : "succeeds before later turn"}`,
-    () =>
-      Effect.gen(function* () {
-        const { llm } = yield* useServerConfig((url) => ({
-          ...providerCfg(url),
-          reasoningDistillation: { enabled: true },
-        }))
-        const prompt = yield* SessionPrompt.Service
-        const sessions = yield* Session.Service
-        const chat = yield* sessions.create({
-          title: "Pinned",
-          permission: [{ permission: "*", pattern: "*", action: "allow" }],
-        })
-        const starts = [yield* Deferred.make<void>(), yield* Deferred.make<void>()]
-        const releases = [yield* Deferred.make<void>(), yield* Deferred.make<void>()]
-        const finishes = [yield* Deferred.make<void>(), yield* Deferred.make<void>()]
-        let calls = 0
-        controlledDistill = (input) =>
-          Effect.gen(function* () {
-            const index = calls++
-            if (index > 1) return
-            expect("messages" in input).toBe(false)
-            expect(input.timing?.queued).toBeGreaterThanOrEqual(input.timing?.prepareStarted ?? Infinity)
-            const slots = input
-              .reasoningDistillation!.groups.flatMap((group) => group.parts)
-              .filter((part) => !part.distilled)
-            expect(slots).toHaveLength(1)
-            expect(slots[0].text).toBe(`original-${index}`)
-            yield* Deferred.succeed(starts[index], undefined)
-            yield* Deferred.await(releases[index])
-            expect(
-              yield* input.adoptReasoning!(
-                slots.map((slot) => ({
-                  messageID: slot.messageID,
-                  partID: slot.partID,
-                  before: slot.text,
-                  after: `distilled-${index}`,
-                })),
-              ),
-            ).toBe(index === 0 || !continuesBeforeAdoption)
-            yield* Deferred.succeed(finishes[index], undefined)
-          })
-        const send = (text: string) =>
-          prompt.prompt({ sessionID: chat.id, agent: "build", noReply: true, parts: [{ type: "text", text }] })
-        const thinking = (messages: SessionV1.WithParts[]) =>
-          messages
-            .flatMap((message) => message.parts)
-            .filter((part) => part.type === "reasoning")
-            .map((part) => part.text)
-        yield* send("first")
-        yield* llm.push(reply().reason("original-0").text("first answer").stop())
-        const first = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
-        yield* awaitWithTimeout(Deferred.await(starts[0]), "first distillation did not start")
-        const completed = yield* awaitWithTimeout(Fiber.join(first), "first turn waited for background distillation")
-        expect(completed.parts.some((part) => part.type === "reasoning" && part.text === "original-0")).toBe(true)
-        expect(thinking(yield* sessions.messages({ sessionID: chat.id }))).toEqual(["original-0"])
-        yield* Deferred.succeed(releases[0], undefined)
-        yield* awaitWithTimeout(Deferred.await(finishes[0]), "first background distillation did not finish")
-        expect(thinking(yield* sessions.messages({ sessionID: chat.id }))).toEqual(["distilled-0"])
+const longThought = (label: string) => `${label} `.repeat(60).trim()
+const organizedAs =
+  (calls: string[]): LLM.Interface["organizer"] =>
+  () =>
+    Effect.succeed({
+      transport: "engine" as const,
+      model: "test/small",
+      call:
+        () =>
+        async ({ prompt }) => {
+          const label = prompt.match(/(tool|final|next)-thinking/)?.[1] ?? "unknown"
+          calls.push(label)
+          return { text: `adopted-${label}`, finishReason: "stop" }
+        },
+    })
 
-        yield* send("second")
-        yield* llm.push(reply().reason("original-1").text("second answer").stop())
-        yield* prompt.loop({ sessionID: chat.id })
-        yield* awaitWithTimeout(Deferred.await(starts[1]), "background distillation did not start")
-        expect(thinking(yield* sessions.messages({ sessionID: chat.id }))).toEqual(["distilled-0", "original-1"])
-        if (continuesBeforeAdoption) {
-          yield* send("third while distillation is pending")
-          yield* llm.text("third answer")
-          yield* prompt.loop({ sessionID: chat.id })
-          const pendingPayload = JSON.stringify((yield* llm.hits).at(-1)?.body)
-          expect(pendingPayload).toContain("original-1")
-          expect(pendingPayload).not.toContain("distilled-1")
-        }
-        yield* Deferred.succeed(releases[1], undefined)
-        yield* awaitWithTimeout(Deferred.await(finishes[1]), "background distillation did not finish")
-        expect(thinking(yield* sessions.messages({ sessionID: chat.id }))).toEqual([
-          "distilled-0",
-          continuesBeforeAdoption ? "original-1" : "distilled-1",
-        ])
-
-        yield* send("next after background decision")
-        yield* llm.text("next answer")
-        yield* prompt.loop({ sessionID: chat.id })
-        const payload = JSON.stringify((yield* llm.hits).at(-1)?.body)
-        expect(payload).toContain("distilled-0")
-        expect(payload).not.toContain("original-0")
-        expect(payload).toContain(continuesBeforeAdoption ? "original-1" : "distilled-1")
-        expect(payload).not.toContain(continuesBeforeAdoption ? "distilled-1" : "original-1")
+const withSettleWindow = <A, E, R>(ms: string, effect: Effect.Effect<A, E, R>) =>
+  Effect.acquireUseRelease(
+    Effect.sync(() => {
+      const previous = process.env.OPENCODE_REASONING_DISTILLATION_SETTLE_MS
+      process.env.OPENCODE_REASONING_DISTILLATION_SETTLE_MS = ms
+      return previous
+    }),
+    () => effect,
+    (previous) =>
+      Effect.sync(() => {
+        if (previous === undefined) delete process.env.OPENCODE_REASONING_DISTILLATION_SETTLE_MS
+        else process.env.OPENCODE_REASONING_DISTILLATION_SETTLE_MS = previous
       }),
   )
 
-distillationIt.instance("tool steps form one distillation turn and include all newly completed reasoning slots", () =>
-  Effect.gen(function* () {
-    const { llm, dir } = yield* useServerConfig((url) => ({
-      ...providerCfg(url),
-      reasoningDistillation: { enabled: true },
-    }))
-    yield* writeText(path.join(dir, "distillation-source.txt"), "source data")
-    const prompt = yield* SessionPrompt.Service
-    const sessions = yield* Session.Service
-    const chat = yield* sessions.create({
-      title: "Pinned",
-      permission: [{ permission: "*", pattern: "*", action: "allow" }],
-    })
-    let calls = 0
-    const adopted = yield* Deferred.make<void>()
-    controlledDistill = (input) =>
-      Effect.gen(function* () {
-        calls++
-        const slots = input
-          .reasoningDistillation!.groups.flatMap((group) => group.parts)
-          .filter((part) => !part.distilled)
-        expect(slots.map((slot) => slot.text)).toEqual(["tool thinking", "final thinking"])
-        expect(
-          yield* input.adoptReasoning!(
-            slots.map((slot) => ({
-              messageID: slot.messageID,
-              partID: slot.partID,
-              before: slot.text,
-              after: `adopted ${slot.text}`,
-            })),
-          ),
-        ).toBe(true)
-        yield* Deferred.succeed(adopted, undefined)
+distillationIt.instance("each step's reasoning is rewritten before its first resend", () =>
+  withSettleWindow(
+    "10000",
+    Effect.gen(function* () {
+      const { llm, dir } = yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        reasoningDistillation: { enabled: true },
+      }))
+      yield* writeText(path.join(dir, "distillation-source.txt"), "source data")
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({
+        title: "Pinned",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
       })
-    yield* prompt.prompt({
-      sessionID: chat.id,
-      agent: "build",
-      noReply: true,
-      parts: [{ type: "text", text: "read and explain" }],
-    })
-    yield* llm.push(
-      reply()
-        .reason("tool thinking")
-        .tool("read", { filePath: path.join(dir, "distillation-source.txt") }, "read-source"),
-      reply().reason("final thinking").text("answer").stop(),
-    )
-    yield* prompt.loop({ sessionID: chat.id })
-    yield* awaitWithTimeout(Deferred.await(adopted), "tool-step distillation did not adopt")
-    expect(calls).toBe(1)
-    const parts = (yield* sessions.messages({ sessionID: chat.id })).flatMap((message) => message.parts)
-    expect(parts.filter((part) => part.type === "reasoning").map((part) => part.text)).toEqual([
-      "adopted tool thinking",
-      "adopted final thinking",
-    ])
-    expect(parts.find((part) => part.type === "tool")).toMatchObject({
-      callID: "read-source",
-      state: { status: "completed" },
-    })
-  }),
+      const calls: string[] = []
+      controlledOrganizer = organizedAs(calls)
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "read and explain" }],
+      })
+      yield* llm.push(
+        reply()
+          .reason(longThought("tool-thinking"))
+          .tool("read", { filePath: path.join(dir, "distillation-source.txt") }, "read-source"),
+        reply().reason(longThought("final-thinking")).text("answer").stop(),
+      )
+      const completed = yield* prompt.loop({ sessionID: chat.id })
+      // The tool step's reasoning is first resent by the second step, which already carries the rewrite.
+      const hits = yield* llm.hits
+      const second = JSON.stringify(hits.at(-1)?.body)
+      expect(second).toContain("adopted-tool")
+      expect(second).not.toContain("tool-thinking")
+      // The final reasoning is still pending when the turn returns; the turn did not wait for it.
+      expect(completed.parts.some((part) => part.type === "reasoning")).toBe(true)
+
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "next" }],
+      })
+      yield* llm.text("next answer")
+      yield* prompt.loop({ sessionID: chat.id })
+      const next = JSON.stringify((yield* llm.hits).at(-1)?.body)
+      expect(next).toContain("adopted-tool")
+      expect(next).toContain("adopted-final")
+      expect(next).not.toContain("thinking thinking")
+      expect(calls.toSorted()).toEqual(["final", "tool"])
+      const parts = (yield* sessions.messages({ sessionID: chat.id })).flatMap((message) => message.parts)
+      expect(parts.filter((part) => part.type === "reasoning").map((part) => part.text)).toEqual([
+        "adopted-tool",
+        "adopted-final",
+      ])
+      expect(parts.find((part) => part.type === "tool")).toMatchObject({
+        callID: "read-source",
+        state: { status: "completed" },
+      })
+    }),
+  ),
+)
+
+distillationIt.instance("a rewrite that misses the settle window is sealed and never adopted", () =>
+  withSettleWindow(
+    "50",
+    Effect.gen(function* () {
+      const { llm, dir } = yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        reasoningDistillation: { enabled: true },
+      }))
+      yield* writeText(path.join(dir, "distillation-source.txt"), "source data")
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({
+        title: "Pinned",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      const started = yield* Deferred.make<void>()
+      const cancelled = yield* Deferred.make<void>()
+      controlledOrganizer = () =>
+        Effect.succeed({
+          transport: "engine" as const,
+          model: "test/small",
+          call: (signal: AbortSignal) => () => {
+            Deferred.doneUnsafe(started, Effect.void)
+            return new Promise<undefined>((resolve) =>
+              signal.addEventListener(
+                "abort",
+                () => {
+                  Deferred.doneUnsafe(cancelled, Effect.void)
+                  resolve(undefined)
+                },
+                { once: true },
+              ),
+            )
+          },
+        })
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "read and explain" }],
+      })
+      yield* llm.push(
+        reply()
+          .reason(longThought("tool-thinking"))
+          .tool("read", { filePath: path.join(dir, "distillation-source.txt") }, "read-source"),
+        reply().text("answer").stop(),
+      )
+      yield* prompt.loop({ sessionID: chat.id })
+      expect(JSON.stringify((yield* llm.hits).at(-1)?.body)).toContain("tool-thinking")
+      // Depending on timing the job is sealed before or during its model call; a started call must be cancelled.
+      yield* Effect.sleep("100 millis")
+      if (yield* Deferred.isDone(started))
+        yield* awaitWithTimeout(Deferred.await(cancelled), "sealed organizer call was not cancelled")
+      const parts = (yield* sessions.messages({ sessionID: chat.id })).flatMap((message) => message.parts)
+      expect(parts.find((part) => part.type === "reasoning")).toMatchObject({ text: longThought("tool-thinking") })
+      expect(parts.some((part) => part.type === "reasoning" && part.distillation !== undefined)).toBe(false)
+    }),
+  ),
 )
 
 for (const command of ["new", "resume", "ordinary"] as const) {

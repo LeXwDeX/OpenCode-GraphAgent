@@ -334,7 +334,7 @@ function llm() {
     layer: Layer.succeed(
       LLM.Service,
       LLM.Service.of({
-        distill: () => Effect.void,
+        organizer: () => Effect.succeed(undefined),
         stream: (input) => {
           const item = queue.shift() ?? Stream.empty
           const stream = typeof item === "function" ? item(input) : item
