@@ -5,12 +5,12 @@
 
 # GraphAgent
 
-> A coding agent that decomposes a task into a dependency graph of child agents and drives it to completion. State is durable, crashes are recoverable, and the whole graph can be inspected and controlled from the terminal.
+> An opencode fork for long, multi-step coding work: durable DAG workflows of child agents, reasoning shaping, project memory, autonomous goals, and Claude Code–compatible hooks — all inspectable and controllable from the terminal.
 
 GraphAgent is the product name for this project; the repository is published as
 **OpenCode-GraphAgent**, a fork of the MIT-licensed
 [opencode](https://github.com/anomalyco/opencode) terminal AI agent that adds
-the DAG workflow engine. **Not affiliated with or endorsed by the OpenCode
+the DAG workflow engine and the features listed below. **Not affiliated with or endorsed by the OpenCode
 team.**
 
 > [!IMPORTANT]
@@ -25,7 +25,123 @@ team.**
 
 ---
 
-## What is the graph
+## What GraphAgent adds
+
+Everything below is developed in this fork on top of opencode. Each feature is opt-in or self-contained; the rest of
+opencode (providers, LSP, client/server, TUI/desktop/web clients) behaves as upstream.
+
+| Feature | What it does | How to use it |
+| --- | --- | --- |
+| [Reasoning shaping](#reasoning-shaping) | Reorganizes each reasoning part with a small model before the model sees it again | `reasoningDistillation.enabled` + `small_model` |
+| [DAG workflows](#dag-workflows) | Decomposes a task into a durable dependency graph of child agents | `/dag-auto`, the `workflow` tool, `.opencode/dag.jsonc` |
+| [Project Memory](#project-memory) | Keeps confirmed preferences, decisions and terminology per project | `/memory on` |
+| [Autonomous goals](#autonomous-goals-goal) | Works one durable, budgeted goal across turns, judged externally | `/goal`, `/subgoal` |
+| [Hooks](#hooks) | Claude Code–compatible lifecycle hooks | `hooks.json`, `/create-hook`, `/import-claude-hooks` |
+| [Context management](#context-management) | Folds duplicate tool output, bounds tool use, compacts long sessions | `compaction`, `maxToolCalls` |
+
+---
+
+## Reasoning shaping
+
+Thinking models send their earlier reasoning back to the provider on later steps. Long reasoning is full of restated
+requests, abandoned guesses and correction narrative, and every later request pays for it again.
+
+With reasoning shaping on, each reasoning part is handed to the configured small model **as soon as it ends**. The
+organizer keeps final facts, values, calculations, constraints, real execution results and open items; it removes
+duplicates, refuted guesses and filler; paths, commands, code, URLs, configuration keys and numbers stay verbatim. The
+rewrite runs while the step's tools execute, and the next request carries it.
+
+- **Rewrite before first resend, or never.** Before every provider request, the session waits for unfinished rewrites
+  up to a short window (`OPENCODE_REASONING_DISTILLATION_SETTLE_MS`, default 3000 ms). Anything not ready is sealed and
+  keeps its original text for good, so provider prompt-cache prefixes from earlier requests are never invalidated.
+- **Only safe carriers.** Plain reasoning and plaintext mirrors are rewritten. Signed, encrypted or referenced reasoning
+  (Anthropic thinking signatures, OpenAI encrypted reasoning, Gemini thought signatures) is never touched.
+- **Reversible.** The original text and metadata are stored with the part; turning the feature off replays originals.
+- **Engine-level.** The organizer call goes through the built-in `@opencode-ai/llm` engine with no tools, no retries and
+  `none`/`low` reasoning effort; a rewrite is adopted only if it is actually smaller.
+
+```jsonc
+// opencode.json
+{
+  "small_model": "provider/small-model", // prefer one with a `none` reasoning variant
+  "reasoningDistillation": {
+    "enabled": true,
+    "language": "zh", // organizer prose language: "zh" (default) or "en"
+  },
+}
+```
+
+`OPENCODE_DISABLE_REASONING_DISTILLATION=1` turns it off regardless of configuration;
+`OPENCODE_REASONING_DISTILLATION_AUX_TIMEOUT_MS` bounds each organizer call. Logs report every rewrite
+(`reasoning distillation`) and every sealed barrier (`reasoning rewrite sealed`).
+
+---
+
+## Project Memory
+
+Project Memory keeps durable, **user-confirmed** context for a project: preferences, decisions and terminology.
+
+- `/memory on` / `/memory off` control it. The project needs a real identity first (run `/init`); Memory stays inert
+  for uninitialized projects.
+- One Memory per project, shared by all of its worktrees. It never forks per worktree, and it moves with the project
+  when the repository gains its first remote.
+- The main session injects relevant Memory into context; `memory_search` retrieves topics on demand.
+- The controller owns persistence, limits and migration; models only propose bounded changes. Memory is not a code
+  index and never an instruction source: current user input and higher-priority instructions always win.
+- Policy lives in `.opencode/memory.jsonc`.
+
+---
+
+## Autonomous goals (`/goal`)
+
+The goal loop works one durable goal autonomously across turns of the current session; graph orchestration (below) is
+its multi-session counterpart.
+
+- Commands: `/goal <text>` sets a goal and starts the loop; `/goal status|pause|resume|done|clear|stop` controls it;
+  `/subgoal <text>|list|remove <n>|clear` manages subgoals attached to the active goal.
+- Budget: `/goal --max-turns 30 <text>` sets a positive integer total budget (default 20). `/goal resume --max-turns 50`
+  changes the total budget without resetting used turns; the new total must exceed used turns. Plain `/goal resume`
+  retains the budget and permits one more execution when exhausted.
+- Judge loop: after each turn an external judge evaluates progress — `done` clears the goal, `continue` injects the next
+  continuation turn against the turn budget (exhaustion pauses the goal; it stays resumable). The agent can
+  self-declare completion with `goal(action: "complete")`; `goal(action: "status")` inspects state.
+- Visibility: while a goal is active or paused, the system prompt carries a live goal block; the TUI sidebar shows a
+  compact goal widget; `GET /session/:sessionID/goal` exposes the state (`404` when no goal is set).
+- Durability: goal state is persisted per session, survives restarts, and is cleared when the session is deleted. Only
+  the main conversation can create or resume a goal.
+
+---
+
+## Hooks
+
+Lifecycle hooks compatible with the Claude Code hooks protocol: 26 events (`PreToolUse`, `PostToolUse`,
+`SessionStart`, `PermissionRequest`, `WorktreeCreate`, …) × 5 execution types (`command`, `mcp`, `http`, `prompt`,
+`agent`).
+
+- `hooks.json` is read from the global opencode config directory and from project/worktree `.opencode` directories,
+  merged by appending and hot-reloaded; hooks can also be registered per session over HTTP, with optional workspace-trust
+  gating.
+- Command hooks can declare `inputFormat: "claude-code"` to receive Claude Code tool names and input keys. This gives
+  naming compatibility, not full behavioral parity.
+- Claude `.claude/settings*.json` files are not loaded automatically: `/import-claude-hooks` migrates them, and
+  `/create-hook` walks through authoring a new hook.
+- Reference: [hooks guide](./packages/core/src/plugin/skill/configure-hooks.md).
+
+---
+
+## Context management
+
+- **Context folding**: repeated tool outputs are folded in the outbound request while the stored history stays
+  canonical (`compaction.dynamic`, `compaction.prune`; `OPENCODE_DISABLE_PRUNE=1` disables pruning).
+- **Bounded tool use**: tool output is size-bounded, and `maxToolCalls` caps tool calls per user input.
+- **Compaction**: automatic summarization of long sessions (`compaction.auto`, `compaction.keep.tokens`,
+  `compaction.buffer`, `compaction.max_context_tokens`).
+
+Which of these apply depends on configuration, provider support and request purpose.
+
+---
+
+## DAG workflows
 
 A workflow is a set of nodes connected by dependency edges. Each node is a real child session with its own agent and context window; an edge means the downstream node consumes the upstream node's output. Nodes run wave by wave in dependency order, so independent work executes in parallel and dependent work waits.
 
@@ -37,7 +153,7 @@ Three terms worth knowing:
 - **Wave** — the set of nodes whose dependencies are all satisfied; a wave runs in parallel up to a concurrency limit.
 - **Gate** — a node whose job is judgment (review, verification, arbitration). Gates emit verdicts (`ACCEPT` / `REVISE` / `REJECT` / `BLOCKED`) and downstream nodes can be conditioned on the verdict.
 
-## Features
+### DAG features
 
 **Orchestration**
 
@@ -59,10 +175,9 @@ Three terms worth knowing:
 - Sidebar panel with per-session progress; HTTP API mirroring every tool action (see [below](#observing--controlling)).
 - Deep mode admission: a bounded Q&A pass (1/3/5 rounds) produces a fingerprinted Requirement Brief with a `READY` / `NOT_READY` / `WAIVED` verdict before an expensive graph starts.
 
-**Beyond the graph**
+**Messaging**
 
-- Autonomous goal loop (`/goal`): one durable goal worked across turns of a single session, judged externally, budgeted and resumable.
-- Claude Code hooks compatibility (26 events × 5 execution types), CJK/IME terminal fixes, per-workflow worktree isolation, and a standalone Go configuration assistant.
+- The main agent can observe nodes of its own workflows and exchange messages with an exact current node attempt. Sending is non-blocking; messages provide context and never grant authorization or change workflow lifecycle.
 
 ## Using workflows
 
@@ -151,10 +266,11 @@ pick, and proves it by starting it once. For one-off graphs, `workflow(action="d
 takes the structured graph as tool parameters and hands back a validated
 `spec_path`, so field drift never reaches the file.
 
-Node prompts come from `.opencode/dag-prompts/*.md` — 12 templates ship
-in-repo, referenced by `prompt_template.id`. Add your own `.md` file there to
-make a new template available; a global workflow should prefer `inline` prompts
-so it does not depend on a repo-local template.
+Node prompts referenced by `prompt_template.id` resolve from the project's
+`.opencode/dag-prompts/<id>.md`, then the global `<config dir>/dag-prompts/`.
+Add your own `.md` file there to make a new template available; a global
+workflow should prefer `inline` prompts so it does not depend on a repo-local
+template.
 
 ## The engine
 
@@ -168,7 +284,7 @@ Each node declares:
 |---|---|
 | `depends_on` | Dependency edges; cycle detection and dangling-reference validation at creation |
 | `worker_type` | Which agent runs the node (`explore`, `build`, `general`, or any configured agent) |
-| `prompt_template` | Prompt by `id` (from `.opencode/dag-prompts/`, 12 templates ship in-repo) or `inline`, with `{{var}}` interpolation |
+| `prompt_template` | Prompt by `id` (from project, then global `dag-prompts/`) or `inline`, with `{{var}}` interpolation |
 | `input_mapping` | Map upstream node outputs into template variables (`"count": "node-b.output.count"`) |
 | `condition` | Expression over upstream outputs; false → node skipped, pure descendants cascade-skip |
 | `output_schema` | JSON Schema; the child agent must call `submit_result` with a matching structured payload |
@@ -234,7 +350,7 @@ Everything else inherits the main opencode configuration.
 |---|---|---|
 | `.opencode/dag.jsonc` | Model tiers (`advanced` / `standard`) and `thinking_depth` for child sessions | `<config dir>/dag.jsonc`, seeded with comments on first use |
 | `.opencode/workflows/*.yaml` | Saved workflow specs, startable by name | `<config dir>/workflows/*.yaml` |
-| `.opencode/dag-prompts/*.md` | Node prompt templates referenced by `prompt_template.id` | — (project-scoped) |
+| `.opencode/dag-prompts/*.md` | Node prompt templates referenced by `prompt_template.id` (project first) | `<config dir>/dag-prompts/*.md` |
 | `.opencode/workflow-reports/` | Node report files (auto-gitignored) | — |
 
 Both `dag.jsonc` and the workflow library are read lazily, so an edit applies to
@@ -254,27 +370,13 @@ The operating doctrine that came out of it:
 
 Why a DAG at all: a single agent loop struggles once a task has staged dependencies, parallelizable independent work, or a quality gate in the middle. Splitting decisions from volume (advanced vs. standard tiers), asking before building (deep-mode admission), gating verdicts with mandatory disposal, and recovering from evidence rather than guesses are the four judgments this engine is built on.
 
-Curated reference topologies — design decision deep-dive, parallel project delivery, deep review of an existing subsystem, compact change review — ship through the workflow library's global scope (curated by the [`opencode-dag-config`](https://github.com/LeXwDeX/opencode-dag-config) repo) and a builtin tier embedded in release binaries. See the [Graph Engineering workflow catalog](./.opencode/workflows/GRAPH-ENGINEERING.md).
-
----
-
-## Autonomous goal loop (`/goal`)
-
-Graph orchestration decomposes a task across child sessions; the goal loop is
-its single-session complement: one durable goal that the agent works toward
-autonomously across turns of the current session.
-
-- Commands: `/goal <text>` sets a goal and starts the loop; `/goal status|pause|resume|done|clear|stop` controls it; `/subgoal <text>|list|remove <n>|clear` manages subgoals attached to the active goal.
-- Budget: `/goal --max-turns 30 <text>` sets a positive integer total budget (default 20). `/goal resume --max-turns 50` changes the total budget without resetting used turns; the new total must exceed used turns. Plain `/goal resume` retains the budget and permits one more execution when exhausted.
-- Judge loop: after each turn an external judge evaluates progress — `done` clears the goal, `continue` injects the next continuation turn against a configurable turn budget (budget exhaustion pauses the goal; it stays resumable). The agent can self-declare completion with the `goal(action: "complete")` tool, which bypasses the judge; `goal(action: "status")` inspects state.
-- Visibility: while a goal is active or paused, the system prompt carries a live goal block (text, status, turns used/remaining, subgoals, last judge verdict); the TUI sidebar shows a compact goal widget; `GET /session/:sessionID/goal` exposes the state (`404` when no goal is set).
-- Durability: goal state is persisted per session (`goal_state`), survives restarts, and is cleared automatically when the session is deleted.
+Curated reference topologies — design decision deep-dive, parallel project delivery, deep review of an existing subsystem, compact change review — ship through the workflow library's global scope (curated by the [`opencode-dag-config`](https://github.com/LeXwDeX/opencode-dag-config) repo) and a builtin tier embedded in release binaries. See the [workflow library](https://github.com/LeXwDeX/opencode-dag-config) for the catalog.
 
 ---
 
 ## Other changes in this fork
 
-- **Hooks API**: Claude Code hooks protocol compatibility. 26 hook events (`PreToolUse`, `PostToolUse`, `SessionStart`, `PermissionRequest`, `WorktreeCreate`, …) × 5 execution types (`command`, `mcp`, `http`, `prompt`, `agent`), loaded from a global/project/worktree `hooks.json` chain or registered per-session over HTTP, with optional workspace-trust gating. See the [hooks reference](./packages/core/src/plugin/skill/configure-hooks.md).
+- **Delegated agents**: `task` delegates to sub-agents and continues them by `task_id`; background sub-agents with completion notifications are available behind `OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS`.
 - **Tool robustness**: JSON repair for broken multi-byte Unicode escapes in LLM output, structured validation errors with field-level hints, expanded tool docs, child-process pipe fixes.
 - **CJK & IME fixes**: corrections for Chinese/Japanese/Korean input in the terminal UI (IME composition flushing, full-width text handling), plus a Korean IME fix script under [`patches/`](./patches).
 - **Worktree isolation**: per-workflow `git worktree` isolation, with experimental sandbox-worktree HTTP endpoints.
@@ -286,14 +388,14 @@ All upstream capabilities (multi-provider, built-in LSP, client/server architect
 
 ## Install
 
-Prebuilt CLI binaries (Linux / macOS / Windows, with SHA256SUMS) are published on the [releases page](https://github.com/LeXwDeX/OpenCode-GraphAgent/releases). Builds from `main` are formal releases; builds from `dev` are prereleases.
+Prebuilt CLI binaries (Linux / macOS / Windows, with SHA256SUMS) are published on the [releases page](https://github.com/LeXwDeX/OpenCode-GraphAgent/releases). Stable releases are built from `main`; the `oc` installer selects and installs a release.
 
 Release acceptance enforces two distinct integrity boundaries:
 
 - **Archive integrity (before extraction)**: the `oc` installer verifies the release `SHA256SUMS` entry before unpacking and refuses to extract on mismatch. If upstream serves no `SHA256SUMS`, it installs with a warning (GitHub HTTPS transport only).
 - **Post-install signature validity (macOS)**: the installer clears quarantine attributes (`xattr -cr`) and ad-hoc re-signs (`codesign -fs -`); acceptance then asserts `codesign --verify` passes and the binary runs. The installed binary's hash is intentionally **not** compared to the archive payload — ad-hoc signing can rewrite the binary's bytes, so differing hashes are legitimate. No post-signature digest is published (cross-version reproducibility of codesign output has not been established, and no supported reproducibility matrix exists).
 
-From source (requires [Bun](https://bun.sh) 1.3+):
+From source (requires the [Bun](https://bun.sh) version pinned in `package.json` `packageManager` and the Node version in `.node-version`):
 
 ```bash
 bun install
@@ -327,10 +429,12 @@ Exact file boundaries are listed in [`NOTICE`](./NOTICE). The AGPL covers the DA
 ## Docs
 
 - [`docs/architecture.md`](./docs/architecture.md) — system overview, client/API boundaries, and source map
+- [`docs/reasoning-rewrite-engine-2026-10-08.md`](./docs/reasoning-rewrite-engine-2026-10-08.md) — reasoning shaping design, measurements and acceptance
+- [`packages/opencode/src/memory/CONTEXT.md`](./packages/opencode/src/memory/CONTEXT.md) — Project Memory model and invariants
+- [Hooks guide](./packages/core/src/plugin/skill/configure-hooks.md) — events, schemas and verification
 - [Saved workflow authoring guide](./packages/core/src/plugin/skill/create-dag-workflow.md) — the `create-dag-workflow` skill body
-- [Graph Engineering workflow catalog](./.opencode/workflows/GRAPH-ENGINEERING.md) — reference topologies and adaptation contracts
+- [`opencode-dag-config`](https://github.com/LeXwDeX/opencode-dag-config) — curated workflows, composable blocks and worker prompts
 - [`docs/harness-dag.md`](./docs/harness-dag.md) — deep-mode admission & review lifecycle
-- [`.opencode/dag-prompts`](./.opencode/dag-prompts) — built-in node prompt templates
 - [`AGENTS.md`](./AGENTS.md) — contribution & development guide
 
 ## Links

@@ -5,10 +5,10 @@
 
 # GraphAgent
 
-> 一个把任务拆成子智能体依赖图、并驱动它跑完的编码智能体。状态持久化，崩溃能恢复，整张图在终端里就能看、能控。
+> 面向长程、多步骤编码工作的 opencode fork：可持久化的子智能体 DAG 工作流、思考自动塑形、项目 Memory、自主目标和兼容 Claude Code 的 hooks，全部能在终端里查看和控制。
 
 GraphAgent 是本项目对外的产品名；仓库以 **OpenCode-GraphAgent** 发布，是 MIT 许可的
-[opencode](https://github.com/anomalyco/opencode) 终端 AI 智能体的 fork，在其之上加了 DAG 工作流引擎。**与 OpenCode 团队无任何隶属或背书关系。**
+[opencode](https://github.com/anomalyco/opencode) 终端 AI 智能体的 fork，在其之上加了 DAG 工作流引擎和下文列出的功能。**与 OpenCode 团队无任何隶属或背书关系。**
 
 > [!IMPORTANT]
 > **GraphAgent v1 现进入聚焦维护阶段。**维护范围限定为 DAG 配置、精选工作流模板，以及通过
@@ -19,7 +19,93 @@ GraphAgent 是本项目对外的产品名；仓库以 **OpenCode-GraphAgent** �
 
 ---
 
-## graph 是什么
+## GraphAgent 自研功能
+
+以下功能都是本 fork 在 opencode 之上自行开发的，各自可选或自成体系；opencode 的其余部分（多 Provider、LSP、客户端/服务器、TUI/桌面/Web 客户端）与上游一致。
+
+| 功能 | 作用 | 怎么用 |
+| --- | --- | --- |
+| [思考自动塑形](#思考自动塑形) | 思考内容在再次发给模型之前，先由小模型整理去噪 | `reasoningDistillation.enabled` + `small_model` |
+| [DAG 工作流](#dag-工作流) | 把任务拆成可持久化的子智能体依赖图并跑完 | `/dag-auto`、`workflow` 工具、`.opencode/dag.jsonc` |
+| [项目 Memory](#项目-memory) | 按项目保存经用户确认的偏好、决策和术语 | `/memory on` |
+| [自主目标（GOAL）](#自主目标循环goal) | 跨回合推进一个持久、有预算、外部评审的目标 | `/goal`、`/subgoal` |
+| [Hooks](#hooks) | 兼容 Claude Code 的生命周期 hooks | `hooks.json`、`/create-hook`、`/import-claude-hooks` |
+| [上下文管理](#上下文管理) | 折叠重复工具输出、限制工具调用、压缩长会话 | `compaction`、`maxToolCalls` |
+
+---
+
+## 思考自动塑形
+
+思考型模型会在后续步骤里把之前的思考内容回传给服务商。长思考里充斥着复述需求、被推翻的猜测和纠错过程，后续每次请求都要为它重复付费。
+
+开启后，每段思考**一结束**就交给配置的小模型整理：保留最终的事实、数值、计算结果、约束、真实执行结果和待办，删掉重复、已被否定的猜测和空话；路径、命令、代码、URL、配置键和数值逐字保留。整理和本步的工具执行并行进行，下一次请求就带上整理后的内容。
+
+- **要么在第一次回传前替换，要么永不替换。** 每次向模型发请求前，会话最多等待一个很短的窗口（`OPENCODE_REASONING_DISTILLATION_SETTLE_MS`，默认 3000 ms）；没整理完的部分被封存，永久保留原文，因此不会让之前请求已经写入的提示缓存前缀失效。
+- **只改安全的载体。** 只改写普通思考和明文镜像；带签名、加密或服务端引用的思考（Anthropic thinking 签名、OpenAI 加密推理、Gemini thought 签名）一律不动。
+- **可还原。** 原文和原始 metadata 随思考一起保存；关闭功能后回放的就是原文。
+- **走引擎层。** 整理请求通过内置的 `@opencode-ai/llm` 引擎发送：不带工具、不自动重试、推理档位用 `none`/`low`；只有整理结果确实更省 token 才会采用。
+
+```jsonc
+// opencode.json
+{
+  "small_model": "provider/small-model", // 建议选有 `none` 推理档位的模型
+  "reasoningDistillation": {
+    "enabled": true,
+    "language": "zh", // 整理后说明文字的语言："zh"（默认）或 "en"
+  },
+}
+```
+
+`OPENCODE_DISABLE_REASONING_DISTILLATION=1` 可以无视配置直接关闭；`OPENCODE_REASONING_DISTILLATION_AUX_TIMEOUT_MS` 限制单次整理调用的时长。日志会记录每一次整理（`reasoning distillation`）和每一次封存（`reasoning rewrite sealed`）。
+
+---
+
+## 项目 Memory
+
+项目 Memory 为一个项目保存持久的、**经用户确认的**上下文：偏好、决策和术语。
+
+- 用 `/memory on` / `/memory off` 开关。项目需要先有真实身份（执行 `/init`）；未初始化的项目里 Memory 不生效。
+- 一个项目只有一份 Memory，所有 worktree 共享，不会按 worktree 分叉；仓库第一次加上远端时 Memory 会随项目一起迁移。
+- 主会话把相关 Memory 注入上下文；`memory_search` 按需检索主题。
+- 持久化、上限和迁移由控制器负责，模型只能提出有界的修改。Memory 不是代码索引，也不是指令来源：当前用户输入和更高优先级的指令永远优先。
+- 策略配置在 `.opencode/memory.jsonc`。
+
+---
+
+## 自主目标循环（`/goal`）
+
+目标循环在当前会话里推进一个目标；下文的图编排是它的多会话对应形态：一个持久目标，智能体在当前会话里跨回合自主推进。
+
+- **命令**：`/goal <文本>` 设定目标并启动循环；`/goal status|pause|resume|done|clear|stop` 控制；`/subgoal <文本>|list|remove <n>|clear` 管理挂在当前目标下的子目标。
+- **轮次预算**：`/goal --max-turns 30 <文本>` 指定正整数总轮数（默认 20）。`/goal resume --max-turns 50` 恢复并调整总轮数，保留已用轮数，新总数必须大于已用轮数。不带参数的 `/goal resume` 保留预算，耗尽后仍可再执行一轮。
+- **评审循环**：每回合结束后由外部评审判定进展——`done` 清除目标，`continue` 注入下一轮续跑提示，受可配置的回合预算约束（预算耗尽转暂停，可随时恢复）。智能体也可以用 `goal(action: "complete")` 工具自我宣告完成（绕过评审）；`goal(action: "status")` 查询状态。
+- **可见性**：目标激活或暂停期间，系统提示里带实时目标块（目标文本、状态、已用/总回合、子目标、最近一次评审判定）；TUI 侧边栏有简洁的目标组件；`GET /session/:sessionID/goal` 暴露状态（未设目标时返回 `404`）。
+- **持久化**：目标状态按会话持久化（`goal_state`），重启不丢，会话删除时自动清除。只有主会话能创建或恢复目标。
+
+---
+
+## Hooks
+
+兼容 Claude Code hooks 协议的生命周期 hooks：26 个事件（`PreToolUse`、`PostToolUse`、`SessionStart`、`PermissionRequest`、`WorktreeCreate` 等）× 5 种执行类型（`command`、`mcp`、`http`、`prompt`、`agent`）。
+
+- `hooks.json` 从全局 opencode 配置目录和项目/worktree 的 `.opencode` 目录读取，按追加方式合并并热加载；也可以经 HTTP 按会话注册，支持可选的工作区信任门控。
+- command hook 可以声明 `inputFormat: "claude-code"`，以 Claude Code 的工具名和参数键接收输入。这提供的是命名兼容，不是完整的行为等价。
+- Claude 的 `.claude/settings*.json` 不会自动加载：用 `/import-claude-hooks` 迁移，用 `/create-hook` 引导编写新 hook。
+- 参考：[hooks 指南](./packages/core/src/plugin/skill/configure-hooks.md)。
+
+---
+
+## 上下文管理
+
+- **上下文折叠**：在发出的请求里折叠重复的工具输出，存储的历史保持原样（`compaction.dynamic`、`compaction.prune`；`OPENCODE_DISABLE_PRUNE=1` 关闭裁剪）。
+- **有界的工具使用**：工具输出有大小上限，`maxToolCalls` 限制每次用户输入的工具调用次数。
+- **压缩**：长会话自动摘要（`compaction.auto`、`compaction.keep.tokens`、`compaction.buffer`、`compaction.max_context_tokens`）。
+
+具体哪些生效取决于配置、服务商支持和请求用途。
+
+---
+
+## DAG 工作流
 
 一个工作流就是一组节点加依赖边。每个节点是一个真实的子会话，有自己的智能体和上下文窗口；一条边意味着下游节点要消费上游节点的产出。节点按依赖顺序逐波执行：能并行的并行跑，有依赖的等着。
 
@@ -31,7 +117,7 @@ GraphAgent 是本项目对外的产品名；仓库以 **OpenCode-GraphAgent** �
 - **波次（wave）**——依赖全部就绪的那批节点；一次波次内并行执行，受并发上限约束。
 - **门禁（gate）**——职责是做判断的节点（审查、验证、仲裁）。门禁输出裁定（`ACCEPT` / `REVISE` / `REJECT` / `BLOCKED`），下游节点可以基于裁定条件执行。
 
-## 特性
+### DAG 特性
 
 **编排**
 
@@ -53,10 +139,9 @@ GraphAgent 是本项目对外的产品名；仓库以 **OpenCode-GraphAgent** �
 - 侧边栏面板按会话展示进度；HTTP API 覆盖全部工具动作（见[下文](#观察与控制)）。
 - deep 模式准入：昂贵的图启动前先过一轮有界问答（1/3/5 轮），产出带指纹的 Requirement Brief，裁定只有 `READY` / `NOT_READY` / `WAIVED` 三种。
 
-**图之外**
+**消息**
 
-- 自主目标循环（`/goal`）：单会话内跨回合推进一个持久目标，外部评审、有预算、可恢复。
-- Claude Code hooks 兼容（26 事件 × 5 种执行类型）、CJK/IME 终端修复、按工作流的 worktree 隔离、独立的 Go 配置助手。
+- 主智能体可以观察自己工作流里的节点，并和某个节点的当前尝试互发消息。发送是非阻塞的；消息只提供上下文，不授予权限，也不改变工作流生命周期。
 
 ## 工作流怎么用
 
@@ -122,7 +207,7 @@ config:
 
 内置的 **`create-dag-workflow`** skill 覆盖 spec 编写：工作流库作用域、文件结构、存盘 spec 必须守的规矩（不能钉死模型、`worker_type` 必须存在、模板必需变量必须给全），以及怎么验证。说一句「把这个存成可复用的工作流」，智能体会先跟你确认阶段和门禁，把文件写进你选的作用域，再真跑一次证明它能用。临时图则用 `workflow(action="draft")`：结构化图走工具参数，返回校验过的 `spec_path`，字段漂移到不了文件。
 
-节点 prompt 来自 `.opencode/dag-prompts/*.md` —— 随仓库附带 12 个，通过 `prompt_template.id` 引用。往那儿加一个 `.md` 就多一个模板；全局工作流建议用 `inline` prompt，否则会依赖某个仓库本地的模板。
+通过 `prompt_template.id` 引用的节点 prompt 先从项目的 `.opencode/dag-prompts/<id>.md` 解析，再找全局 `<config dir>/dag-prompts/`。往那儿加一个 `.md` 就多一个模板；全局工作流建议用 `inline` prompt，否则会依赖某个仓库本地的模板。
 
 ## 引擎
 
@@ -136,7 +221,7 @@ config:
 |---|---|
 | `depends_on` | 依赖边；创建时做环检测和悬空引用校验 |
 | `worker_type` | 执行节点的智能体（`explore`、`build`、`general` 或任意已配置 agent） |
-| `prompt_template` | 通过 `id` 引用模板（`.opencode/dag-prompts/`，随仓库附带 12 个）或 `inline` 内联，支持 `{{var}}` 插值 |
+| `prompt_template` | 通过 `id` 引用模板（先项目、后全局的 `dag-prompts/`）或 `inline` 内联，支持 `{{var}}` 插值 |
 | `input_mapping` | 把上游节点输出映射为模板变量（`"count": "node-b.output.count"`） |
 | `condition` | 基于上游输出的表达式；为假则跳过节点，纯依赖它的下游级联跳过 |
 | `output_schema` | JSON Schema；子智能体必须调用 `submit_result` 提交匹配的结构化结果 |
@@ -200,7 +285,7 @@ DAG 相关的东西都放在 `.opencode/` 下，在 opencode 配置目录（`OPE
 |---|---|---|
 | `.opencode/dag.jsonc` | 模型分层（`advanced` / `standard`）与子会话 `thinking_depth` | `<配置目录>/dag.jsonc`，首次使用时生成带注释的默认文件 |
 | `.opencode/workflows/*.yaml` | 存盘的工作流 spec，可按名字启动 | `<配置目录>/workflows/*.yaml` |
-| `.opencode/dag-prompts/*.md` | 由 `prompt_template.id` 引用的节点 prompt 模板 | ——（仅项目级） |
+| `.opencode/dag-prompts/*.md` | 由 `prompt_template.id` 引用的节点 prompt 模板（项目优先） | `<配置目录>/dag-prompts/*.md` |
 | `.opencode/workflow-reports/` | 节点报告文件（自动 gitignore） | —— |
 
 `dag.jsonc` 和工作流库都是惰性读取，改完下一次启动工作流就生效，不用重启。
@@ -219,25 +304,13 @@ DAG 相关的东西都放在 `.opencode/` 下，在 opencode 配置目录（`OPE
 
 至于为什么是 DAG：任务一旦涉及分阶段依赖、可并行的独立工作，或者中间需要一道质量门禁，单智能体循环就不太够用了。决策和跑量分开（advanced/standard 分层）、建图前先问清楚（deep 准入）、门禁结论必须有下文（处置契约）、恢复靠证据不靠猜——这四个判断就是这个引擎的地基。
 
-强约束参考拓扑——设计决策深挖、并行项目落地、已完成子系统深度 Review、轻量变更审查——随工作流库分发：全局作用域由 [`opencode-dag-config`](https://github.com/LeXwDeX/opencode-dag-config) 仓库维护，正式版的二进制里还有内嵌的 builtin 层。入口见 [Graph Engineering 工作流目录](./.opencode/workflows/GRAPH-ENGINEERING.md)。
-
----
-
-## 自主目标循环（`/goal`）
-
-图编排把任务拆给多个子会话；目标循环是它的单会话互补形态：一个持久目标，智能体在当前会话里跨回合自主推进。
-
-- **命令**：`/goal <文本>` 设定目标并启动循环；`/goal status|pause|resume|done|clear|stop` 控制；`/subgoal <文本>|list|remove <n>|clear` 管理挂在当前目标下的子目标。
-- **轮次预算**：`/goal --max-turns 30 <文本>` 指定正整数总轮数（默认 20）。`/goal resume --max-turns 50` 恢复并调整总轮数，保留已用轮数，新总数必须大于已用轮数。不带参数的 `/goal resume` 保留预算，耗尽后仍可再执行一轮。
-- **评审循环**：每回合结束后由外部评审判定进展——`done` 清除目标，`continue` 注入下一轮续跑提示，受可配置的回合预算约束（预算耗尽转暂停，可随时恢复）。智能体也可以用 `goal(action: "complete")` 工具自我宣告完成（绕过评审）；`goal(action: "status")` 查询状态。
-- **可见性**：目标激活或暂停期间，系统提示里带实时目标块（目标文本、状态、已用/总回合、子目标、最近一次评审判定）；TUI 侧边栏有简洁的目标组件；`GET /session/:sessionID/goal` 暴露状态（未设目标时返回 `404`）。
-- **持久化**：目标状态按会话持久化（`goal_state`），重启不丢，会话删除时自动清除。
+强约束参考拓扑——设计决策深挖、并行项目落地、已完成子系统深度 Review、轻量变更审查——随工作流库分发：全局作用域由 [`opencode-dag-config`](https://github.com/LeXwDeX/opencode-dag-config) 仓库维护，正式版的二进制里还有内嵌的 builtin 层。目录见[工作流库](https://github.com/LeXwDeX/opencode-dag-config)。
 
 ---
 
 ## 本 fork 的其他改动
 
-- **Hooks API**：兼容 Claude Code hooks 协议，26 个 hook 事件（`PreToolUse`、`PostToolUse`、`SessionStart`、`PermissionRequest`、`WorktreeCreate` 等）× 5 种执行类型（`command`、`mcp`、`http`、`prompt`、`agent`），从全局/项目/worktree 的 `hooks.json` 链加载，也可以经 HTTP 按会话注册，支持可选的工作区信任门控。详见 [hooks 参考](./packages/core/src/plugin/skill/configure-hooks.md)。
+- **委派智能体**：`task` 把工作委派给子智能体，并可用 `task_id` 继续；带完成通知的后台子智能体需开启 `OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS`。
 - **工具健壮性**：修复 LLM 输出里损坏的多字节 Unicode 转义（JSON 修复），校验错误带字段级提示，工具文档扩充，子进程管道修复。
 - **CJK 与 IME 修复**：终端 UI 里中日韩文输入的修正（IME 组字刷新、全角文本处理），另有 [`patches/`](./patches) 下的韩文 IME 修复脚本。
 - **Worktree 隔离**：按工作流的 `git worktree` 隔离，附实验性的 sandbox-worktree HTTP 端点。
@@ -249,14 +322,14 @@ DAG 相关的东西都放在 `.opencode/` 下，在 opencode 配置目录（`OPE
 
 ## 安装
 
-预构建 CLI 二进制（Linux / macOS / Windows，附 SHA256SUMS）发布在 [releases 页面](https://github.com/LeXwDeX/OpenCode-GraphAgent/releases)。从 `main` 构建的是正式版；从 `dev` 构建的是预发布版。
+预构建 CLI 二进制（Linux / macOS / Windows，附 SHA256SUMS）发布在 [releases 页面](https://github.com/LeXwDeX/OpenCode-GraphAgent/releases)。正式版从 `main` 构建；`oc` 安装器负责选择并安装版本。
 
 发布验收维护两条相互独立的完整性边界：
 
 - **归档完整性（解包前）**：`oc` 安装器在解包前校验 release 的 `SHA256SUMS` 条目，不匹配则拒绝解包。若上游未提供 `SHA256SUMS`，则告警后继续安装（仅依赖 GitHub HTTPS 传输安全）。
 - **安装后签名有效性（macOS）**：安装器清除 quarantine 属性（`xattr -cr`）并做 ad-hoc 重签名（`codesign -fs -`），验收断言 `codesign --verify` 通过且二进制可执行。安装后的二进制 hash **有意**不与归档 payload 对比——ad-hoc 签名可能改写二进制字节，两者 hash 即使不同也属正常。也不发布签名后 digest（codesign 输出的跨版本可复现性尚未确立，亦无受支持的可复现性矩阵）。
 
-从源码构建（需要 [Bun](https://bun.sh) 1.3+）：
+从源码构建（需要 `package.json` 中 `packageManager` 固定的 [Bun](https://bun.sh) 版本，以及 `.node-version` 指定的 Node 版本）：
 
 ```bash
 bun install
@@ -290,10 +363,12 @@ bun dev serve        # headless API 服务（端口 4096）
 ## 文档
 
 - [`docs/architecture.md`](./docs/architecture.md) —— 系统总览、客户端/API 边界与源码索引
+- [`docs/reasoning-rewrite-engine-2026-10-08.md`](./docs/reasoning-rewrite-engine-2026-10-08.md) —— 思考自动塑形的设计、测量与验收
+- [`packages/opencode/src/memory/CONTEXT.md`](./packages/opencode/src/memory/CONTEXT.md) —— 项目 Memory 的模型与不变量
+- [hooks 指南](./packages/core/src/plugin/skill/configure-hooks.md) —— 事件、schema 与验证方法
 - [存盘工作流编写指南](./packages/core/src/plugin/skill/create-dag-workflow.md) —— `create-dag-workflow` skill 正文
-- [Graph Engineering 工作流目录](./.opencode/workflows/GRAPH-ENGINEERING.md) —— 参考拓扑与自适应协议
+- [`opencode-dag-config`](https://github.com/LeXwDeX/opencode-dag-config) —— 精选工作流、可组合块与 worker prompt
 - [`docs/harness-dag.md`](./docs/harness-dag.md) —— deep 模式准入与审查生命周期
-- [`.opencode/dag-prompts`](./.opencode/dag-prompts) —— 内置节点 prompt 模板
 - [`AGENTS.md`](./AGENTS.md) —— 贡献与开发指南
 
 ## 链接
