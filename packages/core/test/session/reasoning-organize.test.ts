@@ -37,6 +37,8 @@ describe("single-part reasoning organizer", () => {
     expect(result.usageTokens).toBe(12)
     expect(prompt).toContain("整理后的说明文字一律用中文")
     expect(prompt).toContain("文件路径、命令、符号、代码、URL、配置键、版本号和数值逐字保留")
+    expect(prompt).toContain("有依据的排除不是被否定的猜测")
+    expect(prompt).toContain("已排除的假设及其依据、已检查的位置及结果（包括“未发现”）、已确认的指代")
     expect(prompt).toContain(text)
     expect(prompt).not.toContain("m1")
     expect(prompt).not.toContain('"items"')
@@ -55,6 +57,10 @@ describe("single-part reasoning organizer", () => {
       },
     })
     expect(prompt).toContain("Write all explanatory prose in English")
+    expect(prompt).toContain("An exclusion backed by evidence is not a refuted guess")
+    expect(prompt).toContain(
+      'keep excluded hypotheses with their evidence, checked locations with their results (including "nothing found") and confirmed references',
+    )
     expect(prompt).toContain(NO_USEFUL_REASONING)
     expect(prompt).not.toContain("一律用中文")
   })
