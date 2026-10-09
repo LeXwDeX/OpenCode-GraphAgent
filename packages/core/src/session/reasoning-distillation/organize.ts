@@ -14,6 +14,8 @@ export type OrganizeReason =
   | "below-minimum"
   | "work-limit"
   | "invalid-output"
+  /** The model declared the part noise, but the source carries concrete content. */
+  | "rejected-noise-verdict"
   | "truncated"
   | "model-failure"
   | "unchanged"
@@ -51,6 +53,25 @@ export const NO_USEFUL_REASONING_TEXT: Readonly<Record<OrganizeLanguage, string>
   zh: "（无有效推理）",
   en: "(no useful reasoning)",
 }
+
+const CONCRETE_CONTENT = [
+  /\p{Nd}/u, // digits, including full-width
+  /[a-z][a-z0-9+.-]*:\/\//i, // URLs
+  /[\w.~-]\/[\w.-]|(?:^|\s)\/[\w.-]|[A-Za-z]:\\|\w\\\w/, // paths
+  /\b[\w-]+\.[A-Za-z]\w{0,7}\b/, // file names and dotted symbols
+  /`[^`\n]+`/, // code spans
+  /\b[a-z]+[A-Z]\w*|\b[A-Z][a-z0-9]+[A-Z]\w*|\b\w+_\w+|\b[A-Z]{2,}\b|\w\(|\w\s*=/, // identifiers, calls, assignments
+  /\p{Script=Han}[\s\p{P}]*[A-Za-z]|[A-Za-z][\s\p{P}]*\p{Script=Han}/u, // Latin names inside CJK text
+  /下一步|待办|决定|结论|确认|已完成|未完成|尚未|必须|不得|禁止|只读|排除|否决|回滚|失败|成功|根因/,
+  /\b(?:next step|to-?do|decided|decision|conclusion|confirmed|must|ruled out|excluded|rejected|rolled back|failed|succeeded|root cause|read-only|not yet|pending)\b/i,
+]
+
+/**
+ * Whether reasoning carries anything a noise verdict could destroy: digits, URLs, paths, file names, code spans,
+ * identifiers, Latin names inside CJK text, or explicit decision, to-do and state markers. Deliberately broad: a false
+ * positive only keeps a filler part unorganized, while a false negative would let the placeholder replace content.
+ */
+export const carriesConcreteContent = (text: string) => CONCRETE_CONTENT.some((pattern) => pattern.test(text))
 
 export const organizePrompt = (text: string, language: OrganizeLanguage = "zh") =>
   `${ORGANIZE_INSTRUCTIONS[language]}\n${OUTPUT_FORMAT[language]}\n${text}`
@@ -100,6 +121,10 @@ export async function organizeReasoning(
   parseMs = performance.now() - parseStarted
   // Only the explicit marker may declare a part noise; an empty body is a model failure, not a noise verdict.
   if (!raw) return skipped("invalid-output")
+  // A marker mixed with other text is neither a verdict nor a clean body; adopting it would store the marker.
+  if (raw !== NO_USEFUL_REASONING && raw.includes(NO_USEFUL_REASONING)) return skipped("invalid-output")
+  // Small models return the marker for informative parts, so the verdict is trusted only for contentless input.
+  if (raw === NO_USEFUL_REASONING && carriesConcreteContent(slot.text)) return skipped("rejected-noise-verdict")
   const after = raw === NO_USEFUL_REASONING ? NO_USEFUL_REASONING_TEXT[language] : raw
   if (after === slot.text) return skipped("unchanged")
   // Source and rewrite may use different scripts (English reasoning, Chinese prose), so compare unbiased estimates.
