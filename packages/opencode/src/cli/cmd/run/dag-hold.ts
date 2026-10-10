@@ -8,7 +8,7 @@
 // exits and the eventual wake reply is silently lost. The durable dag.* events
 // are not on the client wire and `wake_reported` is not part of the
 // dag.bySession DTO, so the consumer cannot subscribe to completion — it can
-// only poll. This module is that poll: a pure three-condition break rule plus a
+// only poll. This module is that poll: a pure four-condition break rule plus a
 // thin wrapper the run loop calls on the busy/idle transitions it already
 // observes.
 //
@@ -31,20 +31,30 @@
 //   3. every id in poll(now) was already known (a first-seen workflow id means
 //      a wake for it may still be in flight — covers workflows that
 //      terminalize within turn one and chained DAGs started during a wake turn)
+//   4. every completed final-response workflow has its answer receipt in the
+//      parent transcript and a newly delivered answer has been emitted by this
+//      run (multiple completions may be delivered separately)
 //
-// Degradation is deliberately silent and matches pre-614 behavior:
-//   - a poll failure at idle breaks the loop (today's exit, no error surfaced)
+// Degradation is deliberately silent and matches pre-614 behavior for the DAG
+// list itself:
+//   - a DAG list failure at idle breaks the loop (today's exit, no error surfaced)
 //   - a poll failure while busy leaves the state untouched
+// A report receipt read failure stays pending, since breaking could hide a
+// completed workflow's answer from the parent transcript.
 // Paused and stepping workflows are not active statuses, so they never hold the
 // loop open by themselves — the CLI exits as it does today once quiescent and
 // known. There is no timer and no reconnect: an engine stall is bounded by the
 // engine watchdog, and a visible hang is accepted over silent wake loss.
 
 import type { OpencodeClient } from "@opencode-ai/sdk/v2"
+import { reportIdentity } from "@/dag/report-identity"
+import { isRecord } from "@/util/record"
 
 export type DagWorkflowSnapshot = {
   readonly id: string
   readonly status: string
+  /** The completion episode still lacks its parent answer receipt. */
+  readonly awaitingReport?: boolean
 }
 
 export type DagHoldDecision = "hold" | "break"
@@ -90,8 +100,9 @@ export function observeDagHoldBusy(state: DagHoldState, snapshot: readonly DagWo
  * adds it right after. */
 export function applyDagHoldSnapshot(state: DagHoldState, snapshot: readonly DagWorkflowSnapshot[]): DagHoldDecision {
   const active = snapshot.some((workflow) => isDagActiveStatus(workflow.status))
+  const awaitingReport = snapshot.some((workflow) => workflow.awaitingReport === true)
   const known = snapshot.every((workflow) => state.busyIds.has(workflow.id))
-  const decision: DagHoldDecision = !active && !state.busyActive && known ? "break" : "hold"
+  const decision: DagHoldDecision = !active && !state.busyActive && known && !awaitingReport ? "break" : "hold"
   state.inTurn = false
   foldSnapshot(state, snapshot)
   return decision
@@ -106,10 +117,25 @@ export type DagHold = {
   /** session.status=idle for the target session: poll and decide. A failed
    * poll breaks — exactly the pre-614 exit, silently. */
   readonly onIdle: () => Promise<DagHoldDecision>
+  /** Record a finished answer text part after this run emits it to the user. */
+  readonly onText: (part: {
+    id: string
+    sessionID: string
+    messageID: string
+    text?: string
+    metadata?: Record<string, unknown>
+  }) => void
+  /** The current command/prompt user message entered this event stream. */
+  readonly onUserMessage: (messageID: string) => void
 }
 
-export function createDagHold(poll: DagHoldPoll): DagHold {
+export function createDagHold(
+  poll: DagHoldPoll,
+  onText: DagHold["onText"] = () => {},
+  requestedMessageID?: string,
+): DagHold {
   const state = initialDagHoldState()
+  let requestObserved = requestedMessageID === undefined
   return {
     onBusy: async () => {
       const snapshot = await poll().catch(() => undefined)
@@ -117,22 +143,134 @@ export function createDagHold(poll: DagHoldPoll): DagHold {
     },
     onIdle: async () => {
       const snapshot = await poll().catch(() => undefined)
-      if (!snapshot) return "break"
-      return applyDagHoldSnapshot(state, snapshot)
+      const decision = snapshot ? applyDagHoldSnapshot(state, snapshot) : "break"
+      return requestObserved ? decision : "hold"
+    },
+    onText,
+    onUserMessage: (messageID) => {
+      if (messageID === requestedMessageID) requestObserved = true
     },
   }
 }
 
+function finalResponseConfig(raw: string): boolean {
+  try {
+    const parsed: unknown = JSON.parse(raw)
+    return isRecord(parsed) && parsed.result_protocol === "final_response"
+  } catch {
+    return false
+  }
+}
+
+type ReportObservation = {
+  readonly baseline: ReadonlySet<string>
+  readonly emitted: ReadonlySet<string>
+}
+
+function episodeKey(sessionID: string, workflowID: string, seq: number): string {
+  return JSON.stringify([sessionID, workflowID, seq])
+}
+
+function answerKey(sessionID: string, messageID: string, partID: string, workflowID: string, seq: number): string {
+  return JSON.stringify([sessionID, messageID, partID, workflowID, seq])
+}
+
+function answerWasEmitted(part: Parameters<DagHold["onText"]>[0]): string | undefined {
+  if (!isRecord(part.metadata)) return undefined
+  const delivery = part.metadata.dag_delivery
+  if (!isRecord(delivery) || delivery.kind !== "answer") return undefined
+  if (typeof delivery.workflow_id !== "string" || typeof delivery.completion_seq !== "number") return undefined
+  return answerKey(part.sessionID, part.messageID, part.id, delivery.workflow_id, delivery.completion_seq)
+}
+
 /** Poll implementation over the in-process SDK client (GET /dag/session/:id —
- * session-scoped, project-ownership enforced server-side). Any failure maps to
- * undefined so the wrapper degrades silently. */
+ * session-scoped, project-ownership enforced server-side). A completed final
+ * response remains pending until its exact answer receipt is visible. */
 export async function dagWorkflowsBySession(
   client: OpencodeClient,
   sessionID: string,
+  verifiedReceipts: Set<string> = new Set(),
+  observation?: ReportObservation,
 ): Promise<readonly DagWorkflowSnapshot[] | undefined> {
   const response = await client.dag.bySession({ sessionID })
   if (response.error) return undefined
-  return (response.data ?? []).map((workflow) => ({ id: workflow.id, status: workflow.status }))
+  return Promise.all(
+    (response.data ?? []).map(async (workflow): Promise<DagWorkflowSnapshot> => {
+      const basic = { id: workflow.id, status: workflow.status }
+      if (workflow.status !== "completed" || !finalResponseConfig(workflow.config)) return basic
+      if (typeof workflow.seq !== "number" || !Number.isSafeInteger(workflow.seq))
+        return { ...basic, awaitingReport: true }
+      const seq = workflow.seq
+      if (typeof workflow.time_updated !== "number" || !Number.isFinite(workflow.time_updated))
+        return { ...basic, awaitingReport: true }
+      const completedAt = workflow.completed_at
+      if (completedAt !== undefined && (typeof completedAt !== "number" || !Number.isFinite(completedAt)))
+        return { ...basic, awaitingReport: true }
+      const identity = reportIdentity({
+        sessionId: sessionID,
+        id: workflow.id,
+        seq,
+        completedAt: completedAt ?? null,
+        timeUpdated: workflow.time_updated,
+      })
+      const episode = episodeKey(sessionID, workflow.id, seq)
+      const awaitingEmission = () =>
+        observation !== undefined &&
+        !observation.baseline.has(episode) &&
+        !observation.emitted.has(answerKey(sessionID, identity.messageID, identity.answerID, workflow.id, seq))
+      if (verifiedReceipts.has(episode)) return { ...basic, awaitingReport: awaitingEmission() }
+      try {
+        const receipt = await client.session.message({ sessionID, messageID: identity.messageID })
+        const found =
+          !receipt.error &&
+          receipt.data?.info.id === identity.messageID &&
+          receipt.data.parts.some((part) => {
+            if (part.type !== "text" || part.id !== identity.answerID || !isRecord(part.metadata)) return false
+            const delivery = part.metadata.dag_delivery
+            return (
+              isRecord(delivery) &&
+              delivery.workflow_id === workflow.id &&
+              delivery.completion_seq === seq &&
+              delivery.kind === "answer"
+            )
+          })
+        if (found) verifiedReceipts.add(episode)
+        return { ...basic, awaitingReport: !found || awaitingEmission() }
+      } catch {
+        return { ...basic, awaitingReport: true }
+      }
+    }),
+  )
+}
+
+/** Cache only verified receipts for this one CLI run. New completion seqs are
+ * still read, while historic completions cost one read at most. */
+export function makeDagWorkflowPoll(client: OpencodeClient, sessionID: string): DagHoldPoll {
+  const verifiedReceipts = new Set<string>()
+  return () => dagWorkflowsBySession(client, sessionID, verifiedReceipts)
+}
+
+/** Subscribe first, then await this baseline before starting the prompt. A
+ * historic answer already present at startup need not be replayed by the
+ * current stream; every later completion must both persist and be emitted. */
+export async function createDagRunHold(
+  client: OpencodeClient,
+  sessionID: string,
+  requestedMessageID?: string,
+): Promise<DagHold> {
+  const verifiedReceipts = new Set<string>()
+  await dagWorkflowsBySession(client, sessionID, verifiedReceipts).catch(() => undefined)
+  const baseline = new Set(verifiedReceipts)
+  const emitted = new Set<string>()
+  const poll = () => dagWorkflowsBySession(client, sessionID, verifiedReceipts, { baseline, emitted })
+  return createDagHold(
+    poll,
+    (part) => {
+      const key = answerWasEmitted(part)
+      if (key) emitted.add(key)
+    },
+    requestedMessageID,
+  )
 }
 
 export * as DagHold from "./dag-hold"

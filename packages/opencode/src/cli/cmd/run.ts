@@ -26,6 +26,7 @@ import { createOpencodeClient, type OpencodeClient, type ToolPart } from "@openc
 import { FormatError, FormatUnknownError } from "../error"
 import { INTERACTIVE_INPUT_ERROR, resolveInteractiveStdin } from "./run/runtime.stdin"
 import { DagHold } from "./run/dag-hold"
+import { MessageID } from "@/session/schema"
 
 type ModelInput = Parameters<OpencodeClient["session"]["prompt"]>[0]["model"]
 
@@ -678,16 +679,26 @@ export const RunCommand = effectCmd({
         // to stdout/UI. `client` is passed explicitly because attach mode may
         // rebind the SDK to the session's directory after the subscription is
         // created, and replies issued from inside the loop must use that client.
-        async function loop(client: OpencodeClient, events: Awaited<ReturnType<typeof sdk.event.subscribe>>) {
+        async function loop(
+          client: OpencodeClient,
+          events: Awaited<ReturnType<typeof sdk.event.subscribe>>,
+          dagHold?: DagHold.DagHold,
+        ) {
           const toggles = new Map<string, boolean>()
           let error: string | undefined
           // Issue 614: consumer-only DAG hold. Poll dag.bySession on the
           // busy/idle transitions of the target session and keep consuming
           // events while a session workflow may still owe a wake turn. Attach
           // mode keeps today's break-on-first-idle exit.
-          const dagHold = args.attach ? undefined : DagHold.createDagHold(() => DagHold.dagWorkflowsBySession(client, sessionID))
 
           for await (const event of events.stream) {
+            if (
+              event.type === "message.updated" &&
+              event.properties.sessionID === sessionID &&
+              event.properties.info.role === "user" &&
+              dagHold
+            )
+              dagHold.onUserMessage(event.properties.info.id)
             if (
               event.type === "message.updated" &&
               event.properties.sessionID === sessionID &&
@@ -735,16 +746,26 @@ export const RunCommand = effectCmd({
               }
 
               if (part.type === "text" && part.time?.end) {
-                if (emit("text", { part })) continue
+                if (emit("text", { part })) {
+                  dagHold?.onText(part)
+                  continue
+                }
                 const text = part.text.trim()
-                if (!text) continue
+                if (!text) {
+                  // Empty final answers are intentionally not printed, but
+                  // their event still crossed this consumer boundary.
+                  dagHold?.onText(part)
+                  continue
+                }
                 if (!process.stdout.isTTY) {
                   process.stdout.write(text + EOL)
+                  dagHold?.onText(part)
                   continue
                 }
                 UI.empty()
                 UI.println(text)
                 UI.empty()
+                dagHold?.onText(part)
               }
 
               if (part.type === "reasoning" && part.time?.end && thinking) {
@@ -778,9 +799,7 @@ export const RunCommand = effectCmd({
               if (event.properties.status.type === "busy") {
                 await dagHold?.onBusy()
               }
-              if (event.properties.status.type === "idle" && (await dagHold?.onIdle()) !== "hold") {
-                break
-              }
+              if (event.properties.status.type === "idle" && (await dagHold?.onIdle()) !== "hold") break
             }
 
             if (event.type === "permission.asked") {
@@ -817,7 +836,11 @@ export const RunCommand = effectCmd({
 
         if (!interactive) {
           const events = await client.event.subscribe()
-          const completed = loop(client, events).catch((e) => {
+          const requestedMessageID = args.attach ? undefined : MessageID.ascending()
+          const dagHold = args.attach
+            ? undefined
+            : await DagHold.createDagRunHold(client, sessionID, requestedMessageID)
+          const completed = loop(client, events, dagHold).catch((e) => {
             console.error(e)
             process.exitCode = 1
           })
@@ -830,6 +853,7 @@ export const RunCommand = effectCmd({
           if (args.command) {
             const result = await client.session.command({
               sessionID,
+              messageID: requestedMessageID,
               agent,
               model: args.model,
               command: args.command,
@@ -848,6 +872,7 @@ export const RunCommand = effectCmd({
           const model = pick(args.model)
           const result = await client.session.prompt({
             sessionID,
+            messageID: requestedMessageID,
             agent,
             model,
             variant: args.variant,
