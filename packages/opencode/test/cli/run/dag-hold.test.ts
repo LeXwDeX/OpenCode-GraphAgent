@@ -1,8 +1,11 @@
+// oxlint-disable typescript-eslint/no-unsafe-type-assertion -- The SDK mock exposes only the two read endpoints used by this consumer.
 // Unit tests for the consumer-only DAG hold decision rule (issue 614).
 // Table-driven over the busy/idle event orderings the run loop feeds the
 // wrapper: each row is one CLI run's poll sequence with the expected idle
 // decisions. Real-CLI lifecycle coverage lives in run-dag-hold-process.test.ts.
 import { describe, expect, test } from "bun:test"
+import type { OpencodeClient } from "@opencode-ai/sdk/v2"
+import { reportIdentity } from "@/dag/report-identity"
 import { DagHold } from "../../../src/cli/cmd/run/dag-hold"
 
 type Snapshot = readonly DagHold.DagWorkflowSnapshot[]
@@ -39,7 +42,11 @@ function drive(steps: readonly Step[]): Promise<DagHold.DagHoldDecision[]> {
   })()
 }
 
-const wf = (id: string, status: string): DagHold.DagWorkflowSnapshot => ({ id, status })
+const wf = (id: string, status: string, awaitingReport = false): DagHold.DagWorkflowSnapshot => ({
+  id,
+  status,
+  awaitingReport,
+})
 
 describe("dag hold decision rule (issue 614)", () => {
   test("table: every busy/idle ordering resolves to the adjudicated hold/break sequence", async () => {
@@ -136,6 +143,40 @@ describe("dag hold decision rule (issue 614)", () => {
         ],
       },
       {
+        // One delivered report does not discharge a second completed workflow.
+        name: "two completed workflows wait for both answer receipts",
+        steps: [
+          { event: "busy", snapshot: [wf("W1", "completed", true), wf("W2", "completed", true)] },
+          { event: "idle", snapshot: [wf("W1", "completed", true), wf("W2", "completed", true)], expect: "hold" },
+          { event: "busy", snapshot: [wf("W1", "completed"), wf("W2", "completed", true)] },
+          { event: "idle", snapshot: [wf("W1", "completed"), wf("W2", "completed", true)], expect: "hold" },
+          { event: "busy", snapshot: [wf("W1", "completed"), wf("W2", "completed")] },
+          { event: "idle", snapshot: [wf("W1", "completed"), wf("W2", "completed")], expect: "break" },
+        ],
+      },
+      {
+        // Paused work is actionable but not active; it must not mask an owed
+        // answer from another completed final-response workflow.
+        name: "completed report remains held beside paused actionable work",
+        steps: [
+          { event: "busy", snapshot: [wf("done", "completed", true), wf("paused", "paused")] },
+          { event: "idle", snapshot: [wf("done", "completed", true), wf("paused", "paused")], expect: "hold" },
+          { event: "busy", snapshot: [wf("done", "completed"), wf("paused", "paused")] },
+          { event: "idle", snapshot: [wf("done", "completed"), wf("paused", "paused")], expect: "break" },
+        ],
+      },
+      {
+        name: "new completion waits after an older report is already delivered",
+        steps: [
+          { event: "busy", snapshot: [wf("old", "completed"), wf("new", "running")] },
+          { event: "idle", snapshot: [wf("old", "completed"), wf("new", "running")], expect: "hold" },
+          { event: "busy", snapshot: [wf("old", "completed"), wf("new", "completed", true)] },
+          { event: "idle", snapshot: [wf("old", "completed"), wf("new", "completed", true)], expect: "hold" },
+          { event: "busy", snapshot: [wf("old", "completed"), wf("new", "completed")] },
+          { event: "idle", snapshot: [wf("old", "completed"), wf("new", "completed")], expect: "break" },
+        ],
+      },
+      {
         // Paused workflows are not active: after the pause wake turn the loop
         // exits as it did before the hold existed.
         name: "paused holds once for the pause wake, then breaks as today",
@@ -204,6 +245,16 @@ describe("dag hold decision rule (issue 614)", () => {
     expect(decisions).toEqual(["break"])
   })
 
+  test("queued pre-prompt idle cannot end the run before its exact user message is observed", async () => {
+    const hold = DagHold.createDagHold(async () => [], undefined, "msg_current")
+    await hold.onBusy()
+    expect(await hold.onIdle()).toBe("hold")
+    hold.onUserMessage("msg_older")
+    expect(await hold.onIdle()).toBe("hold")
+    hold.onUserMessage("msg_current")
+    expect(await hold.onIdle()).toBe("break")
+  })
+
   test("pure helpers: active statuses, turn reset, and first-seen id evaluation order", () => {
     expect(DagHold.isDagActiveStatus("pending")).toBe(true)
     expect(DagHold.isDagActiveStatus("running")).toBe(true)
@@ -232,5 +283,194 @@ describe("dag hold decision rule (issue 614)", () => {
     DagHold.observeDagHoldBusy(state, [wf("W1", "completed"), wf("W2", "completed")])
     expect(state.busyActive).toBe(false)
     expect(DagHold.applyDagHoldSnapshot(state, [wf("W1", "completed"), wf("W2", "completed")])).toBe("break")
+  })
+})
+
+describe("final-response answer receipt polling", () => {
+  const completed = (id: string, seq: number) => ({
+    id,
+    status: "completed",
+    config: JSON.stringify({ result_protocol: "final_response" }),
+    seq,
+    completed_at: 1000 + seq,
+    time_updated: 1000 + seq,
+  })
+  type Row = ReturnType<typeof completed>
+  const identity = (row: Row) =>
+    reportIdentity({
+      sessionId: "parent",
+      id: row.id,
+      seq: row.seq,
+      completedAt: row.completed_at,
+      timeUpdated: row.time_updated,
+    })
+  const answer = (row: Row) => {
+    const ids = identity(row)
+    return {
+      data: {
+        info: { id: ids.messageID },
+        parts: [
+          {
+            id: ids.answerID,
+            sessionID: "parent",
+            messageID: ids.messageID,
+            type: "text",
+            text: "report",
+            metadata: { dag_delivery: { workflow_id: row.id, completion_seq: row.seq, kind: "answer" } },
+          },
+        ],
+      },
+    }
+  }
+
+  test("two completed workflows wait for both receipts and memoize only verified episodes", async () => {
+    const first = completed("first", 4)
+    const second = completed("second", 8)
+    const received = new Set<string>([identity(first).messageID])
+    const reads: string[] = []
+    const client = {
+      dag: { bySession: async () => ({ data: [first, second] }) },
+      session: {
+        message: async ({ messageID }: { messageID: string }) => {
+          reads.push(messageID)
+          return received.has(messageID)
+            ? answer(messageID === identity(first).messageID ? first : second)
+            : { error: "missing" }
+        },
+      },
+    } as unknown as OpencodeClient
+    const poll = DagHold.makeDagWorkflowPoll(client, "parent")
+    const firstPoll = await poll()
+    expect(firstPoll?.map((row) => row.awaitingReport)).toEqual([false, true])
+    const secondPoll = await poll()
+    expect(secondPoll?.map((row) => row.awaitingReport)).toEqual([false, true])
+    expect(reads).toEqual([identity(first).messageID, identity(second).messageID, identity(second).messageID])
+    received.add(identity(second).messageID)
+    expect((await poll())?.every((row) => row.awaitingReport !== true)).toBe(true)
+    expect(reads.at(-1)).toBe(identity(second).messageID)
+    expect((await poll())?.every((row) => row.awaitingReport !== true)).toBe(true)
+    expect(reads).toHaveLength(4)
+  })
+
+  test("a new completion seq invalidates the old receipt cache", async () => {
+    let row = completed("same", 10)
+    const reads: string[] = []
+    const client = {
+      dag: { bySession: async () => ({ data: [row] }) },
+      session: {
+        message: async ({ messageID }: { messageID: string }) => {
+          reads.push(messageID)
+          return answer(row)
+        },
+      },
+    } as unknown as OpencodeClient
+    const poll = DagHold.makeDagWorkflowPoll(client, "parent")
+    expect((await poll())?.[0]?.awaitingReport).toBe(false)
+    row = completed("same", 11)
+    expect((await poll())?.[0]?.awaitingReport).toBe(false)
+    expect(reads).toEqual([identity(completed("same", 10)).messageID, identity(row).messageID])
+  })
+
+  test("missing, mismatched, and failed receipt reads remain pending while legacy rows stay quiescent", async () => {
+    const row = completed("needs-answer", 12)
+    const legacy = { ...completed("legacy", 1), config: "{}" }
+    const paused = { ...completed("paused", 2), status: "paused" }
+    let mode: "throw" | "wrong-kind" | "valid" = "throw"
+    let reads = 0
+    const client = {
+      dag: { bySession: async () => ({ data: [row, legacy, paused] }) },
+      session: {
+        message: async () => {
+          reads++
+          if (mode === "throw") throw new Error("temporary read failure")
+          const receipt = answer(row)
+          if (mode === "wrong-kind") receipt.data.parts[0].metadata.dag_delivery.kind = "source"
+          return receipt
+        },
+      },
+    } as unknown as OpencodeClient
+    const poll = DagHold.makeDagWorkflowPoll(client, "parent")
+    expect((await poll())?.map((item) => item.awaitingReport)).toEqual([true, undefined, undefined])
+    mode = "wrong-kind"
+    expect((await poll())?.[0]?.awaitingReport).toBe(true)
+    mode = "valid"
+    expect((await poll())?.[0]?.awaitingReport).toBe(false)
+    expect(reads).toBe(3)
+  })
+
+  test("an idle poll cannot exit before an already-persisted second answer is emitted", async () => {
+    const old = completed("old", 20)
+    const next = completed("next", 21)
+    let rows = [old]
+    const client = {
+      dag: { bySession: async () => ({ data: rows }) },
+      session: {
+        message: async ({ messageID }: { messageID: string }) =>
+          answer(messageID === identity(old).messageID ? old : next),
+      },
+    } as unknown as OpencodeClient
+    // Startup happens before the prompt. The old answer is historical and
+    // does not need replay; the second answer appears after this baseline.
+    const hold = await DagHold.createDagRunHold(client, "parent")
+    rows = [old, next]
+    await hold.onBusy()
+    expect(await hold.onIdle()).toBe("hold")
+    // The SDK poll sees both durable receipts, but the stream has not yet
+    // delivered next's text event to the output branch.
+    expect(await hold.onIdle()).toBe("hold")
+    // The plain renderer intentionally skips whitespace, but still consumes
+    // the completed part event and must release the hold.
+    hold.onText({ ...answer(next).data.parts[0], text: " \n" })
+    expect(await hold.onIdle()).toBe("break")
+  })
+
+  test("only the exact new answer part and metadata discharge a new completion seq", async () => {
+    const prior = completed("same", 30)
+    const current = completed("same", 31)
+    let row = prior
+    const client = {
+      dag: { bySession: async () => ({ data: [row] }) },
+      session: { message: async () => answer(row) },
+    } as unknown as OpencodeClient
+    const hold = await DagHold.createDagRunHold(client, "parent")
+    row = current
+    await hold.onBusy()
+    expect(await hold.onIdle()).toBe("hold")
+    hold.onText(answer(prior).data.parts[0])
+    expect(await hold.onIdle()).toBe("hold")
+    const wrongKind = answer(current).data.parts[0]
+    wrongKind.metadata.dag_delivery.kind = "source"
+    hold.onText(wrongKind)
+    expect(await hold.onIdle()).toBe("hold")
+    hold.onText({ ...answer(current).data.parts[0], id: "prt_wrong" })
+    expect(await hold.onIdle()).toBe("hold")
+    hold.onText({ ...answer(current).data.parts[0], messageID: "msg_wrong" })
+    expect(await hold.onIdle()).toBe("hold")
+    hold.onText({ ...answer(current).data.parts[0], sessionID: "other" })
+    expect(await hold.onIdle()).toBe("hold")
+    hold.onText(answer(current).data.parts[0])
+    expect(await hold.onIdle()).toBe("break")
+  })
+
+  test("an emitted answer still waits through a receipt read failure", async () => {
+    const row = completed("later", 40)
+    let rows: Row[] = []
+    let fails = true
+    const client = {
+      dag: { bySession: async () => ({ data: rows }) },
+      session: {
+        message: async () => {
+          if (fails) throw new Error("receipt temporarily unavailable")
+          return answer(row)
+        },
+      },
+    } as unknown as OpencodeClient
+    const hold = await DagHold.createDagRunHold(client, "parent")
+    rows = [row]
+    await hold.onBusy()
+    hold.onText(answer(row).data.parts[0])
+    expect(await hold.onIdle()).toBe("hold")
+    fails = false
+    expect(await hold.onIdle()).toBe("break")
   })
 })

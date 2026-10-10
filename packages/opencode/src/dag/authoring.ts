@@ -151,12 +151,19 @@ export function make(options: Options = {}) {
 function prepareGraph(decoded: DecodedAction, nodes: NodeConfig[], nodeDefaults?: NodeDefaults): PreparedGraph {
   if (decoded.action !== "start") return { action: decoded.action, nodes }
   const spec = decoded.spec
+  const blocks = "blocks" in spec.config ? spec.config.blocks : []
+  const syntheses = blocks.filter(
+    (block) => block.kind === "synthesize" && !blocks.some((other) => other.depends_on?.includes(block.id)),
+  )
+  const deliveryNode = spec.config.delivery_node ?? (syntheses.length === 1 ? syntheses[0].id : undefined)
   return {
     action: decoded.action,
     nodes,
     title: spec.title ?? spec.config.name,
     config: {
       name: spec.config.name,
+      ...(spec.config.result_protocol ? { result_protocol: spec.config.result_protocol } : {}),
+      ...(deliveryNode ? { delivery_node: deliveryNode } : {}),
       mode: spec.mode ?? "standard",
       ...(spec.config.max_concurrency !== undefined ? { max_concurrency: spec.config.max_concurrency } : {}),
       ...(spec.config.max_node_replan_attempts !== undefined
@@ -227,7 +234,7 @@ function compileAction(
   diagnostics: DagValidation.Diagnostic[]
   blocks?: readonly import("./blocks").DagBlocks.WorkflowBlock[]
   node_defaults?: NodeDefaults
-  config: { mode?: "standard" | "deep"; max_total_nodes?: number }
+  config: { mode?: "standard" | "deep"; max_total_nodes?: number; delivery_node?: string }
 } {
   if (decoded.action === "extend") {
     const extend = decoded.spec

@@ -136,8 +136,17 @@ interface NormalizedNodeConfig extends NodeConfig {
   required: boolean
 }
 
+export type ResultProtocol = "final_response" | "submit_result"
+
+/** Missing on historical persisted workflows means the original tool protocol. */
+export function resultProtocol(config: Pick<WorkflowConfig, "result_protocol"> | undefined): ResultProtocol {
+  return config?.result_protocol ?? "submit_result"
+}
+
 export interface WorkflowConfig {
   name: string
+  result_protocol?: ResultProtocol
+  delivery_node?: string
   mode?: ExecutionMode
   admission?: AdmissionRecord
   max_concurrency?: number
@@ -248,6 +257,7 @@ function normalizeWorkflowConfig(config: WorkflowConfig): WorkflowConfig & { nod
   const defaults = normalizeNodeDefaults(config.node_defaults)
   return {
     ...config,
+    result_protocol: config.result_protocol ?? "final_response",
     mode: config.mode ?? "standard",
     max_concurrency: config.max_concurrency ?? DEFAULT_WORKFLOW_CONFIG.maxConcurrency,
     max_node_replan_attempts: config.max_node_replan_attempts ?? DEFAULT_WORKFLOW_CONFIG.maxNodeReplanAttempts,
@@ -292,6 +302,13 @@ export function parseWorkflowConfig(raw: string): WorkflowConfig | undefined {
   if (Option.isNone(parsed)) return undefined
   const candidate: unknown = parsed.value
   if (!isRecord(candidate)) return undefined
+  if (
+    candidate.result_protocol !== undefined &&
+    candidate.result_protocol !== "final_response" &&
+    candidate.result_protocol !== "submit_result"
+  )
+    return undefined
+  if (candidate.delivery_node !== undefined && typeof candidate.delivery_node !== "string") return undefined
   // Guard the invariants every caller relies on (config.nodes.map, node.id,
   // depends_on iteration) instead of trusting the persisted row blindly. Kept
   // structural rather than a full strict schema: rejecting a legacy row that
@@ -508,6 +525,7 @@ export const layer = Layer.effect(
       // before any event publication.
       const structural = DagValidation.structuralDiagnostics({
         nodes: config.nodes,
+        delivery_node: config.delivery_node,
         mode: config.mode,
         max_total_nodes: config.max_total_nodes,
       })
@@ -828,7 +846,9 @@ export const layer = Layer.effect(
       // create/replan parity the spec requires: one authority, two entry points
       // that differ only in scoping (fragment + rerun-only vs whole-graph).
       const maxReplanAttempts = wfConfig.max_node_replan_attempts ?? DEFAULT_WORKFLOW_CONFIG.maxNodeReplanAttempts
-      const terminalNodeIds = new Set(nodes.filter((n) => isNodeTerminalStatus(n.status as NodeStatus)).map((n) => n.id))
+      const terminalNodeIds = new Set(
+        nodes.filter((n) => isNodeTerminalStatus(n.status as NodeStatus)).map((n) => n.id),
+      )
       const merged = computeMergedConfig(wfConfig, normalizedFragment, plan)
       const replanDiagnostics = DagValidation.replanStructuralDiagnostics({
         fragmentNodes: normalizedFragment.nodes,
